@@ -1,0 +1,21 @@
+nidus-bench — cross-engine exact-KNN performance-parity benchmark
+
+USAGE (via just):
+  just bench                      nidus only (quick)
+  just bench duckdb               nidus + DuckDB
+  just bench all                  nidus + DuckDB + LanceDB
+  just bench all top_k=100 n=1000000   extra args pass through
+
+ARGS (key=value; lists are comma-separated):
+  n=10000,100000     corpus sizes
+  dim=384,768        embedding dimensions
+  top_k=10           neighbours to retrieve (alias: k)
+  queries=100        distinct query vectors per cell
+  warmup=10          unrecorded warmup queries
+  iters=5            measured passes over the query set
+  seed=42            PRNG seed (determinism)
+  threshold=1.25     max nidus_p50 / best_p50 before a cell FAILs the run
+  json=<path>        override the JSON artifact path
+
+All engines run EXACT brute-force cosine KNN (no ANN index), so top-k results
+must agree — the harness reports top-k id agreement vs nidus as a fairness check.

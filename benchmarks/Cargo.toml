@@ -19,8 +19,14 @@ path = "src/main.rs"
 
 [dependencies]
 nidus = { path = ".." }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
 
 [features]
 default = []
-# duckdb  -> bundled DuckDB C++ (self-contained)   [added in nidus-zdz]
-# lancedb -> pure-Rust LanceDB                       [added in nidus-bra]
+# Declared now so the harness's cfg-gates are clean; each is wired to its (optional)
+# engine dependency in the adapter task that adds it.
+duckdb = []   # -> bundled DuckDB C++ (self-contained)   [wired in nidus-zdz]
+lancedb = []  # -> pure-Rust LanceDB                       [wired in nidus-bra]
