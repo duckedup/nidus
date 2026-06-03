@@ -47,9 +47,10 @@ demo:
 miri:
     MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks" cargo +nightly miri test
 
-# Show the dependency tree — nidus must stay minimal (only `anyhow`).
+# Show nidus's dependency tree — it must stay minimal and pure Rust. Scoped to
+# `-p nidus` so the heavy, opt-in benchmark crate (nidus-bench) never shows up here.
 deps:
-    cargo tree
+    cargo tree -p nidus
 
 # Pre-commit / pre-PR checks: format clean, no clippy warnings, tests green
 ci: fmt-check lint test
@@ -67,6 +68,34 @@ release:
 # Remove all build artifacts
 clean:
     cargo clean
+
+# ── Benchmarks (quarantined: heavy deps, NEVER on nidus's own build path) ──────
+
+# Cross-engine exact-KNN performance-parity benchmark. Engine deps are heavy and gated,
+# so only the engines you ask for are compiled (nidus is always in). Extra key=value args
+# pass straight through to the harness (`just bench all help` lists them).
+#   just bench                   nidus only (quick)
+#   just bench duckdb            nidus + DuckDB (bundled C++)
+#   just bench lancedb           nidus + LanceDB
+#   just bench all               nidus + DuckDB + LanceDB
+#   just bench all top_k=100 n=1000000   pass-through args
+bench ENGINES="nidus" *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ENGINES}}" in
+      nidus) feats="" ;;
+      all)   feats="duckdb,lancedb" ;;
+      *)     feats="$(echo '{{ENGINES}}' | tr ' ' ',' | sed -E 's/(^|,)nidus(,|$)/\1/g; s/^,+|,+$//g; s/,,+/,/g')" ;;
+    esac
+    cargo run -p nidus-bench --release ${feats:+--features "$feats"} -- {{ARGS}}
+
+# nidus-internal regression benchmarks (criterion); compares against saved baselines.
+# Targets the criterion bench directly so harness args reach it (the lib's libtest
+# harness would otherwise reject them).
+#   just bench-crit                          run all
+#   just bench-crit --save-baseline main     record a baseline to diff later runs against
+bench-crit *ARGS:
+    cargo bench -p nidus-bench --bench nidus_regression -- {{ARGS}}
 
 # ── Project setup ────────────────────────────────────────────────────────────
 

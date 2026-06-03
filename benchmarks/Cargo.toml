@@ -1,0 +1,64 @@
+# nidus-bench — the quarantined performance-parity benchmark.
+#
+# This crate exists to confirm nidus's exact brute-force cosine KNN stays *in line*
+# with DuckDB and LanceDB. It deliberately pulls the heavy, FFI-laden dependencies
+# nidus is designed to avoid (bundled DuckDB C++; pure-Rust-but-huge LanceDB/Arrow/
+# DataFusion). Those land here, behind features, and NEVER on nidus's own build path:
+# the root workspace pins `default-members = ["."]`, so `cargo build` / `just test`
+# touch only nidus. This crate compiles solely on explicit `-p nidus-bench`.
+[package]
+name = "nidus-bench"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+[[bin]]
+name = "nidus-bench"
+path = "src/main.rs"
+
+[dependencies]
+nidus = { path = ".." }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+# Bundled DuckDB (compiles the C++ engine from source — self-contained, no system
+# libduckdb needed). `appender-arrow` enables Appender::append_record_batch, the only
+# way to bulk-load fixed-size FLOAT[] array columns from Rust (the row appender can't).
+# duckdb re-exports its own `arrow`, so we use `duckdb::arrow` (no separate arrow dep).
+duckdb = { version = "1", optional = true, default-features = false, features = [
+    "bundled",
+    "appender-arrow",
+] }
+
+# LanceDB is pure Rust (no system lib), but a heavy compile (Arrow + DataFusion + lance)
+# — gated so it only builds on request. Async, so the adapter drives a tokio runtime and
+# collects the result stream with futures. arrow-array/-schema pinned to the major
+# lancedb tracks (58), which also unifies with duckdb's re-exported arrow.
+lancedb = { version = "0.30", optional = true }
+arrow-array = { version = "58", optional = true }
+arrow-schema = { version = "58", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
+futures = { version = "0.3", optional = true }
+
+[dev-dependencies]
+# criterion lives ONLY here (bench crate dev-dep), never in nidus — it never touches
+# nidus's build/test/CI path. Pure Rust.
+criterion = "0.5"
+
+[[bench]]
+name = "nidus_regression"
+harness = false
+
+[features]
+default = []
+duckdb = ["dep:duckdb"]   # bundled DuckDB C++ (self-contained)
+lancedb = [
+    "dep:lancedb",
+    "dep:arrow-array",
+    "dep:arrow-schema",
+    "dep:tokio",
+    "dep:futures",
+]

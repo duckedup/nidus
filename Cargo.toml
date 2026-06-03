@@ -1,15 +1,24 @@
+# nidus is the workspace root AND its sole default member: `cargo build`/`cargo test`
+# (and the core `just` recipes) touch ONLY nidus, keeping its pure-Rust, seconds-long
+# build path intact. The benchmark crate — which pulls the heavy, FFI-laden deps nidus
+# exists to avoid (bundled DuckDB C++, LanceDB/Arrow/DataFusion) — is a member built
+# solely on explicit request (`-p nidus-bench`, via `just bench`).
+[workspace]
+members = ["benchmarks"]
+default-members = ["."]
+
 [package]
 name = "nidus"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 description = "A small, pure-Rust embeddable vector store: brute-force cosine search over a single append-only file. No FFI, no C, no SQL; anyhow its only dependency."
 repository = "https://github.com/duckedup/nidus"
 license = "MIT"
 keywords = ["vector", "embeddings", "search", "embedded", "database"]
 categories = ["database-implementations", "data-structures"]
 # Keep the published crate lean: drop issue-tracker, agent, and CI infra.
-exclude = [".beads/", ".claude/", ".github/", "AGENTS.md", "justfile"]
+exclude = [".beads/", ".claude/", ".github/", "AGENTS.md", "justfile", "benchmarks/"]
 
 [lib]
 name = "nidus"
