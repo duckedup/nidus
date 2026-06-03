@@ -24,9 +24,32 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 
+# Bundled DuckDB (compiles the C++ engine from source — self-contained, no system
+# libduckdb needed). `appender-arrow` enables Appender::append_record_batch, the only
+# way to bulk-load fixed-size FLOAT[] array columns from Rust (the row appender can't).
+# duckdb re-exports its own `arrow`, so we use `duckdb::arrow` (no separate arrow dep).
+duckdb = { version = "1", optional = true, default-features = false, features = [
+    "bundled",
+    "appender-arrow",
+] }
+
+# LanceDB is pure Rust (no system lib), but a heavy compile (Arrow + DataFusion + lance)
+# — gated so it only builds on request. Async, so the adapter drives a tokio runtime and
+# collects the result stream with futures. arrow-array/-schema pinned to the major
+# lancedb tracks (58), which also unifies with duckdb's re-exported arrow.
+lancedb = { version = "0.30", optional = true }
+arrow-array = { version = "58", optional = true }
+arrow-schema = { version = "58", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
+futures = { version = "0.3", optional = true }
+
 [features]
 default = []
-# Declared now so the harness's cfg-gates are clean; each is wired to its (optional)
-# engine dependency in the adapter task that adds it.
-duckdb = []   # -> bundled DuckDB C++ (self-contained)   [wired in nidus-zdz]
-lancedb = []  # -> pure-Rust LanceDB                       [wired in nidus-bra]
+duckdb = ["dep:duckdb"]   # bundled DuckDB C++ (self-contained)
+lancedb = [
+    "dep:lancedb",
+    "dep:arrow-array",
+    "dep:arrow-schema",
+    "dep:tokio",
+    "dep:futures",
+]
