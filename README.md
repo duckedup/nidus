@@ -131,7 +131,7 @@ just demo     # the end-to-end example
 just deps     # the dependency tree (stays short, all pure Rust)
 ```
 
-Rust 1.95+ (pinned via `rust-toolchain.toml`), edition 2024.
+Rust 1.96+ (pinned via `rust-toolchain.toml`), edition 2024.
 
 ## Design
 

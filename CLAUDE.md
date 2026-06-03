@@ -65,7 +65,7 @@ just doc           # build + open API docs
 just deps          # assert the dependency tree is empty
 ```
 
-Rust 1.95+ required (pinned via `rust-toolchain.toml`). Edition 2024.
+Rust 1.96+ required (pinned via `rust-toolchain.toml`). Edition 2024.
 
 ### Pure-Rust dependencies only, zero FFI — enforced
 

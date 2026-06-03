@@ -47,9 +47,10 @@ demo:
 miri:
     MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks" cargo +nightly miri test
 
-# Show the dependency tree — nidus must stay minimal (only `anyhow`).
+# Show nidus's dependency tree — it must stay minimal and pure Rust. Scoped to
+# `-p nidus` so the heavy, opt-in benchmark crate (nidus-bench) never shows up here.
 deps:
-    cargo tree
+    cargo tree -p nidus
 
 # Pre-commit / pre-PR checks: format clean, no clippy warnings, tests green
 ci: fmt-check lint test

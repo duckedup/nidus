@@ -1,0 +1,26 @@
+# nidus-bench — the quarantined performance-parity benchmark.
+#
+# This crate exists to confirm nidus's exact brute-force cosine KNN stays *in line*
+# with DuckDB and LanceDB. It deliberately pulls the heavy, FFI-laden dependencies
+# nidus is designed to avoid (bundled DuckDB C++; pure-Rust-but-huge LanceDB/Arrow/
+# DataFusion). Those land here, behind features, and NEVER on nidus's own build path:
+# the root workspace pins `default-members = ["."]`, so `cargo build` / `just test`
+# touch only nidus. This crate compiles solely on explicit `-p nidus-bench`.
+[package]
+name = "nidus-bench"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+[[bin]]
+name = "nidus-bench"
+path = "src/main.rs"
+
+[dependencies]
+nidus = { path = ".." }
+
+[features]
+default = []
+# duckdb  -> bundled DuckDB C++ (self-contained)   [added in nidus-zdz]
+# lancedb -> pure-Rust LanceDB                       [added in nidus-bra]
