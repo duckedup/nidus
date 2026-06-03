@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::{Cell, EngineResult, RunCfg, topk_agreement};
+use crate::{Cell, EngineResult, RunCfg};
 
 const REFERENCE: &str = "nidus";
 
@@ -46,16 +46,18 @@ pub fn fmt_bytes(b: u64) -> String {
 
 // ── table ────────────────────────────────────────────────────────────────────
 
-/// Print one cell's results as an aligned table, plus the parity cross-check.
+/// Print one cell's results as an aligned table. The `recall` column is each engine's
+/// recall@k vs the harness's *independent* exact ground truth — reported for every engine
+/// (nidus included); ~100% confirms the exact configs really are exact.
 pub fn print_cell(cell: Cell, results: &[EngineResult]) {
     println!("\n── exact KNN  {cell}  ──────────────────────────────────────");
     println!(
-        "{:<10} {:>10} {:>12} {:>10} {:>10} {:>10} {:>10}",
-        "engine", "build", "ingest/s", "q_p50", "q_p95", "q_p99", "disk"
+        "{:<10} {:>10} {:>12} {:>10} {:>10} {:>10} {:>10} {:>8}",
+        "engine", "build", "ingest/s", "q_p50", "q_p95", "q_p99", "disk", "recall"
     );
     for r in results {
         println!(
-            "{:<10} {:>10} {:>12} {:>10} {:>10} {:>10} {:>10}",
+            "{:<10} {:>10} {:>12} {:>10} {:>10} {:>10} {:>10} {:>7.1}%",
             r.engine,
             fmt_dur(r.build),
             fmt_count(r.ingest_per_s),
@@ -63,23 +65,8 @@ pub fn print_cell(cell: Cell, results: &[EngineResult]) {
             fmt_dur(r.query.p95),
             fmt_dur(r.query.p99),
             fmt_bytes(r.disk_bytes),
+            r.recall * 100.0,
         );
-    }
-
-    // Parity: top-k agreement of every other engine vs the reference (nidus).
-    if let Some(reference) = results.iter().find(|r| r.engine == REFERENCE) {
-        let others: Vec<_> = results.iter().filter(|r| r.engine != REFERENCE).collect();
-        if !others.is_empty() {
-            print!("  parity vs {REFERENCE} (top-k id agreement):");
-            for o in others {
-                print!(
-                    "  {}={:.1}%",
-                    o.engine,
-                    topk_agreement(reference, o) * 100.0
-                );
-            }
-            println!();
-        }
     }
 }
 
@@ -109,6 +96,7 @@ fn timings_json(r: &EngineResult) -> Value {
         "q_mean_ms": r.query.mean.as_secs_f64() * 1e3,
         "q_samples": r.query.count,
         "disk_bytes": r.disk_bytes,
+        "recall_at_k": r.recall,
     })
 }
 

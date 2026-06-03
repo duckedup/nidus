@@ -93,18 +93,20 @@ fn compiled_engines() -> Vec<&'static str> {
     v
 }
 
-/// Run every compiled-in engine over one cell.
+/// Run every compiled-in engine over one cell, scoring recall against one shared,
+/// engine-independent exact ground truth.
 fn run_cell(cell: Cell, args: &Args) -> Result<Vec<EngineResult>> {
     let data = data::generate(args.seed, cell.n, cell.dim, args.queries);
+    let truth = nidus_bench::exact_ground_truth(&data, cell.top_k);
     #[allow(unused_mut)]
-    let mut results = vec![run_engine::<NidusEngine>(cell, &data, &args.cfg)?];
+    let mut results = vec![run_engine::<NidusEngine>(cell, &data, &args.cfg, &truth)?];
     #[cfg(feature = "duckdb")]
     results.push(run_engine::<nidus_bench::engines::duckdb::DuckdbEngine>(
-        cell, &data, &args.cfg,
+        cell, &data, &args.cfg, &truth,
     )?);
     #[cfg(feature = "lancedb")]
     results.push(run_engine::<nidus_bench::engines::lancedb::LancedbEngine>(
-        cell, &data, &args.cfg,
+        cell, &data, &args.cfg, &truth,
     )?);
     Ok(results)
 }

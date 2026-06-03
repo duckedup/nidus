@@ -33,10 +33,25 @@ fully self-contained (no `brew install`, no system libduckdb).
 ### What it measures
 
 Per `(engine × n × dim × top_k)` cell, over a deterministic seeded dataset: build +
-ingest time, ingest throughput, query latency `p50/p95/p99`, and on-disk size. All three
-engines are pinned to **exact** search (LanceDB `bypass_vector_index`, DuckDB
-`array_cosine_similarity` scan, nidus native), so the harness also reports **top-k id
-agreement vs nidus** as a fairness check — it should be ~100%.
+ingest time, ingest throughput, query latency `p50/p95/p99`, on-disk size, and
+**recall@k**. All three engines are pinned to **exact** search (LanceDB
+`bypass_vector_index`, DuckDB `array_cosine_similarity` scan, nidus native).
+
+### Fairness
+
+- **Recall is scored against an independent ground truth.** The harness computes its own
+  exact top-k by full brute-force cosine in `f64` (in `lib::exact_ground_truth`), straight
+  from the raw dataset — *not* from any engine's output. recall@k is then reported for
+  **every** engine, nidus included, so none is trusted as the oracle. ~100% across the
+  board confirms the configs are genuinely exact (no accidental ANN).
+- **Identical inputs.** Every engine sees the same seeded vectors and the same queries;
+  the timed region is exactly the `search` call; warmup and iteration counts are equal.
+
+What it deliberately does **not** control (single-process micro-benchmark, so read with
+this in mind): engines run sequentially in a fixed order (mild cache/thermal effects);
+ingest durability semantics differ per engine (nidus fsyncs per batch); and at small `n`
+the per-query fixed overheads (nidus parses string ids, LanceDB enters its async runtime)
+are visible — the comparison is most meaningful where the scan dominates (larger `n`).
 
 A configurable threshold (`threshold=1.25`: nidus p50 ≤ 1.25× the best engine) sets the
 process exit code, so the run doubles as a pass/fail guard. Each run also writes a JSON

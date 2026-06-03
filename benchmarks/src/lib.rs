@@ -2,9 +2,11 @@
 //!
 //! The goal is **parity, not winning**: confirm nidus's exact brute-force cosine KNN
 //! stays in line with DuckDB and LanceDB, and catch regressions over time. Every engine
-//! is pinned to *exact* search (no ANN index), so the top-k results must agree — the
-//! harness asserts that as a fairness check.
+//! is pinned to *exact* search (no ANN index). The harness computes its own independent
+//! exact ground truth and reports each engine's **recall@k** against it — including
+//! nidus's, so no engine is trusted as the oracle; ~100% confirms the configs are exact.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -68,15 +70,21 @@ pub struct EngineResult {
     pub ingest_per_s: f64,
     pub query: Timings,
     pub disk_bytes: u64,
-    /// Top-k id list per query (first measured iteration), for the parity cross-check.
-    pub topk_ids: Vec<Vec<u64>>,
+    /// recall@k vs the harness's independent exact ground truth, averaged over queries.
+    /// 1.0 = every query returned exactly the true neighbours.
+    pub recall: f64,
 }
 
 /// Run one engine across one cell: create → ingest → warm up → time queries.
+///
+/// `truth` is the harness's own exact top-k per query (see [`exact_ground_truth`]) — the
+/// recall reference, computed independently of every engine so none (not even nidus) is
+/// trusted as the oracle.
 pub fn run_engine<E: VectorStore>(
     cell: Cell,
     data: &Dataset,
     cfg: &RunCfg,
+    truth: &[Vec<u64>],
 ) -> Result<EngineResult> {
     let tmp = tempfile::Builder::new()
         .prefix(&format!("nidus-bench-{}-", E::NAME))
@@ -118,24 +126,65 @@ pub fn run_engine<E: VectorStore>(
         ingest_per_s,
         query: Timings::summarize(samples),
         disk_bytes,
-        topk_ids,
+        recall: recall_at_k(&topk_ids, truth),
     })
 }
 
-/// Fraction of top-k ids shared between two result sets, averaged over queries.
-/// 1.0 means every query agreed exactly. Exact engines may differ only at the k-th
-/// boundary on near-ties, so values just below 1.0 are expected and acceptable.
-pub fn topk_agreement(a: &EngineResult, b: &EngineResult) -> f64 {
-    let q = a.topk_ids.len().min(b.topk_ids.len());
+/// The harness's **independent** exact top-k per query, by full brute-force cosine in f64
+/// — the unbiased ground truth for recall. Computed straight from the raw dataset, never
+/// from an engine's output, so it doesn't privilege whichever engine we compare against.
+pub fn exact_ground_truth(data: &Dataset, top_k: usize) -> Vec<Vec<u64>> {
+    let dim = data.dim;
+    let n = data.n();
+    let norms: Vec<f64> = (0..n)
+        .map(|i| {
+            data.vectors[i * dim..(i + 1) * dim]
+                .iter()
+                .map(|&x| (x as f64) * (x as f64))
+                .sum::<f64>()
+                .sqrt()
+        })
+        .collect();
+
+    data.queries
+        .iter()
+        .map(|q| {
+            let qn: f64 = q
+                .iter()
+                .map(|&x| (x as f64) * (x as f64))
+                .sum::<f64>()
+                .sqrt();
+            let mut scored: Vec<(f64, u64)> = (0..n)
+                .map(|i| {
+                    let row = &data.vectors[i * dim..(i + 1) * dim];
+                    let dot: f64 = row
+                        .iter()
+                        .zip(q)
+                        .map(|(&a, &b)| (a as f64) * (b as f64))
+                        .sum();
+                    let denom = norms[i] * qn;
+                    let cos = if denom > 1e-12 { dot / denom } else { 0.0 };
+                    (cos, data.ids[i])
+                })
+                .collect();
+            // Highest cosine first; total_cmp is a stable total order on ties.
+            scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            scored.into_iter().take(top_k).map(|(_, id)| id).collect()
+        })
+        .collect()
+}
+
+/// recall@k = mean over queries of |returned ∩ truth| / |truth|.
+fn recall_at_k(returned: &[Vec<u64>], truth: &[Vec<u64>]) -> f64 {
+    let q = returned.len().min(truth.len());
     if q == 0 {
         return 1.0;
     }
     let mut acc = 0.0;
     for i in 0..q {
-        let sa: std::collections::HashSet<u64> = a.topk_ids[i].iter().copied().collect();
-        let overlap = b.topk_ids[i].iter().filter(|id| sa.contains(id)).count();
-        let denom = a.topk_ids[i].len().max(1);
-        acc += overlap as f64 / denom as f64;
+        let t: HashSet<u64> = truth[i].iter().copied().collect();
+        let hit = returned[i].iter().filter(|id| t.contains(id)).count();
+        acc += hit as f64 / truth[i].len().max(1) as f64;
     }
     acc / q as f64
 }
