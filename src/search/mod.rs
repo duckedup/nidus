@@ -18,12 +18,52 @@ pub fn normalize(v: &mut [f32]) {
     }
 }
 
+/// Number of independent accumulator lanes in [`dot`]. Eight `f32` lanes is a
+/// 256-bit-wide reduction, which maps onto common SIMD register widths (AVX `ymm`,
+/// or two NEON `q` registers) and keeps enough chains in flight to hide FMA latency.
+const DOT_LANES: usize = 8;
+
 /// Dot product of two equal-length slices. For unit vectors this is cosine
 /// similarity. Panics or is undefined if lengths differ — callers guarantee equal
 /// length (the store pins the dimension).
+///
+/// The hot path of brute-force search. A naive `zip().map().sum()` forces a single
+/// sequential accumulator: because f32 addition is not associative, LLVM may not
+/// reorder it, so without fast-math it stays scalar and leaves the vector units idle.
+/// Here we keep [`DOT_LANES`] *independent* running sums — lane `i` only ever touches
+/// elements `i, i+LANES, i+2·LANES, …` — so each lane is its own associative reduction
+/// chain the optimizer is free to vectorize, and the lanes share no dependency. The
+/// per-lane partials are folded at the end (pairwise, again independent of input
+/// length). Summation order differs from the naive left fold, so the f32 result can
+/// round a hair differently; that only matters at exact-tie boundaries in ranking,
+/// which are arbitrary anyway.
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "dot: slice lengths must be equal");
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+
+    let mut acc = [0.0f32; DOT_LANES];
+    let mut a_chunks = a.chunks_exact(DOT_LANES);
+    let mut b_chunks = b.chunks_exact(DOT_LANES);
+
+    // Bulk of the work: full LANES-wide chunks, each lane an independent FMA chain.
+    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        for lane in 0..DOT_LANES {
+            acc[lane] += ca[lane] * cb[lane];
+        }
+    }
+
+    // Fold the lanes pairwise (8 → 4 → 2 → 1), then add the < LANES tail remainder.
+    let mut half = DOT_LANES / 2;
+    while half >= 1 {
+        for lane in 0..half {
+            acc[lane] += acc[lane + half];
+        }
+        half /= 2;
+    }
+    let mut sum = acc[0];
+    for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        sum += x * y;
+    }
+    sum
 }
 
 // ── Internal total-order wrapper for f32 scores ──────────────────────────────
@@ -285,6 +325,48 @@ mod tests {
         let a: [f32; 0] = [];
         let b: [f32; 0] = [];
         assert_eq!(dot(&a, &b), 0.0);
+    }
+
+    /// Naive sequential reference the chunked `dot` must agree with (modulo f32
+    /// rounding from a different summation order).
+    fn dot_naive(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    #[test]
+    fn dot_matches_naive_across_lengths() {
+        // Cover every residue class around the LANES=8 chunk boundary, including
+        // lengths shorter than one chunk (pure remainder) and exact multiples.
+        for len in [
+            0usize, 1, 3, 7, 8, 9, 15, 16, 17, 31, 33, 64, 384, 768, 1000,
+        ] {
+            let a: Vec<f32> = (0..len).map(|i| (i as f32) * 0.013 - 0.5).collect();
+            let b: Vec<f32> = (0..len).map(|i| 0.25 - (i as f32) * 0.007).collect();
+            let got = dot(&a, &b);
+            let want = dot_naive(&a, &b);
+            // Different summation order → tiny rounding drift; scale tolerance by len.
+            let tol = 1e-4 * (len as f32).max(1.0);
+            assert!(
+                (got - want).abs() <= tol,
+                "len={len}: chunked dot {got} vs naive {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn dot_tail_only_no_full_chunk() {
+        // Length < LANES exercises the remainder path with zero full chunks.
+        let a = [1.0f32, 2.0, 3.0];
+        let b = [4.0f32, 5.0, 6.0];
+        assert!((dot(&a, &b) - 32.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn dot_exact_chunk_boundary() {
+        // Exactly LANES elements: one full chunk, empty remainder.
+        let a = [1.0f32; 8];
+        let b = [2.0f32; 8];
+        assert!((dot(&a, &b) - 16.0).abs() < 1e-5);
     }
 
     // ── TopK ──────────────────────────────────────────────────────────────────
