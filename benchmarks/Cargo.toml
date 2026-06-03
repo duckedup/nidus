@@ -43,6 +43,15 @@ arrow-schema = { version = "58", optional = true }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
 futures = { version = "0.3", optional = true }
 
+[dev-dependencies]
+# criterion lives ONLY here (bench crate dev-dep), never in nidus — it never touches
+# nidus's build/test/CI path. Pure Rust.
+criterion = "0.5"
+
+[[bench]]
+name = "nidus_regression"
+harness = false
+
 [features]
 default = []
 duckdb = ["dep:duckdb"]   # bundled DuckDB C++ (self-contained)

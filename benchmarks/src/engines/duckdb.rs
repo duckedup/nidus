@@ -30,7 +30,10 @@ pub struct DuckdbEngine {
 fn vec_field(dim: usize) -> Field {
     Field::new(
         "vec",
-        DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), dim as i32),
+        DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            dim as i32,
+        ),
         false,
     )
 }
