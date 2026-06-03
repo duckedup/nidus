@@ -410,8 +410,14 @@ impl Store {
         let mut q = query.to_vec();
         normalize(&mut q);
 
-        let mut topk: TopK<(String, String)> = TopK::new(opts.top_k);
-
+        // Gather the in-scope, filter-passing rows as cheap borrowed tuples — no
+        // string allocation on this path — then sort by physical row. The scoring
+        // loop below then walks the data matrix in storage order, so the CPU
+        // prefetcher streams the (row-major, contiguous) `f32` buffer instead of
+        // chasing the arbitrary order a `HashMap` iterator hands back. At small
+        // dimensions, where the dot is cheap relative to a row-boundary cache miss,
+        // this is the difference between memory-bandwidth-bound and miss-bound.
+        let mut scan: Vec<(u64, &str, &str)> = Vec::new();
         for &col_name in collections {
             let Some(col) = self.collections.get(col_name) else {
                 // Named collection that does not exist — skip silently.
@@ -422,32 +428,42 @@ impl Store {
                 if !filter::matches(&opts.filter, &entry.attrs) {
                     continue;
                 }
-                let stored = self.data.row(entry.row);
-                let score = dot(&q, stored);
-                // Apply min_score gate.
-                if let Some(min) = opts.min_score
-                    && score < min
-                {
-                    continue;
-                }
-                topk.offer(score, (col_name.to_string(), id.clone()));
+                scan.push((entry.row, col_name, id.as_str()));
             }
         }
+        scan.sort_unstable_by_key(|&(row, _, _)| row);
 
-        // Build results — only clone attrs for surviving top-k entries.
+        // The heap carries only *borrowed* identifiers (`&str` into `self`/`collections`)
+        // during the scan — offering one is a cheap pointer copy, so no allocation
+        // happens on the hot per-row path. Strings (and attr clones) are materialized
+        // once, at the end, for the ≤ top_k survivors.
+        let mut topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
+        for (row, col_name, id) in scan {
+            let stored = self.data.row(row);
+            let score = dot(&q, stored);
+            // Apply min_score gate.
+            if let Some(min) = opts.min_score
+                && score < min
+            {
+                continue;
+            }
+            topk.offer(score, (col_name, id));
+        }
+
+        // Build results — only clone ids/attrs for surviving top-k entries.
         let results = topk
             .into_sorted_desc()
             .into_iter()
             .map(|(score, (collection, id))| {
                 let attrs = self
                     .collections
-                    .get(&collection)
-                    .and_then(|c| c.docs.get(&id))
+                    .get(collection)
+                    .and_then(|c| c.docs.get(id))
                     .map(|e| e.attrs.clone())
                     .unwrap_or_default();
                 Hit {
-                    collection,
-                    id,
+                    collection: collection.to_string(),
+                    id: id.to_string(),
                     score,
                     attrs,
                 }

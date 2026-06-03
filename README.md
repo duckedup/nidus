@@ -91,6 +91,34 @@ See [`examples/demo.rs`](examples/demo.rs) for an end-to-end run (`cargo run
   core to lock you into a runtime. `Arc<RwLock<Nidus>>` gives concurrent searchers +
   one writer; async callers bridge with `spawn_blocking`.
 
+## Performance
+
+Every vector store ships a benchmark proving it's the fastest, on synthetic data
+that looks nothing like your workload. It's a genre. Here's ours — and yes, we win
+our own benchmark, that's how this works.
+
+Exact brute-force cosine KNN, 100k vectors, single thread, measured against
+DuckDB (`array_cosine_similarity`) and LanceDB (`bypass_vector_index`) — both pinned
+to the same exact search, so all three return the same neighbours. The harness
+computes its own independent ground truth and reports **recall@k** for every engine
+(including nidus), so none is trusted as the oracle. Numbers are query p50; lower is
+better.
+
+| n=100k | top_k | **nidus** | LanceDB | DuckDB | recall |
+|--------|------:|----------:|--------:|-------:|:------:|
+| dim=384 |  10 | **5.44 ms** | 12.29 ms | 32.29 ms | 100% |
+| dim=384 | 100 | **5.53 ms** | 28.52 ms | 30.59 ms | 100% |
+| dim=768 |  10 | **8.09 ms** | 24.78 ms | 69.54 ms | 100% |
+| dim=768 | 100 | **8.57 ms** | 53.16 ms | 64.99 ms | 100% |
+
+All three are exact (recall 100%); nidus is the fastest in every cell while being the
+one that compiles in seconds with zero FFI. The kernel is plain safe Rust — an
+8-lane chunked dot the optimizer can vectorize, an allocation-free top-k scan, and a
+storage-order (prefetcher-friendly) sweep of the matrix. Reproduce with
+`just bench all` (see [`benchmarks/`](benchmarks/); the heavy DuckDB/LanceDB deps are
+quarantined off nidus's own build path). Synthetic data on an Apple Silicon laptop —
+useless, like all benchmarks, but there it is.
+
 ## On-disk layout
 
 A store is a directory:
