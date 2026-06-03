@@ -1,0 +1,33 @@
+[package]
+name = "nidus"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A small, pure-Rust embeddable vector store: brute-force cosine search over a single append-only file. No FFI, no C, no SQL; anyhow its only dependency."
+repository = "https://github.com/duckedup/nidus"
+license = "MIT"
+keywords = ["vector", "embeddings", "search", "embedded", "database"]
+categories = ["database-implementations", "data-structures"]
+# Keep the published crate lean: drop issue-tracker, agent, and CI infra.
+exclude = [".beads/", ".claude/", ".github/", "AGENTS.md", "justfile"]
+
+[lib]
+name = "nidus"
+path = "src/lib.rs"
+
+# One dependency, by design: anyhow (a single pure-Rust crate, no transitive deps,
+# no C, no FFI, sub-second compile). Everything else is std. nidus stays pure safe
+# Rust and fully Miri-checkable, and builds in seconds — unlike a bundled C/C++ store
+# (DuckDB) or a transitively-heavy one (LanceDB).
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+crc32fast = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are large and single-run-only — they just bloat the
+  # cache. CI builds clean each run, so disable incremental compilation.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # Formatting is a no-compile check — keep it as its own fast job.
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # clippy, test, and the release build are separate compiles (check-mode vs
+  # build-mode artifacts vs the release profile), so run them as parallel jobs
+  # instead of one sequential job. Each keeps its own cache slot. nidus is pure
+  # Rust with a tiny dependency tree, so every one of these is a seconds-long build.
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: clippy
+            components: clippy
+            command: cargo clippy --all-targets --all-features -- -D warnings
+          - name: test
+            components: ""
+            command: cargo test --all-features
+          - name: release
+            components: ""
+            command: cargo build --release
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: ${{ matrix.components }}
+
+      # First-party cache with restore-keys. A Cargo.lock change misses the exact
+      # key but falls back to the newest prior cache, so cargo reuses unchanged
+      # deps and only the workspace crate recompiles. registry/src is omitted
+      # (re-extracted from registry/cache) to keep the cache small.
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.name }}-
+
+      - run: ${{ matrix.command }}
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Miri
+        run: |
+          rustup toolchain install nightly --component miri
+          rustup override set nightly
+          cargo miri setup
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-miri-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-miri-
+
+      # nidus is pure safe Rust with zero FFI, so the whole suite runs under Miri
+      # (no feature to gate out). File-backed tests that hit fsync/syscalls Miri
+      # lacks carry `#[cfg_attr(miri, ignore)]`; everything else is checked.
+      - name: Test with Miri
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks"
+        run: cargo miri test
