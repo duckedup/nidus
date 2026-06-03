@@ -1,0 +1,8 @@
+/target
+Cargo.lock
+*.nidus
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
