@@ -1,0 +1,98 @@
+//! Shared data vocabulary used across nidus modules.
+//!
+//! Pure type definitions plus serde derives. *Behavior* lives in the modules that
+//! own it — `filter` evaluates a [`Filter`], `log` (de)serializes an [`Op`], etc.
+//! This module is the single source of truth for the types those modules share, so
+//! they can be built independently and still agree on shapes.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+/// A typed metadata value attached to a [`Record`].
+///
+/// `Null` is **distinct from an absent key**: absence means "not set / not indexed",
+/// while `Null` means "set, and empty/none". Callers rely on this to tell
+/// not-computed apart from computed-empty (e.g. optional relation lists).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Value {
+    Null,
+    Str(String),
+    Int(i64),
+    Bool(bool),
+    List(Vec<String>),
+}
+
+/// A document: a caller-supplied id, its embedding, and typed metadata.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Record {
+    /// Caller-supplied identity; the upsert key (idempotent within a collection).
+    pub id: String,
+    /// The embedding. Length must equal the store dimension.
+    pub vector: Vec<f32>,
+    /// Arbitrary typed metadata.
+    pub attrs: BTreeMap<String, Value>,
+}
+
+/// A single attribute predicate. Predicates are AND-combined inside a [`Filter`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Predicate {
+    /// `attrs[key] == value`.
+    Eq(String, Value),
+    /// `attrs[key]` is a [`Value::Str`] matching the glob pattern.
+    Glob(String, String),
+    /// `attrs[key]` is equal to one of the values in the set.
+    In(String, Vec<Value>),
+}
+
+/// A conjunction (AND) of predicates. An empty filter matches everything.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Filter(pub Vec<Predicate>);
+
+/// Query parameters for a search.
+#[derive(Clone, Debug, Default)]
+pub struct SearchOpts {
+    /// Maximum number of results.
+    pub top_k: usize,
+    /// Pre-scoring metadata filter (applied before the dot product).
+    pub filter: Filter,
+    /// Drop results scoring below this cosine similarity.
+    pub min_score: Option<f32>,
+}
+
+/// One search result. Carries its source `collection` (ids are unique only within a
+/// collection) and the matched record's `attrs`, but deliberately not its vector.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hit {
+    pub collection: String,
+    pub id: String,
+    pub score: f32,
+    pub attrs: BTreeMap<String, Value>,
+}
+
+/// A mutating operation recorded in the op log (the commit stream). `row` indexes
+/// into the data segment. The on-disk log is a sequence of framed, checksummed,
+/// bincode-encoded `Op`s (see `log` module + SPEC.md §5.2).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Op {
+    CreateCollection {
+        collection: String,
+    },
+    DropCollection {
+        collection: String,
+    },
+    SetMeta {
+        collection: String,
+        meta: BTreeMap<String, String>,
+    },
+    Upsert {
+        collection: String,
+        id: String,
+        row: u64,
+        attrs: BTreeMap<String, Value>,
+    },
+    Delete {
+        collection: String,
+        id: String,
+    },
+}

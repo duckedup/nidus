@@ -1,0 +1,510 @@
+# nidus — specification
+
+> _nidus_ (Latin, "nest") — a small place where things are kept safe. A pure-Rust
+> embeddable vector store, leaning on the bird theme.
+
+This document is the source of truth for nidus's design. It records not just
+*what* we build but *why*, including the decisions we deliberately deferred.
+`CLAUDE.md` is the agent-facing summary; this is the long form. Keep them in sync.
+
+---
+
+## 1. Purpose & motivation
+
+nidus is the **local storage leg** for semantic-search and indexing tools: chunk
+some source content → embed each chunk into a dense vector → store the vectors plus
+metadata → answer "nearest neighbours to this query vector" fast, in-process, with
+no hosted service. The source can be anything — code, documents, issues, wiki
+pages — nidus does not care; it stores vectors and metadata and ranks them.
+
+It exists because the obvious off-the-shelf options fail the *embedding* test —
+not the functionality test, the **build-and-ship** test:
+
+- **DuckDB** (a common embedded choice, via `libduckdb-sys`) **bundles a large C++
+  source tree and compiles it from scratch via `cc`**. Costs: multi-minute cold
+  builds, a required C++ toolchain, awkward cross-compilation, a bloated binary,
+  and FFI that **cannot run under Miri**. A typical vector workload uses ~1% of
+  DuckDB: one table, brute-force `array_cosine_distance ... ORDER BY ... LIMIT k`,
+  and equality/GLOB filters.
+- **LanceDB** is "written in Rust" yet still compiles for ~10 minutes, because it
+  drags in **arrow-rs + DataFusion (a full SQL engine) + the Lance columnar format
+  + object_store**. Hundreds of crates and a query engine, to do `ORDER BY distance
+  LIMIT k`. Same disease as DuckDB, transitively-Rust instead of FFI.
+
+The workload is a **vector store, not a database**: no joins, no SQL, no analytics,
+no larger-than-RAM scans (at the target scale). nidus is that store and nothing
+more.
+
+### Thesis (the product *is* the constraints)
+
+1. **Popular, pure-Rust dependencies only.** Lean on well-established pure-Rust
+   crates where they earn their keep (e.g. `anyhow` for errors, `serde`/`bincode`
+   for codecs, `crc32fast` for checksums) — but **never a crate that compiles C or
+   links a native library** (no `*-sys`, no bundled C++). The bar is *build-and-ship*:
+   fast compile, no C toolchain, no FFI. `just deps` should stay short and every
+   crate in it pure Rust.
+2. **Zero FFI, zero `unsafe` in our code.** `#![forbid(unsafe_code)]`. No `flock`,
+   no `mmap`, no `extern "C"` written by us. (A dependency's internal `unsafe` is
+   fine; ours is not.)
+3. **No C to compile.** `cargo build` is rustc — seconds, no C toolchain.
+4. **Fully Miri-checkable.** Our logic, including file IO, runs under Miri.
+
+Pulling in a crate that compiles C, links native code, or adds an `unsafe` block to
+*our* code is a change to *what nidus is*. File an issue and decide deliberately.
+
+---
+
+## 2. Goals & non-goals
+
+**Goals**
+- Embeddable, in-process, single-store-per-directory.
+- Exact (100% recall) brute-force cosine search, fast at the target scale
+  (≤ a few million vectors, comfortably in RAM).
+- Many logical collections (namespaces) in one store, sharing one dimension.
+- **Scoped search**: query one collection, a chosen subset, or the entire store in
+  a single call, with results merged into one ranking. The API must not lock callers
+  into a single namespace per query, and the storage layout must not make
+  whole-store search expensive beyond the unavoidable scan cost.
+- Crash-safe writes; lock-free, consistent cross-process reads.
+- Idempotent upserts by caller-supplied id.
+
+**Non-goals (for v0.1)**
+- Approximate nearest neighbour (HNSW/IVF) — deferred seam (§9). Note: supporting
+  whole-store search makes the scanned `N` potentially large, which strengthens the
+  case for this seam later; it does not change v0.1's exact-scan approach.
+- Larger-than-RAM / memory-mapped operation — deferred seam (§9).
+- Quantization (int8/binary) — deferred seam (§9).
+- SQL, a query planner, transactions spanning multiple operations, multi-writer
+  concurrency, networking, or replication.
+
+---
+
+## 3. Data model
+
+```rust
+pub struct Record {
+    pub id: String,             // caller-supplied; upsert key (idempotent)
+    pub vector: Vec<f32>,       // length must equal the store dimension
+    pub attrs: BTreeMap<String, Value>,
+}
+
+pub enum Value {
+    Null,                       // distinct from "absent" — see below
+    Str(String),
+    Int(i64),
+    Bool(bool),
+    List(Vec<String>),
+}
+```
+
+- **Collections** are logical partitions (namespaces) identified by a `&str`. There
+  are many; each is created/dropped independently; all share the store's single
+  pinned dimension.
+- **Dimension** is fixed for the life of the store, recorded in the `data` header.
+  Reopening with a different dimension is a hard error. One store = one embedding
+  model = one comparable vector space.
+- `Value` is rich enough to hold any scalar/metadata a caller attaches. The
+  `Null`-vs-absent distinction is meaningful and preserved across disk round-trips:
+  it lets a caller tell apart "this field was not computed/indexed" (absent) from
+  "computed, and the value is empty" (e.g. `List([])`) — a distinction that matters
+  for things like optional graph edges or tags.
+
+---
+
+## 4. Public API (sketch)
+
+Synchronous (see §6.5 for why — the hot path is CPU-bound, so async would only add
+overhead and a runtime dependency). Mutations take `&mut self`; reads take `&self`,
+so `Arc<RwLock<Nidus>>` yields many concurrent searchers + one writer. Async callers
+bridge with `spawn_blocking`.
+
+```rust
+impl Nidus {
+    pub fn open(config: Config) -> Result<Self>;                            // canonical
+    pub fn open_dir(dir: impl AsRef<Path>, dimension: usize) -> Result<Self>; // = open(Config::new(dir, dim))
+    pub fn open_in_memory(dimension: usize) -> Result<Self>;                // tests; no files, no lock
+    pub fn dimension(&self) -> usize;
+    pub fn config(&self) -> &Config;
+
+    // collections
+    pub fn create_collection(&mut self, name: &str) -> Result<()>;     // idempotent
+    pub fn drop_collection(&mut self, name: &str) -> Result<()>;
+    pub fn has_collection(&self, name: &str) -> bool;
+    pub fn collections(&self) -> Vec<String>;
+
+    // per-collection metadata (small string map; e.g. a high-water mark, model id)
+    pub fn get_meta(&self, collection: &str) -> BTreeMap<String, String>;
+    pub fn set_meta(&mut self, collection: &str, meta: BTreeMap<String, String>) -> Result<()>;
+
+    // documents — upsert is idempotent by id; fsynced per call (a batch)
+    pub fn upsert(&mut self, collection: &str, records: &[Record]) -> Result<usize>;
+    pub fn delete(&mut self, collection: &str, ids: &[&str]) -> Result<usize>;
+    pub fn delete_where(&mut self, collection: &str, filter: &Filter) -> Result<usize>;
+    pub fn get_all(&self, collection: &str) -> Vec<Record>;            // includes vectors
+
+    // search one collection, a subset, or the whole store — one merged ranking.
+    // `scope` accepts `impl Into<Scope>`, so a bare &str / &[&str] also works.
+    pub fn search(&self, scope: Scope, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>;
+
+    pub fn flush(&mut self) -> Result<()>;     // fsync both files
+    pub fn compact(&mut self) -> Result<()>;   // reclaim dead rows / log churn
+}
+
+/// Which collections a search ranks over. Scores are comparable across
+/// collections because the whole store shares one embedding space (§3).
+pub enum Scope<'a> {
+    Collection(&'a str),       // the common, fast path
+    Collections(&'a [&'a str]),
+    All,                       // every collection in the store
+}
+// impl From<&str> / From<&[&str]> for Scope — ergonomic single- and multi-collection calls.
+
+pub struct SearchOpts { pub top_k: usize, pub filter: Filter, pub min_score: Option<f32> }
+
+// `collection` identifies the source namespace — required when a query spans more
+// than one, and (id) is only unique within a collection.
+pub struct Hit { pub collection: String, pub id: String, pub score: f32, pub attrs: BTreeMap<String, Value> } // no vector
+
+pub struct Filter(pub Vec<Predicate>);   // AND of predicates
+pub enum Predicate {
+    Eq(String, Value),                   // attr == value
+    Glob(String, String),                // attr (Str) matches glob pattern
+    In(String, Vec<Value>),              // attr ∈ set
+}
+```
+
+`Hit` deliberately omits the vector (search returns many; nobody needs the floats
+back). `get_all` includes vectors (callers re-upserting with new metadata need them).
+
+### 4.1 Configuration — the store location is the caller's choice
+
+A store has **no hardcoded location**. `open` takes a `Config`; the directory is
+always supplied by the caller — an application's own config, a user-facing flag, or
+(for an embedding tool) whatever path that tool manages. nidus never picks a path,
+an env var, or a default directory for you. Only the file *names inside* the
+directory (`data`/`log`/`lock`) are fixed; they are an internal detail.
+
+```rust
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub path: PathBuf,             // REQUIRED — the store directory
+    pub dimension: usize,          // REQUIRED — pinned embedding dimension
+    pub fsync: Fsync,              // default PerBatch (decision B)
+    pub open_mode: OpenMode,       // default ReadWrite
+    pub auto_compact: Option<f32>, // dead-row ratio that triggers compaction on open;
+                                   //   None = never. default Some(0.5)
+    pub lock_ttl: Duration,        // stale writer-lock reclamation window. default 60s
+}
+pub enum Fsync { PerBatch, OnFlush }
+pub enum OpenMode { ReadWrite, ReadOnly }   // ReadOnly takes no writer lock; rejects writes
+
+impl Config {
+    pub fn new(path: impl Into<PathBuf>, dimension: usize) -> Self;  // all else defaulted
+    pub fn fsync(self, f: Fsync) -> Self;                            // builder setters
+    pub fn open_mode(self, m: OpenMode) -> Self;
+    pub fn auto_compact(self, ratio: Option<f32>) -> Self;
+    pub fn lock_ttl(self, ttl: Duration) -> Self;
+}
+```
+
+- `OpenMode::ReadOnly` opens **without** taking the writer lock and rejects
+  mutations — the basis for many concurrent search-only processes over a store
+  another process writes (the lock-free snapshot model, §6.2), and the foundation
+  for a future search server (§9).
+- Defaults are chosen so `Config::new(path, dim)` "just works" for the embedded
+  single-writer case; every field is overridable for callers (or a server) that
+  need different durability/lock/compaction behavior.
+
+---
+
+## 5. On-disk format
+
+A store is a **directory**. Three files:
+
+```
+<dir>/
+  data    flat f32 matrix, append-only, never rewritten in place
+  log     append-only op stream (the commit record)
+  lock    writer-exclusion lock file (present only while a writer holds it)
+```
+
+### 5.1 `data` — the vector segment
+
+```
+┌─ header (64 bytes, fixed) ─────────────────────────────────────────────┐
+│ magic   "NIDUS\0" + format version (u16)                               │
+│ dimension (u32)                                                        │
+│ reserved zero padding to 64 bytes (cache-line alignment for rows)      │
+├─ rows ─────────────────────────────────────────────────────────────────┤
+│ row 0:  dim × f32 (little-endian)   at byte offset 64                  │
+│ row 1:  dim × f32                    at offset 64 + 1·dim·4             │
+│ ...                                  row i at 64 + i·dim·4              │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+- Fixed stride (`dim·4` bytes) → row `i` is pure arithmetic; rows are 64-byte
+  aligned → friendly to autovectorized dot products and (later) a sound
+  reinterpret for mmap.
+- **Append-only.** New vectors append at the tail. Existing rows are never mutated,
+  so a concurrent reader always sees fully-written rows. Deletes/overwrites do not
+  remove rows here — the row is simply no longer referenced (reclaimed by §8).
+- Vectors are **unit-normalized before writing** (§7), so `data` stores unit vectors.
+
+### 5.2 `log` — the operation stream
+
+A sequence of records; each record is:
+
+```
+[ len: u32 ][ payload: len bytes ][ crc32: u32 ]   (all little-endian)
+```
+
+`crc32` covers the payload (table-based, hand-rolled, `crc.rs`). Payload is a
+tagged op:
+
+| tag | op | payload |
+|----|----|---------|
+| 0 | `CreateCollection` | name |
+| 1 | `DropCollection`   | name |
+| 2 | `SetMeta`          | collection, `{k:v}` string map |
+| 3 | `Upsert`           | collection, id, **row_index (u64)**, attrs |
+| 4 | `Delete`           | collection, id |
+
+- The **`Upsert` log record is the commit point**: it references a `row_index`
+  into `data`. A vector exists in the store iff a committed `Upsert` points at its
+  row. Orphan rows (vector written, process died before the log record) are inert
+  and reclaimed on compaction.
+- **Replay** (`open`): read records sequentially, applying each to the in-RAM
+  index. If the final record is short (truncated `len`/`payload`) or fails CRC, the
+  log was torn by a crash mid-append → **truncate to the last good record** and
+  continue. This is the crash-recovery mechanism.
+- Strings/maps/attrs use the explicit little-endian codec in `value.rs`
+  (`u32` length prefixes; `Value` tag byte + payload). No serde.
+
+### 5.3 In-RAM state (rebuilt on open)
+
+```
+dimension: usize
+vectors:   Vec<f32>                              // the data rows, row-major
+collections: HashMap<String, Collection>
+struct Collection {
+    meta: BTreeMap<String, String>,
+    docs: HashMap<String, DocEntry>,             // id → entry
+}
+struct DocEntry { row: u64, attrs: BTreeMap<String, Value> }
+```
+
+`open` cost = `read(data)` (one bulk read of a flat blob; **no parsing**) + replay
+`log` (small). The big vector file is never deserialized field-by-field.
+
+---
+
+## 6. Durability & concurrency
+
+Three guarantees, in priority order.
+
+### 6.1 Crash safety — guaranteed
+Append-only files + commit-via-log + CRC'd, length-prefixed records. A writer
+killed at any point leaves: a valid `data` prefix (possibly with inert orphan rows
+at the tail) and a `log` whose last record is either complete or detectably torn.
+Reopening recovers to "last fully-committed op." The worst loss is the in-flight
+batch — acceptable because the index is reproducible from source.
+
+### 6.2 Cross-process reader/writer isolation — lock-free
+**Write order is load-bearing:** append vectors to `data` → **fsync `data`** →
+append committing `log` records → **fsync `log`**. Therefore any committed `Upsert`
+record's referenced row is already durable in `data`.
+
+A reader process opens by reading `data` (size S → `S/dim` rows) then replaying
+`log`, and **ignores any record referencing a row ≥ S/dim**. Result: a consistent,
+possibly-slightly-stale snapshot of whatever was committed when it read — never a
+torn vector, never a half-record. No read lock required.
+
+### 6.3 Writer/writer exclusion — best-effort, pure std
+Two concurrent writers would corrupt the append stream. A writer acquires
+`<dir>/lock` via `OpenOptions::new().write(true).create_new(true)` (atomic O_EXCL
+create — pure `std`, no `flock`/FFI), writing its PID + start timestamp inside. On
+conflict: error with a clear message; a lock older than a TTL is treated as stale
+and reclaimed (git's `index.lock` pattern). The lock is removed on clean close.
+
+> Decision (C): pure-std lock file, not `flock`. `flock` would auto-release on
+> process death (no stale wart) but is FFI. Per the zero-FFI thesis we take the
+> lock file and the mild stale-lock TTL instead. Indexing is typically serial, so
+> contention is rare.
+
+### 6.4 fsync policy
+Decision (B): **per-batch fsync** — every `upsert`/`delete` call fsyncs. Batches are
+large (e.g. hundreds of docs) and infrequent during indexing, so the cost is
+negligible and durability is real. `flush()` exists for callers that want an
+explicit barrier.
+
+### 6.5 Concurrency & speed
+The hot path (`search`) is pure CPU over in-RAM data — there is no IO to await — so
+the core API is **synchronous on purpose**. An `async` core would add executor
+overhead, risk blocking the runtime with a CPU loop, and force a runtime dependency
+on every user (breaking zero-deps and runtime-agnosticism). Speed and concurrency
+come from elsewhere, in order:
+
+- **`&self` reads ⇒ concurrent searchers.** `Arc<RwLock<Nidus>>` gives many parallel
+  searches with one exclusive writer (`Arc<Mutex<…>>` if simplicity is preferred).
+- **Parallel scan (deferred seam, §9).** `search(&self)` may fan the row scan across
+  cores with `std::thread::scope` (**zero-dep**) into per-thread top-k heaps, then
+  merge — no API or format change. The flat, aligned `f32` matrix is laid out for
+  this and for autovectorized dot products.
+- **Async callers** bridge with `spawn_blocking` (their runtime, their choice). The
+  core never exposes `async fn`.
+
+---
+
+## 7. Search semantics
+
+- **Cosine via unit vectors.** Vectors are normalized to unit length on insert; the
+  query is normalized once per search. Then `score = dot(stored, query)` ∈ [−1, 1],
+  identical to `1 − cosine_distance`. No per-vector norms stored, no per-query norm
+  loop. Zero vectors store as-is and score 0.
+  > Observable caveat: `get_all` returns unit-scaled vectors, not the caller's
+  > originals. A re-upsert flow that round-trips vectors is idempotent under this
+  > (re-normalizing a unit vector is a no-op). Documented, intentional.
+- **Scoped scan.** A search ranks over a `Scope` — one collection, a chosen subset,
+  or `All`. The scan walks the `docs` of each in-scope collection, slicing into the
+  shared global `vectors` matrix (rows are global, so no per-collection vector
+  storage and nothing to gather). Single-collection is the fast path (cost scales
+  with that collection); whole-store search costs the union scan — the unavoidable
+  price of exact search, and the reason the ANN seam (§9) exists for later. Merging
+  across collections is **sound because every collection shares one embedding
+  space** (§3): a `score` means the same thing everywhere. Each `Hit` carries its
+  source `collection` (ids are unique only within a collection).
+- **Top-k** via a single bounded min-heap of size `k` fed by every in-scope
+  collection (don't sort all N, and don't merge per-collection result lists).
+  `min_score` filters during selection.
+- **Filters** (`Filter` = AND of `Predicate`s) are evaluated against `attrs` before
+  scoring: `Eq` (typed equality), `Glob` (pattern match on a `Str` attr, §7.1),
+  `In` (membership). This covers typical needs: path-prefix scoping
+  (`Glob "path*"`), type/language/kind equality, exact-path matches, glob-based
+  bulk deletes, and presence sweeps (e.g. collect one attr across a kind).
+
+### 7.1 Glob subset
+`glob.rs` implements the GLOB subset callers actually use: `*` (any run), `?` (one
+char), `[...]` / `[!...]` / `[^...]` (char class / negation, with ranges). Recursive
+matcher with `*` backtracking — fine for short keys like file paths. This matches
+common SQL `GLOB` semantics so an application migrating off such a backend behaves
+identically.
+
+---
+
+## 8. Compaction
+
+Deletes and overwrites leave dead rows in `data` and superseded records in `log`.
+`compact()` rewrites both, live-only:
+
+1. Walk the in-RAM index; assign fresh contiguous row indices to live docs.
+2. Write `data.tmp` (live vectors) and `log.tmp` (`CreateCollection` + `SetMeta` +
+   one `Upsert` per live doc with new row indices).
+3. fsync both → atomically rename over `data`/`log` → swap in-RAM `vectors`.
+
+Triggered by a dead-row-ratio threshold on `open`, and on explicit `compact()`.
+Full reindexes churn little; incremental indexing needs this to bound growth.
+
+---
+
+## 9. Deferred seams (designed-for, not built)
+
+Each is purely additive over the format above. Do **not** build until a real need
+exists; when built, none changes the on-disk byte layout.
+
+- **mmap.** Replace the single "row `i` → `&[f32]`" accessor: index into a mapped
+  region instead of the in-RAM `Vec<f32>`. Gains zero-copy load, cross-process page
+  sharing, >RAM. Cost: FFI (`unsafe`) — would relax the zero-FFI thesis, so it is a
+  conscious future choice, not a default.
+- **ANN index (HNSW/IVF).** Build an in-RAM graph/lists over the same `data` rows;
+  `search` consults it instead of scanning. Needed only past brute-force's comfort
+  zone (≫ a few million vectors). Keep it pure-Rust and light if added.
+- **Scalar/binary quantization.** Store int8/binary alongside or instead of f32 for
+  4×/32× memory and faster first-pass scans, with an f32 rerank. Affects only the
+  `data` segment encoding + the scoring kernel.
+- **Lightweight server.** The core stays an in-process library, but nothing in the
+  design precludes wrapping a long-lived `Nidus` in a thin server exposing
+  `upsert`/`search`/… over a local socket or HTTP. The pieces already exist: the
+  cross-process lock + lock-free read snapshots (§6.2) and `OpenMode::ReadOnly` (§4.1)
+  let a writer process and one-or-more search servers share one store *today*. A
+  server would be a separate wrapper crate, not a change to nidus core — so the core
+  API stays operation-centric, with no global/process-wide assumptions that would
+  block it.
+
+---
+
+## 10. Module layout
+
+```
+src/
+├── lib.rs       Public API (Nidus, Scope); #![forbid(unsafe_code)]; re-exports
+├── config.rs    Config, Fsync, OpenMode (§4.1)
+├── value.rs     Value + little-endian encode/decode
+├── record.rs    Record
+├── filter.rs    Predicate / Filter + matching against attrs
+├── glob.rs      minimal * ? [..] matcher (§7.1)
+├── search.rs    cosine kernel + bounded top-k heap + min_score; SearchOpts, Hit
+├── data.rs      flat f32 segment: header, append, row accessor (the mmap seam)
+├── log.rs       op-log codec: len + payload + crc32, replay, torn-tail recovery
+├── lock.rs      O_EXCL writer lock (pure std)
+├── crc.rs       table CRC32 (zero-dep)
+└── store.rs     in-RAM index, write/read glue, compaction
+tests/           file-backed integration (temp dirs; #[cfg_attr(miri, ignore)] on fsync paths)
+examples/        demo.rs — end-to-end smoke: open → upsert → search (single + All scope)
+```
+
+Errors propagate via `anyhow::Result` everywhere (`anyhow!`/`bail!`/`.context()`),
+matching the common convention; no hand-rolled error enum.
+
+Build order (bottom-up, each with tests, keeping `cargo build` in seconds):
+`config → crc → value → record → glob → filter → search → data → log → lock → store → lib`.
+The shared type vocabulary (`config`, `value`, `record`, `filter`, `search` types)
+is frozen as signatures first so modules can be implemented independently and still
+compile together.
+
+---
+
+## 11. Testing strategy
+
+- **Pure-logic tests run under Miri** (cosine, glob, filter, CRC, and the
+  value/op-log codecs exercised against in-memory `Vec<u8>` buffers). These must
+  never be `#[cfg_attr(miri, ignore)]`.
+- **File-backed tests** (`open`, durability, recovery, compaction) use temp dirs.
+  Mark with `#[cfg_attr(miri, ignore)]` only where they fsync / hit syscalls Miri
+  lacks.
+- **Crash-recovery tests**: hand-write a `log` with a truncated/CRC-broken tail
+  record and assert `open` recovers to the prior good state and re-truncates the file.
+- **Determinism**: same inserts → same on-disk bytes (modulo timestamps); same
+  query → identical ranked ids and scores.
+
+---
+
+## 12. Integrating nidus into a host application
+
+A consuming tool maps its own document type onto a nidus `Record` and (if it is
+async) wraps `Nidus` in `Arc<Mutex<Nidus>>` + `spawn_blocking`. nidus knows nothing
+about the application's domain — it stores `id + vector + attrs` and ranks them.
+
+A typical semantic-index document maps cleanly, e.g.:
+
+| Application concept | nidus `Record` |
+|---|---|
+| stable document id | `id` |
+| embedding | `vector` |
+| the embedded text / summary | `attrs["text"] = Str` |
+| source locator (path, URI) | `attrs["path"] = Str` |
+| chunk type ("file"/"section"/…) | `attrs["kind"] = Str` |
+| name / title | `Str` or absent |
+| line/section range | `Int` or absent |
+| language / mime / labels | `Str` / `List` or absent |
+| content hash (change detection) | `Str` or absent |
+| optional edges/relations | `List` (present) · `Null` (computed-empty) · absent (un-indexed) |
+
+The application's notion of a namespace → a nidus collection; any per-namespace
+bookkeeping (a sync high-water mark, the embedding model id) → the collection's
+string `meta` map; query options (top-k, path scoping, type/language filters,
+min-score) → `SearchOpts` with `Glob`/`Eq`/`In` predicates.
+
+The host owns the **store location**: it maps its own configured path (e.g. a
+`store.<name>.path` setting or a user flag) and any durability/lock preferences into
+a `Config` (§4.1) and calls `Nidus::open(config)`. A search-only process opens with
+`OpenMode::ReadOnly`. nidus contributes no path defaults of its own.

@@ -1,8 +1,27 @@
-/target
+# ── Rust / Cargo ─────────────────────────────────────────────────────────────
+# Compiled output and build artifacts
+/target/
+
+# nidus is a library: do not commit the lockfile (let downstreams resolve).
 Cargo.lock
+
+# Backup files from `rustfmt`
+**/*.rs.bk
+
+# MSVC debug info
+*.pdb
+
+# ── nidus stores ─────────────────────────────────────────────────────────────
+# Stray store directories/files created by examples or local experiments
 *.nidus
 
-# Beads / Dolt files (added by bd init)
+# ── Editors / OS ─────────────────────────────────────────────────────────────
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# ── Beads / Dolt files (added by bd init) ────────────────────────────────────
 .dolt/
 *.db
 .beads-credential-key
