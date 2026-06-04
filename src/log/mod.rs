@@ -1,5 +1,5 @@
 //! The `log` file: an append-only, framed, checksummed op stream — the commit
-//! record and crash-recovery mechanism. Contract: see `SPEC.md` in this directory.
+//! record and crash-recovery mechanism. Contract: see the root `SPEC.md` §5.2, §6.1, §6.6.
 //!
 //! Each record is framed `[len: u32][payload: bincode(Op)][crc32: u32]`, all
 //! little-endian; `crc32` (via `crc32fast`) covers the payload.
@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::model::Op;
 
@@ -171,8 +171,12 @@ impl OpLog {
             .open(path)
             .with_context(|| format!("open log at {}", path.display()))?;
 
-        // Read the entire file.
+        // Read the entire file, reserving fallibly so a huge log fails with an
+        // error instead of aborting the process on allocation.
+        let len = file.metadata().context("log metadata")?.len() as usize;
         let mut data = Vec::new();
+        data.try_reserve_exact(len)
+            .map_err(|_| anyhow!("out of memory loading {len}-byte log file"))?;
         file.read_to_end(&mut data).context("read log file")?;
 
         // Parse all frames, recovering torn tails.
@@ -206,16 +210,63 @@ impl OpLog {
 
     /// Append one framed record. Does NOT fsync — the caller batches then calls
     /// [`sync`](Self::sync).
+    ///
+    /// **Atomic per frame.** If the file write fails partway (e.g. ENOSPC), the
+    /// file is rolled back to the offset it started at, so a torn frame never
+    /// persists mid-file — without this, the next append would write past the
+    /// partial bytes and `parse_all_frames` would reject the result as hard
+    /// `Corruption` on reopen.
     pub fn append(&mut self, op: &Op) -> Result<()> {
         let mut frame_buf = Vec::new();
         frame(op, &mut frame_buf)?;
 
         match &mut self.backend {
             Backend::File { file, .. } => {
-                file.write_all(&frame_buf).context("write log frame")?;
+                let start = file
+                    .stream_position()
+                    .context("read log position before append")?;
+                if let Err(e) = file.write_all(&frame_buf) {
+                    let _ = file.set_len(start);
+                    let _ = file.seek(SeekFrom::Start(start));
+                    return Err(anyhow::Error::new(e)).context("write log frame");
+                }
             }
             Backend::Memory { buf } => {
                 buf.extend_from_slice(&frame_buf);
+            }
+        }
+        Ok(())
+    }
+
+    /// The committed byte length — the append point. A writer captures this before
+    /// a batch and passes it to [`truncate_to`](Self::truncate_to) to undo a failed
+    /// one. (The cursor sits at the end after `open`, every `append`, and
+    /// `rewrite`, so the file length is the logical end.)
+    pub fn offset(&self) -> Result<u64> {
+        match &self.backend {
+            Backend::File { file, .. } => Ok(file.metadata().context("log metadata")?.len()),
+            Backend::Memory { buf } => Ok(buf.len() as u64),
+        }
+    }
+
+    /// Roll the log back to `offset`, discarding any frames appended after it.
+    /// The batch-rollback primitive (counterpart to [`offset`](Self::offset)).
+    pub fn truncate_to(&mut self, offset: u64) -> Result<()> {
+        match &mut self.backend {
+            Backend::File { file, .. } => {
+                file.set_len(offset).context("truncate log")?;
+                file.seek(SeekFrom::Start(offset))
+                    .context("seek after log truncate")?;
+            }
+            Backend::Memory { buf } => {
+                let o = offset as usize;
+                if o > buf.len() {
+                    bail!(
+                        "log truncate_to({offset}) exceeds buffer length {}",
+                        buf.len()
+                    );
+                }
+                buf.truncate(o);
             }
         }
         Ok(())
@@ -447,6 +498,35 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("corruption"));
     }
 
+    #[test]
+    fn in_memory_offset_tracks_appends_and_truncate() {
+        let mut log = OpLog::in_memory();
+        assert_eq!(log.offset().unwrap(), 0);
+        log.append(&Op::CreateCollection {
+            collection: "a".into(),
+        })
+        .unwrap();
+        let mark = log.offset().unwrap();
+        assert!(mark > 0);
+        log.append(&Op::CreateCollection {
+            collection: "b".into(),
+        })
+        .unwrap();
+        assert!(log.offset().unwrap() > mark);
+        log.truncate_to(mark).unwrap();
+        assert_eq!(log.offset().unwrap(), mark);
+    }
+
+    #[test]
+    fn in_memory_truncate_beyond_errors() {
+        let mut log = OpLog::in_memory();
+        log.append(&Op::CreateCollection {
+            collection: "a".into(),
+        })
+        .unwrap();
+        assert!(log.truncate_to(9999).is_err());
+    }
+
     // --- File-backed tests (require real IO; Miri-ignored) ---
 
     #[cfg_attr(miri, ignore)]
@@ -586,6 +666,38 @@ mod tests {
         let (_, replayed) = OpLog::open(&path).unwrap();
         assert_eq!(replayed, ops);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), good_len);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn file_truncate_to_drops_tail_frames_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+
+        let a = Op::CreateCollection {
+            collection: "a".into(),
+        };
+        let b = Op::CreateCollection {
+            collection: "b".into(),
+        };
+
+        let (mut log, _) = OpLog::open(&path).unwrap();
+        log.append(&a).unwrap();
+        log.append(&b).unwrap();
+        let mark = log.offset().unwrap();
+        // Append a third frame, then roll back to the mark.
+        log.append(&Op::CreateCollection {
+            collection: "c".into(),
+        })
+        .unwrap();
+        log.truncate_to(mark).unwrap();
+        log.sync().unwrap();
+        drop(log);
+
+        // Reopen: only the first two frames survive, replayed cleanly (no corruption).
+        let (_, replayed) = OpLog::open(&path).unwrap();
+        assert_eq!(replayed, vec![a, b]);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), mark);
     }
 
     #[cfg_attr(miri, ignore)]

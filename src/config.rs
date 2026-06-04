@@ -40,6 +40,14 @@ pub struct Config {
     pub auto_compact: Option<f32>,
     /// Stale writer-lock reclamation window. Default 60s.
     pub lock_ttl: Duration,
+    /// Hard ceiling on the vector matrix (`rows * dimension * 4` bytes); `None`
+    /// disables (the default — no behavior change). Enforced *before* allocating:
+    /// `upsert` refuses a batch that would exceed it, and `open` refuses a data
+    /// file already over it. This is the only exhaustion guard that holds under
+    /// memory overcommit, where the kernel SIGKILLs before an allocation fails and
+    /// `try_reserve` never fires. Counts physical rows incl. not-yet-compacted dead
+    /// rows, so `compact` can reclaim headroom.
+    pub max_vector_bytes: Option<u64>,
 }
 
 impl Config {
@@ -52,6 +60,7 @@ impl Config {
             open_mode: OpenMode::ReadWrite,
             auto_compact: Some(0.5),
             lock_ttl: Duration::from_secs(60),
+            max_vector_bytes: None,
         }
     }
 
@@ -76,6 +85,12 @@ impl Config {
     /// Set the stale-lock reclamation window.
     pub fn lock_ttl(mut self, ttl: Duration) -> Self {
         self.lock_ttl = ttl;
+        self
+    }
+
+    /// Set the vector-matrix size ceiling (`None` to disable).
+    pub fn max_vector_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.max_vector_bytes = bytes;
         self
     }
 }

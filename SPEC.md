@@ -125,6 +125,7 @@ impl Nidus {
     pub fn open_in_memory(dimension: usize) -> Result<Self>;                // tests; no files, no lock
     pub fn dimension(&self) -> usize;
     pub fn config(&self) -> &Config;
+    pub fn footprint(&self) -> Footprint;   // cheap vector-footprint snapshot (§6.6)
 
     // collections
     pub fn create_collection(&mut self, name: &str) -> Result<()>;     // idempotent
@@ -171,6 +172,13 @@ pub enum Predicate {
     Glob(String, String),                // attr (Str) matches glob pattern
     In(String, Vec<Value>),              // attr ∈ set
 }
+
+// A cheap, allocation-free footprint snapshot (§6.6). `vector_bytes` is the
+// dominant, predictable cost — what `Config::max_vector_bytes` caps.
+pub struct Footprint {
+    pub rows: u64, pub dead_rows: u64, pub dimension: usize,
+    pub vector_bytes: u64, pub doc_count: usize,
+}
 ```
 
 `Hit` deliberately omits the vector (search returns many; nobody needs the floats
@@ -194,6 +202,8 @@ pub struct Config {
     pub auto_compact: Option<f32>, // dead-row ratio that triggers compaction on open;
                                    //   None = never. default Some(0.5)
     pub lock_ttl: Duration,        // stale writer-lock reclamation window. default 60s
+    pub max_vector_bytes: Option<u64>, // hard ceiling on the vector matrix
+                                   //   (rows*dim*4); None = unbounded (default). §6.6
 }
 pub enum Fsync { PerBatch, OnFlush }
 pub enum OpenMode { ReadWrite, ReadOnly }   // ReadOnly takes no writer lock; rejects writes
@@ -204,6 +214,7 @@ impl Config {
     pub fn open_mode(self, m: OpenMode) -> Self;
     pub fn auto_compact(self, ratio: Option<f32>) -> Self;
     pub fn lock_ttl(self, ttl: Duration) -> Self;
+    pub fn max_vector_bytes(self, bytes: Option<u64>) -> Self;
 }
 ```
 
@@ -309,6 +320,13 @@ at the tail) and a `log` whose last record is either complete or detectably torn
 Reopening recovers to "last fully-committed op." The worst loss is the in-flight
 batch — acceptable because the index is reproducible from source.
 
+Crucially this also holds for an *in-process* write failure (e.g. ENOSPC), not just
+a kill: each `append` is atomic per row/frame (a partial write is rolled back to the
+boundary), and `upsert` is **all-or-nothing** — every fallible step rolls `data` and
+`log` back to the marks taken at entry, so a failed batch leaves the store
+byte-identical to its pre-call state. A caught error never leaves a torn row/frame
+for the next write to build on. See §6.6.
+
 ### 6.2 Cross-process reader/writer isolation — lock-free
 **Write order is load-bearing:** append vectors to `data` → **fsync `data`** →
 append committing `log` records → **fsync `log`**. Therefore any committed `Upsert`
@@ -353,6 +371,45 @@ come from elsewhere, in order:
 - **Async callers** bridge with `spawn_blocking` (their runtime, their choice). The
   core never exposes `async fn`.
 
+### 6.6 Resource exhaustion — graceful failure
+
+nidus holds the whole vector matrix in RAM and on disk, so "out of room" has two
+forms; neither may corrupt the store or silently abort the process.
+
+**Disk full (ENOSPC).** Appends are atomic and batches are all-or-nothing (§6.1).
+`DataSegment::append` / `OpLog::append` capture the file offset, and on a partial
+`write_all` roll the file back to the row/frame boundary — without this the next
+append would write past the partial bytes, misaligning the matrix or producing a
+mid-file torn frame that `log` replay rejects as hard corruption. `upsert` captures
+`(data_rows, log_offset)` at entry and, on any failure through data-append →
+data-fsync → log-append → log-fsync, truncates both files back to those marks before
+returning the original error. The in-RAM index is mutated only in a final,
+infallible commit phase (its map capacity is reserved up-front), after both files
+are durable.
+
+**Out of RAM.** Growth of the vector matrix and the index maps uses `try_reserve`,
+so an allocator-null OOM becomes an `Err`, not a `handle_alloc_error` abort. `open`
+streams the data file into a single pre-reserved `Vec<f32>` (no raw-bytes +
+decoded-floats double allocation), so reopening peaks at ≈ steady state and fails
+cleanly if it won't fit. **Limit:** `attrs` (`BTreeMap`) and id (`String`) clones
+have no `try_reserve` in std and can still abort — these are small metadata next to
+the `N·dim·4` matrix, which *is* covered. `get_all` returns a `Vec` (not `Result`)
+and so is likewise not fallible; it is a bulk-read convenience, not a write/open
+path.
+
+**The real risk is constrained/containerized deployments**, not roomy laptops (1M ×
+768-dim ≈ 3 GB fits fine). Under a cgroup limit with memory overcommit, the kernel
+SIGKILLs before an allocation ever fails, so `try_reserve` never fires. The only
+reliable guard there is to refuse work *before* allocating:
+
+- **`Config::max_vector_bytes: Option<u64>`** (default `None` — no behavior change)
+  caps `rows · dim · 4`. `upsert` projects the post-batch size and refuses
+  (cleanly, no rollback) anything over the cap; `open` refuses a data file already
+  over it before allocating. The cap counts physical rows incl. not-yet-compacted
+  dead rows, so `compact` reclaims headroom.
+- **`footprint() -> Footprint`** is the cheap introspection hook (rows, dead rows,
+  `vector_bytes`, live `doc_count`) a host reads to decide whether more data fits.
+
 ---
 
 ## 7. Search semantics
@@ -375,7 +432,10 @@ come from elsewhere, in order:
   source `collection` (ids are unique only within a collection).
 - **Top-k** via a single bounded min-heap of size `k` fed by every in-scope
   collection (don't sort all N, and don't merge per-collection result lists).
-  `min_score` filters during selection.
+  `min_score` filters during selection. `f32` isn't `Ord`: scores are ordered with
+  `f32::total_cmp`, and `NaN` is treated as the lowest possible score so it never
+  displaces a real result. `normalize` leaves a zero / non-finite / near-zero
+  (`< ~1e-12`) vector unchanged, so it scores 0 against everything.
 - **Filters** (`Filter` = AND of `Predicate`s) are evaluated against `attrs` before
   scoring: `Eq` (typed equality), `Glob` (pattern match on a `Str` attr, §7.1),
   `In` (membership). This covers typical needs: path-prefix scoping
@@ -383,11 +443,17 @@ come from elsewhere, in order:
   bulk deletes, and presence sweeps (e.g. collect one attr across a kind).
 
 ### 7.1 Glob subset
-`glob.rs` implements the GLOB subset callers actually use: `*` (any run), `?` (one
-char), `[...]` / `[!...]` / `[^...]` (char class / negation, with ranges). Recursive
-matcher with `*` backtracking — fine for short keys like file paths. This matches
-common SQL `GLOB` semantics so an application migrating off such a backend behaves
-identically.
+`glob.rs` implements the GLOB subset callers actually use: `*` (any run, incl.
+empty), `?` (exactly one char, never empty), `[...]` / `[!...]` / `[^...]` (char
+class / negation, with ranges). Recursive matcher with `*` backtracking — fine for
+short keys like file paths. The pattern is **anchored at both ends** (the whole
+pattern must match the whole text); an unterminated `[` (no closing `]`) is treated
+as a literal `[`. This matches common SQL `GLOB` semantics so an application
+migrating off such a backend behaves identically.
+
+`filter::matches` AND-combines predicates (empty filter matches everything); an
+absent key fails every predicate — except `Eq(key, Null)`, which requires the key
+to be *present* and equal to `Null` (absent ≠ `Null`, per §3).
 
 ---
 

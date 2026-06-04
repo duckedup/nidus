@@ -1,4 +1,4 @@
-//! Minimal GLOB matcher. Implementation contract: see `SPEC.md` in this directory.
+//! Minimal GLOB matcher. Contract: see the root `SPEC.md` §7.1.
 
 /// Returns true if `text` matches the GLOB `pattern`.
 ///

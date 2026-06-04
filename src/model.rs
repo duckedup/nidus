@@ -70,6 +70,25 @@ pub struct Hit {
     pub attrs: BTreeMap<String, Value>,
 }
 
+/// A cheap, allocation-free snapshot of a store's RAM/disk footprint — the
+/// introspection hook a host uses to decide whether it can afford more data before
+/// hitting a memory ceiling. `vector_bytes` is the dominant, predictable cost; the
+/// in-RAM index (ids + attrs) is extra on top and not counted here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Footprint {
+    /// Physical rows in the data matrix (live + not-yet-compacted dead rows).
+    pub rows: u64,
+    /// Rows no longer referenced (reclaimable by `compact`).
+    pub dead_rows: u64,
+    /// The pinned embedding dimension.
+    pub dimension: usize,
+    /// Bytes occupied by the vector matrix: `rows * dimension * 4`. This is what
+    /// `Config::max_vector_bytes` caps.
+    pub vector_bytes: u64,
+    /// Live documents across all collections.
+    pub doc_count: usize,
+}
+
 /// A mutating operation recorded in the op log (the commit stream). `row` indexes
 /// into the data segment. The on-disk log is a sequence of framed, checksummed,
 /// bincode-encoded `Op`s (see `log` module + SPEC.md §5.2).

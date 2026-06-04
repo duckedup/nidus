@@ -30,7 +30,7 @@ mod store;
 
 pub use anyhow::Result;
 pub use config::{Config, Fsync, OpenMode};
-pub use model::{Filter, Hit, Predicate, Record, SearchOpts, Value};
+pub use model::{Filter, Footprint, Hit, Predicate, Record, SearchOpts, Value};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -93,6 +93,13 @@ impl Nidus {
     /// The configuration this store was opened with.
     pub fn config(&self) -> &Config {
         self.store.config()
+    }
+
+    /// A cheap snapshot of the store's vector footprint — rows, dead rows,
+    /// `vector_bytes`, and live `doc_count`. Use it to decide whether more data
+    /// fits before a memory ceiling (pairs with [`Config::max_vector_bytes`]).
+    pub fn footprint(&self) -> Footprint {
+        self.store.footprint()
     }
 
     // ── Collections ──────────────────────────────────────────────────────
