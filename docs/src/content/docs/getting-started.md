@@ -3,11 +3,9 @@ title: Getting started
 description: Add nidus to a Rust project, open a store, index records, and run your first search.
 ---
 
-nidus is built for development and small-scale use, and it's designed to support
-more than one way in. Today you embed it as a library: add the dependency, open a
-store in a directory of your choosing, and call methods — nothing to install, no
-daemon, no network. A standalone (read-only) search server is a planned mode, so
-the same on-disk store will be reachable beyond a single process.
+nidus is built for development and small-scale use. You add it as a dependency,
+open a store in a directory of your choosing, and call methods. There is nothing
+to install, no daemon to run, and no network.
 
 ## Add the dependency
 

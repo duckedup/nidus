@@ -181,11 +181,12 @@ The docs live in `docs/` — an Astro + Starlight site (`just docs` / `docs-buil
 / `docs-preview`), deployed to GitHub Pages at **nidus.duckedup.org** by
 `.github/workflows/docs.yml` on push to `main` under `docs/**`.
 
-**Positioning.** nidus is a vector store **for development and small-scale use**,
-and is meant to support more than one usage mode: an embedded library today, with
-a **standalone (read-only) search server** as a planned/designed-for seam (see
-`SPEC.md` §9). Do NOT frame it as "an embeddable library, not a server" — the
-server is a roadmap item, not a rejected idea. Keep the docs' wording open to it.
+**Positioning.** nidus is a vector store **for development and small-scale use**.
+Keep the public framing open: do NOT pin it down as "an embeddable library" (or
+"a library, not a server") and do NOT make public promises about future modes
+(no "server planned / on the roadmap" in the docs/README). Describe what it does
+today, neutrally, without limiting where it can go. (A server is one of the
+deferred seams in `SPEC.md` §9 — internal context, not a public commitment.)
 
 **Version sync — on every crate version bump, bump the docs too.** When you change
 `version` in `Cargo.toml`, update the install-snippet version string in BOTH the

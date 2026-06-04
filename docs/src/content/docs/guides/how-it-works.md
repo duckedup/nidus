@@ -84,11 +84,8 @@ chunked dot product, an allocation-free top-k scan, and a storage-order
 - **Not a database.** No SQL, no joins, no transactions across calls.
 - **Not async.** The hot path is CPU-bound; the API is synchronous (see
   [Embedding in a host app](/guides/integrating/)).
-- **Not networked — yet.** Today you call it in-process as a library. A
-  standalone (read-only) search server is a planned mode, not a rejected one;
-  nidus is meant to support more than one way in.
+- **In-process.** You use it as a library; there is no built-in network layer.
 
-Each of those is a deferred *seam*, not a wall — mmap, an ANN index, scalar
-quantization, and a read-only search server are all designed-for and additive
-over the same append-only file. They are simply not built until a real use case
-needs them.
+Each of those is a deferred *seam*, not a wall — mmap, an ANN index, and scalar
+quantization are all designed-for and additive over the same append-only file.
+They are simply not built until a real use case needs them.

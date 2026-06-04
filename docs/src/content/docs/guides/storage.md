@@ -85,7 +85,7 @@ A `ReadOnly` open takes **no lock**. It reads `data` to its current size *S*,
 replays `log`, and ignores any record that references a row ≥ *S*/dim. The
 result is a **consistent, possibly-stale snapshot** — never a torn read — even
 while the writer is mid-append. This is the lock-free basis for search-only
-processes and a future read-only search server.
+processes reading a store another process is writing.
 
 Only one **writer** (`OpenMode::ReadWrite`, the default) may hold a store at a
 time, enforced by the `O_EXCL` `lock` file. A stale lock left by a crashed writer
