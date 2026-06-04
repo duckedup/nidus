@@ -1,4 +1,4 @@
-//! Cosine kernels + bounded top-k selection. Contract: see `SPEC.md` here.
+//! Cosine kernels + bounded top-k selection. Contract: see the root `SPEC.md` §7.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;

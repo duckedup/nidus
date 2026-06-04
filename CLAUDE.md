@@ -133,6 +133,14 @@ reproducible). Cross-process readers are lock-free: read `data` to size S, repla
 `log`, ignore any record referencing a row ≥ S/dim — a consistent, possibly-stale
 snapshot, never torn.
 
+**Graceful failure (SPEC §6.6).** Appends are atomic (a partial write rolls back to
+the row/frame boundary) and `upsert` is all-or-nothing (rolls `data`+`log` back to
+entry marks on any failure), so a caught ENOSPC never corrupts the store. RAM growth
+uses `try_reserve` (OOM → `Err`, not an abort) — except `attrs`/`id` clones, which
+std gives no `try_reserve` for. The overcommit-proof guard is
+`Config::max_vector_bytes` (refuse before allocating); `Nidus::footprint()` is the
+introspection hook. Still in-RAM brute-force — not spill-to-disk/mmap (deferred).
+
 **Deferred-but-seamed** (do NOT build until needed; each is additive over the same
 file format): mmap (swap the one row accessor), an ANN/HNSW index, scalar
 quantization. See `SPEC.md` for the full rationale and the decisions behind each.

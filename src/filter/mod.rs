@@ -1,11 +1,11 @@
-//! Filter evaluation against a record's attributes. Contract: see `SPEC.md` here.
+//! Filter evaluation against a record's attributes. Contract: see the root `SPEC.md` §7, §7.1.
 
 use std::collections::BTreeMap;
 
 use crate::model::{Filter, Predicate, Value};
 
 /// True iff every predicate in `filter` matches `attrs` (an empty filter matches
-/// everything). See `SPEC.md` for per-predicate semantics (`Eq`, `Glob`, `In`).
+/// everything). See the root `SPEC.md` §7.1 for per-predicate semantics (`Eq`, `Glob`, `In`).
 pub fn matches(filter: &Filter, attrs: &BTreeMap<String, Value>) -> bool {
     filter.0.iter().all(|predicate| match predicate {
         Predicate::Eq(key, expected) => attrs.get(key) == Some(expected),

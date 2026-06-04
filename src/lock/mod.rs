@@ -1,5 +1,5 @@
 //! Writer exclusion via an `O_EXCL` lock file (pure std, no `flock`/FFI).
-//! Contract: see `SPEC.md` in this directory.
+//! Contract: see the root `SPEC.md` §6.3.
 
 use std::fs::OpenOptions;
 use std::io::Write;

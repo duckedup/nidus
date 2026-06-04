@@ -1,17 +1,18 @@
 //! The integrator: in-RAM index + write/read glue + compaction. Composes
 //! [`DataSegment`](crate::data::DataSegment), [`OpLog`](crate::log::OpLog), and an
-//! optional [`WriteLock`](crate::lock::WriteLock). Contract: see `SPEC.md` here.
+//! optional [`WriteLock`](crate::lock::WriteLock). Contract: see the root `SPEC.md`
+//! §3, §5–§8.
 
 use std::collections::{BTreeMap, HashMap};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::{Config, Fsync, OpenMode};
 use crate::data::DataSegment;
 use crate::filter;
 use crate::lock::WriteLock;
 use crate::log::OpLog;
-use crate::model::{Filter, Hit, Op, Record, SearchOpts};
+use crate::model::{Filter, Footprint, Hit, Op, Record, SearchOpts};
 use crate::search::{TopK, dot, normalize};
 
 // ── In-RAM types ─────────────────────────────────────────────────────────────
@@ -35,6 +36,13 @@ impl Collection {
             docs: HashMap::new(),
         }
     }
+}
+
+/// Map a failed `try_reserve` into a clear out-of-memory error rather than letting
+/// the global allocator abort the process. `count` is the number of elements the
+/// reservation was for (units depend on the collection — vectors, rows, entries).
+fn oom(what: &str, count: usize) -> anyhow::Error {
+    anyhow!("out of memory reserving capacity for {count} {what}")
 }
 
 // ── Store ─────────────────────────────────────────────────────────────────────
@@ -73,8 +81,21 @@ impl Store {
             None
         };
 
-        // 3. Open the data segment.
-        let data = DataSegment::open(&config.path.join("data"), config.dimension)?;
+        // 3. Open the data segment. First refuse — before allocating — to load a
+        //    data file whose vectors already exceed the configured cap, turning a
+        //    would-be allocation abort into a clear error.
+        let data_path = config.path.join("data");
+        if let Some(cap) = config.max_vector_bytes {
+            let on_disk = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
+            let vector_bytes = on_disk.saturating_sub(crate::data::HEADER_LEN as u64);
+            if vector_bytes > cap {
+                bail!(
+                    "data file holds {vector_bytes} bytes of vectors, exceeding \
+                     max_vector_bytes ({cap} bytes)"
+                );
+            }
+        }
+        let data = DataSegment::open(&data_path, config.dimension)?;
 
         // 4. Open and replay the op log.
         let (log, ops) = OpLog::open(&config.path.join("log"))?;
@@ -200,6 +221,20 @@ impl Store {
         &self.config
     }
 
+    /// A cheap snapshot of the store's vector footprint (see [`Footprint`]).
+    pub fn footprint(&self) -> Footprint {
+        let rows = self.data.row_count();
+        let dimension = self.data.dimension();
+        let doc_count = self.collections.values().map(|c| c.docs.len()).sum();
+        Footprint {
+            rows,
+            dead_rows: self.dead_rows as u64,
+            dimension,
+            vector_bytes: rows * dimension as u64 * 4,
+            doc_count,
+        }
+    }
+
     pub fn create_collection(&mut self, name: &str) -> Result<()> {
         self.check_writable()?;
         // Idempotent: only create if absent.
@@ -259,21 +294,14 @@ impl Store {
         Ok(())
     }
 
+    /// Upsert a batch. **All-or-nothing:** every fallible step (vector append,
+    /// data fsync, log append, log fsync) rolls `data` and `log` back to the marks
+    /// captured at entry on failure, then returns the original error — a failed
+    /// batch (e.g. ENOSPC mid-write) leaves the store byte-identical to its
+    /// pre-call state and never corrupts it. The in-RAM index is mutated only in
+    /// the final, infallible commit phase, after both files are durable.
     pub fn upsert(&mut self, collection: &str, records: &[Record]) -> Result<usize> {
         self.check_writable()?;
-
-        // Ensure the collection exists.
-        if !self.collections.contains_key(collection) {
-            self.collections
-                .insert(collection.to_string(), Collection::new());
-            self.log.append(&Op::CreateCollection {
-                collection: collection.to_string(),
-            })?;
-        }
-
-        if records.is_empty() {
-            return Ok(0);
-        }
 
         let dim = self.data.dimension();
 
@@ -288,49 +316,153 @@ impl Store {
             }
         }
 
-        // Phase 1: append all vectors to data (SPEC §6.2 write order).
-        let mut new_rows: Vec<(String, u64, BTreeMap<String, crate::model::Value>)> =
-            Vec::with_capacity(records.len());
+        let need_create = !self.collections.contains_key(collection);
+
+        // Empty batch: preserve the implicit-create contract, transactionally.
+        if records.is_empty() {
+            if need_create {
+                self.log.append(&Op::CreateCollection {
+                    collection: collection.to_string(),
+                })?;
+                self.maybe_sync()?;
+                self.collections
+                    .insert(collection.to_string(), Collection::new());
+            }
+            return Ok(0);
+        }
+
+        // Capacity gate: refuse — before any append — a batch that would grow the
+        // vector matrix past the cap. Clean refusal, no rollback, store stays fully
+        // usable for reads/search. (Counts physical rows incl. dead ones; compact()
+        // reclaims headroom.)
+        if let Some(cap) = self.config.max_vector_bytes {
+            let projected =
+                (self.data.row_count() + records.len() as u64) * self.data.dimension() as u64 * 4;
+            if projected > cap {
+                bail!(
+                    "upsert would grow the vector matrix to {projected} bytes, exceeding \
+                     max_vector_bytes ({cap} bytes); compact() can reclaim dead rows"
+                );
+            }
+        }
+
+        // Rollback marks: where data and log stood before this batch touched them.
+        let data_mark = self.data.row_count();
+        let log_mark = self.log.offset()?;
+
+        // Phase 0: reserve every growable buffer up-front, fallibly, so the commit
+        // phase (Phase 5) can never reallocate / OOM. Nothing is mutated here, so an
+        // OOM just returns — no rollback needed (data + log untouched).
+        let mut staged: Vec<(String, u64, BTreeMap<String, crate::model::Value>)> = Vec::new();
+        staged
+            .try_reserve_exact(records.len())
+            .map_err(|_| oom("upsert staging entries", records.len()))?;
+        // Index capacity: for a not-yet-created collection, build it locally with a
+        // reserved docs map and stash it; for an existing one, grow its docs map now
+        // (pure capacity — harmless if the batch later rolls back).
+        let mut pending_collection: Option<Collection> = None;
+        if need_create {
+            self.collections
+                .try_reserve(1)
+                .map_err(|_| oom("collections map", 1))?;
+            let mut col = Collection::new();
+            col.docs
+                .try_reserve(records.len())
+                .map_err(|_| oom("collection docs map", records.len()))?;
+            pending_collection = Some(col);
+        } else {
+            self.collections
+                .get_mut(collection)
+                .unwrap()
+                .docs
+                .try_reserve(records.len())
+                .map_err(|_| oom("collection docs map", records.len()))?;
+        }
+
+        // Phase 1: append all vectors to data (SPEC §6.2 write order). Roll back on
+        // any failure — nothing else has been touched yet.
+        // NOTE: `rec.attrs.clone()` (BTreeMap) and `rec.id.clone()` (String) can
+        // still abort on OOM — std offers no `try_reserve` for either. These are
+        // small metadata next to the N×dim×4 vector matrix, which `data.append`
+        // reserves fallibly; the `max_vector_bytes` cap guards the dominant memory.
         for rec in records {
             let mut v = rec.vector.clone();
             normalize(&mut v);
-            let row = self.data.append(&v)?;
-            new_rows.push((rec.id.clone(), row, rec.attrs.clone()));
+            match self.data.append(&v) {
+                Ok(row) => staged.push((rec.id.clone(), row, rec.attrs.clone())),
+                Err(e) => {
+                    self.data
+                        .truncate_to(data_mark)
+                        .context("rollback data after failed append")?;
+                    return Err(e);
+                }
+            }
         }
 
         // Phase 2: fsync data before writing log records.
-        self.data.sync()?;
+        if let Err(e) = self.data.sync() {
+            self.data
+                .truncate_to(data_mark)
+                .context("rollback data after failed sync")?;
+            return Err(e);
+        }
 
-        // Phase 3: update in-RAM index and append log records.
-        let col = self.collections.get_mut(collection).unwrap();
-        let mut count = 0usize;
-        for (id, row, attrs) in new_rows {
-            // If overwriting, old row becomes dead.
-            if col.docs.contains_key(&id) {
-                self.dead_rows += 1;
-            }
-            col.docs.insert(
-                id.clone(),
-                DocEntry {
-                    row,
-                    attrs: attrs.clone(),
-                },
-            );
-            self.log.append(&Op::Upsert {
+        // Phase 3: append log records (CreateCollection, if needed, then the
+        // Upserts). On any failure, roll back both files to their marks.
+        let log_ops = need_create
+            .then(|| Op::CreateCollection {
                 collection: collection.to_string(),
-                id,
-                row,
-                attrs,
-            })?;
-            count += 1;
+            })
+            .into_iter()
+            .chain(staged.iter().map(|(id, row, attrs)| Op::Upsert {
+                collection: collection.to_string(),
+                id: id.clone(),
+                row: *row,
+                attrs: attrs.clone(),
+            }));
+        for op in log_ops {
+            if let Err(e) = self.log.append(&op) {
+                self.rollback(data_mark, log_mark)?;
+                return Err(e);
+            }
         }
 
         // Phase 4: fsync log (or defer to flush()).
-        if self.config.fsync == Fsync::PerBatch {
-            self.log.sync()?;
+        if self.config.fsync == Fsync::PerBatch
+            && let Err(e) = self.log.sync()
+        {
+            self.rollback(data_mark, log_mark)?;
+            return Err(e);
+        }
+
+        // Phase 5: commit to the in-RAM index — infallible. Both files are durable,
+        // and the maps' capacity was reserved in Phase 0, so no insert reallocates.
+        if let Some(col) = pending_collection {
+            self.collections.insert(collection.to_string(), col);
+        }
+        let col = self.collections.get_mut(collection).unwrap();
+        let mut count = 0usize;
+        for (id, row, attrs) in staged {
+            if col.docs.contains_key(&id) {
+                self.dead_rows += 1; // overwriting: the old row becomes dead
+            }
+            col.docs.insert(id, DocEntry { row, attrs });
+            count += 1;
         }
 
         Ok(count)
+    }
+
+    /// Roll both append-only files back to the given marks (batch-rollback for a
+    /// failed `upsert`). Surfaces a rollback failure rather than masking it.
+    fn rollback(&mut self, data_mark: u64, log_mark: u64) -> Result<()> {
+        self.log
+            .truncate_to(log_mark)
+            .context("rollback log after failed upsert")?;
+        self.data
+            .truncate_to(data_mark)
+            .context("rollback data after failed upsert")?;
+        Ok(())
     }
 
     pub fn delete(&mut self, collection: &str, ids: &[&str]) -> Result<usize> {
@@ -383,6 +515,11 @@ impl Store {
         self.delete(collection, &refs)
     }
 
+    // NOTE: `get_all` materializes the whole collection (vector + attr clones) into
+    // a fresh Vec and returns it directly, so it is not fallible — an OOM here can
+    // still abort. Making it `Result` would break the public API for a bulk-read
+    // convenience; hosts holding huge collections should prefer `search`/scoped
+    // reads. The write and open paths (the exhaustion-critical ones) are fallible.
     pub fn get_all(&self, collection: &str) -> Vec<Record> {
         let Some(col) = self.collections.get(collection) else {
             return Vec::new();
@@ -418,6 +555,13 @@ impl Store {
         // dimensions, where the dot is cheap relative to a row-boundary cache miss,
         // this is the difference between memory-bandwidth-bound and miss-bound.
         let mut scan: Vec<(u64, &str, &str)> = Vec::new();
+        let scan_cap: usize = collections
+            .iter()
+            .filter_map(|c| self.collections.get(*c))
+            .map(|c| c.docs.len())
+            .sum();
+        scan.try_reserve(scan_cap)
+            .map_err(|_| oom("search scan buffer", scan_cap))?;
         for &col_name in collections {
             let Some(col) = self.collections.get(col_name) else {
                 // Named collection that does not exist — skip silently.
@@ -485,7 +629,11 @@ impl Store {
 
         // 1. Assign fresh contiguous row indices to live docs.
         //    Walk collections in sorted order for determinism.
+        let live_rows: usize = self.collections.values().map(|c| c.docs.len()).sum();
         let mut new_rows: Vec<f32> = Vec::new();
+        new_rows
+            .try_reserve_exact(live_rows * self.data.dimension())
+            .map_err(|_| oom("compacted vector matrix", live_rows * self.data.dimension()))?;
         let mut next_row: u64 = 0;
 
         // Build the new ops list for the log: CreateCollection + SetMeta + Upserts.
@@ -994,7 +1142,163 @@ mod tests {
         assert_eq!(hits.len(), 3);
     }
 
+    #[test]
+    fn upsert_rolls_back_on_mid_batch_failure() {
+        let mut store = Store::in_memory(2).unwrap();
+        store.create_collection("col").unwrap();
+        store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+
+        let rows_before = store.data.row_count();
+        let docs_before = store.get_all("col").len();
+        let dead_before = store.dead_rows;
+
+        // A 2-record batch where the first append succeeds and the second fails.
+        store.data.fail_after(1);
+        let res = store.upsert("col", &[rec("b", vec![0.0, 1.0]), rec("c", vec![1.0, 1.0])]);
+        assert!(res.is_err());
+
+        // Everything restored: no orphan row, index untouched, dead-count untouched.
+        assert_eq!(
+            store.data.row_count(),
+            rows_before,
+            "orphan row must be rolled back"
+        );
+        assert_eq!(store.get_all("col").len(), docs_before, "index unchanged");
+        assert_eq!(store.dead_rows, dead_before);
+
+        // Store remains usable for subsequent writes (disarm the seam first).
+        store.data.fail_after(usize::MAX);
+        store.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
+        assert_eq!(store.get_all("col").len(), 2);
+    }
+
+    #[test]
+    fn footprint_tracks_rows_dead_and_docs() {
+        let mut store = Store::in_memory(4).unwrap();
+        store.create_collection("col").unwrap();
+
+        let fp0 = store.footprint();
+        assert_eq!(fp0.rows, 0);
+        assert_eq!(fp0.dead_rows, 0);
+        assert_eq!(fp0.dimension, 4);
+        assert_eq!(fp0.vector_bytes, 0);
+        assert_eq!(fp0.doc_count, 0);
+
+        store
+            .upsert("col", &[rec("a", vec![1.0, 0.0, 0.0, 0.0])])
+            .unwrap();
+        store
+            .upsert("col", &[rec("b", vec![0.0, 1.0, 0.0, 0.0])])
+            .unwrap();
+        let fp1 = store.footprint();
+        assert_eq!(fp1.rows, 2);
+        assert_eq!(fp1.dead_rows, 0);
+        assert_eq!(fp1.vector_bytes, 2 * 4 * 4); // 2 rows × dim 4 × 4 bytes
+        assert_eq!(fp1.doc_count, 2);
+
+        // Overwrite "a": a dead row appears, doc_count stays at 2.
+        store
+            .upsert("col", &[rec("a", vec![0.0, 0.0, 1.0, 0.0])])
+            .unwrap();
+        let fp2 = store.footprint();
+        assert_eq!(fp2.rows, 3);
+        assert_eq!(fp2.dead_rows, 1);
+        assert_eq!(fp2.doc_count, 2);
+
+        // Compaction reclaims the dead row.
+        store.compact().unwrap();
+        let fp3 = store.footprint();
+        assert_eq!(fp3.rows, 2);
+        assert_eq!(fp3.dead_rows, 0);
+        assert_eq!(fp3.doc_count, 2);
+    }
+
+    #[test]
+    fn max_vector_bytes_refuses_over_budget_upsert() {
+        // Cap at exactly 2 rows (dim 2 × 4 bytes × 2 rows = 16 bytes).
+        let config = Config::new("/dev/null/in-memory", 2)
+            .open_mode(OpenMode::ReadWrite)
+            .auto_compact(None)
+            .max_vector_bytes(Some(16));
+        let mut store = Store {
+            config,
+            data: DataSegment::in_memory(2),
+            log: OpLog::in_memory(),
+            lock: None,
+            collections: HashMap::new(),
+            dead_rows: 0,
+        };
+        store.create_collection("col").unwrap();
+        store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+        store.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
+        assert_eq!(store.footprint().vector_bytes, 16);
+
+        // The third row would exceed the cap — refuse, leaving the store intact.
+        let res = store.upsert("col", &[rec("c", vec![1.0, 1.0])]);
+        assert!(res.is_err());
+        assert_eq!(store.footprint().rows, 2, "refused batch must not append");
+
+        // Store stays usable for reads.
+        let hits = store
+            .search(&["col"], &[1.0, 0.0], &default_opts(5))
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
     // ── File-backed tests (ignored under Miri) ────────────────────────────
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn open_refuses_data_file_over_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        // Write 3 rows (dim 2) with no cap.
+        {
+            let mut store = Store::open(Config::new(&path, 2)).unwrap();
+            store.create_collection("col").unwrap();
+            store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+            store.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
+            store.upsert("col", &[rec("c", vec![1.0, 1.0])]).unwrap();
+        }
+
+        // Reopen with a cap below the on-disk size → clean Err, not a panic.
+        let res = Store::open(Config::new(&path, 2).max_vector_bytes(Some(8)));
+        assert!(res.is_err());
+        let msg = res.err().unwrap().to_string();
+        assert!(
+            msg.contains("max_vector_bytes"),
+            "error should mention the cap: {msg}"
+        );
+
+        // A cap at/above the size still opens fine.
+        let ok = Store::open(Config::new(&path, 2).max_vector_bytes(Some(24)));
+        assert!(ok.is_ok());
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn upsert_rollback_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        {
+            let mut store = Store::open(Config::new(&path, 2)).unwrap();
+            store.create_collection("col").unwrap();
+            store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+
+            // Next append fails immediately; the batch must fully roll back.
+            store.data.fail_after(0);
+            assert!(store.upsert("col", &[rec("b", vec![0.0, 1.0])]).is_err());
+            assert_eq!(store.data.row_count(), 1);
+            assert_eq!(store.get_all("col").len(), 1);
+        }
+
+        // Reopen: only "a" is present, replayed cleanly with no corruption.
+        let store = Store::open(Config::new(&path, 2).open_mode(OpenMode::ReadOnly)).unwrap();
+        let recs = store.get_all("col");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].id, "a");
+    }
 
     #[cfg_attr(miri, ignore)]
     #[test]

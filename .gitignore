@@ -2,8 +2,9 @@
 # Compiled output and build artifacts
 /target/
 
-# nidus is a library: do not commit the lockfile (let downstreams resolve).
-Cargo.lock
+# Cargo.lock IS committed (current Cargo guidance, even for libraries): it pins
+# reproducible builds for CI/contributors and makes any new (esp. C-compiling
+# `*-sys`) dependency show up as a reviewable diff — the zero-FFI guardrail.
 
 # Backup files from `rustfmt`
 **/*.rs.bk
