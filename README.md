@@ -1,8 +1,9 @@
 # nidus
 
-A small, pure-Rust **embeddable vector store**. Brute-force cosine search over a
-single append-only directory, with typed metadata filters and many logical
-collections sharing one embedding space. No FFI, no C, no SQL, no query engine.
+A small, pure-Rust **vector store for development and small-scale use**.
+Brute-force cosine search over a single append-only directory, with typed
+metadata filters and many logical collections sharing one embedding space. No
+FFI, no C, no SQL, no query engine.
 
 > _nidus_ (Latin, "nest") — a small place where things are kept safe.
 
@@ -35,7 +36,7 @@ more, so it **compiles in seconds** and embeds as a normal Rust dependency.
 
 ```toml
 [dependencies]
-nidus = "0.1"
+nidus = "0.3"
 ```
 
 ```rust
@@ -164,7 +165,7 @@ Rust 1.96+ (pinned via `rust-toolchain.toml`), edition 2024.
 ## Design
 
 The full design — data model, on-disk format, durability/concurrency model, and the
-deferred seams (mmap, ANN/HNSW, scalar quantization, a lightweight server) — lives in
+deferred seams (mmap, ANN/HNSW, scalar quantization, …) — lives in
 [`SPEC.md`](SPEC.md). Each module also carries its own contract in `src/<module>/SPEC.md`.
 
 ## License

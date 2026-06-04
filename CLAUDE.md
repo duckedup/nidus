@@ -174,3 +174,21 @@ distinction preserves "computed-empty" vs "un-indexed" semantics) and, if async,
 wraps `Nidus` in `Arc<Mutex<Nidus>>` + `spawn_blocking`. nidus itself knows nothing
 about the application's domain — it is a general-purpose vector store. See `SPEC.md`
 §12 for the mapping pattern.
+
+## Documentation site
+
+The docs live in `docs/` — an Astro + Starlight site (`just docs` / `docs-build`
+/ `docs-preview`), deployed to GitHub Pages at **nidus.duckedup.org** by
+`.github/workflows/docs.yml` on push to `main` under `docs/**`.
+
+**Positioning.** nidus is a vector store **for development and small-scale use**.
+Keep the public framing open: do NOT pin it down as "an embeddable library" (or
+"a library, not a server") and do NOT make public promises about future modes
+(no "server planned / on the roadmap" in the docs/README). Describe what it does
+today, neutrally, without limiting where it can go. (A server is one of the
+deferred seams in `SPEC.md` §9 — internal context, not a public commitment.)
+
+**Version sync — on every crate version bump, bump the docs too.** When you change
+`version` in `Cargo.toml`, update the install-snippet version string in BOTH the
+docs (`docs/src/content/docs/getting-started.md`) and `README.md` to match (e.g.
+`nidus = "0.3"`). Those `[dependencies]` examples must not lag the released crate.

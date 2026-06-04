@@ -1,0 +1,77 @@
+---
+title: nidus
+description: A small, pure-Rust vector store for development and small-scale use. Brute-force cosine search over a single append-only directory — no FFI, no C, no SQL, no query engine.
+template: splash
+hero:
+  tagline: A small, pure-Rust vector store, built for development and small-scale use. Dense vectors plus typed metadata in a single on-disk directory, answered by exact brute-force cosine. No FFI, no C, no SQL, no query engine.
+  image:
+    alt: nidus
+    file: ../../assets/nidus.svg
+  actions:
+    - text: Get started
+      link: /getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/duckedup/nidus
+      icon: external
+      variant: minimal
+---
+
+import { Code } from '@astrojs/starlight/components';
+
+<Code code={`db.search("code", &query, &SearchOpts { top_k: 5, ..Default::default() })?;`} lang="rust" />
+
+<p class="lede not-content">
+  <strong>nidus (Latin, "nest") is a vector store, not a database.</strong> Chunk
+  some source → embed each chunk → store the vectors and metadata → ask for
+  nearest neighbours. It does exactly that and nothing more, so it{" "}
+  <strong>compiles in seconds</strong> and embeds as a normal Rust dependency —
+  no C++ toolchain, no SQL engine, no ten-minute cold build.
+</p>
+
+<p class="section-kicker not-content">Why it exists</p>
+
+<div class="feature-grid not-content">
+  <article class="feature">
+    <span class="num">01</span>
+    <h3>Exact brute-force cosine</h3>
+    <p>100% recall, fast at the target scale (≤ a few million vectors, comfortably in RAM). Vectors are unit-normalized on insert, so a score is plain cosine in [-1, 1].</p>
+  </article>
+  <article class="feature">
+    <span class="num">02</span>
+    <h3>Pure-Rust, zero FFI</h3>
+    <p>Never a crate that compiles C or links a native library. <code>#![forbid(unsafe_code)]</code>. cargo build is just rustc — and the whole crate runs under Miri, file IO included.</p>
+  </article>
+  <article class="feature">
+    <span class="num">03</span>
+    <h3>One directory, crash-safe</h3>
+    <p>An append-only flat-f32 matrix plus a framed, CRC-checked op log. A crash loses at most the in-flight batch; a torn tail is recovered on open.</p>
+  </article>
+  <article class="feature">
+    <span class="num">04</span>
+    <h3>Typed metadata &amp; filters</h3>
+    <p>Attach Str / Int / Bool / List / Null attributes and filter with Eq / Glob / In before scoring. Many collections share one embedding space, searchable in one call.</p>
+  </article>
+</div>
+
+<p class="section-kicker not-content">Where to next</p>
+
+<div class="next-grid not-content">
+  <a class="next-card" href="/getting-started/">
+    <span class="next-title">Getting started</span>
+    <p>Add the dependency, open a store, index records, run your first search.</p>
+  </a>
+  <a class="next-card" href="/guides/how-it-works/">
+    <span class="next-title">How it works</span>
+    <p>The storage model and search path, end to end.</p>
+  </a>
+  <a class="next-card" href="/guides/storage/">
+    <span class="next-title">Storage &amp; durability</span>
+    <p>The on-disk format, the fsync contract, and lock-free readers.</p>
+  </a>
+  <a class="next-card" href="/reference/api/">
+    <span class="next-title">API reference</span>
+    <p>Every public type and method, with signatures.</p>
+  </a>
+</div>
