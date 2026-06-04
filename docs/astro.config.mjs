@@ -10,7 +10,7 @@ export default defineConfig({
     starlight({
       title: "nidus",
       description:
-        "A small, pure-Rust embeddable vector store. Brute-force cosine search over a single append-only directory — no FFI, no C, no SQL, no query engine.",
+        "A small, pure-Rust vector store for development and small-scale use. Brute-force cosine search over a single append-only directory — embed it as a library, with a standalone server planned. No FFI, no C, no SQL, no query engine.",
       logo: {
         // The nest mark — full-colour illustration, reads on light and dark.
         src: "./src/assets/nidus.svg",
