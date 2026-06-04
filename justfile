@@ -55,6 +55,20 @@ deps:
 # Pre-commit / pre-PR checks: format clean, no clippy warnings, tests green
 ci: fmt-check lint test
 
+# ── Docs site (Astro + Starlight, in docs/) ─────────────────────────────────
+
+# Run the docs dev server with live reload (installs deps on first run)
+docs:
+    cd docs && bun install && bun run dev
+
+# Build the docs site to docs/dist/
+docs-build:
+    cd docs && bun install && bun run build
+
+# Preview the production docs build locally
+docs-preview:
+    cd docs && bun run preview
+
 # ── Build ──────────────────────────────────────────────────────────────────
 
 # Debug build for the current host

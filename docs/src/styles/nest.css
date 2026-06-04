@@ -1,0 +1,366 @@
+/* ────────────────────────────────────────────────────────────────────────
+   nidus — "nest" theme
+
+   A warm, woodland reading surface. Bark and parchment grounds, generous
+   negative space, hairline rules, one teal accent — the painted egg. Gold
+   (the nest's flowers) is the single flourish, used sparingly. Fraunces
+   (display) + Hanken Grotesk (text) + JetBrains Mono (code).
+
+   Palette (lifted from the nest mark)
+     Bark        #2A1A10  #3A2316  #532D17  #774627  #8B5A30  #B98541
+     Parchment   #FAF5EA  #F3ECDD  #E9DDCA  #D8C9B6
+     Egg (teal)  #2F807A  #4F9D97  #9ED6D0   ← the one accent
+     Flower      #E0A93F  (gold)            ← the one flourish
+     Moss        #8C9A3B          Blush     #D98C7D
+   ──────────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* Typography */
+  --sl-font: "Hanken Grotesk Variable", ui-sans-serif, system-ui, sans-serif;
+  --sl-font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo,
+    monospace;
+  --nd-display: "Fraunces Variable", Georgia, "Times New Roman", serif;
+
+  /* A little more air than Starlight's defaults */
+  --sl-line-height: 1.72;
+  --sl-content-width: 46rem;
+  --sl-nav-height: 4.25rem;
+
+  /* Brand tokens */
+  --nd-teal: #4f9d97;
+  --nd-teal-deep: #2f807a;
+  --nd-gold: #e0a93f;
+  --nd-bark: #532d17;
+  --nd-moss: #8c9a3b;
+}
+
+/* ── Dark theme (default) — bark ground, parchment text ────────────────────*/
+:root,
+:root[data-theme="dark"] {
+  --sl-color-accent-low: #1f3a38;
+  --sl-color-accent: #3f8f89;
+  --sl-color-accent-high: #9ed6d0;
+
+  --sl-color-white: #f7f0e4;
+  --sl-color-gray-1: #efe7da;
+  --sl-color-gray-2: #e4d8c8;
+  --sl-color-gray-3: #b6a48f;
+  --sl-color-gray-4: #6b5240;
+  --sl-color-gray-5: #4a3526;
+  --sl-color-gray-6: #33231a;
+  --sl-color-black: #271810;
+
+  --sl-color-bg-nav: rgba(39, 24, 16, 0.72);
+  --sl-color-bg-sidebar: var(--sl-color-black);
+  --sl-color-hairline: #3c2a1d;
+  --sl-color-hairline-light: #4a3526;
+  --sl-color-hairline-shade: #21140d;
+  --sl-color-bg-inline-code: #3a2718;
+  --sl-color-text-invert: #271810;
+  --nd-surface: #33231a;
+}
+
+/* ── Light theme — parchment ground, bark text ─────────────────────────────*/
+:root[data-theme="light"] {
+  --sl-color-accent-low: #cfe6e3;
+  --sl-color-accent: #2f807a;
+  --sl-color-accent-high: #1f5853;
+
+  --sl-color-white: #2e1d12;
+  --sl-color-gray-1: #3d2a1c;
+  --sl-color-gray-2: #4f3826;
+  --sl-color-gray-3: #6e5a48;
+  --sl-color-gray-4: #8a7563;
+  --sl-color-gray-5: #d3c2ad;
+  --sl-color-gray-6: #e9ddca;
+  --sl-color-gray-7: #f3ecdd;
+  --sl-color-black: #faf5ea;
+
+  --sl-color-bg-nav: rgba(250, 245, 234, 0.78);
+  --sl-color-bg-sidebar: var(--sl-color-black);
+  --sl-color-hairline: #e3d6c1;
+  --sl-color-hairline-light: #ebe0cf;
+  --sl-color-hairline-shade: #eee4d4;
+  --sl-color-bg-inline-code: #ece1cf;
+  --sl-color-text-invert: #faf5ea;
+  --nd-surface: #fffdf8;
+}
+
+/* ── Global polish ─────────────────────────────────────────────────────────*/
+
+::selection {
+  background: color-mix(in srgb, var(--nd-teal) 32%, transparent);
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Frosted, hairline-bottomed top bar */
+.header {
+  backdrop-filter: blur(12px) saturate(140%);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
+  border-bottom: 1px solid var(--sl-color-hairline);
+}
+
+/* Display type — Fraunces, optical, calm */
+.site-title,
+.hero h1,
+.sl-markdown-content :is(h1, h2),
+.feature h3,
+.next-card .next-title {
+  font-family: var(--nd-display);
+  font-optical-sizing: auto;
+  font-weight: 540;
+  font-variation-settings: "SOFT" 28, "WONK" 0;
+  letter-spacing: -0.005em;
+}
+
+.site-title {
+  font-size: 1.32rem;
+  letter-spacing: -0.01em;
+}
+.site-title img,
+a.site-title img {
+  height: 2.1rem;
+  width: auto;
+}
+
+.sl-markdown-content h1 {
+  font-weight: 560;
+  letter-spacing: -0.012em;
+}
+.sl-markdown-content h2 {
+  margin-top: 2.75rem;
+  padding-top: 1.75rem;
+  border-top: 1px solid var(--sl-color-hairline);
+}
+.sl-markdown-content :is(h3, h4) {
+  font-weight: 600;
+  letter-spacing: -0.006em;
+}
+
+/* Links: quiet by default, teal on hover */
+.sl-markdown-content a:not(:where(.not-content *)) {
+  text-decoration-color: color-mix(in srgb, var(--sl-color-accent) 45%, transparent);
+  text-underline-offset: 0.22em;
+  transition: text-decoration-color 0.15s ease, color 0.15s ease;
+}
+.sl-markdown-content a:not(:where(.not-content *)):hover {
+  text-decoration-color: var(--sl-color-accent);
+}
+
+/* Sidebar: airier, lighter, teal active state */
+.sidebar-content {
+  padding-top: 1rem;
+}
+.sidebar-content .large {
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--sl-color-gray-3);
+}
+a.sidebar-link {
+  border-radius: 0.4rem;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+a.sidebar-link:hover {
+  background: color-mix(in srgb, var(--sl-color-accent) 12%, transparent);
+}
+a.sidebar-link[aria-current="page"],
+a.sidebar-link[aria-current="page"]:hover {
+  background: var(--sl-color-accent-low);
+  color: var(--sl-color-accent-high);
+  font-weight: 500;
+}
+
+/* Inline + block code */
+.sl-markdown-content code:not(:where(.not-content *)) {
+  font-size: 0.875em;
+  border-radius: 0.35rem;
+  padding: 0.15em 0.4em;
+}
+.expressive-code {
+  margin: 1.4rem 0;
+}
+.expressive-code .frame pre {
+  border-radius: 0.5rem;
+}
+
+/* Tables + blockquotes: hairlines only */
+.sl-markdown-content :is(th, td):not(:where(.not-content *)) {
+  border-color: var(--sl-color-hairline);
+}
+.sl-markdown-content th:not(:where(.not-content *)) {
+  font-weight: 600;
+  color: var(--sl-color-white);
+}
+.sl-markdown-content blockquote:not(:where(.not-content *)) {
+  border-inline-start: 2px solid var(--sl-color-accent);
+  padding-inline-start: 1.1rem;
+  color: var(--sl-color-gray-3);
+  font-style: normal;
+}
+
+/* ── Splash / landing hero ─────────────────────────────────────────────────*/
+
+.hero {
+  padding-block: 1.5rem 2.5rem;
+}
+.hero h1 {
+  font-size: clamp(2.6rem, 1.8rem + 3.4vw, 4.25rem);
+  line-height: 1.02;
+}
+.hero .tagline {
+  font-family: var(--sl-font);
+  color: var(--sl-color-gray-3);
+  font-size: clamp(1.05rem, 1rem + 0.6vw, 1.3rem);
+  line-height: 1.6;
+  max-width: 42ch;
+}
+/* A whisper of warmth behind the mark — the only flourish */
+.hero > img,
+.hero .hero-html img {
+  filter: drop-shadow(0 0.6rem 2.4rem color-mix(in srgb, var(--nd-gold) 22%, transparent));
+}
+.hero .actions a[data-variant="primary"] {
+  background: var(--sl-color-accent);
+  border-color: var(--sl-color-accent);
+  color: var(--sl-color-text-invert);
+}
+.hero .actions a[data-variant="primary"]:hover {
+  background: var(--nd-teal);
+  border-color: var(--nd-teal);
+  color: #1a0f08;
+}
+.hero .actions a[data-variant="minimal"] {
+  border-color: var(--sl-color-hairline-light);
+}
+
+/* ── Bespoke feature cards (landing) ───────────────────────────────────────*/
+
+.lede {
+  font-size: 1.18rem;
+  line-height: 1.6;
+  color: var(--sl-color-gray-2);
+  max-width: 60ch;
+  margin: 0.5rem 0 2.5rem;
+}
+.lede strong {
+  color: var(--sl-color-white);
+}
+
+.section-kicker {
+  font-family: var(--sl-font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--sl-color-gray-3);
+  margin: 3rem 0 1.25rem;
+}
+
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1rem;
+}
+@media (max-width: 50rem) {
+  .feature-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.feature {
+  position: relative;
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 0.75rem;
+  background: color-mix(in srgb, var(--nd-surface) 55%, transparent);
+  padding: 1.6rem 1.6rem 1.5rem;
+  transition: border-color 0.2s ease, transform 0.2s ease, background-color 0.2s ease;
+}
+.feature:hover {
+  border-color: color-mix(in srgb, var(--nd-teal) 55%, transparent);
+  transform: translateY(-2px);
+}
+.feature .num {
+  font-family: var(--sl-font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.1em;
+  color: var(--nd-gold);
+}
+.feature h3 {
+  margin: 0.45rem 0 0.5rem;
+  font-size: 1.32rem;
+  line-height: 1.2;
+  color: var(--sl-color-white);
+}
+.feature p {
+  margin: 0;
+  color: var(--sl-color-gray-3);
+  line-height: 1.6;
+}
+
+/* ── "Where next" nav cards ────────────────────────────────────────────────*/
+
+.next-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1rem;
+}
+@media (max-width: 50rem) {
+  .next-grid {
+    grid-template-columns: 1fr;
+  }
+}
+a.next-card {
+  display: block;
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 0.75rem;
+  padding: 1.4rem 1.5rem;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.2s ease, transform 0.2s ease;
+}
+a.next-card:hover {
+  border-color: color-mix(in srgb, var(--nd-teal) 60%, transparent);
+  transform: translateY(-2px);
+}
+.next-card .next-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 1.12rem;
+  color: var(--sl-color-white);
+}
+.next-card .next-title::after {
+  content: "→";
+  font-family: var(--sl-font-mono);
+  color: var(--nd-teal-deep);
+  transition: transform 0.2s ease;
+}
+:root[data-theme="dark"] .next-card .next-title::after {
+  color: var(--nd-teal);
+}
+a.next-card:hover .next-title::after {
+  transform: translateX(4px);
+}
+.next-card p {
+  margin: 0.4rem 0 0;
+  color: var(--sl-color-gray-3);
+  font-size: 0.95rem;
+  line-height: 1.55;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .feature,
+  .feature:hover,
+  a.next-card,
+  a.next-card:hover,
+  a.sidebar-link,
+  .next-card .next-title::after {
+    transition: none;
+    transform: none;
+  }
+}
