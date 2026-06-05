@@ -12,7 +12,7 @@ to install, no daemon to run, and no network.
 ```toml
 # Cargo.toml
 [dependencies]
-nidus = "0.4"
+nidus = "0.5"
 anyhow = "1"     # nidus returns anyhow::Result
 ```
 

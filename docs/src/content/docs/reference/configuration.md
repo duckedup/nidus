@@ -1,6 +1,6 @@
 ---
 title: Configuration
-description: Every knob on nidus Config — fsync policy, open mode, auto-compaction, lock TTL, and the max_vector_bytes ceiling.
+description: Every knob on nidus Config — distance metric, fsync policy, open mode, auto-compaction, lock TTL, and the max_vector_bytes ceiling.
 ---
 
 `Config` carries everything needed to open a store. Construct it with
@@ -10,9 +10,10 @@ choice**: nidus contributes no path defaults, env vars, or hidden directories.
 
 ```rust
 use std::time::Duration;
-use nidus::{Config, Fsync, OpenMode};
+use nidus::{Config, Distance, Fsync, OpenMode};
 
 let cfg = Config::new("/path/to/store", 768)
+    .distance(Distance::Cosine)      // similarity metric (default)
     .fsync(Fsync::PerBatch)          // durability granularity (default)
     .open_mode(OpenMode::ReadWrite)  // ReadOnly = no lock, search-only
     .auto_compact(Some(0.5))         // compact on open above this dead-row ratio
@@ -32,6 +33,14 @@ let cfg = Config::new("/path/to/store", 768)
 `usize` — **required.** The pinned embedding dimension. It is written to the
 `data` header at creation and must match on every reopen — reopening with a
 different dimension is a hard error. One embedding space per store.
+
+### `distance`
+
+[`Distance`](/reference/api/#distance) — default `Distance::Cosine`. The
+similarity / distance metric used for scoring. Like dimension, it is pinned in
+the data header at creation — reopening with a different metric is a hard error.
+See [distance metrics](/guides/search/#distance-metrics) for details on each
+metric.
 
 ### `fsync`
 

@@ -1,10 +1,38 @@
 ---
 title: Search & filters
-description: Scoped cosine search across nidus collections, typed metadata, and the Eq / Glob / In filter predicates applied before scoring.
+description: Scoped search across nidus collections with three distance metrics, typed metadata, and the Eq / Glob / In filter predicates applied before scoring.
 ---
 
-Search in nidus is exact brute-force cosine, optionally narrowed by a metadata
-filter and a score floor, over a scope you choose. This page covers all three.
+Search in nidus is exact brute-force over a scope you choose, using one of three
+distance metrics, optionally narrowed by a metadata filter and a score floor.
+
+## Distance metrics
+
+The distance metric is set at store creation via `Config::distance` and pinned
+in the data header — reopening with a different metric is an error.
+
+| Metric | Normalization | Score | Range | Best for |
+| --- | --- | --- | --- | --- |
+| `Cosine` (default) | Vectors unit-normalized on insert | `dot(q, v)` | \[−1, 1\] | Embedding similarity |
+| `Euclidean` | Stored as-is | `−‖q − v‖²` | (−∞, 0\] | Spatial distance |
+| `DotProduct` | Stored as-is | `dot(q, v)` | (−∞, ∞) | When magnitude matters |
+
+For all metrics, **higher score = more relevant**, so top-k, `min_score`, and
+ranking all work the same way regardless of which metric you choose.
+
+```rust
+use nidus::{Config, Distance, Nidus};
+
+// Cosine (default — same as before)
+let db = Nidus::open(Config::new("./store", 384))?;
+
+// Euclidean distance
+let db = Nidus::open(Config::new("./store-l2", 384).distance(Distance::Euclidean))?;
+
+// Raw dot product (magnitude carries signal)
+let db = Nidus::open(Config::new("./store-dot", 384).distance(Distance::DotProduct))?;
+# anyhow::Ok(())
+```
 
 ## Scope
 
@@ -28,11 +56,6 @@ category error.
 
 ## Scoring
 
-Vectors are **unit-normalized on insert**, so the cosine similarity of a stored
-vector `v` and a query `q` reduces to their dot product. A `Hit.score` is
-therefore plain cosine in `[-1, 1]`: `1.0` is identical direction, `0.0`
-orthogonal, `-1.0` opposite.
-
 `SearchOpts` controls the ranking:
 
 ```rust
@@ -40,7 +63,7 @@ use nidus::SearchOpts;
 
 let opts = SearchOpts {
     top_k: 10,             // keep at most this many hits
-    min_score: Some(0.5),  // drop anything below this cosine (None = no floor)
+    min_score: Some(0.5),  // drop anything below this score (None = no floor)
     ..Default::default()
 };
 # anyhow::Ok(())

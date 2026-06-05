@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::model::Distance;
+
 // ── Header constants ──────────────────────────────────────────────────────────
 
 /// Magic bytes: "NIDUS\0"
@@ -21,6 +23,7 @@ pub(crate) const HEADER_LEN: usize = 64;
 /// handle, etc.) but must keep the method signatures below.
 pub struct DataSegment {
     dimension: usize,
+    distance: Distance,
     vectors: Vec<f32>,
     /// `None` when the segment is in-memory only (no backing file).
     file: Option<FileState>,
@@ -41,7 +44,7 @@ struct FileState {
 // ── Header encode / decode ────────────────────────────────────────────────────
 
 /// Encode the 64-byte header into a fixed-size array.
-fn encode_header(dimension: usize) -> [u8; HEADER_LEN] {
+fn encode_header(dimension: usize, distance: Distance) -> [u8; HEADER_LEN] {
     let mut buf = [0u8; HEADER_LEN];
     // bytes 0..6: magic
     buf[..6].copy_from_slice(MAGIC);
@@ -50,12 +53,31 @@ fn encode_header(dimension: usize) -> [u8; HEADER_LEN] {
     // bytes 8..12: dimension (little-endian u32)
     let dim_u32 = dimension as u32;
     buf[8..12].copy_from_slice(&dim_u32.to_le_bytes());
-    // bytes 12..64: zero-padding (already zeroed)
+    // byte 12: distance metric (0=Cosine, 1=Euclidean, 2=DotProduct)
+    buf[12] = distance_to_byte(distance);
+    // bytes 13..64: zero-padding (already zeroed)
     buf
 }
 
-/// Decode and verify the 64-byte header. Returns the stored `dimension`.
-fn decode_header(buf: &[u8; HEADER_LEN]) -> Result<usize> {
+fn distance_to_byte(d: Distance) -> u8 {
+    match d {
+        Distance::Cosine => 0,
+        Distance::Euclidean => 1,
+        Distance::DotProduct => 2,
+    }
+}
+
+fn byte_to_distance(b: u8) -> Result<Distance> {
+    match b {
+        0 => Ok(Distance::Cosine),
+        1 => Ok(Distance::Euclidean),
+        2 => Ok(Distance::DotProduct),
+        _ => bail!("unknown distance metric byte {b} in data file header"),
+    }
+}
+
+/// Decode and verify the 64-byte header. Returns `(dimension, distance)`.
+fn decode_header(buf: &[u8; HEADER_LEN]) -> Result<(usize, Distance)> {
     if &buf[..6] != MAGIC {
         bail!("data file has wrong magic bytes — not a nidus data file");
     }
@@ -68,7 +90,8 @@ fn decode_header(buf: &[u8; HEADER_LEN]) -> Result<usize> {
         );
     }
     let dim = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
-    Ok(dim)
+    let distance = byte_to_distance(buf[12])?;
+    Ok((dim, distance))
 }
 
 // ── f32 vector I/O ────────────────────────────────────────────────────────────
@@ -104,10 +127,10 @@ fn bytes_to_floats(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
 
 impl DataSegment {
     /// Open or create `path` (the `data` file). Verifies/writes the 64-byte header
-    /// (magic + version + dimension), then reads every fully-written row into RAM.
-    /// Errors on magic mismatch, truncated header, or a dimension that differs from
-    /// `dimension`.
-    pub fn open(path: &Path, dimension: usize) -> Result<DataSegment> {
+    /// (magic + version + dimension + distance), then reads every fully-written row
+    /// into RAM. Errors on magic mismatch, truncated header, or a dimension/distance
+    /// that differs from the requested values.
+    pub fn open(path: &Path, dimension: usize, distance: Distance) -> Result<DataSegment> {
         // Open or create the file with read+write access.
         let mut file = OpenOptions::new()
             .read(true)
@@ -127,7 +150,7 @@ impl DataSegment {
 
         if file_len == 0 {
             // New file — write the header.
-            let header = encode_header(dimension);
+            let header = encode_header(dimension, distance);
             file.write_all(&header)
                 .context("failed to write data file header")?;
             vectors = Vec::new();
@@ -145,13 +168,18 @@ impl DataSegment {
             let mut header_buf = [0u8; HEADER_LEN];
             file.read_exact(&mut header_buf)
                 .context("failed to read data file header")?;
-            let stored_dim = decode_header(&header_buf)
+            let (stored_dim, stored_distance) = decode_header(&header_buf)
                 .with_context(|| format!("invalid header in {}", path.display()))?;
             if stored_dim != dimension {
                 bail!(
                     "data file dimension mismatch: file has dimension {}, requested {}",
                     stored_dim,
                     dimension
+                );
+            }
+            if stored_distance != distance {
+                bail!(
+                    "data file distance metric mismatch: file has {stored_distance:?}, requested {distance:?}"
                 );
             }
 
@@ -211,6 +239,7 @@ impl DataSegment {
 
         Ok(DataSegment {
             dimension,
+            distance,
             vectors,
             file: Some(FileState {
                 path: path.to_path_buf(),
@@ -221,10 +250,17 @@ impl DataSegment {
         })
     }
 
-    /// An in-memory-only segment (no backing file). For tests.
+    /// An in-memory-only segment (no backing file, Cosine distance).
+    #[cfg(test)]
     pub fn in_memory(dimension: usize) -> DataSegment {
+        Self::in_memory_with(dimension, Distance::default())
+    }
+
+    /// An in-memory-only segment with a specific distance metric.
+    pub fn in_memory_with(dimension: usize, distance: Distance) -> DataSegment {
         DataSegment {
             dimension,
+            distance,
             vectors: Vec::new(),
             file: None,
             #[cfg(test)]
@@ -386,7 +422,7 @@ impl DataSegment {
                             format!("failed to create temp file at {}", tmp_path.display())
                         })?;
 
-                    let header = encode_header(dim);
+                    let header = encode_header(dim, self.distance);
                     tmp.write_all(&header)
                         .context("failed to write header to temp data file")?;
 
@@ -460,54 +496,55 @@ mod tests {
 
     #[test]
     fn header_encode_magic() {
-        let h = encode_header(128);
+        let h = encode_header(128, Distance::default());
         assert_eq!(&h[..6], b"NIDUS\0");
     }
 
     #[test]
     fn header_encode_version() {
-        let h = encode_header(128);
+        let h = encode_header(128, Distance::default());
         let v = u16::from_le_bytes([h[6], h[7]]);
         assert_eq!(v, VERSION);
     }
 
     #[test]
     fn header_encode_dimension() {
-        let h = encode_header(384);
+        let h = encode_header(384, Distance::default());
         let d = u32::from_le_bytes([h[8], h[9], h[10], h[11]]);
         assert_eq!(d, 384);
     }
 
     #[test]
     fn header_encode_zero_padding() {
-        let h = encode_header(3);
+        let h = encode_header(3, Distance::default());
         // Bytes 12..64 must all be zero.
         assert!(h[12..64].iter().all(|&b| b == 0));
     }
 
     #[test]
     fn header_length_is_64() {
-        let h = encode_header(1);
+        let h = encode_header(1, Distance::default());
         assert_eq!(h.len(), 64);
     }
 
     #[test]
     fn header_round_trip() {
-        let h = encode_header(512);
-        let dim = decode_header(&h).unwrap();
+        let h = encode_header(512, Distance::default());
+        let (dim, dist) = decode_header(&h).unwrap();
         assert_eq!(dim, 512);
+        assert_eq!(dist, Distance::Cosine);
     }
 
     #[test]
     fn header_bad_magic_errors() {
-        let mut h = encode_header(3);
+        let mut h = encode_header(3, Distance::default());
         h[0] = b'X';
         assert!(decode_header(&h).is_err());
     }
 
     #[test]
     fn header_bad_version_errors() {
-        let mut h = encode_header(3);
+        let mut h = encode_header(3, Distance::default());
         // Force version to 0.
         h[6] = 0;
         h[7] = 0;
@@ -650,7 +687,7 @@ mod tests {
     fn file_open_create_new() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data");
-        let seg = DataSegment::open(&path, 4).unwrap();
+        let seg = DataSegment::open(&path, 4, Distance::default()).unwrap();
         assert_eq!(seg.dimension(), 4);
         assert_eq!(seg.row_count(), 0);
         assert!(path.exists());
@@ -661,7 +698,7 @@ mod tests {
     fn file_append_and_row() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data");
-        let mut seg = DataSegment::open(&path, 3).unwrap();
+        let mut seg = DataSegment::open(&path, 3, Distance::default()).unwrap();
         let v = [1.0_f32, 2.0, 3.0];
         let idx = seg.append(&v).unwrap();
         assert_eq!(idx, 0);
@@ -676,7 +713,7 @@ mod tests {
 
         let rows = [[1.0_f32, 2.0, 3.0], [4.0, 5.0, 6.0]];
         {
-            let mut seg = DataSegment::open(&path, 3).unwrap();
+            let mut seg = DataSegment::open(&path, 3, Distance::default()).unwrap();
             for r in &rows {
                 seg.append(r).unwrap();
             }
@@ -684,7 +721,7 @@ mod tests {
         }
 
         // Reopen and verify all rows are present.
-        let seg2 = DataSegment::open(&path, 3).unwrap();
+        let seg2 = DataSegment::open(&path, 3, Distance::default()).unwrap();
         assert_eq!(seg2.row_count(), 2);
         assert_eq!(seg2.row(0), &rows[0]);
         assert_eq!(seg2.row(1), &rows[1]);
@@ -698,7 +735,7 @@ mod tests {
 
         // Write one complete row then a partial one.
         {
-            let mut seg = DataSegment::open(&path, 4).unwrap();
+            let mut seg = DataSegment::open(&path, 4, Distance::default()).unwrap();
             seg.append(&[1.0, 2.0, 3.0, 4.0]).unwrap();
             seg.sync().unwrap();
         }
@@ -710,7 +747,7 @@ mod tests {
         }
 
         // Reopening should silently ignore the partial tail.
-        let seg2 = DataSegment::open(&path, 4).unwrap();
+        let seg2 = DataSegment::open(&path, 4, Distance::default()).unwrap();
         assert_eq!(seg2.row_count(), 1, "partial tail must be discarded");
         assert_eq!(seg2.row(0), &[1.0_f32, 2.0, 3.0, 4.0]);
 
@@ -725,9 +762,9 @@ mod tests {
     fn file_dimension_mismatch_errors() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data");
-        DataSegment::open(&path, 4).unwrap();
+        DataSegment::open(&path, 4, Distance::default()).unwrap();
         // Reopen with a different dimension must fail.
-        let result = DataSegment::open(&path, 8);
+        let result = DataSegment::open(&path, 8, Distance::default());
         assert!(result.is_err(), "expected dimension-mismatch error");
         let msg = format!("{}", result.err().unwrap());
         assert!(
@@ -744,7 +781,7 @@ mod tests {
 
         // Initial: write two rows.
         {
-            let mut seg = DataSegment::open(&path, 2).unwrap();
+            let mut seg = DataSegment::open(&path, 2, Distance::default()).unwrap();
             seg.append(&[1.0, 2.0]).unwrap();
             seg.append(&[3.0, 4.0]).unwrap();
             seg.sync().unwrap();
@@ -755,7 +792,7 @@ mod tests {
         }
 
         // Reopen and verify the compacted state.
-        let seg2 = DataSegment::open(&path, 2).unwrap();
+        let seg2 = DataSegment::open(&path, 2, Distance::default()).unwrap();
         assert_eq!(seg2.row_count(), 1);
         assert_eq!(seg2.row(0), &[9.0_f32, 8.0]);
     }
@@ -765,7 +802,7 @@ mod tests {
     fn file_rewrite_then_append() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data");
-        let mut seg = DataSegment::open(&path, 2).unwrap();
+        let mut seg = DataSegment::open(&path, 2, Distance::default()).unwrap();
         seg.append(&[1.0, 2.0]).unwrap();
         seg.rewrite(&[5.0_f32, 6.0]).unwrap();
         // Should be able to append after rewrite.
@@ -773,7 +810,7 @@ mod tests {
         assert_eq!(idx, 1);
         seg.sync().unwrap();
 
-        let seg2 = DataSegment::open(&path, 2).unwrap();
+        let seg2 = DataSegment::open(&path, 2, Distance::default()).unwrap();
         assert_eq!(seg2.row_count(), 2);
         assert_eq!(seg2.row(0), &[5.0_f32, 6.0]);
         assert_eq!(seg2.row(1), &[7.0_f32, 8.0]);
@@ -784,7 +821,7 @@ mod tests {
     fn file_append_wrong_dimension_errors() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data");
-        let mut seg = DataSegment::open(&path, 3).unwrap();
+        let mut seg = DataSegment::open(&path, 3, Distance::default()).unwrap();
         assert!(seg.append(&[1.0, 2.0]).is_err());
     }
 
@@ -795,7 +832,7 @@ mod tests {
         let path = dir.path().join("data");
         // Write only a partial header.
         std::fs::write(&path, b"NIDUS").unwrap();
-        let result = DataSegment::open(&path, 3);
+        let result = DataSegment::open(&path, 3, Distance::default());
         assert!(result.is_err(), "expected truncated-header error");
         let msg = format!("{}", result.err().unwrap());
         assert!(
@@ -815,7 +852,7 @@ mod tests {
         buf[6..8].copy_from_slice(&VERSION.to_le_bytes());
         buf[8..12].copy_from_slice(&3u32.to_le_bytes());
         std::fs::write(&path, buf).unwrap();
-        assert!(DataSegment::open(&path, 3).is_err());
+        assert!(DataSegment::open(&path, 3, Distance::default()).is_err());
     }
 
     #[cfg_attr(miri, ignore)]
@@ -824,7 +861,7 @@ mod tests {
         // Verify that the on-disk layout matches the spec exactly.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data");
-        let mut seg = DataSegment::open(&path, 2).unwrap();
+        let mut seg = DataSegment::open(&path, 2, Distance::default()).unwrap();
         seg.append(&[1.0_f32, -1.0]).unwrap();
         seg.sync().unwrap();
 
@@ -844,7 +881,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data");
         {
-            let mut seg = DataSegment::open(&path, 2).unwrap();
+            let mut seg = DataSegment::open(&path, 2, Distance::default()).unwrap();
             seg.append(&[1.0, 2.0]).unwrap();
             seg.append(&[3.0, 4.0]).unwrap();
             seg.append(&[5.0, 6.0]).unwrap();
@@ -859,7 +896,7 @@ mod tests {
             assert_eq!(seg.append(&[7.0, 8.0]).unwrap(), 1);
             seg.sync().unwrap();
         }
-        let seg2 = DataSegment::open(&path, 2).unwrap();
+        let seg2 = DataSegment::open(&path, 2, Distance::default()).unwrap();
         assert_eq!(seg2.row_count(), 2);
         assert_eq!(seg2.row(0), &[1.0_f32, 2.0]);
         assert_eq!(seg2.row(1), &[7.0_f32, 8.0]);

@@ -52,7 +52,7 @@ searchers plus one writer (see
 
 | Method | Signature | Notes |
 | ------ | --------- | ----- |
-| `search` | `fn search<'a>(&self, scope: impl Into<Scope<'a>>, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>` | Ranked cosine search over a scope. |
+| `search` | `fn search<'a>(&self, scope: impl Into<Scope<'a>>, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>` | Ranked search over a scope using the store's distance metric. |
 | `flush` | `fn flush(&mut self) -> Result<()>` | Force an fsync (relevant under `Fsync::OnFlush`). |
 | `compact` | `fn compact(&mut self) -> Result<()>` | Rewrite `data` to reclaim dead rows. |
 
@@ -112,13 +112,28 @@ pub enum Predicate {
 pub struct Filter(pub Vec<Predicate>);
 ```
 
+## `Distance`
+
+The similarity / distance metric, set at store creation via `Config::distance`.
+Pinned in the data header — reopening with a different metric is an error.
+
+```rust
+pub enum Distance {
+    Cosine,      // default — vectors normalized on insert, score = dot(q, v)
+    Euclidean,   // raw vectors, score = −‖q − v‖²
+    DotProduct,  // raw vectors, score = dot(q, v)
+}
+```
+
+For all metrics, higher score = more relevant.
+
 ## `SearchOpts`
 
 ```rust
 pub struct SearchOpts {
     pub top_k: usize,            // maximum number of results
     pub filter: Filter,          // pre-scoring metadata filter
-    pub min_score: Option<f32>,  // drop results below this cosine
+    pub min_score: Option<f32>,  // drop results below this score
 }
 ```
 
@@ -134,7 +149,7 @@ One search result. Carries its source collection and the matched attrs, but
 pub struct Hit {
     pub collection: String,
     pub id: String,
-    pub score: f32,   // cosine similarity in [-1, 1]
+    pub score: f32,   // meaning depends on the store's Distance metric
     pub attrs: BTreeMap<String, Value>,
 }
 ```

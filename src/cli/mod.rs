@@ -10,7 +10,7 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
 use crate::server::dto::{FootprintDto, HitDto};
-use crate::{Config, Filter, Nidus, OpenMode, Record, Scope, SearchOpts};
+use crate::{Config, Distance, Filter, Nidus, OpenMode, Record, Scope, SearchOpts};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,9 +33,29 @@ struct StoreArgs {
     /// Embedding dimension. Must match the store.
     #[arg(long)]
     dim: usize,
+    /// Distance metric: cosine (default), euclidean, or dot.
+    #[arg(long, default_value = "cosine")]
+    distance: DistanceArg,
     /// Open without taking the writer lock (rejects mutations).
     #[arg(long)]
     read_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum DistanceArg {
+    Cosine,
+    Euclidean,
+    Dot,
+}
+
+impl From<DistanceArg> for Distance {
+    fn from(d: DistanceArg) -> Self {
+        match d {
+            DistanceArg::Cosine => Distance::Cosine,
+            DistanceArg::Euclidean => Distance::Euclidean,
+            DistanceArg::Dot => Distance::DotProduct,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -209,6 +229,7 @@ pub fn run(cli: Cli) -> Result<()> {
             let db = open(&store, false)?;
             print_json(&serde_json::json!({
                 "dimension": db.dimension(),
+                "distance": format!("{:?}", db.config().distance),
                 "collections": db.collections(),
                 "footprint": FootprintDto::from(db.footprint()),
             }))
@@ -227,7 +248,11 @@ fn open(store: &StoreArgs, mutating: bool) -> Result<Nidus> {
     } else {
         OpenMode::ReadOnly
     };
-    Nidus::open(Config::new(store.dir.clone(), store.dim).open_mode(mode))
+    Nidus::open(
+        Config::new(store.dir.clone(), store.dim)
+            .distance(store.distance.into())
+            .open_mode(mode),
+    )
 }
 
 fn serve(store: StoreArgs, addr: &str) -> Result<()> {
@@ -236,7 +261,11 @@ fn serve(store: StoreArgs, addr: &str) -> Result<()> {
     } else {
         OpenMode::ReadWrite
     };
-    let db = Nidus::open(Config::new(store.dir.clone(), store.dim).open_mode(mode))?;
+    let db = Nidus::open(
+        Config::new(store.dir.clone(), store.dim)
+            .distance(store.distance.into())
+            .open_mode(mode),
+    )?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

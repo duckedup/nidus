@@ -12,8 +12,8 @@ use crate::data::DataSegment;
 use crate::filter;
 use crate::lock::WriteLock;
 use crate::log::OpLog;
-use crate::model::{Filter, Footprint, Hit, Op, Record, SearchOpts};
-use crate::search::{TopK, dot, normalize};
+use crate::model::{Distance, Filter, Footprint, Hit, Op, Record, SearchOpts};
+use crate::search::{TopK, dot, euclidean_neg_sq, normalize};
 
 // ── In-RAM types ─────────────────────────────────────────────────────────────
 
@@ -95,7 +95,7 @@ impl Store {
                 );
             }
         }
-        let data = DataSegment::open(&data_path, config.dimension)?;
+        let data = DataSegment::open(&data_path, config.dimension, config.distance)?;
 
         // 4. Open and replay the op log.
         let (log, ops) = OpLog::open(&config.path.join("log"))?;
@@ -176,15 +176,19 @@ impl Store {
 
     /// An in-memory store (no files, no lock). For tests.
     pub fn in_memory(dimension: usize) -> Result<Store> {
-        // Use a dummy path — in-memory stores don't use the file system.
-        // We still need a Config, but with in_memory there are no files.
+        Self::in_memory_with(dimension, Distance::default())
+    }
+
+    /// An in-memory store with a specific distance metric.
+    pub fn in_memory_with(dimension: usize, distance: Distance) -> Result<Store> {
         let config = Config::new("/dev/null/in-memory", dimension)
+            .distance(distance)
             .open_mode(OpenMode::ReadWrite)
             .auto_compact(None);
 
         Ok(Store {
             config,
-            data: DataSegment::in_memory(dimension),
+            data: DataSegment::in_memory_with(dimension, distance),
             log: OpLog::in_memory(),
             lock: None,
             collections: HashMap::new(),
@@ -385,9 +389,12 @@ impl Store {
         // still abort on OOM — std offers no `try_reserve` for either. These are
         // small metadata next to the N×dim×4 vector matrix, which `data.append`
         // reserves fallibly; the `max_vector_bytes` cap guards the dominant memory.
+        let should_normalize = self.config.distance == Distance::Cosine;
         for rec in records {
             let mut v = rec.vector.clone();
-            normalize(&mut v);
+            if should_normalize {
+                normalize(&mut v);
+            }
             match self.data.append(&v) {
                 Ok(row) => staged.push((rec.id.clone(), row, rec.attrs.clone())),
                 Err(e) => {
@@ -535,17 +542,24 @@ impl Store {
             .collect()
     }
 
-    /// Brute-force cosine over the union of `collections`, merged into one ranking
-    /// (one bounded top-k heap fed by every in-scope collection).
+    /// Brute-force search over the union of `collections`, merged into one ranking
+    /// (one bounded top-k heap fed by every in-scope collection). The scoring
+    /// function is determined by the store's [`Distance`] metric.
     pub fn search(
         &self,
         collections: &[&str],
         query: &[f32],
         opts: &SearchOpts,
     ) -> Result<Vec<Hit>> {
-        // Normalize the query once.
         let mut q = query.to_vec();
-        normalize(&mut q);
+        if self.config.distance == Distance::Cosine {
+            normalize(&mut q);
+        }
+
+        let score_fn: fn(&[f32], &[f32]) -> f32 = match self.config.distance {
+            Distance::Cosine | Distance::DotProduct => dot,
+            Distance::Euclidean => euclidean_neg_sq,
+        };
 
         // Gather the in-scope, filter-passing rows as cheap borrowed tuples — no
         // string allocation on this path — then sort by physical row. The scoring
@@ -564,11 +578,9 @@ impl Store {
             .map_err(|_| oom("search scan buffer", scan_cap))?;
         for &col_name in collections {
             let Some(col) = self.collections.get(col_name) else {
-                // Named collection that does not exist — skip silently.
                 continue;
             };
             for (id, entry) in &col.docs {
-                // Apply filter before scoring.
                 if !filter::matches(&opts.filter, &entry.attrs) {
                     continue;
                 }
@@ -577,15 +589,10 @@ impl Store {
         }
         scan.sort_unstable_by_key(|&(row, _, _)| row);
 
-        // The heap carries only *borrowed* identifiers (`&str` into `self`/`collections`)
-        // during the scan — offering one is a cheap pointer copy, so no allocation
-        // happens on the hot per-row path. Strings (and attr clones) are materialized
-        // once, at the end, for the ≤ top_k survivors.
         let mut topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
         for (row, col_name, id) in scan {
             let stored = self.data.row(row);
-            let score = dot(&q, stored);
-            // Apply min_score gate.
+            let score = score_fn(&q, stored);
             if let Some(min) = opts.min_score
                 && score < min
             {
@@ -594,7 +601,6 @@ impl Store {
             topk.offer(score, (col_name, id));
         }
 
-        // Build results — only clone ids/attrs for surviving top-k entries.
         let results = topk
             .into_sorted_desc()
             .into_iter()
@@ -1491,5 +1497,170 @@ mod tests {
             assert_eq!(hits.len(), 1);
             assert!((hits[0].score - 1.0).abs() < 1e-5);
         }
+    }
+
+    // ── Euclidean distance tests ─────────────────────────────────────────
+
+    #[test]
+    fn euclidean_exact_match_scores_zero() {
+        let mut store = Store::in_memory_with(3, Distance::Euclidean).unwrap();
+        store.create_collection("col").unwrap();
+        store
+            .upsert("col", &[rec("doc1", vec![1.0, 2.0, 3.0])])
+            .unwrap();
+        let hits = store
+            .search(&["col"], &[1.0, 2.0, 3.0], &default_opts(5))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].score.abs() < 1e-6,
+            "identical vectors should score 0.0, got {}",
+            hits[0].score
+        );
+    }
+
+    #[test]
+    fn euclidean_ranking_closer_first() {
+        let mut store = Store::in_memory_with(3, Distance::Euclidean).unwrap();
+        store.create_collection("col").unwrap();
+        store
+            .upsert(
+                "col",
+                &[
+                    rec("close", vec![0.9, 0.1, 0.0]),
+                    rec("far", vec![0.0, 1.0, 0.0]),
+                ],
+            )
+            .unwrap();
+        let hits = store
+            .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(5))
+            .unwrap();
+        assert_eq!(hits[0].id, "close", "closer vector should rank first");
+        assert!(hits[0].score > hits[1].score);
+    }
+
+    #[test]
+    fn euclidean_does_not_normalize() {
+        let mut store = Store::in_memory_with(2, Distance::Euclidean).unwrap();
+        store.create_collection("col").unwrap();
+        store.upsert("col", &[rec("doc1", vec![3.0, 4.0])]).unwrap();
+        let records = store.get_all("col");
+        assert_eq!(records[0].vector, vec![3.0, 4.0], "raw vectors preserved");
+    }
+
+    #[test]
+    fn euclidean_min_score_filters() {
+        let mut store = Store::in_memory_with(2, Distance::Euclidean).unwrap();
+        store.create_collection("col").unwrap();
+        store
+            .upsert("col", &[rec("doc1", vec![10.0, 0.0])])
+            .unwrap();
+        let opts = SearchOpts {
+            top_k: 5,
+            filter: Filter::default(),
+            min_score: Some(-1.0),
+        };
+        let hits = store.search(&["col"], &[0.0, 0.0], &opts).unwrap();
+        assert!(
+            hits.is_empty(),
+            "score should be -100, below min_score of -1"
+        );
+    }
+
+    // ── DotProduct distance tests ────────────────────────────────────────
+
+    #[test]
+    fn dotproduct_raw_dot() {
+        let mut store = Store::in_memory_with(3, Distance::DotProduct).unwrap();
+        store.create_collection("col").unwrap();
+        store
+            .upsert(
+                "col",
+                &[rec("a", vec![2.0, 0.0, 0.0]), rec("b", vec![1.0, 0.0, 0.0])],
+            )
+            .unwrap();
+        let hits = store
+            .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(5))
+            .unwrap();
+        assert_eq!(hits[0].id, "a", "higher magnitude should score higher");
+        assert!(
+            (hits[0].score - 2.0).abs() < 1e-6,
+            "score = raw dot product"
+        );
+        assert!((hits[1].score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dotproduct_does_not_normalize() {
+        let mut store = Store::in_memory_with(2, Distance::DotProduct).unwrap();
+        store.create_collection("col").unwrap();
+        store.upsert("col", &[rec("doc1", vec![3.0, 4.0])]).unwrap();
+        let records = store.get_all("col");
+        assert_eq!(records[0].vector, vec![3.0, 4.0], "raw vectors preserved");
+    }
+
+    #[test]
+    fn dotproduct_ranking_by_magnitude() {
+        let mut store = Store::in_memory_with(2, Distance::DotProduct).unwrap();
+        store.create_collection("col").unwrap();
+        store
+            .upsert(
+                "col",
+                &[rec("big", vec![10.0, 0.0]), rec("small", vec![1.0, 0.0])],
+            )
+            .unwrap();
+        let hits = store
+            .search(&["col"], &[1.0, 0.0], &default_opts(5))
+            .unwrap();
+        assert_eq!(hits[0].id, "big");
+        assert!(hits[0].score > hits[1].score);
+    }
+
+    // ── Distance metric persistence tests ────────────────────────────────
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn euclidean_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        {
+            let mut store =
+                Store::open(Config::new(&path, 3).distance(Distance::Euclidean)).unwrap();
+            store.create_collection("col").unwrap();
+            store
+                .upsert("col", &[rec("doc1", vec![1.0, 2.0, 3.0])])
+                .unwrap();
+        }
+        {
+            let store = Store::open(
+                Config::new(&path, 3)
+                    .distance(Distance::Euclidean)
+                    .open_mode(OpenMode::ReadOnly),
+            )
+            .unwrap();
+            let records = store.get_all("col");
+            assert_eq!(records[0].vector, vec![1.0, 2.0, 3.0]);
+            let hits = store
+                .search(&["col"], &[1.0, 2.0, 3.0], &default_opts(5))
+                .unwrap();
+            assert!(hits[0].score.abs() < 1e-6);
+        }
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn distance_mismatch_on_reopen_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        {
+            Store::open(Config::new(&path, 3).distance(Distance::Euclidean)).unwrap();
+        }
+        let res = Store::open(Config::new(&path, 3).distance(Distance::Cosine));
+        assert!(res.is_err());
+        let msg = res.err().unwrap().to_string();
+        assert!(
+            msg.contains("distance"),
+            "error should mention distance: {msg}"
+        );
     }
 }
