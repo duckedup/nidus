@@ -9,7 +9,7 @@ default-members = ["."]
 
 [package]
 name = "nidus"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.96"
 description = "A small, pure-Rust embeddable vector store: brute-force cosine search over a single append-only file. No FFI, no C, no SQL; anyhow its only dependency."
@@ -24,18 +24,55 @@ exclude = [".beads/", ".claude/", ".github/", "AGENTS.md", "justfile", "benchmar
 name = "nidus"
 path = "src/lib.rs"
 
-# One dependency, by design: anyhow (a single pure-Rust crate, no transitive deps,
-# no C, no FFI, sub-second compile). Everything else is std. nidus stays pure safe
-# Rust and fully Miri-checkable, and builds in seconds — unlike a bundled C/C++ store
-# (DuckDB) or a transitively-heavy one (LanceDB).
+# The `nidus` binary: the CLI plus `nidus serve`. Gated behind the non-default
+# `cli` feature (see [features]) so it builds only when asked. `cargo install
+# nidus --features cli` compiles it from source; `cargo binstall nidus` fetches
+# a prebuilt binary (see [package.metadata.binstall]) and needs no feature flag.
+[[bin]]
+name = "nidus"
+path = "src/bin/nidus.rs"
+required-features = ["cli"]
+
+[features]
+# Off by default — that is the whole point. With `cli` off, `cargo add nidus`
+# and `cargo tree -p nidus` (`just deps`) pull NOTHING beyond the four core
+# crates below, and the core build/test/Miri path stays pure and seconds-long.
+# Turning it on adds the binary-only deps (all pure Rust, zero FFI).
+cli = ["dep:clap", "dep:tokio", "dep:axum", "dep:tower", "dep:serde_json"]
+
+# The library's dependency tree, by design, is four small pure-Rust crates with no
+# C and no FFI — so nidus stays fully Miri-checkable and builds in seconds, unlike a
+# bundled C/C++ store (DuckDB) or a transitively-heavy one (LanceDB).
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 crc32fast = "1"
 
+# Binary-only deps — compiled ONLY under `--features cli`, never by library
+# consumers. All pure Rust (no `*-sys`, no bundled C): clap for the CLI, and the
+# tokio/axum/tower stack for `nidus serve`. `nidus serve` wraps the synchronous
+# `Nidus` in `Arc<Mutex<…>>` + `spawn_blocking` — the exact async pattern the
+# README/CLAUDE.md prescribe for async callers.
+clap = { version = "4", features = ["derive"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"], optional = true }
+axum = { version = "0.8", optional = true }
+tower = { version = "0.5", optional = true }
+serde_json = { version = "1", optional = true }
+
 [dev-dependencies]
 tempfile = "3"
+
+# Prebuilt-binary fetch for `cargo binstall nidus`. The crate is named `nidus` but
+# the release assets are `nidus-<target>.tar.gz` (`.zip` on Windows), each holding
+# the bare `nidus` binary at the archive root — so the URL and bin-dir are explicit.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/nidus-{ target }{ archive-suffix }"
+bin-dir = "nidus{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [profile.release]
 lto = "thin"

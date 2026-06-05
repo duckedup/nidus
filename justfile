@@ -19,17 +19,17 @@ fmt:
 fmt-check:
     cargo fmt --all -- --check
 
-# Lint with clippy, deny all warnings
+# Lint with clippy, deny all warnings (pure library — no cli feature)
 lint:
-    cargo clippy --all-targets --all-features -- -D warnings
+    cargo clippy --all-targets -- -D warnings
 
-# Run all tests
+# Run all tests (pure library — no cli feature)
 test:
-    cargo test --all-features
+    cargo test
 
 # Run tests within a single module/path (e.g. `just test-mod log`)
 test-mod MOD:
-    cargo test --all-features {{ MOD }}
+    cargo test {{ MOD }}
 
 # Generate and open the API docs
 doc:
@@ -52,8 +52,37 @@ miri:
 deps:
     cargo tree -p nidus
 
-# Pre-commit / pre-PR checks: format clean, no clippy warnings, tests green
+# Pre-commit / pre-PR checks: format clean, no clippy warnings, tests green.
+# Pure library only — the opt-in `cli` feature has its own gate (`just ci-cli`),
+# kept separate so the core stays a seconds-long, FFI-free build path.
 ci: fmt-check lint test
+
+# ── CLI / server binary (the opt-in `cli` feature) ──────────────────────────
+# Off the core build path on purpose: these pull the binary-only deps (clap +
+# the tokio/axum stack). All pure Rust, but heavier than the library alone.
+
+# Lint the cli feature (binary + server)
+lint-cli:
+    cargo clippy --all-targets --features cli -- -D warnings
+
+# Test the cli feature (binary + server)
+test-cli:
+    cargo test --features cli
+
+# Release build of the `nidus` binary
+build-cli:
+    cargo build --release --features cli
+
+# Install the `nidus` binary from this checkout
+install:
+    cargo install --path . --features cli
+
+# Run `nidus serve` against a store (e.g. `just serve /tmp/store 384`)
+serve DIR DIM *ARGS:
+    cargo run --features cli -- serve --dir {{ DIR }} --dim {{ DIM }} {{ ARGS }}
+
+# Pre-PR checks for the cli feature: format clean, no clippy warnings, tests green
+ci-cli: fmt-check lint-cli test-cli
 
 # ── Docs site (Astro + Starlight, in docs/) ─────────────────────────────────
 
