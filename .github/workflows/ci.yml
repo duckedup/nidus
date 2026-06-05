@@ -33,6 +33,13 @@ jobs:
   # build-mode artifacts vs the release profile), so run them as parallel jobs
   # instead of one sequential job. Each keeps its own cache slot. nidus is pure
   # Rust with a tiny dependency tree, so every one of these is a seconds-long build.
+  #
+  # The first three jobs build the pure library (default features) — the fast,
+  # FFI-free core path. The `*-cli` jobs add `--features cli`, which pulls the
+  # binary-only deps (clap + the tokio/axum stack) and compiles the `nidus`
+  # binary + its server. Keeping them separate means a core-only change never
+  # waits on the heavier cli compile, and the library's purity is checked on its
+  # own. (Miri stays on the pure path below — it can't run the async server.)
   build:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
@@ -42,13 +49,19 @@ jobs:
         include:
           - name: clippy
             components: clippy
-            command: cargo clippy --all-targets --all-features -- -D warnings
+            command: cargo clippy --all-targets -- -D warnings
           - name: test
             components: ""
-            command: cargo test --all-features
+            command: cargo test
           - name: release
             components: ""
             command: cargo build --release
+          - name: clippy-cli
+            components: clippy
+            command: cargo clippy --all-targets --features cli -- -D warnings
+          - name: test-cli
+            components: ""
+            command: cargo test --features cli
     steps:
       - uses: actions/checkout@v6
 

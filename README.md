@@ -92,6 +92,31 @@ See [`examples/demo.rs`](examples/demo.rs) for an end-to-end run (`cargo run
   core to lock you into a runtime. `Arc<RwLock<Nidus>>` gives concurrent searchers +
   one writer; async callers bridge with `spawn_blocking`.
 
+## Command line & server
+
+The same crate ships an optional `nidus` binary: a CLI for working with a store
+directly, and `nidus serve`, a small HTTP server exposing the same operations over
+JSON. The binary is built behind a `cli` feature, so `cargo add nidus` stays
+pure — the library never pulls the binary's dependencies.
+
+```bash
+# Install — prebuilt binary, or from source
+cargo binstall nidus
+cargo install nidus --features cli
+
+# Use it on a store directory (records/queries are JSON)
+nidus create  --dir ./store --dim 3 docs
+echo '[{"id":"a","vector":[1,0,0],"attrs":{}}]' | nidus upsert --dir ./store --dim 3 docs
+echo '[1,0,0]' | nidus search --dir ./store --dim 3 docs -k 5
+
+# Or serve it over HTTP
+nidus serve --dir ./store --dim 768 --addr 127.0.0.1:7700
+```
+
+The server is a thin wrapper over an open store — same storage model, durability,
+and search semantics as the library. See the
+[Command line & server guide](https://nidus.duckedup.org/guides/cli-and-server/).
+
 ## Performance
 
 Every vector store ships a benchmark proving it's the fastest, on synthetic data
@@ -153,12 +178,19 @@ defaults, env vars, or hidden directories.
 ## Development
 
 ```bash
-just test    # all tests
-just ci       # fmt-check + clippy (-D warnings) + test
+just test    # all tests (pure library)
+just ci       # fmt-check + clippy (-D warnings) + test (pure library)
 just miri     # undefined-behavior check (nightly; pure-Rust ⇒ runs end to end)
 just demo     # the end-to-end example
 just deps     # the dependency tree (stays short, all pure Rust)
+
+just ci-cli   # the same gate for the opt-in `cli` feature (binary + server)
+just serve ./store 768   # run `nidus serve` from the checkout
 ```
+
+The core recipes touch only the pure library, keeping its FFI-free, seconds-long
+build path intact; the `cli` feature (which pulls clap + the tokio/axum stack, all
+pure Rust) has its own opt-in recipes.
 
 Rust 1.96+ (pinned via `rust-toolchain.toml`), edition 2024.
 

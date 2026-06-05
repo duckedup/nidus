@@ -53,9 +53,9 @@ bd close <id>         # Complete work
 ## Build & Test
 
 ```bash
-just test          # run all tests
-just ci            # fmt-check + clippy (-D warnings) + test
-just lint          # clippy only
+just test          # run all tests (pure library — no cli feature)
+just ci            # fmt-check + clippy (-D warnings) + test (pure library)
+just lint          # clippy only (pure library)
 just miri          # undefined behavior check via Miri (requires nightly)
 just fmt           # format code
 just build         # debug build
@@ -65,6 +65,33 @@ just deps          # assert the dependency tree is empty
 ```
 
 Rust 1.96+ required (pinned via `rust-toolchain.toml`). Edition 2024.
+
+### The `nidus` binary lives behind the opt-in `cli` feature
+
+The crate ships an optional binary — the CLI plus `nidus serve` (an axum/tokio HTTP
+wrapper, SPEC.md §9). It is gated behind the **non-default `cli` feature**, exactly
+like the benchmarks are a separate member: the core recipes above (`just test`,
+`ci`, `lint`, and Miri) build ONLY the pure library, so `cargo add nidus` and `just
+deps` pull nothing beyond the four core crates and the FFI-free, seconds-long build
+path stays intact. The binary's deps (`clap`, `tokio`, `axum`, `tower`,
+`serde_json` — all still pure Rust, zero FFI) compile only under `--features cli`.
+
+```bash
+just ci-cli        # fmt-check + clippy + test, all with --features cli
+just test-cli      # cargo test --features cli
+just build-cli     # release build of the nidus binary
+just serve DIR DIM # cargo run --features cli -- serve --dir DIR --dim DIM
+just install       # cargo install --path . --features cli
+```
+
+When you touch `src/cli/`, `src/server/`, or `src/bin/`, gate it on the `cli`
+feature and verify with `just ci-cli` (the core `just ci` does not compile it).
+Do NOT move these deps into the default feature set or use them from the library
+modules — that would break the pure-`cargo add nidus` install. The binary adapts
+to the library (wire DTOs mirror `Hit`/`Footprint` in `src/server/dto.rs`), never
+the reverse. `cargo binstall nidus` fetches prebuilt binaries via
+`[package.metadata.binstall]`; `cargo install nidus --features cli` builds from
+source.
 
 ### Pure-Rust dependencies only, zero FFI — enforced
 
@@ -115,7 +142,12 @@ src/
 ├── log.rs       # op-log codec: len + payload + crc32, replay, torn-tail recovery
 ├── lock.rs      # writer exclusion via O_EXCL lock file (pure std, no flock/FFI)
 ├── crc.rs       # ~15-line table CRC32 (zero-dep checksum)
-└── store.rs     # in-RAM index, write/read glue, compaction
+├── store.rs     # in-RAM index, write/read glue, compaction
+│
+│   # ── `cli` feature only (the `nidus` binary) — compiled with --features cli ──
+├── bin/nidus.rs # thin entry point: parse args → cli::run
+├── cli/         # clap subcommands over a store dir (serve, upsert, search, …)
+└── server/      # axum/tokio HTTP wrapper over one Nidus; server/dto.rs = wire types
 ```
 
 **Storage model.** A store is a directory: `data` (append-only flat `f32` matrix,

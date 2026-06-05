@@ -54,6 +54,7 @@ export default defineConfig({
             { label: "Storage & durability", link: "/guides/storage/" },
             { label: "Search & filters", link: "/guides/search/" },
             { label: "Embedding in a host app", link: "/guides/integrating/" },
+            { label: "Command line & server", link: "/guides/cli-and-server/" },
           ],
         },
         {

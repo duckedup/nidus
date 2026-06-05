@@ -28,6 +28,14 @@ mod model;
 mod search;
 mod store;
 
+// The `nidus` binary's guts (CLI + `nidus serve`). Compiled only under the
+// non-default `cli` feature, so library consumers never see them and the core
+// build stays pure. The thin `main` lives in `src/bin/nidus.rs`.
+#[cfg(feature = "cli")]
+pub mod cli;
+#[cfg(feature = "cli")]
+pub mod server;
+
 pub use anyhow::Result;
 pub use config::{Config, Fsync, OpenMode};
 pub use model::{Filter, Footprint, Hit, Predicate, Record, SearchOpts, Value};

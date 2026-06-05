@@ -42,8 +42,73 @@ jobs:
             echo "Tag $TAG does not exist, will release"
           fi
 
-  # nidus is a library, so there are no binaries to build/package — the release
-  # is a crates.io publish plus a GitHub release with notes.
+  # Build the `nidus` binary (the `cli` feature) for each target and upload it as
+  # a release artifact. Asset names are `nidus-<target>.tar.gz` (`.zip` on Windows),
+  # each holding the bare `nidus` binary — matching `[package.metadata.binstall]`
+  # so `cargo binstall nidus` resolves them. The library itself stays pure; only
+  # this opt-in feature pulls the clap/tokio/axum stack.
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cross
+        if: matrix.use_cross
+        run: cross build --release --features cli --target ${{ matrix.target }}
+
+      - name: Build with cargo
+        if: "!matrix.use_cross"
+        run: cargo build --release --features cli --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../nidus-${{ matrix.target }}.tar.gz nidus
+          cd ../../..
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/nidus.exe" -DestinationPath "nidus-${{ matrix.target }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.target }}
+          path: nidus-${{ matrix.target }}.*
+
+  # The library is published to crates.io; the binaries above ride the GitHub
+  # release. `cargo publish` verifies with default features, so it never compiles
+  # the optional cli stack.
   publish-crate:
     name: Publish to crates.io
     needs: check-version
@@ -79,13 +144,19 @@ jobs:
 
   github-release:
     name: Create GitHub Release
-    needs: [check-version, publish-crate]
+    needs: [check-version, build-binaries, publish-crate]
     if: "!failure() && !cancelled() && needs.check-version.outputs.should_release == 'true'"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          merge-multiple: true
 
       - name: Create tag
         run: |
@@ -104,12 +175,22 @@ jobs:
           fi
 
           gh release create "${{ needs.check-version.outputs.tag }}" \
+            nidus-*.tar.gz nidus-*.zip \
             --title "${{ needs.check-version.outputs.tag }}" \
             --latest \
             --notes "## nidus ${{ needs.check-version.outputs.version }}
 
+          As a library:
+
           \`\`\`sh
           cargo add nidus@${{ needs.check-version.outputs.version }}
+          \`\`\`
+
+          As a CLI / server binary:
+
+          \`\`\`sh
+          cargo binstall nidus            # prebuilt binary
+          cargo install nidus --features cli   # from source
           \`\`\`
 
           ### Changes
