@@ -66,6 +66,42 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Negative squared Euclidean distance: −Σ(aᵢ − bᵢ)². Result is in (−∞, 0];
+/// 0 = identical vectors. Higher (closer to zero) = more similar, so the same
+/// top-k heap that works for dot/cosine works here without modification.
+pub fn euclidean_neg_sq(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(
+        a.len(),
+        b.len(),
+        "euclidean_neg_sq: slice lengths must be equal"
+    );
+
+    let mut acc = [0.0f32; DOT_LANES];
+    let mut a_chunks = a.chunks_exact(DOT_LANES);
+    let mut b_chunks = b.chunks_exact(DOT_LANES);
+
+    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        for lane in 0..DOT_LANES {
+            let d = ca[lane] - cb[lane];
+            acc[lane] += d * d;
+        }
+    }
+
+    let mut half = DOT_LANES / 2;
+    while half >= 1 {
+        for lane in 0..half {
+            acc[lane] += acc[lane + half];
+        }
+        half /= 2;
+    }
+    let mut sum = acc[0];
+    for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        let d = x - y;
+        sum += d * d;
+    }
+    -sum
+}
+
 // ── Internal total-order wrapper for f32 scores ──────────────────────────────
 //
 // `BinaryHeap` requires `Ord`. Since `f32` is not `Ord` (NaN), we wrap the
@@ -555,5 +591,54 @@ mod tests {
         for (s, _) in &result {
             assert!((*s - 0.5).abs() < 1e-7);
         }
+    }
+
+    // ── euclidean_neg_sq ─────────────────────────────────────────────────
+
+    #[test]
+    fn euclidean_identical_vectors() {
+        let a = [1.0f32, 2.0, 3.0];
+        assert!((euclidean_neg_sq(&a, &a)).abs() < 1e-7, "identical → 0");
+    }
+
+    #[test]
+    fn euclidean_known_value() {
+        let a = [1.0f32, 0.0, 0.0];
+        let b = [0.0f32, 1.0, 0.0];
+        // ||a-b||² = 1+1 = 2, negated → -2
+        assert!((euclidean_neg_sq(&a, &b) + 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn euclidean_empty_slices() {
+        let a: [f32; 0] = [];
+        assert_eq!(euclidean_neg_sq(&a, &a), 0.0);
+    }
+
+    fn euclidean_naive(a: &[f32], b: &[f32]) -> f32 {
+        -a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>()
+    }
+
+    #[test]
+    fn euclidean_matches_naive_across_lengths() {
+        for len in [0usize, 1, 3, 7, 8, 9, 15, 16, 17, 31, 33, 64, 384, 768] {
+            let a: Vec<f32> = (0..len).map(|i| (i as f32) * 0.013 - 0.5).collect();
+            let b: Vec<f32> = (0..len).map(|i| 0.25 - (i as f32) * 0.007).collect();
+            let got = euclidean_neg_sq(&a, &b);
+            let want = euclidean_naive(&a, &b);
+            let tol = 1e-4 * (len as f32).max(1.0);
+            assert!(
+                (got - want).abs() <= tol,
+                "len={len}: chunked {got} vs naive {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn euclidean_closer_vector_scores_higher() {
+        let q = [1.0f32, 0.0, 0.0];
+        let close = [0.9f32, 0.1, 0.0];
+        let far = [0.0f32, 1.0, 0.0];
+        assert!(euclidean_neg_sq(&q, &close) > euclidean_neg_sq(&q, &far));
     }
 }

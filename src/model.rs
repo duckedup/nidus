@@ -9,6 +9,22 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// The similarity / distance metric used for scoring. Pinned at store creation
+/// (stored in the data header) — reopening with a different metric is an error.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Distance {
+    /// Cosine similarity: vectors are unit-normalized on insert, score = dot(q, v).
+    /// Range \[−1, 1\]; 1 = identical direction.
+    #[default]
+    Cosine,
+    /// Negative squared Euclidean distance: vectors stored as-is,
+    /// score = −‖q − v‖². Range (−∞, 0\]; 0 = identical.
+    Euclidean,
+    /// Raw dot product: vectors stored as-is, score = dot(q, v).
+    /// Range (−∞, ∞); magnitude carries signal.
+    DotProduct,
+}
+
 /// A typed metadata value attached to a [`Record`].
 ///
 /// `Null` is **distinct from an absent key**: absence means "not set / not indexed",

@@ -27,12 +27,16 @@ Both install a single `nidus` executable.
 ## Command line
 
 Every command takes the store directory (`--dir`/`-d`) and the embedding
-dimension (`--dim`), which must match the store. Records, query vectors, and
-filters are JSON; output is JSON on stdout.
+dimension (`--dim`), which must match the store. An optional `--distance` flag
+selects the metric (`cosine`, `euclidean`, or `dot`; default `cosine`). Records,
+query vectors, and filters are JSON; output is JSON on stdout.
 
 ```bash
-# Create a collection
+# Create a collection (default cosine distance)
 nidus create --dir ./store --dim 3 docs
+
+# Or with Euclidean distance
+nidus create --dir ./store --dim 3 --distance euclidean docs
 
 # Upsert records (JSON array) from stdin or a --file
 echo '[{"id":"a","vector":[1,0,0],"attrs":{"lang":{"Str":"rust"}}}]' \

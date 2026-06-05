@@ -4,6 +4,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::model::Distance;
+
 /// How aggressively writes are flushed to disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fsync {
@@ -31,6 +33,9 @@ pub struct Config {
     pub path: PathBuf,
     /// The pinned embedding dimension (REQUIRED). Must match the on-disk header.
     pub dimension: usize,
+    /// The similarity / distance metric. Pinned at store creation; must match the
+    /// on-disk header on reopen. Default [`Distance::Cosine`].
+    pub distance: Distance,
     /// Durability granularity. Default [`Fsync::PerBatch`].
     pub fsync: Fsync,
     /// Read/write vs read-only. Default [`OpenMode::ReadWrite`].
@@ -56,12 +61,19 @@ impl Config {
         Self {
             path: path.into(),
             dimension,
+            distance: Distance::default(),
             fsync: Fsync::PerBatch,
             open_mode: OpenMode::ReadWrite,
             auto_compact: Some(0.5),
             lock_ttl: Duration::from_secs(60),
             max_vector_bytes: None,
         }
+    }
+
+    /// Set the distance metric.
+    pub fn distance(mut self, d: Distance) -> Self {
+        self.distance = d;
+        self
     }
 
     /// Set the fsync policy.
