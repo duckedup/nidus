@@ -1,6 +1,6 @@
 ---
 title: Search & filters
-description: Scoped search across nidus collections with three distance metrics, int8 quantization, metadata-only queries, and the Eq / Glob / In filter predicates.
+description: Scoped search across nidus collections with three distance metrics, int8 quantization, metadata-only queries, and equality / glob / set / range filter predicates.
 ---
 
 Search in nidus is exact brute-force over a scope you choose, using one of three
@@ -105,16 +105,31 @@ let filter = Filter(vec![
         Value::Str("rust".into()),
         Value::Str("go".into()),
     ]),
+    // AND attrs["ts"] is at least this (numeric range)
+    Predicate::Ge("ts".into(), Value::Int(1_700_000_000)),
+    // AND attrs["status"] is present and not "archived"
+    Predicate::Ne("status".into(), Value::Str("archived".into())),
 ]);
 # anyhow::Ok(())
 ```
 
-The three predicates:
+The predicates:
 
-- **`Eq(key, value)`** — `attrs[key]` equals `value` exactly (any `Value` type).
+- **`Eq(key, value)`** / **`Ne(key, value)`** — `attrs[key]` equals / does not equal
+  `value` (any `Value` type, typed).
 - **`Glob(key, pattern)`** — `attrs[key]` is a `Str` matching the glob. Supports
   `*`, `?`, and `[...]` character classes.
-- **`In(key, values)`** — `attrs[key]` equals one of the values in the set.
+- **`In(key, values)`** / **`NotIn(key, values)`** — `attrs[key]` is / is not one of
+  the values in the set.
+- **`Lt` / `Le` / `Gt` / `Ge(key, value)`** — ordered range comparison, **same-type
+  and orderable only**: `Int` numeric, `Str` lexical, `Bool` (`false < true`). A
+  cross-type or non-orderable (`Null`, `List`) comparison never matches.
+
+Every predicate is a positive assertion about a **present** attribute: a record that
+lacks `key` matches *nothing* — including `Ne` / `NotIn` and the range predicates. (So
+`Ne("status", "archived")` does not match a record with no `status` at all.) There is
+no OR/disjunction — a `Filter` is always an AND; compose at the call site if you need
+alternatives.
 
 Filters can also drive deletion without a search:
 

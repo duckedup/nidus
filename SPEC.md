@@ -169,8 +169,14 @@ pub struct Hit { pub collection: String, pub id: String, pub score: f32, pub att
 pub struct Filter(pub Vec<Predicate>);   // AND of predicates
 pub enum Predicate {
     Eq(String, Value),                   // attr == value
+    Ne(String, Value),                   // attr present and != value
     Glob(String, String),                // attr (Str) matches glob pattern
     In(String, Vec<Value>),              // attr ∈ set
+    NotIn(String, Vec<Value>),           // attr present and ∉ set
+    Lt(String, Value),                   // attr <  value  (same-type, orderable)
+    Le(String, Value),                   // attr <= value
+    Gt(String, Value),                   // attr >  value
+    Ge(String, Value),                   // attr >= value
 }
 
 // A cheap, allocation-free footprint snapshot (§6.6). `vector_bytes` is the
@@ -437,10 +443,15 @@ reliable guard there is to refuse work *before* allocating:
   displaces a real result. `normalize` leaves a zero / non-finite / near-zero
   (`< ~1e-12`) vector unchanged, so it scores 0 against everything.
 - **Filters** (`Filter` = AND of `Predicate`s) are evaluated against `attrs` before
-  scoring: `Eq` (typed equality), `Glob` (pattern match on a `Str` attr, §7.1),
-  `In` (membership). This covers typical needs: path-prefix scoping
-  (`Glob "path*"`), type/language/kind equality, exact-path matches, glob-based
-  bulk deletes, and presence sweeps (e.g. collect one attr across a kind).
+  scoring: `Eq` (typed equality), `Ne` (typed inequality), `Glob` (pattern match on a
+  `Str` attr, §7.1), `In` / `NotIn` (set membership), and `Lt`/`Le`/`Gt`/`Ge` (ordered
+  range comparison). This covers typical needs: path-prefix scoping (`Glob "path*"`),
+  type/language/kind equality, exact-path matches, glob-based bulk deletes, presence
+  sweeps, numeric/date ranges (`Ge "ts" 1700000000`), and exclusions (`Ne "status"
+  "archived"`). The range predicates are **same-type and orderable only**: `Int`
+  numeric, `Str` lexical, `Bool` (`false < true`); a cross-type or non-orderable
+  (`Null`, `List`) comparison never matches. OR/disjunction is intentionally absent —
+  compose at the call site, or it is a future additive extension.
 
 ### 7.1 Glob subset
 `glob.rs` implements the GLOB subset callers actually use: `*` (any run, incl.
@@ -452,8 +463,11 @@ as a literal `[`. This matches common SQL `GLOB` semantics so an application
 migrating off such a backend behaves identically.
 
 `filter::matches` AND-combines predicates (empty filter matches everything); an
-absent key fails every predicate — except `Eq(key, Null)`, which requires the key
-to be *present* and equal to `Null` (absent ≠ `Null`, per §3).
+absent key fails **every** predicate — including the negative ones (`Ne`, `NotIn`)
+and the range ones. Each predicate is a positive assertion about a *present*
+attribute, so a record lacking the key is never a match (e.g. `Ne "status"
+"archived"` does not match a record with no `status`). `Eq(key, Null)` likewise
+requires the key to be present and equal to `Null` (absent ≠ `Null`, per §3).
 
 ---
 
