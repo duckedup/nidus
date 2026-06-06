@@ -25,6 +25,23 @@ pub enum Distance {
     DotProduct,
 }
 
+/// Configuration for int8 scalar quantization. When enabled, the store maintains
+/// an in-memory int8 vector matrix for faster first-pass scoring, then re-ranks
+/// the top candidates using the original f32 vectors for accuracy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quantization {
+    /// Overscan factor: the int8 first-pass selects `top_k * rescore` candidates,
+    /// then the f32 rerank picks the true top-k. Higher = better recall, slower.
+    /// Default: 4.
+    pub rescore: usize,
+}
+
+impl Default for Quantization {
+    fn default() -> Self {
+        Self { rescore: 4 }
+    }
+}
+
 /// A typed metadata value attached to a [`Record`].
 ///
 /// `Null` is **distinct from an absent key**: absence means "not set / not indexed",

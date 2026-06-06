@@ -1,6 +1,6 @@
 ---
 title: Search & filters
-description: Scoped search across nidus collections with three distance metrics, typed metadata, and the Eq / Glob / In filter predicates applied before scoring.
+description: Scoped search across nidus collections with three distance metrics, int8 quantization, metadata-only queries, and the Eq / Glob / In filter predicates.
 ---
 
 Search in nidus is exact brute-force over a scope you choose, using one of three
@@ -125,3 +125,46 @@ db.delete_where("code", &Filter(vec![
 ]))?;
 # anyhow::Ok(())
 ```
+
+## Metadata-only queries
+
+Use `list` to retrieve records by metadata filter without a vector query. Results
+come back in insertion order with `score: 0.0`.
+
+```rust
+use nidus::{Filter, Predicate, Value};
+
+let hits = db.list("code", &Filter(vec![
+    Predicate::Eq("lang".into(), Value::Str("rust".into())),
+]), 100)?;
+# anyhow::Ok(())
+```
+
+`list` accepts a [`Scope`](/reference/api/#scope) just like `search`, so you can
+list across multiple collections or the whole store.
+
+## int8 scalar quantization
+
+For larger collections, enable int8 scalar quantization to speed up search.
+The store maintains a quantized int8 copy of all vectors in RAM. Search runs
+in two passes: a fast int8 first-pass selects candidates (overscanning by a
+configurable factor), then f32 re-ranks for accuracy.
+
+```rust
+use nidus::{Config, Quantization};
+
+let db = Nidus::open(
+    Config::new("./store", 768)
+        .quantization(Some(Quantization { rescore: 4 }))
+)?;
+# anyhow::Ok(())
+```
+
+The `rescore` factor controls the quality/speed tradeoff: `rescore: 4` means
+the int8 pass selects `top_k * 4` candidates before f32 re-ranking. Higher
+values improve recall at the cost of more f32 scoring work. The default is 4.
+
+Quantization is purely a runtime optimization — it doesn't change the on-disk
+format, and a store opened without quantization produces identical results
+(just slower for large scans). Enable it when search latency matters and you
+have enough vectors for the int8 first-pass to save meaningful work.

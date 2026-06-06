@@ -52,6 +52,9 @@ echo '[1,0,0]' | nidus search --dir ./store --dim 3
 echo '[1,0,0]' | nidus search --dir ./store --dim 3 docs \
   --where '[{"Eq":["lang",{"Str":"rust"}]}]'
 
+# List records by metadata filter (no vector query)
+nidus list --dir ./store --dim 3 docs --where '[{"Eq":["lang",{"Str":"rust"}]}]'
+
 # Inspect, maintain
 nidus collections --dir ./store --dim 3
 nidus get        --dir ./store --dim 3 docs
@@ -90,6 +93,7 @@ The endpoints map one-to-one onto the library API:
 | `POST /collections/{name}/delete` | delete by ids or filter |
 | `GET /collections/{name}/records` | all records in a collection |
 | `POST /search` | nearest-neighbour search |
+| `POST /list` | metadata-only query (no vector) |
 | `POST /flush` | flush to disk |
 | `POST /compact` | reclaim dead rows |
 

@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::model::Distance;
+use crate::model::{Distance, Quantization};
 
 /// How aggressively writes are flushed to disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +53,10 @@ pub struct Config {
     /// `try_reserve` never fires. Counts physical rows incl. not-yet-compacted dead
     /// rows, so `compact` can reclaim headroom.
     pub max_vector_bytes: Option<u64>,
+    /// int8 scalar quantization for faster search. `None` disables (the default).
+    /// When enabled, the store maintains an in-memory int8 vector matrix and uses
+    /// a two-pass search: int8 first-pass → f32 rerank.
+    pub quantization: Option<Quantization>,
 }
 
 impl Config {
@@ -67,6 +71,7 @@ impl Config {
             auto_compact: Some(0.5),
             lock_ttl: Duration::from_secs(60),
             max_vector_bytes: None,
+            quantization: None,
         }
     }
 
@@ -103,6 +108,12 @@ impl Config {
     /// Set the vector-matrix size ceiling (`None` to disable).
     pub fn max_vector_bytes(mut self, bytes: Option<u64>) -> Self {
         self.max_vector_bytes = bytes;
+        self
+    }
+
+    /// Enable int8 scalar quantization for faster search.
+    pub fn quantization(mut self, q: Option<Quantization>) -> Self {
+        self.quantization = q;
         self
     }
 }

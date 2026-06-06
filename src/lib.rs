@@ -38,7 +38,9 @@ pub mod server;
 
 pub use anyhow::Result;
 pub use config::{Config, Fsync, OpenMode};
-pub use model::{Distance, Filter, Footprint, Hit, Predicate, Record, SearchOpts, Value};
+pub use model::{
+    Distance, Filter, Footprint, Hit, Predicate, Quantization, Record, SearchOpts, Value,
+};
 
 use std::collections::BTreeMap;
 use std::path::Path;

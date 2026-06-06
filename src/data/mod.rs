@@ -278,6 +278,11 @@ impl DataSegment {
         (self.vectors.len() / self.dimension.max(1)) as u64
     }
 
+    /// Borrow the entire flat f32 buffer (all rows, contiguous).
+    pub fn vectors(&self) -> &[f32] {
+        &self.vectors
+    }
+
     /// Borrow row `i` as a `dimension`-length slice.
     pub fn row(&self, i: u64) -> &[f32] {
         let dim = self.dimension;
