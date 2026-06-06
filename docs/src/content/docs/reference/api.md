@@ -52,6 +52,7 @@ searchers plus one writer (see
 
 | Method | Signature | Notes |
 | ------ | --------- | ----- |
+| `list` | `fn list<'a>(&self, scope: impl Into<Scope<'a>>, filter: &Filter, limit: usize) -> Result<Vec<Hit>>` | Metadata-only query — no vector, returns filter-matched records in insertion order. |
 | `search` | `fn search<'a>(&self, scope: impl Into<Scope<'a>>, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>` | Ranked search over a scope using the store's distance metric. |
 | `flush` | `fn flush(&mut self) -> Result<()>` | Force an fsync (relevant under `Fsync::OnFlush`). |
 | `compact` | `fn compact(&mut self) -> Result<()>` | Rewrite `data` to reclaim dead rows. |
@@ -167,5 +168,16 @@ pub struct Footprint {
     pub dimension: usize,
     pub vector_bytes: u64,  // rows * dimension * 4 — what max_vector_bytes caps
     pub doc_count: usize,   // live documents across all collections
+}
+```
+
+## `Quantization`
+
+Configuration for int8 scalar quantization. Pass to `Config::quantization` to
+enable two-pass search (int8 first-pass → f32 rerank).
+
+```rust
+pub struct Quantization {
+    pub rescore: usize,  // overscan factor (default 4)
 }
 ```

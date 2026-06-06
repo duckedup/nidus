@@ -10,7 +10,7 @@ choice**: nidus contributes no path defaults, env vars, or hidden directories.
 
 ```rust
 use std::time::Duration;
-use nidus::{Config, Distance, Fsync, OpenMode};
+use nidus::{Config, Distance, Fsync, OpenMode, Quantization};
 
 let cfg = Config::new("/path/to/store", 768)
     .distance(Distance::Cosine)      // similarity metric (default)
@@ -18,7 +18,8 @@ let cfg = Config::new("/path/to/store", 768)
     .open_mode(OpenMode::ReadWrite)  // ReadOnly = no lock, search-only
     .auto_compact(Some(0.5))         // compact on open above this dead-row ratio
     .lock_ttl(Duration::from_secs(60))
-    .max_vector_bytes(None);         // no ceiling (default)
+    .max_vector_bytes(None)          // no ceiling (default)
+    .quantization(None);             // int8 two-pass search (default: off)
 # let _ = cfg;
 ```
 
@@ -73,6 +74,13 @@ the kernel SIGKILLs the process before an allocation fails and `try_reserve`
 never fires. It counts physical rows including not-yet-compacted dead rows, so
 `compact()` can reclaim headroom. Pair it with
 [`footprint()`](/reference/api/#footprint) to decide whether more data fits.
+
+### `quantization`
+
+`Option<Quantization>` — default `None` (disabled). When set, the store
+maintains an in-memory int8 copy of all vectors and uses a two-pass search:
+int8 first-pass → f32 rerank. See
+[int8 scalar quantization](/guides/search/#int8-scalar-quantization) for details.
 
 ## `Fsync`
 

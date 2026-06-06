@@ -102,6 +102,128 @@ pub fn euclidean_neg_sq(a: &[f32], b: &[f32]) -> f32 {
     -sum
 }
 
+// ── int8 quantization helpers ─────────────────────────────────────────────────
+
+/// Per-dimension quantization parameters: (offset, scale) where
+/// `q = round((v - offset) * scale)` and `scale = 255 / (max - min)`.
+/// A dimension with zero range gets `scale = 0` and all values quantize to 0.
+pub struct QuantParams {
+    pub offsets: Vec<f32>,
+    pub scales: Vec<f32>,
+}
+
+impl QuantParams {
+    /// Compute per-dimension min/max from all f32 vectors, then derive offsets and scales.
+    pub fn from_vectors(vectors: &[f32], dim: usize) -> Self {
+        let n = vectors.len().checked_div(dim).unwrap_or(0);
+        let mut offsets = vec![0.0f32; dim];
+        let mut scales = vec![0.0f32; dim];
+        if n == 0 {
+            return Self { offsets, scales };
+        }
+        let mut mins = vec![f32::INFINITY; dim];
+        let mut maxs = vec![f32::NEG_INFINITY; dim];
+        for row in 0..n {
+            let base = row * dim;
+            for d in 0..dim {
+                let v = vectors[base + d];
+                if v < mins[d] {
+                    mins[d] = v;
+                }
+                if v > maxs[d] {
+                    maxs[d] = v;
+                }
+            }
+        }
+        for d in 0..dim {
+            offsets[d] = mins[d];
+            let range = maxs[d] - mins[d];
+            scales[d] = if range > 0.0 { 255.0 / range } else { 0.0 };
+        }
+        Self { offsets, scales }
+    }
+
+    /// Quantize one f32 vector to u8.
+    pub fn quantize(&self, v: &[f32], out: &mut [u8]) {
+        for (i, &val) in v.iter().enumerate() {
+            let q = (val - self.offsets[i]) * self.scales[i];
+            out[i] = q.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    /// Quantize all f32 vectors into a flat u8 matrix.
+    pub fn quantize_all(&self, vectors: &[f32], dim: usize) -> Vec<u8> {
+        let n = vectors.len().checked_div(dim).unwrap_or(0);
+        let mut out = vec![0u8; n * dim];
+        for row in 0..n {
+            let f_base = row * dim;
+            let q_base = row * dim;
+            self.quantize(
+                &vectors[f_base..f_base + dim],
+                &mut out[q_base..q_base + dim],
+            );
+        }
+        out
+    }
+}
+
+/// Approximate dot product between two u8 vectors. Uses u32 accumulation to avoid
+/// overflow (255 * 255 * dim fits u32 for dim ≤ ~66k).
+pub fn dot_u8(a: &[u8], b: &[u8]) -> u32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = [0u32; DOT_LANES];
+    let mut a_chunks = a.chunks_exact(DOT_LANES);
+    let mut b_chunks = b.chunks_exact(DOT_LANES);
+
+    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        for lane in 0..DOT_LANES {
+            acc[lane] += ca[lane] as u32 * cb[lane] as u32;
+        }
+    }
+
+    let mut half = DOT_LANES / 2;
+    while half >= 1 {
+        for lane in 0..half {
+            acc[lane] += acc[lane + half];
+        }
+        half /= 2;
+    }
+    let mut sum = acc[0];
+    for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        sum += *x as u32 * *y as u32;
+    }
+    sum
+}
+
+/// Approximate negative squared Euclidean distance between two u8 vectors.
+pub fn euclidean_neg_sq_u8(a: &[u8], b: &[u8]) -> i32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = [0i32; DOT_LANES];
+    let mut a_chunks = a.chunks_exact(DOT_LANES);
+    let mut b_chunks = b.chunks_exact(DOT_LANES);
+
+    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        for lane in 0..DOT_LANES {
+            let d = ca[lane] as i32 - cb[lane] as i32;
+            acc[lane] += d * d;
+        }
+    }
+
+    let mut half = DOT_LANES / 2;
+    while half >= 1 {
+        for lane in 0..half {
+            acc[lane] += acc[lane + half];
+        }
+        half /= 2;
+    }
+    let mut sum = acc[0];
+    for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        let d = *x as i32 - *y as i32;
+        sum += d * d;
+    }
+    -sum
+}
+
 // ── Internal total-order wrapper for f32 scores ──────────────────────────────
 //
 // `BinaryHeap` requires `Ord`. Since `f32` is not `Ord` (NaN), we wrap the
@@ -640,5 +762,55 @@ mod tests {
         let close = [0.9f32, 0.1, 0.0];
         let far = [0.0f32, 1.0, 0.0];
         assert!(euclidean_neg_sq(&q, &close) > euclidean_neg_sq(&q, &far));
+    }
+
+    // ── int8 quantization helpers ────────────────────────────────────────
+
+    #[test]
+    fn quant_params_round_trip() {
+        // dim=2, rows: [0.0, 1.0], [1.0, 0.0]
+        // per-dim min: [0, 0], max: [1, 1], scale: [255, 255]
+        let vecs = [0.0f32, 1.0, 1.0, 0.0];
+        let params = QuantParams::from_vectors(&vecs, 2);
+        let q = params.quantize_all(&vecs, 2);
+        assert_eq!(q.len(), 4);
+        assert_eq!(q[0], 0); // (0.0 - 0.0) * 255 = 0
+        assert_eq!(q[1], 255); // (1.0 - 0.0) * 255 = 255
+        assert_eq!(q[2], 255); // (1.0 - 0.0) * 255 = 255
+        assert_eq!(q[3], 0); // (0.0 - 0.0) * 255 = 0
+    }
+
+    #[test]
+    fn quant_params_zero_range() {
+        let vecs = [5.0f32, 5.0, 5.0, 5.0];
+        let params = QuantParams::from_vectors(&vecs, 2);
+        let q = params.quantize_all(&vecs, 2);
+        assert!(q.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn dot_u8_known_value() {
+        let a = [255u8, 0, 128];
+        let b = [1u8, 255, 128];
+        // 255*1 + 0*255 + 128*128 = 16639
+        assert_eq!(dot_u8(&a, &b), 16639);
+    }
+
+    #[test]
+    fn dot_u8_empty() {
+        assert_eq!(dot_u8(&[], &[]), 0);
+    }
+
+    #[test]
+    fn euclidean_neg_sq_u8_identical() {
+        let a = [100u8, 200, 50];
+        assert_eq!(euclidean_neg_sq_u8(&a, &a), 0);
+    }
+
+    #[test]
+    fn euclidean_neg_sq_u8_known() {
+        let a = [10u8, 0];
+        let b = [0u8, 10];
+        assert_eq!(euclidean_neg_sq_u8(&a, &b), -(100 + 100));
     }
 }

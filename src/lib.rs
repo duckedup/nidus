@@ -38,7 +38,9 @@ pub mod server;
 
 pub use anyhow::Result;
 pub use config::{Config, Fsync, OpenMode};
-pub use model::{Distance, Filter, Footprint, Hit, Predicate, Record, SearchOpts, Value};
+pub use model::{
+    Distance, Filter, Footprint, Hit, Predicate, Quantization, Record, SearchOpts, Value,
+};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -154,6 +156,23 @@ impl Nidus {
 
     pub fn get_all(&self, collection: &str) -> Vec<Record> {
         self.store.get_all(collection)
+    }
+
+    /// List records matching `filter` across a [`Scope`], without vector scoring.
+    /// Returns up to `limit` hits in insertion order, all with `score: 0.0`.
+    pub fn list<'a>(
+        &self,
+        scope: impl Into<Scope<'a>>,
+        filter: &Filter,
+        limit: usize,
+    ) -> Result<Vec<Hit>> {
+        let names: Vec<String> = match scope.into() {
+            Scope::Collection(c) => vec![c.to_string()],
+            Scope::Collections(cs) => cs.iter().map(|s| s.to_string()).collect(),
+            Scope::All => self.store.collections(),
+        };
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.store.list(&refs, filter, limit)
     }
 
     /// Search a [`Scope`] — one collection, a subset, or the whole store — for the

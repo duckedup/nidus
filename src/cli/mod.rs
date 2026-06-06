@@ -112,6 +112,19 @@ enum Command {
         #[arg(long = "where")]
         filter: Option<String>,
     },
+    /// List records by metadata filter (no vector query).
+    List {
+        #[command(flatten)]
+        store: StoreArgs,
+        /// Collections to list from; omit to list from every collection.
+        collections: Vec<String>,
+        /// Maximum number of results.
+        #[arg(long, short = 'n', default_value_t = 100)]
+        limit: usize,
+        /// AND-filter as JSON, e.g. '[{"Eq":["lang",{"Str":"rust"}]}]'.
+        #[arg(long = "where")]
+        filter: Option<String>,
+    },
     /// Print every record in a collection (JSON).
     Get {
         #[command(flatten)]
@@ -193,6 +206,26 @@ pub fn run(cli: Cli) -> Result<()> {
                 db.search(Scope::All, &query, &opts)?
             } else {
                 db.search(Scope::Collections(&refs), &query, &opts)?
+            };
+            let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
+            print_json(&out)
+        }
+        Command::List {
+            store,
+            collections,
+            limit,
+            filter,
+        } => {
+            let db = open(&store, false)?;
+            let filter = match filter {
+                Some(s) => serde_json::from_str(&s)?,
+                None => Filter::default(),
+            };
+            let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
+            let hits = if refs.is_empty() {
+                db.list(Scope::All, &filter, limit)?
+            } else {
+                db.list(Scope::Collections(&refs), &filter, limit)?
             };
             let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
             print_json(&out)

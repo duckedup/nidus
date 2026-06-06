@@ -12,8 +12,10 @@ use crate::data::DataSegment;
 use crate::filter;
 use crate::lock::WriteLock;
 use crate::log::OpLog;
-use crate::model::{Distance, Filter, Footprint, Hit, Op, Record, SearchOpts};
-use crate::search::{TopK, dot, euclidean_neg_sq, normalize};
+use crate::model::{Distance, Filter, Footprint, Hit, Op, Quantization, Record, SearchOpts};
+use crate::search::{
+    QuantParams, TopK, dot, dot_u8, euclidean_neg_sq, euclidean_neg_sq_u8, normalize,
+};
 
 // ── In-RAM types ─────────────────────────────────────────────────────────────
 
@@ -50,6 +52,13 @@ fn oom(what: &str, count: usize) -> anyhow::Error {
 /// The on-disk + in-RAM store backing [`Nidus`](crate::Nidus). Implementers choose
 /// the internal layout (per-collection `id → (row, attrs)` maps, dead-row counter,
 /// held lock, etc.) but must keep these signatures — `lib.rs` calls them verbatim.
+/// int8 quantization state, maintained in RAM when `Config::quantization` is set.
+struct QuantState {
+    params: QuantParams,
+    vectors: Vec<u8>,
+    cfg: Quantization,
+}
+
 pub struct Store {
     config: Config,
     data: DataSegment,
@@ -61,6 +70,8 @@ pub struct Store {
     collections: HashMap<String, Collection>,
     /// Rows no longer referenced (deleted or overwritten), for compaction tracking.
     dead_rows: usize,
+    /// int8 scalar quantization state (None when quantization is off).
+    quant: Option<QuantState>,
 }
 
 impl Store {
@@ -153,6 +164,12 @@ impl Store {
             }
         }
 
+        let quant = config.quantization.map(|cfg| QuantState {
+            params: QuantParams::from_vectors(&[], 0),
+            vectors: Vec::new(),
+            cfg,
+        });
+
         let mut store = Store {
             config,
             data,
@@ -160,6 +177,7 @@ impl Store {
             lock,
             collections,
             dead_rows,
+            quant,
         };
 
         // 6. Auto-compact if the dead-row ratio exceeds the threshold.
@@ -171,6 +189,9 @@ impl Store {
             }
         }
 
+        // 7. Build int8 quantization state if enabled.
+        store.rebuild_quant();
+
         Ok(store)
     }
 
@@ -181,22 +202,43 @@ impl Store {
 
     /// An in-memory store with a specific distance metric.
     pub fn in_memory_with(dimension: usize, distance: Distance) -> Result<Store> {
-        let config = Config::new("/dev/null/in-memory", dimension)
-            .distance(distance)
-            .open_mode(OpenMode::ReadWrite)
-            .auto_compact(None);
+        Self::in_memory_cfg(
+            Config::new("/dev/null/in-memory", dimension)
+                .distance(distance)
+                .open_mode(OpenMode::ReadWrite)
+                .auto_compact(None),
+        )
+    }
 
+    /// An in-memory store with full config control.
+    pub fn in_memory_cfg(config: Config) -> Result<Store> {
+        let quant = config.quantization.map(|cfg| QuantState {
+            params: QuantParams::from_vectors(&[], 0),
+            vectors: Vec::new(),
+            cfg,
+        });
         Ok(Store {
-            config,
-            data: DataSegment::in_memory_with(dimension, distance),
+            data: DataSegment::in_memory_with(config.dimension, config.distance),
             log: OpLog::in_memory(),
             lock: None,
             collections: HashMap::new(),
             dead_rows: 0,
+            quant,
+            config,
         })
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// (Re)build the int8 quantization state from the current f32 data segment.
+    fn rebuild_quant(&mut self) {
+        if let Some(ref mut qs) = self.quant {
+            let dim = self.data.dimension();
+            let all_floats = self.data.vectors();
+            qs.params = QuantParams::from_vectors(all_floats, dim);
+            qs.vectors = qs.params.quantize_all(all_floats, dim);
+        }
+    }
 
     /// Reject mutations when in ReadOnly mode.
     fn check_writable(&self) -> Result<()> {
@@ -457,6 +499,7 @@ impl Store {
             count += 1;
         }
 
+        self.rebuild_quant();
         Ok(count)
     }
 
@@ -542,9 +585,59 @@ impl Store {
             .collect()
     }
 
+    /// List records matching `filter` across `collections`, without vector scoring.
+    /// Returns up to `limit` hits in insertion order (row index), all with `score: 0.0`.
+    pub fn list(&self, collections: &[&str], filter: &Filter, limit: usize) -> Result<Vec<Hit>> {
+        let mut scan: Vec<(u64, &str, &str)> = Vec::new();
+        let scan_cap: usize = collections
+            .iter()
+            .filter_map(|c| self.collections.get(*c))
+            .map(|c| c.docs.len())
+            .sum();
+        scan.try_reserve(scan_cap)
+            .map_err(|_| oom("list scan buffer", scan_cap))?;
+        for &col_name in collections {
+            let Some(col) = self.collections.get(col_name) else {
+                continue;
+            };
+            for (id, entry) in &col.docs {
+                if !filter::matches(filter, &entry.attrs) {
+                    continue;
+                }
+                scan.push((entry.row, col_name, id.as_str()));
+            }
+        }
+        scan.sort_unstable_by_key(|&(row, _, _)| row);
+        if scan.len() > limit {
+            scan.truncate(limit);
+        }
+
+        let results = scan
+            .into_iter()
+            .map(|(_, collection, id)| {
+                let attrs = self
+                    .collections
+                    .get(collection)
+                    .and_then(|c| c.docs.get(id))
+                    .map(|e| e.attrs.clone())
+                    .unwrap_or_default();
+                Hit {
+                    collection: collection.to_string(),
+                    id: id.to_string(),
+                    score: 0.0,
+                    attrs,
+                }
+            })
+            .collect();
+        Ok(results)
+    }
+
     /// Brute-force search over the union of `collections`, merged into one ranking
     /// (one bounded top-k heap fed by every in-scope collection). The scoring
     /// function is determined by the store's [`Distance`] metric.
+    ///
+    /// When int8 quantization is enabled, the first pass scores with int8 vectors
+    /// (overscanning by the rescore factor), then re-ranks the candidates with f32.
     pub fn search(
         &self,
         collections: &[&str],
@@ -561,13 +654,8 @@ impl Store {
             Distance::Euclidean => euclidean_neg_sq,
         };
 
-        // Gather the in-scope, filter-passing rows as cheap borrowed tuples — no
-        // string allocation on this path — then sort by physical row. The scoring
-        // loop below then walks the data matrix in storage order, so the CPU
-        // prefetcher streams the (row-major, contiguous) `f32` buffer instead of
-        // chasing the arbitrary order a `HashMap` iterator hands back. At small
-        // dimensions, where the dot is cheap relative to a row-boundary cache miss,
-        // this is the difference between memory-bandwidth-bound and miss-bound.
+        // Gather the in-scope, filter-passing rows sorted by physical row for
+        // cache-friendly sequential access.
         let mut scan: Vec<(u64, &str, &str)> = Vec::new();
         let scan_cap: usize = collections
             .iter()
@@ -589,8 +677,17 @@ impl Store {
         }
         scan.sort_unstable_by_key(|&(row, _, _)| row);
 
+        // Two-pass quantized search if enabled and we have enough candidates.
+        if let Some(ref qs) = self.quant {
+            let dim = self.data.dimension();
+            if !qs.vectors.is_empty() && dim > 0 {
+                return self.search_quantized(&q, &scan, opts, qs, score_fn);
+            }
+        }
+
+        // Standard f32 brute-force path.
         let mut topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
-        for (row, col_name, id) in scan {
+        for &(row, col_name, id) in &scan {
             let stored = self.data.row(row);
             let score = score_fn(&q, stored);
             if let Some(min) = opts.min_score
@@ -620,6 +717,75 @@ impl Store {
             })
             .collect();
 
+        Ok(results)
+    }
+
+    /// Two-pass quantized search: int8 first-pass selects candidates, f32 reranks.
+    fn search_quantized(
+        &self,
+        q: &[f32],
+        scan: &[(u64, &str, &str)],
+        opts: &SearchOpts,
+        qs: &QuantState,
+        score_fn: fn(&[f32], &[f32]) -> f32,
+    ) -> Result<Vec<Hit>> {
+        let dim = self.data.dimension();
+        let overscan = opts.top_k.saturating_mul(qs.cfg.rescore).max(opts.top_k);
+
+        // Quantize the query vector.
+        let mut q_u8 = vec![0u8; dim];
+        qs.params.quantize(q, &mut q_u8);
+
+        // First pass: int8 scoring to select overscan candidates.
+        let is_euclidean = self.config.distance == Distance::Euclidean;
+        let mut topk_q: TopK<(u64, &str, &str)> = TopK::new(overscan);
+        for &(row, col_name, id) in scan {
+            let base = row as usize * dim;
+            let end = base + dim;
+            if end > qs.vectors.len() {
+                continue;
+            }
+            let stored_u8 = &qs.vectors[base..end];
+            let approx_score = if is_euclidean {
+                euclidean_neg_sq_u8(&q_u8, stored_u8) as f32
+            } else {
+                dot_u8(&q_u8, stored_u8) as f32
+            };
+            topk_q.offer(approx_score, (row, col_name, id));
+        }
+
+        // Second pass: f32 rerank of the candidates.
+        let candidates = topk_q.into_sorted_desc();
+        let mut topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
+        for (_, (row, col_name, id)) in &candidates {
+            let stored = self.data.row(*row);
+            let score = score_fn(q, stored);
+            if let Some(min) = opts.min_score
+                && score < min
+            {
+                continue;
+            }
+            topk.offer(score, (*col_name, *id));
+        }
+
+        let results = topk
+            .into_sorted_desc()
+            .into_iter()
+            .map(|(score, (collection, id))| {
+                let attrs = self
+                    .collections
+                    .get(collection)
+                    .and_then(|c| c.docs.get(id))
+                    .map(|e| e.attrs.clone())
+                    .unwrap_or_default();
+                Hit {
+                    collection: collection.to_string(),
+                    id: id.to_string(),
+                    score,
+                    attrs,
+                }
+            })
+            .collect();
         Ok(results)
     }
 
@@ -718,6 +884,9 @@ impl Store {
 
         // 4. Reset dead-rows counter.
         self.dead_rows = 0;
+
+        // 5. Rebuild quantization state with compacted vectors.
+        self.rebuild_quant();
 
         Ok(())
     }
@@ -1233,6 +1402,7 @@ mod tests {
             lock: None,
             collections: HashMap::new(),
             dead_rows: 0,
+            quant: None,
         };
         store.create_collection("col").unwrap();
         store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
@@ -1662,5 +1832,228 @@ mod tests {
             msg.contains("distance"),
             "error should mention distance: {msg}"
         );
+    }
+
+    // ── list (metadata-only query) tests ─────────────────────────────────
+
+    #[test]
+    fn list_returns_all_matching() {
+        let mut store = Store::in_memory(3).unwrap();
+        store.create_collection("col").unwrap();
+        let mut a_rust = BTreeMap::new();
+        a_rust.insert("lang".to_string(), Value::Str("rust".to_string()));
+        let mut a_go = BTreeMap::new();
+        a_go.insert("lang".to_string(), Value::Str("go".to_string()));
+        store
+            .upsert(
+                "col",
+                &[
+                    rec_with("r1", vec![1.0, 0.0, 0.0], a_rust.clone()),
+                    rec_with("r2", vec![0.0, 1.0, 0.0], a_rust),
+                    rec_with("g1", vec![0.0, 0.0, 1.0], a_go),
+                ],
+            )
+            .unwrap();
+        let filter = Filter(vec![Predicate::Eq(
+            "lang".to_string(),
+            Value::Str("rust".to_string()),
+        )]);
+        let hits = store.list(&["col"], &filter, 100).unwrap();
+        assert_eq!(hits.len(), 2);
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(ids.contains(&"r1"));
+        assert!(ids.contains(&"r2"));
+    }
+
+    #[test]
+    fn list_respects_limit() {
+        let mut store = Store::in_memory(2).unwrap();
+        store.create_collection("col").unwrap();
+        for i in 0..10u32 {
+            store
+                .upsert("col", &[rec(&format!("d{i}"), vec![i as f32, 0.0])])
+                .unwrap();
+        }
+        let hits = store.list(&["col"], &Filter::default(), 3).unwrap();
+        assert_eq!(hits.len(), 3);
+    }
+
+    #[test]
+    fn list_scores_are_zero() {
+        let mut store = Store::in_memory(2).unwrap();
+        store.create_collection("col").unwrap();
+        store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+        let hits = store.list(&["col"], &Filter::default(), 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].score, 0.0);
+    }
+
+    #[test]
+    fn list_empty_filter_returns_all() {
+        let mut store = Store::in_memory(2).unwrap();
+        store.create_collection("col").unwrap();
+        store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+        store.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
+        let hits = store.list(&["col"], &Filter::default(), 100).unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn list_multi_collection() {
+        let mut store = Store::in_memory(2).unwrap();
+        store.create_collection("a").unwrap();
+        store.create_collection("b").unwrap();
+        store.upsert("a", &[rec("x", vec![1.0, 0.0])]).unwrap();
+        store.upsert("b", &[rec("y", vec![0.0, 1.0])]).unwrap();
+        let hits = store.list(&["a", "b"], &Filter::default(), 100).unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn list_insertion_order() {
+        let mut store = Store::in_memory(2).unwrap();
+        store.create_collection("col").unwrap();
+        store
+            .upsert("col", &[rec("first", vec![1.0, 0.0])])
+            .unwrap();
+        store
+            .upsert("col", &[rec("second", vec![0.0, 1.0])])
+            .unwrap();
+        let hits = store.list(&["col"], &Filter::default(), 100).unwrap();
+        assert_eq!(hits[0].id, "first");
+        assert_eq!(hits[1].id, "second");
+    }
+
+    // ── int8 scalar quantization tests ───────────────────────────────────
+
+    fn quantized_store(dim: usize) -> Store {
+        Store::in_memory_cfg(
+            Config::new("/dev/null/in-memory", dim)
+                .open_mode(OpenMode::ReadWrite)
+                .auto_compact(None)
+                .quantization(Some(Quantization::default())),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn quantized_search_ranking_matches_exact() {
+        let mut store = quantized_store(3);
+        store.create_collection("col").unwrap();
+        store
+            .upsert(
+                "col",
+                &[
+                    rec("close", vec![0.9, 0.1, 0.0]),
+                    rec("mid", vec![0.5, 0.5, 0.0]),
+                    rec("far", vec![0.0, 0.0, 1.0]),
+                ],
+            )
+            .unwrap();
+        let hits = store
+            .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(3))
+            .unwrap();
+        assert_eq!(
+            hits[0].id, "close",
+            "quantized search should rank correctly"
+        );
+    }
+
+    #[test]
+    fn quantized_search_respects_top_k() {
+        let mut store = quantized_store(2);
+        store.create_collection("col").unwrap();
+        for i in 0..20u32 {
+            store
+                .upsert("col", &[rec(&format!("d{i}"), vec![i as f32, 0.0])])
+                .unwrap();
+        }
+        let hits = store
+            .search(&["col"], &[19.0, 0.0], &default_opts(5))
+            .unwrap();
+        assert_eq!(hits.len(), 5);
+    }
+
+    #[test]
+    fn quantized_search_with_filter() {
+        let mut store = quantized_store(3);
+        store.create_collection("col").unwrap();
+        let mut a_rust = BTreeMap::new();
+        a_rust.insert("lang".to_string(), Value::Str("rust".to_string()));
+        let mut a_go = BTreeMap::new();
+        a_go.insert("lang".to_string(), Value::Str("go".to_string()));
+        store
+            .upsert(
+                "col",
+                &[
+                    rec_with("r1", vec![1.0, 0.0, 0.0], a_rust),
+                    rec_with("g1", vec![1.0, 0.0, 0.0], a_go),
+                ],
+            )
+            .unwrap();
+        let opts = SearchOpts {
+            top_k: 5,
+            filter: Filter(vec![Predicate::Eq(
+                "lang".to_string(),
+                Value::Str("rust".to_string()),
+            )]),
+            min_score: None,
+        };
+        let hits = store.search(&["col"], &[1.0, 0.0, 0.0], &opts).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "r1");
+    }
+
+    #[test]
+    fn quantized_search_euclidean() {
+        let mut store = Store::in_memory_cfg(
+            Config::new("/dev/null/in-memory", 3)
+                .distance(Distance::Euclidean)
+                .open_mode(OpenMode::ReadWrite)
+                .auto_compact(None)
+                .quantization(Some(Quantization::default())),
+        )
+        .unwrap();
+        store.create_collection("col").unwrap();
+        store
+            .upsert(
+                "col",
+                &[
+                    rec("exact", vec![1.0, 2.0, 3.0]),
+                    rec("far", vec![10.0, 20.0, 30.0]),
+                ],
+            )
+            .unwrap();
+        let hits = store
+            .search(&["col"], &[1.0, 2.0, 3.0], &default_opts(2))
+            .unwrap();
+        assert_eq!(hits[0].id, "exact");
+    }
+
+    #[test]
+    fn quantized_survives_compact() {
+        let mut store = quantized_store(3);
+        store.create_collection("col").unwrap();
+        store
+            .upsert("col", &[rec("a", vec![1.0, 0.0, 0.0])])
+            .unwrap();
+        store
+            .upsert("col", &[rec("a", vec![0.0, 1.0, 0.0])])
+            .unwrap();
+        store.compact().unwrap();
+        let hits = store
+            .search(&["col"], &[0.0, 1.0, 0.0], &default_opts(5))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!((hits[0].score - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn quantized_empty_store_searches_ok() {
+        let store = quantized_store(3);
+        let hits = store
+            .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(5))
+            .unwrap();
+        assert!(hits.is_empty());
     }
 }

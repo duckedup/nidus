@@ -46,6 +46,22 @@ pub struct SearchRequest {
     pub filter: Filter,
 }
 
+fn default_limit() -> usize {
+    100
+}
+
+/// Body of `POST /list`. Metadata-only query (no vector). An empty `scope`
+/// lists from every collection.
+#[derive(Debug, Deserialize)]
+pub struct ListRequest {
+    #[serde(default)]
+    pub scope: Vec<String>,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub filter: Filter,
+}
+
 /// Serializable mirror of [`crate::Hit`] (which carries no serde derive).
 #[derive(Debug, Serialize)]
 pub struct HitDto {

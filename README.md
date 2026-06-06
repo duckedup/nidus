@@ -36,7 +36,7 @@ more, so it **compiles in seconds** and embeds as a normal Rust dependency.
 
 ```toml
 [dependencies]
-nidus = "0.5"
+nidus = "0.6"
 ```
 
 ```rust
