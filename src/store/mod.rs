@@ -47,14 +47,13 @@ fn oom(what: &str, count: usize) -> anyhow::Error {
     anyhow!("out of memory reserving capacity for {count} {what}")
 }
 
-/// Minimum candidate count before a parallel search splits across worker threads.
-/// Below this, the thread spawn/join overhead outweighs the scan, so we stay serial
-/// even when `Config::query_threads > 1`.
-const PARALLEL_SCAN_FLOOR: usize = 4096;
-
-/// A scored candidate: `(score, (collection, id))`, borrowing names from the store.
-/// One worker's `into_sorted_desc()` yields a `Vec` of these for the merge step.
-type Scored<'a> = (f32, (&'a str, &'a str));
+/// Minimum total scan *work* — candidate rows × dimension — before a parallel search
+/// splits across worker threads. Below this, thread spawn/join overhead outweighs the
+/// scan, so we stay serial even when `Config::query_threads > 1`. The floor is on work
+/// rather than a flat row count because per-row scan cost scales with dimension: a fixed
+/// row floor over-parallelizes narrow vectors and under-parallelizes wide ones. ~1.05M
+/// units ≈ 4096 rows at dim 256, or ~1365 rows at dim 768.
+const PARALLEL_SCAN_WORK_FLOOR: usize = 1 << 20;
 
 /// Score a slice of candidate rows into a fresh bounded top-k heap. The unit of
 /// parallel work: each worker scores one chunk independently, then the caller
@@ -78,6 +77,90 @@ fn score_chunk<'a>(
         topk.offer(score, (col_name, id));
     }
     topk
+}
+
+/// Score a chunk against the **int8** matrix into a bounded top-k of `overscan`
+/// candidates — the quantized first-pass unit of parallel work, mirroring
+/// [`score_chunk`] for the f32 path. The int8 score is monotonic with the f32 score
+/// (shared symmetric scale), so it picks the right candidate set; exact scores come
+/// from the caller's f32 rerank. Carries `row` in the item so the rerank can re-read
+/// the f32 vector. `min_score` is *not* applied here — the int8 score is only an
+/// ordering proxy, so the floor is enforced on the exact f32 score during rerank.
+fn score_chunk_i8<'a>(
+    quant_vectors: &[i8],
+    dim: usize,
+    chunk: &[(u64, &'a str, &'a str)],
+    q_i8: &[i8],
+    is_euclidean: bool,
+    overscan: usize,
+) -> TopK<(u64, &'a str, &'a str)> {
+    let mut topk: TopK<(u64, &'a str, &'a str)> = TopK::new(overscan);
+    for &(row, col_name, id) in chunk {
+        let base = row as usize * dim;
+        let end = base + dim;
+        if end > quant_vectors.len() {
+            continue;
+        }
+        let stored_i8 = &quant_vectors[base..end];
+        let approx_score = if is_euclidean {
+            euclidean_neg_sq_i8(q_i8, stored_i8) as f32
+        } else {
+            dot_i8(q_i8, stored_i8) as f32
+        };
+        topk.offer(approx_score, (row, col_name, id));
+    }
+    topk
+}
+
+/// Split `scan` across `workers` threads, score each chunk with `score_one` into its
+/// own bounded top-k of capacity `cap`, then merge the per-worker results into one.
+/// The shared parallel-scan engine behind both the f32 and int8 first passes.
+///
+/// Each worker sorts its own chunk by physical row before scoring, so the per-chunk
+/// sweep stays storage-ordered for the prefetcher — the global row-sort is skipped on
+/// the parallel path (the prefetch win is per-chunk, and per-chunk sorts run in
+/// parallel instead of as serial pre-work, cutting the Amdahl tax). Reads of `data` /
+/// the quant matrix are shared `&` across threads; the only mutation is each worker
+/// reordering its disjoint `&mut` chunk.
+fn parallel_topk<'a, T, F>(
+    scan: &mut [(u64, &'a str, &'a str)],
+    workers: usize,
+    cap: usize,
+    score_one: F,
+) -> Result<TopK<T>>
+where
+    T: Send,
+    F: Fn(&[(u64, &'a str, &'a str)]) -> TopK<T> + Sync,
+{
+    let chunk_len = scan.len().div_ceil(workers);
+    let score_one = &score_one;
+    let locals = std::thread::scope(|s| -> Result<Vec<Vec<(f32, T)>>> {
+        let handles: Vec<_> = scan
+            .chunks_mut(chunk_len)
+            .map(|chunk| {
+                s.spawn(move || {
+                    chunk.sort_unstable_by_key(|&(row, _, _)| row);
+                    score_one(chunk).into_sorted_desc()
+                })
+            })
+            .collect();
+        let mut out = Vec::with_capacity(handles.len());
+        for h in handles {
+            out.push(
+                h.join()
+                    .map_err(|_| anyhow!("search worker thread panicked"))?,
+            );
+        }
+        Ok(out)
+    })?;
+
+    let mut merged: TopK<T> = TopK::new(cap);
+    for local in locals {
+        for (score, item) in local {
+            merged.offer(score, item);
+        }
+    }
+    Ok(merged)
 }
 
 // ── Store ─────────────────────────────────────────────────────────────────────
@@ -716,6 +799,19 @@ impl Store {
         Ok(results)
     }
 
+    /// How many worker threads to split a scan of `scan_len` candidates across: the
+    /// configured `query_threads` when that is `> 1` *and* the total work
+    /// (`scan_len × dimension`) clears [`PARALLEL_SCAN_WORK_FLOOR`], else `1` (serial).
+    fn parallel_workers(&self, scan_len: usize) -> usize {
+        let threads = self.config.query_threads.max(1);
+        if threads > 1 && scan_len.saturating_mul(self.data.dimension()) >= PARALLEL_SCAN_WORK_FLOOR
+        {
+            threads
+        } else {
+            1
+        }
+    }
+
     /// Brute-force search over the union of `collections`, merged into one ranking
     /// (one bounded top-k heap fed by every in-scope collection). The scoring
     /// function is determined by the store's [`Distance`] metric.
@@ -738,8 +834,9 @@ impl Store {
             Distance::Euclidean => euclidean_neg_sq,
         };
 
-        // Gather the in-scope, filter-passing rows sorted by physical row for
-        // cache-friendly sequential access.
+        // Gather the in-scope, filter-passing rows. Sorting by physical row (for
+        // cache-friendly sequential access) is deferred to the scoring step below —
+        // globally on the serial path, per-chunk on the parallel one.
         let mut scan: Vec<(u64, &str, &str)> = Vec::new();
         let scan_cap: usize = collections
             .iter()
@@ -759,50 +856,28 @@ impl Store {
                 scan.push((entry.row, col_name, id.as_str()));
             }
         }
-        scan.sort_unstable_by_key(|&(row, _, _)| row);
+        // Decide once whether this query splits across workers (configured threads +
+        // enough scan work to amortize spawn cost). The global row-sort is deferred:
+        // the serial path sorts the whole scan; the parallel path lets each worker sort
+        // its own chunk (see `parallel_topk`), so the sort never caps speedup (Amdahl).
+        let workers = self.parallel_workers(scan.len());
 
         // Two-pass quantized search if enabled and we have enough candidates.
         if let Some(ref qs) = self.quant {
             let dim = self.data.dimension();
             if !qs.vectors.is_empty() && dim > 0 {
-                return self.search_quantized(&q, &scan, opts, qs, score_fn);
+                return self.search_quantized(&q, &mut scan, opts, qs, score_fn, workers);
             }
         }
 
-        // Standard f32 brute-force path. Split across worker threads when the store
-        // is configured for it and the scan is large enough to amortize spawn cost;
+        // Standard f32 brute-force path. Split across worker threads when engaged;
         // otherwise score serially. Both yield the same bounded top-k (ties aside).
-        let threads = self.config.query_threads.max(1);
-        let topk = if threads > 1 && scan.len() >= PARALLEL_SCAN_FLOOR {
-            let chunk_len = scan.len().div_ceil(threads);
-            let locals = std::thread::scope(|s| -> Result<Vec<Vec<Scored<'_>>>> {
-                let handles: Vec<_> = scan
-                    .chunks(chunk_len)
-                    .map(|chunk| {
-                        s.spawn(|| {
-                            score_chunk(&self.data, chunk, &q, score_fn, opts.top_k, opts.min_score)
-                                .into_sorted_desc()
-                        })
-                    })
-                    .collect();
-                let mut out = Vec::with_capacity(handles.len());
-                for h in handles {
-                    out.push(
-                        h.join()
-                            .map_err(|_| anyhow!("search worker thread panicked"))?,
-                    );
-                }
-                Ok(out)
-            })?;
-            // Merge the per-worker top-k lists into one bounded top-k.
-            let mut merged: TopK<(&str, &str)> = TopK::new(opts.top_k);
-            for local in locals {
-                for (score, item) in local {
-                    merged.offer(score, item);
-                }
-            }
-            merged
+        let topk = if workers > 1 {
+            parallel_topk(&mut scan, workers, opts.top_k, |chunk| {
+                score_chunk(&self.data, chunk, &q, score_fn, opts.top_k, opts.min_score)
+            })?
         } else {
+            scan.sort_unstable_by_key(|&(row, _, _)| row);
             score_chunk(&self.data, &scan, &q, score_fn, opts.top_k, opts.min_score)
         };
 
@@ -829,13 +904,18 @@ impl Store {
     }
 
     /// Two-pass quantized search: int8 first-pass selects candidates, f32 reranks.
-    fn search_quantized(
+    /// The int8 first pass is the lever that scales with threads — int8 moves 4× fewer
+    /// bytes than f32, so it is compute- not bandwidth-bound — so it splits across
+    /// `workers` (when engaged), while the f32 rerank stays serial (only `top_k ×
+    /// rescore` rows, too few to amortize a second fan-out).
+    fn search_quantized<'a>(
         &self,
         q: &[f32],
-        scan: &[(u64, &str, &str)],
+        scan: &mut [(u64, &'a str, &'a str)],
         opts: &SearchOpts,
         qs: &QuantState,
         score_fn: fn(&[f32], &[f32]) -> f32,
+        workers: usize,
     ) -> Result<Vec<Hit>> {
         let dim = self.data.dimension();
         let overscan = opts.top_k.saturating_mul(qs.cfg.rescore).max(opts.top_k);
@@ -845,24 +925,18 @@ impl Store {
         qs.params.quantize(q, &mut q_i8);
 
         // First pass: int8 scoring to select overscan candidates. The int8 score is
-        // monotonic with the f32 score (shared symmetric scale), so it picks the
-        // right candidate set; exact scores come from the f32 rerank below.
+        // monotonic with the f32 score (shared symmetric scale), so it picks the right
+        // candidate set; exact scores come from the f32 rerank below. Parallel when
+        // engaged (the int8 sweep is the part that scales with threads), else serial.
         let is_euclidean = self.config.distance == Distance::Euclidean;
-        let mut topk_q: TopK<(u64, &str, &str)> = TopK::new(overscan);
-        for &(row, col_name, id) in scan {
-            let base = row as usize * dim;
-            let end = base + dim;
-            if end > qs.vectors.len() {
-                continue;
-            }
-            let stored_i8 = &qs.vectors[base..end];
-            let approx_score = if is_euclidean {
-                euclidean_neg_sq_i8(&q_i8, stored_i8) as f32
-            } else {
-                dot_i8(&q_i8, stored_i8) as f32
-            };
-            topk_q.offer(approx_score, (row, col_name, id));
-        }
+        let topk_q = if workers > 1 {
+            parallel_topk(scan, workers, overscan, |chunk| {
+                score_chunk_i8(&qs.vectors, dim, chunk, &q_i8, is_euclidean, overscan)
+            })?
+        } else {
+            scan.sort_unstable_by_key(|&(row, _, _)| row);
+            score_chunk_i8(&qs.vectors, dim, scan, &q_i8, is_euclidean, overscan)
+        };
 
         // Second pass: f32 rerank of the candidates.
         let candidates = topk_q.into_sorted_desc();
@@ -2285,13 +2359,23 @@ mod tests {
 
     // ── parallel scan tests ──────────────────────────────────────────────
 
-    /// Build an in-memory store with `n` deterministic pseudo-random rows and the
-    /// given `query_threads`. `n` above `PARALLEL_SCAN_FLOOR` engages the parallel path.
-    fn threaded_store(dim: usize, n: usize, threads: usize) -> Store {
-        let cfg = Config::new("/dev/null/in-memory", dim)
+    /// Rows needed at `dim` to clear [`PARALLEL_SCAN_WORK_FLOOR`], so the threaded path
+    /// actually engages. Keeps the parallel tests robust to the constant's value (and
+    /// fast: a wide dim hits the work floor at far fewer rows than a narrow one).
+    fn rows_to_parallelize(dim: usize) -> usize {
+        PARALLEL_SCAN_WORK_FLOOR.div_ceil(dim) + 1
+    }
+
+    /// Build an in-memory store with `n` deterministic pseudo-random rows, the given
+    /// `query_threads`, and optional int8 quantization.
+    fn threaded_store_cfg(dim: usize, n: usize, threads: usize, quant: bool) -> Store {
+        let mut cfg = Config::new("/dev/null/in-memory", dim)
             .open_mode(OpenMode::ReadWrite)
             .auto_compact(None)
             .query_threads(threads);
+        if quant {
+            cfg = cfg.quantization(Some(Quantization::default()));
+        }
         let mut store = Store::in_memory_cfg(cfg).unwrap();
         store.create_collection("col").unwrap();
         let recs: Vec<Record> = (0..n)
@@ -2306,15 +2390,20 @@ mod tests {
         store
     }
 
-    // Ignored under Miri: needs > PARALLEL_SCAN_FLOOR (4096) rows to engage the
-    // threaded path, which Miri runs at ~100x slowdown (minutes). The thread::scope
+    fn threaded_store(dim: usize, n: usize, threads: usize) -> Store {
+        threaded_store_cfg(dim, n, threads, false)
+    }
+
+    // Ignored under Miri: needs enough work to clear PARALLEL_SCAN_WORK_FLOOR to engage
+    // the threaded path, which Miri runs at ~100x slowdown (minutes). The thread::scope
     // scan is `#![forbid(unsafe_code)]` safe Rust over shared `&` reads — the borrow
     // checker already proves it data-race-free, so Miri adds no coverage here.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn parallel_search_matches_serial() {
-        let dim = 8;
-        let n = PARALLEL_SCAN_FLOOR + 500; // exceed the floor so threading engages
+        // A wide dim clears the work floor at ~1.4k rows — far cheaper than narrow dims.
+        let dim = 768;
+        let n = rows_to_parallelize(dim) + 100; // exceed the floor so threading engages
         let serial = threaded_store(dim, n, 1);
         let parallel = threaded_store(dim, n, 4);
         let q: Vec<f32> = (0..dim).map(|d| (d * 5 % 13) as f32 - 6.0).collect();
@@ -2337,8 +2426,8 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn parallel_search_respects_filter_and_min_score() {
-        let dim = 8;
-        let n = PARALLEL_SCAN_FLOOR + 500;
+        let dim = 768;
+        let n = rows_to_parallelize(dim) + 100;
         let parallel = threaded_store(dim, n, 4);
         let q: Vec<f32> = (0..dim).map(|d| (d * 5 % 13) as f32 - 6.0).collect();
         // A min_score floor must be honored across all worker chunks.
@@ -2349,6 +2438,30 @@ mod tests {
         };
         let hits = parallel.search(&["col"], &q, &opts).unwrap();
         assert!(hits.iter().all(|h| h.score >= 0.99));
+    }
+
+    // The quantized first pass scales across threads; its parallel and serial candidate
+    // sets must produce the same final ranking. Ignored under Miri (same cost reason).
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn parallel_quantized_matches_serial() {
+        let dim = 768;
+        let n = rows_to_parallelize(dim) + 100;
+        let serial = threaded_store_cfg(dim, n, 1, true);
+        let parallel = threaded_store_cfg(dim, n, 4, true);
+        let q: Vec<f32> = (0..dim).map(|d| (d * 5 % 13) as f32 - 6.0).collect();
+        let hs = serial.search(&["col"], &q, &default_opts(20)).unwrap();
+        let hp = parallel.search(&["col"], &q, &default_opts(20)).unwrap();
+        assert_eq!(hs.len(), hp.len());
+        // Same int8 candidate set (just scored in chunks) → same f32 rerank scores.
+        for (a, b) in hs.iter().zip(&hp) {
+            assert!(
+                (a.score - b.score).abs() < 1e-6,
+                "score mismatch: serial {} vs parallel {}",
+                a.score,
+                b.score
+            );
+        }
     }
 
     #[test]
@@ -2368,22 +2481,9 @@ mod tests {
 
     #[test]
     fn parallel_search_with_quantization() {
-        // query_threads is set but quantization is on: the quantized path runs
-        // (single-threaded) and must still return correct results.
-        let cfg = Config::new("/dev/null/in-memory", 8)
-            .open_mode(OpenMode::ReadWrite)
-            .auto_compact(None)
-            .quantization(Some(Quantization::default()))
-            .query_threads(4);
-        let mut store = Store::in_memory_cfg(cfg).unwrap();
-        store.create_collection("col").unwrap();
-        let recs: Vec<Record> = (0..200u32)
-            .map(|i| {
-                let v: Vec<f32> = (0..8).map(|d| ((i * 13 + d * 3) % 50) as f32).collect();
-                rec(&format!("d{i}"), v)
-            })
-            .collect();
-        store.upsert("col", &recs).unwrap();
+        // query_threads is set and quantization is on, but the scan is below the work
+        // floor: the quantized path runs single-threaded and must still be correct.
+        let store = threaded_store_cfg(8, 200, 4, true);
         let q: Vec<f32> = (0..8).map(|d| (d * 2 % 7) as f32).collect();
         let hits = store.search(&["col"], &q, &default_opts(10)).unwrap();
         assert_eq!(hits.len(), 10);

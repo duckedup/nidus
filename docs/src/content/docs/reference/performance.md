@@ -48,13 +48,19 @@ sweep isn't enough. Both stay pure-safe-Rust and are off by default:
   the cost of ~25% more RAM. Reproduce: `just bench-quant`.
 - **[parallel scan](/guides/integrating/#two-kinds-of-parallelism)**
   (`Config::query_threads`) — splits one large search across worker threads. The
-  scan is memory-bandwidth-bound, so the gain is sublinear: **~1.3–1.6×** at 4–8
-  threads. Reproduce: `just bench-crit parallel_search`.
+  plain **f32** scan is memory-bandwidth-bound, so its gain is sublinear and plateaus
+  early (**~1.3–1.4×** at 4–8 threads). Combined with **int8 quantization**, threads
+  pay off: the int8 first pass moves 4× fewer bytes, so it is compute- not
+  bandwidth-bound and scales to **~2.4×** at 4 threads. Reproduce:
+  `just bench-crit parallel_search` (the `parallel_search_quant` group is the
+  quantized sweep).
 
 Neither is the headline multiplier its theory suggests — the 4× from int8 and the
 linear scaling from threads both want SIMD/bandwidth headroom nidus doesn't chase
-within its zero-FFI design. They're honest, modest latency wins for the right
-workload, measured by benchmarks you can run yourself.
+within its zero-FFI design. The f32 scan is bandwidth-bound; threads help most when
+paired with the int8 first pass, which has the compute headroom to scale. They're
+honest latency wins for the right workload, measured by benchmarks you can run
+yourself.
 
 ## The target regime
 

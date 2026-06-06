@@ -86,10 +86,12 @@ int8 first-pass → f32 rerank. See
 ### `query_threads`
 
 `usize` — default `1` (single-threaded; no behavior change). When `> 1`, a single
-large exact (f32) search is split across this many `std::thread::scope` workers to
-cut one query's latency. The scan is memory-bandwidth-bound, so the speedup is
-sublinear. Leave it at `1` if you already run concurrent searches under
-`Arc<RwLock<Nidus>>` — see
+large search is split across this many `std::thread::scope` workers to cut one
+query's latency — both the exact f32 scan and, when
+[int8 quantization](/guides/search/#int8-scalar-quantization) is on, its int8 first
+pass. The f32 scan is memory-bandwidth-bound (sublinear speedup); the int8 first
+pass is compute-bound and scales better with threads. Leave it at `1` if you already
+run concurrent searches under `Arc<RwLock<Nidus>>` — see
 [two kinds of parallelism](/guides/integrating/#two-kinds-of-parallelism).
 
 ## `Fsync`
