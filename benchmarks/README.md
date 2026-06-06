@@ -57,6 +57,19 @@ A configurable threshold (`threshold=1.25`: nidus p50 ≤ 1.25× the best engine
 process exit code, so the run doubles as a pass/fail guard. Each run also writes a JSON
 artifact under `target/bench-results/<stamp>.json` for diffing over time.
 
+## int8 quantization sweep
+
+```bash
+just bench-quant                       # recall + speed across rescore=1,2,4,8
+just bench-quant n=1000000 dim=768      # extra key=value args pass through
+```
+
+`bench-quant` builds one exact (f32) store and one quantized store per `rescore`
+factor over identical data, then reports each variant's **recall@k** against the
+harness's independent exact ground truth plus query latency and speedup vs the
+exact path. It's nidus-only (no engine deps) and is how the default `rescore` and
+the documented recall/speed expectations were chosen.
+
 ## nidus regression tracking (criterion)
 
 ```bash

@@ -132,6 +132,13 @@ bench ENGINES="nidus" *ARGS:
     esac
     cargo run -p nidus-bench --release ${feats:+--features "$feats"} -- {{ARGS}}
 
+# int8 quantization recall & speed sweep (nidus-only, no engine deps). Sweeps the
+# rescore factor and reports recall@k vs exact ground truth + query speedup.
+#   just bench-quant                         defaults (n=100k, dim=384/768, rescore=1,2,4,8)
+#   just bench-quant n=10000 rescore=2,4,8   pass-through args
+bench-quant *ARGS:
+    cargo run -p nidus-bench --release --bin nidus-bench-quant -- {{ARGS}}
+
 # nidus-internal regression benchmarks (criterion); compares against saved baselines.
 # Targets the criterion bench directly so harness args reach it (the lib's libtest
 # harness would otherwise reject them).

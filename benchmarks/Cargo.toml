@@ -17,6 +17,11 @@ publish = false
 name = "nidus-bench"
 path = "src/main.rs"
 
+# int8 quantization recall & speed sweep (nidus-only; no engine deps).
+[[bin]]
+name = "nidus-bench-quant"
+path = "src/quant.rs"
+
 [dependencies]
 nidus = { path = ".." }
 anyhow = "1"
