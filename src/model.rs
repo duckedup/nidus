@@ -68,14 +68,33 @@ pub struct Record {
 }
 
 /// A single attribute predicate. Predicates are AND-combined inside a [`Filter`].
+///
+/// Every predicate is a *positive assertion about a present attribute*: if `key` is
+/// absent from a record's attrs, **no** predicate matches it — including the negative
+/// ones (`Ne`/`NotIn`) and the range ones. The comparison variants are same-type only
+/// (`Int`↔`Int` numeric, `Str`↔`Str` lexical, `Bool`↔`Bool` with `false < true`);
+/// a cross-type or non-orderable comparison (`Null`, `List`) never matches a range.
+/// See the root `SPEC.md` §7.1.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Predicate {
     /// `attrs[key] == value`.
     Eq(String, Value),
+    /// `attrs[key]` is present and `!= value`.
+    Ne(String, Value),
     /// `attrs[key]` is a [`Value::Str`] matching the glob pattern.
     Glob(String, String),
     /// `attrs[key]` is equal to one of the values in the set.
     In(String, Vec<Value>),
+    /// `attrs[key]` is present and *not* equal to any value in the set.
+    NotIn(String, Vec<Value>),
+    /// `attrs[key] < value` (same-type, orderable).
+    Lt(String, Value),
+    /// `attrs[key] <= value` (same-type, orderable).
+    Le(String, Value),
+    /// `attrs[key] > value` (same-type, orderable).
+    Gt(String, Value),
+    /// `attrs[key] >= value` (same-type, orderable).
+    Ge(String, Value),
 }
 
 /// A conjunction (AND) of predicates. An empty filter matches everything.

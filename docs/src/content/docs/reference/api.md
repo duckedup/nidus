@@ -101,17 +101,29 @@ pub enum Value {
 ## `Predicate` & `Filter`
 
 A `Filter` is a conjunction (AND) of predicates; an empty filter matches
-everything.
+everything. Every predicate is a positive assertion about a **present** attribute —
+a record lacking `key` matches no predicate, including the negative (`Ne`/`NotIn`)
+and range ones.
 
 ```rust
 pub enum Predicate {
-    Eq(String, Value),     // attrs[key] == value
-    Glob(String, String),  // attrs[key] is a Str matching the glob (* ? [..])
-    In(String, Vec<Value>),// attrs[key] is one of the values
+    Eq(String, Value),      // attrs[key] == value
+    Ne(String, Value),      // attrs[key] present and != value
+    Glob(String, String),   // attrs[key] is a Str matching the glob (* ? [..])
+    In(String, Vec<Value>), // attrs[key] is one of the values
+    NotIn(String, Vec<Value>), // attrs[key] present and not one of the values
+    Lt(String, Value),      // attrs[key] <  value  (same-type, orderable)
+    Le(String, Value),      // attrs[key] <= value
+    Gt(String, Value),      // attrs[key] >  value
+    Ge(String, Value),      // attrs[key] >= value
 }
 
 pub struct Filter(pub Vec<Predicate>);
 ```
+
+The range predicates (`Lt`/`Le`/`Gt`/`Ge`) compare **same-type, orderable** values
+only: `Int` numerically, `Str` lexically, `Bool` as `false < true`. A cross-type or
+non-orderable (`Null`, `List`) comparison never matches.
 
 ## `Distance`
 

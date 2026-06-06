@@ -108,7 +108,8 @@ enum Command {
         /// Drop hits scoring below this cosine similarity.
         #[arg(long)]
         min_score: Option<f32>,
-        /// AND-filter as JSON, e.g. '[{"Eq":["lang",{"Str":"rust"}]}]'.
+        /// AND-filter as JSON. Predicates: Eq, Ne, Glob, In, NotIn, Lt, Le, Gt, Ge.
+        /// E.g. '[{"Ge":["ts",{"Int":1700000000}]},{"Ne":["status",{"Str":"archived"}]}]'.
         #[arg(long = "where")]
         filter: Option<String>,
     },
@@ -124,7 +125,8 @@ enum Command {
         /// Maximum number of results.
         #[arg(long, short = 'n', default_value_t = 100)]
         limit: usize,
-        /// AND-filter as JSON, e.g. '[{"Eq":["lang",{"Str":"rust"}]}]'.
+        /// AND-filter as JSON. Predicates: Eq, Ne, Glob, In, NotIn, Lt, Le, Gt, Ge.
+        /// E.g. '[{"Ge":["ts",{"Int":1700000000}]},{"Ne":["status",{"Str":"archived"}]}]'.
         #[arg(long = "where")]
         filter: Option<String>,
     },
