@@ -2306,6 +2306,11 @@ mod tests {
         store
     }
 
+    // Ignored under Miri: needs > PARALLEL_SCAN_FLOOR (4096) rows to engage the
+    // threaded path, which Miri runs at ~100x slowdown (minutes). The thread::scope
+    // scan is `#![forbid(unsafe_code)]` safe Rust over shared `&` reads — the borrow
+    // checker already proves it data-race-free, so Miri adds no coverage here.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn parallel_search_matches_serial() {
         let dim = 8;
@@ -2328,6 +2333,8 @@ mod tests {
         }
     }
 
+    // Ignored under Miri — same reason as `parallel_search_matches_serial`.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn parallel_search_respects_filter_and_min_score() {
         let dim = 8;
