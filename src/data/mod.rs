@@ -94,6 +94,44 @@ fn decode_header(buf: &[u8; HEADER_LEN]) -> Result<(usize, Distance)> {
     Ok((dim, distance))
 }
 
+/// Peek the pinned `(dimension, distance)` from an existing store's `data`
+/// header without loading any vectors. Returns `Ok(None)` when there is no store
+/// yet (the file is absent or holds no header), so a caller can require an
+/// explicit dimension only at creation time. Reads just the 64-byte header.
+#[cfg(feature = "cli")]
+pub(crate) fn peek_header(path: &Path) -> Result<Option<(usize, Distance)>> {
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("failed to open data file at {}", path.display()));
+        }
+    };
+    let file_len = file
+        .seek(SeekFrom::End(0))
+        .context("failed to seek data file")?;
+    if file_len == 0 {
+        return Ok(None);
+    }
+    if file_len < HEADER_LEN as u64 {
+        bail!(
+            "data file at {} is truncated: {} bytes (need at least {} for header)",
+            path.display(),
+            file_len,
+            HEADER_LEN
+        );
+    }
+    file.seek(SeekFrom::Start(0))
+        .context("failed to rewind data file")?;
+    let mut header_buf = [0u8; HEADER_LEN];
+    file.read_exact(&mut header_buf)
+        .context("failed to read data file header")?;
+    let header = decode_header(&header_buf)
+        .with_context(|| format!("invalid header in {}", path.display()))?;
+    Ok(Some(header))
+}
+
 // ── f32 vector I/O ────────────────────────────────────────────────────────────
 
 /// Encode a slice of `f32` values into a `Vec<u8>` (little-endian).
