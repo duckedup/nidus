@@ -7,12 +7,18 @@ nidus is built for development and small-scale use. You add it as a dependency,
 open a store in a directory of your choosing, and call methods. There is nothing
 to install, no daemon to run, and no network.
 
+:::tip[Just want local search, no Rust?]
+If you'd rather not write Rust, install the `nidus` command-line tool — no
+toolchain required — and stand up a working local store in four commands. See
+[Quickstart: local search in four commands](/guides/cli-and-server/#quickstart-local-search-in-four-commands).
+:::
+
 ## Add the dependency
 
 ```toml
 # Cargo.toml
 [dependencies]
-nidus = "0.7"
+nidus = "0.8"
 anyhow = "1"     # nidus returns anyhow::Result
 ```
 

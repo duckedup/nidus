@@ -23,22 +23,49 @@ pub struct Cli {
     command: Command,
 }
 
-/// Store location, shared by every subcommand. `--dim` must match the store's
-/// pinned dimension (set when the store is first created).
+/// Store location, shared by every subcommand. For an existing store both the
+/// dimension and distance metric are read from the on-disk header, so `--dim`
+/// and `--distance` are only needed when creating a store (or to override and
+/// double-check an existing one — a mismatch is then a hard error).
 #[derive(Args, Debug)]
 struct StoreArgs {
     /// Store directory (created on first write).
     #[arg(long, short = 'd')]
     dir: PathBuf,
-    /// Embedding dimension. Must match the store.
+    /// Embedding dimension. Inferred from an existing store; required to create one.
     #[arg(long)]
-    dim: usize,
-    /// Distance metric: cosine (default), euclidean, or dot.
-    #[arg(long, default_value = "cosine")]
-    distance: DistanceArg,
+    dim: Option<usize>,
+    /// Distance metric: cosine, euclidean, or dot. Inferred from an existing
+    /// store; defaults to cosine when creating one.
+    #[arg(long)]
+    distance: Option<DistanceArg>,
     /// Open without taking the writer lock (rejects mutations).
     #[arg(long)]
     read_only: bool,
+}
+
+impl StoreArgs {
+    /// Resolve the `(dimension, distance)` to open with. An explicit flag always
+    /// wins (and is then verified against the header on open); otherwise the
+    /// value is read from an existing store's header. When neither is available
+    /// — no store yet and no `--dim` — creation cannot proceed, so we ask for it.
+    fn resolve(&self) -> Result<(usize, Distance)> {
+        let peeked = crate::data::peek_header(&self.dir.join("data"))?;
+        let dimension = match (self.dim, peeked) {
+            (Some(d), _) => d,
+            (None, Some((d, _))) => d,
+            (None, None) => bail!(
+                "no store at {} yet — pass --dim to create one",
+                self.dir.display()
+            ),
+        };
+        let distance = match (self.distance, peeked) {
+            (Some(d), _) => d.into(),
+            (None, Some((_, dist))) => dist,
+            (None, None) => Distance::default(),
+        };
+        Ok((dimension, distance))
+    }
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -287,9 +314,10 @@ fn open(store: &StoreArgs, mutating: bool) -> Result<Nidus> {
     } else {
         OpenMode::ReadOnly
     };
+    let (dim, distance) = store.resolve()?;
     Nidus::open(
-        Config::new(store.dir.clone(), store.dim)
-            .distance(store.distance.into())
+        Config::new(store.dir.clone(), dim)
+            .distance(distance)
             .open_mode(mode),
     )
 }
@@ -300,9 +328,10 @@ fn serve(store: StoreArgs, addr: &str) -> Result<()> {
     } else {
         OpenMode::ReadWrite
     };
+    let (dim, distance) = store.resolve()?;
     let db = Nidus::open(
-        Config::new(store.dir.clone(), store.dim)
-            .distance(store.distance.into())
+        Config::new(store.dir.clone(), dim)
+            .distance(distance)
             .open_mode(mode),
     )?;
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -344,7 +373,7 @@ mod tests {
         match cli.command {
             Command::Serve { addr, store } => {
                 assert_eq!(addr, "127.0.0.1:7700");
-                assert_eq!(store.dim, 8);
+                assert_eq!(store.dim, Some(8));
                 assert!(!store.read_only);
             }
             _ => panic!("expected Serve"),
@@ -395,8 +424,45 @@ mod tests {
     }
 
     #[test]
-    fn store_args_required() {
+    fn store_args_require_dir_but_not_dim() {
+        // --dir is always required.
         assert!(Cli::try_parse_from(["nidus", "collections"]).is_err());
-        assert!(Cli::try_parse_from(["nidus", "collections", "--dir", "/tmp/s"]).is_err());
+        // --dim is now optional (inferred from an existing store's header).
+        let cli = Cli::try_parse_from(["nidus", "collections", "--dir", "/tmp/s"]).unwrap();
+        match cli.command {
+            Command::Collections { store } => assert_eq!(store.dim, None),
+            _ => panic!("expected Collections"),
+        }
+    }
+
+    #[test]
+    fn resolve_infers_dim_and_distance_from_existing_store() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a euclidean store, then drop it.
+        {
+            let cfg = Config::new(dir.path().to_path_buf(), 5).distance(Distance::Euclidean);
+            Nidus::open(cfg).unwrap();
+        }
+        // No --dim / --distance: both come from the header.
+        let args = StoreArgs {
+            dir: dir.path().to_path_buf(),
+            dim: None,
+            distance: None,
+            read_only: false,
+        };
+        assert_eq!(args.resolve().unwrap(), (5, Distance::Euclidean));
+    }
+
+    #[test]
+    fn resolve_requires_dim_when_no_store_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = StoreArgs {
+            dir: dir.path().join("does-not-exist-yet"),
+            dim: None,
+            distance: None,
+            read_only: false,
+        };
+        let err = args.resolve().unwrap_err().to_string();
+        assert!(err.contains("--dim"), "unexpected error: {err}");
     }
 }
