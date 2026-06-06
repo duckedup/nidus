@@ -58,8 +58,18 @@ nidus create --dir ./shard --dim 768 docs
 cat shard-records.json | nidus upsert --dir ./shard docs
 
 # Serve it on the box's LAN address. --read-only if a separate writer owns the shard.
-nidus serve --dir ./shard --addr 0.0.0.0:7700
+# --token requires `Authorization: Bearer <token>` on every request (see below).
+nidus serve --dir ./shard --addr 0.0.0.0:7700 --token "$NIDUS_TOKEN"
 ```
+
+:::danger[Binding `0.0.0.0` exposes the store to your whole network]
+Once you leave `127.0.0.1`, anyone who can reach the port can read **and write** —
+upsert, delete, drop collections, compact. The server is unauthenticated by
+default. On a shared or untrusted LAN, set a shared secret with `--token` (or the
+`NIDUS_TOKEN` env var) on every box and send it from the client as
+`Authorization: Bearer <token>`; `--read-only` shards additionally refuse all
+mutations. `/health` stays open so liveness checks need no credential.
+:::
 
 ## Fan out and merge on the client
 
@@ -76,7 +86,9 @@ BOXES="box-a.lan box-b.lan box-c.lan"
 
 for host in $BOXES; do
   curl -s "http://$host:7700/search" \
-    -H 'content-type: application/json' -d "$QUERY"
+    -H 'content-type: application/json' \
+    -H "authorization: Bearer $NIDUS_TOKEN" \
+    -d "$QUERY"
 done \
 | jq -s 'add | sort_by(-.score) | .[0:10]'    # cosine/dot: highest score wins
 #         └ for Euclidean, use `sort_by(.score)` instead (lowest distance wins)

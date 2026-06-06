@@ -4,9 +4,10 @@ description: The nidus storage model and search path, end to end — from upsert
 ---
 
 nidus holds dense vectors plus typed metadata in a single on-disk directory and
-answers nearest-neighbour queries by **exact brute-force cosine**. There is no
-ANN index, no query planner, and no background thread — the whole thing is a
-RAM-resident matrix and a small amount of write glue.
+answers nearest-neighbour queries by **exact brute-force scoring** — cosine (the
+default), dot, or Euclidean. There is no ANN index, no query planner, and no
+background thread — the whole thing is a RAM-resident matrix and a small amount of
+write glue.
 
 ## The storage model
 
@@ -57,8 +58,9 @@ to the entry marks, so a caught `ENOSPC` leaves the store exactly as it was.
 
 ## Search
 
-Search is brute-force cosine over a [`Scope`](/reference/api/#scope) — one
-collection, a named subset, or the whole store — merged into a single ranking:
+Search is brute-force scoring (cosine, dot, or Euclidean) over a
+[`Scope`](/reference/api/#scope) — one collection, a named subset, or the whole
+store — merged into a single ranking:
 
 1. Resolve the scope to a set of candidate rows.
 2. Apply the metadata [`Filter`](/guides/search/#filters) (before any dot

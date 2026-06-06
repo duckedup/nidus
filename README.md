@@ -1,9 +1,9 @@
 # nidus
 
 A small, pure-Rust **vector store for development and small-scale use**.
-Brute-force cosine search over a single append-only directory, with typed
-metadata filters and many logical collections sharing one embedding space. No
-FFI, no C, no SQL, no query engine.
+Exact brute-force search — cosine, dot, or Euclidean — over a single append-only
+directory, with typed metadata filters and many logical collections sharing one
+embedding space. No FFI, no C, no SQL, no query engine.
 
 > _nidus_ (Latin, "nest") — a small place where things are kept safe.
 
@@ -74,9 +74,10 @@ See [`examples/demo.rs`](examples/demo.rs) for an end-to-end run (`cargo run
 
 ## What it does
 
-- **Exact brute-force cosine** — 100% recall, fast at the target scale (≤ a few
-  million vectors, comfortably in RAM). Vectors are unit-normalized on insert, so a
-  score is plain cosine similarity in `[-1, 1]`.
+- **Exact brute-force search** — 100% recall, fast at the target scale (≤ a few
+  million vectors, comfortably in RAM). Score by cosine, dot, or Euclidean (cosine
+  the default; cosine vectors are unit-normalized on insert, so a score is plain
+  similarity in `[-1, 1]`). Optional int8 quantization trades a rerank pass for speed.
 - **Scoped search** — query one collection, a subset, or the **whole store** in one
   call, merged into a single ranking. Sound because every collection shares one
   embedding space (one pinned dimension).

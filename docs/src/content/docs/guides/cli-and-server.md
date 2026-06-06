@@ -124,6 +124,24 @@ nidus serve --dir ./store --dim 768 --addr 127.0.0.1:7700
 Pass `--read-only` to serve without taking the writer lock — useful for a
 search-only process beside a separate writer.
 
+### Authentication
+
+The server is unauthenticated by default, which is fine on `127.0.0.1`. The moment
+you bind a non-local address, set `--token <secret>` (or the `NIDUS_TOKEN` env
+var): every request except `GET /health` must then carry
+`Authorization: Bearer <secret>`, and anything else gets `401`.
+
+```bash
+nidus serve --dir ./store --addr 0.0.0.0:7700 --token "$NIDUS_TOKEN"
+curl -s localhost:7700/search -H "authorization: Bearer $NIDUS_TOKEN" -d '…'
+```
+
+### Request size
+
+Each request body is buffered in memory, so the body-size limit is also the
+largest single upsert. It defaults to 256 MiB; raise or lower it with
+`--max-body-bytes <n>`.
+
 The endpoints map one-to-one onto the library API:
 
 | Method & path | Operation |
@@ -166,7 +184,8 @@ curl -s localhost:7700/collections/docs/delete \
   -H 'content-type: application/json' -d '{"ids": ["a"]}'
 ```
 
-The server holds the store behind a lock and runs each operation on a blocking
-worker, the same pattern the library recommends for [driving it from async
-code](/guides/integrating/). It is a thin wrapper: the storage model, durability,
-and search semantics are exactly those of the library.
+The server holds the store behind a read/write lock and runs each operation on a
+blocking worker, the same pattern the library recommends for [driving it from
+async code](/guides/integrating/). Reads (search, list, get) run concurrently;
+writes take the store exclusively. It is a thin wrapper: the storage model,
+durability, and search semantics are exactly those of the library.
