@@ -33,6 +33,25 @@ download() {
     fi
 }
 
+# Verify a file against an expected SHA-256 (the first field of a `shasum`-style
+# sum file). Uses sha256sum or shasum, whichever exists; warns and skips if
+# neither is present rather than failing the install on a checksum-less box.
+verify_sha256() {
+    file="$1"; sumfile="$2"
+    expected="$(awk '{print $1}' "$sumfile" | head -1)"
+    [ -n "$expected" ] || err "checksum file was empty: $sumfile"
+    if need sha256sum; then
+        actual="$(sha256sum "$file" | awk '{print $1}')"
+    elif need shasum; then
+        actual="$(shasum -a 256 "$file" | awk '{print $1}')"
+    else
+        say "warning: no sha256 tool found — skipping checksum verification"
+        return 0
+    fi
+    [ "$expected" = "$actual" ] \
+        || err "checksum mismatch for $file (expected $expected, got $actual)"
+}
+
 # Map uname output to a Rust target triple matching the release asset names.
 detect_target() {
     os="$(uname -s)"
@@ -81,6 +100,16 @@ main() {
     trap 'rm -rf "$tmp"' EXIT
 
     download "$url" "$tmp/$asset" || err "download failed: $url"
+
+    # Verify the sidecar checksum when the release ships one. Older releases
+    # predate checksums — warn and proceed rather than block the install.
+    if download "${url}.sha256" "$tmp/$asset.sha256" 2>/dev/null; then
+        verify_sha256 "$tmp/$asset" "$tmp/$asset.sha256"
+        say "checksum ok"
+    else
+        say "warning: no published checksum for this release — skipping verification"
+    fi
+
     tar -xzf "$tmp/$asset" -C "$tmp" || err "failed to extract $asset"
     [ -f "$tmp/nidus" ] || err "archive did not contain a 'nidus' binary"
 

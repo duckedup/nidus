@@ -1,9 +1,9 @@
 ---
 title: nidus
-description: A small, pure-Rust vector store for development and small-scale use. Brute-force cosine search over a single append-only directory — no FFI, no C, no SQL, no query engine.
+description: A small, pure-Rust vector store for development and small-scale use. Exact brute-force search — cosine, dot, or Euclidean — over a single append-only directory. No FFI, no C, no SQL, no query engine.
 template: splash
 hero:
-  tagline: A small, pure-Rust vector store, built for development and small-scale use. Dense vectors plus typed metadata in a single on-disk directory, answered by exact brute-force cosine. No FFI, no C, no SQL, no query engine.
+  tagline: A small, pure-Rust vector store, built for development and small-scale use. Dense vectors plus typed metadata in a single on-disk directory, answered by exact brute-force search — cosine, dot, or Euclidean. No FFI, no C, no SQL, no query engine.
   image:
     alt: nidus
     file: ../../assets/nidus.svg
@@ -35,8 +35,8 @@ import { Code } from '@astrojs/starlight/components';
 <div class="feature-grid not-content">
   <article class="feature">
     <span class="num">01</span>
-    <h3>Exact brute-force cosine</h3>
-    <p>100% recall, fast at the target scale (≤ a few million vectors, comfortably in RAM). Vectors are unit-normalized on insert, so a score is plain cosine in [-1, 1].</p>
+    <h3>Exact brute-force search</h3>
+    <p>100% recall, fast at the target scale (≤ a few million vectors, comfortably in RAM). Score by cosine, dot, or Euclidean; optional int8 quantization trades a rerank pass for more speed.</p>
   </article>
   <article class="feature">
     <span class="num">02</span>
@@ -51,7 +51,7 @@ import { Code } from '@astrojs/starlight/components';
   <article class="feature">
     <span class="num">04</span>
     <h3>Typed metadata &amp; filters</h3>
-    <p>Attach Str / Int / Bool / List / Null attributes and filter with Eq / Glob / In before scoring. Many collections share one embedding space, searchable in one call.</p>
+    <p>Attach Str / Int / Bool / List / Null attributes and filter — equality, ranges, globs, sets, and negation — before scoring. Many collections share one embedding space, searchable in one call.</p>
   </article>
 </div>
 

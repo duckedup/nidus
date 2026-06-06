@@ -78,6 +78,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # rust-toolchain.toml pins the channel, so the in-repo build uses that
+      # toolchain — not the one dtolnay just set up. Add the cross target to the
+      # *active* (pinned) toolchain so its std is present (e.g. x86_64-apple-darwin
+      # std on an Apple-Silicon runner). `cross` provides std itself, so skip it.
+      - name: Add target to the pinned toolchain
+        if: "!matrix.use_cross"
+        run: rustup target add ${{ matrix.target }}
+
       - name: Install cross
         if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross
@@ -96,12 +104,17 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar czf ../../../nidus-${{ matrix.target }}.tar.gz nidus
           cd ../../..
+          # A sidecar checksum the installer verifies. `shasum` ships on both
+          # macOS and Ubuntu runners.
+          shasum -a 256 "nidus-${{ matrix.target }}.tar.gz" > "nidus-${{ matrix.target }}.tar.gz.sha256"
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           Compress-Archive -Path "target/${{ matrix.target }}/release/nidus.exe" -DestinationPath "nidus-${{ matrix.target }}.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "nidus-${{ matrix.target }}.zip").Hash.ToLower()
+          "$hash  nidus-${{ matrix.target }}.zip" | Out-File -Encoding ascii -NoNewline "nidus-${{ matrix.target }}.zip.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -178,7 +191,7 @@ jobs:
           fi
 
           gh release create "${{ needs.check-version.outputs.tag }}" \
-            nidus-*.tar.gz nidus-*.zip \
+            nidus-*.tar.gz nidus-*.zip nidus-*.sha256 \
             --title "${{ needs.check-version.outputs.tag }}" \
             --latest \
             --notes "## nidus ${{ needs.check-version.outputs.version }}

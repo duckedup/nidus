@@ -94,6 +94,15 @@ enum Command {
         /// Address to bind.
         #[arg(long, default_value = "127.0.0.1:7700")]
         addr: String,
+        /// Require `Authorization: Bearer <token>` on every request except
+        /// `/health`. Falls back to the `NIDUS_TOKEN` env var. Strongly advised
+        /// when binding anything other than localhost.
+        #[arg(long)]
+        token: Option<String>,
+        /// Maximum request body size in bytes (also the largest single upsert).
+        /// Default 256 MiB.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_body_bytes: usize,
     },
     /// List collections.
     Collections {
@@ -189,7 +198,12 @@ enum Command {
 /// Parse-and-dispatch entry point used by `main`.
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Serve { store, addr } => serve(store, &addr),
+        Command::Serve {
+            store,
+            addr,
+            token,
+            max_body_bytes,
+        } => serve(store, addr, token, max_body_bytes),
         Command::Collections { store } => {
             let db = open(&store, false)?;
             print_json(&db.collections())
@@ -322,7 +336,12 @@ fn open(store: &StoreArgs, mutating: bool) -> Result<Nidus> {
     )
 }
 
-fn serve(store: StoreArgs, addr: &str) -> Result<()> {
+fn serve(
+    store: StoreArgs,
+    addr: String,
+    token: Option<String>,
+    max_body_bytes: usize,
+) -> Result<()> {
     let mode = if store.read_only {
         OpenMode::ReadOnly
     } else {
@@ -334,10 +353,17 @@ fn serve(store: StoreArgs, addr: &str) -> Result<()> {
             .distance(distance)
             .open_mode(mode),
     )?;
+    // An explicit --token wins; otherwise fall back to the NIDUS_TOKEN env var.
+    let token = token.or_else(|| std::env::var("NIDUS_TOKEN").ok().filter(|t| !t.is_empty()));
+    let cfg = crate::server::ServeConfig {
+        addr,
+        token,
+        max_body_bytes,
+    };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(crate::server::serve(db, addr))
+    rt.block_on(crate::server::serve(db, cfg))
 }
 
 /// Read JSON from `file`, or from stdin when absent.
@@ -371,10 +397,13 @@ mod tests {
     fn serve_defaults_addr() {
         let cli = Cli::try_parse_from(["nidus", "serve", "--dir", "/tmp/s", "--dim", "8"]).unwrap();
         match cli.command {
-            Command::Serve { addr, store } => {
+            Command::Serve {
+                addr, store, token, ..
+            } => {
                 assert_eq!(addr, "127.0.0.1:7700");
                 assert_eq!(store.dim, Some(8));
                 assert!(!store.read_only);
+                assert_eq!(token, None);
             }
             _ => panic!("expected Serve"),
         }

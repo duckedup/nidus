@@ -32,7 +32,12 @@ impl WriteLock {
                     match try_create_lock(&path) {
                         Ok(lock) => Ok(lock),
                         Err(e2) if e2.kind() == std::io::ErrorKind::AlreadyExists => {
-                            bail!("store is locked: {}", path.display())
+                            bail!(
+                                "store is locked by another writer (e.g. a running `nidus serve`): {} \
+                                 — stop that process, or send writes through it instead of opening \
+                                 the store a second time",
+                                path.display()
+                            )
                         }
                         Err(e2) => Err(e2).with_context(|| {
                             format!(

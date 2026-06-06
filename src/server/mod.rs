@@ -10,13 +10,14 @@
 
 pub mod dto;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Path, Request, State},
+    http::{StatusCode, header::AUTHORIZATION},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -26,23 +27,51 @@ use tokio::net::TcpListener;
 use crate::{Nidus, Record, Scope, SearchOpts};
 use dto::{DeleteRequest, HitDto, ListRequest, SearchRequest, UpsertRequest};
 
-/// Shared, cloneable handle to the one open store.
-#[derive(Clone)]
-struct AppState {
-    db: Arc<Mutex<Nidus>>,
+/// How `nidus serve` is configured beyond the store itself.
+pub struct ServeConfig {
+    /// Bind address.
+    pub addr: String,
+    /// When `Some`, every request except `/health` must carry
+    /// `Authorization: Bearer <token>`. `None` leaves the server unauthenticated
+    /// (the frictionless localhost default).
+    pub token: Option<String>,
+    /// Maximum request body size in bytes. The store buffers each body in memory,
+    /// so this is also the largest single upsert payload.
+    pub max_body_bytes: usize,
 }
 
-/// Open the store, bind `addr`, and serve until Ctrl-C; flush on shutdown.
-pub async fn serve(db: Nidus, addr: &str) -> anyhow::Result<()> {
-    let state = AppState {
-        db: Arc::new(Mutex::new(db)),
-    };
-    let app = router(state.clone());
+/// Shared, cloneable handle to the one open store.
+///
+/// The store sits behind an `RwLock`, not a `Mutex`: read endpoints (search,
+/// list, get) take `&Nidus` and run **concurrently**, while writes take the
+/// exclusive guard. Brute-force search is CPU-bound, so letting parallel queries
+/// use multiple cores is the whole point at this scale.
+#[derive(Clone)]
+struct AppState {
+    db: Arc<RwLock<Nidus>>,
+    token: Option<Arc<str>>,
+}
 
-    let listener = TcpListener::bind(addr)
+/// Open the store, bind the address, and serve until Ctrl-C; flush on shutdown.
+pub async fn serve(db: Nidus, cfg: ServeConfig) -> anyhow::Result<()> {
+    let state = AppState {
+        db: Arc::new(RwLock::new(db)),
+        token: cfg.token.map(Arc::from),
+    };
+    let app = router(state.clone(), cfg.max_body_bytes);
+
+    let listener = TcpListener::bind(&cfg.addr)
         .await
-        .with_context(|| format!("binding {addr}"))?;
-    eprintln!("nidus serving on http://{addr} (Ctrl-C to stop)");
+        .with_context(|| format!("binding {}", cfg.addr))?;
+    let auth_note = if state.token.is_some() {
+        " (bearer-token auth required)"
+    } else {
+        ""
+    };
+    eprintln!(
+        "nidus serving on http://{} (Ctrl-C to stop){auth_note}",
+        cfg.addr
+    );
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -50,13 +79,13 @@ pub async fn serve(db: Nidus, addr: &str) -> anyhow::Result<()> {
         .context("server error")?;
 
     // Best-effort durability flush on a clean shutdown.
-    if let Ok(mut db) = state.db.lock() {
+    if let Ok(mut db) = state.db.write() {
         let _ = db.flush();
     }
     Ok(())
 }
 
-fn router(state: AppState) -> Router {
+fn router(state: AppState, max_body_bytes: usize) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/collections", get(list_collections))
@@ -72,7 +101,32 @@ fn router(state: AppState) -> Router {
         .route("/list", post(list))
         .route("/flush", post(flush))
         .route("/compact", post(compact))
+        .layer(DefaultBodyLimit::max(max_body_bytes))
+        .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
+}
+
+/// Reject any request lacking a valid `Authorization: Bearer <token>` when a
+/// token is configured. `/health` is always open so liveness checks need no
+/// credential. A no-op when the server is unauthenticated.
+async fn auth(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    if let Some(expected) = &st.token
+        && req.uri().path() != "/health"
+    {
+        let presented = req
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if presented != Some(expected.as_ref()) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "missing or invalid bearer token" })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 async fn shutdown_signal() {
@@ -86,7 +140,7 @@ async fn health() -> &'static str {
 }
 
 async fn list_collections(State(st): State<AppState>) -> Result<Json<Vec<String>>, ApiError> {
-    let names = run(st, |db| Ok(db.collections())).await?;
+    let names = run_read(st, |db| Ok(db.collections())).await?;
     Ok(Json(names))
 }
 
@@ -94,7 +148,7 @@ async fn create_collection(
     State(st): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<JsonValue>, ApiError> {
-    let created = run(st, move |db| {
+    let created = run_write(st, move |db| {
         db.create_collection(&name)?;
         Ok(name)
     })
@@ -106,7 +160,7 @@ async fn drop_collection(
     State(st): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<JsonValue>, ApiError> {
-    let dropped = run(st, move |db| {
+    let dropped = run_write(st, move |db| {
         db.drop_collection(&name)?;
         Ok(name)
     })
@@ -118,7 +172,7 @@ async fn get_meta(
     State(st): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<std::collections::BTreeMap<String, String>>, ApiError> {
-    let meta = run(st, move |db| Ok(db.get_meta(&name))).await?;
+    let meta = run_read(st, move |db| Ok(db.get_meta(&name))).await?;
     Ok(Json(meta))
 }
 
@@ -127,7 +181,7 @@ async fn set_meta(
     Path(name): Path<String>,
     Json(meta): Json<std::collections::BTreeMap<String, String>>,
 ) -> Result<Json<JsonValue>, ApiError> {
-    run(st, move |db| db.set_meta(&name, meta)).await?;
+    run_write(st, move |db| db.set_meta(&name, meta)).await?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -136,7 +190,7 @@ async fn upsert(
     Path(name): Path<String>,
     Json(req): Json<UpsertRequest>,
 ) -> Result<Json<JsonValue>, ApiError> {
-    let n = run(st, move |db| db.upsert(&name, &req.records)).await?;
+    let n = run_write(st, move |db| db.upsert(&name, &req.records)).await?;
     Ok(Json(json!({ "upserted": n })))
 }
 
@@ -145,7 +199,7 @@ async fn delete_records(
     Path(name): Path<String>,
     Json(req): Json<DeleteRequest>,
 ) -> Result<Json<JsonValue>, ApiError> {
-    let n = run(st, move |db| match req.filter {
+    let n = run_write(st, move |db| match req.filter {
         Some(f) => db.delete_where(&name, &f),
         None => {
             let ids: Vec<&str> = req.ids.iter().map(String::as_str).collect();
@@ -160,7 +214,7 @@ async fn records(
     State(st): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<Vec<Record>>, ApiError> {
-    let recs = run(st, move |db| Ok(db.get_all(&name))).await?;
+    let recs = run_read(st, move |db| Ok(db.get_all(&name))).await?;
     Ok(Json(recs))
 }
 
@@ -168,7 +222,7 @@ async fn search(
     State(st): State<AppState>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
-    let hits = run(st, move |db| {
+    let hits = run_read(st, move |db| {
         let SearchRequest {
             query,
             scope,
@@ -196,7 +250,7 @@ async fn list(
     State(st): State<AppState>,
     Json(req): Json<ListRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
-    let hits = run(st, move |db| {
+    let hits = run_read(st, move |db| {
         let ListRequest {
             scope,
             offset,
@@ -215,18 +269,36 @@ async fn list(
 }
 
 async fn flush(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
-    run(st, |db| db.flush()).await?;
+    run_write(st, |db| db.flush()).await?;
     Ok(Json(json!({ "ok": true })))
 }
 
 async fn compact(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
-    run(st, |db| db.compact()).await?;
+    run_write(st, |db| db.compact()).await?;
     Ok(Json(json!({ "ok": true })))
 }
 
-/// Run a store operation on a blocking task, holding the lock only for its
-/// duration. `&mut Nidus` covers both reads and writes (read methods take `&self`).
-async fn run<F, T>(st: AppState, f: F) -> Result<T, ApiError>
+/// Run a **read** operation on a blocking task under a shared lock — concurrent
+/// reads proceed in parallel.
+async fn run_read<F, T>(st: AppState, f: F) -> Result<T, ApiError>
+where
+    F: FnOnce(&Nidus) -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let db = st
+            .db
+            .read()
+            .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
+        f(&db)
+    })
+    .await
+    .map_err(|e| ApiError::internal(anyhow::anyhow!("task join error: {e}")))?
+    .map_err(ApiError::from)
+}
+
+/// Run a **write** operation on a blocking task under the exclusive lock.
+async fn run_write<F, T>(st: AppState, f: F) -> Result<T, ApiError>
 where
     F: FnOnce(&mut Nidus) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
@@ -234,35 +306,112 @@ where
     tokio::task::spawn_blocking(move || {
         let mut db = st
             .db
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
         f(&mut db)
     })
     .await
-    .map_err(|e| ApiError(anyhow::anyhow!("task join error: {e}")))?
-    .map_err(ApiError)
+    .map_err(|e| ApiError::internal(anyhow::anyhow!("task join error: {e}")))?
+    .map_err(ApiError::from)
 }
 
 // ── Error response ──────────────────────────────────────────────────────────
 
-/// Any error from a handler becomes a `500` with a JSON `{ "error": … }` body.
-struct ApiError(anyhow::Error);
+/// A handler error carrying the HTTP status to report. The body is always
+/// `{ "error": … }`. Status is classified from the error so clients can tell a
+/// bad request from a genuine server fault (the library uses `anyhow`, so the
+/// classification is by message — the few client-fault errors the store raises
+/// have stable, distinctive wording).
+struct ApiError {
+    status: StatusCode,
+    err: anyhow::Error,
+}
+
+impl ApiError {
+    fn internal(err: anyhow::Error) -> Self {
+        ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            err,
+        }
+    }
+}
+
+/// Map a store error to an HTTP status. Defaults to `500`; recognises the
+/// store's client-fault messages and the writer-lock conflict.
+fn classify(err: &anyhow::Error) -> StatusCode {
+    let msg = format!("{err:#}").to_lowercase();
+    if msg.contains("does not match store dimension") {
+        StatusCode::BAD_REQUEST
+    } else if msg.contains("read-only store") {
+        StatusCode::FORBIDDEN
+    } else if msg.contains("store is locked") {
+        StatusCode::CONFLICT
+    } else if msg.contains("max_vector_bytes") || msg.contains("out of memory") {
+        StatusCode::INSUFFICIENT_STORAGE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(err: anyhow::Error) -> Self {
+        ApiError {
+            status: classify(&err),
+            err,
+        }
+    }
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("{:#}", self.0) })),
+            self.status,
+            Json(json!({ "error": format!("{:#}", self.err) })),
         )
             .into_response()
     }
 }
 
-impl<E> From<E> for ApiError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(e: E) -> Self {
-        ApiError(e.into())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::anyhow;
+
+    #[test]
+    fn classify_maps_client_faults() {
+        let cases = [
+            (
+                "vector length 4 does not match store dimension 8",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "read-only store: mutations are not allowed",
+                StatusCode::FORBIDDEN,
+            ),
+            ("store is locked: /tmp/s/lock", StatusCode::CONFLICT),
+            (
+                "upsert would grow the vector matrix to 9 bytes, exceeding max_vector_bytes (8 bytes)",
+                StatusCode::INSUFFICIENT_STORAGE,
+            ),
+            (
+                "out of memory reserving capacity for 3 rows",
+                StatusCode::INSUFFICIENT_STORAGE,
+            ),
+            (
+                "something unexpected blew up",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (msg, want) in cases {
+            assert_eq!(classify(&anyhow!("{msg}")), want, "message: {msg}");
+        }
+    }
+
+    #[test]
+    fn classify_sees_through_context_chains() {
+        // The store wraps errors with .context(); classify reads the full chain.
+        let err = anyhow!("vector length 4 does not match store dimension 8")
+            .context("while upserting into 'docs'");
+        assert_eq!(classify(&err), StatusCode::BAD_REQUEST);
     }
 }
