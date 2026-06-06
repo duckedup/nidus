@@ -100,14 +100,15 @@ JSON. The binary is built behind a `cli` feature, so `cargo add nidus` stays
 pure — the library never pulls the binary's dependencies.
 
 ```bash
-# Install — prebuilt binary, or from source
-cargo binstall nidus
-cargo install nidus --features cli
+# Install — no Rust toolchain needed (prebuilt binary for your platform)
+curl -fsSL https://raw.githubusercontent.com/duckedup/nidus/main/install.sh | sh
+# …or, with cargo: `cargo binstall nidus` / `cargo install nidus --features cli`
 
-# Use it on a store directory (records/queries are JSON)
+# Use it on a store directory (records/queries are JSON). --dim is pinned at
+# creation, then inferred from the store, so later commands don't repeat it.
 nidus create  --dir ./store --dim 3 docs
-echo '[{"id":"a","vector":[1,0,0],"attrs":{}}]' | nidus upsert --dir ./store --dim 3 docs
-echo '[1,0,0]' | nidus search --dir ./store --dim 3 docs -k 5
+echo '[{"id":"a","vector":[1,0,0],"attrs":{}}]' | nidus upsert --dir ./store docs
+echo '[1,0,0]' | nidus search --dir ./store docs -k 5
 
 # Or serve it over HTTP
 nidus serve --dir ./store --dim 768 --addr 127.0.0.1:7700

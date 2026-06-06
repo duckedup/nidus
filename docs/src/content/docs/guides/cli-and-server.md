@@ -14,54 +14,97 @@ its extra dependencies are compiled only when you ask for them.
 
 ## Install
 
-```bash
-# Prebuilt binary (fastest):
-cargo binstall nidus
+The fastest path needs **no Rust toolchain** — one command fetches a prebuilt
+`nidus` binary for your platform from the latest release and drops it in
+`~/.local/bin`:
 
-# Or build from source:
-cargo install nidus --features cli
+```bash
+curl -fsSL https://raw.githubusercontent.com/duckedup/nidus/main/install.sh | sh
 ```
 
-Both install a single `nidus` executable.
+Set `NIDUS_BIN_DIR` to install elsewhere, or `NIDUS_VERSION=vX.Y.Z` to pin a
+version. Prefer not to pipe to a shell? [Read the script first](https://github.com/duckedup/nidus/blob/main/install.sh),
+or grab the tarball straight from the [releases page](https://github.com/duckedup/nidus/releases/latest)
+(`nidus-<target>.tar.gz`, or `.zip` on Windows), extract it, and put the `nidus`
+binary on your `PATH`.
+
+If you already have a Rust toolchain, either of these works too:
+
+```bash
+cargo binstall nidus                 # prebuilt binary, via cargo
+cargo install nidus --features cli   # build from source
+```
+
+Every route installs the same single `nidus` executable.
+
+## Quickstart: local search in four commands
+
+From an empty directory to a working nearest-neighbour query — no Rust, no
+config files, no daemon to register. Pick a store directory and an embedding
+dimension once (here a toy `3`); after the store exists, `--dim` is remembered.
+
+```bash
+# 1. Install (see above)
+curl -fsSL https://raw.githubusercontent.com/duckedup/nidus/main/install.sh | sh
+
+# 2. Create a collection. The dimension is pinned here, at creation.
+nidus create --dir ./store --dim 3 docs
+
+# 3. Add a couple of records (id + vector + any typed metadata).
+echo '[
+  {"id":"a","vector":[1,0,0],"attrs":{"lang":{"Str":"rust"}}},
+  {"id":"b","vector":[0,1,0],"attrs":{"lang":{"Str":"go"}}}
+]' | nidus upsert --dir ./store docs
+
+# 4. Search. No --dim needed — it is read from the store.
+echo '[1,0,0]' | nidus search --dir ./store docs -k 2
+```
+
+The last command prints ranked hits as JSON. That is a complete local vector
+store: a single `./store` directory you can copy, back up, or delete. To query
+it over HTTP instead, point [`nidus serve`](#server) at the same directory.
 
 ## Command line
 
-Every command takes the store directory (`--dir`/`-d`) and the embedding
-dimension (`--dim`), which must match the store. An optional `--distance` flag
-selects the metric (`cosine`, `euclidean`, or `dot`; default `cosine`). Records,
-query vectors, and filters are JSON; output is JSON on stdout.
+Every command takes the store directory (`--dir`/`-d`). The embedding dimension
+is pinned in the store the first time you create a collection, so **`--dim` is
+only needed at creation** — afterwards it is read from the store. (Pass it anyway
+and it is checked: a mismatch is a hard error, not a silent surprise.) The
+`--distance` metric (`cosine`, `euclidean`, or `dot`) works the same way: chosen
+at creation (default `cosine`), inferred thereafter. Records, query vectors, and
+filters are JSON; output is JSON on stdout.
 
 ```bash
-# Create a collection (default cosine distance)
+# Create a collection — dimension pinned here (default cosine distance)
 nidus create --dir ./store --dim 3 docs
 
 # Or with Euclidean distance
 nidus create --dir ./store --dim 3 --distance euclidean docs
 
-# Upsert records (JSON array) from stdin or a --file
+# Upsert records (JSON array) from stdin or a --file — no --dim needed
 echo '[{"id":"a","vector":[1,0,0],"attrs":{"lang":{"Str":"rust"}}}]' \
-  | nidus upsert --dir ./store --dim 3 docs
+  | nidus upsert --dir ./store docs
 
 # Nearest-neighbour search — query vector on stdin
-echo '[1,0,0]' | nidus search --dir ./store --dim 3 docs -k 5
+echo '[1,0,0]' | nidus search --dir ./store docs -k 5
 
 # Search every collection at once (omit the collection names)
-echo '[1,0,0]' | nidus search --dir ./store --dim 3
+echo '[1,0,0]' | nidus search --dir ./store
 
 # Filter while searching (an AND of predicates, as JSON)
-echo '[1,0,0]' | nidus search --dir ./store --dim 3 docs \
+echo '[1,0,0]' | nidus search --dir ./store docs \
   --where '[{"Eq":["lang",{"Str":"rust"}]}]'
 
 # List records by metadata filter (no vector query); --offset/-n paginate
-nidus list --dir ./store --dim 3 docs --where '[{"Eq":["lang",{"Str":"rust"}]}]'
-nidus list --dir ./store --dim 3 docs --offset 100 -n 100   # next page
+nidus list --dir ./store docs --where '[{"Eq":["lang",{"Str":"rust"}]}]'
+nidus list --dir ./store docs --offset 100 -n 100   # next page
 
 # Inspect, maintain
-nidus collections --dir ./store --dim 3
-nidus get        --dir ./store --dim 3 docs
-nidus stats      --dir ./store --dim 3
-nidus compact    --dir ./store --dim 3
-nidus delete     --dir ./store --dim 3 docs a b
+nidus collections --dir ./store
+nidus get        --dir ./store docs
+nidus stats      --dir ./store
+nidus compact    --dir ./store
+nidus delete     --dir ./store docs a b
 ```
 
 Read-only commands (`search`, `get`, `collections`, `stats`) open the store
@@ -74,6 +117,7 @@ running server.
 (Ctrl-C, which flushes on the way out).
 
 ```bash
+# --dim is only needed if the store doesn't exist yet; otherwise it's inferred.
 nidus serve --dir ./store --dim 768 --addr 127.0.0.1:7700
 ```
 
