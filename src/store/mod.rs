@@ -47,6 +47,39 @@ fn oom(what: &str, count: usize) -> anyhow::Error {
     anyhow!("out of memory reserving capacity for {count} {what}")
 }
 
+/// Minimum candidate count before a parallel search splits across worker threads.
+/// Below this, the thread spawn/join overhead outweighs the scan, so we stay serial
+/// even when `Config::query_threads > 1`.
+const PARALLEL_SCAN_FLOOR: usize = 4096;
+
+/// A scored candidate: `(score, (collection, id))`, borrowing names from the store.
+/// One worker's `into_sorted_desc()` yields a `Vec` of these for the merge step.
+type Scored<'a> = (f32, (&'a str, &'a str));
+
+/// Score a slice of candidate rows into a fresh bounded top-k heap. The unit of
+/// parallel work: each worker scores one chunk independently, then the caller
+/// merges the per-chunk heaps. Pure read of `data` (shared `&` across threads).
+fn score_chunk<'a>(
+    data: &DataSegment,
+    chunk: &[(u64, &'a str, &'a str)],
+    q: &[f32],
+    score_fn: fn(&[f32], &[f32]) -> f32,
+    top_k: usize,
+    min_score: Option<f32>,
+) -> TopK<(&'a str, &'a str)> {
+    let mut topk: TopK<(&'a str, &'a str)> = TopK::new(top_k);
+    for &(row, col_name, id) in chunk {
+        let score = score_fn(q, data.row(row));
+        if let Some(min) = min_score
+            && score < min
+        {
+            continue;
+        }
+        topk.offer(score, (col_name, id));
+    }
+    topk
+}
+
 // ── Store ─────────────────────────────────────────────────────────────────────
 
 /// int8 quantization state, maintained in RAM when `Config::quantization` is set.
@@ -629,8 +662,17 @@ impl Store {
     }
 
     /// List records matching `filter` across `collections`, without vector scoring.
-    /// Returns up to `limit` hits in insertion order (row index), all with `score: 0.0`.
-    pub fn list(&self, collections: &[&str], filter: &Filter, limit: usize) -> Result<Vec<Hit>> {
+    /// Skips the first `offset` matches and returns up to `limit` more, in insertion
+    /// order (row index), all with `score: 0.0`. `offset`/`limit` paginate a stable
+    /// ordering: the full match set is ordered by physical row, then the window
+    /// `[offset, offset + limit)` is returned.
+    pub fn list(
+        &self,
+        collections: &[&str],
+        filter: &Filter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Hit>> {
         let mut scan: Vec<(u64, &str, &str)> = Vec::new();
         let scan_cap: usize = collections
             .iter()
@@ -651,12 +693,11 @@ impl Store {
             }
         }
         scan.sort_unstable_by_key(|&(row, _, _)| row);
-        if scan.len() > limit {
-            scan.truncate(limit);
-        }
 
         let results = scan
             .into_iter()
+            .skip(offset)
+            .take(limit)
             .map(|(_, collection, id)| {
                 let attrs = self
                     .collections
@@ -728,18 +769,42 @@ impl Store {
             }
         }
 
-        // Standard f32 brute-force path.
-        let mut topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
-        for &(row, col_name, id) in &scan {
-            let stored = self.data.row(row);
-            let score = score_fn(&q, stored);
-            if let Some(min) = opts.min_score
-                && score < min
-            {
-                continue;
+        // Standard f32 brute-force path. Split across worker threads when the store
+        // is configured for it and the scan is large enough to amortize spawn cost;
+        // otherwise score serially. Both yield the same bounded top-k (ties aside).
+        let threads = self.config.query_threads.max(1);
+        let topk = if threads > 1 && scan.len() >= PARALLEL_SCAN_FLOOR {
+            let chunk_len = scan.len().div_ceil(threads);
+            let locals = std::thread::scope(|s| -> Result<Vec<Vec<Scored<'_>>>> {
+                let handles: Vec<_> = scan
+                    .chunks(chunk_len)
+                    .map(|chunk| {
+                        s.spawn(|| {
+                            score_chunk(&self.data, chunk, &q, score_fn, opts.top_k, opts.min_score)
+                                .into_sorted_desc()
+                        })
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(handles.len());
+                for h in handles {
+                    out.push(
+                        h.join()
+                            .map_err(|_| anyhow!("search worker thread panicked"))?,
+                    );
+                }
+                Ok(out)
+            })?;
+            // Merge the per-worker top-k lists into one bounded top-k.
+            let mut merged: TopK<(&str, &str)> = TopK::new(opts.top_k);
+            for local in locals {
+                for (score, item) in local {
+                    merged.offer(score, item);
+                }
             }
-            topk.offer(score, (col_name, id));
-        }
+            merged
+        } else {
+            score_chunk(&self.data, &scan, &q, score_fn, opts.top_k, opts.min_score)
+        };
 
         let results = topk
             .into_sorted_desc()
@@ -1903,7 +1968,7 @@ mod tests {
             "lang".to_string(),
             Value::Str("rust".to_string()),
         )]);
-        let hits = store.list(&["col"], &filter, 100).unwrap();
+        let hits = store.list(&["col"], &filter, 0, 100).unwrap();
         assert_eq!(hits.len(), 2);
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
         assert!(ids.contains(&"r1"));
@@ -1919,7 +1984,7 @@ mod tests {
                 .upsert("col", &[rec(&format!("d{i}"), vec![i as f32, 0.0])])
                 .unwrap();
         }
-        let hits = store.list(&["col"], &Filter::default(), 3).unwrap();
+        let hits = store.list(&["col"], &Filter::default(), 0, 3).unwrap();
         assert_eq!(hits.len(), 3);
     }
 
@@ -1928,7 +1993,7 @@ mod tests {
         let mut store = Store::in_memory(2).unwrap();
         store.create_collection("col").unwrap();
         store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
-        let hits = store.list(&["col"], &Filter::default(), 10).unwrap();
+        let hits = store.list(&["col"], &Filter::default(), 0, 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].score, 0.0);
     }
@@ -1939,7 +2004,7 @@ mod tests {
         store.create_collection("col").unwrap();
         store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
         store.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
-        let hits = store.list(&["col"], &Filter::default(), 100).unwrap();
+        let hits = store.list(&["col"], &Filter::default(), 0, 100).unwrap();
         assert_eq!(hits.len(), 2);
     }
 
@@ -1950,7 +2015,7 @@ mod tests {
         store.create_collection("b").unwrap();
         store.upsert("a", &[rec("x", vec![1.0, 0.0])]).unwrap();
         store.upsert("b", &[rec("y", vec![0.0, 1.0])]).unwrap();
-        let hits = store.list(&["a", "b"], &Filter::default(), 100).unwrap();
+        let hits = store.list(&["a", "b"], &Filter::default(), 0, 100).unwrap();
         assert_eq!(hits.len(), 2);
     }
 
@@ -1964,9 +2029,49 @@ mod tests {
         store
             .upsert("col", &[rec("second", vec![0.0, 1.0])])
             .unwrap();
-        let hits = store.list(&["col"], &Filter::default(), 100).unwrap();
+        let hits = store.list(&["col"], &Filter::default(), 0, 100).unwrap();
         assert_eq!(hits[0].id, "first");
         assert_eq!(hits[1].id, "second");
+    }
+
+    #[test]
+    fn list_offset_paginates() {
+        let mut store = Store::in_memory(2).unwrap();
+        store.create_collection("col").unwrap();
+        for i in 0..10u32 {
+            store
+                .upsert("col", &[rec(&format!("d{i}"), vec![i as f32, 0.0])])
+                .unwrap();
+        }
+        // Page through in windows of 3; concatenating the pages reproduces the
+        // full insertion-ordered list with no gaps or repeats.
+        let mut paged: Vec<String> = Vec::new();
+        for page in 0..4 {
+            let hits = store
+                .list(&["col"], &Filter::default(), page * 3, 3)
+                .unwrap();
+            paged.extend(hits.into_iter().map(|h| h.id));
+        }
+        let full: Vec<String> = store
+            .list(&["col"], &Filter::default(), 0, 100)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(
+            paged, full,
+            "paginated windows must reconstruct the full list"
+        );
+        assert_eq!(paged.len(), 10);
+    }
+
+    #[test]
+    fn list_offset_past_end_is_empty() {
+        let mut store = Store::in_memory(2).unwrap();
+        store.create_collection("col").unwrap();
+        store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+        let hits = store.list(&["col"], &Filter::default(), 5, 10).unwrap();
+        assert!(hits.is_empty());
     }
 
     // ── int8 scalar quantization tests ───────────────────────────────────
@@ -2176,5 +2281,111 @@ mod tests {
             store.quant.as_ref().unwrap().vectors.len(),
             store.data.row_count() as usize * dim
         );
+    }
+
+    // ── parallel scan tests ──────────────────────────────────────────────
+
+    /// Build an in-memory store with `n` deterministic pseudo-random rows and the
+    /// given `query_threads`. `n` above `PARALLEL_SCAN_FLOOR` engages the parallel path.
+    fn threaded_store(dim: usize, n: usize, threads: usize) -> Store {
+        let cfg = Config::new("/dev/null/in-memory", dim)
+            .open_mode(OpenMode::ReadWrite)
+            .auto_compact(None)
+            .query_threads(threads);
+        let mut store = Store::in_memory_cfg(cfg).unwrap();
+        store.create_collection("col").unwrap();
+        let recs: Vec<Record> = (0..n)
+            .map(|i| {
+                let v: Vec<f32> = (0..dim)
+                    .map(|d| ((i * 31 + d * 7) % 97) as f32 - 48.0)
+                    .collect();
+                rec(&format!("d{i}"), v)
+            })
+            .collect();
+        store.upsert("col", &recs).unwrap();
+        store
+    }
+
+    // Ignored under Miri: needs > PARALLEL_SCAN_FLOOR (4096) rows to engage the
+    // threaded path, which Miri runs at ~100x slowdown (minutes). The thread::scope
+    // scan is `#![forbid(unsafe_code)]` safe Rust over shared `&` reads — the borrow
+    // checker already proves it data-race-free, so Miri adds no coverage here.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn parallel_search_matches_serial() {
+        let dim = 8;
+        let n = PARALLEL_SCAN_FLOOR + 500; // exceed the floor so threading engages
+        let serial = threaded_store(dim, n, 1);
+        let parallel = threaded_store(dim, n, 4);
+        let q: Vec<f32> = (0..dim).map(|d| (d * 5 % 13) as f32 - 6.0).collect();
+        let hs = serial.search(&["col"], &q, &default_opts(20)).unwrap();
+        let hp = parallel.search(&["col"], &q, &default_opts(20)).unwrap();
+        assert_eq!(hs.len(), hp.len());
+        // The sorted score sequence must be byte-identical (exact f32 over the same
+        // data); only tie-breaking among equal scores may differ.
+        for (a, b) in hs.iter().zip(&hp) {
+            assert!(
+                (a.score - b.score).abs() < 1e-6,
+                "score mismatch: serial {} vs parallel {}",
+                a.score,
+                b.score
+            );
+        }
+    }
+
+    // Ignored under Miri — same reason as `parallel_search_matches_serial`.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn parallel_search_respects_filter_and_min_score() {
+        let dim = 8;
+        let n = PARALLEL_SCAN_FLOOR + 500;
+        let parallel = threaded_store(dim, n, 4);
+        let q: Vec<f32> = (0..dim).map(|d| (d * 5 % 13) as f32 - 6.0).collect();
+        // A min_score floor must be honored across all worker chunks.
+        let opts = SearchOpts {
+            top_k: 30,
+            filter: Filter::default(),
+            min_score: Some(0.99),
+        };
+        let hits = parallel.search(&["col"], &q, &opts).unwrap();
+        assert!(hits.iter().all(|h| h.score >= 0.99));
+    }
+
+    #[test]
+    fn parallel_below_floor_falls_back_to_serial() {
+        // Fewer rows than the floor: the parallel branch is skipped, but results
+        // must still be correct.
+        let store = threaded_store(4, 10, 8);
+        let hits = store
+            .search(&["col"], &[1.0, 0.0, 0.0, 0.0], &default_opts(5))
+            .unwrap();
+        assert_eq!(hits.len(), 5);
+        // Scores are non-increasing.
+        for w in hits.windows(2) {
+            assert!(w[0].score >= w[1].score);
+        }
+    }
+
+    #[test]
+    fn parallel_search_with_quantization() {
+        // query_threads is set but quantization is on: the quantized path runs
+        // (single-threaded) and must still return correct results.
+        let cfg = Config::new("/dev/null/in-memory", 8)
+            .open_mode(OpenMode::ReadWrite)
+            .auto_compact(None)
+            .quantization(Some(Quantization::default()))
+            .query_threads(4);
+        let mut store = Store::in_memory_cfg(cfg).unwrap();
+        store.create_collection("col").unwrap();
+        let recs: Vec<Record> = (0..200u32)
+            .map(|i| {
+                let v: Vec<f32> = (0..8).map(|d| ((i * 13 + d * 3) % 50) as f32).collect();
+                rec(&format!("d{i}"), v)
+            })
+            .collect();
+        store.upsert("col", &recs).unwrap();
+        let q: Vec<f32> = (0..8).map(|d| (d * 2 % 7) as f32).collect();
+        let hits = store.search(&["col"], &q, &default_opts(10)).unwrap();
+        assert_eq!(hits.len(), 10);
     }
 }

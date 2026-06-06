@@ -80,3 +80,32 @@ Reads (`search`, `get_all`, `footprint`) take `&self`; writes (`upsert`,
 `delete`, `compact`, …) take `&mut self`. An `RwLock` therefore admits many
 concurrent searchers and one exclusive writer. Use `spawn_blocking` (or your
 runtime's equivalent) so a long sweep never blocks the async reactor.
+
+## Two kinds of parallelism
+
+There are two independent ways to put cores to work, and they suit opposite
+workloads:
+
+- **Query-level (the default).** Many `&self` searches run at once under
+  `Arc<RwLock<Nidus>>` — one core per in-flight query. This is what you want for a
+  server fielding concurrent requests; it maxes out **throughput**.
+- **Intra-query (`Config::query_threads`).** A *single* large exact search is split
+  across `query_threads` worker threads (`std::thread::scope`, per-chunk heaps
+  merged at the end), cutting **one query's latency**. Opt-in — the default of `1`
+  keeps search single-threaded.
+
+```rust
+use nidus::{Config, Nidus};
+
+// Split each exact search across 4 worker threads.
+let db = Nidus::open(Config::new("/path/to/store", 768).query_threads(4))?;
+# anyhow::Ok(())
+```
+
+Pick one. Intra-query threads help when queries arrive **one at a time** against a
+large store on otherwise-idle cores; the brute-force scan is memory-bandwidth-bound,
+so the speedup is real but sublinear (≈1.3–1.6× at 4–8 threads on 1M × 768). If you
+already have query-level concurrency, leave `query_threads` at `1` — splitting each
+query then just oversubscribes the cores your concurrent readers are already using.
+(Intra-query threading currently covers the exact f32 path; the quantized path runs
+single-threaded.)

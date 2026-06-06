@@ -12,6 +12,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 publish = false
+# Two binaries live here (the parity harness + the quant sweep), so `cargo run -p
+# nidus-bench` (what `just bench` calls) needs to know which is the default.
+default-run = "nidus-bench"
 
 [[bin]]
 name = "nidus-bench"

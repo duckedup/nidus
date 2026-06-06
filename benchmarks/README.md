@@ -73,10 +73,13 @@ the documented recall/speed expectations were chosen.
 ## nidus regression tracking (criterion)
 
 ```bash
-just bench-crit                        # nidus-internal benchmarks
+just bench-crit                        # all groups: search, parallel_search, ingest
+just bench-crit parallel_search        # just the query_threads scaling group
 just bench-crit --save-baseline main   # record a baseline; later runs report the delta
 ```
 
-`bench-crit` benchmarks nidus through its public API (search + ingest) with criterion's
-statistical sampling and baseline comparison — the "did we regress?" signal. criterion is
-a dev-dependency of *this* crate only and never touches nidus's build.
+`bench-crit` benchmarks nidus through its public API with criterion's statistical
+sampling and baseline comparison — the "did we regress?" signal. It covers single-threaded
+`search`, the `parallel_search` sweep across `query_threads` (1/2/4/8 — the reproducible
+parallel-scan measurement), and `ingest`. criterion is a dev-dependency of *this* crate
+only and never touches nidus's build.

@@ -51,11 +51,13 @@ fn default_limit() -> usize {
 }
 
 /// Body of `POST /list`. Metadata-only query (no vector). An empty `scope`
-/// lists from every collection.
+/// lists from every collection. `offset` skips matches for pagination.
 #[derive(Debug, Deserialize)]
 pub struct ListRequest {
     #[serde(default)]
     pub scope: Vec<String>,
+    #[serde(default)]
+    pub offset: usize,
     #[serde(default = "default_limit")]
     pub limit: usize,
     #[serde(default)]
