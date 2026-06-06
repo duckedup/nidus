@@ -97,8 +97,10 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-/* Frosted, hairline-bottomed top bar */
-.header {
+/* Frosted, hairline-bottomed top bar. Scoped to the <header> element only:
+   Starlight nests a second `.header` (the content row in Header.astro) inside the
+   fixed bar, so an unscoped `.header` border draws a doubled hairline. */
+header.header {
   backdrop-filter: blur(12px) saturate(140%);
   -webkit-backdrop-filter: blur(12px) saturate(140%);
   border-bottom: 1px solid var(--sl-color-hairline);
