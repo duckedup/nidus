@@ -24,7 +24,7 @@ use serde_json::{Value as JsonValue, json};
 use tokio::net::TcpListener;
 
 use crate::{Nidus, Record, Scope, SearchOpts};
-use dto::{DeleteRequest, HitDto, SearchRequest, UpsertRequest};
+use dto::{DeleteRequest, HitDto, ListRequest, SearchRequest, UpsertRequest};
 
 /// Shared, cloneable handle to the one open store.
 #[derive(Clone)]
@@ -69,6 +69,7 @@ fn router(state: AppState) -> Router {
         .route("/collections/{name}/delete", post(delete_records))
         .route("/collections/{name}/records", get(records))
         .route("/search", post(search))
+        .route("/list", post(list))
         .route("/flush", post(flush))
         .route("/compact", post(compact))
         .with_state(state)
@@ -185,6 +186,27 @@ async fn search(
             db.search(Scope::All, &query, &opts)
         } else {
             db.search(Scope::Collections(&refs), &query, &opts)
+        }
+    })
+    .await?;
+    Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+}
+
+async fn list(
+    State(st): State<AppState>,
+    Json(req): Json<ListRequest>,
+) -> Result<Json<Vec<HitDto>>, ApiError> {
+    let hits = run(st, move |db| {
+        let ListRequest {
+            scope,
+            limit,
+            filter,
+        } = req;
+        let refs: Vec<&str> = scope.iter().map(String::as_str).collect();
+        if refs.is_empty() {
+            db.list(Scope::All, &filter, limit)
+        } else {
+            db.list(Scope::Collections(&refs), &filter, limit)
         }
     })
     .await?;

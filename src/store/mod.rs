@@ -542,6 +542,53 @@ impl Store {
             .collect()
     }
 
+    /// List records matching `filter` across `collections`, without vector scoring.
+    /// Returns up to `limit` hits in insertion order (row index), all with `score: 0.0`.
+    pub fn list(&self, collections: &[&str], filter: &Filter, limit: usize) -> Result<Vec<Hit>> {
+        let mut scan: Vec<(u64, &str, &str)> = Vec::new();
+        let scan_cap: usize = collections
+            .iter()
+            .filter_map(|c| self.collections.get(*c))
+            .map(|c| c.docs.len())
+            .sum();
+        scan.try_reserve(scan_cap)
+            .map_err(|_| oom("list scan buffer", scan_cap))?;
+        for &col_name in collections {
+            let Some(col) = self.collections.get(col_name) else {
+                continue;
+            };
+            for (id, entry) in &col.docs {
+                if !filter::matches(filter, &entry.attrs) {
+                    continue;
+                }
+                scan.push((entry.row, col_name, id.as_str()));
+            }
+        }
+        scan.sort_unstable_by_key(|&(row, _, _)| row);
+        if scan.len() > limit {
+            scan.truncate(limit);
+        }
+
+        let results = scan
+            .into_iter()
+            .map(|(_, collection, id)| {
+                let attrs = self
+                    .collections
+                    .get(collection)
+                    .and_then(|c| c.docs.get(id))
+                    .map(|e| e.attrs.clone())
+                    .unwrap_or_default();
+                Hit {
+                    collection: collection.to_string(),
+                    id: id.to_string(),
+                    score: 0.0,
+                    attrs,
+                }
+            })
+            .collect();
+        Ok(results)
+    }
+
     /// Brute-force search over the union of `collections`, merged into one ranking
     /// (one bounded top-k heap fed by every in-scope collection). The scoring
     /// function is determined by the store's [`Distance`] metric.
@@ -1662,5 +1709,95 @@ mod tests {
             msg.contains("distance"),
             "error should mention distance: {msg}"
         );
+    }
+
+    // ── list (metadata-only query) tests ─────────────────────────────────
+
+    #[test]
+    fn list_returns_all_matching() {
+        let mut store = Store::in_memory(3).unwrap();
+        store.create_collection("col").unwrap();
+        let mut a_rust = BTreeMap::new();
+        a_rust.insert("lang".to_string(), Value::Str("rust".to_string()));
+        let mut a_go = BTreeMap::new();
+        a_go.insert("lang".to_string(), Value::Str("go".to_string()));
+        store
+            .upsert(
+                "col",
+                &[
+                    rec_with("r1", vec![1.0, 0.0, 0.0], a_rust.clone()),
+                    rec_with("r2", vec![0.0, 1.0, 0.0], a_rust),
+                    rec_with("g1", vec![0.0, 0.0, 1.0], a_go),
+                ],
+            )
+            .unwrap();
+        let filter = Filter(vec![Predicate::Eq(
+            "lang".to_string(),
+            Value::Str("rust".to_string()),
+        )]);
+        let hits = store.list(&["col"], &filter, 100).unwrap();
+        assert_eq!(hits.len(), 2);
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(ids.contains(&"r1"));
+        assert!(ids.contains(&"r2"));
+    }
+
+    #[test]
+    fn list_respects_limit() {
+        let mut store = Store::in_memory(2).unwrap();
+        store.create_collection("col").unwrap();
+        for i in 0..10u32 {
+            store
+                .upsert("col", &[rec(&format!("d{i}"), vec![i as f32, 0.0])])
+                .unwrap();
+        }
+        let hits = store.list(&["col"], &Filter::default(), 3).unwrap();
+        assert_eq!(hits.len(), 3);
+    }
+
+    #[test]
+    fn list_scores_are_zero() {
+        let mut store = Store::in_memory(2).unwrap();
+        store.create_collection("col").unwrap();
+        store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+        let hits = store.list(&["col"], &Filter::default(), 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].score, 0.0);
+    }
+
+    #[test]
+    fn list_empty_filter_returns_all() {
+        let mut store = Store::in_memory(2).unwrap();
+        store.create_collection("col").unwrap();
+        store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+        store.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
+        let hits = store.list(&["col"], &Filter::default(), 100).unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn list_multi_collection() {
+        let mut store = Store::in_memory(2).unwrap();
+        store.create_collection("a").unwrap();
+        store.create_collection("b").unwrap();
+        store.upsert("a", &[rec("x", vec![1.0, 0.0])]).unwrap();
+        store.upsert("b", &[rec("y", vec![0.0, 1.0])]).unwrap();
+        let hits = store.list(&["a", "b"], &Filter::default(), 100).unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn list_insertion_order() {
+        let mut store = Store::in_memory(2).unwrap();
+        store.create_collection("col").unwrap();
+        store
+            .upsert("col", &[rec("first", vec![1.0, 0.0])])
+            .unwrap();
+        store
+            .upsert("col", &[rec("second", vec![0.0, 1.0])])
+            .unwrap();
+        let hits = store.list(&["col"], &Filter::default(), 100).unwrap();
+        assert_eq!(hits[0].id, "first");
+        assert_eq!(hits[1].id, "second");
     }
 }
