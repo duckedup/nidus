@@ -78,6 +78,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # rust-toolchain.toml pins the channel, so the in-repo build uses that
+      # toolchain — not the one dtolnay just set up. Add the cross target to the
+      # *active* (pinned) toolchain so its std is present (e.g. x86_64-apple-darwin
+      # std on an Apple-Silicon runner). `cross` provides std itself, so skip it.
+      - name: Add target to the pinned toolchain
+        if: "!matrix.use_cross"
+        run: rustup target add ${{ matrix.target }}
+
       - name: Install cross
         if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross
