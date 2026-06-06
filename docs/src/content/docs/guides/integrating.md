@@ -103,9 +103,10 @@ let db = Nidus::open(Config::new("/path/to/store", 768).query_threads(4))?;
 ```
 
 Pick one. Intra-query threads help when queries arrive **one at a time** against a
-large store on otherwise-idle cores; the brute-force scan is memory-bandwidth-bound,
-so the speedup is real but sublinear (≈1.3–1.6× at 4–8 threads on 1M × 768). If you
-already have query-level concurrency, leave `query_threads` at `1` — splitting each
-query then just oversubscribes the cores your concurrent readers are already using.
-(Intra-query threading currently covers the exact f32 path; the quantized path runs
-single-threaded.)
+large store on otherwise-idle cores. The plain f32 scan is memory-bandwidth-bound,
+so its speedup is real but sublinear (≈1.3–1.4× at 4–8 threads on 100k × 768).
+Threads pay off best paired with [int8 quantization](/guides/search/#int8-scalar-quantization):
+the int8 first pass moves 4× fewer bytes (compute- not bandwidth-bound), so it
+splits across the same workers and scales to ≈2.4× at 4 threads. If you already have
+query-level concurrency, leave `query_threads` at `1` — splitting each query then
+just oversubscribes the cores your concurrent readers are already using.

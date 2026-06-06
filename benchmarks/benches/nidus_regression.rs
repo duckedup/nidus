@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use nidus::{Config, Nidus, Record, SearchOpts};
+use nidus::{Config, Nidus, Quantization, Record, SearchOpts};
 use nidus_bench::data;
 use std::hint::black_box;
 
@@ -38,14 +38,23 @@ fn build_store(n: usize, dim: usize) -> Nidus {
     db
 }
 
-/// Build a file-backed store (in a tempdir) with a specific `query_threads`, so the
-/// parallel-scan path can be driven through the public `Config` API. Returns the
-/// `TempDir` guard alongside the store to keep the backing files alive.
-fn build_store_threaded(n: usize, dim: usize, threads: usize) -> (Nidus, tempfile::TempDir) {
+/// Build a file-backed store (in a tempdir) with a specific `query_threads` and
+/// optional int8 quantization, so the parallel-scan path (f32 or quantized) can be
+/// driven through the public `Config` API. Returns the `TempDir` guard alongside the
+/// store to keep the backing files alive.
+fn build_store_threaded(
+    n: usize,
+    dim: usize,
+    threads: usize,
+    quant: bool,
+) -> (Nidus, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let cfg = Config::new(dir.path().join("store"), dim)
+    let mut cfg = Config::new(dir.path().join("store"), dim)
         .query_threads(threads)
         .auto_compact(None);
+    if quant {
+        cfg = cfg.quantization(Some(Quantization::default()));
+    }
     let mut db = Nidus::open(cfg).expect("open store");
     db.create_collection("bench").expect("create collection");
     db.upsert("bench", &records(n, dim)).expect("upsert");
@@ -77,32 +86,36 @@ fn bench_search(c: &mut Criterion) {
 }
 
 /// Same large search, swept across `query_threads` — the reproducible measurement
-/// behind the parallel-scan speedup claim. The brute-force scan is bandwidth-bound,
-/// so expect a sublinear (not N×) gain as threads rise.
+/// behind the parallel-scan speedup claim, for both the f32 and the int8-quantized
+/// first pass. The f32 scan is memory-bandwidth-bound, so its gain is sublinear; the
+/// int8 first pass moves 4× fewer bytes (compute- not bandwidth-bound), so it is the
+/// path that should actually scale with threads. Two groups so they diff separately.
 fn bench_parallel_search(c: &mut Criterion) {
-    let mut group = c.benchmark_group("parallel_search");
     let (n, dim) = (100_000usize, 768usize);
     let query = data::generate(SEED ^ 1, 1, dim, 0).vectors;
     let opts = SearchOpts {
         top_k: 10,
         ..Default::default()
     };
-    for &threads in &[1usize, 2, 4, 8] {
-        let (db, _dir) = build_store_threaded(n, dim, threads);
-        group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(format!("threads{threads}")),
-            &(),
-            |b, _| {
-                b.iter(|| {
-                    let hits = db.search("bench", black_box(&query), &opts).unwrap();
-                    black_box(hits);
-                })
-            },
-        );
-        // `_dir` stays alive through the synchronous bench above, then drops here.
+    for (group_name, quant) in [("parallel_search", false), ("parallel_search_quant", true)] {
+        let mut group = c.benchmark_group(group_name);
+        for &threads in &[1usize, 2, 4, 8] {
+            let (db, _dir) = build_store_threaded(n, dim, threads, quant);
+            group.throughput(Throughput::Elements(n as u64));
+            group.bench_with_input(
+                BenchmarkId::from_parameter(format!("threads{threads}")),
+                &(),
+                |b, _| {
+                    b.iter(|| {
+                        let hits = db.search("bench", black_box(&query), &opts).unwrap();
+                        black_box(hits);
+                    })
+                },
+            );
+            // `_dir` stays alive through the synchronous bench above, then drops here.
+        }
+        group.finish();
     }
-    group.finish();
 }
 
 fn bench_ingest(c: &mut Criterion) {
