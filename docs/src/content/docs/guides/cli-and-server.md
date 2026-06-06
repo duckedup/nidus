@@ -52,8 +52,9 @@ echo '[1,0,0]' | nidus search --dir ./store --dim 3
 echo '[1,0,0]' | nidus search --dir ./store --dim 3 docs \
   --where '[{"Eq":["lang",{"Str":"rust"}]}]'
 
-# List records by metadata filter (no vector query)
+# List records by metadata filter (no vector query); --offset/-n paginate
 nidus list --dir ./store --dim 3 docs --where '[{"Eq":["lang",{"Str":"rust"}]}]'
+nidus list --dir ./store --dim 3 docs --offset 100 -n 100   # next page
 
 # Inspect, maintain
 nidus collections --dir ./store --dim 3

@@ -129,14 +129,20 @@ db.delete_where("code", &Filter(vec![
 ## Metadata-only queries
 
 Use `list` to retrieve records by metadata filter without a vector query. Results
-come back in insertion order with `score: 0.0`.
+come back in insertion order with `score: 0.0`. The `offset` and `limit` arguments
+paginate a stable ordering — advance `offset` by `limit` to page through.
 
 ```rust
 use nidus::{Filter, Predicate, Value};
 
-let hits = db.list("code", &Filter(vec![
+let filter = Filter(vec![
     Predicate::Eq("lang".into(), Value::Str("rust".into())),
-]), 100)?;
+]);
+
+// First page: offset 0, up to 100 matches.
+let page1 = db.list("code", &filter, 0, 100)?;
+// Next page.
+let page2 = db.list("code", &filter, 100, 100)?;
 # anyhow::Ok(())
 ```
 

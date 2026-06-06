@@ -159,11 +159,14 @@ impl Nidus {
     }
 
     /// List records matching `filter` across a [`Scope`], without vector scoring.
-    /// Returns up to `limit` hits in insertion order, all with `score: 0.0`.
+    /// Skips `offset` matches and returns up to `limit` more, in insertion order,
+    /// all with `score: 0.0`. Pass `offset = 0` for the first page; advance by
+    /// `limit` to paginate.
     pub fn list<'a>(
         &self,
         scope: impl Into<Scope<'a>>,
         filter: &Filter,
+        offset: usize,
         limit: usize,
     ) -> Result<Vec<Hit>> {
         let names: Vec<String> = match scope.into() {
@@ -172,7 +175,7 @@ impl Nidus {
             Scope::All => self.store.collections(),
         };
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        self.store.list(&refs, filter, limit)
+        self.store.list(&refs, filter, offset, limit)
     }
 
     /// Search a [`Scope`] — one collection, a subset, or the whole store — for the

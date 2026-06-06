@@ -199,14 +199,15 @@ async fn list(
     let hits = run(st, move |db| {
         let ListRequest {
             scope,
+            offset,
             limit,
             filter,
         } = req;
         let refs: Vec<&str> = scope.iter().map(String::as_str).collect();
         if refs.is_empty() {
-            db.list(Scope::All, &filter, limit)
+            db.list(Scope::All, &filter, offset, limit)
         } else {
-            db.list(Scope::Collections(&refs), &filter, limit)
+            db.list(Scope::Collections(&refs), &filter, offset, limit)
         }
     })
     .await?;

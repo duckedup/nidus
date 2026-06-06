@@ -118,6 +118,9 @@ enum Command {
         store: StoreArgs,
         /// Collections to list from; omit to list from every collection.
         collections: Vec<String>,
+        /// Skip this many matches before returning (pagination).
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Maximum number of results.
         #[arg(long, short = 'n', default_value_t = 100)]
         limit: usize,
@@ -213,6 +216,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::List {
             store,
             collections,
+            offset,
             limit,
             filter,
         } => {
@@ -223,9 +227,9 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
             let hits = if refs.is_empty() {
-                db.list(Scope::All, &filter, limit)?
+                db.list(Scope::All, &filter, offset, limit)?
             } else {
-                db.list(Scope::Collections(&refs), &filter, limit)?
+                db.list(Scope::Collections(&refs), &filter, offset, limit)?
             };
             let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
             print_json(&out)

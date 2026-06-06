@@ -629,8 +629,17 @@ impl Store {
     }
 
     /// List records matching `filter` across `collections`, without vector scoring.
-    /// Returns up to `limit` hits in insertion order (row index), all with `score: 0.0`.
-    pub fn list(&self, collections: &[&str], filter: &Filter, limit: usize) -> Result<Vec<Hit>> {
+    /// Skips the first `offset` matches and returns up to `limit` more, in insertion
+    /// order (row index), all with `score: 0.0`. `offset`/`limit` paginate a stable
+    /// ordering: the full match set is ordered by physical row, then the window
+    /// `[offset, offset + limit)` is returned.
+    pub fn list(
+        &self,
+        collections: &[&str],
+        filter: &Filter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Hit>> {
         let mut scan: Vec<(u64, &str, &str)> = Vec::new();
         let scan_cap: usize = collections
             .iter()
@@ -651,12 +660,11 @@ impl Store {
             }
         }
         scan.sort_unstable_by_key(|&(row, _, _)| row);
-        if scan.len() > limit {
-            scan.truncate(limit);
-        }
 
         let results = scan
             .into_iter()
+            .skip(offset)
+            .take(limit)
             .map(|(_, collection, id)| {
                 let attrs = self
                     .collections
@@ -1903,7 +1911,7 @@ mod tests {
             "lang".to_string(),
             Value::Str("rust".to_string()),
         )]);
-        let hits = store.list(&["col"], &filter, 100).unwrap();
+        let hits = store.list(&["col"], &filter, 0, 100).unwrap();
         assert_eq!(hits.len(), 2);
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
         assert!(ids.contains(&"r1"));
@@ -1919,7 +1927,7 @@ mod tests {
                 .upsert("col", &[rec(&format!("d{i}"), vec![i as f32, 0.0])])
                 .unwrap();
         }
-        let hits = store.list(&["col"], &Filter::default(), 3).unwrap();
+        let hits = store.list(&["col"], &Filter::default(), 0, 3).unwrap();
         assert_eq!(hits.len(), 3);
     }
 
@@ -1928,7 +1936,7 @@ mod tests {
         let mut store = Store::in_memory(2).unwrap();
         store.create_collection("col").unwrap();
         store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
-        let hits = store.list(&["col"], &Filter::default(), 10).unwrap();
+        let hits = store.list(&["col"], &Filter::default(), 0, 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].score, 0.0);
     }
@@ -1939,7 +1947,7 @@ mod tests {
         store.create_collection("col").unwrap();
         store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
         store.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
-        let hits = store.list(&["col"], &Filter::default(), 100).unwrap();
+        let hits = store.list(&["col"], &Filter::default(), 0, 100).unwrap();
         assert_eq!(hits.len(), 2);
     }
 
@@ -1950,7 +1958,7 @@ mod tests {
         store.create_collection("b").unwrap();
         store.upsert("a", &[rec("x", vec![1.0, 0.0])]).unwrap();
         store.upsert("b", &[rec("y", vec![0.0, 1.0])]).unwrap();
-        let hits = store.list(&["a", "b"], &Filter::default(), 100).unwrap();
+        let hits = store.list(&["a", "b"], &Filter::default(), 0, 100).unwrap();
         assert_eq!(hits.len(), 2);
     }
 
@@ -1964,9 +1972,49 @@ mod tests {
         store
             .upsert("col", &[rec("second", vec![0.0, 1.0])])
             .unwrap();
-        let hits = store.list(&["col"], &Filter::default(), 100).unwrap();
+        let hits = store.list(&["col"], &Filter::default(), 0, 100).unwrap();
         assert_eq!(hits[0].id, "first");
         assert_eq!(hits[1].id, "second");
+    }
+
+    #[test]
+    fn list_offset_paginates() {
+        let mut store = Store::in_memory(2).unwrap();
+        store.create_collection("col").unwrap();
+        for i in 0..10u32 {
+            store
+                .upsert("col", &[rec(&format!("d{i}"), vec![i as f32, 0.0])])
+                .unwrap();
+        }
+        // Page through in windows of 3; concatenating the pages reproduces the
+        // full insertion-ordered list with no gaps or repeats.
+        let mut paged: Vec<String> = Vec::new();
+        for page in 0..4 {
+            let hits = store
+                .list(&["col"], &Filter::default(), page * 3, 3)
+                .unwrap();
+            paged.extend(hits.into_iter().map(|h| h.id));
+        }
+        let full: Vec<String> = store
+            .list(&["col"], &Filter::default(), 0, 100)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(
+            paged, full,
+            "paginated windows must reconstruct the full list"
+        );
+        assert_eq!(paged.len(), 10);
+    }
+
+    #[test]
+    fn list_offset_past_end_is_empty() {
+        let mut store = Store::in_memory(2).unwrap();
+        store.create_collection("col").unwrap();
+        store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+        let hits = store.list(&["col"], &Filter::default(), 5, 10).unwrap();
+        assert!(hits.is_empty());
     }
 
     // ── int8 scalar quantization tests ───────────────────────────────────
