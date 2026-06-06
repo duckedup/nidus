@@ -57,6 +57,12 @@ pub struct Config {
     /// When enabled, the store maintains an in-memory int8 vector matrix and uses
     /// a two-pass search: int8 first-pass → f32 rerank.
     pub quantization: Option<Quantization>,
+    /// Worker threads for a single exact (f32) search. Default `1` (single-threaded,
+    /// no behavior change). When `> 1`, a large brute-force scan is split across this
+    /// many `std::thread::scope` workers, each with its own bounded heap, merged at
+    /// the end. Parallelizes *one* query across cores — leave it at `1` when you
+    /// already have query-level concurrency (many readers under `Arc<RwLock<Nidus>>`).
+    pub query_threads: usize,
 }
 
 impl Config {
@@ -72,6 +78,7 @@ impl Config {
             lock_ttl: Duration::from_secs(60),
             max_vector_bytes: None,
             quantization: None,
+            query_threads: 1,
         }
     }
 
@@ -114,6 +121,12 @@ impl Config {
     /// Enable int8 scalar quantization for faster search.
     pub fn quantization(mut self, q: Option<Quantization>) -> Self {
         self.quantization = q;
+        self
+    }
+
+    /// Set the number of worker threads for a single exact search (`1` = serial).
+    pub fn query_threads(mut self, n: usize) -> Self {
+        self.query_threads = n;
         self
     }
 }

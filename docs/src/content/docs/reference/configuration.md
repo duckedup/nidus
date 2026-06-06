@@ -19,7 +19,8 @@ let cfg = Config::new("/path/to/store", 768)
     .auto_compact(Some(0.5))         // compact on open above this dead-row ratio
     .lock_ttl(Duration::from_secs(60))
     .max_vector_bytes(None)          // no ceiling (default)
-    .quantization(None);             // int8 two-pass search (default: off)
+    .quantization(None)              // int8 two-pass search (default: off)
+    .query_threads(1);               // worker threads per exact search (default: 1)
 # let _ = cfg;
 ```
 
@@ -81,6 +82,15 @@ never fires. It counts physical rows including not-yet-compacted dead rows, so
 maintains an in-memory int8 copy of all vectors and uses a two-pass search:
 int8 first-pass → f32 rerank. See
 [int8 scalar quantization](/guides/search/#int8-scalar-quantization) for details.
+
+### `query_threads`
+
+`usize` — default `1` (single-threaded; no behavior change). When `> 1`, a single
+large exact (f32) search is split across this many `std::thread::scope` workers to
+cut one query's latency. The scan is memory-bandwidth-bound, so the speedup is
+sublinear. Leave it at `1` if you already run concurrent searches under
+`Arc<RwLock<Nidus>>` — see
+[two kinds of parallelism](/guides/integrating/#two-kinds-of-parallelism).
 
 ## `Fsync`
 
