@@ -37,6 +37,25 @@ The scoring kernel is plain safe Rust the optimizer can vectorize:
 No FFI boundary to cross, no columnar decode, no query planner — just a tight
 loop over a contiguous `f32` matrix that is already resident in RAM.
 
+## Optional speed levers
+
+Two opt-in knobs trade a little for more speed when the exact single-threaded
+sweep isn't enough. Both stay pure-safe-Rust and are off by default:
+
+- **[int8 quantization](/guides/search/#int8-scalar-quantization)** — a two-pass
+  search (int8 first-pass → f32 rerank) returns essentially the exact neighbours
+  (**~100% recall@10 at `rescore` ≥ 2**) for a **~1.4× speedup** at 1M × 768, at
+  the cost of ~25% more RAM. Reproduce: `just bench-quant`.
+- **[parallel scan](/guides/integrating/#two-kinds-of-parallelism)**
+  (`Config::query_threads`) — splits one large search across worker threads. The
+  scan is memory-bandwidth-bound, so the gain is sublinear: **~1.3–1.6×** at 4–8
+  threads. Reproduce: `just bench-crit parallel_search`.
+
+Neither is the headline multiplier its theory suggests — the 4× from int8 and the
+linear scaling from threads both want SIMD/bandwidth headroom nidus doesn't chase
+within its zero-FFI design. They're honest, modest latency wins for the right
+workload, measured by benchmarks you can run yourself.
+
 ## The target regime
 
 nidus is built for **exact** search at the scale where brute force wins: up to a
@@ -52,7 +71,9 @@ optional, and additive over the same append-only file.
 ## Reproduce it
 
 ```bash
-just bench all
+just bench all                  # cross-engine parity table (nidus vs DuckDB vs LanceDB)
+just bench-quant                # int8 quantization recall & speed sweep
+just bench-crit parallel_search # query_threads scaling (criterion)
 ```
 
 The heavy DuckDB/LanceDB dependencies are **quarantined off nidus's own build
