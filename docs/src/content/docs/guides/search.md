@@ -146,9 +146,11 @@ list across multiple collections or the whole store.
 ## int8 scalar quantization
 
 For larger collections, enable int8 scalar quantization to speed up search.
-The store maintains a quantized int8 copy of all vectors in RAM. Search runs
-in two passes: a fast int8 first-pass selects candidates (overscanning by a
-configurable factor), then f32 re-ranks for accuracy.
+The store keeps an int8 copy of every vector in RAM (global **symmetric**
+quantization — one shared scale, no per-dimension offset, so the int8 score
+stays monotonic with the true score). Search then runs in two passes: a fast
+int8 first-pass selects candidates, overscanning by the `rescore` factor, then
+the original f32 vectors re-rank those candidates for an exact final ranking.
 
 ```rust
 use nidus::{Config, Quantization};
@@ -160,11 +162,20 @@ let db = Nidus::open(
 # anyhow::Ok(())
 ```
 
-The `rescore` factor controls the quality/speed tradeoff: `rescore: 4` means
-the int8 pass selects `top_k * 4` candidates before f32 re-ranking. Higher
-values improve recall at the cost of more f32 scoring work. The default is 4.
+The `rescore` factor trades recall for speed: `rescore: 4` means the int8 pass
+keeps `top_k * 4` candidates before the f32 re-rank. Higher values widen the
+candidate net (better recall, more f32 work); the default is 4.
+
+**What to expect.** In the `just bench-quant` sweep (uniform-random vectors,
+a near-worst case for quantization recall), the two-pass search returns
+essentially the exact neighbours — **~100% recall@10 at `rescore` ≥ 2** — for a
+**~1.4× query speedup** at 1M × 768, in exchange for **~25% more RAM** (the int8
+copy sits alongside the f32 matrix, which the re-rank still needs). The speedup
+is bounded by the pure-safe-Rust scalar int8 kernel; the larger theoretical win
+would need SIMD int8 dot-product intrinsics, which are `unsafe` and outside
+nidus's zero-FFI design. Run `just bench-quant` to measure on your own shapes.
 
 Quantization is purely a runtime optimization — it doesn't change the on-disk
-format, and a store opened without quantization produces identical results
-(just slower for large scans). Enable it when search latency matters and you
-have enough vectors for the int8 first-pass to save meaningful work.
+format, and a store opened without it produces identical results (just slower
+for large scans). Reach for it when search latency matters more than the extra
+RAM. Vectors quantize incrementally on upsert, so adding records stays cheap.

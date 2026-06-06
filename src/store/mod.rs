@@ -14,7 +14,7 @@ use crate::lock::WriteLock;
 use crate::log::OpLog;
 use crate::model::{Distance, Filter, Footprint, Hit, Op, Quantization, Record, SearchOpts};
 use crate::search::{
-    QuantParams, TopK, dot, dot_u8, euclidean_neg_sq, euclidean_neg_sq_u8, normalize,
+    QuantParams, TopK, dot, dot_i8, euclidean_neg_sq, euclidean_neg_sq_i8, normalize,
 };
 
 // ── In-RAM types ─────────────────────────────────────────────────────────────
@@ -49,16 +49,27 @@ fn oom(what: &str, count: usize) -> anyhow::Error {
 
 // ── Store ─────────────────────────────────────────────────────────────────────
 
-/// The on-disk + in-RAM store backing [`Nidus`](crate::Nidus). Implementers choose
-/// the internal layout (per-collection `id → (row, attrs)` maps, dead-row counter,
-/// held lock, etc.) but must keep these signatures — `lib.rs` calls them verbatim.
 /// int8 quantization state, maintained in RAM when `Config::quantization` is set.
+/// `vectors` mirrors the f32 `data` rows one-for-one (same physical row indices).
 struct QuantState {
     params: QuantParams,
-    vectors: Vec<u8>,
+    /// Quantized vectors, flat and row-major, `data.row_count() * dim` int8 values.
+    vectors: Vec<i8>,
+    /// How many rows `params` was fit from. Upserts quantize new rows against the
+    /// current `params` and only refit (rescan for a fresh scale) once the row count
+    /// outgrows this by [`REFIT_GROWTH`], keeping incremental upsert amortized O(1)/row.
+    params_rows: u64,
     cfg: Quantization,
 }
 
+/// Refit the quantization scale once the live row count grows past this multiple of
+/// the count it was last fit from. Geometric (doubling) → amortized O(1) per row over
+/// a full incremental build, while bounding how stale the shared scale can get.
+const REFIT_GROWTH: u64 = 2;
+
+/// The on-disk + in-RAM store backing [`Nidus`](crate::Nidus). Implementers choose
+/// the internal layout (per-collection `id → (row, attrs)` maps, dead-row counter,
+/// held lock, etc.) but must keep these signatures — `lib.rs` calls them verbatim.
 pub struct Store {
     config: Config,
     data: DataSegment,
@@ -165,8 +176,9 @@ impl Store {
         }
 
         let quant = config.quantization.map(|cfg| QuantState {
-            params: QuantParams::from_vectors(&[], 0),
+            params: QuantParams::from_vectors(&[]),
             vectors: Vec::new(),
+            params_rows: 0,
             cfg,
         });
 
@@ -213,8 +225,9 @@ impl Store {
     /// An in-memory store with full config control.
     pub fn in_memory_cfg(config: Config) -> Result<Store> {
         let quant = config.quantization.map(|cfg| QuantState {
-            params: QuantParams::from_vectors(&[], 0),
+            params: QuantParams::from_vectors(&[]),
             vectors: Vec::new(),
+            params_rows: 0,
             cfg,
         });
         Ok(Store {
@@ -230,13 +243,42 @@ impl Store {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// (Re)build the int8 quantization state from the current f32 data segment.
+    /// Refit the quantization scale from *all* current vectors and re-quantize the
+    /// whole matrix. O(N) — used on `open`, `compact`, and the occasional geometric
+    /// refit, not per upsert batch.
     fn rebuild_quant(&mut self) {
         if let Some(ref mut qs) = self.quant {
-            let dim = self.data.dimension();
             let all_floats = self.data.vectors();
-            qs.params = QuantParams::from_vectors(all_floats, dim);
-            qs.vectors = qs.params.quantize_all(all_floats, dim);
+            qs.params = QuantParams::from_vectors(all_floats);
+            qs.vectors = qs.params.quantize_all(all_floats);
+            qs.params_rows = self.data.row_count();
+        }
+    }
+
+    /// Incrementally extend the quantized matrix after `upsert` appended rows
+    /// `[prev_rows, row_count())`. Quantizes only the new rows against the existing
+    /// scale — O(batch), not O(N). Falls back to a full [`rebuild_quant`] when there
+    /// is no scale yet, or once the row count has grown past [`REFIT_GROWTH`]× the
+    /// fit set (so a drifting distribution can't keep saturating a stale scale).
+    fn extend_quant(&mut self, prev_rows: u64) {
+        let total = self.data.row_count();
+        let refit = match self.quant {
+            None => return,
+            Some(ref qs) => qs.params_rows == 0 || total > qs.params_rows * REFIT_GROWTH,
+        };
+        if refit {
+            self.rebuild_quant();
+            return;
+        }
+        if let Some(ref mut qs) = self.quant {
+            let dim = self.data.dimension();
+            let all = self.data.vectors();
+            qs.vectors.resize(total as usize * dim, 0);
+            for row in prev_rows as usize..total as usize {
+                let base = row * dim;
+                let (src, dst) = (&all[base..base + dim], &mut qs.vectors[base..base + dim]);
+                qs.params.quantize(src, dst);
+            }
         }
     }
 
@@ -499,7 +541,8 @@ impl Store {
             count += 1;
         }
 
-        self.rebuild_quant();
+        // Quantize only the rows this batch appended (O(batch)); refits lazily.
+        self.extend_quant(data_mark);
         Ok(count)
     }
 
@@ -732,11 +775,13 @@ impl Store {
         let dim = self.data.dimension();
         let overscan = opts.top_k.saturating_mul(qs.cfg.rescore).max(opts.top_k);
 
-        // Quantize the query vector.
-        let mut q_u8 = vec![0u8; dim];
-        qs.params.quantize(q, &mut q_u8);
+        // Quantize the query vector with the same shared scale as the stored rows.
+        let mut q_i8 = vec![0i8; dim];
+        qs.params.quantize(q, &mut q_i8);
 
-        // First pass: int8 scoring to select overscan candidates.
+        // First pass: int8 scoring to select overscan candidates. The int8 score is
+        // monotonic with the f32 score (shared symmetric scale), so it picks the
+        // right candidate set; exact scores come from the f32 rerank below.
         let is_euclidean = self.config.distance == Distance::Euclidean;
         let mut topk_q: TopK<(u64, &str, &str)> = TopK::new(overscan);
         for &(row, col_name, id) in scan {
@@ -745,11 +790,11 @@ impl Store {
             if end > qs.vectors.len() {
                 continue;
             }
-            let stored_u8 = &qs.vectors[base..end];
+            let stored_i8 = &qs.vectors[base..end];
             let approx_score = if is_euclidean {
-                euclidean_neg_sq_u8(&q_u8, stored_u8) as f32
+                euclidean_neg_sq_i8(&q_i8, stored_i8) as f32
             } else {
-                dot_u8(&q_u8, stored_u8) as f32
+                dot_i8(&q_i8, stored_i8) as f32
             };
             topk_q.offer(approx_score, (row, col_name, id));
         }
@@ -2055,5 +2100,81 @@ mod tests {
             .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(5))
             .unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn quantized_incremental_matches_bulk() {
+        // The int8 matrix must stay correct whether built in one batch or many.
+        // Build the same data two ways and assert identical search rankings.
+        let make = |incremental: bool| {
+            let mut store = quantized_store(4);
+            store.create_collection("col").unwrap();
+            let recs: Vec<Record> = (0..50u32)
+                .map(|i| {
+                    let a = i as f32 * 0.01;
+                    rec(&format!("d{i}"), vec![a, 1.0 - a, 0.5, -a])
+                })
+                .collect();
+            if incremental {
+                for r in &recs {
+                    store.upsert("col", std::slice::from_ref(r)).unwrap();
+                }
+            } else {
+                store.upsert("col", &recs).unwrap();
+            }
+            store
+        };
+        let bulk = make(false);
+        let incr = make(true);
+        let q = vec![0.2, 0.8, 0.5, -0.2];
+        let hb = bulk.search(&["col"], &q, &default_opts(10)).unwrap();
+        let hi = incr.search(&["col"], &q, &default_opts(10)).unwrap();
+        let ids_b: Vec<&str> = hb.iter().map(|h| h.id.as_str()).collect();
+        let ids_i: Vec<&str> = hi.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids_b, ids_i, "incremental and bulk must rank identically");
+    }
+
+    #[test]
+    fn quantized_incremental_keeps_full_recall() {
+        // Drip-feed rows one at a time, then confirm an exact-match query still
+        // finds its target (incremental quantization must not lose the vector).
+        let mut store = quantized_store(3);
+        store.create_collection("col").unwrap();
+        for i in 0..30u32 {
+            let v = vec![i as f32, (30 - i) as f32, 1.0];
+            store.upsert("col", &[rec(&format!("d{i}"), v)]).unwrap();
+        }
+        // Query exactly matches d7.
+        let hits = store
+            .search(&["col"], &[7.0, 23.0, 1.0], &default_opts(1))
+            .unwrap();
+        assert_eq!(hits[0].id, "d7");
+    }
+
+    #[test]
+    fn quantized_refit_tracks_row_growth() {
+        // params_rows must follow the geometric-refit rule: it only jumps when the
+        // row count crosses REFIT_GROWTH× the last fit set, not on every batch.
+        let mut store = quantized_store(2);
+        store.create_collection("col").unwrap();
+        // First batch (2 rows): refit from 0 → params_rows = 2.
+        store
+            .upsert("col", &[rec("a", vec![1.0, 0.0]), rec("b", vec![0.0, 1.0])])
+            .unwrap();
+        assert_eq!(store.quant.as_ref().unwrap().params_rows, 2);
+        // One more row (total 3): 3 <= 2*2, so NO refit — params_rows stays 2.
+        store.upsert("col", &[rec("c", vec![1.0, 1.0])]).unwrap();
+        assert_eq!(store.quant.as_ref().unwrap().params_rows, 2);
+        // Push past 2*2=4 (total 5): refit fires → params_rows = 5.
+        store
+            .upsert("col", &[rec("d", vec![2.0, 0.0]), rec("e", vec![0.0, 2.0])])
+            .unwrap();
+        assert_eq!(store.quant.as_ref().unwrap().params_rows, 5);
+        // The int8 matrix always covers every physical row.
+        let dim = store.data.dimension();
+        assert_eq!(
+            store.quant.as_ref().unwrap().vectors.len(),
+            store.data.row_count() as usize * dim
+        );
     }
 }

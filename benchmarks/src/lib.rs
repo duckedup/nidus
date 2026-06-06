@@ -175,7 +175,7 @@ pub fn exact_ground_truth(data: &Dataset, top_k: usize) -> Vec<Vec<u64>> {
 }
 
 /// recall@k = mean over queries of |returned ∩ truth| / |truth|.
-fn recall_at_k(returned: &[Vec<u64>], truth: &[Vec<u64>]) -> f64 {
+pub fn recall_at_k(returned: &[Vec<u64>], truth: &[Vec<u64>]) -> f64 {
     let q = returned.len().min(truth.len());
     if q == 0 {
         return 1.0;

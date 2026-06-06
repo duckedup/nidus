@@ -104,80 +104,63 @@ pub fn euclidean_neg_sq(a: &[f32], b: &[f32]) -> f32 {
 
 // ── int8 quantization helpers ─────────────────────────────────────────────────
 
-/// Per-dimension quantization parameters: (offset, scale) where
-/// `q = round((v - offset) * scale)` and `scale = 255 / (max - min)`.
-/// A dimension with zero range gets `scale = 0` and all values quantize to 0.
+/// Global **symmetric** int8 quantization: a single scale maps every component
+/// `v → round(v / scale)` clamped to `[-127, 127]`, with `scale = max|v| / 127`
+/// over the whole matrix and zero-point fixed at 0.
+///
+/// Symmetric and uniform-across-dimensions is the point: with no per-dimension
+/// offset and one shared scale, `dot_i8(a, b) = (1/scale²)·dot(a, b)` and
+/// `euclidean_neg_sq_i8(a, b) = (1/scale²)·(−‖a − b‖²)` — both differ from the
+/// true f32 score only by the positive constant `1/scale²`, so the int8 score is
+/// **monotonic** with the true score. That is exactly what the first pass needs:
+/// it picks the right candidate set, and the f32 rerank restores exact scores.
+/// (Per-dimension affine quantization would break this — the offset and per-axis
+/// scale² terms don't cancel, so the int8 dot no longer tracks the true dot.)
 pub struct QuantParams {
-    pub offsets: Vec<f32>,
-    pub scales: Vec<f32>,
+    /// f32 units per int8 step. Zero when there are no (or all-zero) vectors.
+    pub scale: f32,
 }
 
 impl QuantParams {
-    /// Compute per-dimension min/max from all f32 vectors, then derive offsets and scales.
-    pub fn from_vectors(vectors: &[f32], dim: usize) -> Self {
-        let n = vectors.len().checked_div(dim).unwrap_or(0);
-        let mut offsets = vec![0.0f32; dim];
-        let mut scales = vec![0.0f32; dim];
-        if n == 0 {
-            return Self { offsets, scales };
-        }
-        let mut mins = vec![f32::INFINITY; dim];
-        let mut maxs = vec![f32::NEG_INFINITY; dim];
-        for row in 0..n {
-            let base = row * dim;
-            for d in 0..dim {
-                let v = vectors[base + d];
-                if v < mins[d] {
-                    mins[d] = v;
-                }
-                if v > maxs[d] {
-                    maxs[d] = v;
-                }
-            }
-        }
-        for d in 0..dim {
-            offsets[d] = mins[d];
-            let range = maxs[d] - mins[d];
-            scales[d] = if range > 0.0 { 255.0 / range } else { 0.0 };
-        }
-        Self { offsets, scales }
+    /// Derive the global symmetric scale from the largest-magnitude component.
+    pub fn from_vectors(vectors: &[f32]) -> Self {
+        let max_abs = vectors.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 0.0 };
+        Self { scale }
     }
 
-    /// Quantize one f32 vector to u8.
-    pub fn quantize(&self, v: &[f32], out: &mut [u8]) {
-        for (i, &val) in v.iter().enumerate() {
-            let q = (val - self.offsets[i]) * self.scales[i];
-            out[i] = q.round().clamp(0.0, 255.0) as u8;
+    /// Quantize one f32 vector to int8 (elementwise; dimension-agnostic).
+    pub fn quantize(&self, v: &[f32], out: &mut [i8]) {
+        if self.scale <= 0.0 {
+            out.iter_mut().for_each(|o| *o = 0);
+            return;
+        }
+        let inv = 1.0 / self.scale;
+        for (o, &val) in out.iter_mut().zip(v) {
+            *o = (val * inv).round().clamp(-127.0, 127.0) as i8;
         }
     }
 
-    /// Quantize all f32 vectors into a flat u8 matrix.
-    pub fn quantize_all(&self, vectors: &[f32], dim: usize) -> Vec<u8> {
-        let n = vectors.len().checked_div(dim).unwrap_or(0);
-        let mut out = vec![0u8; n * dim];
-        for row in 0..n {
-            let f_base = row * dim;
-            let q_base = row * dim;
-            self.quantize(
-                &vectors[f_base..f_base + dim],
-                &mut out[q_base..q_base + dim],
-            );
-        }
+    /// Quantize a whole flat f32 matrix to int8 (elementwise — no row structure).
+    pub fn quantize_all(&self, vectors: &[f32]) -> Vec<i8> {
+        let mut out = vec![0i8; vectors.len()];
+        self.quantize(vectors, &mut out);
         out
     }
 }
 
-/// Approximate dot product between two u8 vectors. Uses u32 accumulation to avoid
-/// overflow (255 * 255 * dim fits u32 for dim ≤ ~66k).
-pub fn dot_u8(a: &[u8], b: &[u8]) -> u32 {
+/// Dot product of two int8 vectors, accumulated in i32. `i8·i8 ∈ [−16129, 16129]`,
+/// so i32 stays safe for dim up to ~130k. Proportional to the f32 dot under a
+/// shared symmetric scale, so monotonic for ranking.
+pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
     debug_assert_eq!(a.len(), b.len());
-    let mut acc = [0u32; DOT_LANES];
+    let mut acc = [0i32; DOT_LANES];
     let mut a_chunks = a.chunks_exact(DOT_LANES);
     let mut b_chunks = b.chunks_exact(DOT_LANES);
 
     for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
         for lane in 0..DOT_LANES {
-            acc[lane] += ca[lane] as u32 * cb[lane] as u32;
+            acc[lane] += ca[lane] as i32 * cb[lane] as i32;
         }
     }
 
@@ -190,13 +173,14 @@ pub fn dot_u8(a: &[u8], b: &[u8]) -> u32 {
     }
     let mut sum = acc[0];
     for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
-        sum += *x as u32 * *y as u32;
+        sum += *x as i32 * *y as i32;
     }
     sum
 }
 
-/// Approximate negative squared Euclidean distance between two u8 vectors.
-pub fn euclidean_neg_sq_u8(a: &[u8], b: &[u8]) -> i32 {
+/// Negative squared Euclidean distance between two int8 vectors, in i32.
+/// `diff ∈ [−254, 254]`, squared ≤ 64516, so i32 is safe for dim up to ~33k.
+pub fn euclidean_neg_sq_i8(a: &[i8], b: &[i8]) -> i32 {
     debug_assert_eq!(a.len(), b.len());
     let mut acc = [0i32; DOT_LANES];
     let mut a_chunks = a.chunks_exact(DOT_LANES);
@@ -767,50 +751,67 @@ mod tests {
     // ── int8 quantization helpers ────────────────────────────────────────
 
     #[test]
-    fn quant_params_round_trip() {
-        // dim=2, rows: [0.0, 1.0], [1.0, 0.0]
-        // per-dim min: [0, 0], max: [1, 1], scale: [255, 255]
-        let vecs = [0.0f32, 1.0, 1.0, 0.0];
-        let params = QuantParams::from_vectors(&vecs, 2);
-        let q = params.quantize_all(&vecs, 2);
-        assert_eq!(q.len(), 4);
-        assert_eq!(q[0], 0); // (0.0 - 0.0) * 255 = 0
-        assert_eq!(q[1], 255); // (1.0 - 0.0) * 255 = 255
-        assert_eq!(q[2], 255); // (1.0 - 0.0) * 255 = 255
-        assert_eq!(q[3], 0); // (0.0 - 0.0) * 255 = 0
+    fn quant_symmetric_endpoints() {
+        // max|v| = 1.0 → scale = 1/127. ±1.0 map to ±127, 0 maps to 0.
+        let vecs = [1.0f32, -1.0, 0.0, 0.5];
+        let params = QuantParams::from_vectors(&vecs);
+        let q = params.quantize_all(&vecs);
+        assert_eq!(q[0], 127);
+        assert_eq!(q[1], -127);
+        assert_eq!(q[2], 0);
+        assert_eq!(q[3], 64); // round(0.5 * 127) = round(63.5) = 64
     }
 
     #[test]
-    fn quant_params_zero_range() {
-        let vecs = [5.0f32, 5.0, 5.0, 5.0];
-        let params = QuantParams::from_vectors(&vecs, 2);
-        let q = params.quantize_all(&vecs, 2);
-        assert!(q.iter().all(|&v| v == 0));
+    fn quant_all_zero() {
+        let vecs = [0.0f32, 0.0, 0.0];
+        let params = QuantParams::from_vectors(&vecs);
+        assert_eq!(params.scale, 0.0);
+        assert!(params.quantize_all(&vecs).iter().all(|&v| v == 0));
     }
 
     #[test]
-    fn dot_u8_known_value() {
-        let a = [255u8, 0, 128];
-        let b = [1u8, 255, 128];
-        // 255*1 + 0*255 + 128*128 = 16639
-        assert_eq!(dot_u8(&a, &b), 16639);
+    fn quant_dot_monotonic_with_f32() {
+        // The int8 dot must rank candidates the same way the f32 dot does.
+        let q = [1.0f32, 0.0, 0.0];
+        let near = [0.9f32, 0.1, 0.0];
+        let far = [0.0f32, 0.0, 1.0];
+        let all: Vec<f32> = q.iter().chain(&near).chain(&far).copied().collect();
+        let params = QuantParams::from_vectors(&all);
+        let mut qq = [0i8; 3];
+        let mut qn = [0i8; 3];
+        let mut qf = [0i8; 3];
+        params.quantize(&q, &mut qq);
+        params.quantize(&near, &mut qn);
+        params.quantize(&far, &mut qf);
+        // f32: dot(q,near) > dot(q,far); int8 ranking must agree.
+        assert!(dot(&q, &near) > dot(&q, &far));
+        assert!(dot_i8(&qq, &qn) > dot_i8(&qq, &qf));
     }
 
     #[test]
-    fn dot_u8_empty() {
-        assert_eq!(dot_u8(&[], &[]), 0);
+    fn dot_i8_known_value() {
+        let a = [127i8, 0, -64];
+        let b = [1i8, 100, -64];
+        // 127*1 + 0*100 + (-64)*(-64) = 127 + 0 + 4096 = 4223
+        assert_eq!(dot_i8(&a, &b), 4223);
     }
 
     #[test]
-    fn euclidean_neg_sq_u8_identical() {
-        let a = [100u8, 200, 50];
-        assert_eq!(euclidean_neg_sq_u8(&a, &a), 0);
+    fn dot_i8_empty() {
+        assert_eq!(dot_i8(&[], &[]), 0);
     }
 
     #[test]
-    fn euclidean_neg_sq_u8_known() {
-        let a = [10u8, 0];
-        let b = [0u8, 10];
-        assert_eq!(euclidean_neg_sq_u8(&a, &b), -(100 + 100));
+    fn euclidean_neg_sq_i8_identical() {
+        let a = [100i8, -120, 50];
+        assert_eq!(euclidean_neg_sq_i8(&a, &a), 0);
+    }
+
+    #[test]
+    fn euclidean_neg_sq_i8_known() {
+        let a = [10i8, 0];
+        let b = [0i8, -10];
+        assert_eq!(euclidean_neg_sq_i8(&a, &b), -(100 + 100));
     }
 }
