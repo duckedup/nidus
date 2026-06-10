@@ -25,7 +25,7 @@ use serde_json::{Value as JsonValue, json};
 use tokio::net::TcpListener;
 
 use crate::{Nidus, Record, Scope, SearchOpts};
-use dto::{DeleteRequest, HitDto, ListRequest, SearchRequest, UpsertRequest};
+use dto::{DeleteRequest, FootprintDto, HitDto, ListRequest, SearchRequest, UpsertRequest};
 
 /// How `nidus serve` is configured beyond the store itself.
 pub struct ServeConfig {
@@ -88,6 +88,7 @@ pub async fn serve(db: Nidus, cfg: ServeConfig) -> anyhow::Result<()> {
 fn router(state: AppState, max_body_bytes: usize) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/stats", get(stats))
         .route("/collections", get(list_collections))
         .route(
             "/collections/{name}",
@@ -137,6 +138,22 @@ async fn shutdown_signal() {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Store-wide introspection: pinned dimension, distance metric, the collection
+/// list, and the on-disk footprint. Mirrors the CLI `stats` command so a
+/// network-only client can inspect the store without the binary.
+async fn stats(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
+    let body = run_read(st, |db| {
+        Ok(json!({
+            "dimension": db.dimension(),
+            "distance": format!("{:?}", db.config().distance),
+            "collections": db.collections(),
+            "footprint": FootprintDto::from(db.footprint()),
+        }))
+    })
+    .await?;
+    Ok(Json(body))
 }
 
 async fn list_collections(State(st): State<AppState>) -> Result<Json<Vec<String>>, ApiError> {
@@ -376,6 +393,87 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::ServiceExt; // for `oneshot`
+
+    /// Build a router over a fresh in-memory store of the given dimension.
+    fn test_router(dim: usize) -> Router {
+        let db = Nidus::open_in_memory(dim).unwrap();
+        let state = AppState {
+            db: Arc::new(RwLock::new(db)),
+            token: None,
+        };
+        router(state, 16 * 1024 * 1024)
+    }
+
+    async fn json_body(resp: Response) -> JsonValue {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn post(path: &str, body: JsonValue) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn get(path: &str) -> Request<Body> {
+        Request::builder().uri(path).body(Body::empty()).unwrap()
+    }
+
+    /// A client that never links the library can drive the whole lifecycle over
+    /// HTTP: create → upsert → search → stats. Exercises the network-only surface
+    /// the docs promise.
+    #[tokio::test]
+    async fn full_lifecycle_over_http() {
+        let app = test_router(3);
+
+        // Create a collection.
+        let resp = app
+            .clone()
+            .oneshot(post("/collections/docs", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Upsert two records.
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "a", "vector": [1, 0, 0], "attrs": {"lang": {"Str": "rust"}}},
+                    {"id": "b", "vector": [0, 1, 0], "attrs": {"lang": {"Str": "go"}}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await["upserted"], 2);
+
+        // Search.
+        let resp = app
+            .clone()
+            .oneshot(post("/search", json!({"query": [1, 0, 0], "top_k": 1})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        assert_eq!(hits[0]["id"], "a");
+
+        // Stats reflects the store: dimension, collection list, and footprint.
+        let resp = app.clone().oneshot(get("/stats")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let stats = json_body(resp).await;
+        assert_eq!(stats["dimension"], 3);
+        assert_eq!(stats["distance"], "Cosine");
+        assert_eq!(stats["collections"], json!(["docs"]));
+        assert_eq!(stats["footprint"]["doc_count"], 2);
+    }
 
     #[test]
     fn classify_maps_client_faults() {

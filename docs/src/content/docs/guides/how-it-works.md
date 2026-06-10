@@ -87,8 +87,8 @@ chunked dot product, an allocation-free top-k scan, and a storage-order
 - **Not async.** The hot path is CPU-bound; the library API is synchronous (see
   [Embedding in a host app](/guides/integrating/)).
 - **In-process by default.** You embed it and call methods directly; when you
-  want it over the wire, an optional [`nidus serve`](/guides/cli-and-server/#server)
-  wraps a store in a small HTTP layer.
+  want it over the wire, [`nidus serve`](/guides/http-server/) exposes the whole
+  store over HTTP.
 
 Each of those is a deferred *seam*, not a wall — mmap, an ANN index, and scalar
 quantization are all designed-for and additive over the same append-only file.
