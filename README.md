@@ -36,7 +36,7 @@ more, so it **compiles in seconds** and embeds as a normal Rust dependency.
 
 ```toml
 [dependencies]
-nidus = "0.9"
+nidus = "0.10"
 ```
 
 ```rust
@@ -110,6 +110,11 @@ curl -fsSL https://raw.githubusercontent.com/duckedup/nidus/main/install.sh | sh
 nidus create  --dir ./store --dim 3 docs
 echo '[{"id":"a","vector":[1,0,0],"attrs":{}}]' | nidus upsert --dir ./store docs
 echo '[1,0,0]' | nidus search --dir ./store docs -k 5
+
+# Snapshot the whole store to one portable .tar.gz (safe while a writer runs),
+# and restore it — handy before an upgrade or as a cron job.
+nidus backup  --dir ./store --out ./store.tar.gz
+nidus restore --in ./store.tar.gz --dir ./restored
 
 # Or serve it over HTTP
 nidus serve --dir ./store --dim 768 --addr 127.0.0.1:7700
