@@ -181,7 +181,7 @@ fn run() -> Result<()> {
 
             // Quantized variants.
             for &rescore in &args.rescore {
-                let (db, _guard) = build(&data, Some(Quantization { rescore }))?;
+                let (db, _guard) = build(&data, Some(Quantization::int8().rescore(rescore)))?;
                 let (recall, t) = measure(&db, &data, args.top_k, &args, &truth)?;
                 let p50 = t.p50.as_secs_f64();
                 let speedup = if p50 > 0.0 { base / p50 } else { 0.0 };

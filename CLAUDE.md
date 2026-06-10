@@ -132,12 +132,12 @@ no query engine, no network, no background threads.
 
 ```
 src/
-├── lib.rs       # Public API: Nidus::{open, upsert, delete, delete_where, get_all, search, flush, compact}
+├── lib.rs       # Public API: Nidus::{open, upsert, delete, delete_where, get_all, list, search, flush, compact}
 ├── value.rs     # Value (Null|Str|Int|Bool|List) + binary encode/decode
 ├── record.rs    # Record { id, vector, attrs }
-├── filter.rs    # Predicate (Eq|Glob|In) / Filter + matching
+├── filter.rs    # Predicate (Eq|Ne|Glob|In|NotIn|Lt|Le|Gt|Ge) / Filter + matching
 ├── glob.rs      # minimal * ? [..] matcher (covers the GLOB subset callers use)
-├── search.rs    # cosine scoring + bounded top-k heap + min_score
+├── search.rs    # distance kernels (cosine/dot/euclidean, f32 + int8 + binary Hamming) + bounded top-k heap + min_score
 ├── data.rs      # flat f32 segment: header, append, row accessor (the future mmap seam)
 ├── log.rs       # op-log codec: len + payload + crc32, replay, torn-tail recovery
 ├── lock.rs      # writer exclusion via O_EXCL lock file (pure std, no flock/FFI)
@@ -173,8 +173,10 @@ std gives no `try_reserve` for. The overcommit-proof guard is
 introspection hook. Still in-RAM brute-force — not spill-to-disk/mmap (deferred).
 
 **Deferred-but-seamed** (do NOT build until needed; each is additive over the same
-file format): mmap (swap the one row accessor), an ANN/HNSW index, scalar
-quantization. See `SPEC.md` for the full rationale and the decisions behind each.
+file format): mmap (swap the one row accessor) and an ANN/HNSW index. (int8 *and*
+binary quantization, opt-in parallel scan via `Config::query_threads`, and the HTTP
+server have since shipped — they were once on this list.) See `SPEC.md` §9 for the
+full rationale and the decisions behind each.
 
 ## Conventions & Patterns
 

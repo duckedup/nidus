@@ -25,20 +25,59 @@ pub enum Distance {
     DotProduct,
 }
 
-/// Configuration for int8 scalar quantization. When enabled, the store maintains
-/// an in-memory int8 vector matrix for faster first-pass scoring, then re-ranks
-/// the top candidates using the original f32 vectors for accuracy.
+/// Which quantization scheme the store maintains for the search first pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantKind {
+    /// int8 scalar quantization — 4× smaller than f32, valid for any distance metric.
+    Int8,
+    /// Binary sign-bit quantization — 32× smaller than f32, with a Hamming first pass.
+    /// **Cosine only:** sign codes approximate *angular* similarity and discard
+    /// magnitude, so they are not a sound ranking proxy for dot-product or Euclidean.
+    Binary,
+}
+
+/// Configuration for vector quantization. When enabled, the store maintains an
+/// in-memory quantized matrix for faster first-pass scoring, then re-ranks the top
+/// candidates using the original f32 vectors for accuracy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Quantization {
-    /// Overscan factor: the int8 first-pass selects `top_k * rescore` candidates,
-    /// then the f32 rerank picks the true top-k. Higher = better recall, slower.
-    /// Default: 4.
+    /// Which quantization scheme drives the first pass.
+    pub kind: QuantKind,
+    /// Overscan factor: the first pass selects `top_k * rescore` candidates, then the
+    /// f32 rerank picks the true top-k. Higher = better recall, slower. Binary codes
+    /// are coarser than int8, so [`Quantization::binary`] defaults to a larger factor.
     pub rescore: usize,
 }
 
+impl Quantization {
+    /// int8 scalar quantization (overscan 4). Valid for any distance metric.
+    pub fn int8() -> Self {
+        Self {
+            kind: QuantKind::Int8,
+            rescore: 4,
+        }
+    }
+
+    /// Binary sign-bit quantization (overscan 16). **Cosine only.** The coarser proxy
+    /// warrants a larger default overscan than int8.
+    pub fn binary() -> Self {
+        Self {
+            kind: QuantKind::Binary,
+            rescore: 16,
+        }
+    }
+
+    /// Set the overscan factor (clamped to at least 1).
+    pub fn rescore(mut self, n: usize) -> Self {
+        self.rescore = n.max(1);
+        self
+    }
+}
+
 impl Default for Quantization {
+    /// int8 scalar quantization — the original default, unchanged.
     fn default() -> Self {
-        Self { rescore: 4 }
+        Self::int8()
     }
 }
 

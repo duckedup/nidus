@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use nidus::{Config, Nidus, Quantization, Record, SearchOpts};
+use nidus::{Config, Distance, Nidus, QuantKind, Quantization, Record, SearchOpts};
 use nidus_bench::data;
 use std::hint::black_box;
 
@@ -39,21 +39,25 @@ fn build_store(n: usize, dim: usize) -> Nidus {
 }
 
 /// Build a file-backed store (in a tempdir) with a specific `query_threads` and
-/// optional int8 quantization, so the parallel-scan path (f32 or quantized) can be
+/// optional quantization, so the parallel-scan path (f32, int8, or binary) can be
 /// driven through the public `Config` API. Returns the `TempDir` guard alongside the
-/// store to keep the backing files alive.
+/// store to keep the backing files alive. Binary quantization pins cosine distance
+/// (its only supported metric).
 fn build_store_threaded(
     n: usize,
     dim: usize,
     threads: usize,
-    quant: bool,
+    quant: Option<Quantization>,
 ) -> (Nidus, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cfg = Config::new(dir.path().join("store"), dim)
         .query_threads(threads)
         .auto_compact(None);
-    if quant {
-        cfg = cfg.quantization(Some(Quantization::default()));
+    if let Some(q) = quant {
+        cfg = cfg.quantization(Some(q));
+        if q.kind == QuantKind::Binary {
+            cfg = cfg.distance(Distance::Cosine);
+        }
     }
     let mut db = Nidus::open(cfg).expect("open store");
     db.create_collection("bench").expect("create collection");
@@ -86,10 +90,11 @@ fn bench_search(c: &mut Criterion) {
 }
 
 /// Same large search, swept across `query_threads` — the reproducible measurement
-/// behind the parallel-scan speedup claim, for both the f32 and the int8-quantized
-/// first pass. The f32 scan is memory-bandwidth-bound, so its gain is sublinear; the
-/// int8 first pass moves 4× fewer bytes (compute- not bandwidth-bound), so it is the
-/// path that should actually scale with threads. Two groups so they diff separately.
+/// behind the parallel-scan speedup claim, across the f32, int8, and binary first
+/// passes. The f32 scan is memory-bandwidth-bound, so its gain is sublinear; int8
+/// moves 4× fewer bytes and binary 32× (compute- not bandwidth-bound), so those are
+/// the paths that should scale with threads — binary hardest. One group each so they
+/// diff separately, and the int8/binary groups also expose the recall/latency trade.
 fn bench_parallel_search(c: &mut Criterion) {
     let (n, dim) = (100_000usize, 768usize);
     let query = data::generate(SEED ^ 1, 1, dim, 0).vectors;
@@ -97,7 +102,11 @@ fn bench_parallel_search(c: &mut Criterion) {
         top_k: 10,
         ..Default::default()
     };
-    for (group_name, quant) in [("parallel_search", false), ("parallel_search_quant", true)] {
+    for (group_name, quant) in [
+        ("parallel_search", None),
+        ("parallel_search_quant", Some(Quantization::int8())),
+        ("parallel_search_binary", Some(Quantization::binary())),
+    ] {
         let mut group = c.benchmark_group(group_name);
         for &threads in &[1usize, 2, 4, 8] {
             let (db, _dir) = build_store_threaded(n, dim, threads, quant);
