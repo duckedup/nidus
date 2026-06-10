@@ -105,11 +105,56 @@ nidus get        --dir ./store docs
 nidus stats      --dir ./store
 nidus compact    --dir ./store
 nidus delete     --dir ./store docs a b
+
+# Snapshot the whole store to one portable .tar.gz, and restore it
+nidus backup     --dir ./store --out ./store.tar.gz
+nidus restore    --in ./store.tar.gz --dir ./restored
 ```
 
 Read-only commands (`search`, `get`, `collections`, `stats`) open the store
 without taking the writer lock, so they can run alongside a writer such as a
 running server.
+
+## Backup & restore
+
+A store is just a directory, so you can always copy it by hand — but `nidus
+backup` packages the whole thing into a single compressed `.tar.gz` you can
+stash before an upgrade or hand to a cron job, and `nidus restore` brings it
+back.
+
+```bash
+# Snapshot ./store into one portable archive.
+nidus backup --dir ./store --out ./store.tar.gz
+
+# Omit --out and you get a sortable, timestamped name in the current directory,
+# e.g. store-1781063324.tar.gz — handy for keeping a series of snapshots.
+nidus backup --dir ./store
+
+# Restore into a directory. If the target already holds a store you are asked to
+# confirm; pass -y to overwrite without prompting.
+nidus restore --in ./store.tar.gz --dir ./restored
+nidus restore --in ./store.tar.gz --dir ./store --yes
+```
+
+The archive is an ordinary gzip-compressed tarball — `tar tzf store.tar.gz`
+lists the `data` and `log` files plus a small `nidus-backup.json` manifest
+(version, timestamp, dimension), so you can inspect or extract it with standard
+tools too. Restore reopens the store afterwards to confirm it loads, and never
+carries over a stale writer lock.
+
+**Backup is a safe hot snapshot.** It does not take the writer lock, so it can
+run while a writer — including `nidus serve` — is busy. It captures the same
+consistent, possibly-slightly-stale view a [lock-free reader](/guides/storage/)
+sees: never a torn or half-written store.
+
+Because a backup is one self-contained command on a single directory, a periodic
+snapshot is a one-line cron entry:
+
+```bash
+# Every night at 02:00, snapshot into a dated file and keep the last 14.
+0 2 * * *  nidus backup --dir /srv/nidus/store --out /backups/store-$(date +\%F).tar.gz && \
+           ls -1t /backups/store-*.tar.gz | tail -n +15 | xargs -r rm
+```
 
 ## Server
 

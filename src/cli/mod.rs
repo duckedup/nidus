@@ -12,6 +12,8 @@ use serde::Serialize;
 use crate::server::dto::{FootprintDto, HitDto};
 use crate::{Config, Distance, Filter, Nidus, OpenMode, Record, Scope, SearchOpts};
 
+mod backup;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "nidus",
@@ -188,6 +190,31 @@ enum Command {
         #[command(flatten)]
         store: StoreArgs,
     },
+    /// Snapshot a store into a single compressed archive (`.tar.gz`).
+    ///
+    /// Safe to run alongside a writer (e.g. `nidus serve`): it captures a
+    /// consistent, lock-free snapshot without blocking writes. Ideal for a
+    /// pre-upgrade backup or a periodic cron snapshot.
+    Backup {
+        /// Store directory to back up.
+        #[arg(long, short = 'd')]
+        dir: PathBuf,
+        /// Output archive path. Defaults to `<dir-name>-<unix-secs>.tar.gz`.
+        #[arg(long, short = 'o')]
+        out: Option<PathBuf>,
+    },
+    /// Restore a store from a `nidus backup` archive (`.tar.gz`).
+    Restore {
+        /// Backup archive to restore from.
+        #[arg(long = "in", short = 'i')]
+        input: PathBuf,
+        /// Target store directory (created if absent).
+        #[arg(long, short = 'd')]
+        dir: PathBuf,
+        /// Overwrite an existing store without prompting (for cron / scripts).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Print store footprint and collections (JSON).
     Stats {
         #[command(flatten)]
@@ -305,6 +332,11 @@ pub fn run(cli: Cli) -> Result<()> {
             db.compact()?;
             print_json(&serde_json::json!({ "ok": true }))
         }
+        Command::Backup { dir, out } => {
+            let out = out.unwrap_or_else(|| PathBuf::from(backup::default_out_name(&dir)));
+            print_json(&backup::backup(&dir, &out)?)
+        }
+        Command::Restore { input, dir, yes } => print_json(&backup::restore(&input, &dir, yes)?),
         Command::Stats { store } => {
             let db = open(&store, false)?;
             print_json(&serde_json::json!({
@@ -480,6 +512,55 @@ mod tests {
             read_only: false,
         };
         assert_eq!(args.resolve().unwrap(), (5, Distance::Euclidean));
+    }
+
+    #[test]
+    fn backup_parses_dir_and_optional_out() {
+        let cli =
+            Cli::try_parse_from(["nidus", "backup", "--dir", "/tmp/s", "-o", "/tmp/s.tar.gz"])
+                .unwrap();
+        match cli.command {
+            Command::Backup { dir, out } => {
+                assert_eq!(dir, PathBuf::from("/tmp/s"));
+                assert_eq!(out, Some(PathBuf::from("/tmp/s.tar.gz")));
+            }
+            _ => panic!("expected Backup"),
+        }
+        // --out is optional (a timestamped default is synthesized).
+        let cli = Cli::try_parse_from(["nidus", "backup", "-d", "/tmp/s"]).unwrap();
+        match cli.command {
+            Command::Backup { out, .. } => assert_eq!(out, None),
+            _ => panic!("expected Backup"),
+        }
+    }
+
+    #[test]
+    fn restore_parses_in_dir_and_yes() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "restore",
+            "--in",
+            "/tmp/s.tar.gz",
+            "--dir",
+            "/tmp/s2",
+            "-y",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Restore { input, dir, yes } => {
+                assert_eq!(input, PathBuf::from("/tmp/s.tar.gz"));
+                assert_eq!(dir, PathBuf::from("/tmp/s2"));
+                assert!(yes);
+            }
+            _ => panic!("expected Restore"),
+        }
+        // -y defaults off.
+        let cli = Cli::try_parse_from(["nidus", "restore", "-i", "/tmp/s.tar.gz", "-d", "/tmp/s2"])
+            .unwrap();
+        match cli.command {
+            Command::Restore { yes, .. } => assert!(!yes),
+            _ => panic!("expected Restore"),
+        }
     }
 
     #[test]
