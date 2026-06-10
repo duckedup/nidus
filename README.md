@@ -96,9 +96,10 @@ See [`examples/demo.rs`](examples/demo.rs) for an end-to-end run (`cargo run
 ## Command line & server
 
 The same crate ships an optional `nidus` binary: a CLI for working with a store
-directly, and `nidus serve`, a small HTTP server exposing the same operations over
-JSON. The binary is built behind a `cli` feature, so `cargo add nidus` stays
-pure — the library never pulls the binary's dependencies.
+directly, and `nidus serve`, an HTTP server exposing the full store — create,
+upsert, search, inspect, maintain — over JSON. The binary is built behind a `cli`
+feature, so `cargo add nidus` stays pure: the library never pulls the binary's
+dependencies.
 
 ```bash
 # Install — no Rust toolchain needed (prebuilt binary for your platform)
@@ -115,14 +116,24 @@ echo '[1,0,0]' | nidus search --dir ./store docs -k 5
 # and restore it — handy before an upgrade or as a cron job.
 nidus backup  --dir ./store --out ./store.tar.gz
 nidus restore --in ./store.tar.gz --dir ./restored
-
-# Or serve it over HTTP
-nidus serve --dir ./store --dim 768 --addr 127.0.0.1:7700
 ```
 
-The server is a thin wrapper over an open store — same storage model, durability,
-and search semantics as the library. See the
-[Command line & server guide](https://nidus.duckedup.org/guides/cli-and-server/).
+Or drive the same store over the network — no Rust toolchain on the client, just
+HTTP and JSON:
+
+```bash
+nidus serve --dir ./store --dim 3 --addr 127.0.0.1:7700
+
+curl -s -X POST localhost:7700/collections/docs
+curl -s localhost:7700/collections/docs/upsert -H 'content-type: application/json' \
+  -d '{"records": [{"id": "a", "vector": [1,0,0], "attrs": {}}]}'
+curl -s localhost:7700/search -H 'content-type: application/json' \
+  -d '{"query": [1,0,0], "top_k": 5}'
+```
+
+The server shares the library's storage model, durability, and search semantics.
+See the [command-line](https://nidus.duckedup.org/guides/cli-and-server/) and
+[HTTP server & API](https://nidus.duckedup.org/guides/http-server/) guides.
 
 ## Performance
 

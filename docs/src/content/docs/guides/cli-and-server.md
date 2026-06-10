@@ -1,12 +1,12 @@
 ---
-title: Command line & server
-description: Use nidus from the terminal, or run it as a small HTTP server, with the `nidus` binary.
+title: Command line
+description: Use nidus from the terminal with the `nidus` binary — create, upsert, search, inspect, back up, and restore a store directory.
 ---
 
 Besides the Rust library, nidus ships a `nidus` binary: a command-line tool for
-working with a store directly, and `nidus serve`, a small HTTP server that exposes
-the same operations over JSON. Both operate on an ordinary store directory — the
-very same format the library reads and writes.
+working with a store directly. It operates on an ordinary store directory — the
+very same format the library reads and writes. The same binary also runs an HTTP
+server; that has its own [HTTP server & API](/guides/http-server/) page.
 
 The binary is optional. The library has no dependency on it: `cargo add nidus`
 pulls in only the pure-Rust core. The binary is built behind a `cli` feature, so
@@ -61,8 +61,9 @@ echo '[1,0,0]' | nidus search --dir ./store docs -k 2
 ```
 
 The last command prints ranked hits as JSON. That is a complete local vector
-store: a single `./store` directory you can copy, back up, or delete. To query
-it over HTTP instead, point [`nidus serve`](#server) at the same directory.
+store: a single `./store` directory you can copy, back up, or delete. To drive the
+same store over the network instead, point
+[`nidus serve`](/guides/http-server/) at the same directory.
 
 ## Command line
 
@@ -156,81 +157,17 @@ snapshot is a one-line cron entry:
            ls -1t /backups/store-*.tar.gz | tail -n +15 | xargs -r rm
 ```
 
-## Server
+## Over the network
 
-`nidus serve` opens one store and serves it over HTTP until you stop it
-(Ctrl-C, which flushes on the way out).
+The same `nidus` binary serves a store over HTTP, so a client with no Rust
+toolchain can do the full job — create, upsert, search, inspect, maintain — in
+JSON:
 
 ```bash
 # --dim is only needed if the store doesn't exist yet; otherwise it's inferred.
 nidus serve --dir ./store --dim 768 --addr 127.0.0.1:7700
 ```
 
-Pass `--read-only` to serve without taking the writer lock — useful for a
-search-only process beside a separate writer.
-
-### Authentication
-
-The server is unauthenticated by default, which is fine on `127.0.0.1`. The moment
-you bind a non-local address, set `--token <secret>` (or the `NIDUS_TOKEN` env
-var): every request except `GET /health` must then carry
-`Authorization: Bearer <secret>`, and anything else gets `401`.
-
-```bash
-nidus serve --dir ./store --addr 0.0.0.0:7700 --token "$NIDUS_TOKEN"
-curl -s localhost:7700/search -H "authorization: Bearer $NIDUS_TOKEN" -d '…'
-```
-
-### Request size
-
-Each request body is buffered in memory, so the body-size limit is also the
-largest single upsert. It defaults to 256 MiB; raise or lower it with
-`--max-body-bytes <n>`.
-
-The endpoints map one-to-one onto the library API:
-
-| Method & path | Operation |
-| --- | --- |
-| `GET /health` | liveness check |
-| `GET /collections` | list collections |
-| `POST /collections/{name}` | create a collection |
-| `DELETE /collections/{name}` | drop a collection |
-| `GET /collections/{name}/meta` | read collection metadata |
-| `PUT /collections/{name}/meta` | set collection metadata |
-| `POST /collections/{name}/upsert` | upsert records |
-| `POST /collections/{name}/delete` | delete by ids or filter |
-| `GET /collections/{name}/records` | all records in a collection |
-| `POST /search` | nearest-neighbour search |
-| `POST /list` | metadata-only query (no vector) |
-| `POST /flush` | flush to disk |
-| `POST /compact` | reclaim dead rows |
-
-A search request takes a query vector, an optional `scope` (a list of collection
-names; empty means the whole store), and the usual options:
-
-```bash
-curl -s localhost:7700/search -H 'content-type: application/json' -d '{
-  "query": [1, 0, 0],
-  "scope": ["docs"],
-  "top_k": 5,
-  "min_score": 0.2,
-  "filter": [{"Eq": ["lang", {"Str": "rust"}]}]
-}'
-```
-
-Upsert and delete mirror the library:
-
-```bash
-curl -s localhost:7700/collections/docs/upsert \
-  -H 'content-type: application/json' \
-  -d '{"records": [{"id": "a", "vector": [1,0,0], "attrs": {}}]}'
-
-curl -s localhost:7700/collections/docs/delete \
-  -H 'content-type: application/json' -d '{"ids": ["a"]}'
-```
-
-The server holds the store behind a read/write lock and runs each operation on a
-blocking worker, the same pattern the library recommends for [driving it from
-async code](/guides/integrating/). Reads (search, list, get) run concurrently;
-writes take the store exclusively. It is a thin wrapper: the storage model,
-durability, and search semantics are exactly those of the library.
+The complete network workflow, authentication, request limits, and the
+endpoint-by-endpoint reference live on the dedicated
+[HTTP server & API](/guides/http-server/) page.
