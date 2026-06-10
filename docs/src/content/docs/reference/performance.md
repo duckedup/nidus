@@ -54,8 +54,17 @@ sweep isn't enough. Both stay pure-safe-Rust and are off by default:
   bandwidth-bound and scales to **~2.4×** at 4 threads. Reproduce:
   `just bench-crit parallel_search` (the `parallel_search_quant` group is the
   quantized sweep).
+- **[approximate index (HNSW / IVF)](/guides/search/#approximate-search-ann)**
+  (`Config::ann`) — walks an index instead of scanning every vector, for when the
+  collection outgrows a full scan. On realistic clustered data (n=20k, dim=768) HNSW
+  returns **~0.99–1.0 recall@10 at ~7–10× the query speed** of the exact scan; IVF
+  ~1.0 recall at ~3×. The graph is in-RAM but [persisted](/guides/search/#approximate-search-ann)
+  so a warm `open()` is **~0.05 s** instead of rebuilding (~36 s here), and a cold
+  rebuild parallelizes over `query_threads` (**~36 s → ~5 s at 8 threads**). Recall is
+  data-dependent — uniform-random vectors are a near-worst case — so measure your own:
+  `just bench-ann clustered=1`.
 
-Neither is the headline multiplier its theory suggests — the 4× from int8 and the
+Neither int8 nor threads is the headline multiplier its theory suggests — the 4× from int8 and the
 linear scaling from threads both want SIMD/bandwidth headroom nidus doesn't chase
 within its zero-FFI design. The f32 scan is bandwidth-bound; threads help most when
 paired with the int8 first pass, which has the compute headroom to scale. They're

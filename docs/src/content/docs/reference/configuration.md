@@ -86,7 +86,7 @@ int8 first-pass → f32 rerank. See
 
 ### `ann`
 
-`Option<AnnConfig>` — default `None` (disabled; exact brute-force search). When set,
+`Option<AnnConfig>` — default `None` (disabled; exact search). When set,
 the store builds an in-memory approximate-nearest-neighbour index and `search` walks
 it for an over-fetched candidate set, then applies the scope/filter/`min_score` and an
 exact f32 rerank — trading recall for speed when a scan over every vector is more than
