@@ -20,6 +20,7 @@ let cfg = Config::new("/path/to/store", 768)
     .lock_ttl(Duration::from_secs(60))
     .max_vector_bytes(None)          // no ceiling (default)
     .quantization(None)              // int8 two-pass search (default: off)
+    .ann(None)                       // approximate-nearest-neighbour index (default: off)
     .query_threads(1);               // worker threads per exact search (default: 1)
 # let _ = cfg;
 ```
@@ -82,6 +83,17 @@ never fires. It counts physical rows including not-yet-compacted dead rows, so
 maintains an in-memory int8 copy of all vectors and uses a two-pass search:
 int8 first-pass → f32 rerank. See
 [int8 scalar quantization](/guides/search/#int8-scalar-quantization) for details.
+
+### `ann`
+
+`Option<AnnConfig>` — default `None` (disabled; exact brute-force search). When set,
+the store builds an in-memory approximate-nearest-neighbour index and `search` walks
+it for an over-fetched candidate set, then applies the scope/filter/`min_score` and an
+exact f32 rerank — trading recall for speed when a scan over every vector is more than
+you need. Two algorithms, via `AnnConfig::hnsw()` (a navigable small-world graph, the
+default) and `AnnConfig::ivf()` (k-means inverted lists). Mutually exclusive with
+`quantization`. See [approximate search](/guides/search/#approximate-search-ann) for
+details and tuning.
 
 ### `query_threads`
 
