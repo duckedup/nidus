@@ -20,6 +20,10 @@ use crate::search::{
 
 // ── In-RAM types ─────────────────────────────────────────────────────────────
 
+/// The cached row-sorted scan order: `(row, collection, id)` for every live doc,
+/// sorted by `row` (see [`Store::scan_order`]).
+type ScanOrder = Vec<(u64, String, String)>;
+
 /// One document's entry within a collection.
 struct DocEntry {
     row: u64,
@@ -287,6 +291,16 @@ pub struct Store {
     dead_rows: usize,
     /// Quantization state (None when quantization is off — the f32 brute-force default).
     quant: Option<Quant>,
+    /// Row-sorted scan order over *all* live docs — `(row, collection, id)` sorted by
+    /// `row` — so a whole-store scan reaches the data matrix in storage order without
+    /// re-sorting on every query (nidus-dxt). Built lazily on the first whole-store
+    /// `search`/`list` after a write and reused until the next write invalidates it
+    /// (`None` = stale). Subset-only workloads never build it, so they pay nothing.
+    /// Behind a `RwLock` because searches take `&self` and may run concurrently
+    /// (the store is shared as `Arc<RwLock<Nidus>>`); writers hold `&mut self` and
+    /// invalidate via `get_mut` (no lock contention). The duplicated id/collection
+    /// strings cost ~one extra copy of the key set in RAM while the cache is live.
+    scan_order: std::sync::RwLock<Option<ScanOrder>>,
 }
 
 impl Store {
@@ -392,6 +406,7 @@ impl Store {
             collections,
             dead_rows,
             quant,
+            scan_order: std::sync::RwLock::new(None),
         };
 
         // 6. Auto-compact if the dead-row ratio exceeds the threshold.
@@ -437,6 +452,7 @@ impl Store {
             collections: HashMap::new(),
             dead_rows: 0,
             quant,
+            scan_order: std::sync::RwLock::new(None),
             config,
         })
     }
@@ -566,6 +582,8 @@ impl Store {
                 collection: name.to_string(),
             })?;
             self.maybe_sync()?;
+            // The collection's docs left the scan order — drop the cache.
+            self.invalidate_scan_order();
         }
         Ok(())
     }
@@ -765,6 +783,8 @@ impl Store {
 
         // Quantize only the rows this batch appended (O(batch)); refits lazily.
         self.extend_quant(data_mark);
+        // The doc set changed — drop the cached scan order (rebuilt on next query).
+        self.invalidate_scan_order();
         Ok(count)
     }
 
@@ -801,6 +821,8 @@ impl Store {
 
         if count > 0 {
             self.maybe_sync()?;
+            // Docs were removed — drop the cached scan order.
+            self.invalidate_scan_order();
         }
 
         Ok(count)
@@ -862,47 +884,28 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<Hit>> {
-        let mut scan: Vec<(u64, &str, &str)> = Vec::new();
-        let scan_cap: usize = collections
-            .iter()
-            .filter_map(|c| self.collections.get(*c))
-            .map(|c| c.docs.len())
-            .sum();
-        scan.try_reserve(scan_cap)
-            .map_err(|_| oom("list scan buffer", scan_cap))?;
-        for &col_name in collections {
-            let Some(col) = self.collections.get(col_name) else {
-                continue;
-            };
-            for (id, entry) in &col.docs {
-                if !filter::matches(filter, &entry.attrs) {
-                    continue;
-                }
-                scan.push((entry.row, col_name, id.as_str()));
-            }
-        }
-        scan.sort_unstable_by_key(|&(row, _, _)| row);
-
-        let results = scan
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(_, collection, id)| {
-                let attrs = self
-                    .collections
-                    .get(collection)
-                    .and_then(|c| c.docs.get(id))
-                    .map(|e| e.attrs.clone())
-                    .unwrap_or_default();
-                Hit {
-                    collection: collection.to_string(),
-                    id: id.to_string(),
-                    score: 0.0,
-                    attrs,
-                }
-            })
-            .collect();
-        Ok(results)
+        self.with_sorted_scan(collections, filter, |scan| {
+            let results = scan
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .map(|&(_, collection, id)| {
+                    let attrs = self
+                        .collections
+                        .get(collection)
+                        .and_then(|c| c.docs.get(id))
+                        .map(|e| e.attrs.clone())
+                        .unwrap_or_default();
+                    Hit {
+                        collection: collection.to_string(),
+                        id: id.to_string(),
+                        score: 0.0,
+                        attrs,
+                    }
+                })
+                .collect();
+            Ok(results)
+        })
     }
 
     /// How many worker threads to split a scan of `scan_len` candidates across: the
@@ -915,6 +918,128 @@ impl Store {
             threads
         } else {
             1
+        }
+    }
+
+    /// Total live docs across all collections — the scan-order cache's length and the
+    /// yardstick for "does this scope cover the whole store?" (`scan_cap == live count`).
+    fn live_doc_count(&self) -> usize {
+        self.collections.values().map(|c| c.docs.len()).sum()
+    }
+
+    /// Drop the cached scan order. Called from every write that changes the doc set
+    /// (`upsert`, `delete`, `drop_collection`, `compact`); `&mut self`, so it takes the
+    /// lock uncontended via `get_mut` and clears even a poisoned lock.
+    fn invalidate_scan_order(&mut self) {
+        *self.scan_order.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// A read guard over the cached row-sorted scan order, rebuilding it first if stale.
+    /// The returned guard always holds `Some`. Double-checked under the write lock so
+    /// concurrent searchers rebuild at most once. Fallible only on the rebuild's
+    /// `try_reserve` (OOM) — the per-entry `String` clones share the codebase's
+    /// no-`try_reserve`-for-clones caveat (small next to the vector matrix).
+    fn scan_order(&self) -> Result<std::sync::RwLockReadGuard<'_, Option<ScanOrder>>> {
+        // Fast path: already built and current.
+        {
+            let guard = self.scan_order.read().unwrap_or_else(|e| e.into_inner());
+            if guard.is_some() {
+                return Ok(guard);
+            }
+        }
+        // Rebuild under the write lock; another searcher may have raced us (re-check).
+        {
+            let mut w = self.scan_order.write().unwrap_or_else(|e| e.into_inner());
+            if w.is_none() {
+                let n = self.live_doc_count();
+                let mut order: ScanOrder = Vec::new();
+                order
+                    .try_reserve_exact(n)
+                    .map_err(|_| oom("scan-order cache", n))?;
+                for (col_name, col) in &self.collections {
+                    for (id, entry) in &col.docs {
+                        order.push((entry.row, col_name.clone(), id.clone()));
+                    }
+                }
+                order.sort_unstable_by_key(|&(row, _, _)| row);
+                *w = Some(order);
+            }
+        }
+        Ok(self.scan_order.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Build the in-scope, filter-passing scan **in row order** and hand it to `f`.
+    /// This is the single place row-sorted access is established for `search` and
+    /// `list`, so both reach the data matrix storage-ordered (nidus-33k) — and skip the
+    /// per-query sort when they can (nidus-dxt).
+    ///
+    /// Two ways there. When the scope covers every live doc (`scan_cap == live count` —
+    /// the single-collection store and `Scope::All`, the common cases), the scan is
+    /// drawn from the lazily-cached global order, so the sort is amortized across all
+    /// queries between writes rather than redone each time. Otherwise (a strict subset)
+    /// it falls back to iterating just the in-scope collections and sorting that smaller
+    /// scan — which is cheaper than walking the whole-store cache to extract a small
+    /// slice. Either way `f` receives an already row-sorted `&mut` scan.
+    fn with_sorted_scan<R>(
+        &self,
+        collections: &[&str],
+        filter: &Filter,
+        f: impl for<'b> FnOnce(&mut [(u64, &'b str, &'b str)]) -> Result<R>,
+    ) -> Result<R> {
+        let scan_cap: usize = collections
+            .iter()
+            .filter_map(|c| self.collections.get(*c))
+            .map(|c| c.docs.len())
+            .sum();
+        let mut scan: Vec<(u64, &str, &str)> = Vec::new();
+        scan.try_reserve(scan_cap)
+            .map_err(|_| oom("search scan buffer", scan_cap))?;
+
+        if scan_cap == self.live_doc_count() {
+            // Whole-store scope: draw from the cached row-sorted order (no per-query
+            // sort). The cache covers every live doc, so every entry is in scope.
+            let guard = self.scan_order()?;
+            let order = guard
+                .as_ref()
+                .expect("scan_order() guarantees Some on success");
+            let match_all = filter.0.is_empty();
+            for (row, col, id) in order {
+                if !match_all {
+                    // Non-empty filter needs the attrs; look the live entry up (cheaper
+                    // than a sort at scale, and skipped entirely for the common
+                    // empty-filter search).
+                    let Some(attrs) = self
+                        .collections
+                        .get(col)
+                        .and_then(|c| c.docs.get(id))
+                        .map(|e| &e.attrs)
+                    else {
+                        continue;
+                    };
+                    if !filter::matches(filter, attrs) {
+                        continue;
+                    }
+                }
+                scan.push((*row, col.as_str(), id.as_str()));
+            }
+            // `scan` inherits the cache's row order — already sorted, no sort call.
+            f(&mut scan)
+        } else {
+            // Strict subset: iterate only the in-scope collections, then sort that
+            // (smaller) scan.
+            for &col_name in collections {
+                let Some(col) = self.collections.get(col_name) else {
+                    continue;
+                };
+                for (id, entry) in &col.docs {
+                    if !filter::matches(filter, &entry.attrs) {
+                        continue;
+                    }
+                    scan.push((entry.row, col_name, id.as_str()));
+                }
+            }
+            scan.sort_unstable_by_key(|&(row, _, _)| row);
+            f(&mut scan)
         }
     }
 
@@ -940,76 +1065,59 @@ impl Store {
             Distance::Euclidean => euclidean_neg_sq,
         };
 
-        // Gather the in-scope, filter-passing rows. Sorting by physical row (for
-        // cache-friendly sequential access) is deferred to the scoring step below —
-        // globally on the serial path, per-chunk on the parallel one.
-        let mut scan: Vec<(u64, &str, &str)> = Vec::new();
-        let scan_cap: usize = collections
-            .iter()
-            .filter_map(|c| self.collections.get(*c))
-            .map(|c| c.docs.len())
-            .sum();
-        scan.try_reserve(scan_cap)
-            .map_err(|_| oom("search scan buffer", scan_cap))?;
-        for &col_name in collections {
-            let Some(col) = self.collections.get(col_name) else {
-                continue;
+        // Gather the in-scope, filter-passing rows in physical-row order (for
+        // cache-friendly sequential `data` access — nidus-33k). `with_sorted_scan`
+        // hands back an already row-sorted scan, reusing the cached whole-store order
+        // where it can so the sort is not redone every query (nidus-dxt).
+        self.with_sorted_scan(collections, &opts.filter, |scan| {
+            // Decide once whether this query splits across workers (configured threads +
+            // enough scan work to amortize spawn cost). On the parallel path each worker
+            // re-sorts its own (already-ordered) chunk; the serial path scores in place,
+            // so the global sort never caps speedup (Amdahl).
+            let workers = self.parallel_workers(scan.len());
+
+            // Two-pass quantized search if enabled and the quantized matrix is populated.
+            match self.quant {
+                Some(Quant::Int8(ref s)) if !s.vectors.is_empty() && self.data.dimension() > 0 => {
+                    return self.search_int8(&q, scan, opts, s, score_fn, workers);
+                }
+                Some(Quant::Binary(ref s)) if !s.words.is_empty() && self.data.dimension() > 0 => {
+                    return self.search_binary(&q, scan, opts, s, score_fn, workers);
+                }
+                _ => {}
+            }
+
+            // Standard f32 brute-force path. Split across worker threads when engaged;
+            // otherwise score serially. Both yield the same bounded top-k (ties aside).
+            let topk = if workers > 1 {
+                parallel_topk(scan, workers, opts.top_k, |chunk| {
+                    score_chunk(&self.data, chunk, &q, score_fn, opts.top_k, opts.min_score)
+                })?
+            } else {
+                score_chunk(&self.data, scan, &q, score_fn, opts.top_k, opts.min_score)
             };
-            for (id, entry) in &col.docs {
-                if !filter::matches(&opts.filter, &entry.attrs) {
-                    continue;
-                }
-                scan.push((entry.row, col_name, id.as_str()));
-            }
-        }
-        // Decide once whether this query splits across workers (configured threads +
-        // enough scan work to amortize spawn cost). The global row-sort is deferred:
-        // the serial path sorts the whole scan; the parallel path lets each worker sort
-        // its own chunk (see `parallel_topk`), so the sort never caps speedup (Amdahl).
-        let workers = self.parallel_workers(scan.len());
 
-        // Two-pass quantized search if enabled and the quantized matrix is populated.
-        match self.quant {
-            Some(Quant::Int8(ref s)) if !s.vectors.is_empty() && self.data.dimension() > 0 => {
-                return self.search_int8(&q, &mut scan, opts, s, score_fn, workers);
-            }
-            Some(Quant::Binary(ref s)) if !s.words.is_empty() && self.data.dimension() > 0 => {
-                return self.search_binary(&q, &mut scan, opts, s, score_fn, workers);
-            }
-            _ => {}
-        }
+            let results = topk
+                .into_sorted_desc()
+                .into_iter()
+                .map(|(score, (collection, id))| {
+                    let attrs = self
+                        .collections
+                        .get(collection)
+                        .and_then(|c| c.docs.get(id))
+                        .map(|e| e.attrs.clone())
+                        .unwrap_or_default();
+                    Hit {
+                        collection: collection.to_string(),
+                        id: id.to_string(),
+                        score,
+                        attrs,
+                    }
+                })
+                .collect();
 
-        // Standard f32 brute-force path. Split across worker threads when engaged;
-        // otherwise score serially. Both yield the same bounded top-k (ties aside).
-        let topk = if workers > 1 {
-            parallel_topk(&mut scan, workers, opts.top_k, |chunk| {
-                score_chunk(&self.data, chunk, &q, score_fn, opts.top_k, opts.min_score)
-            })?
-        } else {
-            scan.sort_unstable_by_key(|&(row, _, _)| row);
-            score_chunk(&self.data, &scan, &q, score_fn, opts.top_k, opts.min_score)
-        };
-
-        let results = topk
-            .into_sorted_desc()
-            .into_iter()
-            .map(|(score, (collection, id))| {
-                let attrs = self
-                    .collections
-                    .get(collection)
-                    .and_then(|c| c.docs.get(id))
-                    .map(|e| e.attrs.clone())
-                    .unwrap_or_default();
-                Hit {
-                    collection: collection.to_string(),
-                    id: id.to_string(),
-                    score,
-                    attrs,
-                }
-            })
-            .collect();
-
-        Ok(results)
+            Ok(results)
+        })
     }
 
     /// The configured overscan factor (the first pass keeps `top_k × rescore`
@@ -1049,7 +1157,7 @@ impl Store {
                 score_chunk_i8(&s.vectors, dim, chunk, &q_i8, is_euclidean, overscan)
             })?
         } else {
-            scan.sort_unstable_by_key(|&(row, _, _)| row);
+            // `scan` arrives row-sorted from `with_sorted_scan` — score it in place.
             score_chunk_i8(&s.vectors, dim, scan, &q_i8, is_euclidean, overscan)
         };
 
@@ -1084,7 +1192,7 @@ impl Store {
                 score_chunk_bin(&s.words, wpr, chunk, &q_words, overscan)
             })?
         } else {
-            scan.sort_unstable_by_key(|&(row, _, _)| row);
+            // `scan` arrives row-sorted from `with_sorted_scan` — score it in place.
             score_chunk_bin(&s.words, wpr, scan, &q_words, overscan)
         };
 
@@ -1229,6 +1337,9 @@ impl Store {
 
         // 5. Rebuild quantization state with compacted vectors.
         self.rebuild_quant();
+
+        // 6. Rows were renumbered — drop the cached scan order.
+        self.invalidate_scan_order();
 
         Ok(())
     }
@@ -1757,6 +1868,7 @@ mod tests {
             collections: HashMap::new(),
             dead_rows: 0,
             quant: None,
+            scan_order: std::sync::RwLock::new(None),
         };
         store.create_collection("col").unwrap();
         store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
@@ -2316,6 +2428,183 @@ mod tests {
         store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
         let hits = store.list(&["col"], &Filter::default(), 5, 10).unwrap();
         assert!(hits.is_empty());
+    }
+
+    // ── scan-order cache (nidus-dxt) ─────────────────────────────────────
+    //
+    // The whole-store fast path caches a row-sorted scan across queries; these pin
+    // that it stays consistent with the doc set — i.e. every write that changes the
+    // docs invalidates it, so a search after a write never reads a stale order.
+
+    #[test]
+    fn scan_cache_reflects_upsert_between_searches() {
+        let mut store = Store::in_memory(3).unwrap();
+        store.create_collection("col").unwrap();
+        store
+            .upsert("col", &[rec("doc1", vec![1.0, 0.0, 0.0])])
+            .unwrap();
+        // First search builds the cache.
+        let hits = store
+            .search(&["col"], &[0.0, 1.0, 0.0], &default_opts(5))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        // A new doc lands on a fresh row — the cache must pick it up next query.
+        store
+            .upsert("col", &[rec("doc2", vec![0.0, 1.0, 0.0])])
+            .unwrap();
+        let hits = store
+            .search(&["col"], &[0.0, 1.0, 0.0], &default_opts(5))
+            .unwrap();
+        assert_eq!(hits.len(), 2, "second search must see the upserted doc");
+        assert_eq!(hits[0].id, "doc2", "new doc is the nearest to the query");
+    }
+
+    #[test]
+    fn scan_cache_reflects_delete_between_searches() {
+        let mut store = Store::in_memory(3).unwrap();
+        store.create_collection("col").unwrap();
+        store
+            .upsert(
+                "col",
+                &[
+                    rec("doc1", vec![1.0, 0.0, 0.0]),
+                    rec("doc2", vec![0.0, 1.0, 0.0]),
+                ],
+            )
+            .unwrap();
+        // Build the cache.
+        assert_eq!(
+            store
+                .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(5))
+                .unwrap()
+                .len(),
+            2
+        );
+        // Delete and re-search: a stale cache would still rank the dead row.
+        store.delete("col", &["doc1"]).unwrap();
+        let hits = store
+            .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(5))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "doc2");
+    }
+
+    #[test]
+    fn scan_cache_overwrite_uses_new_vector() {
+        let mut store = Store::in_memory(3).unwrap();
+        store.create_collection("col").unwrap();
+        store
+            .upsert("col", &[rec("doc1", vec![1.0, 0.0, 0.0])])
+            .unwrap();
+        // Build the cache against the original row.
+        store
+            .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(5))
+            .unwrap();
+        // Overwrite doc1 — old row goes dead, new row is appended.
+        store
+            .upsert("col", &[rec("doc1", vec![0.0, 1.0, 0.0])])
+            .unwrap();
+        let hits = store
+            .search(&["col"], &[0.0, 1.0, 0.0], &default_opts(5))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            (hits[0].score - 1.0).abs() < 1e-6,
+            "search must score the overwritten vector, not the dead row"
+        );
+    }
+
+    #[test]
+    fn scan_cache_survives_compact() {
+        let mut store = Store::in_memory(3).unwrap();
+        store.create_collection("col").unwrap();
+        store
+            .upsert(
+                "col",
+                &[
+                    rec("a", vec![1.0, 0.0, 0.0]),
+                    rec("b", vec![0.0, 1.0, 0.0]),
+                    rec("c", vec![0.0, 0.0, 1.0]),
+                ],
+            )
+            .unwrap();
+        store.delete("col", &["b"]).unwrap();
+        // Build the cache while a dead row exists.
+        store
+            .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(5))
+            .unwrap();
+        // Compaction renumbers every live row — the cache must be rebuilt against them.
+        store.compact().unwrap();
+        let hits = store
+            .search(&["col"], &[0.0, 0.0, 1.0], &default_opts(5))
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "c");
+    }
+
+    #[test]
+    fn scan_cache_whole_store_filter_matches_subset_path() {
+        // The whole-store cache path filters via a per-entry attr lookup; the subset
+        // path filters inline. Both must agree. Build one collection with attrs and
+        // compare a filtered whole-store search against the same filter via subset.
+        let mut store = Store::in_memory(3).unwrap();
+        store.create_collection("col").unwrap();
+        let tag = |t: &str| {
+            let mut m = BTreeMap::new();
+            m.insert("tag".to_string(), Value::Str(t.to_string()));
+            m
+        };
+        store
+            .upsert(
+                "col",
+                &[
+                    rec_with("a", vec![1.0, 0.0, 0.0], tag("keep")),
+                    rec_with("b", vec![0.9, 0.1, 0.0], tag("drop")),
+                    rec_with("c", vec![0.8, 0.2, 0.0], tag("keep")),
+                ],
+            )
+            .unwrap();
+        let opts = SearchOpts {
+            top_k: 5,
+            filter: Filter(vec![Predicate::Eq(
+                "tag".to_string(),
+                Value::Str("keep".to_string()),
+            )]),
+            min_score: None,
+        };
+        let hits = store.search(&["col"], &[1.0, 0.0, 0.0], &opts).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c"], "filter must keep only tagged docs");
+    }
+
+    #[test]
+    fn scan_cache_subset_scope_excludes_other_collections() {
+        // A strict subset scope takes the direct (non-cache) path; it must not leak
+        // docs from out-of-scope collections, and the cache (built by a prior whole-
+        // store search) must not interfere.
+        let mut store = Store::in_memory(3).unwrap();
+        store.create_collection("a").unwrap();
+        store.create_collection("b").unwrap();
+        store
+            .upsert("a", &[rec("a1", vec![1.0, 0.0, 0.0])])
+            .unwrap();
+        store
+            .upsert("b", &[rec("b1", vec![0.0, 1.0, 0.0])])
+            .unwrap();
+        // Whole-store search builds the global cache.
+        assert_eq!(
+            store
+                .search(&["a", "b"], &[1.0, 0.0, 0.0], &default_opts(5))
+                .unwrap()
+                .len(),
+            2
+        );
+        // Subset search must see only collection "a".
+        let hits = store
+            .search(&["a"], &[1.0, 0.0, 0.0], &default_opts(5))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "a1");
     }
 
     // ── int8 scalar quantization tests ───────────────────────────────────

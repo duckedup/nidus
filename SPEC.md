@@ -508,6 +508,16 @@ build until a real need exists.
   Amdahl tax). Both the exact f32 scan **and** the int8 first pass parallelize. The f32
   scan is bandwidth-bound (sublinear gain past a few cores); the int8 first pass is
   compute-bound and scales better. See §6.5.
+- **Cached scan order.** A whole-store search/`list` scans every live doc in physical-row
+  order for prefetcher-friendly `data` access (the nidus-33k win), which means a
+  `(row, collection, id)` scan sorted by row. That order only changes on a write, so it
+  is cached in RAM (`RwLock<Option<…>>`) and reused across the many queries between
+  writes instead of being re-sorted every query — a ~27% serial-search win at n=100k,
+  dim=768 (the sort was ~2.16 ms of a ~8 ms query). Built lazily on the first whole-store
+  query after a write (subset-only scopes keep the direct iterate-and-sort path, so they
+  never build it), and invalidated by `upsert`/`delete`/`drop_collection`/`compact`. No
+  API or format change; in-RAM only. The int8/binary serial first passes drop their own
+  per-query sort too. The parallel path is unchanged (it sorts per-chunk, §6.5).
 - **Scalar (int8) quantization.** `Config::quantization` maintains an in-RAM int8
   matrix mirroring the f32 rows one-for-one and runs a two-pass search: an int8
   first-pass — monotonic with the f32 score under a single shared symmetric scale, so
