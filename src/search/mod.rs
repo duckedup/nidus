@@ -208,6 +208,62 @@ pub fn euclidean_neg_sq_i8(a: &[i8], b: &[i8]) -> i32 {
     -sum
 }
 
+// ── binary (sign-bit) quantization helpers ─────────────────────────────────────
+
+/// Pack the **sign bits** of `v` into `u64` words: bit `i` is set iff `v[i] >= 0.0`.
+/// The last word is zero-padded for indices past `v.len()`, so packed vectors of equal
+/// dimension always have equal word length and the padding never affects a later XOR.
+///
+/// This is the binary (SimHash) code for *angular* similarity: the sign pattern of a
+/// vector is invariant to the positive scaling that unit-normalization applies, so the
+/// code of a normalized vector equals the code of its raw form. `+0.0` and `-0.0` both
+/// pack as a set bit (`-0.0 >= 0.0` is true), keeping the rule total and deterministic.
+pub fn pack_signs(v: &[f32]) -> Vec<u64> {
+    let mut out = vec![0u64; v.len().div_ceil(64)];
+    pack_signs_into(v, &mut out);
+    out
+}
+
+/// Pack the sign bits of `v` into the pre-sized word slice `out` (length
+/// `v.len().div_ceil(64)`), zeroing it first. The store's row-major matrix packer
+/// writes each row's code into its slice of one big `Vec<u64>` with this — no per-row
+/// allocation. See [`pack_signs`] for the sign rule and padding contract.
+pub fn pack_signs_into(v: &[f32], out: &mut [u64]) {
+    out.iter_mut().for_each(|w| *w = 0);
+    for (i, &x) in v.iter().enumerate() {
+        if x >= 0.0 {
+            out[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+}
+
+/// Hamming distance between two equal-length packed bit vectors: the number of
+/// differing bits, `Σ (aᵢ ^ bᵢ).count_ones()`. Pure integer (a `POPCNT` reduction),
+/// so it runs under Miri and needs no FFI. Kept in [`DOT_LANES`] independent lanes for
+/// the same instruction-level-parallelism reason as [`dot`].
+///
+/// The binary first-pass proxy: fewer differing sign bits ⇒ smaller angle between the
+/// vectors ⇒ higher cosine similarity. Callers negate it so "higher is better" holds.
+pub fn hamming(a: &[u64], b: &[u64]) -> u32 {
+    debug_assert_eq!(a.len(), b.len(), "hamming: word lengths must be equal");
+
+    let mut acc = [0u32; DOT_LANES];
+    let mut a_chunks = a.chunks_exact(DOT_LANES);
+    let mut b_chunks = b.chunks_exact(DOT_LANES);
+
+    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        for lane in 0..DOT_LANES {
+            acc[lane] += (ca[lane] ^ cb[lane]).count_ones();
+        }
+    }
+
+    let mut sum: u32 = acc.iter().sum();
+    for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        sum += (x ^ y).count_ones();
+    }
+    sum
+}
+
 // ── Internal total-order wrapper for f32 scores ──────────────────────────────
 //
 // `BinaryHeap` requires `Ord`. Since `f32` is not `Ord` (NaN), we wrap the
@@ -813,5 +869,110 @@ mod tests {
         let a = [10i8, 0];
         let b = [0i8, -10];
         assert_eq!(euclidean_neg_sq_i8(&a, &b), -(100 + 100));
+    }
+
+    // ── binary (sign-bit) quantization helpers ───────────────────────────
+
+    #[test]
+    fn pack_signs_bit_positions() {
+        // Positive (and zero) → set bit; negative → clear bit. Bit i lands at word i/64,
+        // offset i%64.
+        let v = [1.0f32, -1.0, 0.0, -0.5, 2.0];
+        let w = pack_signs(&v);
+        assert_eq!(w.len(), 1);
+        // set: idx 0 (1.0), 2 (0.0), 4 (2.0); clear: 1 (-1.0), 3 (-0.5).
+        assert_eq!(w[0], 0b10101);
+    }
+
+    #[test]
+    fn pack_signs_neg_zero_is_set() {
+        // -0.0 >= 0.0 is true in IEEE-754, so it packs as a set bit (deterministic rule).
+        assert_eq!(pack_signs(&[-0.0f32])[0] & 1, 1);
+    }
+
+    #[test]
+    fn pack_signs_word_length_and_tail_padding() {
+        // 65 components → 2 words; the high word holds exactly one live bit, the rest 0.
+        let mut v = vec![-1.0f32; 65];
+        v[64] = 1.0; // only the 65th (index 64) is positive
+        let w = pack_signs(&v);
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0], 0, "indices 0..63 all negative");
+        assert_eq!(w[1], 1, "index 64 → bit 0 of word 1; padding bits stay 0");
+    }
+
+    #[test]
+    fn pack_signs_invariant_to_positive_scaling() {
+        // Unit-normalization is positive scaling, so sign codes must be unaffected.
+        let v = [3.0f32, -2.0, 0.1, -7.0, 4.0];
+        let scaled: Vec<f32> = v.iter().map(|x| x * 0.137).collect();
+        assert_eq!(pack_signs(&v), pack_signs(&scaled));
+    }
+
+    #[test]
+    fn hamming_identical_is_zero() {
+        let a = pack_signs(&[1.0f32, -1.0, 1.0, 1.0]);
+        assert_eq!(hamming(&a, &a), 0);
+    }
+
+    #[test]
+    fn hamming_all_bits_differ() {
+        // Opposite sign patterns differ in every one of the `dim` live bits.
+        let a = pack_signs(&[1.0f32; 100]);
+        let b = pack_signs(&[-1.0f32; 100]);
+        assert_eq!(
+            hamming(&a, &b),
+            100,
+            "padding bits (100..128) match → not counted"
+        );
+    }
+
+    #[test]
+    fn hamming_known_value() {
+        let a: [u64; 1] = [0b1011];
+        let b: [u64; 1] = [0b0110];
+        // XOR = 0b1101 → 3 set bits.
+        assert_eq!(hamming(&a, &b), 3);
+    }
+
+    #[test]
+    fn hamming_empty() {
+        assert_eq!(hamming(&[], &[]), 0);
+    }
+
+    /// Naive reference the lane-folded `hamming` must match exactly (integer, so no
+    /// rounding slack — must be bit-for-bit equal across all word-length residues).
+    fn hamming_naive(a: &[u64], b: &[u64]) -> u32 {
+        a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
+    }
+
+    #[test]
+    fn hamming_matches_naive_across_lengths() {
+        // Cover residues around the LANES=8 chunk boundary, incl. pure-remainder lengths.
+        for words in [0usize, 1, 3, 7, 8, 9, 15, 16, 17, 31, 33, 64, 100] {
+            let a: Vec<u64> = (0..words as u64)
+                .map(|i| i.wrapping_mul(0x9E37_79B9))
+                .collect();
+            let b: Vec<u64> = (0..words as u64)
+                .map(|i| i.wrapping_mul(0xC2B2_AE35) ^ 0xFF)
+                .collect();
+            assert_eq!(
+                hamming(&a, &b),
+                hamming_naive(&a, &b),
+                "words={words}: lane-folded hamming must equal naive"
+            );
+        }
+    }
+
+    #[test]
+    fn hamming_ranks_angular_similarity() {
+        // A binary first pass must rank a near-aligned vector above an opposed one.
+        let q = pack_signs(&[1.0f32, 1.0, 1.0, 1.0]);
+        let near = pack_signs(&[1.0f32, 1.0, 1.0, -1.0]); // 1 sign flip
+        let far = pack_signs(&[-1.0f32, -1.0, -1.0, -1.0]); // all flipped
+        assert!(
+            hamming(&q, &near) < hamming(&q, &far),
+            "fewer differing sign bits ⇒ more similar"
+        );
     }
 }

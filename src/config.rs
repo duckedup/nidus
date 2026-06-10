@@ -53,9 +53,11 @@ pub struct Config {
     /// `try_reserve` never fires. Counts physical rows incl. not-yet-compacted dead
     /// rows, so `compact` can reclaim headroom.
     pub max_vector_bytes: Option<u64>,
-    /// int8 scalar quantization for faster search. `None` disables (the default).
-    /// When enabled, the store maintains an in-memory int8 vector matrix and uses
-    /// a two-pass search: int8 first-pass → f32 rerank.
+    /// Vector quantization for faster search. `None` disables (the default). When
+    /// enabled, the store maintains an in-memory quantized matrix and uses a two-pass
+    /// search: a cheap first pass selects candidates, then an f32 rerank restores exact
+    /// scores. [`Quantization::int8`] (4× smaller, any metric) or
+    /// [`Quantization::binary`] (32× smaller, Hamming first pass, **cosine only**).
     pub quantization: Option<Quantization>,
     /// Worker threads for a single search. Default `1` (single-threaded, no behavior
     /// change). When `> 1`, a large scan is split across this many `std::thread::scope`
@@ -120,7 +122,7 @@ impl Config {
         self
     }
 
-    /// Enable int8 scalar quantization for faster search.
+    /// Enable vector quantization for faster search (int8 or binary; `None` disables).
     pub fn quantization(mut self, q: Option<Quantization>) -> Self {
         self.quantization = q;
         self

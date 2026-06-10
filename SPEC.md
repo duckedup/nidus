@@ -24,12 +24,11 @@ not the functionality test, the **build-and-ship** test:
   source tree and compiles it from scratch via `cc`**. Costs: multi-minute cold
   builds, a required C++ toolchain, awkward cross-compilation, a bloated binary,
   and FFI that **cannot run under Miri**. A typical vector workload uses ~1% of
-  DuckDB: one table, brute-force `array_cosine_distance ... ORDER BY ... LIMIT k`,
-  and equality/GLOB filters.
+  DuckDB: one table, a brute-force cosine top-k, and equality/GLOB filters.
 - **LanceDB** is "written in Rust" yet still compiles for ~10 minutes, because it
   drags in **arrow-rs + DataFusion (a full SQL engine) + the Lance columnar format
-  + object_store**. Hundreds of crates and a query engine, to do `ORDER BY distance
-  LIMIT k`. Same disease as DuckDB, transitively-Rust instead of FFI.
+  + object_store**. Hundreds of crates and a query engine, to do a distance-ranked
+  top-k. Same disease as DuckDB, transitively-Rust instead of FFI.
 
 The workload is a **vector store, not a database**: no joins, no SQL, no analytics,
 no larger-than-RAM scans (at the target scale). nidus is that store and nothing
@@ -73,7 +72,8 @@ Pulling in a crate that compiles C, links native code, or adds an `unsafe` block
   whole-store search makes the scanned `N` potentially large, which strengthens the
   case for this seam later; it does not change v0.1's exact-scan approach.
 - Larger-than-RAM / memory-mapped operation — deferred seam (§9).
-- Quantization (int8/binary) — deferred seam (§9).
+- Quantization — int8 scalar and binary (sign-bit) quantization have since shipped
+  (§9, opt-in via `Config::quantization`).
 - SQL, a query planner, transactions spanning multiple operations, multi-writer
   concurrency, networking, or replication.
 
@@ -227,7 +227,7 @@ impl Config {
 - `OpenMode::ReadOnly` opens **without** taking the writer lock and rejects
   mutations — the basis for many concurrent search-only processes over a store
   another process writes (the lock-free snapshot model, §6.2), and the foundation
-  for a future search server (§9).
+  for the search server (§9, shipped as `nidus serve` behind the `cli` feature).
 - Defaults are chosen so `Config::new(path, dim)` "just works" for the embedded
   single-writer case; every field is overridable for callers (or a server) that
   need different durability/lock/compaction behavior.
@@ -370,10 +370,13 @@ come from elsewhere, in order:
 
 - **`&self` reads ⇒ concurrent searchers.** `Arc<RwLock<Nidus>>` gives many parallel
   searches with one exclusive writer (`Arc<Mutex<…>>` if simplicity is preferred).
-- **Parallel scan (deferred seam, §9).** `search(&self)` may fan the row scan across
-  cores with `std::thread::scope` (**zero-dep**) into per-thread top-k heaps, then
-  merge — no API or format change. The flat, aligned `f32` matrix is laid out for
-  this and for autovectorized dot products.
+- **Parallel scan (shipped, §9).** `search(&self)` fans the row scan across cores
+  with `std::thread::scope` (**zero-dep std, no rayon**) into per-thread top-k heaps,
+  then merges — no API or format change. Opt-in via `Config::query_threads` (default
+  `1`, serial); a dim-aware work floor keeps small scans serial so thread spawn/join
+  never dominates. The flat, aligned `f32` matrix is laid out for this and for
+  autovectorized dot products. Leave it at `1` when query-level concurrency already
+  saturates the cores (many readers under `Arc<RwLock<Nidus>>`).
 - **Async callers** bridge with `spawn_blocking` (their runtime, their choice). The
   core never exposes `async fn`.
 
@@ -486,10 +489,52 @@ Full reindexes churn little; incremental indexing needs this to bound growth.
 
 ---
 
-## 9. Deferred seams (designed-for, not built)
+## 9. Seams: shipped and still-deferred
 
-Each is purely additive over the format above. Do **not** build until a real need
-exists; when built, none changes the on-disk byte layout.
+Every seam here is purely additive over the format in §5 — **none changed the on-disk
+byte layout.** Several were designed-for here and have since been built; the design
+rationale is kept so the choices stay legible. The rest stay deferred: do **not**
+build until a real need exists.
+
+### Shipped (was a deferred seam)
+
+- **Parallel scan.** `search(&self)` fans the row scan across `Config::query_threads`
+  workers via `std::thread::scope` (zero-dep std — no rayon, no added dependency) into
+  per-worker bounded top-k heaps, merged at the end. No API or format change. Opt-in:
+  `query_threads` defaults to `1` (serial, zero behavior change), and a dim-aware work
+  floor (`rows × dim` below a threshold) keeps small scans serial so spawn/join cost
+  never dominates. Each worker sorts its own chunk by physical row, so per-chunk access
+  stays prefetcher-friendly and the global sort is skipped on the parallel path (no
+  Amdahl tax). Both the exact f32 scan **and** the int8 first pass parallelize. The f32
+  scan is bandwidth-bound (sublinear gain past a few cores); the int8 first pass is
+  compute-bound and scales better. See §6.5.
+- **Scalar (int8) quantization.** `Config::quantization` maintains an in-RAM int8
+  matrix mirroring the f32 rows one-for-one and runs a two-pass search: an int8
+  first-pass — monotonic with the f32 score under a single shared symmetric scale, so
+  it picks the right candidate set — selects an overscanned candidate set (`top_k ×
+  rescore`), then f32 reranks those for exact scores. ~4× less memory traffic on the
+  first pass. The scale refits geometrically on growth so incremental upsert stays
+  amortized O(1)/row. Affects only the in-RAM matrix + the scoring kernel, never the
+  `data` segment on disk. The scheme is selected by `Quantization::int8()` (the default).
+- **Binary (sign-bit) quantization.** `Quantization::binary()` maintains an in-RAM
+  packed-bit matrix (`dim/8` bytes/row, ~32× smaller than f32, 8× smaller than int8) and
+  runs the same two-pass shape with a Hamming-distance first pass (`u64::count_ones` —
+  pure Rust, autovectorizes, Miri-clean, no new deps), then an exact f32 rerank. **Cosine
+  only:** sign codes are an angular (SimHash) proxy that discards magnitude, so binary is
+  rejected at `open()` for dot-product/Euclidean. Scale-free (a row's code is just its
+  signs), so incremental upsert is plain append — no scale, no refit. Parallelizes harder
+  than int8 (32× less first-pass traffic). The first pass overscans more (`rescore`
+  defaults to 16 vs int8's 4) to offset the coarser proxy.
+- **Lightweight server.** `nidus serve` (behind the opt-in `cli` feature) wraps a
+  long-lived `Nidus` in a thin axum/tokio HTTP layer — exactly the separate-wrapper
+  shape this seam called for, not a change to nidus core. The enabling pieces were
+  already here: the cross-process lock + lock-free read snapshots (§6.2) and
+  `OpenMode::ReadOnly` (§4.1) let a writer process and one-or-more search servers share
+  one store. The core API stayed operation-centric, with no process-wide assumptions.
+  Its deps (`clap`, `tokio`, `axum`, `tower`, `serde_json` — all pure Rust, zero FFI)
+  compile only under `--features cli`, so `cargo add nidus` stays lean.
+
+### Still deferred (designed-for, not built)
 
 - **mmap.** Replace the single "row `i` → `&[f32]`" accessor: index into a mapped
   region instead of the in-RAM `Vec<f32>`. Gains zero-copy load, cross-process page
@@ -498,17 +543,6 @@ exists; when built, none changes the on-disk byte layout.
 - **ANN index (HNSW/IVF).** Build an in-RAM graph/lists over the same `data` rows;
   `search` consults it instead of scanning. Needed only past brute-force's comfort
   zone (≫ a few million vectors). Keep it pure-Rust and light if added.
-- **Scalar/binary quantization.** Store int8/binary alongside or instead of f32 for
-  4×/32× memory and faster first-pass scans, with an f32 rerank. Affects only the
-  `data` segment encoding + the scoring kernel.
-- **Lightweight server.** The core stays an in-process library, but nothing in the
-  design precludes wrapping a long-lived `Nidus` in a thin server exposing
-  `upsert`/`search`/… over a local socket or HTTP. The pieces already exist: the
-  cross-process lock + lock-free read snapshots (§6.2) and `OpenMode::ReadOnly` (§4.1)
-  let a writer process and one-or-more search servers share one store *today*. A
-  server would be a separate wrapper crate, not a change to nidus core — so the core
-  API stays operation-centric, with no global/process-wide assumptions that would
-  block it.
 
 ---
 

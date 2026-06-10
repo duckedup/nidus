@@ -4,7 +4,10 @@
 
 use std::collections::BTreeMap;
 
-use nidus::{Config, Filter, Nidus, OpenMode, Predicate, Record, Scope, SearchOpts, Value};
+use nidus::{
+    Config, Distance, Filter, Nidus, OpenMode, Predicate, Quantization, Record, Scope, SearchOpts,
+    Value,
+};
 
 fn rec(id: &str, vector: Vec<f32>, kind: &str) -> Record {
     let mut attrs = BTreeMap::new();
@@ -134,6 +137,37 @@ fn file_backed_persistence_and_readonly() {
         db.get_meta("c").get("model").map(String::as_str),
         Some("demo-embed")
     );
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn binary_quantization_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = || {
+        Config::new(dir.path(), 3)
+            .distance(Distance::Cosine)
+            .quantization(Some(Quantization::binary()))
+    };
+
+    {
+        let mut db = Nidus::open(cfg()).unwrap();
+        db.create_collection("c").unwrap();
+        db.upsert(
+            "c",
+            &[
+                rec("close", vec![0.9, 0.1, 0.0], "file"),
+                rec("far", vec![-1.0, -0.2, 0.3], "file"),
+            ],
+        )
+        .unwrap();
+    } // writer lock released; in-RAM binary matrix dropped
+
+    // Reopen: the sign-bit matrix is repacked from `data` by rebuild_quant, so the
+    // two-pass binary search still ranks correctly against the persisted vectors.
+    let db = Nidus::open(cfg()).unwrap();
+    let hits = db.search("c", &[1.0, 0.0, 0.0], &opts(2)).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].id, "close");
 }
 
 #[cfg_attr(miri, ignore)]

@@ -12,9 +12,10 @@ use crate::data::DataSegment;
 use crate::filter;
 use crate::lock::WriteLock;
 use crate::log::OpLog;
-use crate::model::{Distance, Filter, Footprint, Hit, Op, Quantization, Record, SearchOpts};
+use crate::model::{Distance, Filter, Footprint, Hit, Op, QuantKind, Record, SearchOpts};
 use crate::search::{
-    QuantParams, TopK, dot, dot_i8, euclidean_neg_sq, euclidean_neg_sq_i8, normalize,
+    QuantParams, TopK, dot, dot_i8, euclidean_neg_sq, euclidean_neg_sq_i8, hamming, normalize,
+    pack_signs, pack_signs_into,
 };
 
 // ── In-RAM types ─────────────────────────────────────────────────────────────
@@ -112,6 +113,32 @@ fn score_chunk_i8<'a>(
     topk
 }
 
+/// Score a chunk against the **binary** (sign-bit) matrix into a bounded top-k of
+/// `overscan` candidates — the binary first-pass unit of parallel work, mirroring
+/// [`score_chunk_i8`]. Score is `-(hamming)` (higher = better), monotone with cosine
+/// rank for unit vectors, so it picks the right candidate set; exact scores come from
+/// the caller's f32 rerank. Carries `row` so the rerank can re-read the f32 vector.
+/// `min_score` is *not* applied here — Hamming is only an ordering proxy.
+fn score_chunk_bin<'a>(
+    words: &[u64],
+    words_per_row: usize,
+    chunk: &[(u64, &'a str, &'a str)],
+    q_words: &[u64],
+    overscan: usize,
+) -> TopK<(u64, &'a str, &'a str)> {
+    let mut topk: TopK<(u64, &'a str, &'a str)> = TopK::new(overscan);
+    for &(row, col_name, id) in chunk {
+        let base = row as usize * words_per_row;
+        let end = base + words_per_row;
+        if end > words.len() {
+            continue;
+        }
+        let approx_score = -(hamming(q_words, &words[base..end]) as f32);
+        topk.offer(approx_score, (row, col_name, id));
+    }
+    topk
+}
+
 /// Split `scan` across `workers` threads, score each chunk with `score_one` into its
 /// own bounded top-k of capacity `cap`, then merge the per-worker results into one.
 /// The shared parallel-scan engine behind both the f32 and int8 first passes.
@@ -165,9 +192,9 @@ where
 
 // ── Store ─────────────────────────────────────────────────────────────────────
 
-/// int8 quantization state, maintained in RAM when `Config::quantization` is set.
-/// `vectors` mirrors the f32 `data` rows one-for-one (same physical row indices).
-struct QuantState {
+/// int8 scalar quantization state. `vectors` mirrors the f32 `data` rows one-for-one
+/// (same physical row indices).
+struct Int8State {
     params: QuantParams,
     /// Quantized vectors, flat and row-major, `data.row_count() * dim` int8 values.
     vectors: Vec<i8>,
@@ -175,7 +202,68 @@ struct QuantState {
     /// current `params` and only refit (rescan for a fresh scale) once the row count
     /// outgrows this by [`REFIT_GROWTH`], keeping incremental upsert amortized O(1)/row.
     params_rows: u64,
-    cfg: Quantization,
+}
+
+/// Binary (sign-bit) quantization state. **Scale-free:** each row's code is just its
+/// sign bits, so there is no scale to fit and no refit — incremental upsert is a plain
+/// append. `words` mirrors the f32 `data` rows one-for-one, `words_per_row` u64 each.
+struct BinState {
+    /// Packed sign-bit codes, flat and row-major, `row_count * words_per_row` u64 values.
+    words: Vec<u64>,
+    /// `dim.div_ceil(64)` — words per row's code.
+    words_per_row: usize,
+}
+
+/// The active quantization scheme's in-RAM state, maintained when `Config::quantization`
+/// is set (`None` when quantization is off — the f32 brute-force default).
+enum Quant {
+    Int8(Int8State),
+    Binary(BinState),
+}
+
+impl Quant {
+    /// An empty quant state for `kind`, validating metric compatibility up front.
+    /// Binary codes are an angular proxy (they ignore magnitude), so they are rejected
+    /// for any metric but cosine — a clear error beats a silently wrong ranking.
+    fn empty(kind: QuantKind, dim: usize, distance: Distance) -> Result<Self> {
+        match kind {
+            QuantKind::Int8 => Ok(Quant::Int8(Int8State {
+                params: QuantParams::from_vectors(&[]),
+                vectors: Vec::new(),
+                params_rows: 0,
+            })),
+            QuantKind::Binary => {
+                if distance != Distance::Cosine {
+                    bail!(
+                        "binary quantization requires Distance::Cosine (sign codes are an \
+                         angular proxy and ignore magnitude); use int8 quantization for a \
+                         dot-product or Euclidean store"
+                    );
+                }
+                Ok(Quant::Binary(BinState {
+                    words: Vec::new(),
+                    words_per_row: dim.div_ceil(64),
+                }))
+            }
+        }
+    }
+}
+
+/// Pack a flat row-major f32 matrix (`dim` floats per row) into row-major sign-bit
+/// codes, `dim.div_ceil(64)` u64 per row. The whole-matrix build used by `rebuild_quant`.
+fn pack_matrix(vectors: &[f32], dim: usize) -> Vec<u64> {
+    if dim == 0 {
+        return Vec::new();
+    }
+    let words_per_row = dim.div_ceil(64);
+    let rows = vectors.len() / dim;
+    let mut out = vec![0u64; rows * words_per_row];
+    for r in 0..rows {
+        let src = &vectors[r * dim..(r + 1) * dim];
+        let dst = &mut out[r * words_per_row..(r + 1) * words_per_row];
+        pack_signs_into(src, dst);
+    }
+    out
 }
 
 /// Refit the quantization scale once the live row count grows past this multiple of
@@ -197,8 +285,8 @@ pub struct Store {
     collections: HashMap<String, Collection>,
     /// Rows no longer referenced (deleted or overwritten), for compaction tracking.
     dead_rows: usize,
-    /// int8 scalar quantization state (None when quantization is off).
-    quant: Option<QuantState>,
+    /// Quantization state (None when quantization is off — the f32 brute-force default).
+    quant: Option<Quant>,
 }
 
 impl Store {
@@ -291,12 +379,10 @@ impl Store {
             }
         }
 
-        let quant = config.quantization.map(|cfg| QuantState {
-            params: QuantParams::from_vectors(&[]),
-            vectors: Vec::new(),
-            params_rows: 0,
-            cfg,
-        });
+        let quant = match config.quantization {
+            Some(q) => Some(Quant::empty(q.kind, data.dimension(), config.distance)?),
+            None => None,
+        };
 
         let mut store = Store {
             config,
@@ -317,7 +403,7 @@ impl Store {
             }
         }
 
-        // 7. Build int8 quantization state if enabled.
+        // 7. Build the quantized matrix from the loaded vectors, if enabled.
         store.rebuild_quant();
 
         Ok(store)
@@ -340,12 +426,10 @@ impl Store {
 
     /// An in-memory store with full config control.
     pub fn in_memory_cfg(config: Config) -> Result<Store> {
-        let quant = config.quantization.map(|cfg| QuantState {
-            params: QuantParams::from_vectors(&[]),
-            vectors: Vec::new(),
-            params_rows: 0,
-            cfg,
-        });
+        let quant = match config.quantization {
+            Some(q) => Some(Quant::empty(q.kind, config.dimension, config.distance)?),
+            None => None,
+        };
         Ok(Store {
             data: DataSegment::in_memory_with(config.dimension, config.distance),
             log: OpLog::in_memory(),
@@ -359,41 +443,63 @@ impl Store {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Refit the quantization scale from *all* current vectors and re-quantize the
-    /// whole matrix. O(N) — used on `open`, `compact`, and the occasional geometric
-    /// refit, not per upsert batch.
+    /// Rebuild the quantized matrix from *all* current vectors. O(N) — used on `open`,
+    /// `compact`, and the occasional int8 geometric refit, not per upsert batch. int8
+    /// re-fits the scale and re-quantizes; binary repacks sign bits (scale-free).
     fn rebuild_quant(&mut self) {
-        if let Some(ref mut qs) = self.quant {
-            let all_floats = self.data.vectors();
-            qs.params = QuantParams::from_vectors(all_floats);
-            qs.vectors = qs.params.quantize_all(all_floats);
-            qs.params_rows = self.data.row_count();
+        let dim = self.data.dimension();
+        let all = self.data.vectors();
+        match self.quant {
+            None => {}
+            Some(Quant::Int8(ref mut s)) => {
+                s.params = QuantParams::from_vectors(all);
+                s.vectors = s.params.quantize_all(all);
+                s.params_rows = self.data.row_count();
+            }
+            Some(Quant::Binary(ref mut s)) => {
+                s.words_per_row = dim.div_ceil(64);
+                s.words = pack_matrix(all, dim);
+            }
         }
     }
 
     /// Incrementally extend the quantized matrix after `upsert` appended rows
-    /// `[prev_rows, row_count())`. Quantizes only the new rows against the existing
-    /// scale — O(batch), not O(N). Falls back to a full [`rebuild_quant`] when there
-    /// is no scale yet, or once the row count has grown past [`REFIT_GROWTH`]× the
-    /// fit set (so a drifting distribution can't keep saturating a stale scale).
+    /// `[prev_rows, row_count())` — O(batch), not O(N). int8 quantizes the new rows
+    /// against the existing scale, falling back to a full [`rebuild_quant`] when there
+    /// is no scale yet or the row count has grown past [`REFIT_GROWTH`]× the fit set (so
+    /// a drifting distribution can't keep saturating a stale scale). Binary is scale-free
+    /// — it just packs the new rows' sign bits, never refits.
     fn extend_quant(&mut self, prev_rows: u64) {
         let total = self.data.row_count();
+        let dim = self.data.dimension();
+        // Decide whether int8 needs a full refit before taking the mutable state borrow.
         let refit = match self.quant {
             None => return,
-            Some(ref qs) => qs.params_rows == 0 || total > qs.params_rows * REFIT_GROWTH,
+            Some(Quant::Int8(ref s)) => s.params_rows == 0 || total > s.params_rows * REFIT_GROWTH,
+            Some(Quant::Binary(_)) => false, // scale-free: never refits
         };
         if refit {
             self.rebuild_quant();
             return;
         }
-        if let Some(ref mut qs) = self.quant {
-            let dim = self.data.dimension();
-            let all = self.data.vectors();
-            qs.vectors.resize(total as usize * dim, 0);
-            for row in prev_rows as usize..total as usize {
-                let base = row * dim;
-                let (src, dst) = (&all[base..base + dim], &mut qs.vectors[base..base + dim]);
-                qs.params.quantize(src, dst);
+        let all = self.data.vectors();
+        match self.quant {
+            None => {}
+            Some(Quant::Int8(ref mut s)) => {
+                s.vectors.resize(total as usize * dim, 0);
+                for row in prev_rows as usize..total as usize {
+                    let base = row * dim;
+                    let (src, dst) = (&all[base..base + dim], &mut s.vectors[base..base + dim]);
+                    s.params.quantize(src, dst);
+                }
+            }
+            Some(Quant::Binary(ref mut s)) => {
+                let wpr = s.words_per_row;
+                s.words.resize(total as usize * wpr, 0);
+                for row in prev_rows as usize..total as usize {
+                    let src = &all[row * dim..(row + 1) * dim];
+                    pack_signs_into(src, &mut s.words[row * wpr..(row + 1) * wpr]);
+                }
             }
         }
     }
@@ -862,12 +968,15 @@ impl Store {
         // its own chunk (see `parallel_topk`), so the sort never caps speedup (Amdahl).
         let workers = self.parallel_workers(scan.len());
 
-        // Two-pass quantized search if enabled and we have enough candidates.
-        if let Some(ref qs) = self.quant {
-            let dim = self.data.dimension();
-            if !qs.vectors.is_empty() && dim > 0 {
-                return self.search_quantized(&q, &mut scan, opts, qs, score_fn, workers);
+        // Two-pass quantized search if enabled and the quantized matrix is populated.
+        match self.quant {
+            Some(Quant::Int8(ref s)) if !s.vectors.is_empty() && self.data.dimension() > 0 => {
+                return self.search_int8(&q, &mut scan, opts, s, score_fn, workers);
             }
+            Some(Quant::Binary(ref s)) if !s.words.is_empty() && self.data.dimension() > 0 => {
+                return self.search_binary(&q, &mut scan, opts, s, score_fn, workers);
+            }
+            _ => {}
         }
 
         // Standard f32 brute-force path. Split across worker threads when engaged;
@@ -903,26 +1012,32 @@ impl Store {
         Ok(results)
     }
 
-    /// Two-pass quantized search: int8 first-pass selects candidates, f32 reranks.
-    /// The int8 first pass is the lever that scales with threads — int8 moves 4× fewer
-    /// bytes than f32, so it is compute- not bandwidth-bound — so it splits across
-    /// `workers` (when engaged), while the f32 rerank stays serial (only `top_k ×
-    /// rescore` rows, too few to amortize a second fan-out).
-    fn search_quantized<'a>(
+    /// The configured overscan factor (the first pass keeps `top_k × rescore`
+    /// candidates for the f32 rerank). 1 when quantization is off — unused on that path.
+    fn rescore(&self) -> usize {
+        self.config.quantization.map_or(1, |q| q.rescore)
+    }
+
+    /// Two-pass int8 search: int8 first-pass selects candidates, f32 reranks. The int8
+    /// first pass is the lever that scales with threads — int8 moves 4× fewer bytes than
+    /// f32, so it is compute- not bandwidth-bound — so it splits across `workers` (when
+    /// engaged), while the f32 rerank stays serial (only `top_k × rescore` rows, too few
+    /// to amortize a second fan-out).
+    fn search_int8<'a>(
         &self,
         q: &[f32],
         scan: &mut [(u64, &'a str, &'a str)],
         opts: &SearchOpts,
-        qs: &QuantState,
+        s: &Int8State,
         score_fn: fn(&[f32], &[f32]) -> f32,
         workers: usize,
     ) -> Result<Vec<Hit>> {
         let dim = self.data.dimension();
-        let overscan = opts.top_k.saturating_mul(qs.cfg.rescore).max(opts.top_k);
+        let overscan = opts.top_k.saturating_mul(self.rescore()).max(opts.top_k);
 
         // Quantize the query vector with the same shared scale as the stored rows.
         let mut q_i8 = vec![0i8; dim];
-        qs.params.quantize(q, &mut q_i8);
+        s.params.quantize(q, &mut q_i8);
 
         // First pass: int8 scoring to select overscan candidates. The int8 score is
         // monotonic with the f32 score (shared symmetric scale), so it picks the right
@@ -931,19 +1046,65 @@ impl Store {
         let is_euclidean = self.config.distance == Distance::Euclidean;
         let topk_q = if workers > 1 {
             parallel_topk(scan, workers, overscan, |chunk| {
-                score_chunk_i8(&qs.vectors, dim, chunk, &q_i8, is_euclidean, overscan)
+                score_chunk_i8(&s.vectors, dim, chunk, &q_i8, is_euclidean, overscan)
             })?
         } else {
             scan.sort_unstable_by_key(|&(row, _, _)| row);
-            score_chunk_i8(&qs.vectors, dim, scan, &q_i8, is_euclidean, overscan)
+            score_chunk_i8(&s.vectors, dim, scan, &q_i8, is_euclidean, overscan)
         };
 
-        // Second pass: f32 rerank of the candidates.
         let candidates = topk_q.into_sorted_desc();
+        Ok(self.rerank_candidates(q, &candidates, score_fn, opts))
+    }
+
+    /// Two-pass binary search: a Hamming first-pass over the 32×-smaller sign-bit matrix
+    /// selects candidates, f32 reranks. Cosine only (enforced at `open`), so the query is
+    /// already unit-normalized when it reaches here; its sign code is invariant to that.
+    /// The binary first pass moves 32× fewer bytes than f32, so it scales with `workers`
+    /// even harder than int8; the f32 rerank stays serial.
+    fn search_binary<'a>(
+        &self,
+        q: &[f32],
+        scan: &mut [(u64, &'a str, &'a str)],
+        opts: &SearchOpts,
+        s: &BinState,
+        score_fn: fn(&[f32], &[f32]) -> f32,
+        workers: usize,
+    ) -> Result<Vec<Hit>> {
+        let overscan = opts.top_k.saturating_mul(self.rescore()).max(opts.top_k);
+
+        // Pack the query's sign bits with the same rule as the stored rows.
+        let q_words = pack_signs(q);
+        let wpr = s.words_per_row;
+
+        // First pass: Hamming scoring selects overscan candidates. Score = -(hamming),
+        // monotone with cosine rank for unit vectors; exact scores come from the rerank.
+        let topk_q = if workers > 1 {
+            parallel_topk(scan, workers, overscan, |chunk| {
+                score_chunk_bin(&s.words, wpr, chunk, &q_words, overscan)
+            })?
+        } else {
+            scan.sort_unstable_by_key(|&(row, _, _)| row);
+            score_chunk_bin(&s.words, wpr, scan, &q_words, overscan)
+        };
+
+        let candidates = topk_q.into_sorted_desc();
+        Ok(self.rerank_candidates(q, &candidates, score_fn, opts))
+    }
+
+    /// Exact f32 rerank of first-pass candidates → final ranked `Hit`s. Shared by both
+    /// two-pass paths: the first pass is only an ordering proxy, so the true score (and
+    /// `min_score`) is computed here from the original f32 vectors.
+    fn rerank_candidates(
+        &self,
+        q: &[f32],
+        candidates: &[(f32, (u64, &str, &str))],
+        score_fn: fn(&[f32], &[f32]) -> f32,
+        opts: &SearchOpts,
+    ) -> Vec<Hit> {
         let mut topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
-        for (_, (row, col_name, id)) in &candidates {
-            let stored = self.data.row(*row);
-            let score = score_fn(q, stored);
+        for (_, (row, col_name, id)) in candidates {
+            let score = score_fn(q, self.data.row(*row));
             if let Some(min) = opts.min_score
                 && score < min
             {
@@ -951,9 +1112,7 @@ impl Store {
             }
             topk.offer(score, (*col_name, *id));
         }
-
-        let results = topk
-            .into_sorted_desc()
+        topk.into_sorted_desc()
             .into_iter()
             .map(|(score, (collection, id))| {
                 let attrs = self
@@ -969,8 +1128,7 @@ impl Store {
                     attrs,
                 }
             })
-            .collect();
-        Ok(results)
+            .collect()
     }
 
     pub fn flush(&mut self) -> Result<()> {
@@ -1083,7 +1241,19 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::model::{Filter, Predicate, Record, SearchOpts, Value};
+    use crate::model::{Filter, Predicate, Quantization, Record, SearchOpts, Value};
+
+    /// Extract the int8 state from a store's quant slot, panicking if it is off or binary.
+    fn int8_state(store: &Store) -> &Int8State {
+        match store
+            .quant
+            .as_ref()
+            .expect("quantization should be enabled")
+        {
+            Quant::Int8(s) => s,
+            Quant::Binary(_) => panic!("expected int8 quant state, found binary"),
+        }
+    }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -2340,21 +2510,226 @@ mod tests {
         store
             .upsert("col", &[rec("a", vec![1.0, 0.0]), rec("b", vec![0.0, 1.0])])
             .unwrap();
-        assert_eq!(store.quant.as_ref().unwrap().params_rows, 2);
+        assert_eq!(int8_state(&store).params_rows, 2);
         // One more row (total 3): 3 <= 2*2, so NO refit — params_rows stays 2.
         store.upsert("col", &[rec("c", vec![1.0, 1.0])]).unwrap();
-        assert_eq!(store.quant.as_ref().unwrap().params_rows, 2);
+        assert_eq!(int8_state(&store).params_rows, 2);
         // Push past 2*2=4 (total 5): refit fires → params_rows = 5.
         store
             .upsert("col", &[rec("d", vec![2.0, 0.0]), rec("e", vec![0.0, 2.0])])
             .unwrap();
-        assert_eq!(store.quant.as_ref().unwrap().params_rows, 5);
+        assert_eq!(int8_state(&store).params_rows, 5);
         // The int8 matrix always covers every physical row.
         let dim = store.data.dimension();
         assert_eq!(
-            store.quant.as_ref().unwrap().vectors.len(),
+            int8_state(&store).vectors.len(),
             store.data.row_count() as usize * dim
         );
+    }
+
+    // ── binary (sign-bit) quantization tests ─────────────────────────────
+
+    /// A deterministic xorshift pseudo-random vector in roughly [-0.5, 0.5)^dim, for
+    /// recall/parallel tests where structured modulo data would produce Hamming ties.
+    fn pseudo_vec(seed: u64, dim: usize) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        (0..dim)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32) / ((1u64 << 24) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    fn binary_store(dim: usize) -> Store {
+        Store::in_memory_cfg(
+            Config::new("/dev/null/in-memory", dim)
+                .distance(Distance::Cosine)
+                .open_mode(OpenMode::ReadWrite)
+                .auto_compact(None)
+                .quantization(Some(Quantization::binary())),
+        )
+        .unwrap()
+    }
+
+    /// Extract the binary state, panicking if quant is off or int8.
+    fn bin_state(store: &Store) -> &BinState {
+        match store
+            .quant
+            .as_ref()
+            .expect("quantization should be enabled")
+        {
+            Quant::Binary(s) => s,
+            Quant::Int8(_) => panic!("expected binary quant state, found int8"),
+        }
+    }
+
+    #[test]
+    fn binary_rejects_non_cosine() {
+        // Sign codes are an angular proxy; binary must refuse dot-product / Euclidean.
+        for distance in [Distance::DotProduct, Distance::Euclidean] {
+            let result = Store::in_memory_cfg(
+                Config::new("/dev/null/in-memory", 4)
+                    .distance(distance)
+                    .open_mode(OpenMode::ReadWrite)
+                    .quantization(Some(Quantization::binary())),
+            );
+            let err = match result {
+                Ok(_) => panic!("binary quantization must be rejected for {distance:?}"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string()
+                    .contains("binary quantization requires Distance::Cosine"),
+                "expected cosine-only rejection, got: {err}"
+            );
+        }
+        // Cosine is accepted.
+        assert!(
+            Store::in_memory_cfg(
+                Config::new("/dev/null/in-memory", 4)
+                    .distance(Distance::Cosine)
+                    .open_mode(OpenMode::ReadWrite)
+                    .quantization(Some(Quantization::binary())),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn binary_search_ranks_correctly() {
+        let mut store = binary_store(3);
+        store.create_collection("col").unwrap();
+        store
+            .upsert(
+                "col",
+                &[
+                    rec("close", vec![0.9, 0.1, 0.0]),
+                    rec("mid", vec![0.6, 0.5, 0.1]),
+                    rec("far", vec![-1.0, -0.2, 0.3]),
+                ],
+            )
+            .unwrap();
+        let hits = store
+            .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(3))
+            .unwrap();
+        assert_eq!(
+            hits[0].id, "close",
+            "binary first-pass + f32 rerank should rank correctly"
+        );
+        // The reranked score is the exact f32 cosine, not a Hamming proxy.
+        assert!(hits[0].score <= 1.0 + 1e-6 && hits[0].score >= -1.0 - 1e-6);
+    }
+
+    #[test]
+    fn binary_state_covers_all_rows_multiword() {
+        // dim 130 → 3 u64 words per row; words must cover every physical row.
+        let mut store = binary_store(130);
+        store.create_collection("col").unwrap();
+        for i in 0..7u32 {
+            store
+                .upsert(
+                    "col",
+                    &[rec(&format!("d{i}"), pseudo_vec(i as u64 + 1, 130))],
+                )
+                .unwrap();
+        }
+        assert_eq!(bin_state(&store).words_per_row, 130usize.div_ceil(64)); // == 3
+        assert_eq!(
+            bin_state(&store).words.len(),
+            store.data.row_count() as usize * 3
+        );
+    }
+
+    // Ignored under Miri: builds thousands of rows to make recall meaningful — far too
+    // slow at Miri's ~100x. Pure in-RAM logic, covered amply by the f32/serial path.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn binary_search_recall_high_vs_exact() {
+        let dim = 128;
+        let n = 2000usize;
+        let k = 10usize;
+        let mut exact = Store::in_memory_with(dim, Distance::Cosine).unwrap();
+        let mut bin = binary_store(dim);
+        exact.create_collection("c").unwrap();
+        bin.create_collection("c").unwrap();
+        for i in 0..n {
+            let r = rec(&format!("d{i}"), pseudo_vec(i as u64 + 1, dim));
+            exact.upsert("c", std::slice::from_ref(&r)).unwrap();
+            bin.upsert("c", &[r]).unwrap();
+        }
+        let (mut hit, mut total) = (0usize, 0usize);
+        for qi in 0..20u64 {
+            let q = pseudo_vec(1_000_000 + qi, dim);
+            let truth: Vec<String> = exact
+                .search(&["c"], &q, &default_opts(k))
+                .unwrap()
+                .into_iter()
+                .map(|h| h.id)
+                .collect();
+            let got: std::collections::HashSet<String> = bin
+                .search(&["c"], &q, &default_opts(k))
+                .unwrap()
+                .into_iter()
+                .map(|h| h.id)
+                .collect();
+            for id in &truth {
+                if got.contains(id) {
+                    hit += 1;
+                }
+                total += 1;
+            }
+        }
+        let recall = hit as f64 / total as f64;
+        assert!(recall >= 0.6, "binary recall@{k} too low: {recall:.3}");
+    }
+
+    /// Build a binary-quantized store with `n` pseudo-random rows and the given threads.
+    fn binary_pseudo_store(dim: usize, n: usize, threads: usize) -> Store {
+        let mut store = Store::in_memory_cfg(
+            Config::new("/dev/null/in-memory", dim)
+                .distance(Distance::Cosine)
+                .open_mode(OpenMode::ReadWrite)
+                .auto_compact(None)
+                .query_threads(threads)
+                .quantization(Some(Quantization::binary())),
+        )
+        .unwrap();
+        store.create_collection("col").unwrap();
+        let recs: Vec<Record> = (0..n)
+            .map(|i| rec(&format!("d{i}"), pseudo_vec(i as u64 + 1, dim)))
+            .collect();
+        store.upsert("col", &recs).unwrap();
+        store
+    }
+
+    // Ignored under Miri — needs to clear PARALLEL_SCAN_WORK_FLOOR to engage threads.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn binary_parallel_matches_serial() {
+        // Pseudo-random sign codes make Hamming ties near the overscan boundary
+        // vanishingly unlikely, so serial and parallel select the same candidates and
+        // rerank to byte-identical ordered results.
+        let dim = 768;
+        let n = rows_to_parallelize(dim) + 100;
+        let serial = binary_pseudo_store(dim, n, 1);
+        let parallel = binary_pseudo_store(dim, n, 4);
+        let q = pseudo_vec(7_000_001, dim);
+        let hs: Vec<String> = serial
+            .search(&["col"], &q, &default_opts(20))
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        let hp: Vec<String> = parallel
+            .search(&["col"], &q, &default_opts(20))
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(hs, hp, "binary parallel scan must match serial");
     }
 
     // ── parallel scan tests ──────────────────────────────────────────────
