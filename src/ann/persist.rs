@@ -213,7 +213,7 @@ mod tests {
         );
         let cfg = AnnConfig::hnsw();
         let mut ann = Ann::empty(cfg, 3, Distance::Cosine);
-        ann.build(&data, &[0, 1, 2]);
+        ann.build(&data, &[0, 1, 2], 1);
         let before = ann.search(&data, &[0.0, 1.0, 0.0], 3);
 
         let bytes = roundtrip_bytes(&ann, 3, Distance::Cosine, &cfg, 3);
@@ -234,7 +234,7 @@ mod tests {
         let data = seg(2, &rows);
         let cfg = AnnConfig::ivf().n_lists(4);
         let mut ann = Ann::empty(cfg, 2, Distance::Cosine);
-        ann.build(&data, &(0..20).collect::<Vec<_>>());
+        ann.build(&data, &(0..20).collect::<Vec<_>>(), 1);
         let before = ann.search(&data, &rows[5], 5);
 
         let bytes = roundtrip_bytes(&ann, 2, Distance::Cosine, &cfg, 20);
@@ -248,7 +248,7 @@ mod tests {
         let data = seg(2, &[vec![1.0, 0.0], vec![0.0, 1.0]]);
         let cfg = AnnConfig::hnsw().m(16);
         let mut ann = Ann::empty(cfg, 2, Distance::Cosine);
-        ann.build(&data, &[0, 1]);
+        ann.build(&data, &[0, 1], 1);
         let bytes = roundtrip_bytes(&ann, 2, Distance::Cosine, &cfg, 2);
 
         // Different m → cache invalid → None.
@@ -265,7 +265,7 @@ mod tests {
         let data = seg(2, &[vec![1.0, 0.0], vec![0.0, 1.0]]);
         let cfg = AnnConfig::hnsw();
         let mut ann = Ann::empty(cfg, 2, Distance::Cosine);
-        ann.build(&data, &[0, 1]);
+        ann.build(&data, &[0, 1], 1);
         let mut bytes = roundtrip_bytes(&ann, 2, Distance::Cosine, &cfg, 2);
         // Flip a payload byte; CRC must catch it.
         let mid = HEADER_LEN + 1;

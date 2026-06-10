@@ -106,6 +106,13 @@ pass is compute-bound and scales better with threads. Leave it at `1` if you alr
 run concurrent searches under `Arc<RwLock<Nidus>>` — see
 [two kinds of parallelism](/guides/integrating/#two-kinds-of-parallelism).
 
+When an [HNSW index](/guides/search/#approximate-search-ann) is enabled, `> 1` also
+parallelizes the from-scratch graph **build** (on `open` with no cache, and on
+`compact`) across this many threads — the expensive part of opening an ANN store.
+Incremental `upsert` and the serial build at `1` are unchanged; note a parallel build
+is non-deterministic (insertion order varies), so a graph built with threads can
+differ slightly from the serial one (recall stays equivalent).
+
 ## `Fsync`
 
 ```rust

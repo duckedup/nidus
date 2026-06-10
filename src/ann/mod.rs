@@ -123,11 +123,13 @@ impl Ann {
     }
 
     /// Full (re)build from `live_rows` (physical row indices into `data`). Used on
-    /// `open` and after `compact` renumbers rows.
-    pub(crate) fn build(&mut self, data: &DataSegment, live_rows: &[u64]) {
+    /// `open` and after `compact` renumbers rows. `workers` (from
+    /// `Config::query_threads`) caps build concurrency; `1` builds serially and
+    /// deterministically.
+    pub(crate) fn build(&mut self, data: &DataSegment, live_rows: &[u64], workers: usize) {
         match self {
-            Ann::Hnsw(g) => g.build(data, live_rows),
-            Ann::Ivf(i) => i.build(data, live_rows),
+            Ann::Hnsw(g) => g.build(data, live_rows, workers),
+            Ann::Ivf(i) => i.build(data, live_rows, workers),
         }
     }
 

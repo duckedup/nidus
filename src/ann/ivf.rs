@@ -70,7 +70,9 @@ impl IvfIndex {
         }
     }
 
-    pub(crate) fn build(&mut self, data: &DataSegment, live_rows: &[u64]) {
+    // IVF build is already cheap (k-means over a fixed iteration count, ~seconds even
+    // at scale), so it stays serial; `_workers` keeps the signature uniform with HNSW.
+    pub(crate) fn build(&mut self, data: &DataSegment, live_rows: &[u64], _workers: usize) {
         self.centroids.clear();
         self.lists.clear();
         if self.dim == 0 || live_rows.is_empty() {
@@ -153,7 +155,7 @@ impl IvfIndex {
         if self.dim == 0 || self.n_centroids() == 0 {
             // No centroids yet (index built empty) — fold these in via a full build.
             if !rows.is_empty() {
-                self.build(data, rows);
+                self.build(data, rows, 1);
             }
             return;
         }
@@ -226,7 +228,7 @@ mod tests {
 
     fn build(data: &DataSegment, n: u64, cfg: AnnConfig) -> IvfIndex {
         let mut ix = IvfIndex::new(cfg, data.dimension(), Distance::Cosine);
-        ix.build(data, &(0..n).collect::<Vec<_>>());
+        ix.build(data, &(0..n).collect::<Vec<_>>(), 1);
         ix
     }
 
@@ -282,7 +284,7 @@ mod tests {
             .collect();
         let data = seg(2, &rows);
         let mut ix = IvfIndex::new(AnnConfig::ivf().n_lists(3), 2, Distance::Cosine);
-        ix.build(&data, &(0..15).collect::<Vec<_>>());
+        ix.build(&data, &(0..15).collect::<Vec<_>>(), 1);
         ix.insert_rows(&data, &(15..20).collect::<Vec<_>>());
         let total: usize = ix.lists.iter().map(|l| l.len()).sum();
         assert_eq!(total, 20, "all rows should be assigned to some list");

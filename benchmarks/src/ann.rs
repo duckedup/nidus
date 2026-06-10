@@ -16,6 +16,9 @@
 //!   warmup=10          unrecorded warmup queries
 //!   iters=5            measured passes over the query set
 //!   seed=42            PRNG seed
+//!   clustered=0        1 = realistic clustered data, 0 = uniform random (ANN worst case)
+//!   clusters=64        cluster count when clustered=1
+//!   threads=1          query_threads for the cold-open rebuild (parallel HNSW build)
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -116,6 +119,7 @@ struct Args {
     seed: u64,
     clustered: bool,
     clusters: usize,
+    threads: usize,
 }
 
 impl Default for Args {
@@ -132,6 +136,7 @@ impl Default for Args {
             seed: 42,
             clustered: false,
             clusters: 64,
+            threads: 1,
         }
     }
 }
@@ -148,7 +153,8 @@ fn parse_args() -> Result<Args> {
         if tok == "help" || tok == "--help" || tok == "-h" {
             println!("nidus-bench-ann — ANN (HNSW + IVF) recall & speed sweep");
             println!(
-                "args: n=, dim=, top_k=, ef_search=, n_probe=, queries=, warmup=, iters=, seed="
+                "args: n=, dim=, top_k=, ef_search=, n_probe=, queries=, warmup=, iters=, \
+                 seed=, clustered=, clusters=, threads="
             );
             std::process::exit(0);
         }
@@ -167,6 +173,7 @@ fn parse_args() -> Result<Args> {
             "seed" => a.seed = val.parse()?,
             "clustered" => a.clustered = val.parse::<u8>()? != 0,
             "clusters" => a.clusters = val.parse()?,
+            "threads" => a.threads = val.parse()?,
             other => bail!("unknown arg `{other}` (try `help`)"),
         }
     }
@@ -330,6 +337,7 @@ fn run() -> Result<()> {
                     Config::new(&store_path, dim)
                         .ann(Some(AnnConfig::hnsw()))
                         .auto_compact(None)
+                        .query_threads(args.threads) // parallel cold-open rebuild when > 1
                 };
                 db.persist_index()?; // write the cache
                 drop(db); // release the writer lock before reopening
@@ -346,7 +354,8 @@ fn run() -> Result<()> {
                 drop(cold);
 
                 println!(
-                    "  open: cold(rebuild)={:>7.2}s   warm(cache)={:>7.3}s   {:.0}x faster",
+                    "  open: cold(rebuild, {}thr)={:>7.2}s   warm(cache)={:>7.3}s   {:.0}x faster",
+                    args.threads,
                     cold_open.as_secs_f64(),
                     warm_open.as_secs_f64(),
                     cold_open.as_secs_f64() / warm_open.as_secs_f64().max(1e-9)

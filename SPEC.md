@@ -573,6 +573,14 @@ build until a real need exists.
   catches up** any rows appended since it was written; an absent, stale, over-long, or
   corrupt cache is silently discarded and the index rebuilt from the vectors. The
   `data`/`log` format is unchanged.
+  **Parallel build.** `Config::query_threads > 1` also parallelizes the from-scratch
+  HNSW build (on a cacheless `open` and on `compact`): node levels are assigned
+  serially, then per-node neighbour search + linking run across `std::thread::scope`
+  workers with one `Mutex` per node's adjacency and an `RwLock` entry point, edges
+  locked in node-id order (deadlock-free; safe Rust precludes data races). The serial
+  build at `query_threads == 1` is unchanged and deterministic; a parallel build
+  varies slightly with thread count (insertion order), with equivalent recall.
+  Incremental `upsert` stays serial. IVF build is already cheap and stays serial.
 
 ### Still deferred (designed-for, not built)
 

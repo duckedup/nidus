@@ -595,8 +595,9 @@ impl Store {
             return;
         }
         let live_rows = self.rebuild_row_to_doc();
+        let workers = self.config.query_threads;
         if let Some(ann) = self.ann.as_mut() {
-            ann.build(&self.data, &live_rows);
+            ann.build(&self.data, &live_rows, workers);
         }
         self.ann_dirty = true;
     }
@@ -3492,6 +3493,45 @@ mod tests {
         assert!(
             recall >= 0.90,
             "HNSW recall@{k} = {recall:.3}, expected >= 0.90"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // builds a parallel HNSW graph; threads + size not for Miri.
+    fn hnsw_parallel_build_recall_matches_serial() {
+        // A parallel build produces a different-but-equivalent graph; recall should
+        // stay in the same ballpark as the serial build on the same data.
+        let (n, dim, k) = (1500, 32, 10); // > PARALLEL_BUILD_MIN so the parallel path runs
+        let data = random_unit_vectors(n, dim, 7);
+        let queries = random_unit_vectors(30, dim, 8);
+        let truth = exact_store(dim, &data);
+
+        let serial = ann_store(dim, AnnConfig::hnsw(), &data); // query_threads defaults to 1
+        let parallel = {
+            let mut s = Store::in_memory_cfg(
+                Config::new("/dev/null/in-memory", dim)
+                    .auto_compact(None)
+                    .query_threads(4)
+                    .ann(Some(AnnConfig::hnsw())),
+            )
+            .unwrap();
+            let recs: Vec<Record> = data
+                .iter()
+                .enumerate()
+                .map(|(i, v)| rec(&format!("d{i}"), v.clone()))
+                .collect();
+            // upsert builds incrementally (serial); force the parallel from-scratch
+            // build path via compact (rebuild_ann under query_threads=4).
+            s.upsert("col", &recs).unwrap();
+            s.compact().unwrap();
+            s
+        };
+
+        let serial_recall = mean_recall(&serial, &truth, &queries, k);
+        let parallel_recall = mean_recall(&parallel, &truth, &queries, k);
+        assert!(
+            parallel_recall >= serial_recall - 0.05,
+            "parallel recall {parallel_recall:.3} should track serial {serial_recall:.3}"
         );
     }
 

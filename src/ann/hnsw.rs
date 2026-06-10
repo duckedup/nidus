@@ -14,6 +14,9 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::sync::Mutex;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use crate::ann::{AnnSnapshotRef, ScoreFn, SplitMix64, score_fn_for};
 use crate::data::DataSegment;
@@ -136,12 +139,19 @@ impl HnswGraph {
         }
     }
 
-    pub(crate) fn build(&mut self, data: &DataSegment, live_rows: &[u64]) {
+    pub(crate) fn build(&mut self, data: &DataSegment, live_rows: &[u64], workers: usize) {
         self.rows.clear();
         self.links.clear();
         self.entry = None;
         self.max_level = 0;
-        self.insert_rows(data, live_rows);
+        // Parallelize only a large from-scratch build; small builds and incremental
+        // upserts stay serial (and deterministic). The serial path is byte-identical
+        // to before this knob existed.
+        if workers > 1 && self.dim > 0 && live_rows.len() >= PARALLEL_BUILD_MIN {
+            self.build_parallel(data, live_rows, workers);
+        } else {
+            self.insert_rows(data, live_rows);
+        }
     }
 
     pub(crate) fn insert_rows(&mut self, data: &DataSegment, rows: &[u64]) {
@@ -310,36 +320,7 @@ impl HnswGraph {
     /// spreads links across directions (better navigability) instead of clustering them
     /// all toward the single nearest region.
     fn select_neighbors(&self, data: &DataSegment, candidates: &[Scored], m: usize) -> Vec<u32> {
-        let mut selected: Vec<u32> = Vec::with_capacity(m);
-        // `candidates` arrives best-first from `search_layer`.
-        for cand in candidates {
-            if selected.len() >= m {
-                break;
-            }
-            let cand_row = data.row(self.rows[cand.node as usize]);
-            let keep = selected.iter().all(|&r| {
-                let r_row = data.row(self.rows[r as usize]);
-                // cand→base score vs cand→neighbour score: keep if cand is closer to the
-                // base than to this neighbour (i.e. it adds a genuinely new direction).
-                cand.score >= (self.score_fn)(cand_row, r_row)
-            });
-            if keep {
-                selected.push(cand.node);
-            }
-        }
-        // If the heuristic was too strict to fill `m`, top up with the remaining
-        // nearest candidates so the node is not under-connected.
-        if selected.len() < m {
-            for cand in candidates {
-                if selected.len() >= m {
-                    break;
-                }
-                if !selected.contains(&cand.node) {
-                    selected.push(cand.node);
-                }
-            }
-        }
-        selected
+        select_neighbors(&self.rows, data, self.score_fn, candidates, m)
     }
 
     /// Add `to` to `from`'s adjacency at `level` (deduplicated).
@@ -404,6 +385,311 @@ impl HnswGraph {
             .map(|s| (self.rows[s.node as usize], s.score))
             .collect()
     }
+
+    /// Build the graph across `workers` threads. Node levels are assigned serially
+    /// (deterministic, cheap), then the expensive per-node neighbour search + linking
+    /// runs concurrently: adjacency is guarded by one `Mutex` per node and the entry
+    /// point by an `RwLock`. Edges always lock the two endpoints in node-id order, so
+    /// there is no deadlock; safe Rust rules out data races, so the only effect of
+    /// concurrency is that the graph (and thus exact recall) varies slightly with the
+    /// thread count — determinism holds only on the serial path.
+    fn build_parallel(&mut self, data: &DataSegment, live_rows: &[u64], workers: usize) {
+        let n = live_rows.len();
+        self.rows = live_rows.to_vec();
+        let levels: Vec<usize> = (0..n).map(|_| self.random_level()).collect();
+        let links: Vec<Mutex<Vec<Vec<u32>>>> = levels
+            .iter()
+            .map(|&l| Mutex::new(vec![Vec::new(); l + 1]))
+            .collect();
+        // Seed the entry with node 0; higher-level nodes promote it as they insert.
+        let entry_state = RwLock::new((0u32, levels[0]));
+        let counter = AtomicUsize::new(1); // node 0 is the seed; insert 1..n
+        let (m, m_max0, ef_c, score_fn) =
+            (self.m, self.m_max0, self.ef_construction, self.score_fn);
+        let rows = &self.rows;
+        let links_ref = &links;
+        let entry_ref = &entry_state;
+        let levels_ref = &levels;
+        let counter_ref = &counter;
+
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(move || {
+                    loop {
+                        let i = counter_ref.fetch_add(1, AtomicOrdering::Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        insert_locked(
+                            i as u32, rows, data, score_fn, links_ref, entry_ref, levels_ref, m,
+                            m_max0, ef_c,
+                        );
+                    }
+                });
+            }
+        });
+
+        self.links = links.into_iter().map(|m| m.into_inner().unwrap()).collect();
+        let (entry, max_level) = entry_state.into_inner().unwrap();
+        self.entry = Some(entry);
+        self.max_level = max_level;
+    }
+}
+
+/// Below this node count a parallel build isn't worth the thread/lock overhead — the
+/// serial path is used instead (also the case for incremental upserts).
+const PARALLEL_BUILD_MIN: usize = 1024;
+
+/// The HNSW neighbour-selection heuristic (free function so the serial method and the
+/// parallel builder share one implementation). Walks candidates nearest-first, keeping
+/// one only if it is nearer to the base than to any already-kept neighbour; tops up
+/// with the nearest remaining if the heuristic underfills `m`.
+fn select_neighbors(
+    rows: &[u64],
+    data: &DataSegment,
+    score_fn: ScoreFn,
+    candidates: &[Scored],
+    m: usize,
+) -> Vec<u32> {
+    let mut selected: Vec<u32> = Vec::with_capacity(m);
+    for cand in candidates {
+        if selected.len() >= m {
+            break;
+        }
+        let cand_row = data.row(rows[cand.node as usize]);
+        let keep = selected.iter().all(|&r| {
+            let r_row = data.row(rows[r as usize]);
+            cand.score >= score_fn(cand_row, r_row)
+        });
+        if keep {
+            selected.push(cand.node);
+        }
+    }
+    if selected.len() < m {
+        for cand in candidates {
+            if selected.len() >= m {
+                break;
+            }
+            if !selected.contains(&cand.node) {
+                selected.push(cand.node);
+            }
+        }
+    }
+    selected
+}
+
+/// A snapshot copy of `node`'s level-`level` neighbours, taken under its lock and
+/// released immediately (so scoring never holds a lock).
+fn nbrs_locked(links: &[Mutex<Vec<Vec<u32>>>], node: u32, level: usize) -> Vec<u32> {
+    let g = links[node as usize].lock().unwrap();
+    g.get(level).cloned().unwrap_or_default()
+}
+
+/// Locked variant of `greedy_descend` for the parallel build.
+fn greedy_descend_locked(
+    rows: &[u64],
+    data: &DataSegment,
+    score_fn: ScoreFn,
+    links: &[Mutex<Vec<Vec<u32>>>],
+    q: &[f32],
+    entry: u32,
+    level: usize,
+) -> u32 {
+    let mut cur = entry;
+    let mut cur_score = score_fn(q, data.row(rows[cur as usize]));
+    loop {
+        let mut improved = false;
+        for nbr in nbrs_locked(links, cur, level) {
+            let s = score_fn(q, data.row(rows[nbr as usize]));
+            if s > cur_score {
+                cur_score = s;
+                cur = nbr;
+                improved = true;
+            }
+        }
+        if !improved {
+            return cur;
+        }
+    }
+}
+
+/// Locked variant of `search_layer` for the parallel build.
+#[allow(clippy::too_many_arguments)]
+fn search_layer_locked(
+    rows: &[u64],
+    data: &DataSegment,
+    score_fn: ScoreFn,
+    links: &[Mutex<Vec<Vec<u32>>>],
+    q: &[f32],
+    entry_points: &[u32],
+    ef: usize,
+    level: usize,
+    n_nodes: usize,
+) -> Vec<Scored> {
+    let mut visited = vec![false; n_nodes];
+    let mut candidates: BinaryHeap<Scored> = BinaryHeap::new();
+    let mut result: BinaryHeap<MinScored> = BinaryHeap::new();
+
+    for &ep in entry_points {
+        if visited[ep as usize] {
+            continue;
+        }
+        visited[ep as usize] = true;
+        let s = score_fn(q, data.row(rows[ep as usize]));
+        let sc = Scored { score: s, node: ep };
+        candidates.push(sc);
+        result.push(MinScored(sc));
+    }
+
+    while let Some(cand) = candidates.pop() {
+        let worst = result
+            .peek()
+            .map(|m| m.0.score)
+            .unwrap_or(f32::NEG_INFINITY);
+        if result.len() >= ef && cand.score < worst {
+            break;
+        }
+        for nbr in nbrs_locked(links, cand.node, level) {
+            if visited[nbr as usize] {
+                continue;
+            }
+            visited[nbr as usize] = true;
+            let s = score_fn(q, data.row(rows[nbr as usize]));
+            let worst = result
+                .peek()
+                .map(|m| m.0.score)
+                .unwrap_or(f32::NEG_INFINITY);
+            if result.len() < ef || s > worst {
+                let sc = Scored {
+                    score: s,
+                    node: nbr,
+                };
+                candidates.push(sc);
+                result.push(MinScored(sc));
+                if result.len() > ef {
+                    result.pop();
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<Scored> = result.into_iter().map(|m| m.0).collect();
+    out.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+    out
+}
+
+/// Add the bidirectional edge `node ↔ nbr` at `level` and prune `nbr` back to its
+/// degree cap, all under both endpoints' locks (acquired in node-id order to avoid
+/// deadlock).
+#[allow(clippy::too_many_arguments)]
+fn link_and_prune(
+    rows: &[u64],
+    data: &DataSegment,
+    score_fn: ScoreFn,
+    links: &[Mutex<Vec<Vec<u32>>>],
+    node: u32,
+    nbr: u32,
+    level: usize,
+    m: usize,
+    m_max0: usize,
+) {
+    let (a, b) = (node.min(nbr), node.max(nbr));
+    let mut ga = links[a as usize].lock().unwrap();
+    let mut gb = links[b as usize].lock().unwrap();
+    // `ga`/`gb` are disjoint guards, so &mut to each at once is sound.
+    let (g_node, g_nbr): (&mut Vec<Vec<u32>>, &mut Vec<Vec<u32>>) = if node == a {
+        (&mut ga, &mut gb)
+    } else {
+        (&mut gb, &mut ga)
+    };
+
+    if level < g_node.len() && !g_node[level].contains(&nbr) {
+        g_node[level].push(nbr);
+    }
+    if level < g_nbr.len() {
+        if !g_nbr[level].contains(&node) {
+            g_nbr[level].push(node);
+        }
+        let cap = if level == 0 { m_max0 } else { m };
+        if g_nbr[level].len() > cap {
+            let base = data.row(rows[nbr as usize]);
+            let mut scored: Vec<Scored> = g_nbr[level]
+                .iter()
+                .map(|&x| Scored {
+                    score: score_fn(base, data.row(rows[x as usize])),
+                    node: x,
+                })
+                .collect();
+            scored.sort_unstable_by(|x, y| y.score.total_cmp(&x.score));
+            g_nbr[level] = select_neighbors(rows, data, score_fn, &scored, cap);
+        }
+    }
+}
+
+/// Insert one node into the locked graph (the concurrent counterpart of `insert_one`).
+#[allow(clippy::too_many_arguments)]
+fn insert_locked(
+    node: u32,
+    rows: &[u64],
+    data: &DataSegment,
+    score_fn: ScoreFn,
+    links: &[Mutex<Vec<Vec<u32>>>],
+    entry_state: &RwLock<(u32, usize)>,
+    levels: &[usize],
+    m: usize,
+    m_max0: usize,
+    ef_c: usize,
+) {
+    let q = data.row(rows[node as usize]);
+    let node_level = levels[node as usize];
+    let (mut ep, top) = {
+        let g = entry_state.read().unwrap();
+        (g.0, g.1)
+    };
+
+    // Greedy descent through the layers above this node's level.
+    let mut lc = top;
+    while lc > node_level {
+        ep = greedy_descend_locked(rows, data, score_fn, links, q, ep, lc);
+        lc -= 1;
+    }
+
+    // From min(node_level, top) down to 0: beam search, connect, prune.
+    let mut lc = node_level.min(top) as isize;
+    let mut entry_points = vec![ep];
+    while lc >= 0 {
+        let level = lc as usize;
+        let found = search_layer_locked(
+            rows,
+            data,
+            score_fn,
+            links,
+            q,
+            &entry_points,
+            ef_c,
+            level,
+            rows.len(),
+        );
+        let cap = if level == 0 { m_max0 } else { m };
+        let selected = select_neighbors(rows, data, score_fn, &found, cap);
+        for &nbr in &selected {
+            if nbr != node {
+                link_and_prune(rows, data, score_fn, links, node, nbr, level, m, m_max0);
+            }
+        }
+        entry_points = found.iter().map(|s| s.node).collect();
+        if entry_points.is_empty() {
+            entry_points.push(ep);
+        }
+        lc -= 1;
+    }
+
+    if node_level > top {
+        let mut g = entry_state.write().unwrap();
+        if node_level > g.1 {
+            *g = (node, node_level);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -423,7 +709,7 @@ mod tests {
     fn build_graph(data: &DataSegment, n: u64) -> HnswGraph {
         let mut g = HnswGraph::new(AnnConfig::hnsw(), data.dimension(), Distance::Cosine);
         let live: Vec<u64> = (0..n).collect();
-        g.build(data, &live);
+        g.build(data, &live, 1);
         g
     }
 
