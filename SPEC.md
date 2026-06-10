@@ -561,9 +561,18 @@ build until a real need exists.
   resolution is re-verified against the live index) and reclaimed on the next
   `compact` rebuild. ANN and quantization both replace the search path and are
   **mutually exclusive** (rejected at `open`); combining them (a quantized walk + f32
-  rerank) is a deferred optimization. The index is in-RAM only — no `data`/`log`
-  format change, rebuilt from the vectors on `open` and `compact`, extended in
-  O(batch) on `upsert`.
+  rerank) is a deferred optimization. The index is extended in O(batch) on `upsert`.
+  **Persistence (derived cache).** The graph/lists are reconstructable from the
+  vectors, so they are persisted only as an optimization: a separate `ann` file
+  (`NIDUS\0` header + `bincode` + CRC32, atomically written) lets `open` *load* the
+  index instead of rebuilding it (the expensive part — HNSW build is scalar/
+  single-threaded). It is written strictly **out-of-band** — on `compact` and the
+  explicit `Nidus::persist_index()`, **never** on the `upsert`/`flush` hot path, so
+  writes stay fast and there is no background thread. `open` loads the cache, validates
+  it against the current `(dim, distance, kind, params)` + a CRC, and **incrementally
+  catches up** any rows appended since it was written; an absent, stale, over-long, or
+  corrupt cache is silently discarded and the index rebuilt from the vectors. The
+  `data`/`log` format is unchanged.
 
 ### Still deferred (designed-for, not built)
 

@@ -9,7 +9,7 @@
 //! exact f32 metric (we score real rows), so recall loss comes only from rows sitting
 //! in unprobed lists.
 
-use crate::ann::{ScoreFn, SplitMix64, score_fn_for};
+use crate::ann::{AnnSnapshotRef, ScoreFn, SplitMix64, score_fn_for};
 use crate::data::DataSegment;
 use crate::model::{AnnConfig, Distance};
 
@@ -46,6 +46,28 @@ impl IvfIndex {
 
     fn n_centroids(&self) -> usize {
         self.centroids.len() / self.dim.max(1)
+    }
+
+    /// Reconstruct an index from decoded durable state (snapshot load).
+    pub(crate) fn from_parts(
+        cfg: AnnConfig,
+        dim: usize,
+        distance: Distance,
+        centroids: Vec<f32>,
+        lists: Vec<Vec<u64>>,
+    ) -> Self {
+        let mut ix = IvfIndex::new(cfg, dim, distance);
+        ix.centroids = centroids;
+        ix.lists = lists;
+        ix
+    }
+
+    /// A borrowed view of the durable index state, for serialization.
+    pub(crate) fn snapshot_ref(&self) -> AnnSnapshotRef<'_> {
+        AnnSnapshotRef::Ivf {
+            centroids: &self.centroids,
+            lists: &self.lists,
+        }
     }
 
     pub(crate) fn build(&mut self, data: &DataSegment, live_rows: &[u64]) {

@@ -295,6 +295,13 @@ pub struct Store {
     /// Approximate-nearest-neighbour index (None when ANN is off — the exact default).
     /// Mutually exclusive with `quant` (rejected at `open`).
     ann: Option<Ann>,
+    /// The in-RAM ANN index has unpersisted changes (rows inserted since the last
+    /// `persist_index`/load). Lets `persist_index` skip a redundant write and tracks
+    /// whether the on-disk `ann` cache is current. Meaningless when ANN is off.
+    ann_dirty: bool,
+    /// True for in-memory stores (no backing directory) — they never persist the ANN
+    /// cache. `open`ed (file-backed) stores set this false.
+    in_memory: bool,
     /// Reverse map physical-row → `(collection, id)`, maintained only when ANN is on,
     /// so an ANN candidate row resolves to its owning doc in O(1) for the post-filter
     /// and `Hit` build. It is a *hint*: every lookup is re-verified against the
@@ -422,6 +429,8 @@ impl Store {
             dead_rows,
             quant,
             ann,
+            ann_dirty: false,
+            in_memory: false,
             row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
         };
@@ -437,8 +446,9 @@ impl Store {
 
         // 7. Build the quantized matrix from the loaded vectors, if enabled.
         store.rebuild_quant();
-        // 8. Build the ANN index (and its reverse map) from the loaded vectors.
-        store.rebuild_ann();
+        // 8. Load the ANN index from its cache (incrementally catching up any rows
+        //    added since), or rebuild it from the vectors if there is no valid cache.
+        store.load_or_build_ann()?;
 
         Ok(store)
     }
@@ -487,6 +497,8 @@ impl Store {
             dead_rows: 0,
             quant,
             ann,
+            ann_dirty: false,
+            in_memory: true,
             row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
             config,
@@ -556,14 +568,10 @@ impl Store {
         }
     }
 
-    /// Rebuild the ANN index and its reverse map from *all* current live docs. O(N) —
-    /// used on `open` and after `compact` renumbers rows. No-op when ANN is off.
-    fn rebuild_ann(&mut self) {
-        if self.ann.is_none() {
-            return;
-        }
-        // Reverse map sized to the physical row count; live docs fill their slot, dead
-        // rows stay `None`. Also collect the live rows to (re)build the index over.
+    /// Rebuild the `row → (collection, id)` reverse map from the live index and return
+    /// the live physical rows. Sized to the physical row count; dead rows stay `None`.
+    /// Shared by the ANN rebuild and the snapshot-load paths.
+    fn rebuild_row_to_doc(&mut self) -> Vec<u64> {
         let mut row_to_doc: Vec<Option<(String, String)>> =
             vec![None; self.data.row_count() as usize];
         let mut live_rows: Vec<u64> = Vec::new();
@@ -576,9 +584,88 @@ impl Store {
             }
         }
         self.row_to_doc = row_to_doc;
+        live_rows
+    }
+
+    /// Rebuild the ANN index and its reverse map from *all* current live docs. O(N) —
+    /// used after `compact` renumbers rows and when no valid cache exists on `open`.
+    /// No-op when ANN is off. Marks the index dirty (the on-disk cache is now stale).
+    fn rebuild_ann(&mut self) {
+        if self.ann.is_none() {
+            return;
+        }
+        let live_rows = self.rebuild_row_to_doc();
         if let Some(ann) = self.ann.as_mut() {
             ann.build(&self.data, &live_rows);
         }
+        self.ann_dirty = true;
+    }
+
+    /// On `open`: load the ANN index from its `ann` cache if one is present and valid
+    /// for this store's config, then incrementally insert any rows added since the
+    /// cache was written (so a stale/partial cache still makes open cheap). With no
+    /// valid cache, fall back to a full `rebuild_ann`. No-op when ANN is off.
+    fn load_or_build_ann(&mut self) -> Result<()> {
+        let Some(cfg) = self.config.ann else {
+            return Ok(());
+        };
+        if self.ann.is_none() {
+            return Ok(());
+        }
+        let path = self.config.path.join("ann");
+        let dim = self.data.dimension();
+        let distance = self.config.distance;
+        let total = self.data.row_count();
+
+        match crate::ann::load_index(&path, dim, distance, &cfg)? {
+            // Valid cache that doesn't claim more rows than the data file holds (a
+            // larger `covered` would mean dangling node→row refs — treat as stale).
+            Some((ann, covered)) if covered <= total => {
+                self.ann = Some(ann);
+                self.rebuild_row_to_doc();
+                if total > covered {
+                    // Catch up rows appended after the cache was written.
+                    let new_rows: Vec<u64> = (covered..total).collect();
+                    if let Some(ann) = self.ann.as_mut() {
+                        ann.insert_rows(&self.data, &new_rows);
+                    }
+                    self.ann_dirty = true; // the delta isn't persisted yet
+                } else {
+                    self.ann_dirty = false; // on-disk cache is exactly current
+                }
+            }
+            // No cache, or stale/corrupt/over-long → rebuild from the vectors.
+            _ => self.rebuild_ann(),
+        }
+        Ok(())
+    }
+
+    /// Write the ANN index to its `ann` cache file so the next `open` skips the
+    /// rebuild. Out-of-band by design — call it explicitly (e.g. before shutdown) or
+    /// let `compact` trigger it; it is *never* on the `upsert`/`flush` write path. A
+    /// no-op when ANN is off, the store is in-memory or read-only, or nothing changed
+    /// since the last persist.
+    pub fn persist_index(&mut self) -> Result<()> {
+        let Some(cfg) = self.config.ann else {
+            return Ok(());
+        };
+        if self.in_memory || self.config.open_mode == OpenMode::ReadOnly || !self.ann_dirty {
+            return Ok(());
+        }
+        let Some(ann) = self.ann.as_ref() else {
+            return Ok(());
+        };
+        let path = self.config.path.join("ann");
+        crate::ann::save_index(
+            &path,
+            ann,
+            self.data.row_count(),
+            self.data.dimension(),
+            self.config.distance,
+            &cfg,
+        )?;
+        self.ann_dirty = false;
+        Ok(())
     }
 
     /// Incrementally index the rows `upsert` just appended (`[prev_rows, row_count())`),
@@ -599,6 +686,7 @@ impl Store {
         if let Some(ann) = self.ann.as_mut() {
             ann.insert_rows(&self.data, &new_rows);
         }
+        self.ann_dirty = true;
     }
 
     /// Reject mutations when in ReadOnly mode.
@@ -1504,8 +1592,11 @@ impl Store {
         // 5. Rebuild quantization state with compacted vectors.
         self.rebuild_quant();
 
-        // 5b. Rebuild the ANN index + reverse map (rows were renumbered).
+        // 5b. Rebuild the ANN index + reverse map (rows were renumbered) and refresh
+        //     its on-disk cache. Best effort: the cache is derived, so a persist
+        //     failure must not fail the compaction.
         self.rebuild_ann();
+        let _ = self.persist_index();
 
         // 6. Rows were renumbered — drop the cached scan order.
         self.invalidate_scan_order();
@@ -2038,6 +2129,8 @@ mod tests {
             dead_rows: 0,
             quant: None,
             ann: None,
+            ann_dirty: false,
+            in_memory: true,
             row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
         };

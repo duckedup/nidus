@@ -12,14 +12,52 @@
 //! safe Rust with no dependencies — the only randomness is a hand-rolled seeded
 //! [`SplitMix64`] PRNG, so builds are deterministic and the logic runs under Miri.
 
+use serde::{Deserialize, Serialize};
+
 use crate::data::DataSegment;
 use crate::model::{AnnConfig, AnnKind, Distance};
 
 mod hnsw;
 mod ivf;
+mod persist;
 
 pub(crate) use hnsw::HnswGraph;
 pub(crate) use ivf::IvfIndex;
+pub(crate) use persist::{load as load_index, save as save_index};
+
+/// Borrowed view of an index's durable state, for zero-copy serialization on save.
+/// Mirrors [`AnnSnapshot`] but holds references so a snapshot write never clones the
+/// (potentially large) graph.
+#[derive(Serialize)]
+pub(crate) enum AnnSnapshotRef<'a> {
+    Hnsw {
+        rows: &'a [u64],
+        links: &'a [Vec<Vec<u32>>],
+        entry: Option<u32>,
+        max_level: usize,
+    },
+    Ivf {
+        centroids: &'a [f32],
+        lists: &'a [Vec<u64>],
+    },
+}
+
+/// Owned durable state of an index, decoded from a snapshot on load. Reconstituted
+/// into a live [`Ann`] via [`Ann::from_snapshot`] (the config-derived fields — score
+/// function, PRNG, tunables — come from the `AnnConfig`, not the file).
+#[derive(Deserialize)]
+pub(crate) enum AnnSnapshot {
+    Hnsw {
+        rows: Vec<u64>,
+        links: Vec<Vec<Vec<u32>>>,
+        entry: Option<u32>,
+        max_level: usize,
+    },
+    Ivf {
+        centroids: Vec<f32>,
+        lists: Vec<Vec<u64>>,
+    },
+}
 
 /// Scoring function shared with the brute-force path: **higher = nearer**. Cosine and
 /// dot-product use the raw dot product (vectors are unit-normalized on insert for
@@ -98,6 +136,37 @@ impl Ann {
         match self {
             Ann::Hnsw(g) => g.insert_rows(data, rows),
             Ann::Ivf(i) => i.insert_rows(data, rows),
+        }
+    }
+
+    /// A borrowed view of this index's durable state, for serialization on save.
+    pub(crate) fn snapshot_ref(&self) -> AnnSnapshotRef<'_> {
+        match self {
+            Ann::Hnsw(g) => g.snapshot_ref(),
+            Ann::Ivf(i) => i.snapshot_ref(),
+        }
+    }
+
+    /// Rebuild a live index from a decoded snapshot. The kind must match `cfg.kind`
+    /// (the caller validates this against the file header first).
+    pub(crate) fn from_snapshot(
+        cfg: AnnConfig,
+        dim: usize,
+        distance: Distance,
+        snap: AnnSnapshot,
+    ) -> Self {
+        match snap {
+            AnnSnapshot::Hnsw {
+                rows,
+                links,
+                entry,
+                max_level,
+            } => Ann::Hnsw(HnswGraph::from_parts(
+                cfg, dim, distance, rows, links, entry, max_level,
+            )),
+            AnnSnapshot::Ivf { centroids, lists } => {
+                Ann::Ivf(IvfIndex::from_parts(cfg, dim, distance, centroids, lists))
+            }
         }
     }
 

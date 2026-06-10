@@ -56,6 +56,7 @@ searchers plus one writer (see
 | `search` | `fn search<'a>(&self, scope: impl Into<Scope<'a>>, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>` | Ranked search over a scope using the store's distance metric. |
 | `flush` | `fn flush(&mut self) -> Result<()>` | Force an fsync (relevant under `Fsync::OnFlush`). |
 | `compact` | `fn compact(&mut self) -> Result<()>` | Rewrite `data` to reclaim dead rows. |
+| `persist_index` | `fn persist_index(&mut self) -> Result<()>` | Write the [ANN index](#annconfig--annkind) to its `ann` cache so the next `open()` loads it instead of rebuilding the graph. Out-of-band (never on `upsert`/`flush`); no-op when ANN is off, in-memory, or read-only. `compact()` refreshes it too. |
 
 ## `Scope`
 

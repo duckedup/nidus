@@ -208,4 +208,15 @@ impl Nidus {
     pub fn compact(&mut self) -> Result<()> {
         self.store.compact()
     }
+
+    /// Write the approximate-nearest-neighbour index ([`Config::ann`]) to its on-disk
+    /// cache so the next [`open`](Self::open) loads it instead of rebuilding the graph
+    /// (the expensive part of opening an ANN store). This is an explicit, out-of-band
+    /// operation — it is never triggered by `upsert`/`flush`, so the write path stays
+    /// fast — so call it before shutting down a long-lived handle (e.g. a search
+    /// server). A no-op when ANN is disabled, the store is in-memory or read-only, or
+    /// nothing changed since the last persist. `compact()` refreshes the cache too.
+    pub fn persist_index(&mut self) -> Result<()> {
+        self.store.persist_index()
+    }
 }

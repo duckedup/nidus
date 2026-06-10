@@ -246,6 +246,16 @@ let cfg = AnnConfig::hnsw().m(32).ef_search(128).overscan(8);
 # let _ = cfg;
 ```
 
+**Persisting the index.** The graph is in-RAM and rebuilt from the vectors on
+`open()` — and for HNSW that build is the expensive part. Call
+[`db.persist_index()`](/reference/api/#nidus) to write it to an `ann` cache file so
+the next `open()` *loads* it instead of rebuilding. It's an explicit, out-of-band
+operation (also triggered by `compact()`) — never on the `upsert`/`flush` write path,
+so storage stays fast — so call it before shutting down a long-lived handle. `open()`
+incrementally catches up any rows added since the cache was written, and silently
+rebuilds if the cache is missing, stale, or for a different config. The cache is
+derived data: deleting the `ann` file only costs a one-time rebuild.
+
 **Trade-offs to know.**
 
 - **Approximate recall.** ANN may miss a true neighbour. Raise `ef_search`/`n_probe`

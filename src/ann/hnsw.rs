@@ -15,7 +15,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use crate::ann::{ScoreFn, SplitMix64, score_fn_for};
+use crate::ann::{AnnSnapshotRef, ScoreFn, SplitMix64, score_fn_for};
 use crate::data::DataSegment;
 use crate::model::{AnnConfig, Distance};
 
@@ -104,6 +104,35 @@ impl HnswGraph {
             links: Vec::new(),
             entry: None,
             max_level: 0,
+        }
+    }
+
+    /// Reconstruct a graph from decoded durable state (snapshot load). Config-derived
+    /// fields (tunables, score fn, PRNG) come from `cfg`/`distance`, not the file.
+    pub(crate) fn from_parts(
+        cfg: AnnConfig,
+        dim: usize,
+        distance: Distance,
+        rows: Vec<u64>,
+        links: Vec<Vec<Vec<u32>>>,
+        entry: Option<u32>,
+        max_level: usize,
+    ) -> Self {
+        let mut g = HnswGraph::new(cfg, dim, distance);
+        g.rows = rows;
+        g.links = links;
+        g.entry = entry;
+        g.max_level = max_level;
+        g
+    }
+
+    /// A borrowed view of the durable graph state, for serialization.
+    pub(crate) fn snapshot_ref(&self) -> AnnSnapshotRef<'_> {
+        AnnSnapshotRef::Hnsw {
+            rows: &self.rows,
+            links: &self.links,
+            entry: self.entry,
+            max_level: self.max_level,
         }
     }
 

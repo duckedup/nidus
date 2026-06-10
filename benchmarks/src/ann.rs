@@ -319,6 +319,39 @@ fn run() -> Result<()> {
                     speedup
                 );
             }
+
+            // Persistence: open time with a cold store (graph rebuilt from vectors)
+            // vs a warm one (graph loaded from the persisted `ann` cache) — the
+            // persist_index() win.
+            {
+                let (mut db, guard, _bt) = build(&data, Some(AnnConfig::hnsw()))?;
+                let store_path = guard.path().join("store");
+                let reopen = || {
+                    Config::new(&store_path, dim)
+                        .ann(Some(AnnConfig::hnsw()))
+                        .auto_compact(None)
+                };
+                db.persist_index()?; // write the cache
+                drop(db); // release the writer lock before reopening
+
+                let t = Instant::now();
+                let warm = Nidus::open(reopen())?;
+                let warm_open = t.elapsed();
+                drop(warm);
+
+                std::fs::remove_file(store_path.join("ann")).ok(); // force a rebuild
+                let t = Instant::now();
+                let cold = Nidus::open(reopen())?;
+                let cold_open = t.elapsed();
+                drop(cold);
+
+                println!(
+                    "  open: cold(rebuild)={:>7.2}s   warm(cache)={:>7.3}s   {:.0}x faster",
+                    cold_open.as_secs_f64(),
+                    warm_open.as_secs_f64(),
+                    cold_open.as_secs_f64() / warm_open.as_secs_f64().max(1e-9)
+                );
+            }
         }
     }
     Ok(())
