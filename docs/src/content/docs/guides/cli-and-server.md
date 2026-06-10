@@ -111,9 +111,9 @@ nidus backup     --dir ./store --out ./store.tar.gz
 nidus restore    --in ./store.tar.gz --dir ./restored
 ```
 
-Read-only commands (`search`, `get`, `collections`, `stats`) open the store
-without taking the writer lock, so they can run alongside a writer such as a
-running server.
+Read-only commands (`search`, `list`, `get`, `collections`, `stats`, and
+`backup`) open the store without taking the writer lock, so they can run
+alongside a writer such as a running server.
 
 ## Backup & restore
 

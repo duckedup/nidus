@@ -84,9 +84,11 @@ chunked dot product, an allocation-free top-k scan, and a storage-order
 
 - **Not approximate.** No HNSW/IVF index. 100% recall, by construction.
 - **Not a database.** No SQL, no joins, no transactions across calls.
-- **Not async.** The hot path is CPU-bound; the API is synchronous (see
+- **Not async.** The hot path is CPU-bound; the library API is synchronous (see
   [Embedding in a host app](/guides/integrating/)).
-- **In-process.** You use it as a library; there is no built-in network layer.
+- **In-process by default.** You embed it and call methods directly; when you
+  want it over the wire, an optional [`nidus serve`](/guides/cli-and-server/#server)
+  wraps a store in a small HTTP layer.
 
 Each of those is a deferred *seam*, not a wall — mmap, an ANN index, and scalar
 quantization are all designed-for and additive over the same append-only file.
