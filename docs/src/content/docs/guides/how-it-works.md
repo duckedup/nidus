@@ -4,9 +4,11 @@ description: The nidus storage model and search path, end to end — from upsert
 ---
 
 nidus holds dense vectors plus typed metadata in a single on-disk directory and
-answers nearest-neighbour queries by **exact brute-force scoring** — cosine (the
-default), dot, or Euclidean. There is no ANN index, no query planner, and no
-background thread — the whole thing is a RAM-resident matrix and a small amount of
+answers nearest-neighbour queries over cosine (the default), dot, or Euclidean.
+Scoring is **exact by default** — every in-scope vector is compared — and you can
+opt into an [approximate index](/guides/search/#approximate-search-ann) (HNSW or IVF)
+for larger collections. There is no query planner and no background thread — the
+whole thing is a RAM-resident matrix, an optional in-RAM index, and a small amount of
 write glue.
 
 ## The storage model
@@ -58,9 +60,12 @@ to the entry marks, so a caught `ENOSPC` leaves the store exactly as it was.
 
 ## Search
 
-Search is brute-force scoring (cosine, dot, or Euclidean) over a
+Search scores (cosine, dot, or Euclidean) over a
 [`Scope`](/reference/api/#scope) — one collection, a named subset, or the whole
-store — merged into a single ranking:
+store — merged into a single ranking. By default it is exact (every in-scope row is
+scored); with [`Config::ann`](/guides/search/#approximate-search-ann) set it instead
+walks an approximate index for a candidate set and applies the same scope/filter/rerank
+to those. The exact path is:
 
 1. Resolve the scope to a set of candidate rows.
 2. Apply the metadata [`Filter`](/guides/search/#filters) (before any dot
@@ -82,7 +87,10 @@ chunked dot product, an allocation-free top-k scan, and a storage-order
 
 ## What it deliberately is not
 
-- **Not approximate.** No HNSW/IVF index. 100% recall, by construction.
+- **Exact by default.** The default search compares every in-scope vector — 100%
+  recall, by construction. Approximate indexing (HNSW/IVF) is opt-in via
+  [`Config::ann`](/guides/search/#approximate-search-ann) when you want speed over
+  exactness at larger scale.
 - **Not a database.** No SQL, no joins, no transactions across calls.
 - **Not async.** The hot path is CPU-bound; the library API is synchronous (see
   [Embedding in a host app](/guides/integrating/)).

@@ -3437,6 +3437,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // N=200 HNSW build is slow under Miri; tiny cases cover the path.
     fn ann_post_filter_returns_only_matching() {
         // Half the docs carry kind=a, half kind=b; an ANN query filtered to kind=b must
         // never return a kind=a doc.

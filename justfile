@@ -139,6 +139,14 @@ bench ENGINES="nidus" *ARGS:
 bench-quant *ARGS:
     cargo run -p nidus-bench --release --bin nidus-bench-quant -- {{ARGS}}
 
+# ANN (HNSW + IVF) recall & speed sweep (nidus-only, no engine deps). Sweeps
+# ef_search (HNSW) and n_probe (IVF), reporting recall@k vs exact ground truth,
+# build time, and query speedup vs exact brute force.
+#   just bench-ann                              defaults (n=100k, dim=384/768)
+#   just bench-ann n=50000 dim=768 ef_search=64,128   pass-through args
+bench-ann *ARGS:
+    cargo run -p nidus-bench --release --bin nidus-bench-ann -- {{ARGS}}
+
 # nidus-internal regression benchmarks (criterion); compares against saved baselines.
 # Targets the criterion bench directly so harness args reach it (the lib's libtest
 # harness would otherwise reject them).

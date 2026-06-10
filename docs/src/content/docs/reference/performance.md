@@ -64,15 +64,17 @@ yourself.
 
 ## The target regime
 
-nidus is built for **exact** search at the scale where brute force wins: up to a
+nidus is tuned for **exact** search at the scale where a full scan wins: up to a
 few million vectors, comfortably in RAM. At that size, 100% recall with no index
-to build or tune beats an approximate index — and you never pay for an ANN
-structure you don't need.
+to build or tune beats an approximate index — and exact search is the default, so
+you never pay for an index you don't need.
 
-ANN/HNSW is a [deferred seam](/guides/how-it-works/#what-it-deliberately-is-not),
-not a missing feature: it stays unbuilt until a real consumer hits a scale and
-latency budget brute force can't meet — and even then it must be pure-Rust,
-optional, and additive over the same append-only file.
+Past that scale, an [approximate index](/guides/search/#approximate-search-ann)
+(HNSW or IVF, via `Config::ann`) is available as an opt-in: it trades some recall
+for a smaller candidate walk instead of a full scan. It is pure-Rust, optional, and
+additive over the same append-only file — exact search is unchanged when it is off.
+The benchmark above measures the exact path; run `just bench-ann` to sweep the
+approximate variants' recall and latency on your own shapes.
 
 ## Reproduce it
 

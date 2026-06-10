@@ -1,10 +1,13 @@
 ---
 title: Search & filters
-description: Scoped search across nidus collections with three distance metrics, int8 quantization, metadata-only queries, and equality / glob / set / range filter predicates.
+description: Scoped search across nidus collections with three distance metrics, exact or approximate (HNSW/IVF) indexing, int8 quantization, metadata-only queries, and equality / glob / set / range filter predicates.
 ---
 
-Search in nidus is exact brute-force over a scope you choose, using one of three
-distance metrics, optionally narrowed by a metadata filter and a score floor.
+Search in nidus runs over a scope you choose, using one of three distance metrics,
+optionally narrowed by a metadata filter and a score floor. It is **exact by
+default** — every in-scope vector is scored — and can opt into an
+[approximate index](#approximate-search-ann) (HNSW or IVF) when a full scan is more
+than you want to pay.
 
 ## Distance metrics
 

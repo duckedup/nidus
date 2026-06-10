@@ -1,9 +1,10 @@
 # nidus
 
 A small, pure-Rust **vector store for development and small-scale use**.
-Exact brute-force search — cosine, dot, or Euclidean — over a single append-only
-directory, with typed metadata filters and many logical collections sharing one
-embedding space. No FFI, no C, no SQL, no query engine.
+Nearest-neighbour search — cosine, dot, or Euclidean — over a single append-only
+directory, exact by default or approximate (HNSW/IVF) when you opt in, with typed
+metadata filters and many logical collections sharing one embedding space. No FFI,
+no C, no SQL, no query engine.
 
 > _nidus_ (Latin, "nest") — a small place where things are kept safe.
 
@@ -74,10 +75,11 @@ See [`examples/demo.rs`](examples/demo.rs) for an end-to-end run (`cargo run
 
 ## What it does
 
-- **Exact brute-force search** — 100% recall, fast at the target scale (≤ a few
-  million vectors, comfortably in RAM). Score by cosine, dot, or Euclidean (cosine
-  the default; cosine vectors are unit-normalized on insert, so a score is plain
-  similarity in `[-1, 1]`). Optional int8 quantization trades a rerank pass for speed.
+- **Exact or approximate search** — exact by default (100% recall, fast at the target
+  scale of ≤ a few million vectors, comfortably in RAM). Score by cosine, dot, or
+  Euclidean (cosine the default; cosine vectors are unit-normalized on insert, so a
+  score is plain similarity in `[-1, 1]`). Opt into an approximate index (HNSW or IVF)
+  or int8 quantization to trade some recall for speed at larger scale.
 - **Scoped search** — query one collection, a subset, or the **whole store** in one
   call, merged into a single ranking. Sound because every collection shares one
   embedding space (one pinned dimension).
@@ -214,8 +216,9 @@ Rust 1.96+ (pinned via `rust-toolchain.toml`), edition 2024.
 
 ## Design
 
-The full design — data model, on-disk format, durability/concurrency model, and the
-deferred seams (mmap, ANN/HNSW, scalar quantization, …) — lives in
+The full design — data model, on-disk format, durability/concurrency model, the
+opt-in modes (approximate ANN/HNSW + IVF, scalar/binary quantization), and the
+remaining deferred seams (mmap, …) — lives in
 [`SPEC.md`](SPEC.md). Each module also carries its own contract in `src/<module>/SPEC.md`.
 
 ## License
