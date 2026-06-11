@@ -143,7 +143,13 @@ src/
 ├── log.rs       # op-log codec: len + payload + crc32, replay, torn-tail recovery
 ├── lock.rs      # writer exclusion via O_EXCL lock file (pure std, no flock/FFI)
 ├── crc.rs       # ~15-line table CRC32 (zero-dep checksum)
-├── store.rs     # in-RAM index, write/read glue, compaction
+├── store/       # the integrator, split by concern (see "Keep files focused"):
+│   ├── mod.rs    #   Store type + open/in_memory constructors + ANN index lifecycle glue
+│   ├── scoring.rs#   scan kernels (f32/int8/binary chunk scorers) + parallel-scan engine
+│   ├── quant.rs  #   int8/binary quant state + the quantized two-pass search
+│   ├── read.rs   #   accessors, scan plumbing, exact + ANN search
+│   ├── write.rs  #   upsert/delete/flush/compact + collection lifecycle
+│   └── tests.rs  #   store tests (pure-logic + file-backed + quant/ANN)
 │
 │   # ── `cli` feature only (the `nidus` binary) — compiled with --features cli ──
 ├── bin/nidus.rs # thin entry point: parse args → cli::run
@@ -195,6 +201,19 @@ each.
 - **Codec discipline**: all on-disk encoding is little-endian and explicit; every
   record is length-prefixed and CRC32-checked so a torn tail is detectable and
   recoverable. Test codecs against in-memory buffers (Miri-clean).
+- **Keep files focused — split by concern, not by size cap.** There is no hard line
+  limit, but a module that has grown to cover several distinct concerns should be
+  broken into a directory of sibling files, each owning one concern, with `mod.rs`
+  holding the core type + the glue. `store/` is the worked example: `scoring`,
+  `quant`, `read`, `write`, and `tests` each stand alone. **In Rust this costs almost
+  nothing**: child modules see the parent's private items and private struct fields,
+  so an inherent `impl Store` can span several files with **no** field made `pub`;
+  only a method/type/fn *called across sibling submodules* needs `pub(super)` (e.g.
+  `hits_from_topk`, `rebuild_quant`). Keep state types beside the code that reads
+  their internals (e.g. `Int8State` lives with the quantized search) so their fields
+  stay private. When you add a big new concern to an already-large module, prefer a
+  new sibling file over appending to it — and move the matching tests into the
+  module's own `tests.rs` rather than growing one giant test block.
 - **Commit style**: emoji prefix + short description (e.g. `🪺 op-log codec`).
 - **Issue tracking**: `bd` (beads) — run `bd ready` for available work.
 - **Branch workflow**: one branch per issue or bundled epic, push for PR review.
@@ -223,7 +242,18 @@ Keep the public framing open: do NOT pin it down as "an embeddable library" (or
 today, neutrally, without limiting where it can go. (A server is one of the
 deferred seams in `SPEC.md` §9 — internal context, not a public commitment.)
 
+**Bump the version in EVERY PR — releases are automatic.** `.github/workflows/release.yml`
+runs on push to `main`: it reads `version` from `Cargo.toml`, and releases (tag
+`v<version>`, GitHub release, prebuilt `cargo binstall` binaries) **only if that tag
+does not already exist**. So a PR that doesn't bump `version` ships nothing — the tag
+is already there and the release is silently skipped. Every PR with a user-visible or
+behavioural change MUST bump `Cargo.toml` `version` (semver: patch for fixes/refactors,
+minor for new features/behaviour, major for breaking API). Pure-internal no-op churn
+is the only exception.
+
 **Version sync — on every crate version bump, bump the docs too.** When you change
 `version` in `Cargo.toml`, update the install-snippet version string in BOTH the
 docs (`docs/src/content/docs/getting-started.md`) and `README.md` to match (e.g.
-`nidus = "0.3"`). Those `[dependencies]` examples must not lag the released crate.
+`nidus = "0.3"`) — but only when the `major.minor` changes, since the snippets pin
+`major.minor` (a patch bump like `0.12.1 → 0.12.2` leaves `nidus = "0.12"` correct).
+Those `[dependencies]` examples must not lag the released crate.
