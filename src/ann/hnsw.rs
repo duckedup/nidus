@@ -9,8 +9,10 @@
 //! search at layer 0; the best candidates (mapped back to rows) are returned for the
 //! store to filter and rerank.
 //!
-//! Everything scores with [`ScoreFn`] where **higher = nearer**, so the beam is a
-//! "keep the highest scores" collector and "closer" means "higher score".
+//! Everything scores through the [`Walk`] where **higher = nearer**, so the beam is a
+//! "keep the highest scores" collector and "closer" means "higher score". The walk is
+//! exact f32 by default, or quantized int8/binary codes when the store combines ANN with
+//! quantization (nidus-ndu) — build and search then run in that same quantized space.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -18,8 +20,7 @@ use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-use crate::ann::{AnnSnapshotRef, ScoreFn, SplitMix64, score_fn_for};
-use crate::data::DataSegment;
+use crate::ann::{AnnSnapshotRef, SplitMix64, Walk};
 use crate::model::{AnnConfig, Distance};
 
 /// A `(score, node)` pair ordered by score, for the search heaps. `total_cmp` keeps
@@ -70,7 +71,6 @@ impl Ord for MinScored {
 
 pub(crate) struct HnswGraph {
     dim: usize,
-    score_fn: ScoreFn,
     /// Tunables from [`AnnConfig`].
     m: usize,
     m_max0: usize,
@@ -90,13 +90,12 @@ pub(crate) struct HnswGraph {
 }
 
 impl HnswGraph {
-    pub(crate) fn new(cfg: AnnConfig, dim: usize, distance: Distance) -> Self {
+    pub(crate) fn new(cfg: AnnConfig, dim: usize, _distance: Distance) -> Self {
         let m = cfg.m.max(1);
         // ln(1) == 0 would divide by zero; m == 1 degenerates to a single layer.
         let level_mult = if m > 1 { 1.0 / (m as f64).ln() } else { 0.0 };
         HnswGraph {
             dim,
-            score_fn: score_fn_for(distance),
             m,
             m_max0: m.saturating_mul(2).max(1),
             ef_construction: cfg.ef_construction.max(1),
@@ -139,7 +138,7 @@ impl HnswGraph {
         }
     }
 
-    pub(crate) fn build(&mut self, data: &DataSegment, live_rows: &[u64], workers: usize) {
+    pub(crate) fn build(&mut self, walk: &Walk, live_rows: &[u64], workers: usize) {
         self.rows.clear();
         self.links.clear();
         self.entry = None;
@@ -148,18 +147,18 @@ impl HnswGraph {
         // upserts stay serial (and deterministic). The serial path is byte-identical
         // to before this knob existed.
         if workers > 1 && self.dim > 0 && live_rows.len() >= PARALLEL_BUILD_MIN {
-            self.build_parallel(data, live_rows, workers);
+            self.build_parallel(walk, live_rows, workers);
         } else {
-            self.insert_rows(data, live_rows);
+            self.insert_rows(walk, live_rows);
         }
     }
 
-    pub(crate) fn insert_rows(&mut self, data: &DataSegment, rows: &[u64]) {
+    pub(crate) fn insert_rows(&mut self, walk: &Walk, rows: &[u64]) {
         if self.dim == 0 {
             return;
         }
         for &row in rows {
-            self.insert_one(data, row);
+            self.insert_one(walk, row);
         }
     }
 
@@ -174,7 +173,7 @@ impl HnswGraph {
         (-u.ln() * self.level_mult).floor() as usize
     }
 
-    fn insert_one(&mut self, data: &DataSegment, row: u64) {
+    fn insert_one(&mut self, walk: &Walk, row: u64) {
         let node = self.rows.len() as u32;
         let level = self.random_level();
         self.rows.push(row);
@@ -187,13 +186,15 @@ impl HnswGraph {
             return;
         };
 
-        let q = data.row(row);
+        // The "query" is the inserting row; score every node against it via the walk
+        // (quantized codes or exact f32). `score(r)` = nearness of physical row `r` to it.
+        let score = |r: u64| walk.score_rows(row, r);
         let mut ep = entry;
 
         // Greedy descent through the layers above `level` (beam of 1).
         let mut lc = self.max_level;
         while lc > level {
-            ep = self.greedy_descend(data, q, ep, lc);
+            ep = self.greedy_descend(&score, ep, lc);
             lc -= 1;
         }
 
@@ -202,14 +203,14 @@ impl HnswGraph {
         let mut entry_points = vec![ep];
         while lc >= 0 {
             let level_u = lc as usize;
-            let found = self.search_layer(data, q, &entry_points, self.ef_construction, level_u);
+            let found = self.search_layer(&score, &entry_points, self.ef_construction, level_u);
             let m = if level_u == 0 { self.m_max0 } else { self.m };
-            let selected = self.select_neighbors(data, &found, m);
+            let selected = self.select_neighbors(walk, &found, m);
 
             for &nbr in &selected {
                 self.connect(node, nbr, level_u);
                 self.connect(nbr, node, level_u);
-                self.prune(data, nbr, level_u);
+                self.prune(walk, nbr, level_u);
             }
 
             entry_points = found.iter().map(|s| s.node).collect();
@@ -226,14 +227,16 @@ impl HnswGraph {
     }
 
     /// One greedy hop-to-the-best walk at `level`, returning the nearest node found.
-    fn greedy_descend(&self, data: &DataSegment, q: &[f32], entry: u32, level: usize) -> u32 {
+    /// `score(row)` gives the nearness of physical `row` to the fixed probe (an inserting
+    /// row during build, the encoded query during search).
+    fn greedy_descend(&self, score: &impl Fn(u64) -> f32, entry: u32, level: usize) -> u32 {
         let mut cur = entry;
-        let mut cur_score = (self.score_fn)(q, data.row(self.rows[cur as usize]));
+        let mut cur_score = score(self.rows[cur as usize]);
         loop {
             let mut improved = false;
             if let Some(neighbors) = self.links[cur as usize].get(level) {
                 for &nbr in neighbors {
-                    let s = (self.score_fn)(q, data.row(self.rows[nbr as usize]));
+                    let s = score(self.rows[nbr as usize]);
                     if s > cur_score {
                         cur_score = s;
                         cur = nbr;
@@ -248,11 +251,10 @@ impl HnswGraph {
     }
 
     /// Beam search at `level`: explore from `entry_points`, keeping the `ef` nearest
-    /// nodes. Returns them best-first.
+    /// nodes. Returns them best-first. `score` is the probe scorer (see [`greedy_descend`]).
     fn search_layer(
         &self,
-        data: &DataSegment,
-        q: &[f32],
+        score: &impl Fn(u64) -> f32,
         entry_points: &[u32],
         ef: usize,
         level: usize,
@@ -268,7 +270,7 @@ impl HnswGraph {
                 continue;
             }
             visited[ep as usize] = true;
-            let s = (self.score_fn)(q, data.row(self.rows[ep as usize]));
+            let s = score(self.rows[ep as usize]);
             let sc = Scored { score: s, node: ep };
             candidates.push(sc);
             result.push(MinScored(sc));
@@ -290,7 +292,7 @@ impl HnswGraph {
                         continue;
                     }
                     visited[nbr as usize] = true;
-                    let s = (self.score_fn)(q, data.row(self.rows[nbr as usize]));
+                    let s = score(self.rows[nbr as usize]);
                     let worst = result
                         .peek()
                         .map(|m| m.0.score)
@@ -319,8 +321,8 @@ impl HnswGraph {
     /// one only if it is nearer to the base than to any already-kept neighbour. This
     /// spreads links across directions (better navigability) instead of clustering them
     /// all toward the single nearest region.
-    fn select_neighbors(&self, data: &DataSegment, candidates: &[Scored], m: usize) -> Vec<u32> {
-        select_neighbors(&self.rows, data, self.score_fn, candidates, m)
+    fn select_neighbors(&self, walk: &Walk, candidates: &[Scored], m: usize) -> Vec<u32> {
+        select_neighbors(&self.rows, walk, candidates, m)
     }
 
     /// Add `to` to `from`'s adjacency at `level` (deduplicated).
@@ -337,28 +339,28 @@ impl HnswGraph {
     /// Trim `node`'s level-`level` adjacency back to the level cap using the same
     /// selection heuristic, so bidirectional inserts never let a node's degree grow
     /// without bound.
-    fn prune(&mut self, data: &DataSegment, node: u32, level: usize) {
+    fn prune(&mut self, walk: &Walk, node: u32, level: usize) {
         let cap = if level == 0 { self.m_max0 } else { self.m };
         let adj = &self.links[node as usize][level];
         if adj.len() <= cap {
             return;
         }
-        let base = data.row(self.rows[node as usize]);
+        let base = self.rows[node as usize];
         let mut scored: Vec<Scored> = adj
             .iter()
             .map(|&n| Scored {
-                score: (self.score_fn)(base, data.row(self.rows[n as usize])),
+                score: walk.score_rows(base, self.rows[n as usize]),
                 node: n,
             })
             .collect();
         scored.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
-        let kept = self.select_neighbors(data, &scored, cap);
+        let kept = self.select_neighbors(walk, &scored, cap);
         self.links[node as usize][level] = kept;
     }
 
     pub(crate) fn search(
         &self,
-        data: &DataSegment,
+        walk: &Walk,
         query: &[f32],
         n_candidates: usize,
     ) -> Vec<(u64, f32)> {
@@ -369,16 +371,21 @@ impl HnswGraph {
             return Vec::new();
         };
 
+        // Encode the query once for the walk's metric, then score every visited row
+        // against it. Quantized when the walk carries a codebook, exact f32 otherwise.
+        let qs = walk.query_scorer(query);
+        let score = |r: u64| qs.score(r);
+
         // Descend the upper layers greedily, then beam-search layer 0 with a beam wide
         // enough to surface `n_candidates`.
         let mut ep = entry;
         let mut lc = self.max_level;
         while lc > 0 {
-            ep = self.greedy_descend(data, query, ep, lc);
+            ep = self.greedy_descend(&score, ep, lc);
             lc -= 1;
         }
         let ef = self.ef_search.max(n_candidates);
-        let mut found = self.search_layer(data, query, &[ep], ef, 0);
+        let mut found = self.search_layer(&score, &[ep], ef, 0);
         found.truncate(n_candidates);
         found
             .into_iter()
@@ -393,7 +400,7 @@ impl HnswGraph {
     /// there is no deadlock; safe Rust rules out data races, so the only effect of
     /// concurrency is that the graph (and thus exact recall) varies slightly with the
     /// thread count — determinism holds only on the serial path.
-    fn build_parallel(&mut self, data: &DataSegment, live_rows: &[u64], workers: usize) {
+    fn build_parallel(&mut self, walk: &Walk, live_rows: &[u64], workers: usize) {
         let n = live_rows.len();
         self.rows = live_rows.to_vec();
         let levels: Vec<usize> = (0..n).map(|_| self.random_level()).collect();
@@ -404,8 +411,7 @@ impl HnswGraph {
         // Seed the entry with node 0; higher-level nodes promote it as they insert.
         let entry_state = RwLock::new((0u32, levels[0]));
         let counter = AtomicUsize::new(1); // node 0 is the seed; insert 1..n
-        let (m, m_max0, ef_c, score_fn) =
-            (self.m, self.m_max0, self.ef_construction, self.score_fn);
+        let (m, m_max0, ef_c) = (self.m, self.m_max0, self.ef_construction);
         let rows = &self.rows;
         let links_ref = &links;
         let entry_ref = &entry_state;
@@ -421,8 +427,7 @@ impl HnswGraph {
                             break;
                         }
                         insert_locked(
-                            i as u32, rows, data, score_fn, links_ref, entry_ref, levels_ref, m,
-                            m_max0, ef_c,
+                            i as u32, rows, walk, links_ref, entry_ref, levels_ref, m, m_max0, ef_c,
                         );
                     }
                 });
@@ -444,23 +449,16 @@ const PARALLEL_BUILD_MIN: usize = 1024;
 /// parallel builder share one implementation). Walks candidates nearest-first, keeping
 /// one only if it is nearer to the base than to any already-kept neighbour; tops up
 /// with the nearest remaining if the heuristic underfills `m`.
-fn select_neighbors(
-    rows: &[u64],
-    data: &DataSegment,
-    score_fn: ScoreFn,
-    candidates: &[Scored],
-    m: usize,
-) -> Vec<u32> {
+fn select_neighbors(rows: &[u64], walk: &Walk, candidates: &[Scored], m: usize) -> Vec<u32> {
     let mut selected: Vec<u32> = Vec::with_capacity(m);
     for cand in candidates {
         if selected.len() >= m {
             break;
         }
-        let cand_row = data.row(rows[cand.node as usize]);
-        let keep = selected.iter().all(|&r| {
-            let r_row = data.row(rows[r as usize]);
-            cand.score >= score_fn(cand_row, r_row)
-        });
+        let cand_row = rows[cand.node as usize];
+        let keep = selected
+            .iter()
+            .all(|&r| cand.score >= walk.score_rows(cand_row, rows[r as usize]));
         if keep {
             selected.push(cand.node);
         }
@@ -485,22 +483,21 @@ fn nbrs_locked(links: &[Mutex<Vec<Vec<u32>>>], node: u32, level: usize) -> Vec<u
     g.get(level).cloned().unwrap_or_default()
 }
 
-/// Locked variant of `greedy_descend` for the parallel build.
+/// Locked variant of `greedy_descend` for the parallel build. `score(row)` is the
+/// inserting row's walk scorer (see [`HnswGraph::greedy_descend`]).
 fn greedy_descend_locked(
     rows: &[u64],
-    data: &DataSegment,
-    score_fn: ScoreFn,
+    score: &impl Fn(u64) -> f32,
     links: &[Mutex<Vec<Vec<u32>>>],
-    q: &[f32],
     entry: u32,
     level: usize,
 ) -> u32 {
     let mut cur = entry;
-    let mut cur_score = score_fn(q, data.row(rows[cur as usize]));
+    let mut cur_score = score(rows[cur as usize]);
     loop {
         let mut improved = false;
         for nbr in nbrs_locked(links, cur, level) {
-            let s = score_fn(q, data.row(rows[nbr as usize]));
+            let s = score(rows[nbr as usize]);
             if s > cur_score {
                 cur_score = s;
                 cur = nbr;
@@ -517,10 +514,8 @@ fn greedy_descend_locked(
 #[allow(clippy::too_many_arguments)]
 fn search_layer_locked(
     rows: &[u64],
-    data: &DataSegment,
-    score_fn: ScoreFn,
+    score: &impl Fn(u64) -> f32,
     links: &[Mutex<Vec<Vec<u32>>>],
-    q: &[f32],
     entry_points: &[u32],
     ef: usize,
     level: usize,
@@ -535,7 +530,7 @@ fn search_layer_locked(
             continue;
         }
         visited[ep as usize] = true;
-        let s = score_fn(q, data.row(rows[ep as usize]));
+        let s = score(rows[ep as usize]);
         let sc = Scored { score: s, node: ep };
         candidates.push(sc);
         result.push(MinScored(sc));
@@ -554,7 +549,7 @@ fn search_layer_locked(
                 continue;
             }
             visited[nbr as usize] = true;
-            let s = score_fn(q, data.row(rows[nbr as usize]));
+            let s = score(rows[nbr as usize]);
             let worst = result
                 .peek()
                 .map(|m| m.0.score)
@@ -584,8 +579,7 @@ fn search_layer_locked(
 #[allow(clippy::too_many_arguments)]
 fn link_and_prune(
     rows: &[u64],
-    data: &DataSegment,
-    score_fn: ScoreFn,
+    walk: &Walk,
     links: &[Mutex<Vec<Vec<u32>>>],
     node: u32,
     nbr: u32,
@@ -612,16 +606,16 @@ fn link_and_prune(
         }
         let cap = if level == 0 { m_max0 } else { m };
         if g_nbr[level].len() > cap {
-            let base = data.row(rows[nbr as usize]);
+            let base = rows[nbr as usize];
             let mut scored: Vec<Scored> = g_nbr[level]
                 .iter()
                 .map(|&x| Scored {
-                    score: score_fn(base, data.row(rows[x as usize])),
+                    score: walk.score_rows(base, rows[x as usize]),
                     node: x,
                 })
                 .collect();
             scored.sort_unstable_by(|x, y| y.score.total_cmp(&x.score));
-            g_nbr[level] = select_neighbors(rows, data, score_fn, &scored, cap);
+            g_nbr[level] = select_neighbors(rows, walk, &scored, cap);
         }
     }
 }
@@ -631,8 +625,7 @@ fn link_and_prune(
 fn insert_locked(
     node: u32,
     rows: &[u64],
-    data: &DataSegment,
-    score_fn: ScoreFn,
+    walk: &Walk,
     links: &[Mutex<Vec<Vec<u32>>>],
     entry_state: &RwLock<(u32, usize)>,
     levels: &[usize],
@@ -640,7 +633,9 @@ fn insert_locked(
     m_max0: usize,
     ef_c: usize,
 ) {
-    let q = data.row(rows[node as usize]);
+    // Score every node against this inserting row, via the walk (quantized or exact).
+    let node_row = rows[node as usize];
+    let score = |r: u64| walk.score_rows(node_row, r);
     let node_level = levels[node as usize];
     let (mut ep, top) = {
         let g = entry_state.read().unwrap();
@@ -650,7 +645,7 @@ fn insert_locked(
     // Greedy descent through the layers above this node's level.
     let mut lc = top;
     while lc > node_level {
-        ep = greedy_descend_locked(rows, data, score_fn, links, q, ep, lc);
+        ep = greedy_descend_locked(rows, &score, links, ep, lc);
         lc -= 1;
     }
 
@@ -659,22 +654,13 @@ fn insert_locked(
     let mut entry_points = vec![ep];
     while lc >= 0 {
         let level = lc as usize;
-        let found = search_layer_locked(
-            rows,
-            data,
-            score_fn,
-            links,
-            q,
-            &entry_points,
-            ef_c,
-            level,
-            rows.len(),
-        );
+        let found =
+            search_layer_locked(rows, &score, links, &entry_points, ef_c, level, rows.len());
         let cap = if level == 0 { m_max0 } else { m };
-        let selected = select_neighbors(rows, data, score_fn, &found, cap);
+        let selected = select_neighbors(rows, walk, &found, cap);
         for &nbr in &selected {
             if nbr != node {
-                link_and_prune(rows, data, score_fn, links, node, nbr, level, m, m_max0);
+                link_and_prune(rows, walk, links, node, nbr, level, m, m_max0);
             }
         }
         entry_points = found.iter().map(|s| s.node).collect();
@@ -695,6 +681,7 @@ fn insert_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::DataSegment;
     use crate::model::AnnConfig;
 
     /// A tiny in-memory `DataSegment` of unit-ish vectors for Miri-clean graph tests.
@@ -709,7 +696,7 @@ mod tests {
     fn build_graph(data: &DataSegment, n: u64) -> HnswGraph {
         let mut g = HnswGraph::new(AnnConfig::hnsw(), data.dimension(), Distance::Cosine);
         let live: Vec<u64> = (0..n).collect();
-        g.build(data, &live, 1);
+        g.build(&Walk::exact(data, Distance::Cosine), &live, 1);
         g
     }
 
@@ -717,7 +704,10 @@ mod tests {
     fn empty_graph_returns_nothing() {
         let data = seg(3, &[]);
         let g = build_graph(&data, 0);
-        assert!(g.search(&data, &[1.0, 0.0, 0.0], 5).is_empty());
+        assert!(
+            g.search(&Walk::exact(&data, Distance::Cosine), &[1.0, 0.0, 0.0], 5)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -732,7 +722,7 @@ mod tests {
             ],
         );
         let g = build_graph(&data, 3);
-        let hits = g.search(&data, &[0.0, 1.0, 0.0], 1);
+        let hits = g.search(&Walk::exact(&data, Distance::Cosine), &[0.0, 1.0, 0.0], 1);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, 1, "row 1 is the exact match");
     }
@@ -749,7 +739,7 @@ mod tests {
             ],
         );
         let g = build_graph(&data, 4);
-        let hits = g.search(&data, &[1.0, 0.0], 4);
+        let hits = g.search(&Walk::exact(&data, Distance::Cosine), &[1.0, 0.0], 4);
         // Scores must be non-increasing.
         for w in hits.windows(2) {
             assert!(w[0].1 >= w[1].1, "candidates not best-first: {hits:?}");
@@ -778,9 +768,15 @@ mod tests {
         let data = seg(2, &rows);
         let mut g = HnswGraph::new(AnnConfig::hnsw(), 2, Distance::Cosine);
         // Insert in two incremental batches.
-        g.insert_rows(&data, &(0..10).collect::<Vec<_>>());
-        g.insert_rows(&data, &(10..20).collect::<Vec<_>>());
-        let hits = g.search(&data, &rows[7], 1);
+        g.insert_rows(
+            &Walk::exact(&data, Distance::Cosine),
+            &(0..10).collect::<Vec<_>>(),
+        );
+        g.insert_rows(
+            &Walk::exact(&data, Distance::Cosine),
+            &(10..20).collect::<Vec<_>>(),
+        );
+        let hits = g.search(&Walk::exact(&data, Distance::Cosine), &rows[7], 1);
         assert_eq!(hits[0].0, 7, "self should be the nearest neighbour");
     }
 }

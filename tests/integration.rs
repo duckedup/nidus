@@ -244,6 +244,79 @@ fn ann_index_incremental_catchup_after_persist() {
     assert_eq!(hits.len(), 2, "both rows present");
 }
 
+/// ANN combined with quantization (nidus-ndu): the quantized-walk index persists and
+/// reloads, ranking identically, and the f32 rerank keeps the self-query exact.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn ann_with_int8_quantization_persists_and_reloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = || {
+        Config::new(dir.path(), 3)
+            .ann(Some(AnnConfig::hnsw()))
+            .quantization(Some(Quantization::default()))
+    };
+    let query = [0.0, 1.0, 0.0];
+
+    let before = {
+        let mut db = Nidus::open(cfg()).unwrap();
+        db.upsert(
+            "c",
+            &[
+                ann_rec("a", vec![1.0, 0.0, 0.0]),
+                ann_rec("b", vec![0.0, 1.0, 0.0]),
+                ann_rec("c", vec![0.0, 0.0, 1.0]),
+            ],
+        )
+        .unwrap();
+        let hits = db.search("c", &query, &opts(3)).unwrap();
+        db.persist_index().unwrap();
+        hits
+    };
+    assert_eq!(before[0].id, "b", "exact rerank surfaces the true nearest");
+
+    let db = Nidus::open(cfg()).unwrap();
+    let after = db.search("c", &query, &opts(3)).unwrap();
+    let ids_before: Vec<_> = before.iter().map(|h| &h.id).collect();
+    let ids_after: Vec<_> = after.iter().map(|h| &h.id).collect();
+    assert_eq!(
+        ids_before, ids_after,
+        "quantized-walk cache reloads identically"
+    );
+}
+
+/// Changing the quantization config invalidates the ANN cache (it encodes the quant
+/// kind in its validity key), so a reopen rebuilds rather than walking a graph built in
+/// a different space.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn ann_cache_invalidated_by_quant_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let recs = [
+        ann_rec("a", vec![1.0, 0.0, 0.0]),
+        ann_rec("b", vec![0.0, 1.0, 0.0]),
+    ];
+    {
+        let mut db = Nidus::open(
+            Config::new(dir.path(), 3)
+                .ann(Some(AnnConfig::hnsw()))
+                .quantization(Some(Quantization::default())),
+        )
+        .unwrap();
+        db.upsert("c", &recs).unwrap();
+        db.persist_index().unwrap();
+    }
+    // Reopen with binary quantization instead of int8: the cached graph is in int8
+    // space, so it must be discarded and rebuilt. The query still returns correctly.
+    let db = Nidus::open(
+        Config::new(dir.path(), 3)
+            .ann(Some(AnnConfig::hnsw()))
+            .quantization(Some(Quantization::binary())),
+    )
+    .unwrap();
+    let hits = db.search("c", &[0.0, 1.0, 0.0], &opts(2)).unwrap();
+    assert_eq!(hits[0].id, "b", "rebuilt index searches correctly");
+}
+
 /// A corrupt cache file is silently discarded and the index rebuilt — no error.
 #[cfg_attr(miri, ignore)]
 #[test]

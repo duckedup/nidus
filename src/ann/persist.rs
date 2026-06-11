@@ -18,7 +18,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::ann::{Ann, AnnSnapshot};
-use crate::model::{AnnConfig, AnnKind, Distance};
+use crate::model::{AnnConfig, AnnKind, Distance, QuantKind};
 
 /// Magic bytes: "NIDUS\0" (shared convention with `data`/`log`).
 const MAGIC: &[u8; 6] = b"NIDUS\0";
@@ -42,12 +42,24 @@ fn distance_to_byte(d: Distance) -> u8 {
     }
 }
 
-/// Encode the header for a cache valid only for this exact `(dim, distance, cfg,
+/// The quantization space the graph/lists were built in. Part of the validity key: a
+/// graph built with int8 codes is navigated in int8 space, so a cache built under a
+/// different quantization config must be discarded and rebuilt (nidus-ndu).
+fn quant_to_byte(quant: Option<QuantKind>) -> u8 {
+    match quant {
+        None => 0,
+        Some(QuantKind::Int8) => 1,
+        Some(QuantKind::Binary) => 2,
+    }
+}
+
+/// Encode the header for a cache valid only for this exact `(dim, distance, cfg, quant,
 /// covered_rows)` tuple — any mismatch on load means "rebuild".
 fn encode_header(
     dim: usize,
     distance: Distance,
     cfg: &AnnConfig,
+    quant: Option<QuantKind>,
     covered_rows: u64,
 ) -> [u8; HEADER_LEN] {
     let mut b = [0u8; HEADER_LEN];
@@ -55,7 +67,8 @@ fn encode_header(
     b[6..8].copy_from_slice(&VERSION.to_le_bytes());
     b[8] = kind_to_byte(cfg.kind);
     b[9] = distance_to_byte(distance);
-    // 10..12 pad
+    b[10] = quant_to_byte(quant);
+    // 11..12 pad
     b[12..16].copy_from_slice(&(dim as u32).to_le_bytes());
     b[16..24].copy_from_slice(&covered_rows.to_le_bytes());
     b[24..28].copy_from_slice(&(cfg.m as u32).to_le_bytes());
@@ -67,6 +80,7 @@ fn encode_header(
 
 /// Save the index to `path` atomically. `covered_rows` is the live row count the
 /// index reflects (so a later `open` knows how many rows to incrementally catch up).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn save(
     path: &Path,
     ann: &Ann,
@@ -74,11 +88,12 @@ pub(crate) fn save(
     dim: usize,
     distance: Distance,
     cfg: &AnnConfig,
+    quant: Option<QuantKind>,
 ) -> Result<()> {
     let payload =
         bincode::serialize(&ann.snapshot_ref()).context("serialize ANN index snapshot")?;
     let crc = crc32fast::hash(&payload);
-    let header = encode_header(dim, distance, cfg, covered_rows);
+    let header = encode_header(dim, distance, cfg, quant, covered_rows);
 
     // Atomic: write to a temp sibling, fsync, then rename over the target.
     let tmp = path.with_extension("ann.tmp");
@@ -99,7 +114,7 @@ pub(crate) fn save(
 }
 
 /// Load the index from `path` if present and valid for the current `(dim, distance,
-/// cfg)`. Returns `Ok(None)` — never an error — when the cache is absent, stale, or
+/// cfg, quant)`. Returns `Ok(None)` — never an error — when the cache is absent, stale, or
 /// corrupt; the caller rebuilds. On success returns the index and the row count it
 /// covers (the caller incrementally catches up any rows added since).
 pub(crate) fn load(
@@ -107,6 +122,7 @@ pub(crate) fn load(
     dim: usize,
     distance: Distance,
     cfg: &AnnConfig,
+    quant: Option<QuantKind>,
 ) -> Result<Option<(Ann, u64)>> {
     let mut f = match File::open(path) {
         Ok(f) => f,
@@ -122,9 +138,9 @@ pub(crate) fn load(
     if bytes.len() < HEADER_LEN + 4 {
         return Ok(None);
     }
-    let expected = encode_header(dim, distance, cfg, 0);
+    let expected = encode_header(dim, distance, cfg, quant, 0);
     // Compare every header field except the covered_rows slot (16..24), which is data,
-    // not a validity key.
+    // not a validity key. The quant byte lives at offset 10, inside the [..16] range.
     let header = &bytes[..HEADER_LEN];
     let matches = header[..16] == expected[..16] && header[24..44] == expected[24..44];
     if !matches {
@@ -150,6 +166,7 @@ pub(crate) fn load(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ann::Walk;
     use crate::data::DataSegment;
 
     fn seg(dim: usize, rows: &[Vec<f32>]) -> DataSegment {
@@ -171,7 +188,7 @@ mod tests {
     ) -> Vec<u8> {
         let payload = bincode::serialize(&ann.snapshot_ref()).unwrap();
         let crc = crc32fast::hash(&payload);
-        let mut out = encode_header(dim, distance, cfg, covered).to_vec();
+        let mut out = encode_header(dim, distance, cfg, None, covered).to_vec();
         out.extend_from_slice(&payload);
         out.extend_from_slice(&crc.to_le_bytes());
         out
@@ -186,7 +203,7 @@ mod tests {
         if bytes.len() < HEADER_LEN + 4 {
             return None;
         }
-        let expected = encode_header(dim, distance, cfg, 0);
+        let expected = encode_header(dim, distance, cfg, None, 0);
         let header = &bytes[..HEADER_LEN];
         if header[..16] != expected[..16] || header[24..44] != expected[24..44] {
             return None;
@@ -213,13 +230,13 @@ mod tests {
         );
         let cfg = AnnConfig::hnsw();
         let mut ann = Ann::empty(cfg, 3, Distance::Cosine);
-        ann.build(&data, &[0, 1, 2], 1);
-        let before = ann.search(&data, &[0.0, 1.0, 0.0], 3);
+        ann.build(&Walk::exact(&data, Distance::Cosine), &[0, 1, 2], 1);
+        let before = ann.search(&Walk::exact(&data, Distance::Cosine), &[0.0, 1.0, 0.0], 3);
 
         let bytes = roundtrip_bytes(&ann, 3, Distance::Cosine, &cfg, 3);
         let (restored, covered) = decode_bytes(&bytes, 3, Distance::Cosine, &cfg).unwrap();
         assert_eq!(covered, 3);
-        let after = restored.search(&data, &[0.0, 1.0, 0.0], 3);
+        let after = restored.search(&Walk::exact(&data, Distance::Cosine), &[0.0, 1.0, 0.0], 3);
         assert_eq!(before, after, "restored graph must search identically");
     }
 
@@ -234,12 +251,16 @@ mod tests {
         let data = seg(2, &rows);
         let cfg = AnnConfig::ivf().n_lists(4);
         let mut ann = Ann::empty(cfg, 2, Distance::Cosine);
-        ann.build(&data, &(0..20).collect::<Vec<_>>(), 1);
-        let before = ann.search(&data, &rows[5], 5);
+        ann.build(
+            &Walk::exact(&data, Distance::Cosine),
+            &(0..20).collect::<Vec<_>>(),
+            1,
+        );
+        let before = ann.search(&Walk::exact(&data, Distance::Cosine), &rows[5], 5);
 
         let bytes = roundtrip_bytes(&ann, 2, Distance::Cosine, &cfg, 20);
         let (restored, _) = decode_bytes(&bytes, 2, Distance::Cosine, &cfg).unwrap();
-        let after = restored.search(&data, &rows[5], 5);
+        let after = restored.search(&Walk::exact(&data, Distance::Cosine), &rows[5], 5);
         assert_eq!(before, after);
     }
 
@@ -248,7 +269,7 @@ mod tests {
         let data = seg(2, &[vec![1.0, 0.0], vec![0.0, 1.0]]);
         let cfg = AnnConfig::hnsw().m(16);
         let mut ann = Ann::empty(cfg, 2, Distance::Cosine);
-        ann.build(&data, &[0, 1], 1);
+        ann.build(&Walk::exact(&data, Distance::Cosine), &[0, 1], 1);
         let bytes = roundtrip_bytes(&ann, 2, Distance::Cosine, &cfg, 2);
 
         // Different m → cache invalid → None.
@@ -265,7 +286,7 @@ mod tests {
         let data = seg(2, &[vec![1.0, 0.0], vec![0.0, 1.0]]);
         let cfg = AnnConfig::hnsw();
         let mut ann = Ann::empty(cfg, 2, Distance::Cosine);
-        ann.build(&data, &[0, 1], 1);
+        ann.build(&Walk::exact(&data, Distance::Cosine), &[0, 1], 1);
         let mut bytes = roundtrip_bytes(&ann, 2, Distance::Cosine, &cfg, 2);
         // Flip a payload byte; CRC must catch it.
         let mid = HEADER_LEN + 1;

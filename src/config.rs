@@ -64,8 +64,9 @@ pub struct Config {
     /// ([`crate::AnnConfig::hnsw`] or [`crate::AnnConfig::ivf`]) and `search` walks it
     /// for an over-fetched candidate set, then applies the scope/filter/`min_score`
     /// and an exact f32 rerank. Approximate: trades recall for speed past brute-force's
-    /// comfort zone. Mutually exclusive with [`Config::quantization`] — enabling both
-    /// is rejected at `open`.
+    /// comfort zone. May be combined with [`Config::quantization`]: the index walk then
+    /// scores quantized codes for cheaper candidate selection and the exact f32 rerank
+    /// restores accuracy (a quantized walk + exact rerank).
     pub ann: Option<AnnConfig>,
     /// Worker threads for a single search. Default `1` (single-threaded, no behavior
     /// change). When `> 1`, a large scan is split across this many `std::thread::scope`
@@ -138,7 +139,8 @@ impl Config {
     }
 
     /// Enable approximate-nearest-neighbour search (HNSW or IVF; `None` disables —
-    /// the default exact brute-force). Mutually exclusive with quantization.
+    /// the default exact brute-force). May be combined with quantization for a quantized
+    /// index walk plus an exact f32 rerank.
     pub fn ann(mut self, ann: Option<AnnConfig>) -> Self {
         self.ann = ann;
         self

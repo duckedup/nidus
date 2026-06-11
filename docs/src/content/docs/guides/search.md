@@ -266,5 +266,7 @@ derived data: deleting the `ann` file only costs a one-time rebuild.
   queries, exact search (the default) may serve you better.
 - **Deletes.** A deleted vector leaves a stale node in the index that is skipped at
   query time and fully reclaimed on the next `compact()`.
-- **One or the other.** `ann` and `quantization` both replace the search path and
-  cannot be enabled together (it is rejected at `open`).
+- **Combine with quantization.** `ann` and `quantization` can be enabled together: the
+  index walk scores quantized codes (a cheaper candidate selection) and the exact f32
+  rerank over those candidates restores accuracy. Recall runs a little below the
+  exact-walk index, so widen `ef_search`/`n_probe` and `overscan` if you need it back.

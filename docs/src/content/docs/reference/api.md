@@ -221,5 +221,6 @@ pub struct AnnConfig {
 //           .overscan(), .seed()
 ```
 
-Mutually exclusive with [`Quantization`](#quantization) — enabling both is rejected
-at `open`.
+May be combined with [`Quantization`](#quantization): the index walk then scores
+quantized codes for cheaper candidate selection, and the exact f32 rerank over the
+resulting candidates restores accuracy.

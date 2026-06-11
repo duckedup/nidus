@@ -103,8 +103,9 @@ pub enum AnnKind {
 /// traded for speed past brute-force's comfort zone (≫ a few million vectors).
 ///
 /// Construct with [`AnnConfig::hnsw`] or [`AnnConfig::ivf`] and adjust via the
-/// setters. ANN and [`Quantization`] both replace the search path and may not be
-/// enabled together (rejected at `open`).
+/// setters. ANN may be combined with [`Quantization`]: the index walk then scores
+/// quantized codes for cheaper candidate selection, and the exact f32 rerank over the
+/// resulting candidates restores accuracy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnnConfig {
     /// Which index drives the candidate walk.

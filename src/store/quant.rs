@@ -8,8 +8,31 @@ use anyhow::{Result, bail};
 
 use super::Store;
 use super::scoring::{parallel_topk, score_chunk_bin, score_chunk_i8};
+use crate::ann::Walk;
+use crate::data::DataSegment;
 use crate::model::{Distance, Hit, QuantKind, SearchOpts};
 use crate::search::{QuantParams, TopK, pack_signs, pack_signs_into};
+
+/// Build the ANN [`Walk`] for the store's current quantization state (nidus-ndu): a
+/// quantized walk when a populated int8/binary matrix is present — the ANN graph/lists
+/// were built in that same space — else the exact f32 walk. A free function (not a
+/// `&self` method) so callers can construct it from the disjoint `quant`/`data` fields
+/// while holding `&mut self.ann` for build/insert.
+pub(super) fn ann_walk_for<'a>(
+    quant: Option<&'a Quant>,
+    data: &'a DataSegment,
+    distance: Distance,
+) -> Walk<'a> {
+    match quant {
+        Some(Quant::Int8(s)) if !s.vectors.is_empty() => {
+            Walk::int8(data, &s.vectors, s.params, distance)
+        }
+        Some(Quant::Binary(s)) if !s.words.is_empty() => {
+            Walk::binary(data, &s.words, s.words_per_row)
+        }
+        _ => Walk::exact(data, distance),
+    }
+}
 
 /// int8 scalar quantization state. `vectors` mirrors the f32 `data` rows one-for-one
 /// (same physical row indices). Fields are `pub(super)` so the store's test module

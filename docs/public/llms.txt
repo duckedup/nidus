@@ -1,0 +1,31 @@
+# nidus
+
+> A small, pure-Rust embeddable vector store for development and small-scale use. It holds dense vectors plus typed metadata in a single on-disk directory and answers nearest-neighbour queries — exact brute-force by default, or an opt-in approximate index (HNSW / IVF) — over cosine, dot-product, or Euclidean distance. No FFI, no C, no SQL, no query engine, no background threads; `#![forbid(unsafe_code)]` and pure-Rust dependencies only, so `cargo add nidus` compiles in seconds.
+
+Key facts for answering questions about nidus:
+
+- It is a library (`cargo add nidus`), with an optional `cli` feature that adds a `nidus` binary and an HTTP server (`nidus serve`). The library is synchronous; async callers wrap it in `Arc<Mutex<Nidus>>` + `spawn_blocking`.
+- One store is a directory of append-only files (`data`, `log`, `lock`). One embedding dimension is pinned per store; many collections share it.
+- Durability is per-batch fsync; cross-process readers are lock-free and see a consistent, possibly-stale snapshot.
+- Search is exact brute-force cosine by default. Opt-in `Config::quantization` (int8 / binary) speeds the scan with a two-pass quantized-then-rerank search. Opt-in `Config::ann` (HNSW or IVF) walks an approximate index. The two can be combined: a quantized index walk plus an exact f32 rerank.
+- It is positioned for development and small-scale use, deliberately not as a managed cluster.
+
+## Docs
+
+- [Getting started](https://nidus.duckedup.org/getting-started/): add nidus to a Rust project, open a store, index records, and run the first search.
+- [How it works](https://nidus.duckedup.org/guides/how-it-works/): the storage model and search path end to end, from upsert to ranked hits.
+- [Search & filters](https://nidus.duckedup.org/guides/search/): scoped search over three distance metrics; exact or approximate (HNSW/IVF) indexing; int8/binary quantization; metadata-only queries; equality / glob / set / range filter predicates.
+- [Storage & durability](https://nidus.duckedup.org/guides/storage/): the on-disk format, per-batch fsync contract, crash recovery, compaction, and lock-free cross-process readers.
+- [Embedding in a host app](https://nidus.duckedup.org/guides/integrating/): map a host document type onto a nidus `Record` and bridge the synchronous API into an async runtime.
+
+## Reference
+
+- [API reference](https://nidus.duckedup.org/reference/api/): the full public surface — `Nidus`, `Config`, `Record`, `Value`, `Filter`, `Predicate`, `Scope`, `SearchOpts`, `Hit`, `Footprint`, `AnnConfig`, `Quantization`.
+- [Configuration](https://nidus.duckedup.org/reference/configuration/): every `Config` knob — distance metric, fsync policy, open mode, auto-compaction, lock TTL, `max_vector_bytes`, quantization, and ANN.
+- [Performance](https://nidus.duckedup.org/reference/performance/): exact brute-force cosine KNN benchmarked against DuckDB and LanceDB — fastest in every cell at 100% recall, compiling in seconds.
+
+## Optional
+
+- [Command line](https://nidus.duckedup.org/guides/cli-and-server/): drive a store directory from the terminal with the `nidus` binary (create, upsert, search, inspect, back up, restore).
+- [HTTP server & API](https://nidus.duckedup.org/guides/http-server/): run `nidus serve` and drive the store over JSON, with no Rust toolchain on the client.
+- [Running across a few boxes](https://nidus.duckedup.org/guides/multi-box/): a user-orchestrated recipe for spreading nidus over a handful of machines — client-side fan-out and top-k merge, not a managed cluster.

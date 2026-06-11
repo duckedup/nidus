@@ -2026,21 +2026,105 @@ fn ann_skips_deleted_rows() {
     assert_eq!(hits[0].id, "d1");
 }
 
+/// An ANN store that also quantizes — the walk scores quantized codes and the store
+/// reranks candidates with the exact f32 score (nidus-ndu).
+fn ann_quant_store(dim: usize, cfg: AnnConfig, quant: Quantization, vectors: &[Vec<f32>]) -> Store {
+    let mut s = Store::in_memory_cfg(
+        Config::new("/dev/null/in-memory", dim)
+            .auto_compact(None)
+            .ann(Some(cfg))
+            .quantization(Some(quant)),
+    )
+    .unwrap();
+    let recs: Vec<Record> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| rec(&format!("d{i}"), v.clone()))
+        .collect();
+    s.upsert("col", &recs).unwrap();
+    s
+}
+
+// ANN + quantization combined: the index walk runs in the quantized space and the f32
+// rerank restores accuracy. Recall is necessarily a touch below the exact-walk ANN
+// (the coarse codes steer the walk less precisely), so the thresholds are looser than
+// the pure-ANN tests above — but well clear of chance.
+
 #[test]
-fn ann_rejects_combination_with_quantization() {
-    let result = Store::in_memory_cfg(
-        Config::new("/dev/null/in-memory", 4)
-            .ann(Some(AnnConfig::hnsw()))
-            .quantization(Some(Quantization::default())),
-    );
-    let err = match result {
-        Ok(_) => panic!("expected ann+quantization to be rejected"),
-        Err(e) => e,
-    };
+#[cfg_attr(miri, ignore)]
+fn hnsw_int8_walk_recall() {
+    let (n, dim, k) = (2000, 32, 10);
+    let data = random_unit_vectors(n, dim, 11);
+    let queries = random_unit_vectors(50, dim, 12);
+    let truth = exact_store(dim, &data);
+    let ann = ann_quant_store(dim, AnnConfig::hnsw(), Quantization::default(), &data);
+    let recall = mean_recall(&ann, &truth, &queries, k);
     assert!(
-        err.to_string().contains("cannot both be set"),
-        "unexpected error: {err}"
+        recall >= 0.85,
+        "HNSW+int8 recall@{k} = {recall:.3}, expected >= 0.85"
     );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn hnsw_binary_walk_recall() {
+    let (n, dim, k) = (2000, 64, 10);
+    let data = random_unit_vectors(n, dim, 13);
+    let queries = random_unit_vectors(50, dim, 14);
+    let truth = exact_store(dim, &data);
+    // Binary codes are the coarsest proxy; a wider beam/over-fetch keeps recall solid.
+    let ann = ann_quant_store(
+        dim,
+        AnnConfig::hnsw().ef_search(128).overscan(16),
+        Quantization::binary(),
+        &data,
+    );
+    let recall = mean_recall(&ann, &truth, &queries, k);
+    assert!(
+        recall >= 0.70,
+        "HNSW+binary recall@{k} = {recall:.3}, expected >= 0.70"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn ivf_int8_walk_recall() {
+    let (n, dim, k) = (2000, 32, 10);
+    let data = random_unit_vectors(n, dim, 15);
+    let queries = random_unit_vectors(50, dim, 16);
+    let truth = exact_store(dim, &data);
+    let ann = ann_quant_store(
+        dim,
+        AnnConfig::ivf().n_probe(12),
+        Quantization::default(),
+        &data,
+    );
+    let recall = mean_recall(&ann, &truth, &queries, k);
+    assert!(
+        recall >= 0.65,
+        "IVF+int8 recall@{k} = {recall:.3}, expected >= 0.65"
+    );
+}
+
+/// The combination is accepted at `open` (the v1 mutual-exclusion is lifted) and the
+/// quantized-walk path returns exactly `top_k` ranked hits on a tiny store — Miri-clean.
+#[test]
+fn ann_with_quantization_is_accepted() {
+    let data: Vec<Vec<f32>> = (0..8)
+        .map(|i| {
+            let t = i as f32 / 8.0;
+            let mut v = vec![t.cos(), t.sin(), 0.25, -0.5];
+            normalize(&mut v);
+            v
+        })
+        .collect();
+    let s = ann_quant_store(4, AnnConfig::hnsw(), Quantization::default(), &data);
+    let hits = s.search(&["col"], &data[2], &default_opts(3)).unwrap();
+    assert_eq!(hits.len(), 3);
+    // Exact rerank means the self-query's nearest hit is the doc itself.
+    assert_eq!(hits[0].id, "d2");
+    // Scores are the exact f32 cosine (rerank), not the quantized walk score.
+    assert!(hits[0].score > 0.99, "self-match score {}", hits[0].score);
 }
 
 /// Build an ANN store and a matching exact (brute-force) store over the same

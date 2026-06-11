@@ -116,6 +116,7 @@ pub fn euclidean_neg_sq(a: &[f32], b: &[f32]) -> f32 {
 /// it picks the right candidate set, and the f32 rerank restores exact scores.
 /// (Per-dimension affine quantization would break this — the offset and per-axis
 /// scale² terms don't cancel, so the int8 dot no longer tracks the true dot.)
+#[derive(Clone, Copy)]
 pub struct QuantParams {
     /// f32 units per int8 step. Zero when there are no (or all-zero) vectors.
     pub scale: f32,
