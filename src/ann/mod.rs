@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::DataSegment;
 use crate::model::{AnnConfig, AnnKind, Distance};
+use crate::search::{QuantParams, dot_i8, euclidean_neg_sq_i8, hamming, pack_signs};
 
 mod hnsw;
 mod ivf;
@@ -74,6 +75,189 @@ pub(crate) fn score_fn_for(distance: Distance) -> ScoreFn {
     }
 }
 
+/// The metric the [`Walk`] scores in. `None` is exact f32 (the default, unchanged); the
+/// quantized variants score the store's int8/binary codes for a cheaper walk. The codes
+/// are borrowed from the store's quantization state by *physical row* — the same layout
+/// the brute-force two-pass search uses — so this adds no new state or persistence.
+enum WalkQuant<'a> {
+    /// Exact f32: rows are scored straight from the `data` matrix.
+    None,
+    /// int8 scalar codes, flat row-major (`dim` per row). `euclidean` picks
+    /// [`euclidean_neg_sq_i8`] over [`dot_i8`]; both are monotonic with the f32 score.
+    /// `params` is the store's shared scale — the query must be quantized with the same
+    /// scale the stored codes were, so the int8 scores stay mutually comparable.
+    Int8 {
+        codes: &'a [i8],
+        dim: usize,
+        euclidean: bool,
+        params: QuantParams,
+    },
+    /// Binary sign-bit codes, flat row-major (`wpr` u64 words per row). Score is
+    /// `-hamming`, monotone with cosine rank for unit vectors (cosine only).
+    Binary { words: &'a [u64], wpr: usize },
+}
+
+/// How the ANN index measures "nearness" during build and search (nidus-ndu).
+///
+/// It always carries the f32 `data` matrix (IVF fits its centroids in f32, and the exact
+/// variant scores rows straight from it) plus an optional quantized codebook. When a
+/// codebook is present the *walk* — the graph hops / list scans the index does to pick a
+/// candidate set — scores cheap quantized codes instead of f32; the store then reranks the
+/// resulting candidate rows with the exact f32 score, so the walk only has to choose a good
+/// candidate *set*. Higher score = nearer in every variant.
+///
+/// Borrows the store's `data` and (when quantized) its code matrix, so it is cheap to
+/// build per query/build and `Sync` for the parallel HNSW build.
+pub(crate) struct Walk<'a> {
+    data: &'a DataSegment,
+    score_fn: ScoreFn,
+    quant: WalkQuant<'a>,
+}
+
+/// A query encoded once for a [`Walk`], reused to score it against many rows. Created by
+/// [`Walk::query_scorer`]; for the exact variant it just borrows the f32 query.
+pub(crate) struct QueryScorer<'a> {
+    walk: &'a Walk<'a>,
+    query: &'a [f32],
+    code: QueryCode,
+}
+
+enum QueryCode {
+    F32,
+    Int8(Vec<i8>),
+    Binary(Vec<u64>),
+}
+
+/// int8 row score as f32 — monotonic with the f32 metric under the shared symmetric scale.
+fn i8_score(euclidean: bool, a: &[i8], b: &[i8]) -> f32 {
+    if euclidean {
+        euclidean_neg_sq_i8(a, b) as f32
+    } else {
+        dot_i8(a, b) as f32
+    }
+}
+
+impl<'a> Walk<'a> {
+    /// The exact f32 walk (no quantization) — byte-for-byte the pre-nidus-ndu behavior.
+    pub(crate) fn exact(data: &'a DataSegment, distance: Distance) -> Self {
+        Walk {
+            data,
+            score_fn: score_fn_for(distance),
+            quant: WalkQuant::None,
+        }
+    }
+
+    /// A walk that scores int8 codes (`codes` is row-major, `data.dimension()` per row);
+    /// `params` is the store's shared quantization scale.
+    pub(crate) fn int8(
+        data: &'a DataSegment,
+        codes: &'a [i8],
+        params: QuantParams,
+        distance: Distance,
+    ) -> Self {
+        Walk {
+            data,
+            score_fn: score_fn_for(distance),
+            quant: WalkQuant::Int8 {
+                codes,
+                dim: data.dimension(),
+                euclidean: distance == Distance::Euclidean,
+                params,
+            },
+        }
+    }
+
+    /// A walk that scores binary sign-bit codes (`words` is row-major, `wpr` words/row).
+    /// Cosine only (binary codes are an angular proxy — enforced at `open`).
+    pub(crate) fn binary(data: &'a DataSegment, words: &'a [u64], wpr: usize) -> Self {
+        Walk {
+            data,
+            score_fn: score_fn_for(Distance::Cosine),
+            quant: WalkQuant::Binary { words, wpr },
+        }
+    }
+
+    /// The f32 data matrix (IVF k-means fits centroids from it; the exact variant scores
+    /// rows from it).
+    pub(crate) fn data(&self) -> &DataSegment {
+        self.data
+    }
+
+    /// Score physical rows `a` and `b` against each other (HNSW build heuristics). Uses the
+    /// quantized codes when present, else exact f32.
+    pub(crate) fn score_rows(&self, a: u64, b: u64) -> f32 {
+        match &self.quant {
+            WalkQuant::None => (self.score_fn)(self.data.row(a), self.data.row(b)),
+            WalkQuant::Int8 {
+                codes,
+                dim,
+                euclidean,
+                ..
+            } => {
+                let (a, b) = (a as usize, b as usize);
+                i8_score(
+                    *euclidean,
+                    &codes[a * dim..(a + 1) * dim],
+                    &codes[b * dim..(b + 1) * dim],
+                )
+            }
+            WalkQuant::Binary { words, wpr } => {
+                let (a, b) = (a as usize, b as usize);
+                -(hamming(
+                    &words[a * wpr..(a + 1) * wpr],
+                    &words[b * wpr..(b + 1) * wpr],
+                ) as f32)
+            }
+        }
+    }
+
+    /// Encode `query` once into a scorer that scores it against any row (search path).
+    pub(crate) fn query_scorer(&'a self, query: &'a [f32]) -> QueryScorer<'a> {
+        let code = match &self.quant {
+            WalkQuant::None => QueryCode::F32,
+            WalkQuant::Int8 { dim, params, .. } => {
+                let mut q = vec![0i8; *dim];
+                params.quantize(query, &mut q);
+                QueryCode::Int8(q)
+            }
+            WalkQuant::Binary { .. } => QueryCode::Binary(pack_signs(query)),
+        };
+        QueryScorer {
+            walk: self,
+            query,
+            code,
+        }
+    }
+}
+
+impl QueryScorer<'_> {
+    /// Score the encoded query against physical row `row`. Higher = nearer.
+    pub(crate) fn score(&self, row: u64) -> f32 {
+        match (&self.walk.quant, &self.code) {
+            (WalkQuant::None, _) => (self.walk.score_fn)(self.query, self.walk.data.row(row)),
+            (
+                WalkQuant::Int8 {
+                    codes,
+                    dim,
+                    euclidean,
+                    ..
+                },
+                QueryCode::Int8(q),
+            ) => {
+                let r = row as usize;
+                i8_score(*euclidean, q, &codes[r * dim..(r + 1) * dim])
+            }
+            (WalkQuant::Binary { words, wpr }, QueryCode::Binary(q)) => {
+                let r = row as usize;
+                -(hamming(q, &words[r * wpr..(r + 1) * wpr]) as f32)
+            }
+            // `query_scorer` always pairs a code with its own walk, so the cross
+            // combinations are unreachable.
+            _ => unreachable!("query code does not match walk metric"),
+        }
+    }
+}
+
 /// A small, fast, fully-deterministic PRNG (splitmix64). Pure arithmetic, no deps —
 /// used for HNSW level assignment and IVF centroid seeding so a build is reproducible
 /// from [`AnnConfig::seed`](crate::AnnConfig::seed).
@@ -125,19 +309,20 @@ impl Ann {
     /// Full (re)build from `live_rows` (physical row indices into `data`). Used on
     /// `open` and after `compact` renumbers rows. `workers` (from
     /// `Config::query_threads`) caps build concurrency; `1` builds serially and
-    /// deterministically.
-    pub(crate) fn build(&mut self, data: &DataSegment, live_rows: &[u64], workers: usize) {
+    /// deterministically. The [`Walk`] decides whether the build scores exact f32 or
+    /// quantized codes (nidus-ndu).
+    pub(crate) fn build(&mut self, walk: &Walk, live_rows: &[u64], workers: usize) {
         match self {
-            Ann::Hnsw(g) => g.build(data, live_rows, workers),
-            Ann::Ivf(i) => i.build(data, live_rows, workers),
+            Ann::Hnsw(g) => g.build(walk, live_rows, workers),
+            Ann::Ivf(i) => i.build(walk, live_rows, workers),
         }
     }
 
     /// Incrementally index `rows` (already appended to `data`) without a full rebuild.
-    pub(crate) fn insert_rows(&mut self, data: &DataSegment, rows: &[u64]) {
+    pub(crate) fn insert_rows(&mut self, walk: &Walk, rows: &[u64]) {
         match self {
-            Ann::Hnsw(g) => g.insert_rows(data, rows),
-            Ann::Ivf(i) => i.insert_rows(data, rows),
+            Ann::Hnsw(g) => g.insert_rows(walk, rows),
+            Ann::Ivf(i) => i.insert_rows(walk, rows),
         }
     }
 
@@ -173,16 +358,18 @@ impl Ann {
     }
 
     /// Walk the index for up to `n_candidates` rows, best-first as `(row, score)`. The
-    /// caller post-filters and reranks; recall rises with `n_candidates`.
+    /// caller post-filters and reranks; recall rises with `n_candidates`. Scores are
+    /// quantized-approximate when the [`Walk`] carries a codebook (the store reranks the
+    /// rows exactly), exact f32 otherwise.
     pub(crate) fn search(
         &self,
-        data: &DataSegment,
+        walk: &Walk,
         query: &[f32],
         n_candidates: usize,
     ) -> Vec<(u64, f32)> {
         match self {
-            Ann::Hnsw(g) => g.search(data, query, n_candidates),
-            Ann::Ivf(i) => i.search(data, query, n_candidates),
+            Ann::Hnsw(g) => g.search(walk, query, n_candidates),
+            Ann::Ivf(i) => i.search(walk, query, n_candidates),
         }
     }
 }

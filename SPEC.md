@@ -559,9 +559,15 @@ build until a real need exists.
   degrades silently there; an exact-prefilter path is the planned follow-up. Deletes
   leave stale nodes in the index that are skipped at query time (the candidate→doc
   resolution is re-verified against the live index) and reclaimed on the next
-  `compact` rebuild. ANN and quantization both replace the search path and are
-  **mutually exclusive** (rejected at `open`); combining them (a quantized walk + f32
-  rerank) is a deferred optimization. The index is extended in O(batch) on `upsert`.
+  `compact` rebuild. ANN and quantization **may be combined** (nidus-ndu): when
+  `Config::quantization` is also set, the index walk — both the build heuristics and
+  the query traversal — scores the store's int8/binary codes (the graph/lists are built
+  *in* that quantized space) for a cheaper candidate selection, and `search` then reranks
+  the candidate rows with the exact f32 score, so accuracy is restored while the walk
+  stays cheap. IVF keeps its k-means fit and centroids in f32 (a mean of codes is
+  meaningless) and only its per-row list scan goes quantized. Recall runs a touch below
+  the exact-walk index — widen `ef_search`/`n_probe`/`overscan` to recover it. The index
+  is extended in O(batch) on `upsert`.
   **Persistence (derived cache).** The graph/lists are reconstructable from the
   vectors, so they are persisted only as an optimization: a separate `ann` file
   (`NIDUS\0` header + `bincode` + CRC32, atomically written) lets `open` *load* the
@@ -569,7 +575,7 @@ build until a real need exists.
   single-threaded). It is written strictly **out-of-band** — on `compact` and the
   explicit `Nidus::persist_index()`, **never** on the `upsert`/`flush` hot path, so
   writes stay fast and there is no background thread. `open` loads the cache, validates
-  it against the current `(dim, distance, kind, params)` + a CRC, and **incrementally
+  it against the current `(dim, distance, kind, params, quantization)` + a CRC, and **incrementally
   catches up** any rows appended since it was written; an absent, stale, over-long, or
   corrupt cache is silently discarded and the index rebuilt from the vectors. The
   `data`/`log` format is unchanged.

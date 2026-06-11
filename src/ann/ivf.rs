@@ -9,8 +9,7 @@
 //! exact f32 metric (we score real rows), so recall loss comes only from rows sitting
 //! in unprobed lists.
 
-use crate::ann::{AnnSnapshotRef, ScoreFn, SplitMix64, score_fn_for};
-use crate::data::DataSegment;
+use crate::ann::{AnnSnapshotRef, ScoreFn, SplitMix64, Walk, score_fn_for};
 use crate::model::{AnnConfig, Distance};
 
 /// Fixed Lloyd's-iteration count for the k-means fit. Enough to settle on random
@@ -72,7 +71,11 @@ impl IvfIndex {
 
     // IVF build is already cheap (k-means over a fixed iteration count, ~seconds even
     // at scale), so it stays serial; `_workers` keeps the signature uniform with HNSW.
-    pub(crate) fn build(&mut self, data: &DataSegment, live_rows: &[u64], _workers: usize) {
+    // The k-means fit and centroids are always f32 (a mean of quantized codes is
+    // meaningless), so build reads the f32 matrix straight from `walk.data()`; only the
+    // per-row scan in `search` consults the walk's quantized codes (nidus-ndu).
+    pub(crate) fn build(&mut self, walk: &Walk, live_rows: &[u64], _workers: usize) {
+        let data = walk.data();
         self.centroids.clear();
         self.lists.clear();
         if self.dim == 0 || live_rows.is_empty() {
@@ -151,11 +154,12 @@ impl IvfIndex {
         }
     }
 
-    pub(crate) fn insert_rows(&mut self, data: &DataSegment, rows: &[u64]) {
+    pub(crate) fn insert_rows(&mut self, walk: &Walk, rows: &[u64]) {
+        let data = walk.data();
         if self.dim == 0 || self.n_centroids() == 0 {
             // No centroids yet (index built empty) — fold these in via a full build.
             if !rows.is_empty() {
-                self.build(data, rows, 1);
+                self.build(walk, rows, 1);
             }
             return;
         }
@@ -182,7 +186,7 @@ impl IvfIndex {
 
     pub(crate) fn search(
         &self,
-        data: &DataSegment,
+        walk: &Walk,
         query: &[f32],
         n_candidates: usize,
     ) -> Vec<(u64, f32)> {
@@ -190,7 +194,8 @@ impl IvfIndex {
             return Vec::new();
         }
 
-        // Rank centroids by score, take the nearest `n_probe`.
+        // Rank centroids by score (always f32 — centroids are f32 means), take the
+        // nearest `n_probe`.
         let mut centroid_scores: Vec<(f32, usize)> = (0..self.n_centroids())
             .map(|c| {
                 let cen = &self.centroids[c * self.dim..(c + 1) * self.dim];
@@ -200,12 +205,15 @@ impl IvfIndex {
         let probe = self.n_probe.min(centroid_scores.len());
         centroid_scores.select_nth_unstable_by(probe - 1, |a, b| b.0.total_cmp(&a.0));
 
-        // Score every row in the probed lists; keep the best `n_candidates`.
+        // Score every row in the probed lists via the walk (quantized codes when the
+        // walk carries a codebook, else exact f32); keep the best `n_candidates`. The
+        // store reranks these rows exactly afterward, so a quantized score is only a
+        // selection proxy here.
+        let qs = walk.query_scorer(query);
         let mut scored: Vec<(u64, f32)> = Vec::new();
         for &(_, c) in &centroid_scores[..probe] {
             for &row in &self.lists[c] {
-                let s = (self.score_fn)(query, data.row(row));
-                scored.push((row, s));
+                scored.push((row, qs.score(row)));
             }
         }
         scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
@@ -217,6 +225,7 @@ impl IvfIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::DataSegment;
 
     fn seg(dim: usize, rows: &[Vec<f32>]) -> DataSegment {
         let mut d = DataSegment::in_memory(dim);
@@ -228,7 +237,11 @@ mod tests {
 
     fn build(data: &DataSegment, n: u64, cfg: AnnConfig) -> IvfIndex {
         let mut ix = IvfIndex::new(cfg, data.dimension(), Distance::Cosine);
-        ix.build(data, &(0..n).collect::<Vec<_>>(), 1);
+        ix.build(
+            &Walk::exact(data, Distance::Cosine),
+            &(0..n).collect::<Vec<_>>(),
+            1,
+        );
         ix
     }
 
@@ -236,7 +249,10 @@ mod tests {
     fn empty_index_returns_nothing() {
         let data = seg(3, &[]);
         let ix = build(&data, 0, AnnConfig::ivf());
-        assert!(ix.search(&data, &[1.0, 0.0, 0.0], 5).is_empty());
+        assert!(
+            ix.search(&Walk::exact(&data, Distance::Cosine), &[1.0, 0.0, 0.0], 5)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -254,7 +270,7 @@ mod tests {
         }
         let data = seg(2, &rows);
         let ix = build(&data, 16, AnnConfig::ivf().n_lists(2).n_probe(2));
-        let hits = ix.search(&data, &rows[3], 1);
+        let hits = ix.search(&Walk::exact(&data, Distance::Cosine), &rows[3], 1);
         assert_eq!(hits[0].0, 3, "exact row should surface with full probe");
     }
 
@@ -268,7 +284,7 @@ mod tests {
             .collect();
         let data = seg(2, &rows);
         let ix = build(&data, 30, AnnConfig::ivf().n_lists(4).n_probe(4));
-        let hits = ix.search(&data, &[1.0, 0.0], 5);
+        let hits = ix.search(&Walk::exact(&data, Distance::Cosine), &[1.0, 0.0], 5);
         for w in hits.windows(2) {
             assert!(w[0].1 >= w[1].1, "not best-first: {hits:?}");
         }
@@ -284,8 +300,15 @@ mod tests {
             .collect();
         let data = seg(2, &rows);
         let mut ix = IvfIndex::new(AnnConfig::ivf().n_lists(3), 2, Distance::Cosine);
-        ix.build(&data, &(0..15).collect::<Vec<_>>(), 1);
-        ix.insert_rows(&data, &(15..20).collect::<Vec<_>>());
+        ix.build(
+            &Walk::exact(&data, Distance::Cosine),
+            &(0..15).collect::<Vec<_>>(),
+            1,
+        );
+        ix.insert_rows(
+            &Walk::exact(&data, Distance::Cosine),
+            &(15..20).collect::<Vec<_>>(),
+        );
         let total: usize = ix.lists.iter().map(|l| l.len()).sum();
         assert_eq!(total, 20, "all rows should be assigned to some list");
     }

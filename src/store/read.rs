@@ -404,10 +404,14 @@ impl Store {
             }
         }
 
-        let candidates = ann.search(&self.data, q, n_candidates);
+        // Walk the index in the configured space — quantized codes when quantization is
+        // on (the graph/lists were built in that space), else exact f32 (nidus-ndu).
+        let walk =
+            super::quant::ann_walk_for(self.quant.as_ref(), &self.data, self.config.distance);
+        let candidates = ann.search(&walk, q, n_candidates);
 
         let mut topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
-        for (row, score) in &candidates {
+        for (row, _) in &candidates {
             // Resolve the candidate row to its owning doc via the reverse map, then
             // verify the doc still lives at this row (catches deletes/overwrites).
             let Some(Some((col_name, id))) = self.row_to_doc.get(*row as usize) else {
@@ -428,12 +432,17 @@ impl Store {
             if !filter::matches(&opts.filter, &entry.attrs) {
                 continue;
             }
+            // Rerank exactly: the walk's score is only a selection proxy (approximate
+            // under quantization), so the true f32 score — and `min_score` — is computed
+            // here from the original vectors, exactly as the quantized brute-force path
+            // reranks its first-pass candidates.
+            let score = score_fn(q, self.data.row(*row));
             if let Some(min) = opts.min_score
-                && *score < min
+                && score < min
             {
                 continue;
             }
-            topk.offer(*score, (col_name.as_str(), id.as_str()));
+            topk.offer(score, (col_name.as_str(), id.as_str()));
         }
 
         Ok(self.hits_from_topk(topk))

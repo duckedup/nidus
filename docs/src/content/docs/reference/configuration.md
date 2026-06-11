@@ -91,9 +91,9 @@ the store builds an in-memory approximate-nearest-neighbour index and `search` w
 it for an over-fetched candidate set, then applies the scope/filter/`min_score` and an
 exact f32 rerank — trading recall for speed when a scan over every vector is more than
 you need. Two algorithms, via `AnnConfig::hnsw()` (a navigable small-world graph, the
-default) and `AnnConfig::ivf()` (k-means inverted lists). Mutually exclusive with
-`quantization`. See [approximate search](/guides/search/#approximate-search-ann) for
-details and tuning.
+default) and `AnnConfig::ivf()` (k-means inverted lists). May be combined with
+`quantization` (a quantized index walk plus an exact f32 rerank). See
+[approximate search](/guides/search/#approximate-search-ann) for details and tuning.
 
 ### `query_threads`
 

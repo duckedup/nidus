@@ -86,7 +86,8 @@ pub struct Store {
     /// Quantization state (None when quantization is off — the f32 brute-force default).
     quant: Option<Quant>,
     /// Approximate-nearest-neighbour index (None when ANN is off — the exact default).
-    /// Mutually exclusive with `quant` (rejected at `open`).
+    /// May coexist with `quant`: the index walk then scores `quant`'s codes and the
+    /// f32 rerank in `search_ann` restores accuracy (nidus-ndu).
     ann: Option<Ann>,
     /// The in-RAM ANN index has unpersisted changes (rows inserted since the last
     /// `persist_index`/load). Lets `persist_index` skip a redundant write and tracks
@@ -204,7 +205,6 @@ impl Store {
             }
         }
 
-        Self::reject_ann_with_quant(&config)?;
         let quant = match config.quantization {
             Some(q) => Some(Quant::empty(q.kind, data.dimension(), config.distance)?),
             None => None,
@@ -246,17 +246,6 @@ impl Store {
         Ok(store)
     }
 
-    /// ANN and quantization both replace the search path and may not run together.
-    fn reject_ann_with_quant(config: &Config) -> Result<()> {
-        if config.ann.is_some() && config.quantization.is_some() {
-            bail!(
-                "Config::ann and Config::quantization cannot both be set — ANN and \
-                 quantization both replace the search path; enable only one"
-            );
-        }
-        Ok(())
-    }
-
     /// An in-memory store (no files, no lock). For tests.
     pub fn in_memory(dimension: usize) -> Result<Store> {
         Self::in_memory_with(dimension, Distance::default())
@@ -274,7 +263,6 @@ impl Store {
 
     /// An in-memory store with full config control.
     pub fn in_memory_cfg(config: Config) -> Result<Store> {
-        Self::reject_ann_with_quant(&config)?;
         let quant = match config.quantization {
             Some(q) => Some(Quant::empty(q.kind, config.dimension, config.distance)?),
             None => None,
@@ -328,8 +316,9 @@ impl Store {
         }
         let live_rows = self.rebuild_row_to_doc();
         let workers = self.config.query_threads;
+        let walk = quant::ann_walk_for(self.quant.as_ref(), &self.data, self.config.distance);
         if let Some(ann) = self.ann.as_mut() {
-            ann.build(&self.data, &live_rows, workers);
+            ann.build(&walk, &live_rows, workers);
         }
         self.ann_dirty = true;
     }
@@ -350,7 +339,8 @@ impl Store {
         let distance = self.config.distance;
         let total = self.data.row_count();
 
-        match crate::ann::load_index(&path, dim, distance, &cfg)? {
+        let quant = self.config.quantization.map(|q| q.kind);
+        match crate::ann::load_index(&path, dim, distance, &cfg, quant)? {
             // Valid cache that doesn't claim more rows than the data file holds (a
             // larger `covered` would mean dangling node→row refs — treat as stale).
             Some((ann, covered)) if covered <= total => {
@@ -359,8 +349,10 @@ impl Store {
                 if total > covered {
                     // Catch up rows appended after the cache was written.
                     let new_rows: Vec<u64> = (covered..total).collect();
+                    let walk =
+                        quant::ann_walk_for(self.quant.as_ref(), &self.data, self.config.distance);
                     if let Some(ann) = self.ann.as_mut() {
-                        ann.insert_rows(&self.data, &new_rows);
+                        ann.insert_rows(&walk, &new_rows);
                     }
                     self.ann_dirty = true; // the delta isn't persisted yet
                 } else {
@@ -396,6 +388,7 @@ impl Store {
             self.data.dimension(),
             self.config.distance,
             &cfg,
+            self.config.quantization.map(|q| q.kind),
         )?;
         self.ann_dirty = false;
         Ok(())
@@ -416,8 +409,9 @@ impl Store {
             self.row_to_doc[*row as usize] = Some((collection.to_string(), id.clone()));
         }
         let new_rows: Vec<u64> = (prev_rows..total).collect();
+        let walk = quant::ann_walk_for(self.quant.as_ref(), &self.data, self.config.distance);
         if let Some(ann) = self.ann.as_mut() {
-            ann.insert_rows(&self.data, &new_rows);
+            ann.insert_rows(&walk, &new_rows);
         }
         self.ann_dirty = true;
     }
