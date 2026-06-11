@@ -9,8 +9,8 @@ use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
-use crate::server::dto::{FootprintDto, HitDto};
-use crate::{Config, Distance, Filter, Nidus, OpenMode, Record, Scope, SearchOpts};
+use crate::server::dto::{AnnDto, FootprintDto, HitDto};
+use crate::{AnnConfig, Config, Distance, Filter, Nidus, OpenMode, Record, Scope, SearchOpts};
 
 mod backup;
 
@@ -44,6 +44,34 @@ struct StoreArgs {
     /// Open without taking the writer lock (rejects mutations).
     #[arg(long)]
     read_only: bool,
+    /// Opt into an approximate-nearest-neighbour index: `hnsw` or `ivf`. Omit for
+    /// exact brute-force search (the default). Unlike `--dim`/`--distance`, the ANN
+    /// choice is *not* stored in the header — pass it on every open (including
+    /// `serve`) where you want the index built/consulted.
+    #[arg(long)]
+    ann: Option<AnnKindArg>,
+    /// HNSW: max neighbours per node above layer 0. Ignored without `--ann hnsw`.
+    #[arg(long)]
+    ann_m: Option<usize>,
+    /// HNSW: build-time beam width. Ignored without `--ann hnsw`.
+    #[arg(long)]
+    ann_ef_construction: Option<usize>,
+    /// HNSW: search-time beam width. Ignored without `--ann hnsw`.
+    #[arg(long)]
+    ann_ef_search: Option<usize>,
+    /// IVF: number of k-means lists (`0` = auto `~sqrt(n)`). Ignored without `--ann ivf`.
+    #[arg(long)]
+    ann_n_lists: Option<usize>,
+    /// IVF: lists probed per query. Ignored without `--ann ivf`.
+    #[arg(long)]
+    ann_n_probe: Option<usize>,
+    /// Candidate over-fetch multiple (`top_k * overscan`) before post-filter + rerank.
+    /// Applies to both ANN kinds. Ignored without `--ann`.
+    #[arg(long)]
+    ann_overscan: Option<usize>,
+    /// Build PRNG seed (deterministic index). Applies to both ANN kinds. Ignored without `--ann`.
+    #[arg(long)]
+    ann_seed: Option<u64>,
 }
 
 impl StoreArgs {
@@ -68,6 +96,40 @@ impl StoreArgs {
         };
         Ok((dimension, distance))
     }
+
+    /// Build the `Option<AnnConfig>` from the `--ann*` flags. `None` (no `--ann`)
+    /// keeps exact brute-force search; otherwise start from the kind's defaults and
+    /// override only the params the caller supplied. Param flags for the *other*
+    /// kind are accepted but inert (matching `AnnConfig`'s own ignore semantics).
+    fn ann_config(&self) -> Option<AnnConfig> {
+        let base = match self.ann? {
+            AnnKindArg::Hnsw => AnnConfig::hnsw(),
+            AnnKindArg::Ivf => AnnConfig::ivf(),
+        };
+        let mut cfg = base;
+        if let Some(v) = self.ann_m {
+            cfg = cfg.m(v);
+        }
+        if let Some(v) = self.ann_ef_construction {
+            cfg = cfg.ef_construction(v);
+        }
+        if let Some(v) = self.ann_ef_search {
+            cfg = cfg.ef_search(v);
+        }
+        if let Some(v) = self.ann_n_lists {
+            cfg = cfg.n_lists(v);
+        }
+        if let Some(v) = self.ann_n_probe {
+            cfg = cfg.n_probe(v);
+        }
+        if let Some(v) = self.ann_overscan {
+            cfg = cfg.overscan(v);
+        }
+        if let Some(v) = self.ann_seed {
+            cfg = cfg.seed(v);
+        }
+        Some(cfg)
+    }
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -85,6 +147,12 @@ impl From<DistanceArg> for Distance {
             DistanceArg::Dot => Distance::DotProduct,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum AnnKindArg {
+    Hnsw,
+    Ivf,
 }
 
 #[derive(Subcommand, Debug)]
@@ -342,6 +410,7 @@ pub fn run(cli: Cli) -> Result<()> {
             print_json(&serde_json::json!({
                 "dimension": db.dimension(),
                 "distance": format!("{:?}", db.config().distance),
+                "ann": db.config().ann.map(AnnDto::from),
                 "collections": db.collections(),
                 "footprint": FootprintDto::from(db.footprint()),
             }))
@@ -364,6 +433,7 @@ fn open(store: &StoreArgs, mutating: bool) -> Result<Nidus> {
     Nidus::open(
         Config::new(store.dir.clone(), dim)
             .distance(distance)
+            .ann(store.ann_config())
             .open_mode(mode),
     )
 }
@@ -383,6 +453,7 @@ fn serve(
     let db = Nidus::open(
         Config::new(store.dir.clone(), dim)
             .distance(distance)
+            .ann(store.ann_config())
             .open_mode(mode),
     )?;
     // An explicit --token wins; otherwise fall back to the NIDUS_TOKEN env var.
@@ -419,6 +490,7 @@ fn print_json<T: Serialize>(v: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AnnKind;
 
     #[test]
     fn no_subcommand_errors() {
@@ -510,6 +582,14 @@ mod tests {
             dim: None,
             distance: None,
             read_only: false,
+            ann: None,
+            ann_m: None,
+            ann_ef_construction: None,
+            ann_ef_search: None,
+            ann_n_lists: None,
+            ann_n_probe: None,
+            ann_overscan: None,
+            ann_seed: None,
         };
         assert_eq!(args.resolve().unwrap(), (5, Distance::Euclidean));
     }
@@ -564,6 +644,75 @@ mod tests {
     }
 
     #[test]
+    fn ann_defaults_off() {
+        // No --ann: exact brute-force (Config::ann stays None).
+        let cli =
+            Cli::try_parse_from(["nidus", "search", "--dir", "/tmp/s", "--dim", "3"]).unwrap();
+        match cli.command {
+            Command::Search { store, .. } => assert!(store.ann_config().is_none()),
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn ann_hnsw_with_param_overrides() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "serve",
+            "--dir",
+            "/tmp/s",
+            "--dim",
+            "3",
+            "--ann",
+            "hnsw",
+            "--ann-m",
+            "32",
+            "--ann-ef-search",
+            "128",
+            "--ann-overscan",
+            "8",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Serve { store, .. } => {
+                let ann = store.ann_config().expect("ann enabled");
+                assert_eq!(ann.kind, AnnKind::Hnsw);
+                assert_eq!(ann.m, 32); // overridden
+                assert_eq!(ann.ef_search, 128); // overridden
+                assert_eq!(ann.overscan, 8); // overridden
+                assert_eq!(ann.ef_construction, AnnConfig::hnsw().ef_construction); // default kept
+            }
+            _ => panic!("expected Serve"),
+        }
+    }
+
+    #[test]
+    fn ann_ivf_uses_ivf_defaults() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "search",
+            "--dir",
+            "/tmp/s",
+            "--dim",
+            "3",
+            "--ann",
+            "ivf",
+            "--ann-n-probe",
+            "16",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Search { store, .. } => {
+                let ann = store.ann_config().expect("ann enabled");
+                assert_eq!(ann.kind, AnnKind::Ivf);
+                assert_eq!(ann.n_probe, 16); // overridden
+                assert_eq!(ann.n_lists, AnnConfig::ivf().n_lists); // default kept
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
     fn resolve_requires_dim_when_no_store_yet() {
         let dir = tempfile::tempdir().unwrap();
         let args = StoreArgs {
@@ -571,6 +720,14 @@ mod tests {
             dim: None,
             distance: None,
             read_only: false,
+            ann: None,
+            ann_m: None,
+            ann_ef_construction: None,
+            ann_ef_search: None,
+            ann_n_lists: None,
+            ann_n_probe: None,
+            ann_overscan: None,
+            ann_seed: None,
         };
         let err = args.resolve().unwrap_err().to_string();
         assert!(err.contains("--dim"), "unexpected error: {err}");

@@ -25,7 +25,7 @@ use serde_json::{Value as JsonValue, json};
 use tokio::net::TcpListener;
 
 use crate::{Nidus, Record, Scope, SearchOpts};
-use dto::{DeleteRequest, FootprintDto, HitDto, ListRequest, SearchRequest, UpsertRequest};
+use dto::{AnnDto, DeleteRequest, FootprintDto, HitDto, ListRequest, SearchRequest, UpsertRequest};
 
 /// How `nidus serve` is configured beyond the store itself.
 pub struct ServeConfig {
@@ -148,6 +148,7 @@ async fn stats(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> 
         Ok(json!({
             "dimension": db.dimension(),
             "distance": format!("{:?}", db.config().distance),
+            "ann": db.config().ann.map(AnnDto::from),
             "collections": db.collections(),
             "footprint": FootprintDto::from(db.footprint()),
         }))
@@ -471,6 +472,7 @@ mod tests {
         let stats = json_body(resp).await;
         assert_eq!(stats["dimension"], 3);
         assert_eq!(stats["distance"], "Cosine");
+        assert_eq!(stats["ann"], JsonValue::Null); // exact search by default
         assert_eq!(stats["collections"], json!(["docs"]));
         assert_eq!(stats["footprint"]["doc_count"], 2);
     }
