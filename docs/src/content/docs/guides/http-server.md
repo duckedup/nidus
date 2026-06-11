@@ -34,6 +34,11 @@ embedding dimension is pinned at creation.
 Pass `--read-only` to serve without taking the writer lock: a search-only process
 that can run beside a separate writer.
 
+To serve approximate (ANN) search, add `--ann hnsw` or `--ann ivf` (with the
+optional `--ann-*` knobs from the [command-line guide](/guides/cli-and-server/)).
+The index lives in memory for the life of the process; `GET /stats` reports the
+active configuration.
+
 ## A complete session over HTTP
 
 From an empty directory to ranked results without ever touching the binary again
@@ -117,7 +122,7 @@ server fault (see [Errors](#errors)).
 | Method & path | Operation | Library method |
 | --- | --- | --- |
 | `GET /health` | liveness check (always unauthenticated) | — |
-| `GET /stats` | dimension, distance, collections, footprint | `dimension` / `footprint` |
+| `GET /stats` | dimension, distance, ann config, collections, footprint | `dimension` / `footprint` |
 | `GET /collections` | list collection names | `collections` |
 | `POST /collections/{name}` | create a collection | `create_collection` |
 | `DELETE /collections/{name}` | drop a collection and its records | `drop_collection` |
@@ -144,6 +149,7 @@ Store-wide introspection — the network equivalent of `nidus stats`.
 {
   "dimension": 768,
   "distance": "Cosine",
+  "ann": null,
   "collections": ["docs", "notes"],
   "footprint": {
     "rows": 1240,
@@ -157,6 +163,14 @@ Store-wide introspection — the network equivalent of `nidus stats`.
 
 `rows` counts every vector slot on disk (including superseded ones); `dead_rows`
 is how many a `compact` would reclaim; `doc_count` is the live record count.
+`ann` is `null` for exact brute-force search (the default), or echoes the active
+ANN configuration when the server was started with `--ann hnsw`/`--ann ivf` (only
+the knobs that apply to the chosen index are reported):
+
+```json
+"ann": { "kind": "Hnsw", "overscan": 4, "seed": 11400714819323198485,
+         "m": 16, "ef_construction": 200, "ef_search": 64 }
+```
 
 ### `GET /collections`
 

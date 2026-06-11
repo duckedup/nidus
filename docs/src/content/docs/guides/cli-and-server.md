@@ -116,6 +116,33 @@ Read-only commands (`search`, `list`, `get`, `collections`, `stats`, and
 `backup`) open the store without taking the writer lock, so they can run
 alongside a writer such as a running server.
 
+## Approximate search (ANN)
+
+By default search is exact brute-force. For larger stores you can opt into an
+in-memory approximate-nearest-neighbour index with `--ann hnsw` or `--ann ivf`.
+Unlike `--dim` and `--distance`, the ANN choice is **not** recorded in the store
+header — it is a property of how you *open* the store, so pass it on every command
+that should build or consult the index (including `serve`):
+
+```bash
+# Upsert into a store whose index you maintain as an HNSW graph
+echo '[{"id":"a","vector":[1,0,0],"attrs":{}}]' \
+  | nidus upsert --dir ./store --dim 3 --ann hnsw docs
+
+# Search via the index (over-fetch, then exact rerank of the survivors)
+echo '[1,0,0]' | nidus search --dir ./store --ann hnsw docs -k 5
+
+# Tune the knobs (all optional; defaults are sensible)
+echo '[1,0,0]' | nidus search --dir ./store --ann hnsw \
+  --ann-ef-search 128 --ann-overscan 8 docs
+```
+
+HNSW knobs: `--ann-m`, `--ann-ef-construction`, `--ann-ef-search`. IVF knobs:
+`--ann-n-lists`, `--ann-n-probe`. `--ann-overscan` and `--ann-seed` apply to both.
+Candidate *selection* is approximate, but the final ranking is always the exact
+score over the over-fetched survivors. `nidus stats --ann …` echoes the active
+configuration. ANN cannot be combined with quantization.
+
 ## Backup & restore
 
 A store is just a directory, so you can always copy it by hand — but `nidus

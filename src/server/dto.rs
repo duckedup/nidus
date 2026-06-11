@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Filter, Footprint, Hit, Record, Value};
+use crate::{AnnConfig, AnnKind, Filter, Footprint, Hit, Record, Value};
 
 /// Body of `POST /collections/{name}/upsert`.
 #[derive(Debug, Deserialize)]
@@ -103,5 +103,70 @@ impl From<Footprint> for FootprintDto {
             vector_bytes: f.vector_bytes,
             doc_count: f.doc_count,
         }
+    }
+}
+
+/// Serializable mirror of [`crate::AnnConfig`] for the `stats` surface. Only the
+/// knobs that apply to the active [`AnnKind`] are emitted; the inert ones are
+/// omitted. `stats` reports `null` when no ANN index is configured (exact search).
+#[derive(Debug, Serialize)]
+pub struct AnnDto {
+    pub kind: String,
+    pub overscan: usize,
+    pub seed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub m: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ef_construction: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ef_search: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n_lists: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n_probe: Option<usize>,
+}
+
+impl From<AnnConfig> for AnnDto {
+    fn from(a: AnnConfig) -> Self {
+        let (hnsw, ivf) = match a.kind {
+            AnnKind::Hnsw => (true, false),
+            AnnKind::Ivf => (false, true),
+        };
+        Self {
+            kind: format!("{:?}", a.kind),
+            overscan: a.overscan,
+            seed: a.seed,
+            m: hnsw.then_some(a.m),
+            ef_construction: hnsw.then_some(a.ef_construction),
+            ef_search: hnsw.then_some(a.ef_search),
+            n_lists: ivf.then_some(a.n_lists),
+            n_probe: ivf.then_some(a.n_probe),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ann_dto_hnsw_emits_only_hnsw_knobs() {
+        let v = serde_json::to_value(AnnDto::from(AnnConfig::hnsw())).unwrap();
+        assert_eq!(v["kind"], "Hnsw");
+        assert!(v.get("m").is_some());
+        assert!(v.get("ef_search").is_some());
+        // IVF-only knobs are skipped for an HNSW index.
+        assert!(v.get("n_lists").is_none());
+        assert!(v.get("n_probe").is_none());
+    }
+
+    #[test]
+    fn ann_dto_ivf_emits_only_ivf_knobs() {
+        let v = serde_json::to_value(AnnDto::from(AnnConfig::ivf())).unwrap();
+        assert_eq!(v["kind"], "Ivf");
+        assert!(v.get("n_probe").is_some());
+        // HNSW-only knobs are skipped for an IVF index.
+        assert!(v.get("m").is_none());
+        assert!(v.get("ef_search").is_none());
     }
 }
