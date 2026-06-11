@@ -9,7 +9,7 @@ default-members = ["."]
 
 [package]
 name = "nidus"
-version = "0.12.1"
+version = "0.12.2"
 edition = "2024"
 rust-version = "1.96"
 description = "A small, pure-Rust embeddable vector store: brute-force cosine search over a single append-only file. No FFI, no C, no SQL; anyhow its only dependency."
