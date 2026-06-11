@@ -68,9 +68,10 @@ Pulling in a crate that compiles C, links native code, or adds an `unsafe` block
 - Idempotent upserts by caller-supplied id.
 
 **Non-goals (for v0.1)**
-- Approximate nearest neighbour (HNSW/IVF) — deferred seam (§9). Note: supporting
-  whole-store search makes the scanned `N` potentially large, which strengthens the
-  case for this seam later; it does not change v0.1's exact-scan approach.
+- Approximate nearest neighbour (HNSW/IVF) was a deferred seam; it has since shipped
+  as the opt-in `Config::ann` mode (§9). Exact brute-force remains the default —
+  whole-store search makes the scanned `N` potentially large, which is exactly what
+  motivated the seam.
 - Larger-than-RAM / memory-mapped operation — deferred seam (§9).
 - Quantization — int8 scalar and binary (sign-bit) quantization have since shipped
   (§9, opt-in via `Config::quantization`).
@@ -543,6 +544,43 @@ build until a real need exists.
   one store. The core API stayed operation-centric, with no process-wide assumptions.
   Its deps (`clap`, `tokio`, `axum`, `tower`, `serde_json` — all pure Rust, zero FFI)
   compile only under `--features cli`, so `cargo add nidus` stays lean.
+- **ANN index (HNSW/IVF).** `Config::ann` opts a store into an in-RAM approximate
+  index over the same `data` rows; `search` walks it instead of scanning. Two
+  algorithms, selected by `AnnKind`: **HNSW** (`AnnConfig::hnsw`, the default — a
+  navigable small-world graph with native incremental insert) and **IVF**
+  (`AnnConfig::ivf` — k-means inverted lists). Both are pure safe Rust with no new
+  deps; the only randomness is a hand-rolled seeded splitmix64 PRNG, so builds are
+  deterministic and the logic runs under Miri. The index only *picks* an over-fetched
+  candidate set (`top_k × overscan`); the store then post-filters those candidates by
+  scope + metadata filter + `min_score` and ranks them by the exact f32 score, so
+  final ordering is always exact even though candidate *selection* is approximate.
+  **Approximation cost:** a very selective filter or collection-subset scope can
+  starve the candidate set (the graph walk surfaces too few matching rows) — recall
+  degrades silently there; an exact-prefilter path is the planned follow-up. Deletes
+  leave stale nodes in the index that are skipped at query time (the candidate→doc
+  resolution is re-verified against the live index) and reclaimed on the next
+  `compact` rebuild. ANN and quantization both replace the search path and are
+  **mutually exclusive** (rejected at `open`); combining them (a quantized walk + f32
+  rerank) is a deferred optimization. The index is extended in O(batch) on `upsert`.
+  **Persistence (derived cache).** The graph/lists are reconstructable from the
+  vectors, so they are persisted only as an optimization: a separate `ann` file
+  (`NIDUS\0` header + `bincode` + CRC32, atomically written) lets `open` *load* the
+  index instead of rebuilding it (the expensive part — HNSW build is scalar/
+  single-threaded). It is written strictly **out-of-band** — on `compact` and the
+  explicit `Nidus::persist_index()`, **never** on the `upsert`/`flush` hot path, so
+  writes stay fast and there is no background thread. `open` loads the cache, validates
+  it against the current `(dim, distance, kind, params)` + a CRC, and **incrementally
+  catches up** any rows appended since it was written; an absent, stale, over-long, or
+  corrupt cache is silently discarded and the index rebuilt from the vectors. The
+  `data`/`log` format is unchanged.
+  **Parallel build.** `Config::query_threads > 1` also parallelizes the from-scratch
+  HNSW build (on a cacheless `open` and on `compact`): node levels are assigned
+  serially, then per-node neighbour search + linking run across `std::thread::scope`
+  workers with one `Mutex` per node's adjacency and an `RwLock` entry point, edges
+  locked in node-id order (deadlock-free; safe Rust precludes data races). The serial
+  build at `query_threads == 1` is unchanged and deterministic; a parallel build
+  varies slightly with thread count (insertion order), with equivalent recall.
+  Incremental `upsert` stays serial. IVF build is already cheap and stays serial.
 
 ### Still deferred (designed-for, not built)
 
@@ -550,9 +588,6 @@ build until a real need exists.
   region instead of the in-RAM `Vec<f32>`. Gains zero-copy load, cross-process page
   sharing, >RAM. Cost: FFI (`unsafe`) — would relax the zero-FFI thesis, so it is a
   conscious future choice, not a default.
-- **ANN index (HNSW/IVF).** Build an in-RAM graph/lists over the same `data` rows;
-  `search` consults it instead of scanning. Needed only past brute-force's comfort
-  zone (≫ a few million vectors). Keep it pure-Rust and light if added.
 
 ---
 
@@ -567,6 +602,7 @@ src/
 ├── filter.rs    Predicate / Filter + matching against attrs
 ├── glob.rs      minimal * ? [..] matcher (§7.1)
 ├── search.rs    cosine kernel + bounded top-k heap + min_score; SearchOpts, Hit
+├── ann/         opt-in ANN index (Config::ann): hnsw.rs (graph) + ivf.rs (lists)
 ├── data.rs      flat f32 segment: header, append, row accessor (the mmap seam)
 ├── log.rs       op-log codec: len + payload + crc32, replay, torn-tail recovery
 ├── lock.rs      O_EXCL writer lock (pure std)

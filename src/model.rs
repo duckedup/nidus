@@ -81,6 +81,134 @@ impl Default for Quantization {
     }
 }
 
+/// Which approximate-nearest-neighbour index the store builds when ANN search is
+/// enabled via [`crate::Config::ann`]. ANN is an **opt-in** mode: with no `ann`
+/// configured, search is exact brute-force (the default), and none of this applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnnKind {
+    /// Hierarchical Navigable Small World graph. Native incremental insert (matches
+    /// nidus's append-only upsert), high recall, no training pass. The default.
+    Hnsw,
+    /// Inverted-file index: k-means centroids partition the space into lists; a query
+    /// probes the nearest few lists. Lower edge memory than HNSW, but its centroids
+    /// are fit from the data present at build time, so heavy incremental growth drifts
+    /// until the next [`crate::Nidus::compact`] rebuild.
+    Ivf,
+}
+
+/// Configuration for approximate-nearest-neighbour search. When set on
+/// [`crate::Config::ann`] the store maintains an in-RAM ANN index and `search`
+/// consults it — walking the index for an over-fetched candidate set, then applying
+/// the scope/filter/`min_score` and an exact f32 rerank. Approximate: recall is
+/// traded for speed past brute-force's comfort zone (≫ a few million vectors).
+///
+/// Construct with [`AnnConfig::hnsw`] or [`AnnConfig::ivf`] and adjust via the
+/// setters. ANN and [`Quantization`] both replace the search path and may not be
+/// enabled together (rejected at `open`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnnConfig {
+    /// Which index drives the candidate walk.
+    pub kind: AnnKind,
+    /// HNSW: max neighbours kept per node above layer 0 (layer 0 keeps `2 * m`).
+    /// Higher = better recall, more memory. Ignored for IVF.
+    pub m: usize,
+    /// HNSW: beam width used while *building* the graph. Higher = better-connected
+    /// graph (better recall), slower inserts. Ignored for IVF.
+    pub ef_construction: usize,
+    /// HNSW: beam width used while *searching*. The effective beam is
+    /// `max(ef_search, top_k * overscan)`. Higher = better recall, slower queries.
+    /// Ignored for IVF.
+    pub ef_search: usize,
+    /// IVF: number of k-means centroids (inverted lists). `0` = pick `~sqrt(n)` at
+    /// build time. Ignored for HNSW.
+    pub n_lists: usize,
+    /// IVF: how many of the nearest lists a query scans. Higher = better recall,
+    /// slower queries. Ignored for HNSW.
+    pub n_probe: usize,
+    /// Over-fetch multiple: the walk collects `top_k * overscan` candidates before the
+    /// scope/filter/`min_score` post-filter and f32 rerank, so a metadata filter or a
+    /// collection-subset scope still has survivors to rank. Higher = better recall
+    /// under selective filters, slower queries.
+    pub overscan: usize,
+    /// Seed for the index's PRNG (HNSW level assignment, IVF centroid init), so a
+    /// build is deterministic and tests are reproducible.
+    pub seed: u64,
+}
+
+impl AnnConfig {
+    /// HNSW with sensible defaults (`m = 16`, `ef_construction = 200`,
+    /// `ef_search = 64`, `overscan = 4`). The default ANN index.
+    pub fn hnsw() -> Self {
+        Self {
+            kind: AnnKind::Hnsw,
+            m: 16,
+            ef_construction: 200,
+            ef_search: 64,
+            n_lists: 0,
+            n_probe: 8,
+            overscan: 4,
+            seed: 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    /// IVF with sensible defaults (`n_lists = 0` → `~sqrt(n)`, `n_probe = 8`,
+    /// `overscan = 4`).
+    pub fn ivf() -> Self {
+        Self {
+            kind: AnnKind::Ivf,
+            m: 16,
+            ef_construction: 200,
+            ef_search: 64,
+            n_lists: 0,
+            n_probe: 8,
+            overscan: 4,
+            seed: 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    /// Set the HNSW max-neighbours-per-node (clamped to at least 1).
+    pub fn m(mut self, m: usize) -> Self {
+        self.m = m.max(1);
+        self
+    }
+
+    /// Set the HNSW build beam width (clamped to at least 1).
+    pub fn ef_construction(mut self, ef: usize) -> Self {
+        self.ef_construction = ef.max(1);
+        self
+    }
+
+    /// Set the HNSW search beam width (clamped to at least 1).
+    pub fn ef_search(mut self, ef: usize) -> Self {
+        self.ef_search = ef.max(1);
+        self
+    }
+
+    /// Set the IVF centroid count (`0` = auto `~sqrt(n)`).
+    pub fn n_lists(mut self, n: usize) -> Self {
+        self.n_lists = n;
+        self
+    }
+
+    /// Set the IVF probe count (clamped to at least 1).
+    pub fn n_probe(mut self, n: usize) -> Self {
+        self.n_probe = n.max(1);
+        self
+    }
+
+    /// Set the candidate over-fetch multiple (clamped to at least 1).
+    pub fn overscan(mut self, n: usize) -> Self {
+        self.overscan = n.max(1);
+        self
+    }
+
+    /// Set the build PRNG seed.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
+    }
+}
+
 /// A typed metadata value attached to a [`Record`].
 ///
 /// `Null` is **distinct from an absent key**: absence means "not set / not indexed",

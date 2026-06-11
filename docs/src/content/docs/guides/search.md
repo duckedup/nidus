@@ -1,10 +1,13 @@
 ---
 title: Search & filters
-description: Scoped search across nidus collections with three distance metrics, int8 quantization, metadata-only queries, and equality / glob / set / range filter predicates.
+description: Scoped search across nidus collections with three distance metrics, exact or approximate (HNSW/IVF) indexing, int8 quantization, metadata-only queries, and equality / glob / set / range filter predicates.
 ---
 
-Search in nidus is exact brute-force over a scope you choose, using one of three
-distance metrics, optionally narrowed by a metadata filter and a score floor.
+Search in nidus runs over a scope you choose, using one of three distance metrics,
+optionally narrowed by a metadata filter and a score floor. It is **exact by
+default** — every in-scope vector is scored — and can opt into an
+[approximate index](#approximate-search-ann) (HNSW or IVF) when a full scan is more
+than you want to pay.
 
 ## Distance metrics
 
@@ -200,3 +203,68 @@ Quantization is purely a runtime optimization — it doesn't change the on-disk
 format, and a store opened without it produces identical results (just slower
 for large scans). Reach for it when search latency matters more than the extra
 RAM. Vectors quantize incrementally on upsert, so adding records stays cheap.
+
+## Approximate search (ANN)
+
+By default every search is **exact** — it scores every in-scope vector. When a
+collection grows past the point where a full scan is more than you want to pay,
+`Config::ann` opts into an **approximate** index that walks a much smaller candidate
+set instead. It is purely a runtime choice: nothing about the on-disk format changes,
+and a store opened without it behaves exactly as before.
+
+```rust
+use nidus::{Config, Nidus, AnnConfig};
+
+// HNSW — a navigable small-world graph (the default ANN index):
+let db = Nidus::open(Config::new("./store", 768).ann(Some(AnnConfig::hnsw())))?;
+
+// or IVF — k-means inverted lists:
+let db2 = Nidus::open(Config::new("./store2", 768).ann(Some(AnnConfig::ivf())))?;
+# anyhow::Ok(())
+```
+
+Both index types work the same way at query time: the index selects an over-fetched
+candidate set (`top_k × overscan`), then nidus applies your scope, metadata filter,
+and `min_score` to those candidates and ranks the survivors by the **exact** f32
+score. So the *final ordering is always exact* — only the candidate *selection* is
+approximate.
+
+**Choosing an index.** `AnnConfig::hnsw()` gives high recall and supports cheap
+incremental `upsert` (new vectors are inserted into the graph directly); it is the
+right default. `AnnConfig::ivf()` uses less memory for its links but fits its k-means
+partition from the data present at build time, so heavy incremental growth drifts the
+partition until the next `compact()` rebuilds it.
+
+**Tuning.** Each has builder setters: HNSW exposes `m`, `ef_construction`, and
+`ef_search` (higher = better recall, more work); IVF exposes `n_lists` and `n_probe`
+(more probed lists = better recall, slower). Both share `overscan` (how many
+candidates to fetch before the post-filter) and a `seed` for reproducible builds.
+
+```rust
+use nidus::AnnConfig;
+let cfg = AnnConfig::hnsw().m(32).ef_search(128).overscan(8);
+# let _ = cfg;
+```
+
+**Persisting the index.** The graph is in-RAM and rebuilt from the vectors on
+`open()` — and for HNSW that build is the expensive part. Call
+[`db.persist_index()`](/reference/api/#nidus) to write it to an `ann` cache file so
+the next `open()` *loads* it instead of rebuilding. It's an explicit, out-of-band
+operation (also triggered by `compact()`) — never on the `upsert`/`flush` write path,
+so storage stays fast — so call it before shutting down a long-lived handle. `open()`
+incrementally catches up any rows added since the cache was written, and silently
+rebuilds if the cache is missing, stale, or for a different config. The cache is
+derived data: deleting the `ann` file only costs a one-time rebuild.
+
+**Trade-offs to know.**
+
+- **Approximate recall.** ANN may miss a true neighbour. Raise `ef_search`/`n_probe`
+  and `overscan` to trade speed for recall.
+- **Selective filters.** Because the filter is applied *after* the walk, a very
+  selective filter or a narrow collection-subset scope can leave too few matching
+  candidates — recall drops in that case. If you mostly run highly-selective filtered
+  queries, exact search (the default) may serve you better.
+- **Deletes.** A deleted vector leaves a stale node in the index that is skipped at
+  query time and fully reclaimed on the next `compact()`.
+- **One or the other.** `ann` and `quantization` both replace the search path and
+  cannot be enabled together (it is rejected at `open`).

@@ -56,6 +56,7 @@ searchers plus one writer (see
 | `search` | `fn search<'a>(&self, scope: impl Into<Scope<'a>>, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>` | Ranked search over a scope using the store's distance metric. |
 | `flush` | `fn flush(&mut self) -> Result<()>` | Force an fsync (relevant under `Fsync::OnFlush`). |
 | `compact` | `fn compact(&mut self) -> Result<()>` | Rewrite `data` to reclaim dead rows. |
+| `persist_index` | `fn persist_index(&mut self) -> Result<()>` | Write the [ANN index](#annconfig--annkind) to its `ann` cache so the next `open()` loads it instead of rebuilding the graph. Out-of-band (never on `upsert`/`flush`); no-op when ANN is off, in-memory, or read-only. `compact()` refreshes it too. |
 
 ## `Scope`
 
@@ -193,3 +194,32 @@ pub struct Quantization {
     pub rescore: usize,  // overscan factor (default 4)
 }
 ```
+
+## `AnnConfig` & `AnnKind`
+
+Configuration for the opt-in approximate-nearest-neighbour index. Pass to
+`Config::ann` to walk an index instead of scanning every vector. Construct with
+`AnnConfig::hnsw()` or `AnnConfig::ivf()` and adjust via the builder setters. See the
+[approximate search guide](/guides/search/#approximate-search-ann).
+
+```rust
+pub enum AnnKind { Hnsw, Ivf }
+
+pub struct AnnConfig {
+    pub kind: AnnKind,
+    pub m: usize,               // HNSW: neighbours/node (default 16)
+    pub ef_construction: usize, // HNSW: build beam width (default 200)
+    pub ef_search: usize,       // HNSW: query beam width (default 64)
+    pub n_lists: usize,         // IVF: centroids; 0 = auto ~sqrt(n)
+    pub n_probe: usize,         // IVF: lists scanned per query (default 8)
+    pub overscan: usize,        // candidate over-fetch multiple (default 4)
+    pub seed: u64,              // build PRNG seed (deterministic)
+}
+
+// Builders: AnnConfig::hnsw(), AnnConfig::ivf()
+// Setters:  .m(), .ef_construction(), .ef_search(), .n_lists(), .n_probe(),
+//           .overscan(), .seed()
+```
+
+Mutually exclusive with [`Quantization`](#quantization) — enabling both is rejected
+at `open`.

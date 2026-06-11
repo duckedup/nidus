@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::model::{Distance, Quantization};
+use crate::model::{AnnConfig, Distance, Quantization};
 
 /// How aggressively writes are flushed to disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +59,14 @@ pub struct Config {
     /// scores. [`Quantization::int8`] (4× smaller, any metric) or
     /// [`Quantization::binary`] (32× smaller, Hamming first pass, **cosine only**).
     pub quantization: Option<Quantization>,
+    /// Approximate-nearest-neighbour index. `None` disables (the default — exact
+    /// brute-force search, unchanged). When set, the store builds an in-RAM ANN index
+    /// ([`crate::AnnConfig::hnsw`] or [`crate::AnnConfig::ivf`]) and `search` walks it
+    /// for an over-fetched candidate set, then applies the scope/filter/`min_score`
+    /// and an exact f32 rerank. Approximate: trades recall for speed past brute-force's
+    /// comfort zone. Mutually exclusive with [`Config::quantization`] — enabling both
+    /// is rejected at `open`.
+    pub ann: Option<AnnConfig>,
     /// Worker threads for a single search. Default `1` (single-threaded, no behavior
     /// change). When `> 1`, a large scan is split across this many `std::thread::scope`
     /// workers, each with its own bounded heap, merged at the end — both the exact f32
@@ -82,6 +90,7 @@ impl Config {
             lock_ttl: Duration::from_secs(60),
             max_vector_bytes: None,
             quantization: None,
+            ann: None,
             query_threads: 1,
         }
     }
@@ -125,6 +134,13 @@ impl Config {
     /// Enable vector quantization for faster search (int8 or binary; `None` disables).
     pub fn quantization(mut self, q: Option<Quantization>) -> Self {
         self.quantization = q;
+        self
+    }
+
+    /// Enable approximate-nearest-neighbour search (HNSW or IVF; `None` disables —
+    /// the default exact brute-force). Mutually exclusive with quantization.
+    pub fn ann(mut self, ann: Option<AnnConfig>) -> Self {
+        self.ann = ann;
         self
     }
 

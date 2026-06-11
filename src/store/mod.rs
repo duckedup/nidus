@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::ann::Ann;
 use crate::config::{Config, Fsync, OpenMode};
 use crate::data::DataSegment;
 use crate::filter;
@@ -291,6 +292,23 @@ pub struct Store {
     dead_rows: usize,
     /// Quantization state (None when quantization is off — the f32 brute-force default).
     quant: Option<Quant>,
+    /// Approximate-nearest-neighbour index (None when ANN is off — the exact default).
+    /// Mutually exclusive with `quant` (rejected at `open`).
+    ann: Option<Ann>,
+    /// The in-RAM ANN index has unpersisted changes (rows inserted since the last
+    /// `persist_index`/load). Lets `persist_index` skip a redundant write and tracks
+    /// whether the on-disk `ann` cache is current. Meaningless when ANN is off.
+    ann_dirty: bool,
+    /// True for in-memory stores (no backing directory) — they never persist the ANN
+    /// cache. `open`ed (file-backed) stores set this false.
+    in_memory: bool,
+    /// Reverse map physical-row → `(collection, id)`, maintained only when ANN is on,
+    /// so an ANN candidate row resolves to its owning doc in O(1) for the post-filter
+    /// and `Hit` build. It is a *hint*: every lookup is re-verified against the
+    /// authoritative index (`docs[id].row == row`), so deletions and overwrites need no
+    /// special invalidation — a stale entry simply fails the check and is skipped.
+    /// Dense + append-only (rebuilt wholesale on `compact`, which renumbers rows).
+    row_to_doc: Vec<Option<(String, String)>>,
     /// Row-sorted scan order over *all* live docs — `(row, collection, id)` sorted by
     /// `row` — so a whole-store scan reaches the data matrix in storage order without
     /// re-sorting on every query (nidus-dxt). Built lazily on the first whole-store
@@ -393,10 +411,14 @@ impl Store {
             }
         }
 
+        Self::reject_ann_with_quant(&config)?;
         let quant = match config.quantization {
             Some(q) => Some(Quant::empty(q.kind, data.dimension(), config.distance)?),
             None => None,
         };
+        let ann = config
+            .ann
+            .map(|a| Ann::empty(a, data.dimension(), config.distance));
 
         let mut store = Store {
             config,
@@ -406,6 +428,10 @@ impl Store {
             collections,
             dead_rows,
             quant,
+            ann,
+            ann_dirty: false,
+            in_memory: false,
+            row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
         };
 
@@ -420,8 +446,22 @@ impl Store {
 
         // 7. Build the quantized matrix from the loaded vectors, if enabled.
         store.rebuild_quant();
+        // 8. Load the ANN index from its cache (incrementally catching up any rows
+        //    added since), or rebuild it from the vectors if there is no valid cache.
+        store.load_or_build_ann()?;
 
         Ok(store)
+    }
+
+    /// ANN and quantization both replace the search path and may not run together.
+    fn reject_ann_with_quant(config: &Config) -> Result<()> {
+        if config.ann.is_some() && config.quantization.is_some() {
+            bail!(
+                "Config::ann and Config::quantization cannot both be set — ANN and \
+                 quantization both replace the search path; enable only one"
+            );
+        }
+        Ok(())
     }
 
     /// An in-memory store (no files, no lock). For tests.
@@ -441,10 +481,14 @@ impl Store {
 
     /// An in-memory store with full config control.
     pub fn in_memory_cfg(config: Config) -> Result<Store> {
+        Self::reject_ann_with_quant(&config)?;
         let quant = match config.quantization {
             Some(q) => Some(Quant::empty(q.kind, config.dimension, config.distance)?),
             None => None,
         };
+        let ann = config
+            .ann
+            .map(|a| Ann::empty(a, config.dimension, config.distance));
         Ok(Store {
             data: DataSegment::in_memory_with(config.dimension, config.distance),
             log: OpLog::in_memory(),
@@ -452,6 +496,10 @@ impl Store {
             collections: HashMap::new(),
             dead_rows: 0,
             quant,
+            ann,
+            ann_dirty: false,
+            in_memory: true,
+            row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
             config,
         })
@@ -518,6 +566,128 @@ impl Store {
                 }
             }
         }
+    }
+
+    /// Rebuild the `row → (collection, id)` reverse map from the live index and return
+    /// the live physical rows. Sized to the physical row count; dead rows stay `None`.
+    /// Shared by the ANN rebuild and the snapshot-load paths.
+    fn rebuild_row_to_doc(&mut self) -> Vec<u64> {
+        let mut row_to_doc: Vec<Option<(String, String)>> =
+            vec![None; self.data.row_count() as usize];
+        let mut live_rows: Vec<u64> = Vec::new();
+        for (col_name, col) in &self.collections {
+            for (id, entry) in &col.docs {
+                if (entry.row as usize) < row_to_doc.len() {
+                    row_to_doc[entry.row as usize] = Some((col_name.clone(), id.clone()));
+                    live_rows.push(entry.row);
+                }
+            }
+        }
+        self.row_to_doc = row_to_doc;
+        live_rows
+    }
+
+    /// Rebuild the ANN index and its reverse map from *all* current live docs. O(N) —
+    /// used after `compact` renumbers rows and when no valid cache exists on `open`.
+    /// No-op when ANN is off. Marks the index dirty (the on-disk cache is now stale).
+    fn rebuild_ann(&mut self) {
+        if self.ann.is_none() {
+            return;
+        }
+        let live_rows = self.rebuild_row_to_doc();
+        let workers = self.config.query_threads;
+        if let Some(ann) = self.ann.as_mut() {
+            ann.build(&self.data, &live_rows, workers);
+        }
+        self.ann_dirty = true;
+    }
+
+    /// On `open`: load the ANN index from its `ann` cache if one is present and valid
+    /// for this store's config, then incrementally insert any rows added since the
+    /// cache was written (so a stale/partial cache still makes open cheap). With no
+    /// valid cache, fall back to a full `rebuild_ann`. No-op when ANN is off.
+    fn load_or_build_ann(&mut self) -> Result<()> {
+        let Some(cfg) = self.config.ann else {
+            return Ok(());
+        };
+        if self.ann.is_none() {
+            return Ok(());
+        }
+        let path = self.config.path.join("ann");
+        let dim = self.data.dimension();
+        let distance = self.config.distance;
+        let total = self.data.row_count();
+
+        match crate::ann::load_index(&path, dim, distance, &cfg)? {
+            // Valid cache that doesn't claim more rows than the data file holds (a
+            // larger `covered` would mean dangling node→row refs — treat as stale).
+            Some((ann, covered)) if covered <= total => {
+                self.ann = Some(ann);
+                self.rebuild_row_to_doc();
+                if total > covered {
+                    // Catch up rows appended after the cache was written.
+                    let new_rows: Vec<u64> = (covered..total).collect();
+                    if let Some(ann) = self.ann.as_mut() {
+                        ann.insert_rows(&self.data, &new_rows);
+                    }
+                    self.ann_dirty = true; // the delta isn't persisted yet
+                } else {
+                    self.ann_dirty = false; // on-disk cache is exactly current
+                }
+            }
+            // No cache, or stale/corrupt/over-long → rebuild from the vectors.
+            _ => self.rebuild_ann(),
+        }
+        Ok(())
+    }
+
+    /// Write the ANN index to its `ann` cache file so the next `open` skips the
+    /// rebuild. Out-of-band by design — call it explicitly (e.g. before shutdown) or
+    /// let `compact` trigger it; it is *never* on the `upsert`/`flush` write path. A
+    /// no-op when ANN is off, the store is in-memory or read-only, or nothing changed
+    /// since the last persist.
+    pub fn persist_index(&mut self) -> Result<()> {
+        let Some(cfg) = self.config.ann else {
+            return Ok(());
+        };
+        if self.in_memory || self.config.open_mode == OpenMode::ReadOnly || !self.ann_dirty {
+            return Ok(());
+        }
+        let Some(ann) = self.ann.as_ref() else {
+            return Ok(());
+        };
+        let path = self.config.path.join("ann");
+        crate::ann::save_index(
+            &path,
+            ann,
+            self.data.row_count(),
+            self.data.dimension(),
+            self.config.distance,
+            &cfg,
+        )?;
+        self.ann_dirty = false;
+        Ok(())
+    }
+
+    /// Incrementally index the rows `upsert` just appended (`[prev_rows, row_count())`),
+    /// all owned by `collection`, recording their owners in the reverse map — O(batch),
+    /// not O(N). No-op when ANN is off. `new_owners` is `(row, id)` captured at commit.
+    fn extend_ann(&mut self, collection: &str, prev_rows: u64, new_owners: &[(u64, String)]) {
+        if self.ann.is_none() {
+            return;
+        }
+        let total = self.data.row_count();
+        if self.row_to_doc.len() < total as usize {
+            self.row_to_doc.resize(total as usize, None);
+        }
+        for (row, id) in new_owners {
+            self.row_to_doc[*row as usize] = Some((collection.to_string(), id.clone()));
+        }
+        let new_rows: Vec<u64> = (prev_rows..total).collect();
+        if let Some(ann) = self.ann.as_mut() {
+            ann.insert_rows(&self.data, &new_rows);
+        }
+        self.ann_dirty = true;
     }
 
     /// Reject mutations when in ReadOnly mode.
@@ -772,10 +942,15 @@ impl Store {
             self.collections.insert(collection.to_string(), col);
         }
         let col = self.collections.get_mut(collection).unwrap();
+        let ann_on = self.ann.is_some();
+        let mut new_owners: Vec<(u64, String)> = Vec::new();
         let mut count = 0usize;
         for (id, row, attrs) in staged {
             if col.docs.contains_key(&id) {
                 self.dead_rows += 1; // overwriting: the old row becomes dead
+            }
+            if ann_on {
+                new_owners.push((row, id.clone()));
             }
             col.docs.insert(id, DocEntry { row, attrs });
             count += 1;
@@ -783,6 +958,8 @@ impl Store {
 
         // Quantize only the rows this batch appended (O(batch)); refits lazily.
         self.extend_quant(data_mark);
+        // Index the new rows in the ANN graph/lists (O(batch)). No-op when ANN is off.
+        self.extend_ann(collection, data_mark, &new_owners);
         // The doc set changed — drop the cached scan order (rebuilt on next query).
         self.invalidate_scan_order();
         Ok(count)
@@ -1065,6 +1242,14 @@ impl Store {
             Distance::Euclidean => euclidean_neg_sq,
         };
 
+        // ANN path: walk the index for an over-fetched candidate set, then post-filter
+        // by scope + filter + min_score and rerank. Approximate — recall is traded for
+        // speed, and a selective filter/scope can starve the candidate set (the
+        // exact-prefilter follow-up addresses that). Skips the linear scan entirely.
+        if self.ann.is_some() {
+            return Ok(self.search_ann(collections, &q, opts));
+        }
+
         // Gather the in-scope, filter-passing rows in physical-row order (for
         // cache-friendly sequential `data` access — nidus-33k). `with_sorted_scan`
         // hands back an already row-sorted scan, reusing the cached whole-store order
@@ -1198,6 +1383,76 @@ impl Store {
 
         let candidates = topk_q.into_sorted_desc();
         Ok(self.rerank_candidates(q, &candidates, score_fn, opts))
+    }
+
+    /// ANN search: walk the index for `top_k × overscan` candidate rows, then resolve
+    /// each to its owning doc, keep only those in scope and passing the filter, and
+    /// rank by the exact f32 score (the candidate scores returned by the index are
+    /// already the exact metric — both the HNSW beam and the IVF probe score real
+    /// rows). Over-fetching gives the post-filter survivors to rank; recall still
+    /// degrades when a filter/scope is very selective (see the exact-prefilter
+    /// follow-up). Candidate→doc resolution is verified against the live index, so
+    /// stale graph nodes (deleted/overwritten rows) are skipped.
+    fn search_ann(&self, collections: &[&str], q: &[f32], opts: &SearchOpts) -> Vec<Hit> {
+        let Some(ann) = self.ann.as_ref() else {
+            return Vec::new();
+        };
+        if opts.top_k == 0 {
+            return Vec::new();
+        }
+        let scope: std::collections::HashSet<&str> = collections.iter().copied().collect();
+        let overscan = self.config.ann.map_or(1, |a| a.overscan).max(1);
+        let n_candidates = opts.top_k.saturating_mul(overscan).max(opts.top_k);
+
+        let candidates = ann.search(&self.data, q, n_candidates);
+
+        let mut topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
+        for (row, score) in &candidates {
+            // Resolve the candidate row to its owning doc via the reverse map, then
+            // verify the doc still lives at this row (catches deletes/overwrites).
+            let Some(Some((col_name, id))) = self.row_to_doc.get(*row as usize) else {
+                continue;
+            };
+            if !scope.contains(col_name.as_str()) {
+                continue;
+            }
+            let Some(col) = self.collections.get(col_name) else {
+                continue;
+            };
+            let Some(entry) = col.docs.get(id) else {
+                continue;
+            };
+            if entry.row != *row {
+                continue; // stale reverse-map hint — row was overwritten
+            }
+            if !filter::matches(&opts.filter, &entry.attrs) {
+                continue;
+            }
+            if let Some(min) = opts.min_score
+                && *score < min
+            {
+                continue;
+            }
+            topk.offer(*score, (col_name.as_str(), id.as_str()));
+        }
+
+        topk.into_sorted_desc()
+            .into_iter()
+            .map(|(score, (collection, id))| {
+                let attrs = self
+                    .collections
+                    .get(collection)
+                    .and_then(|c| c.docs.get(id))
+                    .map(|e| e.attrs.clone())
+                    .unwrap_or_default();
+                Hit {
+                    collection: collection.to_string(),
+                    id: id.to_string(),
+                    score,
+                    attrs,
+                }
+            })
+            .collect()
     }
 
     /// Exact f32 rerank of first-pass candidates → final ranked `Hit`s. Shared by both
@@ -1337,6 +1592,12 @@ impl Store {
 
         // 5. Rebuild quantization state with compacted vectors.
         self.rebuild_quant();
+
+        // 5b. Rebuild the ANN index + reverse map (rows were renumbered) and refresh
+        //     its on-disk cache. Best effort: the cache is derived, so a persist
+        //     failure must not fail the compaction.
+        self.rebuild_ann();
+        let _ = self.persist_index();
 
         // 6. Rows were renumbered — drop the cached scan order.
         self.invalidate_scan_order();
@@ -1868,6 +2129,10 @@ mod tests {
             collections: HashMap::new(),
             dead_rows: 0,
             quant: None,
+            ann: None,
+            ann_dirty: false,
+            in_memory: true,
+            row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
         };
         store.create_collection("col").unwrap();
@@ -3151,5 +3416,236 @@ mod tests {
         let q: Vec<f32> = (0..8).map(|d| (d * 2 % 7) as f32).collect();
         let hits = store.search(&["col"], &q, &default_opts(10)).unwrap();
         assert_eq!(hits.len(), 10);
+    }
+
+    // ── ANN ─────────────────────────────────────────────────────────────────────
+
+    use crate::ann::SplitMix64;
+    use crate::model::AnnConfig;
+
+    /// `n` deterministic random unit vectors of dimension `dim`.
+    fn random_unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut rng = SplitMix64::new(seed);
+        (0..n)
+            .map(|_| {
+                let mut v: Vec<f32> = (0..dim)
+                    .map(|_| rng.next_f64() as f32 * 2.0 - 1.0)
+                    .collect();
+                normalize(&mut v);
+                v
+            })
+            .collect()
+    }
+
+    fn ann_store(dim: usize, cfg: AnnConfig, vectors: &[Vec<f32>]) -> Store {
+        let mut s = Store::in_memory_cfg(
+            Config::new("/dev/null/in-memory", dim)
+                .auto_compact(None)
+                .ann(Some(cfg)),
+        )
+        .unwrap();
+        let recs: Vec<Record> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| rec(&format!("d{i}"), v.clone()))
+            .collect();
+        s.upsert("col", &recs).unwrap();
+        s
+    }
+
+    fn exact_store(dim: usize, vectors: &[Vec<f32>]) -> Store {
+        let mut s = Store::in_memory(dim).unwrap();
+        let recs: Vec<Record> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| rec(&format!("d{i}"), v.clone()))
+            .collect();
+        s.upsert("col", &recs).unwrap();
+        s
+    }
+
+    /// Mean recall@k of `ann` against the exact brute-force `truth` over `queries`.
+    fn mean_recall(ann: &Store, truth: &Store, queries: &[Vec<f32>], k: usize) -> f32 {
+        let mut total = 0.0f32;
+        for q in queries {
+            let exact: std::collections::HashSet<String> = truth
+                .search(&["col"], q, &default_opts(k))
+                .unwrap()
+                .into_iter()
+                .map(|h| h.id)
+                .collect();
+            let got = ann.search(&["col"], q, &default_opts(k)).unwrap();
+            let hit = got.iter().filter(|h| exact.contains(&h.id)).count();
+            total += hit as f32 / k as f32;
+        }
+        total / queries.len() as f32
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // N=2000 build is too slow under Miri; logic is covered in ann/.
+    fn hnsw_recall_matches_exact() {
+        let (n, dim, k) = (2000, 32, 10);
+        let data = random_unit_vectors(n, dim, 1);
+        let queries = random_unit_vectors(50, dim, 2);
+        let ann = ann_store(dim, AnnConfig::hnsw(), &data);
+        let truth = exact_store(dim, &data);
+        let recall = mean_recall(&ann, &truth, &queries, k);
+        assert!(
+            recall >= 0.90,
+            "HNSW recall@{k} = {recall:.3}, expected >= 0.90"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // builds a parallel HNSW graph; threads + size not for Miri.
+    fn hnsw_parallel_build_recall_matches_serial() {
+        // A parallel build produces a different-but-equivalent graph; recall should
+        // stay in the same ballpark as the serial build on the same data.
+        let (n, dim, k) = (1500, 32, 10); // > PARALLEL_BUILD_MIN so the parallel path runs
+        let data = random_unit_vectors(n, dim, 7);
+        let queries = random_unit_vectors(30, dim, 8);
+        let truth = exact_store(dim, &data);
+
+        let serial = ann_store(dim, AnnConfig::hnsw(), &data); // query_threads defaults to 1
+        let parallel = {
+            let mut s = Store::in_memory_cfg(
+                Config::new("/dev/null/in-memory", dim)
+                    .auto_compact(None)
+                    .query_threads(4)
+                    .ann(Some(AnnConfig::hnsw())),
+            )
+            .unwrap();
+            let recs: Vec<Record> = data
+                .iter()
+                .enumerate()
+                .map(|(i, v)| rec(&format!("d{i}"), v.clone()))
+                .collect();
+            // upsert builds incrementally (serial); force the parallel from-scratch
+            // build path via compact (rebuild_ann under query_threads=4).
+            s.upsert("col", &recs).unwrap();
+            s.compact().unwrap();
+            s
+        };
+
+        let serial_recall = mean_recall(&serial, &truth, &queries, k);
+        let parallel_recall = mean_recall(&parallel, &truth, &queries, k);
+        assert!(
+            parallel_recall >= serial_recall - 0.05,
+            "parallel recall {parallel_recall:.3} should track serial {serial_recall:.3}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn ivf_recall_matches_exact() {
+        let (n, dim, k) = (2000, 32, 10);
+        let data = random_unit_vectors(n, dim, 3);
+        let queries = random_unit_vectors(50, dim, 4);
+        // Probe a generous fraction of lists so recall is solid.
+        let ann = ann_store(dim, AnnConfig::ivf().n_probe(12), &data);
+        let truth = exact_store(dim, &data);
+        let recall = mean_recall(&ann, &truth, &queries, k);
+        assert!(
+            recall >= 0.70,
+            "IVF recall@{k} = {recall:.3}, expected >= 0.70"
+        );
+    }
+
+    /// Small-N correctness that stays Miri-clean (no fsync, tiny build).
+    #[test]
+    fn ann_finds_exact_match_small() {
+        let data = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        for cfg in [AnnConfig::hnsw(), AnnConfig::ivf().n_probe(8)] {
+            let s = ann_store(3, cfg, &data);
+            let hits = s
+                .search(&["col"], &[0.0, 1.0, 0.0], &default_opts(1))
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].id, "d1", "{cfg:?} should find the exact match");
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // N=200 HNSW build is slow under Miri; tiny cases cover the path.
+    fn ann_post_filter_returns_only_matching() {
+        // Half the docs carry kind=a, half kind=b; an ANN query filtered to kind=b must
+        // never return a kind=a doc.
+        let dim = 16;
+        let data = random_unit_vectors(200, dim, 5);
+        let mut s = Store::in_memory_cfg(
+            Config::new("/dev/null/in-memory", dim)
+                .auto_compact(None)
+                .ann(Some(AnnConfig::hnsw().overscan(8))),
+        )
+        .unwrap();
+        let recs: Vec<Record> = data
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let mut attrs = BTreeMap::new();
+                let kind = if i % 2 == 0 { "a" } else { "b" };
+                attrs.insert("kind".to_string(), Value::Str(kind.to_string()));
+                rec_with(&format!("d{i}"), v.clone(), attrs)
+            })
+            .collect();
+        s.upsert("col", &recs).unwrap();
+
+        let opts = SearchOpts {
+            top_k: 10,
+            filter: Filter(vec![Predicate::Eq(
+                "kind".to_string(),
+                Value::Str("b".to_string()),
+            )]),
+            min_score: None,
+        };
+        let hits = s.search(&["col"], &data[1], &opts).unwrap();
+        assert!(!hits.is_empty(), "filtered ANN should still return results");
+        for h in &hits {
+            // d1, d3, … are odd indices = kind b.
+            let idx: usize = h.id.trim_start_matches('d').parse().unwrap();
+            assert_eq!(idx % 2, 1, "{} leaked into a kind=b query", h.id);
+        }
+    }
+
+    #[test]
+    fn ann_skips_deleted_rows() {
+        let data = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.9, 0.1, 0.0],
+            vec![0.0, 1.0, 0.0],
+        ];
+        let mut s = ann_store(3, AnnConfig::hnsw(), &data);
+        // Delete the nearest doc to a +x query; its graph node is now stale.
+        s.delete("col", &["d0"]).unwrap();
+        let hits = s
+            .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(3))
+            .unwrap();
+        assert!(
+            hits.iter().all(|h| h.id != "d0"),
+            "deleted doc must not appear: {hits:?}"
+        );
+        // The next-nearest live doc should now lead.
+        assert_eq!(hits[0].id, "d1");
+    }
+
+    #[test]
+    fn ann_rejects_combination_with_quantization() {
+        let result = Store::in_memory_cfg(
+            Config::new("/dev/null/in-memory", 4)
+                .ann(Some(AnnConfig::hnsw()))
+                .quantization(Some(Quantization::default())),
+        );
+        let err = match result {
+            Ok(_) => panic!("expected ann+quantization to be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("cannot both be set"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -54,8 +54,17 @@ sweep isn't enough. Both stay pure-safe-Rust and are off by default:
   bandwidth-bound and scales to **~2.4×** at 4 threads. Reproduce:
   `just bench-crit parallel_search` (the `parallel_search_quant` group is the
   quantized sweep).
+- **[approximate index (HNSW / IVF)](/guides/search/#approximate-search-ann)**
+  (`Config::ann`) — walks an index instead of scanning every vector, for when the
+  collection outgrows a full scan. On realistic clustered data (n=20k, dim=768) HNSW
+  returns **~0.99–1.0 recall@10 at ~7–10× the query speed** of the exact scan; IVF
+  ~1.0 recall at ~3×. The graph is in-RAM but [persisted](/guides/search/#approximate-search-ann)
+  so a warm `open()` is **~0.05 s** instead of rebuilding (~36 s here), and a cold
+  rebuild parallelizes over `query_threads` (**~36 s → ~5 s at 8 threads**). Recall is
+  data-dependent — uniform-random vectors are a near-worst case — so measure your own:
+  `just bench-ann clustered=1`.
 
-Neither is the headline multiplier its theory suggests — the 4× from int8 and the
+Neither int8 nor threads is the headline multiplier its theory suggests — the 4× from int8 and the
 linear scaling from threads both want SIMD/bandwidth headroom nidus doesn't chase
 within its zero-FFI design. The f32 scan is bandwidth-bound; threads help most when
 paired with the int8 first pass, which has the compute headroom to scale. They're
@@ -64,15 +73,17 @@ yourself.
 
 ## The target regime
 
-nidus is built for **exact** search at the scale where brute force wins: up to a
+nidus is tuned for **exact** search at the scale where a full scan wins: up to a
 few million vectors, comfortably in RAM. At that size, 100% recall with no index
-to build or tune beats an approximate index — and you never pay for an ANN
-structure you don't need.
+to build or tune beats an approximate index — and exact search is the default, so
+you never pay for an index you don't need.
 
-ANN/HNSW is a [deferred seam](/guides/how-it-works/#what-it-deliberately-is-not),
-not a missing feature: it stays unbuilt until a real consumer hits a scale and
-latency budget brute force can't meet — and even then it must be pure-Rust,
-optional, and additive over the same append-only file.
+Past that scale, an [approximate index](/guides/search/#approximate-search-ann)
+(HNSW or IVF, via `Config::ann`) is available as an opt-in: it trades some recall
+for a smaller candidate walk instead of a full scan. It is pure-Rust, optional, and
+additive over the same append-only file — exact search is unchanged when it is off.
+The benchmark above measures the exact path; run `just bench-ann` to sweep the
+approximate variants' recall and latency on your own shapes.
 
 ## Reproduce it
 

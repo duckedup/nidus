@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use nidus::{
-    Config, Distance, Filter, Nidus, OpenMode, Predicate, Quantization, Record, Scope, SearchOpts,
-    Value,
+    AnnConfig, Config, Distance, Filter, Nidus, OpenMode, Predicate, Quantization, Record, Scope,
+    SearchOpts, Value,
 };
 
 fn rec(id: &str, vector: Vec<f32>, kind: &str) -> Record {
@@ -176,4 +176,117 @@ fn reopen_with_wrong_dimension_errors() {
     let dir = tempfile::tempdir().unwrap();
     Nidus::open(Config::new(dir.path(), 3)).unwrap();
     assert!(Nidus::open(Config::new(dir.path(), 5)).is_err());
+}
+
+// ── ANN index persistence ────────────────────────────────────────────────────
+
+fn ann_rec(id: &str, vector: Vec<f32>) -> Record {
+    rec(id, vector, "doc")
+}
+
+/// persist_index() writes a cache; the next open loads it and searches identically.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn ann_index_persists_and_reloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = || Config::new(dir.path(), 3).ann(Some(AnnConfig::hnsw()));
+    let query = [0.0, 1.0, 0.0];
+
+    let before = {
+        let mut db = Nidus::open(cfg()).unwrap();
+        db.upsert(
+            "c",
+            &[
+                ann_rec("a", vec![1.0, 0.0, 0.0]),
+                ann_rec("b", vec![0.0, 1.0, 0.0]),
+                ann_rec("c", vec![0.0, 0.0, 1.0]),
+            ],
+        )
+        .unwrap();
+        let hits = db.search("c", &query, &opts(3)).unwrap();
+        db.persist_index().unwrap(); // writes the `ann` cache
+        hits
+    };
+
+    // The cache file exists, and a reopen returns the same ranking.
+    assert!(
+        dir.path().join("ann").exists(),
+        "persist_index wrote the cache"
+    );
+    let db = Nidus::open(cfg()).unwrap();
+    let after = db.search("c", &query, &opts(3)).unwrap();
+    let ids_before: Vec<_> = before.iter().map(|h| &h.id).collect();
+    let ids_after: Vec<_> = after.iter().map(|h| &h.id).collect();
+    assert_eq!(ids_before, ids_after, "reloaded index ranks identically");
+}
+
+/// Rows added after the cache was written are incrementally caught up on open.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn ann_index_incremental_catchup_after_persist() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = || Config::new(dir.path(), 3).ann(Some(AnnConfig::hnsw()));
+
+    {
+        let mut db = Nidus::open(cfg()).unwrap();
+        db.upsert("c", &[ann_rec("a", vec![1.0, 0.0, 0.0])])
+            .unwrap();
+        db.persist_index().unwrap(); // cache covers 1 row
+        // Add a second row *after* persisting — only in `data`/`log`, not the cache.
+        db.upsert("c", &[ann_rec("b", vec![0.0, 1.0, 0.0])])
+            .unwrap();
+    }
+
+    // Reopen: cache (1 row) loads, then row `b` is incrementally inserted.
+    let db = Nidus::open(cfg()).unwrap();
+    let hits = db.search("c", &[0.0, 1.0, 0.0], &opts(2)).unwrap();
+    assert_eq!(hits[0].id, "b", "caught-up row is searchable and nearest");
+    assert_eq!(hits.len(), 2, "both rows present");
+}
+
+/// A corrupt cache file is silently discarded and the index rebuilt — no error.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn ann_corrupt_cache_falls_back_to_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = || Config::new(dir.path(), 3).ann(Some(AnnConfig::hnsw()));
+    {
+        let mut db = Nidus::open(cfg()).unwrap();
+        db.upsert("c", &[ann_rec("a", vec![1.0, 0.0, 0.0])])
+            .unwrap();
+        db.persist_index().unwrap();
+    }
+    // Clobber the cache with garbage.
+    std::fs::write(dir.path().join("ann"), b"not a valid nidus ann cache").unwrap();
+
+    let db = Nidus::open(cfg()).unwrap(); // must not error
+    let hits = db.search("c", &[1.0, 0.0, 0.0], &opts(1)).unwrap();
+    assert_eq!(
+        hits[0].id, "a",
+        "rebuilt from vectors after discarding bad cache"
+    );
+}
+
+/// A read-only handle loads the persisted cache (and persist_index is a no-op).
+#[cfg_attr(miri, ignore)]
+#[test]
+fn ann_readonly_reopen_loads_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut db = Nidus::open(Config::new(dir.path(), 3).ann(Some(AnnConfig::hnsw()))).unwrap();
+        db.upsert("c", &[ann_rec("a", vec![1.0, 0.0, 0.0])])
+            .unwrap();
+        db.persist_index().unwrap();
+    }
+    let mut db = Nidus::open(
+        Config::new(dir.path(), 3)
+            .ann(Some(AnnConfig::hnsw()))
+            .open_mode(OpenMode::ReadOnly),
+    )
+    .unwrap();
+    assert_eq!(
+        db.search("c", &[1.0, 0.0, 0.0], &opts(1)).unwrap()[0].id,
+        "a"
+    );
+    db.persist_index().unwrap(); // no-op under ReadOnly, must not error
 }

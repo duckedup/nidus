@@ -20,6 +20,7 @@ let cfg = Config::new("/path/to/store", 768)
     .lock_ttl(Duration::from_secs(60))
     .max_vector_bytes(None)          // no ceiling (default)
     .quantization(None)              // int8 two-pass search (default: off)
+    .ann(None)                       // approximate-nearest-neighbour index (default: off)
     .query_threads(1);               // worker threads per exact search (default: 1)
 # let _ = cfg;
 ```
@@ -83,6 +84,17 @@ maintains an in-memory int8 copy of all vectors and uses a two-pass search:
 int8 first-pass → f32 rerank. See
 [int8 scalar quantization](/guides/search/#int8-scalar-quantization) for details.
 
+### `ann`
+
+`Option<AnnConfig>` — default `None` (disabled; exact search). When set,
+the store builds an in-memory approximate-nearest-neighbour index and `search` walks
+it for an over-fetched candidate set, then applies the scope/filter/`min_score` and an
+exact f32 rerank — trading recall for speed when a scan over every vector is more than
+you need. Two algorithms, via `AnnConfig::hnsw()` (a navigable small-world graph, the
+default) and `AnnConfig::ivf()` (k-means inverted lists). Mutually exclusive with
+`quantization`. See [approximate search](/guides/search/#approximate-search-ann) for
+details and tuning.
+
 ### `query_threads`
 
 `usize` — default `1` (single-threaded; no behavior change). When `> 1`, a single
@@ -93,6 +105,13 @@ pass. The f32 scan is memory-bandwidth-bound (sublinear speedup); the int8 first
 pass is compute-bound and scales better with threads. Leave it at `1` if you already
 run concurrent searches under `Arc<RwLock<Nidus>>` — see
 [two kinds of parallelism](/guides/integrating/#two-kinds-of-parallelism).
+
+When an [HNSW index](/guides/search/#approximate-search-ann) is enabled, `> 1` also
+parallelizes the from-scratch graph **build** (on `open` with no cache, and on
+`compact`) across this many threads — the expensive part of opening an ANN store.
+Incremental `upsert` and the serial build at `1` are unchanged; note a parallel build
+is non-deterministic (insertion order varies), so a graph built with threads can
+differ slightly from the serial one (recall stays equivalent).
 
 ## `Fsync`
 
