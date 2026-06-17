@@ -10,7 +10,10 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
 use crate::server::dto::{AnnDto, FootprintDto, HitDto};
-use crate::{AnnConfig, Config, Distance, Filter, Nidus, OpenMode, Record, Scope, SearchOpts};
+use crate::{
+    AnnConfig, Config, Distance, Filter, FtsQuery, HybridOpts, Language, Nidus, OpenMode, Record,
+    Scope, SearchOpts,
+};
 
 mod backup;
 
@@ -236,6 +239,62 @@ enum Command {
         #[arg(long = "where")]
         filter: Option<String>,
     },
+    /// Declare a collection's full-text-indexed fields (BM25). Fields use the US
+    /// English analyzer. Re-running rebuilds the affected field indexes.
+    SetFtsSchema {
+        #[command(flatten)]
+        store: StoreArgs,
+        collection: String,
+        /// Attribute field to full-text index (repeatable).
+        #[arg(long = "field", required = true)]
+        fields: Vec<String>,
+    },
+    /// Full-text (BM25) search of a field declared via `set-fts-schema`.
+    TextSearch {
+        #[command(flatten)]
+        store: StoreArgs,
+        /// The full-text-indexed field to search.
+        field: String,
+        /// Query text (analyzed the same way documents were indexed).
+        query: String,
+        /// Collections to search; omit to search every collection.
+        #[arg(long = "in")]
+        collections: Vec<String>,
+        #[arg(long, short = 'k', default_value_t = 10)]
+        top_k: usize,
+        /// Drop hits scoring below this raw BM25 score.
+        #[arg(long)]
+        min_score: Option<f32>,
+        /// AND-filter as JSON (same form as `search --where`).
+        #[arg(long = "where")]
+        filter: Option<String>,
+    },
+    /// Hybrid search: fuse a vector query and a BM25 text query with RRF.
+    HybridSearch {
+        #[command(flatten)]
+        store: StoreArgs,
+        /// The full-text-indexed field for the BM25 leg.
+        field: String,
+        /// Query text for the BM25 leg.
+        text: String,
+        /// Read the query vector (JSON array) from this file instead of stdin.
+        #[arg(long)]
+        query_file: Option<PathBuf>,
+        /// Collections to search; omit to search every collection.
+        #[arg(long = "in")]
+        collections: Vec<String>,
+        #[arg(long, short = 'k', default_value_t = 10)]
+        top_k: usize,
+        /// AND-filter as JSON, applied to both legs.
+        #[arg(long = "where")]
+        filter: Option<String>,
+        /// RRF rank-bias constant.
+        #[arg(long, default_value_t = 60.0)]
+        rrf_k: f32,
+        /// Candidates pulled per leg before fusing.
+        #[arg(long, default_value_t = 100)]
+        candidates: usize,
+    },
     /// Print every record in a collection (JSON).
     Get {
         #[command(flatten)]
@@ -368,6 +427,81 @@ pub fn run(cli: Cli) -> Result<()> {
                 db.list(Scope::All, &filter, offset, limit)?
             } else {
                 db.list(Scope::Collections(&refs), &filter, offset, limit)?
+            };
+            let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
+            print_json(&out)
+        }
+        Command::SetFtsSchema {
+            store,
+            collection,
+            fields,
+        } => {
+            let mut db = open(&store, true)?;
+            let decl: Vec<(String, Language)> = fields
+                .iter()
+                .map(|f| (f.clone(), Language::English))
+                .collect();
+            db.set_fts_schema(&collection, &decl)?;
+            print_json(&serde_json::json!({ "collection": collection, "fts_fields": fields }))
+        }
+        Command::TextSearch {
+            store,
+            field,
+            query,
+            collections,
+            top_k,
+            min_score,
+            filter,
+        } => {
+            let db = open(&store, false)?;
+            let filter = match filter {
+                Some(s) => serde_json::from_str(&s)?,
+                None => Filter::default(),
+            };
+            let opts = SearchOpts {
+                top_k,
+                min_score,
+                filter,
+            };
+            let q = FtsQuery::new(field, query);
+            let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
+            let hits = if refs.is_empty() {
+                db.text_search(Scope::All, &q, &opts)?
+            } else {
+                db.text_search(Scope::Collections(&refs), &q, &opts)?
+            };
+            let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
+            print_json(&out)
+        }
+        Command::HybridSearch {
+            store,
+            field,
+            text,
+            query_file,
+            collections,
+            top_k,
+            filter,
+            rrf_k,
+            candidates,
+        } => {
+            let db = open(&store, false)?;
+            let vector: Vec<f32> = serde_json::from_str(&read_input(query_file.as_ref())?)?;
+            let filter = match filter {
+                Some(s) => serde_json::from_str(&s)?,
+                None => Filter::default(),
+            };
+            let opts = HybridOpts {
+                top_k,
+                filter,
+                rrf_k,
+                candidates,
+            };
+            let q = FtsQuery::new(field, text);
+            let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
+            let hits = if refs.is_empty() {
+                db.hybrid_search(Scope::All, &vector, &q, &opts)?
+            } else {
+                db.hybrid_search(Scope::Collections(&refs), &vector, &q, &opts)?
             };
             let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
             print_json(&out)

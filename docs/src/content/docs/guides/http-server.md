@@ -131,7 +131,10 @@ server fault (see [Errors](#errors)).
 | `POST /collections/{name}/upsert` | insert or overwrite records | `upsert` |
 | `POST /collections/{name}/delete` | delete by ids or by filter | `delete` / `delete_where` |
 | `GET /collections/{name}/records` | every record in a collection | `get_all` |
+| `POST /collections/{name}/fts-schema` | declare full-text-indexed fields | `set_fts_schema` |
 | `POST /search` | nearest-neighbour search | `search` |
+| `POST /text-search` | BM25 full-text search | `text_search` |
+| `POST /hybrid-search` | fused vector + BM25 (RRF) | `hybrid_search` |
 | `POST /list` | metadata-only query (no vector) | `list` |
 | `POST /flush` | flush buffered writes to disk | `flush` |
 | `POST /compact` | reclaim dead rows and superseded log records | `compact` |
@@ -275,6 +278,34 @@ Returns hits sorted by descending score:
 ```json
 [{"collection": "docs", "id": "a", "score": 1.0, "attrs": {"lang": {"Str": "rust"}}}]
 ```
+
+### `POST /collections/{name}/fts-schema` · `POST /text-search` · `POST /hybrid-search`
+
+Full-text search. First declare which attribute fields are full-text indexed (US
+English analyzer), then query by text or fuse with a vector. See
+[Full-text search](/guides/search/#full-text-search-bm25) for the ranking model.
+
+```bash
+# Declare the fields once.
+curl -s -X POST localhost:7700/collections/docs/fts-schema \
+  -H 'content-type: application/json' -d '{"fields": ["body"]}'
+
+# BM25 text search. `min_score` here is a raw BM25 floor.
+curl -s localhost:7700/text-search \
+  -H 'content-type: application/json' \
+  -d '{"field": "body", "query": "running quickly", "scope": ["docs"], "top_k": 5}'
+
+# Hybrid: fuse a vector and a BM25 query with Reciprocal Rank Fusion.
+curl -s localhost:7700/hybrid-search \
+  -H 'content-type: application/json' \
+  -d '{"vector": [1,0,0], "field": "body", "text": "vector database", "top_k": 5}'
+```
+
+Both search endpoints return the same hit shape as `/search`. `/text-search` takes the
+search fields (`field`, `query`, `scope`, `top_k`, `min_score`, `filter`);
+`/hybrid-search` takes `vector` + `field` + `text` plus `top_k`, `filter`, `rrf_k`
+(default 60), and `candidates` (default 100), and has no `min_score` (a fused RRF score
+has no absolute scale).
 
 ### `POST /list`
 
