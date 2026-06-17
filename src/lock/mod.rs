@@ -21,24 +21,36 @@ impl WriteLock {
     /// (`anyhow`, surfaced as a clear "store is locked" message).
     pub fn acquire(dir: &Path, ttl: Duration) -> Result<WriteLock> {
         let path = dir.join("lock");
-        match try_create_lock(&path) {
-            Ok(lock) => Ok(lock),
+        match Self::try_acquire_path(&path, ttl)? {
+            Some(lock) => Ok(lock),
+            None => bail!(
+                "store is locked by another writer (e.g. a running `nidus serve`): {} \
+                 — stop that process, or send writes through it instead of opening \
+                 the store a second time",
+                path.display()
+            ),
+        }
+    }
+
+    /// The reusable O_EXCL primitive behind [`acquire`](Self::acquire): try to take
+    /// the lock file at `path`, reclaiming it if it is older than `ttl` (a crashed
+    /// writer). Returns `Ok(None)` — **not** an error — when the lock is genuinely
+    /// held by a live writer, so a caller honouring the `Persistence::try_lock`
+    /// contract (lock-or-`None`, never a hard error on contention) can map it
+    /// directly. A real IO failure is still an `Err`.
+    pub fn try_acquire_path(path: &Path, ttl: Duration) -> Result<Option<WriteLock>> {
+        match try_create_lock(path) {
+            Ok(lock) => Ok(Some(lock)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Existing lock: reclaim it if stale, otherwise refuse.
-                if is_stale(&path, ttl)? {
-                    std::fs::remove_file(&path).with_context(|| {
+                // Existing lock: reclaim it if stale, otherwise report contention.
+                if is_stale(path, ttl)? {
+                    std::fs::remove_file(path).with_context(|| {
                         format!("failed to reclaim stale lock at {}", path.display())
                     })?;
-                    match try_create_lock(&path) {
-                        Ok(lock) => Ok(lock),
-                        Err(e2) if e2.kind() == std::io::ErrorKind::AlreadyExists => {
-                            bail!(
-                                "store is locked by another writer (e.g. a running `nidus serve`): {} \
-                                 — stop that process, or send writes through it instead of opening \
-                                 the store a second time",
-                                path.display()
-                            )
-                        }
+                    match try_create_lock(path) {
+                        Ok(lock) => Ok(Some(lock)),
+                        // Lost the race after reclaiming — another writer got it first.
+                        Err(e2) if e2.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
                         Err(e2) => Err(e2).with_context(|| {
                             format!(
                                 "failed to acquire lock at {} after reclaiming stale lock",
@@ -47,7 +59,7 @@ impl WriteLock {
                         }),
                     }
                 } else {
-                    bail!("store is locked: {}", path.display())
+                    Ok(None)
                 }
             }
             Err(e) => {

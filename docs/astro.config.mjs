@@ -52,6 +52,7 @@ export default defineConfig({
           items: [
             { label: "How it works", link: "/guides/how-it-works/" },
             { label: "Storage & durability", link: "/guides/storage/" },
+            { label: "Storage backends", link: "/guides/backends/" },
             { label: "Search & filters", link: "/guides/search/" },
             { label: "Embedding in a host app", link: "/guides/integrating/" },
             { label: "Command line", link: "/guides/cli-and-server/" },

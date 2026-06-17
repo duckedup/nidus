@@ -731,7 +731,11 @@ a `Config` (§4.1) and calls `Nidus::open(config)`. A search-only process opens 
 
 §5 describes one configuration: a local directory, with vectors held in local process
 RAM. This section generalizes that along **two independent axes**, behind two small sync
-traits. It is **designed-for, not built** (the seam in §9).
+traits. The **trait surface and the local backends are built** (`src/backend/`:
+`Persistence` + `Appender` + `BackendLock` and `MemoryTier`, with `LocalFs` and
+`LocalRam`, selected by URL scheme — nidus-870.2 Phase 1); the remote members (S3/GCS
+persistence, Redis/Valkey/Memcached memory tier) and the wiring of the live `data`/`log`
+path onto `Appender` remain **designed-for, not built** (the seam in §9).
 
 - **Persistence** — where the durable *source-of-truth* bytes (`data`/`log`) live:
   **local files** (default), **S3**, or **GCS**. Optimized for durability and cost.

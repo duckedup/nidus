@@ -19,6 +19,7 @@
 //! ```
 
 mod ann;
+pub mod backend;
 mod config;
 mod data;
 mod filter;
@@ -40,6 +41,10 @@ pub mod cli;
 pub mod server;
 
 pub use anyhow::Result;
+pub use backend::{
+    Appender, BackendLock, LocalFs, LocalRam, MemoryTier, Persistence, open_memory_tier,
+    open_persistence,
+};
 pub use config::{Config, Fsync, OpenMode};
 pub use fts::Language;
 pub use model::{
