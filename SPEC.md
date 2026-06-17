@@ -36,20 +36,32 @@ more.
 
 ### Thesis (the product *is* the constraints)
 
-1. **Popular, pure-Rust dependencies only.** Lean on well-established pure-Rust
-   crates where they earn their keep (e.g. `anyhow` for errors, `serde`/`bincode`
-   for codecs, `crc32fast` for checksums) — but **never a crate that compiles C or
-   links a native library** (no `*-sys`, no bundled C++). The bar is *build-and-ship*:
-   fast compile, no C toolchain, no FFI. `just deps` should stay short and every
-   crate in it pure Rust.
-2. **Zero FFI, zero `unsafe` in our code.** `#![forbid(unsafe_code)]`. No `flock`,
-   no `mmap`, no `extern "C"` written by us. (A dependency's internal `unsafe` is
-   fine; ours is not.)
-3. **No C to compile.** `cargo build` is rustc — seconds, no C toolchain.
-4. **Fully Miri-checkable.** Our logic, including file IO, runs under Miri.
+The hard bar is **build-and-ship speed, not zero-C absolutism.** What disqualified
+DuckDB and LanceDB was a *multi-minute* build (a large C/C++ tree, a whole SQL engine)
+— not the mere presence of any C. nidus's bar is concrete and testable: **a clean build
+stays under a minute** (it is ~seconds today).
 
-Pulling in a crate that compiles C, links native code, or adds an `unsafe` block to
-*our* code is a change to *what nidus is*. File an issue and decide deliberately.
+1. **Pure-Rust-first, fast to build.** Prefer well-established pure-Rust crates
+   (`anyhow`, `serde`/`bincode`, `crc32fast`, …). A C-compiling/native-linking dep is
+   acceptable **only** when it stays small and fast (e.g. `ring`'s TLS for the storage
+   backends, §13) — **never** a crate that compiles a *large* C tree (DuckDB's C++,
+   `aws-lc-sys`, vendored OpenSSL). `just deps` stays short; CI asserts the build-time
+   ceiling.
+2. **Zero `unsafe` in *our* code.** `#![forbid(unsafe_code)]`. No `flock`, no `mmap`,
+   no `extern "C"` written by us. (A dependency's internal `unsafe`/C is fine; ours is
+   not.)
+3. **Fast builds over zero-C.** `cargo build` stays in **seconds**. The pure-Rust core
+   needs no C toolchain; the always-compiled storage backends (§13) add `ring` (small
+   C/asm) to the default tree, so a C toolchain *is* required — but the build stays in
+   seconds, which is the property that actually matters.
+4. **Miri covers all *our* logic.** Our code — codecs, filters, distance math, file IO
+   — runs under Miri. A dependency's native/FFI paths (a backend's TLS) cannot, so the
+   tests that exercise them are `#[cfg_attr(miri, ignore)]` like the fsync tests (§11).
+   This is narrower than "the whole crate runs under Miri," and a deliberate trade for
+   frictionless pluggable backends (§13.6).
+
+Compiling a *large* C tree, or adding an `unsafe` block to *our* code, is a change to
+*what nidus is*. File an issue and decide deliberately.
 
 ---
 
@@ -76,7 +88,11 @@ Pulling in a crate that compiles C, links native code, or adds an `unsafe` block
 - Quantization — int8 scalar and binary (sign-bit) quantization have since shipped
   (§9, opt-in via `Config::quantization`).
 - SQL, a query planner, transactions spanning multiple operations, multi-writer
-  concurrency, networking, or replication.
+  concurrency, or replication.
+- A query *protocol* over the network was a non-goal; the opt-in `nidus serve` (§9)
+  has since shipped as a separate `cli`-feature wrapper, not a core change. Networked
+  *storage backends* (S3/GCS/Redis behind one trait) are now a designed seam (§13) —
+  that is where the *bytes* live, still distinct from a query protocol.
 
 ---
 
@@ -237,14 +253,22 @@ impl Config {
 
 ## 5. On-disk format
 
-A store is a **directory**. Three files:
+A store is, by default, a **local directory** — the first of the pluggable storage
+backends designed in §13. Its objects:
 
 ```
 <dir>/
-  data    flat f32 matrix, append-only, never rewritten in place
-  log     append-only op stream (the commit record)
+  data    flat f32 matrix, append-only, never rewritten in place   (source of truth)
+  log     append-only op stream (the commit record)                (source of truth)
+  ann     persisted ANN index — derived cache, reconstructable, best-effort (§9)
+  fts     persisted BM25 index — derived cache, shares the ann cache codec (§9)
   lock    writer-exclusion lock file (present only while a writer holds it)
 ```
+
+`data` and `log` are the **source of truth**; `ann`/`fts` are **derived caches**
+(an absent/stale/corrupt cache is rebuilt, never fatal — see `index_cache.rs`, §9).
+That two-tier split is what lets other backends (object stores, Redis) durably hold a
+store without shipping the large, append-hostile index — see §13.
 
 ### 5.1 `data` — the vector segment
 
@@ -612,6 +636,12 @@ build until a real need exists.
   region instead of the in-RAM `Vec<f32>`. Gains zero-copy load, cross-process page
   sharing, >RAM. Cost: FFI (`unsafe`) — would relax the zero-FFI thesis, so it is a
   conscious future choice, not a default.
+- **Pluggable storage backends.** Generalize the §5 local directory into one
+  object-granular, sync `Backend` trait with implementations for local files, S3, GCS,
+  and Redis/Valkey, selected by URL scheme (`file://`, `s3://`, `gs://`, `redis://`).
+  The on-disk *object set* (`data`/`log` + derived caches) is unchanged — only *where*
+  the bytes live. Fully designed in §13; the gating choice is the cloud-TLS zero-FFI
+  decision (§13.6).
 
 ---
 
@@ -692,3 +722,168 @@ The host owns the **store location**: it maps its own configured path (e.g. a
 `store.<name>.path` setting or a user flag) and any durability/lock preferences into
 a `Config` (§4.1) and calls `Nidus::open(config)`. A search-only process opens with
 `OpenMode::ReadOnly`. nidus contributes no path defaults of its own.
+
+---
+
+## 13. Storage backends (designed, not built)
+
+§5 describes one backend: a local directory of files. This section generalizes that
+into a **pluggable storage layer** — the same in-RAM store, durably backed by local
+files, an object store (S3, GCS), or a remote key-value server (Redis/Valkey), behind
+one trait. It is **designed-for, not built**; it records the shape and the decisions
+so the choice stays legible (the seam listed in §9).
+
+### 13.1 What a backend is — a durable container of named objects
+
+A store is not intrinsically a directory; it is a small, fixed set of **named byte
+objects**, in two **classes** that drive the whole design:
+
+| object | class | reconstructable? | local discipline (§5/§6) |
+|---|---|---|---|
+| `data` | **source of truth** | no | append + fsync |
+| `log` | **source of truth** | no | append + fsync |
+| `ann` | derived cache | yes (from data/log) | atomic temp+fsync+rename, best-effort load |
+| `fts` | derived cache | yes (from data/log) | atomic temp+fsync+rename, best-effort load |
+
+- **Source of truth** (`data`, `log`) must be durable and is append-shaped — small,
+  incremental streams.
+- **Derived caches** (`ann`, `fts`, and the in-RAM quant matrices) are *reconstructable*
+  from data/log; a missing/stale/corrupt cache is never fatal (§9, `index_cache.rs`). A
+  backend may persist them or **drop and rebuild on open**.
+
+This split is what makes non-local backends tractable: only `data`+`log` must be shipped
+durably; the large, append-hostile index (the HNSW graph) is exactly the artifact a
+backend is free to discard.
+
+### 13.2 The trait — object-granular, sync
+
+The trait is the **common denominator** of what local files, object stores, and KV
+servers can all do — whole-object put/get/list/delete — plus an **optional append
+capability** that local and Redis implement natively and object stores emulate:
+
+```rust
+// sketch — not final
+pub trait Backend: Send + Sync {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;     // whole object
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;    // atomic whole-object write
+    fn delete(&self, key: &str) -> Result<()>;
+    fn list(&self) -> Result<Vec<String>>;
+
+    // Capability: incremental durable append. Local = append+fsync; Redis = APPEND/
+    // streams; object stores = None → caller falls back to whole-object rewrite/segments.
+    fn appender(&self, key: &str) -> Option<Box<dyn Appender>> { None }
+
+    // Best-effort exclusion (§6.3). Local = O_EXCL file; cloud = conditional-PUT; None.
+    fn try_lock(&self, key: &str, ttl: Duration) -> Result<Option<Lock>>;
+}
+```
+
+**Sync, deliberately** (consistent with §6.5):
+
+1. Search is CPU-over-RAM and never touches the backend (§13.4) — there is no query IO
+   to make async.
+2. Every backend *can* be sync: the sans-IO S3/GCS crates pair with a blocking HTTP
+   client; `redis-rs` has a blocking mode; local files are sync.
+3. A sync trait is `dyn`-safe out of the box → genuine runtime plug-and-play
+   (`Box<dyn Backend>`). Async trait methods are not `dyn`-safe without `async-trait`
+   (boxed futures), which makes plug-and-play *worse*.
+4. An async core would have an enormous blast radius against the §6.5 sync design, for
+   no payoff on the non-bottleneck path.
+
+> Decision: a backend whose only client is async (e.g. `google-cloud-storage`) owns a
+> small runtime and `block_on`s **internally** — the async is quarantined inside that
+> one impl; the trait and core stay sync. (`block_on` panics if called from within a
+> caller's existing async context; the documented `spawn_blocking` integration (§12)
+> avoids that.)
+
+Selection is by **URL scheme**: `file://`, `s3://`, `gs://`, `redis://`.
+
+### 13.3 The backends
+
+| backend | crate (pure-Rust, sans-IO / blocking) | append? | auth crypto | TLS |
+|---|---|---|---|---|
+| Local FS | `std::fs` | native (fsync) | — | — |
+| Redis / Valkey | `redis` (blocking) | native (`APPEND`/streams) | — | only `rediss://` |
+| Amazon S3 (+ R2/MinIO) | `rusty-s3` (sans-IO) + blocking HTTP | none (whole-object) | Sigv4 = HMAC-SHA256 (pure RustCrypto) | yes |
+| Google Cloud Storage | `tame-gcs` (sans-IO) + blocking HTTP | none (whole-object) | OAuth2 svc-account = RSA-JWT | yes |
+
+S3 and GCS are **different APIs needing different clients** — not one "cloud" backend.
+`rusty-s3`/`tame-gcs` are sans-IO (build/sign requests, parse responses; bring your own
+transport), so the SDK layer itself adds no async and no TLS.
+
+### 13.4 Effect on functionality and speed
+
+**Search is backend-independent.** Every search path — exact cosine, ANN walk
+(HNSW/IVF), int8/binary two-pass, BM25, hybrid RRF — runs over **in-RAM** structures.
+The backend is never in the query hot path, so query *results and latency are identical*
+across all backends. What changes, and only for network backends:
+
+| op | local | network (S3/GCS/Redis) |
+|---|---|---|
+| search | RAM | **identical** — RAM |
+| `open` | one bulk read | **download data/log into RAM**, then rebuild caches (one-time; grows with size) |
+| write durability | fsync (~0.1–2 ms) | **network round-trip** (Redis sub-ms–ms; S3/GCS ~20–100 ms+) |
+| append | native | Redis native; S3/GCS → whole-object rewrite (**O(store)**) or segmented objects (incremental, a real engine addition) |
+
+So the cloud tradeoff is **cheaper near-incremental writes** (ship only the small
+`data`/`log` delta; drop+rebuild `ann`/`fts`) for a **costlier `open`** (rebuild from the
+download) — which fits nidus's load-once-serve-many shape.
+
+> Expectation to name: a network backend does **not** make nidus larger-than-RAM. The
+> whole store still loads into the process and search still runs in RAM; the backend
+> only changes where the bytes durably live (and enables shared state across processes).
+> Larger-than-RAM remains the separate, deferred mmap/spill seam (§9).
+
+### 13.5 Two usage modes (both supported)
+
+- **Live backing store.** A store's `data`/`log` (and optionally caches) live on the
+  backend; writes durably round-trip per §13.4. Best for low-write-rate / dev /
+  small-scale use (nidus's positioning) and, for Redis, shared state across processes.
+- **Snapshot / backup.** PUT/GET the whole store as one archive (the existing
+  `cli`-feature `tar.gz`). This is *exactly* object-granular, so all backends do it
+  trivially and the live local path is untouched — the simplest first increment.
+
+### 13.6 The zero-FFI decision — RESOLVED: pragmatic, under a hard build-time budget
+
+The thesis (§1) forbids C/`*-sys`. S3/GCS need HTTPS → a TLS stack. Resolved dependency
+trees confirm the wall and the one escape:
+
+- `rustls` defaults to `aws-lc-sys` (C); its `ring` provider compiles C+asm; `reqwest`'s
+  rustls path pulls `ring`; `google-cloud-storage` pulls `ring` **and** OpenSSL.
+- A **pure** path exists: `rustls` + the `rustls-rustcrypto` provider + a hand-built
+  `hyper`/`tokio-rustls` transport resolve with **no C** — but `rustls-rustcrypto` is
+  **unaudited**. S3 auth (Sigv4) is pure HMAC (`rusty-s3` is clean); GCS auth
+  (`tame-oauth`) pulls `ring` for RSA-JWT signing and would need replacing with
+  RustCrypto's `rsa`.
+
+The two candidates were **(A) pragmatic** — allow an audited C TLS dep, feature-gated —
+and **(B) purist** — hold zero-FFI via `rustls-rustcrypto` + hand-rolled auth.
+
+> **Decision: (A) pragmatic, NOT purist — and NOT feature-gated.** All backends compile
+> into the **default build**; there is no per-backend or `cloud` feature flag. The
+> reason is the whole point of a pluggable backend: a user who *outgrows local FS and
+> needs S3* should switch with a **one-line runtime change** (`file://…` → `s3://…`),
+> never a `Cargo.toml`-edit-and-recompile event that first confronts them with a new
+> toolchain requirement at the worst moment. Compiling everything in makes the upgrade
+> path frictionless for *every* consumer.
+>
+> The cost — accepted deliberately (§1): `ring` enters the default tree, so a C
+> toolchain is required for all consumers (even local-only), and Miri now covers only
+> *our* logic (§1.4). The thesis bar is *build speed*, not zero-C: the enemy is the
+> *multi-minute* C tree, not `ring`'s small one.
+>
+> - **Forbidden** (slow compile): `rustls`'s default `aws-lc-sys`, **vendored** OpenSSL,
+>   and the `reqwest`+`tokio`+`hyper` stack.
+> - **Chosen** (fast compile): the **sans-IO clients** `rusty-s3`/`tame-gcs` + a
+>   **lightweight blocking HTTP client** (`ureq`) with TLS via `ring`. Measured: a clean
+>   debug build of the full core + all four backends (sync Redis, no tokio/aws-lc/OpenSSL
+>   in the tree) is **~7.5 s** — ~8× under the one-minute budget.
+>
+> `(B)` purist (`rustls-rustcrypto`) is rejected: it would keep no-C + Miri, but at the
+> cost of bespoke **unaudited** crypto on a credentialed path — a worse trade. Note this
+> is *not* a capacity upgrade: S3/GCS change where bytes durably live, not the
+> RAM-bound search model (§13.4) — "outgrow" means durability/sharing, not larger-than-RAM.
+
+Redis over plain TCP (`redis://`) needs no TLS; only `rediss://` exercises `ring`'s TLS.
+Local FS needs nothing. **The standing guardrail: the whole crate's clean build stays
+under a minute — CI asserts it (§9, the build-time gate).**
