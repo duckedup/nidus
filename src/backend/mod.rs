@@ -215,6 +215,28 @@ pub fn open_memory_tier(location: &str) -> Result<Box<dyn MemoryTier>> {
     )
 }
 
+/// Open the persistence backend holding a single named **object** addressed by
+/// `location` — splitting it into a backend root and an object key at the last `/`
+/// (a bare name, no `/`, roots at the current directory). Used for snapshots, whose
+/// destination/source is one archive object on any backend: `./snap.tar.gz`,
+/// `file:///backups/snap.tar.gz`, or (once it lands) `s3://bucket/snap.tar.gz`.
+pub fn open_object_location(location: &str) -> Result<(Box<dyn Persistence>, String)> {
+    let (root, key) = split_object_location(location)?;
+    Ok((open_persistence(root)?, key.to_string()))
+}
+
+/// Split a location into `(root_location, object_key)` at the last `/`. Pure string
+/// logic (no IO), so it is unit-tested directly.
+fn split_object_location(location: &str) -> Result<(&str, &str)> {
+    match location.rsplit_once('/') {
+        Some((_, "")) => bail!("location {location:?} ends in '/' — it has no object name"),
+        // Last '/' is the root's trailing slash (e.g. `file:///x` → root `/`).
+        Some((root, key)) => Ok((if root.is_empty() { "/" } else { root }, key)),
+        // No '/' at all → a bare object name in the current directory.
+        None => Ok((".", location)),
+    }
+}
+
 /// If `s` begins with `<scheme>://`, return the remainder; else `None`.
 fn strip_scheme<'a>(s: &'a str, scheme: &str) -> Option<&'a str> {
     let prefix_len = scheme.len() + 3; // "://"

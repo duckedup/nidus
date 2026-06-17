@@ -126,6 +126,24 @@ pub(crate) fn peek_header(path: &std::path::Path) -> Result<Option<(usize, Dista
     Ok(Some(header))
 }
 
+/// Decode the pinned `(dimension, distance)` from the leading bytes of a `data`
+/// object (the first [`HEADER_LEN`] bytes) — the in-memory counterpart to
+/// [`peek_header`] for callers that already hold the object (e.g. snapshot/backup
+/// reading `data` via the persistence backend).
+#[cfg(feature = "cli")]
+pub(crate) fn header_from_bytes(bytes: &[u8]) -> Result<(usize, Distance)> {
+    if bytes.len() < HEADER_LEN {
+        bail!(
+            "data is truncated: {} bytes (need at least {} for header)",
+            bytes.len(),
+            HEADER_LEN
+        );
+    }
+    let mut header_buf = [0u8; HEADER_LEN];
+    header_buf.copy_from_slice(&bytes[..HEADER_LEN]);
+    decode_header(&header_buf)
+}
+
 // ── f32 vector I/O ────────────────────────────────────────────────────────────
 
 /// Encode a slice of `f32` values into a `Vec<u8>` (little-endian).

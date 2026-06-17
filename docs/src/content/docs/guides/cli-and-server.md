@@ -172,6 +172,15 @@ nidus restore --in ./store.tar.gz --dir ./restored
 nidus restore --in ./store.tar.gz --dir ./store --yes
 ```
 
+The archive's `--out`/`--in` is a [storage-backend](/guides/backends/) location, so
+besides a plain path it accepts a `file://` URL (and, as more backends land, their
+URLs) — the snapshot is written and read as one object on whatever backend the
+location names:
+
+```bash
+nidus backup  --dir ./store --out file:///backups/store.tar.gz
+```
+
 The archive is an ordinary gzip-compressed tarball — `tar tzf store.tar.gz`
 lists the `data` and `log` files plus a small `nidus-backup.json` manifest
 (version, timestamp, dimension), so you can inspect or extract it with standard

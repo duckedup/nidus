@@ -326,15 +326,16 @@ enum Command {
         /// Store directory to back up.
         #[arg(long, short = 'd')]
         dir: PathBuf,
-        /// Output archive path. Defaults to `<dir-name>-<unix-secs>.tar.gz`.
+        /// Output archive location — a local path, `file://…`, or another backend's
+        /// URL. Defaults to `<dir-name>-<unix-secs>.tar.gz` in the current directory.
         #[arg(long, short = 'o')]
-        out: Option<PathBuf>,
+        out: Option<String>,
     },
     /// Restore a store from a `nidus backup` archive (`.tar.gz`).
     Restore {
-        /// Backup archive to restore from.
+        /// Backup archive location to restore from (a local path or `file://…`).
         #[arg(long = "in", short = 'i')]
-        input: PathBuf,
+        input: String,
         /// Target store directory (created if absent).
         #[arg(long, short = 'd')]
         dir: PathBuf,
@@ -535,7 +536,7 @@ pub fn run(cli: Cli) -> Result<()> {
             print_json(&serde_json::json!({ "ok": true }))
         }
         Command::Backup { dir, out } => {
-            let out = out.unwrap_or_else(|| PathBuf::from(backup::default_out_name(&dir)));
+            let out = out.unwrap_or_else(|| backup::default_out_name(&dir));
             print_json(&backup::backup(&dir, &out)?)
         }
         Command::Restore { input, dir, yes } => print_json(&backup::restore(&input, &dir, yes)?),
@@ -736,7 +737,7 @@ mod tests {
         match cli.command {
             Command::Backup { dir, out } => {
                 assert_eq!(dir, PathBuf::from("/tmp/s"));
-                assert_eq!(out, Some(PathBuf::from("/tmp/s.tar.gz")));
+                assert_eq!(out.as_deref(), Some("/tmp/s.tar.gz"));
             }
             _ => panic!("expected Backup"),
         }
@@ -762,7 +763,7 @@ mod tests {
         .unwrap();
         match cli.command {
             Command::Restore { input, dir, yes } => {
-                assert_eq!(input, PathBuf::from("/tmp/s.tar.gz"));
+                assert_eq!(input, "/tmp/s.tar.gz");
                 assert_eq!(dir, PathBuf::from("/tmp/s2"));
                 assert!(yes);
             }

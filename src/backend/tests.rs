@@ -54,6 +54,32 @@ fn memory_tier_unknown_scheme_errors() {
 }
 
 #[test]
+fn split_object_location_cases() {
+    assert_eq!(
+        split_object_location("snap.tar.gz").unwrap(),
+        (".", "snap.tar.gz")
+    );
+    assert_eq!(
+        split_object_location("./snap.tar.gz").unwrap(),
+        (".", "snap.tar.gz")
+    );
+    assert_eq!(
+        split_object_location("/a/b/snap.tgz").unwrap(),
+        ("/a/b", "snap.tgz")
+    );
+    assert_eq!(split_object_location("/snap").unwrap(), ("/", "snap"));
+    assert_eq!(
+        split_object_location("file:///backups/snap.tar.gz").unwrap(),
+        ("file:///backups", "snap.tar.gz")
+    );
+    assert_eq!(
+        split_object_location("s3://bucket/snap.tar.gz").unwrap(),
+        ("s3://bucket", "snap.tar.gz")
+    );
+    assert!(split_object_location("dir/").is_err());
+}
+
+#[test]
 fn strip_scheme_is_case_insensitive_and_bounded() {
     assert_eq!(strip_scheme("S3://x", "s3"), Some("x"));
     assert_eq!(strip_scheme("file:///abs", "file"), Some("/abs"));

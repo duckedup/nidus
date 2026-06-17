@@ -140,6 +140,25 @@ let tier = open_memory_tier("local")?;
 are recognized and rejected with a clear error rather than a silent fallback, so a
 location string is always validated up front.
 
+## Snapshots are object-granular
+
+Because a store is just a few named objects, a **snapshot is one object too** — a
+single `.tar.gz` holding the source-of-truth `data` and `log`. The
+[`nidus backup`](/guides/cli-and-server/) command reads those objects from the source
+store's backend and `put`s the archive to whatever backend its destination names:
+
+```bash
+# A local path or file:// today; another backend's URL once it lands.
+nidus backup  --dir ./store --out ./store.tar.gz
+nidus backup  --dir ./store --out file:///backups/store.tar.gz
+nidus restore --in  ./store.tar.gz --dir ./restored
+```
+
+The snapshot is consistent without taking the writer lock: it captures `data` then
+`log`, and a log record referencing a row not yet in the captured `data` is ignored on
+restore (the same lock-free rule that lets a reader run beside a writer — see
+[Storage & durability](/guides/storage/#cross-process-readers)).
+
 ## Why the traits are synchronous
 
 Both traits are sync, on purpose:
