@@ -512,6 +512,7 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         config,
         data: DataSegment::in_memory(2),
         log: OpLog::in_memory(),
+        persistence: None,
         lock: None,
         collections: HashMap::new(),
         dead_rows: 0,

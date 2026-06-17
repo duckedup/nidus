@@ -6,7 +6,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result, bail};
+#[cfg(test)]
+use anyhow::bail;
+use anyhow::{Context, Result};
 
 /// A held writer lock. Removes the lock file on drop.
 #[derive(Debug)]
@@ -18,7 +20,11 @@ impl WriteLock {
     /// Acquire `<dir>/lock` by atomic create (`create_new`). Writes the PID + a
     /// timestamp inside for diagnostics. If the file already exists and is older
     /// than `ttl` (stale — a crashed writer), reclaim it; otherwise return an error
-    /// (`anyhow`, surfaced as a clear "store is locked" message).
+    /// (`anyhow`, surfaced as a clear "store is locked" message). The store goes
+    /// through [`Persistence::try_lock`](crate::backend::Persistence::try_lock) (which
+    /// shares [`try_acquire_path`](Self::try_acquire_path)); this dir-based form backs
+    /// the lock's own tests.
+    #[cfg(test)]
     pub fn acquire(dir: &Path, ttl: Duration) -> Result<WriteLock> {
         let path = dir.join("lock");
         match Self::try_acquire_path(&path, ttl)? {

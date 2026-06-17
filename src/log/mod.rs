@@ -4,12 +4,9 @@
 //! Each record is framed `[len: u32][payload: bincode(Op)][crc32: u32]`, all
 //! little-endian; `crc32` (via `crc32fast`) covers the payload.
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use anyhow::{Context, Result, bail};
 
-use anyhow::{Context, Result, anyhow, bail};
-
+use crate::backend::{Appender, MemAppender};
 use crate::model::Op;
 
 // ---------------------------------------------------------------------------
@@ -144,201 +141,94 @@ fn parse_all_frames(data: &[u8]) -> Result<(Vec<Op>, usize)> {
 // OpLog
 // ---------------------------------------------------------------------------
 
-/// Backing storage — either a real file or an in-memory buffer.
-enum Backend {
-    File { file: File, path: PathBuf },
-    Memory { buf: Vec<u8> },
-}
-
-/// Append-only handle to the op log.
+/// Append-only handle to the op log over a persistence [`Appender`] (a local file, or
+/// RAM for an in-memory store).
 pub struct OpLog {
-    backend: Backend,
+    appender: Box<dyn Appender>,
 }
 
 impl OpLog {
-    /// Open or create the log at `path`, **replay** all committed records into a
-    /// `Vec<Op>` (in order), and return the write handle alongside them. A torn or
-    /// CRC-failing *tail* record (crash mid-append) is recovered by truncating the
-    /// file to the last good record — not an error. A bad record in the *middle*
-    /// is corruption (error).
-    pub fn open(path: &Path) -> Result<(OpLog, Vec<Op>)> {
-        // Open (or create) the file for reading + writing.
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
+    /// Open or create the `log` file at `path` (convenience over
+    /// [`open_with`](Self::open_with): wraps a local `FileAppender`). The store path
+    /// goes through the persistence backend's appender via `open_with`; this direct
+    /// path-based form backs the log's own file tests.
+    #[cfg(test)]
+    pub fn open(path: &std::path::Path) -> Result<(OpLog, Vec<Op>)> {
+        let appender = crate::backend::FileAppender::open(path)
             .with_context(|| format!("open log at {}", path.display()))?;
+        Self::open_with(Box::new(appender))
+    }
 
-        // Read the entire file, reserving fallibly so a huge log fails with an
-        // error instead of aborting the process on allocation.
-        let len = file.metadata().context("log metadata")?.len() as usize;
+    /// Open the log over an already-opened persistence [`Appender`]: **replay** all
+    /// committed records into a `Vec<Op>` (in order) and return the write handle
+    /// alongside them. A torn or CRC-failing *tail* record (crash mid-append) is
+    /// recovered by truncating to the last good record — not an error. A bad record in
+    /// the *middle* is corruption (error).
+    pub fn open_with(mut appender: Box<dyn Appender>) -> Result<(OpLog, Vec<Op>)> {
+        // Read the entire log (the `read_to_end` default reserves fallibly, so a huge
+        // log fails with an error instead of aborting the process on allocation).
         let mut data = Vec::new();
-        data.try_reserve_exact(len)
-            .map_err(|_| anyhow!("out of memory loading {len}-byte log file"))?;
-        file.read_to_end(&mut data).context("read log file")?;
+        appender.read_to_end(&mut data).context("read log file")?;
 
         // Parse all frames, recovering torn tails.
         let (ops, good_len) = parse_all_frames(&data)?;
 
-        // Truncate the file to the last good position if it has trailing garbage.
+        // Truncate to the last good position if there is trailing garbage.
         if good_len < data.len() {
-            file.set_len(good_len as u64)
+            appender
+                .truncate_to(good_len as u64)
                 .context("truncate torn log tail")?;
         }
 
-        // Seek to the end (good_len) for appending.
-        file.seek(SeekFrom::Start(good_len as u64))
-            .context("seek to end of log")?;
-
-        let path = path.to_path_buf();
-        Ok((
-            OpLog {
-                backend: Backend::File { file, path },
-            },
-            ops,
-        ))
+        Ok((OpLog { appender }, ops))
     }
 
-    /// An in-memory-only log (no backing file). For tests.
+    /// An in-memory-only log (no backing file). For tests and in-memory stores.
     pub fn in_memory() -> OpLog {
         OpLog {
-            backend: Backend::Memory { buf: Vec::new() },
+            appender: Box::new(MemAppender::new()),
         }
     }
 
     /// Append one framed record. Does NOT fsync — the caller batches then calls
     /// [`sync`](Self::sync).
     ///
-    /// **Atomic per frame.** If the file write fails partway (e.g. ENOSPC), the
-    /// file is rolled back to the offset it started at, so a torn frame never
-    /// persists mid-file — without this, the next append would write past the
-    /// partial bytes and `parse_all_frames` would reject the result as hard
-    /// `Corruption` on reopen.
+    /// **Atomic per frame.** If the write fails partway (e.g. ENOSPC), the appender
+    /// rolls back to the offset it started at, so a torn frame never persists mid-file
+    /// — without this, the next append would write past the partial bytes and
+    /// `parse_all_frames` would reject the result as hard `Corruption` on reopen.
     pub fn append(&mut self, op: &Op) -> Result<()> {
         let mut frame_buf = Vec::new();
         frame(op, &mut frame_buf)?;
-
-        match &mut self.backend {
-            Backend::File { file, .. } => {
-                let start = file
-                    .stream_position()
-                    .context("read log position before append")?;
-                if let Err(e) = file.write_all(&frame_buf) {
-                    let _ = file.set_len(start);
-                    let _ = file.seek(SeekFrom::Start(start));
-                    return Err(anyhow::Error::new(e)).context("write log frame");
-                }
-            }
-            Backend::Memory { buf } => {
-                buf.extend_from_slice(&frame_buf);
-            }
-        }
-        Ok(())
+        self.appender.append(&frame_buf).context("write log frame")
     }
 
     /// The committed byte length — the append point. A writer captures this before
     /// a batch and passes it to [`truncate_to`](Self::truncate_to) to undo a failed
-    /// one. (The cursor sits at the end after `open`, every `append`, and
-    /// `rewrite`, so the file length is the logical end.)
+    /// one.
     pub fn offset(&self) -> Result<u64> {
-        match &self.backend {
-            Backend::File { file, .. } => Ok(file.metadata().context("log metadata")?.len()),
-            Backend::Memory { buf } => Ok(buf.len() as u64),
-        }
+        self.appender.len().context("log length")
     }
 
     /// Roll the log back to `offset`, discarding any frames appended after it.
     /// The batch-rollback primitive (counterpart to [`offset`](Self::offset)).
     pub fn truncate_to(&mut self, offset: u64) -> Result<()> {
-        match &mut self.backend {
-            Backend::File { file, .. } => {
-                file.set_len(offset).context("truncate log")?;
-                file.seek(SeekFrom::Start(offset))
-                    .context("seek after log truncate")?;
-            }
-            Backend::Memory { buf } => {
-                let o = offset as usize;
-                if o > buf.len() {
-                    bail!(
-                        "log truncate_to({offset}) exceeds buffer length {}",
-                        buf.len()
-                    );
-                }
-                buf.truncate(o);
-            }
-        }
-        Ok(())
+        self.appender.truncate_to(offset).context("truncate log")
     }
 
-    /// fsync the backing file (no-op for in-memory).
+    /// fsync the backing appender (no-op for in-memory).
     pub fn sync(&mut self) -> Result<()> {
-        match &mut self.backend {
-            Backend::File { file, .. } => {
-                file.sync_all().context("sync log")?;
-            }
-            Backend::Memory { .. } => {}
-        }
-        Ok(())
+        self.appender.sync().context("sync log")
     }
 
-    /// Atomically rewrite the log to contain exactly `ops` (compaction).
-    /// Writes all ops as frames to a temp file in the same directory, fsyncs,
-    /// atomically renames over the log, then reopens the append handle.
+    /// Atomically rewrite the log to contain exactly `ops` (compaction). The appender
+    /// handles the atomic temp + fsync + rename (or, in-memory, the buffer swap).
     pub fn rewrite(&mut self, ops: &[Op]) -> Result<()> {
-        match &mut self.backend {
-            Backend::File { path, .. } => {
-                let path = path.clone();
-                let dir = path.parent().unwrap_or(Path::new("."));
-
-                // Build the full frame content.
-                let mut frame_buf = Vec::new();
-                for op in ops {
-                    frame(op, &mut frame_buf)?;
-                }
-
-                // Write to a temp file in the same directory.
-                let tmp_path = dir.join("log.tmp");
-                {
-                    let mut tmp = OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(&tmp_path)
-                        .context("open log.tmp")?;
-                    tmp.write_all(&frame_buf).context("write log.tmp")?;
-                    tmp.sync_all().context("sync log.tmp")?;
-                }
-
-                // Atomically rename over the log.
-                std::fs::rename(&tmp_path, &path).context("rename log.tmp over log")?;
-
-                // Reopen the file for appending.
-                let mut file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(false)
-                    .truncate(false)
-                    .open(&path)
-                    .context("reopen log after rewrite")?;
-
-                let new_end = frame_buf.len() as u64;
-                file.seek(SeekFrom::Start(new_end))
-                    .context("seek to end after rewrite")?;
-
-                self.backend = Backend::File { file, path };
-                Ok(())
-            }
-            Backend::Memory { buf } => {
-                // In-memory: just rebuild the buffer.
-                buf.clear();
-                for op in ops {
-                    frame(op, buf)?;
-                }
-                Ok(())
-            }
+        let mut frame_buf = Vec::new();
+        for op in ops {
+            frame(op, &mut frame_buf)?;
         }
+        self.appender.rewrite(&frame_buf).context("rewrite log")
     }
 }
 

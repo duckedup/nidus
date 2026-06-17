@@ -15,16 +15,15 @@
 //! The **key** is opaque validity bytes the caller composes (ANN: dim/metric/params;
 //! FTS: schema hash/language) — any change to it invalidates the cache. The
 //! **watermark** is *data*, not part of the key: it records how much the cache covers
-//! (rows / docs) so the caller can incrementally catch up the rest. Writes are atomic
-//! (temp file + fsync + rename) so a crash can't leave a torn cache.
-
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::path::Path;
+//! (rows / docs) so the caller can incrementally catch up the rest. The bytes live as
+//! one named object on the [`Persistence`] backend, so the atomic-write guarantee
+//! (local: temp + fsync + rename) is the backend's `put`, not hand-rolled here.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+
+use crate::backend::Persistence;
 
 /// Magic bytes, shared with the `data`/`log` files.
 const MAGIC: &[u8; 6] = b"NIDUS\0";
@@ -82,44 +81,32 @@ pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8], key: &[u8]) -> Option<(T
         .map(|p| (p, watermark))
 }
 
-/// Save `payload` to `path` atomically, valid only for `key`. `watermark` is how much
+/// Save `payload` as the `object` on `p`, valid only for `key`. `watermark` is how much
 /// of the source the cache reflects (rows / docs), so a later [`load`] knows how far to
-/// catch up.
+/// catch up. The whole-object [`Persistence::put`] is atomic.
 pub(crate) fn save<T: Serialize>(
-    path: &Path,
+    p: &dyn Persistence,
+    object: &str,
     key: &[u8],
     watermark: u64,
     payload: &T,
 ) -> Result<()> {
     let buf = frame(key, watermark, payload)?;
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)
-            .with_context(|| format!("create index cache temp {tmp:?}"))?;
-        f.write_all(&buf)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path).with_context(|| format!("rename index cache into {path:?}"))?;
-    Ok(())
+    p.put(object, &buf)
 }
 
-/// Load and validate the cache at `path` for `key`. `Ok(None)` — never an error — when
-/// the file is absent, stale, or corrupt; on success returns the decoded payload and
+/// Load and validate the `object` on `p` for `key`. `Ok(None)` — never an error — when
+/// the object is absent, stale, or corrupt; on success returns the decoded payload and
 /// the watermark it covers.
-pub(crate) fn load<T: DeserializeOwned>(path: &Path, key: &[u8]) -> Result<Option<(T, u64)>> {
-    let mut f = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("open index cache {path:?}")),
-    };
-    let mut bytes = Vec::new();
-    f.read_to_end(&mut bytes)
-        .with_context(|| format!("read index cache {path:?}"))?;
-    Ok(decode::<T>(&bytes, key))
+pub(crate) fn load<T: DeserializeOwned>(
+    p: &dyn Persistence,
+    object: &str,
+    key: &[u8],
+) -> Result<Option<(T, u64)>> {
+    match p.get(object)? {
+        Some(bytes) => Ok(decode::<T>(&bytes, key)),
+        None => Ok(None),
+    }
 }
 
 #[cfg(test)]

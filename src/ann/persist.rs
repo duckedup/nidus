@@ -8,13 +8,15 @@
 //! best-effort — a missing, stale (config/dim/metric/params changed), or CRC-failed
 //! file returns `None` and the caller rebuilds; it is never fatal.
 
-use std::path::Path;
-
 use anyhow::Result;
 
 use crate::ann::{Ann, AnnSnapshot};
+use crate::backend::Persistence;
 use crate::index_cache;
 use crate::model::{AnnConfig, AnnKind, Distance, QuantKind};
+
+/// The object name of the ANN cache on the persistence backend.
+const ANN_OBJECT: &str = "ann";
 
 fn kind_to_byte(k: AnnKind) -> u8 {
     match k {
@@ -64,11 +66,11 @@ fn validity_key(
     k
 }
 
-/// Save the index to `path` atomically. `covered_rows` is the live row count the index
-/// reflects (so a later `open` knows how many rows to incrementally catch up).
+/// Save the index to the backend `p` atomically. `covered_rows` is the live row count
+/// the index reflects (so a later `open` knows how many rows to incrementally catch up).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn save(
-    path: &Path,
+    p: &dyn Persistence,
     ann: &Ann,
     covered_rows: u64,
     dim: usize,
@@ -77,22 +79,22 @@ pub(crate) fn save(
     quant: Option<QuantKind>,
 ) -> Result<()> {
     let key = validity_key(dim, distance, cfg, quant);
-    index_cache::save(path, &key, covered_rows, &ann.snapshot_ref())
+    index_cache::save(p, ANN_OBJECT, &key, covered_rows, &ann.snapshot_ref())
 }
 
-/// Load the index from `path` if present and valid for the current `(dim, distance,
-/// cfg, quant)`. Returns `Ok(None)` — never an error — when the cache is absent, stale,
-/// or corrupt; the caller rebuilds. On success returns the index and the row count it
+/// Load the index from `p` if present and valid for the current `(dim, distance, cfg,
+/// quant)`. Returns `Ok(None)` — never an error — when the cache is absent, stale, or
+/// corrupt; the caller rebuilds. On success returns the index and the row count it
 /// covers (the caller incrementally catches up any rows added since).
 pub(crate) fn load(
-    path: &Path,
+    p: &dyn Persistence,
     dim: usize,
     distance: Distance,
     cfg: &AnnConfig,
     quant: Option<QuantKind>,
 ) -> Result<Option<(Ann, u64)>> {
     let key = validity_key(dim, distance, cfg, quant);
-    Ok(index_cache::load::<AnnSnapshot>(path, &key)?
+    Ok(index_cache::load::<AnnSnapshot>(p, ANN_OBJECT, &key)?
         .map(|(snap, covered)| (Ann::from_snapshot(*cfg, dim, distance, snap), covered)))
 }
 

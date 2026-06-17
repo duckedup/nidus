@@ -151,10 +151,23 @@ impl Appender for FileAppender {
             .len())
     }
 
+    fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.handle
+            .seek(SeekFrom::Start(offset))
+            .with_context(|| format!("failed to seek {} to {offset}", self.path.display()))?;
+        self.handle
+            .read_exact(buf)
+            .with_context(|| format!("failed to read {} at {offset}", self.path.display()))
+    }
+
     fn append(&mut self, bytes: &[u8]) -> Result<()> {
-        let start = self.handle.stream_position().with_context(|| {
-            format!("failed to read append position of {}", self.path.display())
-        })?;
+        // Always append at the true end: a preceding `read_exact_at` may have left the
+        // cursor mid-file, so don't trust it — seek to the end and capture that as the
+        // rollback boundary.
+        let start = self
+            .handle
+            .seek(SeekFrom::End(0))
+            .with_context(|| format!("failed to seek to end of {}", self.path.display()))?;
         if let Err(e) = self.handle.write_all(bytes) {
             // Roll back any partial bytes to the boundary the append started at.
             let _ = self.handle.set_len(start);
@@ -226,17 +239,5 @@ impl Appender for FileAppender {
         self.handle = handle;
         Ok(())
     }
-
-    fn read_to_end(&mut self, out: &mut Vec<u8>) -> Result<()> {
-        self.handle
-            .seek(SeekFrom::Start(0))
-            .with_context(|| format!("failed to rewind {}", self.path.display()))?;
-        self.handle
-            .read_to_end(out)
-            .with_context(|| format!("failed to read {}", self.path.display()))?;
-        self.handle
-            .seek(SeekFrom::End(0))
-            .with_context(|| format!("failed to seek to end of {}", self.path.display()))?;
-        Ok(())
-    }
+    // `read_to_end` uses the trait's provided impl (fallible-reserve + `read_exact_at`).
 }

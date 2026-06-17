@@ -17,9 +17,10 @@
 //! of the box — genuine runtime plug-and-play. Selection is by **URL scheme**
 //! ([`open_persistence`] / [`open_memory_tier`]).
 //!
-//! This module is the **trait surface + the two local impls**. Wiring the live
-//! `data`/`log` path onto [`Appender`] and routing snapshots through [`Persistence`]
-//! land alongside the remote backends, where they first become meaningful.
+//! The live store runs over these traits: its `data`/`log` segments are
+//! [`Appender`]s the [`Persistence`] backend hands out, and its `ann`/`fts` caches and
+//! writer lock go through `get`/`put`/`try_lock`. Routing snapshot/backup through
+//! [`Persistence`] lands alongside the remote backends, where it first becomes meaningful.
 
 use std::time::Duration;
 
@@ -33,6 +34,7 @@ mod tests;
 
 pub use local::{FileAppender, LocalFs};
 pub use ram::LocalRam;
+pub(crate) use ram::MemAppender;
 
 /// Where the durable bytes live: whole **named byte objects** in two classes —
 /// source-of-truth (`data`/`log`, never reconstructable) and derived caches
@@ -72,10 +74,16 @@ pub trait Persistence: Send + Sync {
 }
 
 /// A durable, append-shaped byte stream — the native local-FS capability that the
-/// `data`/`log` segments need (§5–§6): append with per-write rollback, truncate to a
-/// byte boundary, fsync, and atomic whole-file rewrite (compaction). Object-store
-/// backends do not provide this (see [`Persistence::appender`]).
-pub trait Appender: Send {
+/// `data`/`log` segments need (§5–§6): random-access read (to load/replay on open),
+/// append with per-write rollback, truncate to a byte boundary, fsync, and atomic
+/// whole-file rewrite (compaction). Object-store backends do not provide this (see
+/// [`Persistence::appender`]).
+///
+/// `Send + Sync` because a [`Store`](crate::Nidus) holding an appender is shared as
+/// `Arc<RwLock<Nidus>>`: searchers take `&self` and never touch the appender (it is a
+/// `&mut self`-only, write-path resource), so sharing `&dyn Appender` across threads is
+/// sound — both concrete impls (a `File`, an in-RAM `Vec<u8>`) are themselves `Sync`.
+pub trait Appender: Send + Sync {
     /// The current committed length in bytes — the append point.
     fn len(&self) -> Result<u64>;
 
@@ -83,6 +91,12 @@ pub trait Appender: Send {
     fn is_empty(&self) -> Result<bool> {
         Ok(self.len()? == 0)
     }
+
+    /// Read exactly `buf.len()` bytes starting at byte `offset` into `buf`. Errors if
+    /// fewer than that many bytes remain. The load/replay primitive — lets a caller
+    /// stream a large segment in bounded chunks (no whole-object materialization, so
+    /// `data` keeps its low transient open-time footprint).
+    fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()>;
 
     /// Append `bytes`. **Atomic:** on a partial write (e.g. ENOSPC) the stream is
     /// rolled back to the length it had before the call, so no torn suffix persists
@@ -100,15 +114,24 @@ pub trait Appender: Send {
     /// then leave the handle positioned to append after them. The compaction path.
     fn rewrite(&mut self, bytes: &[u8]) -> Result<()>;
 
-    /// Append the entire current contents to `out`. Used once on open, before any
-    /// append, to load/replay the stream.
-    fn read_to_end(&mut self, out: &mut Vec<u8>) -> Result<()>;
+    /// Append the entire current contents to `out`. Provided over
+    /// [`read_exact_at`](Self::read_exact_at) with a fallible reserve, so an oversized
+    /// stream surfaces an `Err` instead of aborting the process.
+    fn read_to_end(&mut self, out: &mut Vec<u8>) -> Result<()> {
+        let len = self.len()? as usize;
+        let start = out.len();
+        out.try_reserve_exact(len)
+            .map_err(|_| anyhow::anyhow!("out of memory reading {len} bytes from appender"))?;
+        out.resize(start + len, 0);
+        self.read_exact_at(0, &mut out[start..])
+    }
 }
 
 /// A held backend lock, released on drop (RAII). Returned by
 /// [`Persistence::try_lock`]; the concrete guard owns whatever the backend needs to
-/// release (a lock file, a conditional-PUT marker, …).
-pub trait BackendLock: Send {}
+/// release (a lock file, a conditional-PUT marker, …). `Send + Sync` for the same
+/// reason as [`Appender`] — a held lock lives inside the shared [`Store`](crate::Nidus).
+pub trait BackendLock: Send + Sync {}
 
 /// Where the in-RAM working set is held so it can be **shared across processes** and
 /// **reloaded without a rebuild** (SPEC §13.3). A rebuildable cache of the serialized

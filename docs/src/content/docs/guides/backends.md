@@ -14,7 +14,10 @@ Both default to local, and they compose:
 
 Today nidus ships the local implementations of both — `LocalFs` (a directory) and
 `LocalRam` (the process heap) — and exposes the traits as the seam any other backend
-plugs into.
+plugs into. A file-backed store **runs over `LocalFs`**: its `data`/`log` segments are
+append handles the backend hands out, and its `ann`/`fts` caches and writer lock go
+through the same object operations — so the trait is the real substrate, not a wrapper
+bolted on the side.
 
 ## Why the two axes are separate
 
