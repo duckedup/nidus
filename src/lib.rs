@@ -22,6 +22,7 @@ mod ann;
 mod config;
 mod data;
 mod filter;
+mod fts;
 mod glob;
 mod index_cache;
 mod lock;
@@ -40,6 +41,7 @@ pub mod server;
 
 pub use anyhow::Result;
 pub use config::{Config, Fsync, OpenMode};
+pub use fts::Language;
 pub use model::{
     AnnConfig, AnnKind, Distance, Filter, Footprint, Hit, Predicate, QuantKind, Quantization,
     Record, SearchOpts, Value,

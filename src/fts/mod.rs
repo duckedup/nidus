@@ -1,0 +1,309 @@
+//! Opt-in BM25 full-text search index (the FTS leg of SPEC.md §9).
+//!
+//! A *derived secondary index*, like [`crate::ann`]: built from the documents'
+//! text-bearing attrs, rebuildable from the op-log, and cached on disk only as an
+//! optimization. Each full-text-indexed `(collection, field)` owns one [`FieldIndex`]
+//! — an inverted index (term → postings) plus the per-doc lengths BM25 needs. A query
+//! is [analyzed](analyzer) into terms, scored against a field, and ranked by BM25.
+//!
+//! Identity is an FTS-local **docnum** (a dense `[0, n)` id), not the data-matrix row:
+//! FTS indexes only a subset of docs per field and text-only docs have no row at all.
+//! A candidate docnum is *hint-verified* against the live `id ↔ docnum` maps before it
+//! scores, so deletes/overwrites need no posting rewrite (they leave a tombstone the
+//! lookup skips). Pure safe Rust, Miri-clean, zero FFI.
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+mod analyzer;
+
+pub use analyzer::Language;
+pub(crate) use analyzer::analyze;
+
+/// BM25 term-frequency saturation. Larger = term frequency matters more before
+/// saturating. The conventional default.
+const K1: f32 = 1.2;
+/// BM25 length normalization. `0` = none, `1` = full. The conventional default.
+const B: f32 = 0.75;
+
+/// One posting: a document's local docnum and the term's frequency in this field.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct Posting {
+    docnum: u32,
+    tf: u32,
+}
+
+/// The BM25 inverted index for one `(collection, field)`. `docnum` is dense and
+/// FTS-local; `docnum_to_id[d]` is `None` once that doc is tombstoned (deleted or
+/// overwritten), and `id_to_docnum` is the authoritative live mapping.
+// Methods are exercised by tests now and wired into `crate::store` in the schema/
+// lifecycle tasks (nidus-b6i.6/.8); drop the allow as the call sites land.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct FieldIndex {
+    lang: Language,
+    /// term → postings, appended in docnum order.
+    postings: HashMap<String, Vec<Posting>>,
+    /// docnum → field length in terms (`0` once tombstoned).
+    doc_len: Vec<u32>,
+    /// docnum → owning doc id, or `None` for a tombstoned slot.
+    docnum_to_id: Vec<Option<String>>,
+    /// doc id → its live docnum.
+    id_to_docnum: HashMap<String, u32>,
+    /// Live (non-tombstoned) docs — BM25's `N`.
+    doc_count: u64,
+    /// Sum of `doc_len` over live docs — `avgdl = total_len / doc_count`.
+    total_len: u64,
+    /// Tombstoned slots (a compaction-pressure signal).
+    tombstones: u32,
+}
+
+#[allow(dead_code)]
+impl FieldIndex {
+    pub(crate) fn new(lang: Language) -> Self {
+        Self {
+            lang,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn language(&self) -> Language {
+        self.lang
+    }
+
+    /// Index (or re-index) document `id` with this field's `text`. Re-indexing an
+    /// existing id tombstones its previous docnum first (lazy delete — the old postings
+    /// stay but are skipped via hint-verify). O(terms in `text`).
+    pub(crate) fn index(&mut self, id: &str, text: &str) {
+        self.tombstone(id);
+
+        let terms = analyze(text, self.lang);
+        let len = terms.len() as u32;
+        let docnum = self.docnum_to_id.len() as u32;
+
+        // Term frequencies within this doc.
+        let mut tf: HashMap<&str, u32> = HashMap::new();
+        for t in &terms {
+            *tf.entry(t.as_str()).or_insert(0) += 1;
+        }
+        for (term, count) in tf {
+            self.postings
+                .entry(term.to_string())
+                .or_default()
+                .push(Posting { docnum, tf: count });
+        }
+
+        self.doc_len.push(len);
+        self.docnum_to_id.push(Some(id.to_string()));
+        self.id_to_docnum.insert(id.to_string(), docnum);
+        self.doc_count += 1;
+        self.total_len += len as u64;
+    }
+
+    /// Tombstone document `id` if present (delete or pre-overwrite). Postings are left
+    /// dangling and skipped at query time; live counts are corrected immediately so
+    /// `avgdl`/`N` track live docs (compaction later drops the dead postings).
+    pub(crate) fn tombstone(&mut self, id: &str) {
+        if let Some(docnum) = self.id_to_docnum.remove(id) {
+            let d = docnum as usize;
+            self.docnum_to_id[d] = None;
+            self.total_len -= self.doc_len[d] as u64;
+            self.doc_len[d] = 0;
+            self.doc_count -= 1;
+            self.tombstones += 1;
+        }
+    }
+
+    /// Average field length over live docs (`1.0` when empty, to avoid a 0/0 in BM25).
+    fn avgdl(&self) -> f32 {
+        if self.doc_count == 0 {
+            1.0
+        } else {
+            self.total_len as f32 / self.doc_count as f32
+        }
+    }
+
+    /// Live BM25 score for every doc matching at least one term of `query_text`, as
+    /// `(id, score)`. Unranked (the caller feeds these into the shared top-k heap so
+    /// scope/filter/top-k apply uniformly with vector search).
+    pub(crate) fn score(&self, query_text: &str) -> Vec<(&str, f32)> {
+        let query_terms = analyze(query_text, self.lang);
+        if query_terms.is_empty() || self.doc_count == 0 {
+            return Vec::new();
+        }
+        let avgdl = self.avgdl();
+        let n = self.doc_count as f32;
+
+        // docnum → accumulated score.
+        let mut scores: HashMap<u32, f32> = HashMap::new();
+        // De-dup query terms: a repeated query term doesn't change BM25 here (we score
+        // document term frequency, not query term frequency).
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for term in &query_terms {
+            if !seen.insert(term.as_str()) {
+                continue;
+            }
+            let Some(postings) = self.postings.get(term) else {
+                continue;
+            };
+            // df over **live** postings only, so idf reflects the live corpus.
+            let live: Vec<&Posting> = postings
+                .iter()
+                .filter(|p| self.docnum_to_id[p.docnum as usize].is_some())
+                .collect();
+            let df = live.len() as f32;
+            if df == 0.0 {
+                continue;
+            }
+            // BM25+ idf: the leading `1 +` keeps it positive for all df (defensive even
+            // though df ≤ N here), so a common term never drags a score negative.
+            let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+            for p in live {
+                let dl = self.doc_len[p.docnum as usize] as f32;
+                let tf = p.tf as f32;
+                let norm = tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avgdl));
+                *scores.entry(p.docnum).or_insert(0.0) += idf * norm;
+            }
+        }
+
+        scores
+            .into_iter()
+            .filter_map(|(docnum, score)| {
+                self.docnum_to_id[docnum as usize]
+                    .as_deref()
+                    .map(|id| (id, score))
+            })
+            .collect()
+    }
+
+    /// Whether this index currently holds document `id` (live).
+    #[cfg(test)]
+    fn contains(&self, id: &str) -> bool {
+        self.id_to_docnum.contains_key(id)
+    }
+}
+
+/// All FTS state for a store: the per-`(collection, field)` indexes plus the declared
+/// schema (`collection → [(field, language)]`). The schema is the source of truth for
+/// which attrs are full-text indexed; it is persisted via the op-log and replayed on
+/// open. Wired into [`crate::store`] in the schema/lifecycle tasks.
+#[allow(dead_code)] // wired into the store in nidus-b6i.6/.8
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct Fts {
+    fields: HashMap<(String, String), FieldIndex>,
+    schema: HashMap<String, Vec<(String, Language)>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn idx_with(docs: &[(&str, &str)]) -> FieldIndex {
+        let mut idx = FieldIndex::new(Language::English);
+        for (id, text) in docs {
+            idx.index(id, text);
+        }
+        idx
+    }
+
+    /// `score` ranked descending, for assertions.
+    fn ranked(idx: &FieldIndex, query: &str) -> Vec<(String, f32)> {
+        let mut v: Vec<(String, f32)> = idx
+            .score(query)
+            .into_iter()
+            .map(|(id, s)| (id.to_string(), s))
+            .collect();
+        // Score desc, then id asc — a deterministic order despite HashMap iteration.
+        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+        v
+    }
+
+    #[test]
+    fn ranks_by_relevance_and_stems() {
+        let idx = idx_with(&[
+            ("d1", "the cat sat on the mat"),
+            ("d2", "cats and more cats running with cats"),
+            ("d3", "a dog barked"),
+        ]);
+        let hits = ranked(&idx, "cat");
+        // d2 mentions "cats" most → highest; d3 has no cat term → absent.
+        assert_eq!(hits[0].0, "d2");
+        assert_eq!(hits[1].0, "d1");
+        assert!(!hits.iter().any(|(id, _)| id == "d3"));
+        assert!(hits.iter().all(|(_, s)| *s > 0.0));
+    }
+
+    #[test]
+    fn query_is_stemmed_to_match_documents() {
+        let idx = idx_with(&[("d1", "developers love running tests")]);
+        // "run" (query) stems to the same root as "running" (doc).
+        assert_eq!(idx.score("run").len(), 1);
+        assert_eq!(idx.score("RUNNING").len(), 1);
+    }
+
+    #[test]
+    fn tombstone_removes_doc_from_results_and_fixes_counts() {
+        let mut idx = idx_with(&[("d1", "alpha beta"), ("d2", "alpha gamma")]);
+        assert_eq!(idx.doc_count, 2);
+        idx.tombstone("d1");
+        assert_eq!(idx.doc_count, 1);
+        assert!(!idx.contains("d1"));
+        let hits = idx.score("alpha");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "d2");
+    }
+
+    #[test]
+    fn reindex_overwrites_previous_text() {
+        let mut idx = idx_with(&[("d1", "alpha beta")]);
+        idx.index("d1", "gamma delta");
+        assert_eq!(idx.doc_count, 1); // still one live doc
+        assert!(idx.score("alpha").is_empty(), "old term gone");
+        assert_eq!(idx.score("gamma").len(), 1, "new term present");
+    }
+
+    #[test]
+    fn idf_stays_positive_when_term_is_in_every_doc() {
+        // A term present in all docs has df == N; the BM25+ `1 +` keeps idf > 0, so
+        // scores never go negative (which would invert ranking).
+        let idx = idx_with(&[("d1", "common"), ("d2", "common"), ("d3", "common")]);
+        let hits = idx.score("common");
+        assert_eq!(hits.len(), 3);
+        assert!(
+            hits.iter().all(|(_, s)| *s > 0.0),
+            "idf must stay positive at df==N"
+        );
+    }
+
+    #[test]
+    fn shorter_docs_score_higher_for_same_tf() {
+        // Length normalization (b): the same single occurrence is worth more in a short
+        // doc than a long one.
+        let idx = idx_with(&[
+            ("short", "needle"),
+            (
+                "long",
+                "needle and a whole lot of other unrelated padding words here",
+            ),
+        ]);
+        let hits = ranked(&idx, "needle");
+        assert_eq!(hits[0].0, "short");
+    }
+
+    #[test]
+    fn empty_and_unknown_queries_return_nothing() {
+        let idx = idx_with(&[("d1", "alpha")]);
+        assert!(idx.score("").is_empty());
+        assert!(idx.score("the and of").is_empty()); // all stopwords
+        assert!(idx.score("zzz").is_empty()); // unknown term
+    }
+
+    #[test]
+    fn field_index_serde_roundtrips() {
+        let idx = idx_with(&[("d1", "alpha beta"), ("d2", "beta gamma")]);
+        let bytes = bincode::serialize(&idx).unwrap();
+        let restored: FieldIndex = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(ranked(&idx, "beta"), ranked(&restored, "beta"));
+    }
+}
