@@ -18,7 +18,7 @@ toolchain required — and stand up a working local store in four commands. See
 ```toml
 # Cargo.toml
 [dependencies]
-nidus = "0.13"
+nidus = "0.14"
 anyhow = "1"     # nidus returns anyhow::Result
 ```
 
@@ -68,15 +68,13 @@ let mut attrs = BTreeMap::new();
 attrs.insert("path".into(), Value::Str("src/auth/login.rs".into()));
 attrs.insert("lines".into(), Value::Int(42));
 
-db.upsert("code", &[Record {
-    id: "a".into(),
-    vector: vec![/* 768 f32s */],
-    attrs,
-}])?;
+db.upsert("code", &[Record::new("a", vec![/* 768 f32s */], attrs)])?;
 # anyhow::Ok(())
 ```
 
-Pass a slice to upsert a whole batch in one durable, all-or-nothing call.
+Pass a slice to upsert a whole batch in one durable, all-or-nothing call. A record
+may also carry no embedding — `Record::text_only(id, attrs)` — for a document indexed
+purely by [full-text search](/guides/search/#full-text-search-bm25).
 
 ## Search
 

@@ -1,6 +1,6 @@
 ---
 title: Search & filters
-description: Scoped search across nidus collections with three distance metrics, exact or approximate (HNSW/IVF) indexing, int8 quantization, metadata-only queries, and equality / glob / set / range filter predicates.
+description: Scoped search across nidus collections with three distance metrics, exact or approximate (HNSW/IVF) indexing, int8 quantization, BM25 full-text and hybrid (RRF) search, metadata-only queries, and equality / glob / set / range filter predicates.
 ---
 
 Search in nidus runs over a scope you choose, using one of three distance metrics,
@@ -270,3 +270,85 @@ derived data: deleting the `ann` file only costs a one-time rebuild.
   index walk scores quantized codes (a cheaper candidate selection) and the exact f32
   rerank over those candidates restores accuracy. Recall runs a little below the
   exact-walk index, so widen `ef_search`/`n_probe` and `overscan` if you need it back.
+
+## Full-text search (BM25)
+
+Alongside vector search, a collection can declare **full-text-indexed fields** and be
+queried by keyword with [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) ranking. It
+reuses the same `Hit` results, `Filter`, scope, and `top_k` heap as vector search —
+only the scoring differs.
+
+Declare which attribute fields are full-text indexed (each with an analyzer
+`Language`). You can do it up front at collection creation (the recommended path —
+indexing is incremental from the first upsert) or any time afterward (it indexes the
+docs already stored):
+
+```rust
+use nidus::{Config, Nidus, Language};
+
+let mut db = Nidus::open(Config::new("./store", 384))?;
+
+// Up front (recommended):
+db.create_collection_with_fts("docs", &[("body".into(), Language::English)])?;
+
+// …or declare/redeclare later on an existing collection:
+db.set_fts_schema("docs", &[("title".into(), Language::English)])?;
+# anyhow::Ok(())
+```
+
+Then query a field with [`text_search`](/reference/api/#nidus):
+
+```rust
+use nidus::{FtsQuery, SearchOpts};
+
+let hits = db.text_search(
+    "docs",
+    &FtsQuery::new("body", "running quickly"),
+    &SearchOpts { top_k: 10, ..Default::default() },
+)?;
+# anyhow::Ok(())
+```
+
+- **Analyzer.** US English today (`Language::English`): lowercase → Unicode word
+  tokenization → English stopword removal → Porter stemming. Stemming means a query for
+  `run` matches documents containing `running`, `runs`, or `ran`. The same analysis runs
+  at index and query time. The `Language` enum is the seam for further languages.
+- **What gets indexed.** `Str` attrs are indexed directly; `List` attrs are indexed
+  per element. A document only lives in a field's index while it has text there.
+- **`SearchOpts`.** `top_k` and `filter` work exactly as for vector search; here
+  `min_score` is a **raw BM25** floor (not a cosine one). Results are tie-broken by
+  `(collection, id)` for determinism.
+- **Text-only documents.** A `Record` may carry no vector (`Record::text_only`) — a
+  pure full-text document. It is found by `text_search` and never by vector `search`.
+  Vector-bearing and text-only docs coexist in one collection.
+
+## Hybrid search (RRF)
+
+[`hybrid_search`](/reference/api/#nidus) fuses a vector query and a BM25 text query
+into one ranking using **Reciprocal Rank Fusion**: each leg is ranked independently,
+and a document's fused score is `Σ 1 / (rrf_k + rank)` over the legs it appears in.
+
+```rust
+use nidus::{FtsQuery, HybridOpts};
+
+let hits = db.hybrid_search(
+    "docs",
+    &query_vector,                       // the vector leg
+    &FtsQuery::new("body", "vector database"), // the BM25 leg
+    &HybridOpts { top_k: 10, ..Default::default() },
+)?;
+# anyhow::Ok(())
+```
+
+RRF fuses by **rank position**, not raw score, so the incomparable scales of cosine
+(or euclidean/dot-product) and unbounded BM25 never need normalizing, and a document
+that surfaces in only one leg (a strong vector match with weak text, or a text-only
+doc) is still ranked. `HybridOpts` exposes `top_k`, a `filter` applied to both legs,
+`rrf_k` (the rank-bias constant, default 60), and `candidates` (how deep each leg is
+pulled before fusing, default 100). There is no `min_score` — a fused RRF score has no
+absolute scale; threshold the individual legs via `search` / `text_search` if you need
+a floor.
+
+Full-text and hybrid search are a runtime feature over the same store — like ANN and
+quantization, they change nothing about the on-disk vector format, and a store opened
+without declaring any FTS schema behaves exactly as before.

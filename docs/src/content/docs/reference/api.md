@@ -1,6 +1,6 @@
 ---
 title: API reference
-description: The full nidus public surface — Nidus, Config, Record, Value, Filter, Predicate, Scope, SearchOpts, Hit, Footprint.
+description: The full nidus public surface — Nidus, Config, Record, Value, Filter, Predicate, Scope, SearchOpts, FtsQuery, HybridOpts, Hit, Footprint.
 ---
 
 The complete public API. All fallible methods return `anyhow::Result`. For the
@@ -38,6 +38,8 @@ searchers plus one writer (see
 | `collections` | `fn collections(&self) -> Vec<String>` | All collection names. |
 | `get_meta` | `fn get_meta(&self, collection: &str) -> BTreeMap<String, String>` | Per-collection metadata. |
 | `set_meta` | `fn set_meta(&mut self, collection: &str, meta: BTreeMap<String, String>) -> Result<()>` | |
+| `create_collection_with_fts` | `fn create_collection_with_fts(&mut self, name: &str, fields: &[(String, Language)]) -> Result<()>` | Create + declare [full-text fields](/guides/search/#full-text-search-bm25) up front (incremental from the first upsert). |
+| `set_fts_schema` | `fn set_fts_schema(&mut self, collection: &str, fields: &[(String, Language)]) -> Result<()>` | Declare/redeclare full-text fields any time; indexes existing docs once. |
 
 ### Records
 
@@ -54,6 +56,8 @@ searchers plus one writer (see
 | ------ | --------- | ----- |
 | `list` | `fn list<'a>(&self, scope: impl Into<Scope<'a>>, filter: &Filter, offset: usize, limit: usize) -> Result<Vec<Hit>>` | Metadata-only query — no vector, returns filter-matched records in insertion order; `offset`/`limit` paginate. |
 | `search` | `fn search<'a>(&self, scope: impl Into<Scope<'a>>, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>` | Ranked search over a scope using the store's distance metric. |
+| `text_search` | `fn text_search<'a>(&self, scope: impl Into<Scope<'a>>, query: &FtsQuery, opts: &SearchOpts) -> Result<Vec<Hit>>` | [BM25 full-text search](/guides/search/#full-text-search-bm25); `min_score` is a raw BM25 floor. |
+| `hybrid_search` | `fn hybrid_search<'a>(&self, scope: impl Into<Scope<'a>>, vector: &[f32], text: &FtsQuery, opts: &HybridOpts) -> Result<Vec<Hit>>` | [Hybrid vector + BM25](/guides/search/#hybrid-search-rrf), fused with Reciprocal Rank Fusion. |
 | `flush` | `fn flush(&mut self) -> Result<()>` | Force an fsync (relevant under `Fsync::OnFlush`). |
 | `compact` | `fn compact(&mut self) -> Result<()>` | Rewrite `data` to reclaim dead rows. |
 | `persist_index` | `fn persist_index(&mut self) -> Result<()>` | Write the [ANN index](#annconfig--annkind) to its `ann` cache so the next `open()` loads it instead of rebuilding the graph. Out-of-band (never on `upsert`/`flush`); no-op when ANN is off, in-memory, or read-only. `compact()` refreshes it too. |
@@ -78,11 +82,16 @@ embedding space.
 
 ```rust
 pub struct Record {
-    pub id: String,               // caller-supplied; the upsert key
-    pub vector: Vec<f32>,         // length must equal the store dimension
+    pub id: String,                  // caller-supplied; the upsert key
+    pub vector: Option<Vec<f32>>,    // Some: length must equal the dimension; None: text-only
     pub attrs: BTreeMap<String, Value>,
 }
 ```
+
+Construct with `Record::new(id, vector, attrs)` for a vector-bearing document, or
+`Record::text_only(id, attrs)` for a document with no embedding (indexed purely by
+[full-text search](/guides/search/#full-text-search-bm25)). Over the wire / in backups
+the `vector` field may be omitted, which deserializes to `None`.
 
 ## `Value`
 
@@ -152,7 +161,40 @@ pub struct SearchOpts {
 ```
 
 Implements `Default` — `SearchOpts { top_k: 5, ..Default::default() }` is the
-idiomatic call.
+idiomatic call. Reused by `text_search`, where `min_score` is a raw BM25 floor.
+
+## `FtsQuery` & `Language`
+
+A [full-text query](/guides/search/#full-text-search-bm25): the indexed field and the
+raw query text (analyzed at query time the same way documents were at index time).
+
+```rust
+pub struct FtsQuery {
+    pub field: String,  // a full-text-indexed attribute field
+    pub text: String,   // raw query text
+}
+
+pub enum Language { English }  // the analyzer; extensible (US English today)
+```
+
+Construct with `FtsQuery::new(field, text)`.
+
+## `HybridOpts`
+
+Options for [hybrid search](/guides/search/#hybrid-search-rrf) (vector + BM25, fused
+with Reciprocal Rank Fusion).
+
+```rust
+pub struct HybridOpts {
+    pub top_k: usize,      // final result count
+    pub filter: Filter,    // applied to both legs
+    pub rrf_k: f32,        // RRF rank-bias constant (default 60)
+    pub candidates: usize, // depth pulled per leg before fusing (default 100)
+}
+```
+
+Implements `Default` (`top_k: 10`). There is no `min_score` — a fused RRF score has no
+absolute scale.
 
 ## `Hit`
 
