@@ -93,25 +93,32 @@ the reverse. `cargo binstall nidus` fetches prebuilt binaries via
 `[package.metadata.binstall]`; `cargo install nidus --features cli` builds from
 source.
 
-### Pure-Rust dependencies only, zero FFI — enforced
+### The dependency bar is BUILD-AND-SHIP SPEED, not zero-C — enforced
 
-nidus may depend on **popular pure-Rust crates** (`anyhow`, `serde`/`bincode`,
-`crc32fast`, …), but **never a crate that compiles C or links a native library**
-(no `*-sys`, no bundled C/C++), and our own code carries `#![forbid(unsafe_code)]`.
-These are not stylistic preferences; they are the product. Pulling in a C-compiling
-crate or adding an `unsafe` block to our code is a design change, not an
-implementation detail — raise it as an issue first. `just deps` should stay short
-and every crate in it pure Rust. This is the entire reason nidus exists instead of
-DuckDB (bundled C++, multi-minute builds, FFI) or LanceDB (Arrow + DataFusion,
-~10-minute builds).
+The real constraint is **build-and-ship cost** (fast compiles, no heavy toolchain,
+no binary bloat), not language purity (SPEC §1, §13.6). nidus's core is **popular
+pure-Rust crates** (`anyhow`, `serde`/`bincode`, `crc32fast`, …); the S3/GCS
+persistence backends add sans-IO clients (`rusty-s3`/`tame-gcs`) over `ureq`, whose
+default TLS is rustls + **`ring`** — a *small* C+asm compile. `ring` is **allowed**
+(in the default build, not feature-gated, so `file://`→`s3://` is a runtime switch).
+Our own code still carries `#![forbid(unsafe_code)]`.
+
+**FORBIDDEN — the multi-minute C trees nidus exists to avoid:** bundled C/C++
+(DuckDB's `libduckdb-sys`), vendored OpenSSL, `aws-lc-sys`, or a transitively-huge
+graph (Arrow + DataFusion). The guardrail is empirical: **the whole-crate clean build
+stays well under a minute** (measured ~7s; CI asserts it). Adding a dependency that
+blows that budget — or a bundled-C / native-linking crate — is a design change, not
+an implementation detail: raise it as an issue first. Judge a dep by "does it blow up
+compile time / require a heavy toolchain / bloat the binary," not "is it pure Rust."
 
 ### Miri (Undefined Behavior Checker)
 
 `just miri` runs the test suite under [Miri](https://github.com/rust-lang/miri/).
-Because nidus is pure safe Rust with **no FFI**, the *entire* crate compiles and
-runs under Miri — unlike a C-backed store, where Miri can't execute the FFI and
-the backend must be feature-gated out. Miri runs with `-Zmiri-disable-isolation`
-so file-backed tests can touch a temp dir.
+**All of nidus's own logic** runs under Miri — the codecs, search kernels, filters,
+and the local file IO. Only the network paths in the S3/GCS backends are outside its
+reach (and their unit tests — presigned-URL/request construction — are pure and DO run
+under Miri; the localhost-mock round-trips are `#[cfg_attr(miri, ignore)]`). Miri runs
+with `-Zmiri-disable-isolation` so file-backed tests can touch a temp dir.
 
 **When to add `#[cfg_attr(miri, ignore)]`** to a test:
 - It calls `File::sync_all`/`sync_data` (fsync) or other filesystem syscalls Miri
@@ -188,8 +195,10 @@ each.
 
 ## Conventions & Patterns
 
-- **Pure safe Rust**: `#![forbid(unsafe_code)]`; popular pure-Rust crates only,
-  never a C-compiling / native-linking crate. Non-negotiable.
+- **Safe Rust, fast builds**: `#![forbid(unsafe_code)]` in our code; deps judged by
+  build-and-ship cost, not purity (`ring`'s small TLS compile is allowed for the
+  S3/GCS backends; multi-minute C/C++ trees are not — see above). Non-negotiable: the
+  whole-crate clean build stays well under a minute.
 - **Sync API**: nidus is synchronous (CPU + blocking file IO). Async callers wrap
   it in `Arc<Mutex<Nidus>>` + `spawn_blocking` (the same pattern used to wrap a
   blocking embedded DB connection).

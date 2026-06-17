@@ -14,13 +14,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::ann::Ann;
+use crate::backend::{BackendLock, LocalFs, Persistence};
 use crate::config::{Config, OpenMode};
 use crate::data::DataSegment;
 use crate::fts::Fts;
-use crate::lock::WriteLock;
 use crate::log::OpLog;
 use crate::model::{Distance, Op};
 
@@ -79,10 +79,14 @@ pub struct Store {
     config: Config,
     data: DataSegment,
     log: OpLog,
-    /// Held for its `Drop` effect (removes the lock file on close). `ReadOnly` stores
+    /// The persistence backend the store's objects (`data`/`log`/`ann`/`fts`/`lock`)
+    /// live on — a [`LocalFs`] for a file-backed store. `None` for an in-memory store
+    /// (no durable backing; the cache/lock paths short-circuit).
+    persistence: Option<Box<dyn Persistence>>,
+    /// Held for its `Drop` effect (releases the writer lock on close). `ReadOnly` stores
     /// and in-memory stores hold `None`.
     #[allow(dead_code)]
-    lock: Option<WriteLock>,
+    lock: Option<Box<dyn BackendLock>>,
     collections: HashMap<String, Collection>,
     /// Rows no longer referenced (deleted or overwritten), for compaction tracking.
     dead_rows: usize,
@@ -131,25 +135,36 @@ impl Store {
     /// that reference rows beyond the data file — the lock-free reader rule, §6.2),
     /// and auto-compact if the dead-row ratio exceeds `config.auto_compact`.
     pub fn open(config: Config) -> Result<Store> {
-        // 1. Create the store directory if needed.
-        std::fs::create_dir_all(&config.path).map_err(|e| {
-            anyhow::anyhow!("failed to create store directory {:?}: {}", config.path, e)
-        })?;
+        // 1. Open the persistence backend rooted at the store directory (created if
+        //    absent). Local today; the same code drives an object store once one exists.
+        let persistence: Box<dyn Persistence> = Box::new(LocalFs::new(&config.path)?);
 
-        // 2. Acquire the writer lock (ReadWrite only).
+        // 2. Acquire the writer lock (ReadWrite only). `try_lock` reports contention as
+        //    `Ok(None)`, which we surface as a clear "store is locked" error.
         let lock = if config.open_mode == OpenMode::ReadWrite {
-            Some(WriteLock::acquire(&config.path, config.lock_ttl)?)
+            match persistence.try_lock("lock", config.lock_ttl)? {
+                Some(l) => Some(l),
+                None => bail!(
+                    "store is locked by another writer (e.g. a running `nidus serve`): {} \
+                     — stop that process, or send writes through it instead of opening \
+                     the store a second time",
+                    config.path.join("lock").display()
+                ),
+            }
         } else {
             None
         };
 
-        // 3. Open the data segment. First refuse — before allocating — to load a
-        //    data file whose vectors already exceed the configured cap, turning a
-        //    would-be allocation abort into a clear error.
-        let data_path = config.path.join("data");
+        // 3. Open the data segment through the backend's native appender. First refuse —
+        //    before allocating — to load a data file whose vectors already exceed the
+        //    configured cap, turning a would-be allocation abort into a clear error.
+        let data_ap = persistence
+            .appender("data")?
+            .context("persistence backend does not provide a native data segment")?;
         if let Some(cap) = config.max_vector_bytes {
-            let on_disk = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
-            let vector_bytes = on_disk.saturating_sub(crate::data::HEADER_LEN as u64);
+            let vector_bytes = data_ap
+                .len()?
+                .saturating_sub(crate::data::HEADER_LEN as u64);
             if vector_bytes > cap {
                 bail!(
                     "data file holds {vector_bytes} bytes of vectors, exceeding \
@@ -157,10 +172,13 @@ impl Store {
                 );
             }
         }
-        let data = DataSegment::open(&data_path, config.dimension, config.distance)?;
+        let data = DataSegment::open_with(data_ap, config.dimension, config.distance)?;
 
-        // 4. Open and replay the op log.
-        let (log, ops) = OpLog::open(&config.path.join("log"))?;
+        // 4. Open and replay the op log through the backend's appender.
+        let log_ap = persistence
+            .appender("log")?
+            .context("persistence backend does not provide a native op log")?;
+        let (log, ops) = OpLog::open_with(log_ap)?;
 
         let row_count = data.row_count();
 
@@ -259,6 +277,7 @@ impl Store {
             config,
             data,
             log,
+            persistence: Some(persistence),
             lock,
             collections,
             dead_rows,
@@ -333,6 +352,7 @@ impl Store {
         Ok(Store {
             data: DataSegment::in_memory_with(config.dimension, config.distance),
             log: OpLog::in_memory(),
+            persistence: None,
             lock: None,
             collections: HashMap::new(),
             dead_rows: 0,
@@ -399,13 +419,21 @@ impl Store {
         if self.ann.is_none() {
             return Ok(());
         }
-        let path = self.config.path.join("ann");
         let dim = self.data.dimension();
         let distance = self.config.distance;
         let total = self.data.row_count();
-
         let quant = self.config.quantization.map(|q| q.kind);
-        match crate::ann::load_index(&path, dim, distance, &cfg, quant)? {
+
+        // Load the cache in its own scope so the immutable borrow of `persistence` ends
+        // before we mutate `self` below. No backend (in-memory) → rebuild from vectors.
+        let loaded = {
+            let Some(p) = self.persistence.as_deref() else {
+                self.rebuild_ann();
+                return Ok(());
+            };
+            crate::ann::load_index(p, dim, distance, &cfg, quant)?
+        };
+        match loaded {
             // Valid cache that doesn't claim more rows than the data file holds (a
             // larger `covered` would mean dangling node→row refs — treat as stale).
             Some((ann, covered)) if covered <= total => {
@@ -456,9 +484,11 @@ impl Store {
         let Some(ann) = self.ann.as_ref() else {
             return Ok(());
         };
-        let path = self.config.path.join("ann");
+        let Some(p) = self.persistence.as_deref() else {
+            return Ok(());
+        };
         crate::ann::save_index(
-            &path,
+            p,
             ann,
             self.data.row_count(),
             self.data.dimension(),
@@ -479,9 +509,11 @@ impl Store {
         if !self.fts.is_active() || !self.fts_dirty {
             return Ok(());
         }
-        let path = self.config.path.join("fts");
         let watermark = self.log.offset()?;
-        crate::index_cache::save(&path, &self.fts.cache_key(), watermark, &self.fts)?;
+        let Some(p) = self.persistence.as_deref() else {
+            return Ok(());
+        };
+        crate::index_cache::save(p, "fts", &self.fts.cache_key(), watermark, &self.fts)?;
         self.fts_dirty = false;
         Ok(())
     }
@@ -494,10 +526,16 @@ impl Store {
         if !self.fts.is_active() {
             return Ok(());
         }
-        let path = self.config.path.join("fts");
         let key = self.fts.cache_key();
         let current = self.log.offset()?;
-        if let Some((cached, watermark)) = crate::index_cache::load::<Fts>(&path, &key)?
+        let loaded = {
+            let Some(p) = self.persistence.as_deref() else {
+                self.rebuild_fts();
+                return Ok(());
+            };
+            crate::index_cache::load::<Fts>(p, "fts", &key)?
+        };
+        if let Some((cached, watermark)) = loaded
             && watermark == current
         {
             // The cache reflects the store exactly as it stands.

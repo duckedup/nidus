@@ -1,12 +1,9 @@
 //! The `data` file: an append-only, fixed-stride, row-major `f32` matrix loaded
 //! into RAM. Contract: see the root `SPEC.md` §5.1, §5.3, §6 (incl. §6.6).
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::backend::Appender;
 use crate::model::Distance;
 
 // ── Header constants ──────────────────────────────────────────────────────────
@@ -19,26 +16,20 @@ const VERSION: u16 = 1;
 pub(crate) const HEADER_LEN: usize = 64;
 
 /// The vector segment. Holds every row in memory; appends go to the tail of the
-/// backing file and are mirrored in `vectors`. Implementers may add fields (a file
-/// handle, etc.) but must keep the method signatures below.
+/// backing [`Appender`] (a local file, or RAM for an in-memory store) and are mirrored
+/// in `vectors`.
 pub struct DataSegment {
     dimension: usize,
     distance: Distance,
     vectors: Vec<f32>,
-    /// `None` when the segment is in-memory only (no backing file).
-    file: Option<FileState>,
+    /// `None` when the segment is in-memory only (no durable backing). `Some` wraps the
+    /// persistence backend's append handle — a `FileAppender` for a local store.
+    appender: Option<Box<dyn Appender>>,
     /// Test-only fault seam: when `Some(n)`, the next `n` appends succeed and the
     /// one after fails — lets tests exercise mid-batch rollback deterministically
     /// (real ENOSPC is not reproducible in a unit test).
     #[cfg(test)]
     fail_after: Option<usize>,
-}
-
-struct FileState {
-    /// Path to the data file (needed for `rewrite`).
-    path: PathBuf,
-    /// Open file handle (append position maintained via seek on rewrite).
-    handle: File,
 }
 
 // ── Header encode / decode ────────────────────────────────────────────────────
@@ -99,7 +90,10 @@ fn decode_header(buf: &[u8; HEADER_LEN]) -> Result<(usize, Distance)> {
 /// yet (the file is absent or holds no header), so a caller can require an
 /// explicit dimension only at creation time. Reads just the 64-byte header.
 #[cfg(feature = "cli")]
-pub(crate) fn peek_header(path: &Path) -> Result<Option<(usize, Distance)>> {
+pub(crate) fn peek_header(path: &std::path::Path) -> Result<Option<(usize, Distance)>> {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -130,6 +124,24 @@ pub(crate) fn peek_header(path: &Path) -> Result<Option<(usize, Distance)>> {
     let header = decode_header(&header_buf)
         .with_context(|| format!("invalid header in {}", path.display()))?;
     Ok(Some(header))
+}
+
+/// Decode the pinned `(dimension, distance)` from the leading bytes of a `data`
+/// object (the first [`HEADER_LEN`] bytes) — the in-memory counterpart to
+/// [`peek_header`] for callers that already hold the object (e.g. snapshot/backup
+/// reading `data` via the persistence backend).
+#[cfg(feature = "cli")]
+pub(crate) fn header_from_bytes(bytes: &[u8]) -> Result<(usize, Distance)> {
+    if bytes.len() < HEADER_LEN {
+        bail!(
+            "data is truncated: {} bytes (need at least {} for header)",
+            bytes.len(),
+            HEADER_LEN
+        );
+    }
+    let mut header_buf = [0u8; HEADER_LEN];
+    header_buf.copy_from_slice(&bytes[..HEADER_LEN]);
+    decode_header(&header_buf)
 }
 
 // ── f32 vector I/O ────────────────────────────────────────────────────────────
@@ -164,50 +176,57 @@ fn bytes_to_floats(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
 }
 
 impl DataSegment {
-    /// Open or create `path` (the `data` file). Verifies/writes the 64-byte header
-    /// (magic + version + dimension + distance), then reads every fully-written row
-    /// into RAM. Errors on magic mismatch, truncated header, or a dimension/distance
-    /// that differs from the requested values.
-    pub fn open(path: &Path, dimension: usize, distance: Distance) -> Result<DataSegment> {
-        // Open or create the file with read+write access.
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
+    /// Open or create the `data` file at `path` (convenience over
+    /// [`open_with`](Self::open_with): wraps a local `FileAppender`). The store path
+    /// goes through the persistence backend's appender via `open_with`; this direct
+    /// path-based form backs the segment's own file tests.
+    #[cfg(test)]
+    pub fn open(
+        path: &std::path::Path,
+        dimension: usize,
+        distance: Distance,
+    ) -> Result<DataSegment> {
+        let appender = crate::backend::FileAppender::open(path)
             .with_context(|| format!("failed to open data file at {}", path.display()))?;
+        Self::open_with(Box::new(appender), dimension, distance)
+    }
 
-        let file_len = file
-            .seek(SeekFrom::End(0))
-            .context("failed to seek data file")?;
-        file.seek(SeekFrom::Start(0))
-            .context("failed to rewind data file")?;
+    /// Open the segment over an already-opened persistence [`Appender`]. Verifies/writes
+    /// the 64-byte header (magic + version + dimension + distance), then reads every
+    /// fully-written row into RAM. Errors on magic mismatch, truncated header, or a
+    /// dimension/distance that differs from the requested values.
+    pub fn open_with(
+        mut appender: Box<dyn Appender>,
+        dimension: usize,
+        distance: Distance,
+    ) -> Result<DataSegment> {
+        let file_len = appender.len().context("failed to size data segment")?;
 
         let vectors: Vec<f32>;
 
         if file_len == 0 {
-            // New file — write the header.
+            // New segment — write the header (durable on the next `sync`). The append
+            // point is now byte 64.
             let header = encode_header(dimension, distance);
-            file.write_all(&header)
+            appender
+                .append(&header)
                 .context("failed to write data file header")?;
             vectors = Vec::new();
-            // File position is now at byte 64 (end of header == append point).
         } else {
-            // Existing file — read and verify the header.
+            // Existing segment — read and verify the header.
             if file_len < HEADER_LEN as u64 {
                 bail!(
-                    "data file at {} is truncated: {} bytes (need at least {} for header)",
-                    path.display(),
+                    "data file is truncated: {} bytes (need at least {} for header)",
                     file_len,
                     HEADER_LEN
                 );
             }
             let mut header_buf = [0u8; HEADER_LEN];
-            file.read_exact(&mut header_buf)
+            appender
+                .read_exact_at(0, &mut header_buf)
                 .context("failed to read data file header")?;
-            let (stored_dim, stored_distance) = decode_header(&header_buf)
-                .with_context(|| format!("invalid header in {}", path.display()))?;
+            let (stored_dim, stored_distance) =
+                decode_header(&header_buf).context("invalid data file header")?;
             if stored_dim != dimension {
                 bail!(
                     "data file dimension mismatch: file has dimension {}, requested {}",
@@ -234,8 +253,9 @@ impl DataSegment {
             // Read exactly the whole rows. Stream into a single pre-reserved
             // `Vec<f32>`, converting LE bytes in bounded chunks — this both makes
             // the load fallible (try_reserve → Err instead of an allocator abort)
-            // and avoids the old raw-bytes + decoded-floats double allocation (~2×
-            // transient peak at open time).
+            // and avoids a raw-bytes + decoded-floats double allocation (~2×
+            // transient peak at open time). `read_exact_at` keeps this streaming over
+            // any backend, never materializing the whole object.
             let total_floats = (row_count as usize) * dimension;
             vectors = if total_floats == 0 {
                 Vec::new()
@@ -248,41 +268,38 @@ impl DataSegment {
                         whole_data_bytes
                     )
                 })?;
+                let mut offset = HEADER_LEN as u64;
                 let mut remaining = whole_data_bytes as usize;
                 let mut buf = [0u8; 8192]; // multiple of 4 (f32 width)
                 while remaining > 0 {
                     let take = remaining.min(buf.len());
-                    file.read_exact(&mut buf[..take])
+                    appender
+                        .read_exact_at(offset, &mut buf[..take])
                         .context("failed to read data file rows")?;
                     for chunk in buf[..take].chunks_exact(4) {
                         v.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
                     }
+                    offset += take as u64;
                     remaining -= take;
                 }
                 v
             };
 
-            // Seek (and effectively truncate) to the end of the last whole row,
-            // discarding any partial tail so future appends are aligned.
+            // Truncate to the end of the last whole row, discarding any partial tail so
+            // future appends stay aligned.
             let good_end = HEADER_LEN as u64 + whole_data_bytes;
             if file_len > good_end {
-                // Truncate partial tail.
-                file.set_len(good_end)
+                appender
+                    .truncate_to(good_end)
                     .context("failed to truncate partial tail from data file")?;
             }
-            // Position the file cursor at the write end.
-            file.seek(SeekFrom::End(0))
-                .context("failed to seek to end of data file")?;
         }
 
         Ok(DataSegment {
             dimension,
             distance,
             vectors,
-            file: Some(FileState {
-                path: path.to_path_buf(),
-                handle: file,
-            }),
+            appender: Some(appender),
             #[cfg(test)]
             fail_after: None,
         })
@@ -300,7 +317,7 @@ impl DataSegment {
             dimension,
             distance,
             vectors: Vec::new(),
-            file: None,
+            appender: None,
             #[cfg(test)]
             fail_after: None,
         }
@@ -365,21 +382,13 @@ impl DataSegment {
             )
         })?;
 
-        // Write to file first (if backed), then mirror into RAM.
-        if let Some(ref mut fs) = self.file {
+        // Write to the backing appender first (if backed), then mirror into RAM. The
+        // appender rolls a partial write back to the boundary it started at, so a torn
+        // row never persists; we only extend RAM after the write commits.
+        if let Some(ap) = self.appender.as_mut() {
             let bytes = floats_to_bytes(vector);
-            let start = fs
-                .handle
-                .stream_position()
-                .context("failed to read data file position before append")?;
-            if let Err(e) = fs.handle.write_all(&bytes) {
-                // Roll back any partial bytes to the row boundary (best-effort —
-                // the row never landed, so leave the file aligned for the next try).
-                let _ = fs.handle.set_len(start);
-                let _ = fs.handle.seek(SeekFrom::Start(start));
-                return Err(anyhow::Error::new(e))
-                    .with_context(|| format!("failed to append row {row_index} to data file"));
-            }
+            ap.append(&bytes)
+                .with_context(|| format!("failed to append row {row_index} to data file"))?;
         }
 
         // Infallible — capacity reserved above.
@@ -400,14 +409,10 @@ impl DataSegment {
                 self.row_count()
             );
         }
-        if let Some(ref mut fs) = self.file {
+        if let Some(ap) = self.appender.as_mut() {
             let good_end = HEADER_LEN as u64 + rows * (self.dimension as u64) * 4;
-            fs.handle
-                .set_len(good_end)
+            ap.truncate_to(good_end)
                 .context("failed to truncate data file")?;
-            fs.handle
-                .seek(SeekFrom::Start(good_end))
-                .context("failed to seek after data truncate")?;
         }
         self.vectors.truncate(keep_floats);
         Ok(())
@@ -419,16 +424,18 @@ impl DataSegment {
         self.fail_after = Some(n);
     }
 
-    /// fsync the backing file (no-op for in-memory).
+    /// fsync the backing appender (no-op for in-memory).
     pub fn sync(&mut self) -> Result<()> {
-        if let Some(ref mut fs) = self.file {
-            fs.handle.sync_all().context("failed to fsync data file")?;
+        if let Some(ap) = self.appender.as_mut() {
+            ap.sync().context("failed to fsync data file")?;
         }
         Ok(())
     }
 
-    /// Atomically rewrite the backing file to contain exactly `rows` (compaction),
-    /// then swap in-RAM state. `rows.len()` must be a multiple of `dimension`.
+    /// Atomically rewrite the backing segment to contain exactly `rows` (compaction),
+    /// then swap in-RAM state. `rows.len()` must be a multiple of `dimension`. The
+    /// appender's `rewrite` handles the atomic temp + fsync + rename (or, in-memory,
+    /// the buffer swap).
     pub fn rewrite(&mut self, rows: &[f32]) -> Result<()> {
         let dim = self.dimension;
         if dim > 0 && !rows.len().is_multiple_of(dim) {
@@ -439,77 +446,13 @@ impl DataSegment {
             );
         }
 
-        match self.file {
-            None => {
-                // In-memory only: just swap the RAM buffer.
-                self.vectors = try_clone_floats(rows)?;
-                return Ok(());
+        if let Some(ap) = self.appender.as_mut() {
+            let mut buf = Vec::with_capacity(HEADER_LEN + rows.len() * 4);
+            buf.extend_from_slice(&encode_header(dim, self.distance));
+            if !rows.is_empty() {
+                buf.extend_from_slice(&floats_to_bytes(rows));
             }
-            Some(ref fs) => {
-                let data_path = fs.path.clone();
-
-                // Determine the sibling temp file path (same directory for atomic rename).
-                let dir = data_path
-                    .parent()
-                    .context("data file path has no parent directory")?;
-                let tmp_path = dir.join("data.tmp");
-
-                // Write header + rows to the temp file.
-                {
-                    let mut tmp = OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(&tmp_path)
-                        .with_context(|| {
-                            format!("failed to create temp file at {}", tmp_path.display())
-                        })?;
-
-                    let header = encode_header(dim, self.distance);
-                    tmp.write_all(&header)
-                        .context("failed to write header to temp data file")?;
-
-                    if !rows.is_empty() {
-                        let bytes = floats_to_bytes(rows);
-                        tmp.write_all(&bytes)
-                            .context("failed to write rows to temp data file")?;
-                    }
-
-                    tmp.sync_all().context("failed to fsync temp data file")?;
-                    // `tmp` is dropped (and closed) here.
-                }
-
-                // Atomic rename over the original data file.
-                std::fs::rename(&tmp_path, &data_path).with_context(|| {
-                    format!(
-                        "failed to rename {} to {}",
-                        tmp_path.display(),
-                        data_path.display()
-                    )
-                })?;
-
-                // Reopen the file for appending.
-                let mut new_handle = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&data_path)
-                    .with_context(|| {
-                        format!(
-                            "failed to reopen data file after rewrite at {}",
-                            data_path.display()
-                        )
-                    })?;
-
-                new_handle
-                    .seek(SeekFrom::End(0))
-                    .context("failed to seek to end of data file after rewrite")?;
-
-                // Update the FileState handle.
-                self.file = Some(FileState {
-                    path: data_path,
-                    handle: new_handle,
-                });
-            }
+            ap.rewrite(&buf).context("failed to rewrite data file")?;
         }
 
         // Swap in-RAM buffer.
@@ -533,6 +476,9 @@ fn try_clone_floats(rows: &[f32]) -> Result<Vec<f32>> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
     use super::*;
 
     // ── Pure helpers (Miri-clean) ─────────────────────────────────────────

@@ -3,8 +3,8 @@
 A small, pure-Rust **vector store for development and small-scale use**.
 Nearest-neighbour search — cosine, dot, or Euclidean — over a single append-only
 directory, exact by default or approximate (HNSW/IVF) when you opt in, with typed
-metadata filters and many logical collections sharing one embedding space. No FFI,
-no C, no SQL, no query engine.
+metadata filters and many logical collections sharing one embedding space. No SQL,
+no query engine, and a build measured in seconds, not minutes.
 
 > _nidus_ (Latin, "nest") — a small place where things are kept safe.
 
@@ -27,17 +27,26 @@ more, so it **compiles in seconds** and embeds as a normal Rust dependency.
 
 ### The constraints are the product
 
-- **Pure-Rust dependencies only** — never a crate that compiles C or links a native
-  library (no `*-sys`, no bundled C/C++).
-- **Zero FFI, zero `unsafe`** in our code (`#![forbid(unsafe_code)]`).
-- **No C to compile** — `cargo build` is just rustc.
-- **Fully Miri-checkable** — including the file IO.
+The bar is **build-and-ship speed**, not zero-C absolutism. The enemy is the
+*multi-minute* C/C++ tree (DuckDB) or hundred-crate graph (LanceDB) — not a small,
+fast dependency.
+
+- **Builds in seconds** — the whole crate, with every backend, compiles in seconds
+  (CI asserts well under a minute). The only native code is `ring` (the TLS used by
+  the optional S3/GCS backends — a small C+asm compile); never a bundled C++ tree,
+  vendored OpenSSL, or `aws-lc`.
+- **Zero `unsafe` in our code** (`#![forbid(unsafe_code)]`).
+- **Pure-Rust core** — the local store and search path are pure Rust with no native
+  library; the cloud backends are sans-IO clients (`rusty-s3`/`tame-gcs`) over a small
+  blocking HTTP client.
+- **Miri-checkable** — all of nidus's own logic, including the local file IO, runs
+  under Miri (only the network TLS paths are excluded).
 
 ## Quick start
 
 ```toml
 [dependencies]
-nidus = "0.14"
+nidus = "0.15"
 ```
 
 ```rust
@@ -158,7 +167,7 @@ better.
 | dim=768 | 100 | **8.57 ms** | 53.16 ms | 64.99 ms | 100% |
 
 All three are exact (recall 100%); nidus is the fastest in every cell while being the
-one that compiles in seconds with zero FFI. The kernel is plain safe Rust — an
+one that compiles in seconds. The kernel is plain safe Rust — an
 8-lane chunked dot the optimizer can vectorize, an allocation-free top-k scan, and a
 storage-order (prefetcher-friendly) sweep of the matrix. Reproduce with
 `just bench all` (see [`benchmarks/`](benchmarks/); the heavy DuckDB/LanceDB deps are
@@ -200,17 +209,18 @@ defaults, env vars, or hidden directories.
 ```bash
 just test    # all tests (pure library)
 just ci       # fmt-check + clippy (-D warnings) + test (pure library)
-just miri     # undefined-behavior check (nightly; pure-Rust ⇒ runs end to end)
+just miri     # undefined-behavior check (nightly; all of nidus's own logic runs)
 just demo     # the end-to-end example
-just deps     # the dependency tree (stays short, all pure Rust)
+just deps     # the dependency tree (stays short)
 
 just ci-cli   # the same gate for the opt-in `cli` feature (binary + server)
 just serve ./store 768   # run `nidus serve` from the checkout
 ```
 
-The core recipes touch only the pure library, keeping its FFI-free, seconds-long
-build path intact; the `cli` feature (which pulls clap + the tokio/axum stack, all
-pure Rust) has its own opt-in recipes.
+The core recipes keep the seconds-long build path intact; the `cli` feature (which
+pulls clap + the tokio/axum stack) has its own opt-in recipes. Miri runs all of
+nidus's own logic, including the local file IO — only the network TLS paths in the
+S3/GCS backends are outside its reach.
 
 Rust 1.96+ (pinned via `rust-toolchain.toml`), edition 2024.
 

@@ -731,7 +731,16 @@ a `Config` (§4.1) and calls `Nidus::open(config)`. A search-only process opens 
 
 §5 describes one configuration: a local directory, with vectors held in local process
 RAM. This section generalizes that along **two independent axes**, behind two small sync
-traits. It is **designed-for, not built** (the seam in §9).
+traits. The **trait surface, the local backends, and the live store's wiring onto them
+are built** (`src/backend/`: `Persistence` + `Appender` + `BackendLock` and `MemoryTier`,
+with `LocalFs` and `LocalRam`, selected by URL scheme — nidus-870.2 Phase 1; the store's
+`data`/`log` segments run over `Persistence::appender` and its `ann`/`fts` caches over
+`get`/`put`/`try_lock` — nidus-vnu); snapshot/backup is routed through `Persistence`
+too, so `nidus backup --out <loc>` writes the archive object to any backend (§13.7).
+The **S3 and GCS persistence backends are built** (`src/backend/s3.rs`,
+`src/backend/gcs.rs`: whole-object get/put/delete/list over sans-IO `rusty-s3` /
+`tame-gcs`+`tame-oauth` + `ureq`, selected by `s3://…` / `gs://…` — nidus-870.4). The
+Redis/Valkey/Memcached memory tier remains **designed-for, not built** (the seam in §9).
 
 - **Persistence** — where the durable *source-of-truth* bytes (`data`/`log`) live:
   **local files** (default), **S3**, or **GCS**. Optimized for durability and cost.
@@ -927,6 +936,10 @@ minute — CI asserts it (§9, the build-time gate).**
 - **Live backing store.** A store's `data`/`log` (and optionally caches) live on the
   persistence backend; writes durably round-trip per §13.5. Best for low-write-rate / dev /
   small-scale use (nidus's positioning).
-- **Snapshot / backup.** PUT/GET the whole store as one archive (the existing `cli`-feature
+- **Snapshot / backup (built).** PUT/GET the whole store as one archive (the `cli`-feature
   `tar.gz`). This is *exactly* object-granular, so every persistence backend does it
-  trivially and the live local path is untouched — the simplest first increment.
+  trivially. `nidus backup --out <loc>` reads the source store's `data`/`log` objects via
+  its backend and PUTs the archive to the destination backend named by `<loc>` (a local
+  path / `file://` today, `s3://` once that backend lands); `nidus restore --in <loc>` GETs
+  it and PUTs the objects into the target store. The capture order (`data` then `log`) plus
+  the lock-free reader rule (§6.2) keep a hot snapshot consistent without a writer lock.

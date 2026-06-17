@@ -18,13 +18,14 @@ toolchain required — and stand up a working local store in four commands. See
 ```toml
 # Cargo.toml
 [dependencies]
-nidus = "0.14"
+nidus = "0.15"
 anyhow = "1"     # nidus returns anyhow::Result
 ```
 
-nidus requires **Rust 1.96+** (edition 2024). It pulls in only popular pure-Rust
-crates — there is no C to compile and no native library to link, so the build is
-seconds, not minutes.
+nidus requires **Rust 1.96+** (edition 2024). It pulls in only popular, mostly
+pure-Rust crates — the local store and search path are pure Rust, and the bundled
+S3/GCS backends add only a small TLS compile (`ring`), never a bundled C++ tree — so
+the whole build is seconds, not minutes.
 
 ## Open a store
 

@@ -1,20 +1,23 @@
-//! `nidus backup` / `nidus restore`: snapshot a store directory into a single
-//! pure-Rust `.tar.gz`, and extract one back.
+//! `nidus backup` / `nidus restore`: snapshot a store into a single pure-Rust
+//! `.tar.gz` **object**, and extract one back. The archive's destination/source is a
+//! [`Persistence`](crate::backend::Persistence) location, so a snapshot is just one
+//! named object on any backend — a local file (`./snap.tar.gz`, `file:///b/snap.tar.gz`)
+//! today, an object store (`s3://…`) once one lands (SPEC §13.7). It is *exactly*
+//! object-granular, which is why every backend does it trivially.
 //!
-//! A store is a directory holding `data` (append-only flat `f32` matrix) and
-//! `log` (the commit record); `lock` is per-process writer exclusion and the
-//! `.tmp` files are transient compaction scratch — neither belongs in a backup.
+//! A store is a directory of named objects; `data` (the flat `f32` matrix) and `log`
+//! (the commit record) are the durable source of truth. `lock` is per-process writer
+//! exclusion and the derived caches (`ann`/`fts`) are rebuildable — none belong in a
+//! backup. We read `data` then `log` from the source backend.
 //!
-//! **Why a hot backup is consistent (no writer lock needed).** The writer
-//! fsyncs `data` *before* appending committing records to `log`, and every
-//! reader ignores log records that reference a row beyond the data file's size
-//! (`row ≥ data_len / dim`). So a snapshot that captures `data` first — at a
-//! fixed size — and `log` second sees exactly what a lock-free reader would:
-//! possibly a hair stale, never torn. We therefore copy `data` then `log`, each
-//! at the length observed when we start streaming it.
+//! **Why a hot backup is consistent (no writer lock needed).** The writer fsyncs
+//! `data` *before* appending committing records to `log`, and every reader ignores log
+//! records that reference a row beyond the data object's size (`row ≥ data_len / dim`).
+//! So capturing `data` first and `log` second sees exactly what a lock-free reader
+//! would: a log record for a row not yet in the captured `data` is simply ignored on
+//! restore-open — possibly a hair stale, never torn.
 
-use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,11 +27,10 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::Serialize;
 
+use crate::backend::{LocalFs, Persistence, open_object_location};
 use crate::{Config, Nidus, OpenMode};
 
-/// Files that make up the durable, portable state of a store. Order matters:
-/// `data` is captured before `log` so the snapshot is a consistent lock-free
-/// view (see the module docs).
+/// Source-of-truth objects that make up the durable, portable state of a store.
 const ARCHIVED: [&str; 2] = ["data", "log"];
 /// Embedded manifest entry name (informational; restore tolerates its absence).
 const MANIFEST: &str = "nidus-backup.json";
@@ -69,64 +71,71 @@ struct Manifest {
     log_bytes: u64,
 }
 
-/// Snapshot the store at `dir` into a gzip-compressed tar at `out`.
-pub fn backup(dir: &Path, out: &Path) -> Result<BackupReport> {
-    let data_path = dir.join("data");
-    if !data_path.exists() {
-        bail!("no nidus store at {} (no `data` file)", dir.display());
-    }
-    // Read dim/distance for the manifest (and to confirm the header is sane).
-    let (dimension, distance) = crate::data::peek_header(&data_path)?
-        .with_context(|| format!("{} has no readable nidus header", data_path.display()))?;
-
-    let file = File::create(out)
-        .with_context(|| format!("failed to create backup file {}", out.display()))?;
-    let gz = GzEncoder::new(file, Compression::default());
-    let mut tar = tar::Builder::new(gz);
+/// Snapshot the store at `store_dir` into a gzip-compressed tar **object** at
+/// `out_location` (a persistence location — a local path/`file://` today, `s3://`
+/// once implemented).
+pub fn backup(store_dir: &Path, out_location: &str) -> Result<BackupReport> {
+    // Read the source store's durable objects through its (local) backend — `data`
+    // first, then `log`, for the consistent lock-free snapshot (see the module docs).
+    let src = LocalFs::new(store_dir)?;
+    let data = src.get("data")?.with_context(|| {
+        format!(
+            "no nidus store at {} (no `data` object)",
+            store_dir.display()
+        )
+    })?;
+    let log = src.get("log")?.unwrap_or_default();
+    let (dimension, distance) = crate::data::header_from_bytes(&data)
+        .with_context(|| format!("{} has no readable nidus header", store_dir.display()))?;
 
     let created_unix = now_unix();
 
-    // `data` first, then `log` — the consistent-snapshot ordering.
-    let data_bytes = append_fixed(&mut tar, &data_path, "data", created_unix)?;
-    let log_bytes = append_fixed(&mut tar, &dir.join("log"), "log", created_unix)?;
+    // Build the whole gzip-tar archive in memory, then PUT it as one object. A
+    // snapshot of a dev/small-scale store fits in RAM comfortably (SPEC §13.7).
+    let mut archive: Vec<u8> = Vec::new();
+    {
+        let gz = GzEncoder::new(&mut archive, Compression::default());
+        let mut tar = tar::Builder::new(gz);
+        append_bytes(&mut tar, "data", &data, created_unix)?;
+        append_bytes(&mut tar, "log", &log, created_unix)?;
 
-    // Manifest last (it is derived from the two above).
-    let manifest = Manifest {
-        nidus_version: env!("CARGO_PKG_VERSION"),
-        created_unix,
-        dimension,
-        distance: format!("{distance:?}"),
-        data_bytes,
-        log_bytes,
-    };
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-    append_bytes(&mut tar, MANIFEST, &manifest_bytes, created_unix)?;
+        let manifest = Manifest {
+            nidus_version: env!("CARGO_PKG_VERSION"),
+            created_unix,
+            dimension,
+            distance: format!("{distance:?}"),
+            data_bytes: data.len() as u64,
+            log_bytes: log.len() as u64,
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+        append_bytes(&mut tar, MANIFEST, &manifest_bytes, created_unix)?;
 
-    // Finish the tar, then the gzip stream, then make the bytes durable.
-    let gz = tar.into_inner().context("failed to finalize tar archive")?;
-    let mut file = gz.finish().context("failed to finish gzip stream")?;
-    file.flush()?;
-    file.sync_all().ok();
+        // Finalize tar, then the gzip stream — both flush into `archive`.
+        let gz = tar.into_inner().context("failed to finalize tar archive")?;
+        gz.finish().context("failed to finish gzip stream")?;
+    }
 
-    let archive_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let (dest, key) = open_object_location(out_location)?;
+    dest.put(&key, &archive)
+        .with_context(|| format!("failed to write backup to {out_location}"))?;
 
     Ok(BackupReport {
-        backup: out.display().to_string(),
-        source: dir.display().to_string(),
+        backup: out_location.to_string(),
+        source: store_dir.display().to_string(),
         dimension,
         distance: format!("{distance:?}"),
-        data_bytes,
-        log_bytes,
-        archive_bytes,
+        data_bytes: data.len() as u64,
+        log_bytes: log.len() as u64,
+        archive_bytes: archive.len() as u64,
     })
 }
 
-/// Restore the store in archive `archive` into `dir`.
+/// Restore the store in the archive at `in_location` into `dir`.
 ///
 /// If `dir` already holds a store, the caller must confirm: with
 /// `assume_yes == false` we prompt on stderr and read one line from stdin;
 /// anything but `y`/`yes` (including EOF / a non-interactive pipe) aborts.
-pub fn restore(archive: &Path, dir: &Path, assume_yes: bool) -> Result<RestoreReport> {
+pub fn restore(in_location: &str, dir: &Path, assume_yes: bool) -> Result<RestoreReport> {
     if store_present(dir) && !assume_yes && !confirm_overwrite(dir)? {
         bail!(
             "aborted: {} already contains a store (pass -y/--yes to overwrite)",
@@ -134,43 +143,53 @@ pub fn restore(archive: &Path, dir: &Path, assume_yes: bool) -> Result<RestoreRe
         );
     }
 
-    let file = File::open(archive)
-        .with_context(|| format!("failed to open backup {}", archive.display()))?;
-    let mut tar = tar::Archive::new(GzDecoder::new(file));
+    let (src, key) = open_object_location(in_location)?;
+    let archive = src
+        .get(&key)?
+        .with_context(|| format!("backup archive not found: {in_location}"))?;
 
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("failed to create target directory {}", dir.display()))?;
-
+    // Extract the source-of-truth objects into the target store's backend. `put`
+    // validates each key (rejecting any path separators / `..`), so a hand-crafted
+    // traversal entry can never escape the store directory.
+    let target = LocalFs::new(dir)?;
+    let mut tar = tar::Archive::new(GzDecoder::new(&archive[..]));
+    let mut found_data = false;
     for entry in tar.entries().context("malformed backup archive")? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
-        // Only ever write the known, bare filenames — never honour a path with
-        // directory components (defends against a hand-crafted traversal entry).
         let name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) if path.components().count() == 1 => n.to_string(),
             _ => continue,
         };
         if ARCHIVED.contains(&name.as_str()) {
+            let mut buf = Vec::new();
             entry
-                .unpack(dir.join(&name))
-                .with_context(|| format!("failed to extract `{name}`"))?;
+                .read_to_end(&mut buf)
+                .with_context(|| format!("failed to read `{name}` from archive"))?;
+            target
+                .put(&name, &buf)
+                .with_context(|| format!("failed to write `{name}`"))?;
+            if name == "data" {
+                found_data = true;
+            }
         }
         // The manifest and anything unexpected are ignored.
     }
 
-    if !dir.join("data").exists() {
-        bail!("backup archive contained no `data` file — not a nidus backup");
+    if !found_data {
+        bail!("backup archive contained no `data` object — not a nidus backup");
     }
 
-    // Leave a clean store: never carry over a stale writer lock or tmp scratch.
-    for stale in ["lock", "data.tmp", "log.tmp"] {
-        let _ = std::fs::remove_file(dir.join(stale));
-    }
+    // Leave a clean store: never carry over a stale writer lock.
+    let _ = target.delete("lock");
 
     // Validate by reopening read-only — surfaces a corrupt/incompatible archive
     // instead of silently leaving an unloadable store behind.
-    let (dimension, distance) = crate::data::peek_header(&dir.join("data"))?
-        .context("restored data file has no readable nidus header")?;
+    let data = target
+        .get("data")?
+        .context("restored store has no `data` object")?;
+    let (dimension, distance) = crate::data::header_from_bytes(&data)
+        .context("restored data has no readable nidus header")?;
     let db = Nidus::open(
         Config::new(dir.to_path_buf(), dimension)
             .distance(distance)
@@ -180,7 +199,7 @@ pub fn restore(archive: &Path, dir: &Path, assume_yes: bool) -> Result<RestoreRe
 
     Ok(RestoreReport {
         restored_to: dir.display().to_string(),
-        source_archive: archive.display().to_string(),
+        source_archive: in_location.to_string(),
         dimension,
         distance: format!("{distance:?}"),
         collections: db.collections(),
@@ -188,8 +207,8 @@ pub fn restore(archive: &Path, dir: &Path, assume_yes: bool) -> Result<RestoreRe
     })
 }
 
-/// A sortable default backup filename: `<dir-name>-<unix-secs>.tar.gz`. Cron
-/// users template their own via `--out`.
+/// A sortable default backup object name: `<dir-name>-<unix-secs>.tar.gz` (written to
+/// the current directory). Cron users template their own via `--out`.
 pub fn default_out_name(dir: &Path) -> String {
     let stem = dir
         .file_name()
@@ -199,29 +218,8 @@ pub fn default_out_name(dir: &Path) -> String {
     format!("{stem}-{}.tar.gz", now_unix())
 }
 
-/// Append `src` to the tar at a fixed size: snapshot `len` once, then stream
-/// exactly that many bytes. A concurrent append that grows the file mid-copy is
-/// ignored (we stop at `len`), so the entry never contains a torn trailing row.
-fn append_fixed<W: Write>(
-    tar: &mut tar::Builder<W>,
-    src: &Path,
-    name: &str,
-    mtime: u64,
-) -> Result<u64> {
-    let file = File::open(src).with_context(|| format!("failed to read {}", src.display()))?;
-    let len = file.metadata()?.len();
-    let mut header = tar::Header::new_gnu();
-    header.set_size(len);
-    header.set_mode(0o644);
-    header.set_mtime(mtime);
-    // append_data sets the path and recomputes the checksum for us.
-    tar.append_data(&mut header, name, file.take(len))
-        .with_context(|| format!("failed to archive `{name}`"))?;
-    Ok(len)
-}
-
-/// Append an in-memory byte buffer (the manifest) as a tar entry.
-fn append_bytes<W: Write>(
+/// Append an in-memory byte buffer as a tar entry.
+fn append_bytes<W: std::io::Write>(
     tar: &mut tar::Builder<W>,
     name: &str,
     bytes: &[u8],
@@ -244,6 +242,7 @@ fn store_present(dir: &Path) -> bool {
 /// Prompt on stderr; return `true` only on an explicit yes. EOF or a
 /// non-interactive pipe reads as empty → `false` (safe default).
 fn confirm_overwrite(dir: &Path) -> Result<bool> {
+    use std::io::Write;
     eprint!(
         "{} already contains a store; overwrite it? [y/N] ",
         dir.display()
@@ -291,13 +290,13 @@ mod tests {
         let archive = arc.path().join("snap.tar.gz");
         make_store(src.path());
 
-        let report = backup(src.path(), &archive).unwrap();
+        let report = backup(src.path(), &archive.to_string_lossy()).unwrap();
         assert_eq!(report.dimension, 3);
         assert!(archive.exists());
 
         // Restore into a fresh (empty) directory.
         let restored = dst.path().join("store");
-        let rr = restore(&archive, &restored, true).unwrap();
+        let rr = restore(&archive.to_string_lossy(), &restored, true).unwrap();
         assert_eq!(rr.records, 2);
         assert_eq!(rr.collections, vec!["docs".to_string()]);
 
@@ -320,6 +319,23 @@ mod tests {
     }
 
     #[test]
+    fn backup_to_file_url_then_restore() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        make_store(src.path());
+
+        // `file://<abs path>` destination exercises the URL-scheme path.
+        let archive = src.path().join("via-url.tar.gz");
+        let url = format!("file://{}", archive.display());
+        backup(src.path(), &url).unwrap();
+        assert!(archive.exists());
+
+        let restored = dst.path().join("store");
+        let rr = restore(&url, &restored, true).unwrap();
+        assert_eq!(rr.records, 2);
+    }
+
+    #[test]
     fn restore_into_existing_store_without_yes_aborts() {
         let src = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
@@ -328,9 +344,9 @@ mod tests {
         make_store(src.path());
         make_store(target.path()); // target already holds a store
 
-        backup(src.path(), &archive).unwrap();
+        backup(src.path(), &archive.to_string_lossy()).unwrap();
         // assume_yes == false with no interactive stdin (EOF) → abort.
-        let err = restore(&archive, target.path(), false).unwrap_err();
+        let err = restore(&archive.to_string_lossy(), target.path(), false).unwrap_err();
         assert!(err.to_string().contains("already contains a store"));
     }
 
@@ -338,7 +354,7 @@ mod tests {
     fn backup_rejects_missing_store() {
         let empty = tempfile::tempdir().unwrap();
         let archive = empty.path().join("snap.tar.gz");
-        let err = backup(empty.path(), &archive).unwrap_err();
+        let err = backup(empty.path(), &archive.to_string_lossy()).unwrap_err();
         assert!(err.to_string().contains("no nidus store"));
     }
 }
