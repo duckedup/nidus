@@ -46,7 +46,12 @@ fn quant_to_byte(quant: Option<QuantKind>) -> u8 {
 /// `(kind, distance, quant, dim, m, ef_construction, n_lists, seed)`. Any mismatch on
 /// load means "rebuild". (`ef_search`, `n_probe`, `overscan` are query-time tunables
 /// that don't change the built structure, so they are deliberately excluded.)
-fn validity_key(dim: usize, distance: Distance, cfg: &AnnConfig, quant: Option<QuantKind>) -> Vec<u8> {
+fn validity_key(
+    dim: usize,
+    distance: Distance,
+    cfg: &AnnConfig,
+    quant: Option<QuantKind>,
+) -> Vec<u8> {
     let mut k = Vec::with_capacity(3 + 4 * 4 + 8);
     k.push(kind_to_byte(cfg.kind));
     k.push(distance_to_byte(distance));

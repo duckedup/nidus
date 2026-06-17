@@ -72,17 +72,18 @@ impl Store {
             .iter()
             .map(|(id, entry)| crate::model::Record {
                 id: id.clone(),
-                vector: self.data.row(entry.row).to_vec(),
+                // Text-only docs (row None) have no embedding.
+                vector: entry.row.map(|r| self.data.row(r).to_vec()),
                 attrs: entry.attrs.clone(),
             })
             .collect()
     }
 
     /// List records matching `filter` across `collections`, without vector scoring.
-    /// Skips the first `offset` matches and returns up to `limit` more, in insertion
-    /// order (row index), all with `score: 0.0`. `offset`/`limit` paginate a stable
-    /// ordering: the full match set is ordered by physical row, then the window
-    /// `[offset, offset + limit)` is returned.
+    /// Skips the first `offset` matches and returns up to `limit` more, all with
+    /// `score: 0.0`. Unlike `search`, this **includes text-only docs** (no vector) —
+    /// it is a metadata query. The window `[offset, offset + limit)` paginates a stable
+    /// ordering: vector-bearing docs first by physical row, then text-only docs by id.
     pub fn list(
         &self,
         collections: &[&str],
@@ -90,28 +91,52 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<Hit>> {
-        self.with_sorted_scan(collections, filter, |scan| {
-            let results = scan
-                .iter()
-                .skip(offset)
-                .take(limit)
-                .map(|&(_, collection, id)| {
-                    let attrs = self
-                        .collections
-                        .get(collection)
-                        .and_then(|c| c.docs.get(id))
-                        .map(|e| e.attrs.clone())
-                        .unwrap_or_default();
-                    Hit {
-                        collection: collection.to_string(),
-                        id: id.to_string(),
-                        score: 0.0,
-                        attrs,
-                    }
-                })
-                .collect();
-            Ok(results)
-        })
+        let cap: usize = collections
+            .iter()
+            .filter_map(|c| self.collections.get(*c))
+            .map(|c| c.docs.len())
+            .sum();
+        let mut scan: Vec<(Option<u64>, &str, &str)> = Vec::new();
+        scan.try_reserve(cap)
+            .map_err(|_| oom("list scan buffer", cap))?;
+        for &col_name in collections {
+            let Some(col) = self.collections.get(col_name) else {
+                continue;
+            };
+            for (id, entry) in &col.docs {
+                if !filter::matches(filter, &entry.attrs) {
+                    continue;
+                }
+                scan.push((entry.row, col_name, id.as_str()));
+            }
+        }
+        // Rowed docs by row, then text-only docs by id — a stable order for pagination.
+        scan.sort_unstable_by(|a, b| match (a.0, b.0) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.2.cmp(b.2),
+        });
+        let results = scan
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|&(_, collection, id)| {
+                let attrs = self
+                    .collections
+                    .get(collection)
+                    .and_then(|c| c.docs.get(id))
+                    .map(|e| e.attrs.clone())
+                    .unwrap_or_default();
+                Hit {
+                    collection: collection.to_string(),
+                    id: id.to_string(),
+                    score: 0.0,
+                    attrs,
+                }
+            })
+            .collect();
+        Ok(results)
     }
 
     // ── Scan plumbing ─────────────────────────────────────────────────────────
@@ -129,10 +154,27 @@ impl Store {
         }
     }
 
-    /// Total live docs across all collections — the scan-order cache's length and the
-    /// yardstick for "does this scope cover the whole store?" (`scan_cap == live count`).
-    fn live_doc_count(&self) -> usize {
-        self.collections.values().map(|c| c.docs.len()).sum()
+    /// Total **scannable** (vector-bearing) docs across all collections — the scan-order
+    /// cache's length and the yardstick for "does this scope cover every vector doc?"
+    /// (`scan_cap == scannable count`). Text-only docs carry no row and are excluded:
+    /// they never enter a vector scan.
+    fn scannable_doc_count(&self) -> usize {
+        self.collections
+            .values()
+            .flat_map(|c| c.docs.values())
+            .filter(|e| e.row.is_some())
+            .count()
+    }
+
+    /// Scannable (vector-bearing) docs within `collections` — the in-scope half of the
+    /// whole-store yardstick and the ANN selectivity population.
+    fn scannable_in_scope(&self, collections: &[&str]) -> usize {
+        collections
+            .iter()
+            .filter_map(|c| self.collections.get(*c))
+            .flat_map(|c| c.docs.values())
+            .filter(|e| e.row.is_some())
+            .count()
     }
 
     /// Drop the cached scan order. Called from every write that changes the doc set
@@ -159,14 +201,17 @@ impl Store {
         {
             let mut w = self.scan_order.write().unwrap_or_else(|e| e.into_inner());
             if w.is_none() {
-                let n = self.live_doc_count();
+                let n = self.scannable_doc_count();
                 let mut order: ScanOrder = Vec::new();
                 order
                     .try_reserve_exact(n)
                     .map_err(|_| oom("scan-order cache", n))?;
                 for (col_name, col) in &self.collections {
                     for (id, entry) in &col.docs {
-                        order.push((entry.row, col_name.clone(), id.clone()));
+                        // Only vector-bearing docs belong in the scan order.
+                        if let Some(row) = entry.row {
+                            order.push((row, col_name.clone(), id.clone()));
+                        }
                     }
                 }
                 order.sort_unstable_by_key(|&(row, _, _)| row);
@@ -194,16 +239,13 @@ impl Store {
         filter: &Filter,
         f: impl for<'b> FnOnce(&mut [(u64, &'b str, &'b str)]) -> Result<R>,
     ) -> Result<R> {
-        let scan_cap: usize = collections
-            .iter()
-            .filter_map(|c| self.collections.get(*c))
-            .map(|c| c.docs.len())
-            .sum();
+        // Count only vector-bearing docs — text-only docs never enter a vector scan.
+        let scan_cap: usize = self.scannable_in_scope(collections);
         let mut scan: Vec<(u64, &str, &str)> = Vec::new();
         scan.try_reserve(scan_cap)
             .map_err(|_| oom("search scan buffer", scan_cap))?;
 
-        if scan_cap == self.live_doc_count() {
+        if scan_cap == self.scannable_doc_count() {
             // Whole-store scope: draw from the cached row-sorted order (no per-query
             // sort). The cache covers every live doc, so every entry is in scope.
             let guard = self.scan_order()?;
@@ -240,10 +282,11 @@ impl Store {
                     continue;
                 };
                 for (id, entry) in &col.docs {
+                    let Some(row) = entry.row else { continue };
                     if !filter::matches(filter, &entry.attrs) {
                         continue;
                     }
-                    scan.push((entry.row, col_name, id.as_str()));
+                    scan.push((row, col_name, id.as_str()));
                 }
             }
             scan.sort_unstable_by_key(|&(row, _, _)| row);
@@ -387,12 +430,8 @@ impl Store {
         // selectivity ≥ 1/overscan, i.e. the survivor population ≥ total/overscan;
         // below that we gather the survivors directly (bailing out as soon as the
         // population proves it is *not* selective) and score them exactly.
-        let total = self.live_doc_count();
-        let in_scope: usize = collections
-            .iter()
-            .filter_map(|c| self.collections.get(*c))
-            .map(|c| c.docs.len())
-            .sum();
+        let total = self.scannable_doc_count();
+        let in_scope = self.scannable_in_scope(collections);
         let narrowed = !opts.filter.0.is_empty() || in_scope < total;
         if narrowed {
             let cap = (total / overscan).max(n_candidates);
@@ -426,8 +465,8 @@ impl Store {
             let Some(entry) = col.docs.get(id) else {
                 continue;
             };
-            if entry.row != *row {
-                continue; // stale reverse-map hint — row was overwritten
+            if entry.row != Some(*row) {
+                continue; // stale reverse-map hint — row was overwritten/cleared
             }
             if !filter::matches(&opts.filter, &entry.attrs) {
                 continue;
@@ -468,13 +507,14 @@ impl Store {
                 continue;
             };
             for (id, entry) in &col.docs {
+                let Some(row) = entry.row else { continue };
                 if !filter::matches(filter, &entry.attrs) {
                     continue;
                 }
                 if scan.len() == cap {
                     return None; // population exceeds the selective threshold
                 }
-                scan.push((entry.row, col_name, id.as_str()));
+                scan.push((row, col_name, id.as_str()));
             }
         }
         Some(scan)

@@ -270,11 +270,7 @@ mod tests {
     use crate::{Record, Scope, SearchOpts};
 
     fn rec(id: &str, vector: Vec<f32>) -> Record {
-        Record {
-            id: id.to_string(),
-            vector,
-            attrs: BTreeMap::new(),
-        }
+        Record::new(id, vector, BTreeMap::new())
     }
 
     fn make_store(dir: &Path) {

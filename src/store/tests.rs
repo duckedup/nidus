@@ -25,19 +25,11 @@ fn int8_state(store: &Store) -> &Int8State {
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 fn rec(id: &str, vector: Vec<f32>) -> Record {
-    Record {
-        id: id.to_string(),
-        vector,
-        attrs: BTreeMap::new(),
-    }
+    Record::new(id, vector, BTreeMap::new())
 }
 
 fn rec_with(id: &str, vector: Vec<f32>, attrs: BTreeMap<String, Value>) -> Record {
-    Record {
-        id: id.to_string(),
-        vector,
-        attrs,
-    }
+    Record::new(id, vector, attrs)
 }
 
 fn default_opts(top_k: usize) -> SearchOpts {
@@ -382,7 +374,7 @@ fn get_all_includes_vector() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].id, "doc1");
     // Vector should be unit-normalized (already unit here).
-    assert_eq!(records[0].vector.len(), 3);
+    assert_eq!(records[0].vector.as_deref().unwrap().len(), 3);
 }
 
 #[test]
@@ -841,7 +833,11 @@ fn euclidean_does_not_normalize() {
     store.create_collection("col").unwrap();
     store.upsert("col", &[rec("doc1", vec![3.0, 4.0])]).unwrap();
     let records = store.get_all("col");
-    assert_eq!(records[0].vector, vec![3.0, 4.0], "raw vectors preserved");
+    assert_eq!(
+        records[0].vector,
+        Some(vec![3.0, 4.0]),
+        "raw vectors preserved"
+    );
 }
 
 #[test]
@@ -892,7 +888,11 @@ fn dotproduct_does_not_normalize() {
     store.create_collection("col").unwrap();
     store.upsert("col", &[rec("doc1", vec![3.0, 4.0])]).unwrap();
     let records = store.get_all("col");
-    assert_eq!(records[0].vector, vec![3.0, 4.0], "raw vectors preserved");
+    assert_eq!(
+        records[0].vector,
+        Some(vec![3.0, 4.0]),
+        "raw vectors preserved"
+    );
 }
 
 #[test]
@@ -934,7 +934,7 @@ fn euclidean_survives_reopen() {
         )
         .unwrap();
         let records = store.get_all("col");
-        assert_eq!(records[0].vector, vec![1.0, 2.0, 3.0]);
+        assert_eq!(records[0].vector, Some(vec![1.0, 2.0, 3.0]));
         let hits = store
             .search(&["col"], &[1.0, 2.0, 3.0], &default_opts(5))
             .unwrap();
@@ -2263,4 +2263,149 @@ fn ann_selective_filter_respects_min_score() {
     assert!(hits.iter().all(|h| h.score >= 0.99));
     // d0 is `rare` (index 0) and identical to the query → it must be present.
     assert_eq!(hits[0].id, "d0");
+}
+
+// ── Optional vectors: text-only documents ──────────────────────────────────
+
+/// A text-only record (no embedding) — coexists with vector docs in a collection.
+fn text_rec(id: &str, attrs: BTreeMap<String, Value>) -> Record {
+    Record::text_only(id, attrs)
+}
+
+fn attrs_one(key: &str, val: &str) -> BTreeMap<String, Value> {
+    let mut m = BTreeMap::new();
+    m.insert(key.to_string(), Value::Str(val.to_string()));
+    m
+}
+
+#[test]
+fn text_only_upsert_adds_no_row() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert("col", &[text_rec("t1", attrs_one("kind", "note"))])
+        .unwrap();
+    // No vector ⇒ no data row, no vector_bytes, but it is a live doc.
+    let fp = store.footprint();
+    assert_eq!(fp.rows, 0);
+    assert_eq!(fp.vector_bytes, 0);
+    assert_eq!(fp.doc_count, 1);
+    // get_all returns it with vector None.
+    let recs = store.get_all("col");
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].id, "t1");
+    assert_eq!(recs[0].vector, None);
+}
+
+#[test]
+fn vector_search_excludes_text_only_docs() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert(
+            "col",
+            &[
+                rec("v1", vec![1.0, 0.0, 0.0]),
+                text_rec("t1", attrs_one("kind", "note")),
+            ],
+        )
+        .unwrap();
+    let hits = store
+        .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(10))
+        .unwrap();
+    // Only the vector doc is ranked; the text-only doc never appears.
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "v1");
+}
+
+#[test]
+fn list_includes_text_only_docs() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert(
+            "col",
+            &[
+                rec("v1", vec![1.0, 0.0, 0.0]),
+                text_rec("t1", attrs_one("kind", "note")),
+            ],
+        )
+        .unwrap();
+    let hits = store.list(&["col"], &Filter::default(), 0, 10).unwrap();
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["v1", "t1"],
+        "rowed doc first, then text-only by id"
+    );
+}
+
+#[test]
+fn doc_can_switch_between_vector_and_text_only() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert("col", &[rec("d", vec![1.0, 0.0, 0.0])])
+        .unwrap();
+    assert_eq!(store.footprint().rows, 1);
+    // Re-upsert the same id as text-only: the old row becomes dead.
+    store
+        .upsert("col", &[text_rec("d", attrs_one("kind", "note"))])
+        .unwrap();
+    assert_eq!(store.footprint().doc_count, 1);
+    assert_eq!(store.footprint().dead_rows, 1);
+    // It no longer appears in vector search.
+    let hits = store
+        .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(10))
+        .unwrap();
+    assert!(hits.is_empty());
+    // Re-upsert with a vector again: searchable once more.
+    store
+        .upsert("col", &[rec("d", vec![0.0, 1.0, 0.0])])
+        .unwrap();
+    let hits = store
+        .search(&["col"], &[0.0, 1.0, 0.0], &default_opts(10))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "d");
+}
+
+#[test]
+fn delete_text_only_doc_leaves_no_dead_row() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert("col", &[text_rec("t1", attrs_one("kind", "note"))])
+        .unwrap();
+    assert_eq!(store.delete("col", &["t1"]).unwrap(), 1);
+    assert_eq!(store.footprint().dead_rows, 0);
+    assert_eq!(store.footprint().doc_count, 0);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn text_only_docs_survive_reopen_and_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store
+            .upsert(
+                "col",
+                &[
+                    rec("v1", vec![3.0, 4.0]),
+                    text_rec("t1", attrs_one("kind", "note")),
+                    text_rec("t2", attrs_one("kind", "memo")),
+                ],
+            )
+            .unwrap();
+        store.compact().unwrap();
+    }
+    // Reopen: the UpsertText log records must replay back into live docs.
+    let store = Store::open(Config::new(&path, 2)).unwrap();
+    assert_eq!(store.footprint().doc_count, 3);
+    assert_eq!(store.footprint().rows, 1, "only the vector doc has a row");
+    let all = store.get_all("col");
+    let mut text_only: Vec<&str> = all
+        .iter()
+        .filter(|r| r.vector.is_none())
+        .map(|r| r.id.as_str())
+        .collect();
+    text_only.sort();
+    assert_eq!(text_only, vec!["t1", "t2"]);
 }

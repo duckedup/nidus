@@ -224,15 +224,46 @@ pub enum Value {
     List(Vec<String>),
 }
 
-/// A document: a caller-supplied id, its embedding, and typed metadata.
+/// A document: a caller-supplied id, an **optional** embedding, and typed metadata.
+///
+/// `vector` is `None` for a **text-only** document — one with no embedding, indexed and
+/// retrieved purely by full-text search and metadata. Such a doc occupies no row in the
+/// vector matrix and never appears in a vector `search`; it coexists in the same
+/// collection as vector-bearing docs. When `Some`, the vector's length must equal the
+/// store dimension. Use [`Record::new`] for a vector doc and [`Record::text_only`] for a
+/// text-only one.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     /// Caller-supplied identity; the upsert key (idempotent within a collection).
     pub id: String,
-    /// The embedding. Length must equal the store dimension.
-    pub vector: Vec<f32>,
+    /// The embedding, or `None` for a text-only doc. When `Some`, length must equal the
+    /// store dimension. Over the wire / in backups the field may be omitted (→ `None`)
+    /// and is elided when absent, so a text-only doc is just `{ id, attrs }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<Vec<f32>>,
     /// Arbitrary typed metadata.
     pub attrs: BTreeMap<String, Value>,
+}
+
+impl Record {
+    /// A vector-bearing document. `vector`'s length must equal the store dimension.
+    pub fn new(id: impl Into<String>, vector: Vec<f32>, attrs: BTreeMap<String, Value>) -> Self {
+        Self {
+            id: id.into(),
+            vector: Some(vector),
+            attrs,
+        }
+    }
+
+    /// A text-only document — no embedding. Indexed and retrieved by full-text search
+    /// and metadata only; never appears in a vector `search`.
+    pub fn text_only(id: impl Into<String>, attrs: BTreeMap<String, Value>) -> Self {
+        Self {
+            id: id.into(),
+            vector: None,
+            attrs,
+        }
+    }
 }
 
 /// A single attribute predicate. Predicates are AND-combined inside a [`Filter`].
@@ -333,5 +364,14 @@ pub enum Op {
     Delete {
         collection: String,
         id: String,
+    },
+    /// Upsert a **text-only** document — no embedding, so no `row` into the data
+    /// segment. Appended after the original variants so existing logs (which never
+    /// contain it) still decode: bincode tags enum variants by declaration index, so
+    /// new variants must only ever be added at the end.
+    UpsertText {
+        collection: String,
+        id: String,
+        attrs: BTreeMap<String, Value>,
     },
 }

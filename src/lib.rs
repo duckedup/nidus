@@ -13,7 +13,7 @@
 //!
 //! let mut db = Nidus::open(Config::new("/tmp/store", 3))?;
 //! db.create_collection("docs")?;
-//! db.upsert("docs", &[Record { id: "a".into(), vector: vec![1.0, 0.0, 0.0], attrs: BTreeMap::new() }])?;
+//! db.upsert("docs", &[Record::new("a", vec![1.0, 0.0, 0.0], BTreeMap::new())])?;
 //! let hits = db.search("docs", &[1.0, 0.0, 0.0], &SearchOpts { top_k: 5, ..Default::default() })?;
 //! # anyhow::Ok(())
 //! ```

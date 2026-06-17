@@ -39,9 +39,11 @@ use quant::Quant;
 /// sorted by `row` (see [`Store::scan_order`]).
 type ScanOrder = Vec<(u64, String, String)>;
 
-/// One document's entry within a collection.
+/// One document's entry within a collection. `row` is `None` for a text-only doc (no
+/// embedding, so no row in the data matrix); such docs are full-text/metadata only and
+/// never enter the vector scan or ANN index.
 struct DocEntry {
-    row: u64,
+    row: Option<u64>,
     attrs: BTreeMap<String, crate::model::Value>,
 }
 
@@ -167,7 +169,8 @@ impl Store {
                 }
                 Op::DropCollection { collection } => {
                     if let Some(col) = collections.remove(&collection) {
-                        dead_rows += col.docs.len();
+                        // Only rowed docs leave a reclaimable data row behind.
+                        dead_rows += col.docs.values().filter(|e| e.row.is_some()).count();
                     }
                 }
                 Op::SetMeta { collection, meta } => {
@@ -189,15 +192,36 @@ impl Store {
                     let col = collections
                         .entry(collection)
                         .or_insert_with(Collection::new);
-                    // If overwriting an existing id, the old row becomes dead.
-                    if col.docs.contains_key(&id) {
+                    // Overwriting a *rowed* doc leaves its old row dead.
+                    if let Some(old) = col.docs.insert(
+                        id,
+                        DocEntry {
+                            row: Some(row),
+                            attrs,
+                        },
+                    ) && old.row.is_some()
+                    {
                         dead_rows += 1;
                     }
-                    col.docs.insert(id, DocEntry { row, attrs });
+                }
+                Op::UpsertText {
+                    collection,
+                    id,
+                    attrs,
+                } => {
+                    let col = collections
+                        .entry(collection)
+                        .or_insert_with(Collection::new);
+                    if let Some(old) = col.docs.insert(id, DocEntry { row: None, attrs })
+                        && old.row.is_some()
+                    {
+                        dead_rows += 1;
+                    }
                 }
                 Op::Delete { collection, id } => {
                     if let Some(col) = collections.get_mut(&collection)
-                        && col.docs.remove(&id).is_some()
+                        && let Some(old) = col.docs.remove(&id)
+                        && old.row.is_some()
                     {
                         dead_rows += 1;
                     }
@@ -297,9 +321,12 @@ impl Store {
         let mut live_rows: Vec<u64> = Vec::new();
         for (col_name, col) in &self.collections {
             for (id, entry) in &col.docs {
-                if (entry.row as usize) < row_to_doc.len() {
-                    row_to_doc[entry.row as usize] = Some((col_name.clone(), id.clone()));
-                    live_rows.push(entry.row);
+                // Text-only docs (row None) have no vector — they never enter the index.
+                if let Some(row) = entry.row
+                    && (row as usize) < row_to_doc.len()
+                {
+                    row_to_doc[row as usize] = Some((col_name.clone(), id.clone()));
+                    live_rows.push(row);
                 }
             }
         }
