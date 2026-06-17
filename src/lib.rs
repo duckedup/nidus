@@ -23,6 +23,7 @@ mod config;
 mod data;
 mod filter;
 mod glob;
+mod index_cache;
 mod lock;
 mod log;
 mod model;
