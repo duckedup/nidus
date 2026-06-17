@@ -173,13 +173,15 @@ nidus restore --in ./store.tar.gz --dir ./store --yes
 ```
 
 The archive's `--out`/`--in` is a [storage-backend](/guides/backends/) location, so
-besides a plain path it accepts a `file://` URL or an `s3://` bucket — the snapshot is
-written and read as one object on whatever backend the location names:
+besides a plain path it accepts a `file://` URL, an `s3://` bucket, or a `gs://` bucket
+— the snapshot is written and read as one object on whatever backend the location names:
 
 ```bash
 nidus backup  --dir ./store --out file:///backups/store.tar.gz
 # Straight to S3 (creds from the AWS environment):
 nidus backup  --dir ./store --out s3://my-bucket/backups/store.tar.gz
+# …or Google Cloud Storage (GOOGLE_APPLICATION_CREDENTIALS):
+nidus backup  --dir ./store --out gs://my-bucket/backups/store.tar.gz
 ```
 
 The archive is an ordinary gzip-compressed tarball — `tar tzf store.tar.gz`

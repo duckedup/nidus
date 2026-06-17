@@ -24,15 +24,6 @@ fn validate_key_rejects_bad_names() {
 // ── Scheme parsing (pure, Miri-clean) ───────────────────────────────────────────
 
 #[test]
-fn gcs_scheme_is_clear_not_yet() {
-    for loc in ["gs://bucket/p", "gcs://bucket/p"] {
-        let err = open_persistence(loc).err().unwrap().to_string();
-        assert!(err.contains("not yet implemented"), "{loc}: {err}");
-        assert!(err.contains("Phase 3"), "{loc}: {err}");
-    }
-}
-
-#[test]
 fn memory_tier_remote_schemes_are_clear_not_yet() {
     for loc in [
         "redis://h:6379",
@@ -83,6 +74,8 @@ fn split_object_location_cases() {
 fn strip_scheme_is_case_insensitive_and_bounded() {
     assert_eq!(strip_scheme("S3://x", "s3"), Some("x"));
     assert_eq!(strip_scheme("file:///abs", "file"), Some("/abs"));
+    assert_eq!(strip_scheme("gs://bucket/p", "gs"), Some("bucket/p"));
+    assert_eq!(strip_scheme("gcs://bucket/p", "gcs"), Some("bucket/p"));
     assert_eq!(strip_scheme("s3:/x", "s3"), None); // missing one slash
     assert_eq!(strip_scheme("s3", "s3"), None);
 }

@@ -136,21 +136,25 @@ let tier = open_memory_tier("local")?;
 # anyhow::Ok(())
 ```
 
-`file://` (local files), `local` (local RAM), and **`s3://<bucket>[/<prefix>]`**
-(Amazon S3 and S3-compatible stores — R2, MinIO) are available today; `s3://` reads
-credentials, region, and an optional custom endpoint from the standard AWS environment
-(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT_URL`). Other
-schemes (`gs://`) are recognized and rejected with a clear error rather than a silent
-fallback, so a location string is always validated up front.
+Available today: `file://` (local files), `local` (local RAM),
+**`s3://<bucket>[/<prefix>]`** (Amazon S3 and S3-compatible stores — R2, MinIO), and
+**`gs://<bucket>[/<prefix>]`** (Google Cloud Storage). Credentials come from the
+standard environment — S3 from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION`
+(plus `AWS_ENDPOINT_URL` for R2/MinIO), GCS from a service-account key at
+`GOOGLE_APPLICATION_CREDENTIALS`. An unrecognized scheme is rejected with a clear error
+rather than a silent fallback, so a location string is always validated up front.
 
 ```bash
-# Snapshot a local store straight to S3 — the destination is just an s3:// location.
+# Snapshot a local store straight to the cloud — the destination is just a location.
 AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=us-east-1 \
   nidus backup --dir ./store --out s3://my-bucket/backups/store.tar.gz
+
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json \
+  nidus backup --dir ./store --out gs://my-bucket/backups/store.tar.gz
 ```
 
-S3 is a whole-object backend (`get`/`put`/`delete`/`list`) — there is no native
-append, so it serves snapshots and whole-object use, not a live append-backed
+S3 and GCS are whole-object backends (`get`/`put`/`delete`/`list`) — there is no native
+append, so they serve snapshots and whole-object use, not a live append-backed
 `data`/`log` store.
 
 ## Snapshots are object-granular

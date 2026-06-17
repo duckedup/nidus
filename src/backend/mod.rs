@@ -27,6 +27,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 
 mod cloud;
+mod gcs;
 mod local;
 mod ram;
 mod s3;
@@ -34,6 +35,7 @@ mod s3;
 #[cfg(test)]
 mod tests;
 
+pub use gcs::Gcs;
 pub use local::{FileAppender, LocalFs};
 pub use ram::LocalRam;
 pub(crate) use ram::MemAppender;
@@ -172,11 +174,8 @@ pub fn open_persistence(location: &str) -> Result<Box<dyn Persistence>> {
     if let Some(rest) = strip_scheme(location, "s3") {
         return Ok(Box::new(S3::from_url(rest)?));
     }
-    if strip_scheme(location, "gs").is_some() || strip_scheme(location, "gcs").is_some() {
-        bail!(
-            "the Google Cloud Storage persistence backend ({location:?}) is not yet \
-             implemented (planned: SPEC §13.2, nidus-870 Phase 3)"
-        );
+    if let Some(rest) = strip_scheme(location, "gs").or_else(|| strip_scheme(location, "gcs")) {
+        return Ok(Box::new(Gcs::from_url(rest)?));
     }
     // `file://<path>` or a bare path → local files.
     let path = strip_scheme(location, "file").unwrap_or(location);

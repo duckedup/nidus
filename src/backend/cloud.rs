@@ -41,6 +41,12 @@ impl Http {
     pub(crate) fn delete(&self, url: &str) -> Result<(u16, Vec<u8>)> {
         finish(self.agent.delete(url).call().map_err(net_err)?)
     }
+
+    /// Run a fully-built request (method + uri + headers + body) — used by GCS, whose
+    /// sans-IO client (and `tame-oauth`) emit [`http::Request`]s.
+    pub(crate) fn run(&self, req: http::Request<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
+        finish(self.agent.run(req).map_err(net_err)?)
+    }
 }
 
 /// Read a response into `(status, body)`.
