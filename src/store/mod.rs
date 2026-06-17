@@ -97,9 +97,12 @@ pub struct Store {
     /// whether the on-disk `ann` cache is current. Meaningless when ANN is off.
     ann_dirty: bool,
     /// Full-text (BM25) index, keyed per declared `(collection, field)`. Empty (inert)
-    /// until a collection declares an FTS schema; rebuilt from the live docs on open.
-    /// (The on-disk `fts` cache that lets open skip the rebuild lands in nidus-b6i.8.)
+    /// until a collection declares an FTS schema; loaded from the `fts` cache on open
+    /// when current, else rebuilt from the live docs.
     fts: Fts,
+    /// The in-RAM FTS index has changes not yet written to the `fts` cache (mirrors
+    /// `ann_dirty`). Meaningless when FTS is inactive.
+    fts_dirty: bool,
     /// True for in-memory stores (no backing directory) — they never persist the ANN
     /// cache. `open`ed (file-backed) stores set this false.
     in_memory: bool,
@@ -263,6 +266,7 @@ impl Store {
             ann,
             ann_dirty: false,
             fts,
+            fts_dirty: false,
             in_memory: false,
             row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
@@ -282,9 +286,10 @@ impl Store {
         // 8. Load the ANN index from its cache (incrementally catching up any rows
         //    added since), or rebuild it from the vectors if there is no valid cache.
         store.load_or_build_ann()?;
-        // 9. Build the FTS inverted index from the replayed docs (the schema was
-        //    restored during replay). A no-op when no collection declares FTS.
-        store.rebuild_fts();
+        // 9. Load the FTS index from its `fts` cache when it is exactly current, else
+        //    rebuild it from the replayed docs (the schema was restored during replay).
+        //    A no-op when no collection declares FTS.
+        store.load_or_build_fts()?;
 
         Ok(store)
     }
@@ -323,6 +328,7 @@ impl Store {
             ann,
             ann_dirty: false,
             fts: Fts::default(),
+            fts_dirty: false,
             in_memory: true,
             row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
@@ -418,10 +424,21 @@ impl Store {
     /// no-op when ANN is off, the store is in-memory or read-only, or nothing changed
     /// since the last persist.
     pub fn persist_index(&mut self) -> Result<()> {
+        // The on-disk caches are never written for an in-memory or read-only store.
+        if self.in_memory || self.config.open_mode == OpenMode::ReadOnly {
+            return Ok(());
+        }
+        self.persist_ann()?;
+        self.persist_fts()?;
+        Ok(())
+    }
+
+    /// Persist the ANN cache if dirty (gating shared via [`Self::persist_index`]).
+    fn persist_ann(&mut self) -> Result<()> {
         let Some(cfg) = self.config.ann else {
             return Ok(());
         };
-        if self.in_memory || self.config.open_mode == OpenMode::ReadOnly || !self.ann_dirty {
+        if !self.ann_dirty {
             return Ok(());
         }
         let Some(ann) = self.ann.as_ref() else {
@@ -438,6 +455,46 @@ impl Store {
             self.config.quantization.map(|q| q.kind),
         )?;
         self.ann_dirty = false;
+        Ok(())
+    }
+
+    /// Persist the FTS index to the `fts` cache if dirty. The validity key is the
+    /// declared schema + analyzer/BM25 params; the watermark is the current log offset,
+    /// so on open the cache is adopted only when nothing has been written since (any
+    /// later write → the offset differs → rebuild). Reuses the shared
+    /// [`crate::index_cache`] codec.
+    fn persist_fts(&mut self) -> Result<()> {
+        if !self.fts.is_active() || !self.fts_dirty {
+            return Ok(());
+        }
+        let path = self.config.path.join("fts");
+        let watermark = self.log.offset()?;
+        crate::index_cache::save(&path, &self.fts.cache_key(), watermark, &self.fts)?;
+        self.fts_dirty = false;
+        Ok(())
+    }
+
+    /// On `open`: adopt the `fts` cache when it is valid for the current schema **and**
+    /// its watermark equals the current log offset (i.e. nothing was written after it
+    /// was persisted — the clean-reopen fast path). Otherwise rebuild from the replayed
+    /// docs. No-op when FTS is inactive.
+    fn load_or_build_fts(&mut self) -> Result<()> {
+        if !self.fts.is_active() {
+            return Ok(());
+        }
+        let path = self.config.path.join("fts");
+        let key = self.fts.cache_key();
+        let current = self.log.offset()?;
+        if let Some((cached, watermark)) = crate::index_cache::load::<Fts>(&path, &key)?
+            && watermark == current
+        {
+            // The cache reflects the store exactly as it stands.
+            self.fts = cached;
+            self.fts_dirty = false;
+            return Ok(());
+        }
+        // Absent, stale (schema/params changed), or the store changed since persist.
+        self.rebuild_fts();
         Ok(())
     }
 
@@ -489,5 +546,7 @@ impl Store {
                 self.fts.index_doc(col_name, id, attrs);
             }
         }
+        // The rebuilt index isn't on disk yet.
+        self.fts_dirty = true;
     }
 }

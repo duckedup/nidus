@@ -519,6 +519,7 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         ann: None,
         ann_dirty: false,
         fts: crate::fts::Fts::default(),
+        fts_dirty: false,
         in_memory: true,
         row_to_doc: Vec::new(),
         scan_order: std::sync::RwLock::new(None),
@@ -2627,6 +2628,10 @@ fn hybrid_search_fuses_vector_and_text() {
 }
 
 #[test]
+// Miri evaluates `ln` (in BM25's idf) non-deterministically by design, so the fused
+// RRF scores vary by an ULP run-to-run under Miri — the very stability this asserts.
+// The tie-break determinism it checks holds under real float semantics.
+#[cfg_attr(miri, ignore)]
 fn hybrid_search_is_deterministic() {
     let mut store = Store::in_memory(3).unwrap();
     store
@@ -2653,4 +2658,54 @@ fn hybrid_search_is_deterministic() {
     let ids_a: Vec<&str> = a.iter().map(|h| h.id.as_str()).collect();
     let ids_b: Vec<&str> = b.iter().map(|h| h.id.as_str()).collect();
     assert_eq!(ids_a, ids_b);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn fts_cache_persists_and_reloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store
+            .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+            .unwrap();
+        store
+            .upsert("docs", &[doc("a", "alpha beta"), doc("b", "beta gamma")])
+            .unwrap();
+        // Write the fts cache out of band.
+        store.persist_index().unwrap();
+        assert!(path.join("fts").exists(), "fts cache file written");
+    }
+    // Reopen: cache watermark == log offset → adopted, results intact.
+    {
+        let store = Store::open(Config::new(&path, 2)).unwrap();
+        let hits = store
+            .text_search(&["docs"], &FtsQuery::new("body", "beta"), &default_opts(10))
+            .unwrap();
+        let mut ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+    // A write after the cache was persisted must still be reflected on the next open
+    // (watermark mismatch → rebuild from the live docs, including the new doc).
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store.upsert("docs", &[doc("c", "gamma delta")]).unwrap();
+        // (no persist_index here — the cache is now stale)
+    }
+    {
+        let store = Store::open(Config::new(&path, 2)).unwrap();
+        let hits = store
+            .text_search(
+                &["docs"],
+                &FtsQuery::new("body", "delta"),
+                &default_opts(10),
+            )
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            vec!["c"]
+        );
+    }
 }

@@ -210,6 +210,25 @@ impl Fts {
         !self.schema.is_empty()
     }
 
+    /// The on-disk cache validity key: the cache format version, the BM25 params, and
+    /// the full declared schema (deterministically ordered via `BTreeMap`). Any change
+    /// to the analyzer params or the schema flips the key, so a stale cache is rejected
+    /// by [`crate::index_cache`] and the index is rebuilt.
+    pub(crate) fn cache_key(&self) -> Vec<u8> {
+        /// Bump when the inverted-index layout or analyzer behaviour changes.
+        const FTS_CACHE_VERSION: u8 = 1;
+        let mut key = vec![FTS_CACHE_VERSION];
+        key.extend_from_slice(&K1.to_le_bytes());
+        key.extend_from_slice(&B.to_le_bytes());
+        // BTreeMap iterates key-sorted, so the encoding is deterministic.
+        let sorted: std::collections::BTreeMap<&String, &Vec<(String, Language)>> =
+            self.schema.iter().collect();
+        if let Ok(bytes) = bincode::serialize(&sorted) {
+            key.extend_from_slice(&bytes);
+        }
+        key
+    }
+
     /// The declared `(field, language)` list for `collection`, if any.
     pub(crate) fn schema_for(&self, collection: &str) -> Option<&[(String, Language)]> {
         self.schema.get(collection).map(Vec::as_slice)
@@ -411,6 +430,15 @@ mod tests {
         let idx = idx_with(&[("d1", "alpha beta"), ("d2", "beta gamma")]);
         let bytes = bincode::serialize(&idx).unwrap();
         let restored: FieldIndex = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(ranked(&idx, "beta"), ranked(&restored, "beta"));
+        // Compare the ranking (ids), not exact scores: BM25's idf uses `ln`, which Miri
+        // deliberately evaluates non-deterministically (last-ULP), so two score
+        // computations can differ by an ULP while the ranking is identical.
+        let ids = |i: &FieldIndex| {
+            ranked(i, "beta")
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&idx), ids(&restored));
     }
 }

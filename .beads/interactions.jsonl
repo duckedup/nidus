@@ -65,3 +65,4 @@
 {"id":"int-20f0ba93","kind":"field_change","created_at":"2026-06-17T04:49:53.287633Z","actor":"Austin Riendeau","issue_id":"nidus-b6i.7","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
 {"id":"int-9b321725","kind":"field_change","created_at":"2026-06-17T04:53:55.156835Z","actor":"Austin Riendeau","issue_id":"nidus-b6i.10","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
 {"id":"int-ca98abcc","kind":"field_change","created_at":"2026-06-17T04:59:20.95299Z","actor":"Austin Riendeau","issue_id":"nidus-b6i.9","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
+{"id":"int-ca40f5ab","kind":"field_change","created_at":"2026-06-17T05:10:28.338263Z","actor":"Austin Riendeau","issue_id":"nidus-b6i.8","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}

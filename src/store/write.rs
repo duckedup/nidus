@@ -51,7 +51,10 @@ impl Store {
             // Only rowed docs leave a reclaimable data row behind.
             self.dead_rows += col.docs.values().filter(|e| e.row.is_some()).count();
             // Drop the collection's FTS schema + field indexes.
-            self.fts.drop_collection(name);
+            if self.fts.is_active() {
+                self.fts.drop_collection(name);
+                self.fts_dirty = true;
+            }
             self.log.append(&Op::DropCollection {
                 collection: name.to_string(),
             })?;
@@ -92,6 +95,7 @@ impl Store {
             let attrs = &col.docs[id].attrs;
             self.fts.index_doc(collection, id, attrs);
         }
+        self.fts_dirty = true;
         Ok(())
     }
 
@@ -315,6 +319,10 @@ impl Store {
             count += 1;
         }
 
+        if fts_on {
+            self.fts_dirty = true;
+        }
+
         // Quantize only the rows this batch appended (O(batch)); refits lazily.
         self.extend_quant(data_mark);
         // Index the new rows in the ANN graph/lists (O(batch)). No-op when ANN is off.
@@ -365,6 +373,9 @@ impl Store {
             self.maybe_sync()?;
             // Docs were removed — drop the cached scan order.
             self.invalidate_scan_order();
+            if self.fts.is_active() {
+                self.fts_dirty = true;
+            }
         }
 
         Ok(count)
@@ -519,11 +530,15 @@ impl Store {
         //     its on-disk cache. Best effort: the cache is derived, so a persist
         //     failure must not fail the compaction.
         self.rebuild_ann();
-        let _ = self.persist_index();
 
         // 5c. Rebuild the FTS index from the live docs (drops tombstones, renumbers
-        //     docnums). Reads attrs, so it is unaffected by the row renumbering.
+        //     docnums). Reads attrs, so it is unaffected by the row renumbering. Done
+        //     before persist so the refreshed `fts` cache matches the rewritten log.
         self.rebuild_fts();
+
+        // 5d. Refresh both on-disk caches. Best effort: a persist failure must not fail
+        //     the compaction (the caches are derived).
+        let _ = self.persist_index();
 
         // 6. Rows were renumbered — drop the cached scan order.
         self.invalidate_scan_order();
