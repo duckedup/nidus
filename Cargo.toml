@@ -12,7 +12,7 @@ name = "nidus"
 version = "0.15.0"
 edition = "2024"
 rust-version = "1.96"
-description = "A small, pure-Rust embeddable vector store: brute-force cosine search over a single append-only file. No FFI, no C, no SQL; anyhow its only dependency."
+description = "A small, pure-Rust embeddable vector store: brute-force or ANN cosine search over a single append-only directory, with pluggable persistence (local files, S3, GCS). No SQL, no query engine; builds in seconds."
 repository = "https://github.com/duckedup/nidus"
 license = "MIT"
 keywords = ["vector", "embeddings", "search", "embedded", "database"]
@@ -40,14 +40,32 @@ required-features = ["cli"]
 # Turning it on adds the binary-only deps (all pure Rust, zero FFI).
 cli = ["dep:clap", "dep:tokio", "dep:axum", "dep:tower", "dep:serde_json", "dep:tar", "dep:flate2"]
 
-# The library's dependency tree, by design, is four small pure-Rust crates with no
-# C and no FFI — so nidus stays fully Miri-checkable and builds in seconds, unlike a
-# bundled C/C++ store (DuckDB) or a transitively-heavy one (LanceDB).
+# The core is four small pure-Rust crates with no C and no FFI. The S3/GCS
+# persistence backends (below) add a few more — still all pure Rust except `ring`
+# (ureq's TLS, a small C+asm compile) — and they are NOT feature-gated: outgrowing
+# local FS for S3 is meant to be a one-line `file://`→`s3://` runtime switch, never a
+# recompile. The bar is build-and-ship SPEED (whole-crate clean build stays seconds,
+# ~8× under a minute — CI asserts it), not zero-C absolutism (SPEC §1, §13.6). The
+# multi-minute C trees nidus exists to avoid (bundled DuckDB C++, vendored OpenSSL,
+# aws-lc-sys) stay forbidden.
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 crc32fast = "1"
+
+# Storage-backend deps (SPEC §13), in the DEFAULT build. The cloud clients are
+# sans-IO (build + sign requests; no transport, no async) — `rusty-s3` (Sigv4 = pure
+# RustCrypto HMAC) and `tame-gcs`/`tame-oauth` (GCS + OAuth2 service-account JWT) —
+# executed over `ureq`, a small blocking HTTP client whose default TLS is
+# rustls + `ring` (self-contained via webpki-roots; NOT aws-lc, NOT OpenSSL). `url`
+# and `http` are their request types, surfaced for backend construction.
+rusty-s3 = "0.9"
+tame-gcs = "0.14"
+tame-oauth = "0.10"
+ureq = "3"
+url = "2"
+http = "1"
 
 # Binary-only deps — compiled ONLY under `--features cli`, never by library
 # consumers. All pure Rust (no `*-sys`, no bundled C): clap for the CLI, and the

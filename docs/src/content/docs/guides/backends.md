@@ -136,9 +136,22 @@ let tier = open_memory_tier("local")?;
 # anyhow::Ok(())
 ```
 
-`file://` (local files) and `local` (local RAM) are available today. Other schemes
-are recognized and rejected with a clear error rather than a silent fallback, so a
-location string is always validated up front.
+`file://` (local files), `local` (local RAM), and **`s3://<bucket>[/<prefix>]`**
+(Amazon S3 and S3-compatible stores — R2, MinIO) are available today; `s3://` reads
+credentials, region, and an optional custom endpoint from the standard AWS environment
+(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT_URL`). Other
+schemes (`gs://`) are recognized and rejected with a clear error rather than a silent
+fallback, so a location string is always validated up front.
+
+```bash
+# Snapshot a local store straight to S3 — the destination is just an s3:// location.
+AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=us-east-1 \
+  nidus backup --dir ./store --out s3://my-bucket/backups/store.tar.gz
+```
+
+S3 is a whole-object backend (`get`/`put`/`delete`/`list`) — there is no native
+append, so it serves snapshots and whole-object use, not a live append-backed
+`data`/`log` store.
 
 ## Snapshots are object-granular
 

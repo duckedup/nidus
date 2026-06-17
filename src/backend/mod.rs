@@ -26,8 +26,10 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 
+mod cloud;
 mod local;
 mod ram;
+mod s3;
 
 #[cfg(test)]
 mod tests;
@@ -35,6 +37,7 @@ mod tests;
 pub use local::{FileAppender, LocalFs};
 pub use ram::LocalRam;
 pub(crate) use ram::MemAppender;
+pub use s3::S3;
 
 /// Where the durable bytes live: whole **named byte objects** in two classes —
 /// source-of-truth (`data`/`log`, never reconstructable) and derived caches
@@ -167,11 +170,7 @@ pub(crate) fn validate_key(key: &str) -> Result<()> {
 /// The directory is created if absent.
 pub fn open_persistence(location: &str) -> Result<Box<dyn Persistence>> {
     if let Some(rest) = strip_scheme(location, "s3") {
-        let _ = rest;
-        bail!(
-            "the S3 persistence backend ({location:?}) is not yet implemented \
-             (planned: SPEC §13.2, nidus-870 Phase 3)"
-        );
+        return Ok(Box::new(S3::from_url(rest)?));
     }
     if strip_scheme(location, "gs").is_some() || strip_scheme(location, "gcs").is_some() {
         bail!(

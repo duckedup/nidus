@@ -737,8 +737,10 @@ with `LocalFs` and `LocalRam`, selected by URL scheme — nidus-870.2 Phase 1; t
 `data`/`log` segments run over `Persistence::appender` and its `ann`/`fts` caches over
 `get`/`put`/`try_lock` — nidus-vnu); snapshot/backup is routed through `Persistence`
 too, so `nidus backup --out <loc>` writes the archive object to any backend (§13.7).
-The remote members (S3/GCS persistence, Redis/Valkey/Memcached memory tier) remain
-**designed-for, not built** (the seam in §9).
+The **S3 persistence backend is built** (`src/backend/s3.rs`: whole-object
+get/put/delete/list over sans-IO `rusty-s3` + `ureq`, selected by `s3://…` — nidus-870.4);
+GCS persistence and the Redis/Valkey/Memcached memory tier remain **designed-for, not
+built** (the seam in §9).
 
 - **Persistence** — where the durable *source-of-truth* bytes (`data`/`log`) live:
   **local files** (default), **S3**, or **GCS**. Optimized for durability and cost.

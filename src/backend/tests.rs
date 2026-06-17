@@ -24,8 +24,8 @@ fn validate_key_rejects_bad_names() {
 // ── Scheme parsing (pure, Miri-clean) ───────────────────────────────────────────
 
 #[test]
-fn persistence_remote_schemes_are_clear_not_yet() {
-    for loc in ["s3://bucket/p", "gs://bucket/p", "gcs://bucket/p"] {
+fn gcs_scheme_is_clear_not_yet() {
+    for loc in ["gs://bucket/p", "gcs://bucket/p"] {
         let err = open_persistence(loc).err().unwrap().to_string();
         assert!(err.contains("not yet implemented"), "{loc}: {err}");
         assert!(err.contains("Phase 3"), "{loc}: {err}");
