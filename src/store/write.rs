@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use super::{Collection, DocEntry, Store, oom};
 use crate::config::{Fsync, OpenMode};
 use crate::filter;
+use crate::fts::Language;
 use crate::model::{Distance, Filter, Op, Record, Value};
 use crate::search::normalize;
 
@@ -49,6 +50,8 @@ impl Store {
         if let Some(col) = self.collections.remove(name) {
             // Only rowed docs leave a reclaimable data row behind.
             self.dead_rows += col.docs.values().filter(|e| e.row.is_some()).count();
+            // Drop the collection's FTS schema + field indexes.
+            self.fts.drop_collection(name);
             self.log.append(&Op::DropCollection {
                 collection: name.to_string(),
             })?;
@@ -57,6 +60,50 @@ impl Store {
             self.invalidate_scan_order();
         }
         Ok(())
+    }
+
+    /// Declare `collection`'s full-text-indexed fields (the per-collection FTS schema),
+    /// then build the field indexes from its existing live docs. Settable any time;
+    /// `create_collection_with_fts` is the up-front path that shares this code so a
+    /// fresh collection indexes incrementally from its first upsert with no build pass.
+    /// Redeclaring discards and rebuilds the affected field indexes.
+    pub fn set_fts_schema(
+        &mut self,
+        collection: &str,
+        fields: &[(String, Language)],
+    ) -> Result<()> {
+        self.check_writable()?;
+        // Implicitly create the collection if absent (matches set_meta / replay leniency).
+        self.collections
+            .entry(collection.to_string())
+            .or_insert_with(Collection::new);
+        self.log.append(&Op::SetFtsSchema {
+            collection: collection.to_string(),
+            fields: fields.to_vec(),
+        })?;
+        self.maybe_sync()?;
+        self.fts.set_schema(collection, fields);
+        // Build the field indexes from docs already in the collection (sorted ids →
+        // reproducible docnums). For a brand-new collection this loop is empty.
+        let col = &self.collections[collection];
+        let mut ids: Vec<&String> = col.docs.keys().collect();
+        ids.sort();
+        for id in ids {
+            let attrs = &col.docs[id].attrs;
+            self.fts.index_doc(collection, id, attrs);
+        }
+        Ok(())
+    }
+
+    /// Create `collection` (idempotent) and declare its full-text fields up front. The
+    /// recommended FTS path: indexing is fully incremental from the first upsert.
+    pub fn create_collection_with_fts(
+        &mut self,
+        name: &str,
+        fields: &[(String, Language)],
+    ) -> Result<()> {
+        self.create_collection(name)?;
+        self.set_fts_schema(name, fields)
     }
 
     pub fn set_meta(&mut self, collection: &str, meta: BTreeMap<String, String>) -> Result<()> {
@@ -246,12 +293,18 @@ impl Store {
         }
         let col = self.collections.get_mut(collection).unwrap();
         let ann_on = self.ann.is_some();
+        let fts_on = self.fts.is_active();
         let mut new_owners: Vec<(u64, String)> = Vec::new();
         let mut count = 0usize;
         for (id, row, attrs) in staged {
             // Only a vector-bearing new doc joins the ANN index.
             if ann_on && let Some(r) = row {
                 new_owners.push((r, id.clone()));
+            }
+            // Index the doc's text into any FTS fields (no-op if this collection has no
+            // schema). Done before the attrs move into the index. O(batch).
+            if fts_on {
+                self.fts.index_doc(collection, &id, &attrs);
             }
             // Overwriting a *rowed* doc leaves its old row dead.
             if let Some(old) = col.docs.insert(id, DocEntry { row, attrs })
@@ -299,6 +352,8 @@ impl Store {
             if old.row.is_some() {
                 self.dead_rows += 1;
             }
+            // Tombstone the doc in any FTS field indexes (no-op when none).
+            self.fts.remove_doc(collection, id);
             self.log.append(&Op::Delete {
                 collection: collection.to_string(),
                 id: id.to_string(),
@@ -396,6 +451,14 @@ impl Store {
                 });
             }
 
+            // Re-emit the FTS schema so a post-compact replay restores it.
+            if let Some(fields) = self.fts.schema_for(col_name) {
+                log_ops.push(Op::SetFtsSchema {
+                    collection: col_name.clone(),
+                    fields: fields.to_vec(),
+                });
+            }
+
             // Assign new rows to live docs (sorted by id for determinism).
             let mut doc_ids: Vec<&String> = col.docs.keys().collect();
             doc_ids.sort();
@@ -457,6 +520,10 @@ impl Store {
         //     failure must not fail the compaction.
         self.rebuild_ann();
         let _ = self.persist_index();
+
+        // 5c. Rebuild the FTS index from the live docs (drops tombstones, renumbers
+        //     docnums). Reads attrs, so it is unaffected by the row renumbering.
+        self.rebuild_fts();
 
         // 6. Rows were renumbered — drop the cached scan order.
         self.invalidate_scan_order();

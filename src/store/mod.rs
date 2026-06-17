@@ -19,6 +19,7 @@ use anyhow::{Result, anyhow, bail};
 use crate::ann::Ann;
 use crate::config::{Config, OpenMode};
 use crate::data::DataSegment;
+use crate::fts::Fts;
 use crate::lock::WriteLock;
 use crate::log::OpLog;
 use crate::model::{Distance, Op};
@@ -95,6 +96,10 @@ pub struct Store {
     /// `persist_index`/load). Lets `persist_index` skip a redundant write and tracks
     /// whether the on-disk `ann` cache is current. Meaningless when ANN is off.
     ann_dirty: bool,
+    /// Full-text (BM25) index, keyed per declared `(collection, field)`. Empty (inert)
+    /// until a collection declares an FTS schema; rebuilt from the live docs on open.
+    /// (The on-disk `fts` cache that lets open skip the rebuild lands in nidus-b6i.8.)
+    fts: Fts,
     /// True for in-memory stores (no backing directory) — they never persist the ANN
     /// cache. `open`ed (file-backed) stores set this false.
     in_memory: bool,
@@ -159,6 +164,7 @@ impl Store {
         // 5. Replay ops into the in-RAM index.
         let mut collections: HashMap<String, Collection> = HashMap::new();
         let mut dead_rows: usize = 0;
+        let mut fts = Fts::default();
 
         for op in ops {
             match op {
@@ -226,6 +232,15 @@ impl Store {
                         dead_rows += 1;
                     }
                 }
+                Op::SetFtsSchema { collection, fields } => {
+                    // The collection exists implicitly (matches SetMeta leniency); the
+                    // field indexes are (re)built from the live docs once replay finishes
+                    // (see `rebuild_fts`).
+                    collections
+                        .entry(collection.clone())
+                        .or_insert_with(Collection::new);
+                    fts.set_schema(&collection, &fields);
+                }
             }
         }
 
@@ -247,6 +262,7 @@ impl Store {
             quant,
             ann,
             ann_dirty: false,
+            fts,
             in_memory: false,
             row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
@@ -266,6 +282,9 @@ impl Store {
         // 8. Load the ANN index from its cache (incrementally catching up any rows
         //    added since), or rebuild it from the vectors if there is no valid cache.
         store.load_or_build_ann()?;
+        // 9. Build the FTS inverted index from the replayed docs (the schema was
+        //    restored during replay). A no-op when no collection declares FTS.
+        store.rebuild_fts();
 
         Ok(store)
     }
@@ -303,6 +322,7 @@ impl Store {
             quant,
             ann,
             ann_dirty: false,
+            fts: Fts::default(),
             in_memory: true,
             row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
@@ -441,5 +461,33 @@ impl Store {
             ann.insert_rows(&walk, &new_rows);
         }
         self.ann_dirty = true;
+    }
+
+    // ── FTS index lifecycle ───────────────────────────────────────────────────────
+
+    /// Rebuild the full-text index from all live docs (used on `open` after replay and
+    /// after `compact` renumbers). Clears the field indexes (keeping the declared
+    /// schema), then re-indexes every doc of every FTS collection in a deterministic
+    /// order (sorted collection, then sorted id) so docnums are reproducible. No-op when
+    /// FTS is inactive.
+    fn rebuild_fts(&mut self) {
+        if !self.fts.is_active() {
+            return;
+        }
+        self.fts.clear_indexes();
+        let mut col_names: Vec<String> = self.collections.keys().cloned().collect();
+        col_names.sort();
+        for col_name in &col_names {
+            if self.fts.schema_for(col_name).is_none() {
+                continue;
+            }
+            let col = &self.collections[col_name];
+            let mut ids: Vec<&String> = col.docs.keys().collect();
+            ids.sort();
+            for id in ids {
+                let attrs = &col.docs[id].attrs;
+                self.fts.index_doc(col_name, id, attrs);
+            }
+        }
     }
 }

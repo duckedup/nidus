@@ -12,14 +12,27 @@
 //! scores, so deletes/overwrites need no posting rewrite (they leave a tombstone the
 //! lookup skips). Pure safe Rust, Miri-clean, zero FFI.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+
+use crate::model::Value;
 
 mod analyzer;
 
 pub use analyzer::Language;
 pub(crate) use analyzer::analyze;
+
+/// The full text of attribute `field` for FTS purposes: a `Str` directly, a `List`
+/// joined by spaces (each element is its own run of terms), everything else empty.
+fn field_text(attrs: &BTreeMap<String, Value>, field: &str) -> String {
+    match attrs.get(field) {
+        Some(Value::Str(s)) => s.clone(),
+        Some(Value::List(items)) => items.join(" "),
+        _ => String::new(),
+    }
+}
 
 /// BM25 term-frequency saturation. Larger = term frequency matters more before
 /// saturating. The conventional default.
@@ -37,9 +50,6 @@ struct Posting {
 /// The BM25 inverted index for one `(collection, field)`. `docnum` is dense and
 /// FTS-local; `docnum_to_id[d]` is `None` once that doc is tombstoned (deleted or
 /// overwritten), and `id_to_docnum` is the authoritative live mapping.
-// Methods are exercised by tests now and wired into `crate::store` in the schema/
-// lifecycle tasks (nidus-b6i.6/.8); drop the allow as the call sites land.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct FieldIndex {
     lang: Language,
@@ -59,7 +69,6 @@ pub(crate) struct FieldIndex {
     tombstones: u32,
 }
 
-#[allow(dead_code)]
 impl FieldIndex {
     pub(crate) fn new(lang: Language) -> Self {
         Self {
@@ -187,12 +196,110 @@ impl FieldIndex {
 /// All FTS state for a store: the per-`(collection, field)` indexes plus the declared
 /// schema (`collection → [(field, language)]`). The schema is the source of truth for
 /// which attrs are full-text indexed; it is persisted via the op-log and replayed on
-/// open. Wired into [`crate::store`] in the schema/lifecycle tasks.
-#[allow(dead_code)] // wired into the store in nidus-b6i.6/.8
+/// open.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Fts {
     fields: HashMap<(String, String), FieldIndex>,
     schema: HashMap<String, Vec<(String, Language)>>,
+}
+
+impl Fts {
+    /// Whether any collection has declared full-text fields. When false the store skips
+    /// all FTS work on the hot path.
+    pub(crate) fn is_active(&self) -> bool {
+        !self.schema.is_empty()
+    }
+
+    /// The declared `(field, language)` list for `collection`, if any.
+    pub(crate) fn schema_for(&self, collection: &str) -> Option<&[(String, Language)]> {
+        self.schema.get(collection).map(Vec::as_slice)
+    }
+
+    /// Declare (or redeclare) `collection`'s full-text fields, discarding any existing
+    /// field indexes for it. The caller then re-indexes the collection's live docs.
+    pub(crate) fn set_schema(&mut self, collection: &str, fields: &[(String, Language)]) {
+        self.fields.retain(|(c, _), _| c != collection);
+        for (field, lang) in fields {
+            self.fields.insert(
+                (collection.to_string(), field.clone()),
+                FieldIndex::new(*lang),
+            );
+        }
+        self.schema.insert(collection.to_string(), fields.to_vec());
+    }
+
+    /// Index document `id`'s text into every declared field of `collection`. A field
+    /// with no text (absent / non-string attr) tombstones any prior value for that id,
+    /// so a doc only lives in a field's index while it has text there. No-op if the
+    /// collection has no FTS schema.
+    pub(crate) fn index_doc(
+        &mut self,
+        collection: &str,
+        id: &str,
+        attrs: &BTreeMap<String, Value>,
+    ) {
+        let Fts { fields, schema } = self;
+        let Some(decl) = schema.get(collection) else {
+            return;
+        };
+        for (field, _lang) in decl {
+            let Some(idx) = fields.get_mut(&(collection.to_string(), field.clone())) else {
+                continue;
+            };
+            let text = field_text(attrs, field);
+            if text.is_empty() {
+                idx.tombstone(id);
+            } else {
+                idx.index(id, &text);
+            }
+        }
+    }
+
+    /// Tombstone document `id` across all of `collection`'s field indexes (delete).
+    pub(crate) fn remove_doc(&mut self, collection: &str, id: &str) {
+        if let Some(decl) = self.schema.get(collection) {
+            for (field, _) in decl {
+                if let Some(idx) = self
+                    .fields
+                    .get_mut(&(collection.to_string(), field.clone()))
+                {
+                    idx.tombstone(id);
+                }
+            }
+        }
+    }
+
+    /// Drop `collection`'s schema and field indexes entirely (collection dropped).
+    pub(crate) fn drop_collection(&mut self, collection: &str) {
+        self.fields.retain(|(c, _), _| c != collection);
+        self.schema.remove(collection);
+    }
+
+    /// Reset every field index to empty (keeping the declared schema), so the caller can
+    /// re-index all live docs from scratch — used on compaction and on open.
+    pub(crate) fn clear_indexes(&mut self) {
+        for ((_, _), idx) in self.fields.iter_mut() {
+            let lang = idx.language();
+            *idx = FieldIndex::new(lang);
+        }
+    }
+
+    /// BM25-score `query_text` against `collection`.`field`, as `(id, score)` for live
+    /// matches. Empty when the field isn't indexed or nothing matches.
+    pub(crate) fn score(
+        &self,
+        collection: &str,
+        field: &str,
+        query_text: &str,
+    ) -> Vec<(&str, f32)> {
+        match self
+            .fields
+            .get(&(collection.to_string(), field.to_string()))
+        {
+            Some(idx) => idx.score(query_text),
+            None => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]

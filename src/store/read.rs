@@ -12,7 +12,7 @@ use super::scoring::{PARALLEL_SCAN_WORK_FLOOR, parallel_topk, score_chunk};
 use super::{ScanOrder, Store, oom};
 use crate::config::Config;
 use crate::filter;
-use crate::model::{Distance, Filter, Footprint, Hit, SearchOpts};
+use crate::model::{Distance, Filter, Footprint, FtsQuery, Hit, SearchOpts};
 use crate::search::{TopK, dot, euclidean_neg_sq, normalize};
 
 impl Store {
@@ -345,6 +345,55 @@ impl Store {
             }
             self.rank_scan(&q, scan, score_fn, opts)
         })
+    }
+
+    /// Full-text (BM25) search over `collections`, ranked by BM25 relevance for
+    /// `query.field`. Reuses the same `Hit`/`Filter`/top-k machinery as vector
+    /// `search`: each in-scope collection's matches are scored, the metadata `filter`
+    /// and `min_score` (here a **raw BM25** floor, not cosine) are applied, and one
+    /// bounded heap merges them into a single ranking. Text-only and vector-bearing
+    /// docs are both eligible — relevance is purely textual. Results are tie-broken by
+    /// `(collection, id)` for determinism.
+    pub fn text_search(
+        &self,
+        collections: &[&str],
+        query: &FtsQuery,
+        opts: &SearchOpts,
+    ) -> Result<Vec<Hit>> {
+        if opts.top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let mut topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
+        for &col_name in collections {
+            let Some(col) = self.collections.get(col_name) else {
+                continue;
+            };
+            for (id, score) in self.fts.score(col_name, &query.field, &query.text) {
+                if let Some(min) = opts.min_score
+                    && score < min
+                {
+                    continue;
+                }
+                // Hint-verify the id against the live index and apply the metadata
+                // filter (the FTS index can lag a delete until the next rebuild).
+                let Some(entry) = col.docs.get(id) else {
+                    continue;
+                };
+                if !filter::matches(&opts.filter, &entry.attrs) {
+                    continue;
+                }
+                topk.offer(score, (col_name, id));
+            }
+        }
+        let mut hits = self.hits_from_topk(topk);
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.collection.cmp(&b.collection))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(hits)
     }
 
     /// Score an already-gathered, in-scope, filter-passing scan exactly (f32) into

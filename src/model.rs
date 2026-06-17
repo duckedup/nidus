@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::fts::Language;
+
 /// The similarity / distance metric used for scoring. Pinned at store creation
 /// (stored in the data header) — reopening with a different metric is an error.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +302,28 @@ pub enum Predicate {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Filter(pub Vec<Predicate>);
 
+/// A full-text query: the indexed `field` to search and the raw query `text`. The text
+/// is analyzed (lowercase → tokenize → stopword → stem) with the field's configured
+/// language at query time, exactly as documents were at index time, so a query term
+/// matches a stored term when they share a stem.
+#[derive(Clone, Debug)]
+pub struct FtsQuery {
+    /// The full-text-indexed attribute field to search (declared in the FTS schema).
+    pub field: String,
+    /// Raw query text.
+    pub text: String,
+}
+
+impl FtsQuery {
+    /// A query over `field` for `text`.
+    pub fn new(field: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            text: text.into(),
+        }
+    }
+}
+
 /// Query parameters for a search.
 #[derive(Clone, Debug, Default)]
 pub struct SearchOpts {
@@ -373,5 +397,12 @@ pub enum Op {
         collection: String,
         id: String,
         attrs: BTreeMap<String, Value>,
+    },
+    /// Declare a collection's full-text-indexed fields (the FTS schema). Replayed on
+    /// open to rebuild the inverted index; re-emitted by `compact`. Appended at the end
+    /// for the same forward-compatibility reason as `UpsertText`.
+    SetFtsSchema {
+        collection: String,
+        fields: Vec<(String, Language)>,
     },
 }

@@ -518,6 +518,7 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         quant: None,
         ann: None,
         ann_dirty: false,
+        fts: crate::fts::Fts::default(),
         in_memory: true,
         row_to_doc: Vec::new(),
         scan_order: std::sync::RwLock::new(None),
@@ -2408,4 +2409,171 @@ fn text_only_docs_survive_reopen_and_compact() {
         .collect();
     text_only.sort();
     assert_eq!(text_only, vec!["t1", "t2"]);
+}
+
+// ── Full-text search (BM25) ─────────────────────────────────────────────────
+
+use crate::Language;
+use crate::model::FtsQuery;
+
+fn doc(id: &str, body: &str) -> Record {
+    let mut attrs = BTreeMap::new();
+    attrs.insert("body".to_string(), Value::Str(body.to_string()));
+    Record::text_only(id, attrs)
+}
+
+#[test]
+fn text_search_ranks_and_stems() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                doc("a", "the cat sat on the mat"),
+                doc("b", "cats are running and cats keep running"),
+                doc("c", "a dog barked loudly"),
+            ],
+        )
+        .unwrap();
+    let hits = store
+        .text_search(
+            &["docs"],
+            &FtsQuery::new("body", "running cats"),
+            &default_opts(10),
+        )
+        .unwrap();
+    // b mentions the query terms most; c matches nothing.
+    assert_eq!(hits[0].id, "b");
+    assert!(!hits.iter().any(|h| h.id == "c"));
+}
+
+#[test]
+fn text_search_indexes_docs_upserted_before_schema() {
+    // Declaring the schema after upserts must index the existing docs.
+    let mut store = Store::in_memory(3).unwrap();
+    store.upsert("docs", &[doc("a", "alpha beta")]).unwrap();
+    store
+        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .unwrap();
+    let hits = store
+        .text_search(
+            &["docs"],
+            &FtsQuery::new("body", "alpha"),
+            &default_opts(10),
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "a");
+}
+
+#[test]
+fn text_search_respects_filter_and_delete() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .unwrap();
+    let mut a = doc("a", "shared term");
+    a.attrs
+        .insert("lang".to_string(), Value::Str("rust".to_string()));
+    let mut b = doc("b", "shared term");
+    b.attrs
+        .insert("lang".to_string(), Value::Str("go".to_string()));
+    store.upsert("docs", &[a, b]).unwrap();
+
+    // Filter to lang=rust → only a.
+    let opts = SearchOpts {
+        top_k: 10,
+        filter: Filter(vec![Predicate::Eq(
+            "lang".to_string(),
+            Value::Str("rust".to_string()),
+        )]),
+        min_score: None,
+    };
+    let hits = store
+        .text_search(&["docs"], &FtsQuery::new("body", "shared"), &opts)
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["a"]
+    );
+
+    // Delete a → no longer found.
+    store.delete("docs", &["a"]).unwrap();
+    let hits = store
+        .text_search(
+            &["docs"],
+            &FtsQuery::new("body", "shared"),
+            &default_opts(10),
+        )
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["b"]
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn text_search_survives_reopen_and_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store
+            .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+            .unwrap();
+        store
+            .upsert(
+                "docs",
+                &[
+                    doc("a", "searching for needles"),
+                    doc("b", "haystack of hay"),
+                ],
+            )
+            .unwrap();
+        store.delete("docs", &["b"]).unwrap();
+        store.compact().unwrap();
+    }
+    let store = Store::open(Config::new(&path, 2)).unwrap();
+    let hits = store
+        .text_search(
+            &["docs"],
+            &FtsQuery::new("body", "needle"),
+            &default_opts(10),
+        )
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["a"]
+    );
+}
+
+#[test]
+fn hybrid_collection_text_and_vector_coexist() {
+    // A collection can hold vector docs and full-text fields on the same records.
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .unwrap();
+    let mut r = Record::new("a", vec![1.0, 0.0, 0.0], BTreeMap::new());
+    r.attrs.insert(
+        "body".to_string(),
+        Value::Str("vector and text together".to_string()),
+    );
+    store.upsert("docs", &[r]).unwrap();
+
+    // Vector search finds it.
+    let vhits = store
+        .search(&["docs"], &[1.0, 0.0, 0.0], &default_opts(10))
+        .unwrap();
+    assert_eq!(vhits.len(), 1);
+    // Text search finds it too.
+    let thits = store
+        .text_search(&["docs"], &FtsQuery::new("body", "text"), &default_opts(10))
+        .unwrap();
+    assert_eq!(thits.len(), 1);
+    assert_eq!(thits[0].id, "a");
 }
