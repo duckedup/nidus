@@ -90,9 +90,10 @@ Compiling a *large* C tree, or adding an `unsafe` block to *our* code, is a chan
 - SQL, a query planner, transactions spanning multiple operations, multi-writer
   concurrency, or replication.
 - A query *protocol* over the network was a non-goal; the opt-in `nidus serve` (§9)
-  has since shipped as a separate `cli`-feature wrapper, not a core change. Networked
-  *storage backends* (S3/GCS/Redis behind one trait) are now a designed seam (§13) —
-  that is where the *bytes* live, still distinct from a query protocol.
+  has since shipped as a separate `cli`-feature wrapper, not a core change. Pluggable
+  *persistence* backends (S3/GCS) and a shared *memory tier* (Redis/Valkey/Memcached)
+  are now a designed seam (§13) — that is where the *bytes* live and where the *warm
+  working set* is shared, still distinct from a query protocol.
 
 ---
 
@@ -267,7 +268,7 @@ backends designed in §13. Its objects:
 
 `data` and `log` are the **source of truth**; `ann`/`fts` are **derived caches**
 (an absent/stale/corrupt cache is rebuilt, never fatal — see `index_cache.rs`, §9).
-That two-tier split is what lets other backends (object stores, Redis) durably hold a
+That two-tier split is what lets object-store persistence backends (S3/GCS) durably hold a
 store without shipping the large, append-hostile index — see §13.
 
 ### 5.1 `data` — the vector segment
@@ -636,12 +637,13 @@ build until a real need exists.
   region instead of the in-RAM `Vec<f32>`. Gains zero-copy load, cross-process page
   sharing, >RAM. Cost: FFI (`unsafe`) — would relax the zero-FFI thesis, so it is a
   conscious future choice, not a default.
-- **Pluggable storage backends.** Generalize the §5 local directory into one
-  object-granular, sync `Backend` trait with implementations for local files, S3, GCS,
-  and Redis/Valkey, selected by URL scheme (`file://`, `s3://`, `gs://`, `redis://`).
-  The on-disk *object set* (`data`/`log` + derived caches) is unchanged — only *where*
-  the bytes live. Fully designed in §13; the gating choice is the cloud-TLS zero-FFI
-  decision (§13.6).
+- **Pluggable storage & memory backends.** Generalize the §5 local directory along two
+  orthogonal axes behind two sync traits: a **persistence** backend (durable `data`/`log`
+  — local files / S3 / GCS) and a shared **memory tier** (the warm working set — local RAM
+  / Redis / Valkey / Memcached), selected by URL scheme (`file://`, `s3://`, `gs://`;
+  `redis://`, `memcache://`). The on-disk *object set* (`data`/`log` + derived caches) is
+  unchanged — only *where the bytes live* and *whether the working set is shared*. Search
+  stays in local RAM, never over the wire. Fully designed in §13.
 
 ---
 
@@ -725,18 +727,42 @@ a `Config` (§4.1) and calls `Nidus::open(config)`. A search-only process opens 
 
 ---
 
-## 13. Storage backends (designed, not built)
+## 13. Storage & memory backends (designed, not built)
 
-§5 describes one backend: a local directory of files. This section generalizes that
-into a **pluggable storage layer** — the same in-RAM store, durably backed by local
-files, an object store (S3, GCS), or a remote key-value server (Redis/Valkey), behind
-one trait. It is **designed-for, not built**; it records the shape and the decisions
-so the choice stays legible (the seam listed in §9).
+§5 describes one configuration: a local directory, with vectors held in local process
+RAM. This section generalizes that along **two independent axes**, behind two small sync
+traits. It is **designed-for, not built** (the seam in §9).
 
-### 13.1 What a backend is — a durable container of named objects
+- **Persistence** — where the durable *source-of-truth* bytes (`data`/`log`) live:
+  **local files** (default), **S3**, or **GCS**. Optimized for durability and cost.
+- **Memory tier** — where the in-RAM *working set* is held for serving: **local process
+  RAM** (default), or a shared external in-memory store — **Redis, Valkey, Memcached**.
+  Optimized for fast access and sharing.
 
-A store is not intrinsically a directory; it is a small, fixed set of **named byte
-objects**, in two **classes** that drive the whole design:
+The axes are orthogonal and compose (e.g. truth in S3, working set shared via Redis, scan
+in local RAM); both default to local.
+
+### 13.1 Two axes, and why search is independent of both
+
+nidus searches with **CPU SIMD over a local, contiguous `Vec<f32>`** (exact cosine, the
+ANN walk, the quantized scan, BM25). You cannot run that over bytes on a socket, so
+**neither axis is ever in the query hot path**:
+
+- The **persistence** tier is the durable truth, read on `open` and synced on write.
+- The **memory** tier is a **shared, rebuildable cache of the in-RAM working set**, always
+  materialized into local RAM *before* a scan — never searched over the wire.
+
+So Redis/Valkey/Memcached are **not** persistence (S3 is cheaper and durable for that) and
+**not** a way to search data that never enters local RAM. They are the shared-memory
+**model (a)**: the working set lives in the external store so many stateless workers share
+one copy and a cold start skips the rebuild — but each worker still loads it into its own
+RAM to serve. Neither axis makes nidus larger-than-RAM (§9 mmap remains the only path to
+that).
+
+### 13.2 Persistence backends (the durable source of truth)
+
+A persisted store is not intrinsically a directory; it is a small, fixed set of **named
+byte objects** in two **classes**:
 
 | object | class | reconstructable? | local discipline (§5/§6) |
 |---|---|---|---|
@@ -747,106 +773,113 @@ objects**, in two **classes** that drive the whole design:
 
 - **Source of truth** (`data`, `log`) must be durable and is append-shaped — small,
   incremental streams.
-- **Derived caches** (`ann`, `fts`, and the in-RAM quant matrices) are *reconstructable*
-  from data/log; a missing/stale/corrupt cache is never fatal (§9, `index_cache.rs`). A
-  backend may persist them or **drop and rebuild on open**.
+- **Derived caches** (`ann`, `fts`, the in-RAM quant matrices) are *reconstructable* from
+  data/log; a missing/stale/corrupt cache is never fatal (§9, `index_cache.rs`). A backend
+  may persist them or **drop and rebuild on open**.
 
-This split is what makes non-local backends tractable: only `data`+`log` must be shipped
-durably; the large, append-hostile index (the HNSW graph) is exactly the artifact a
-backend is free to discard.
+Only `data`+`log` must be shipped durably; the large, append-hostile HNSW graph is exactly
+the artifact a backend is free to discard. Members:
 
-### 13.2 The trait — object-granular, sync
-
-The trait is the **common denominator** of what local files, object stores, and KV
-servers can all do — whole-object put/get/list/delete — plus an **optional append
-capability** that local and Redis implement natively and object stores emulate:
-
-```rust
-// sketch — not final
-pub trait Backend: Send + Sync {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;     // whole object
-    fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;    // atomic whole-object write
-    fn delete(&self, key: &str) -> Result<()>;
-    fn list(&self) -> Result<Vec<String>>;
-
-    // Capability: incremental durable append. Local = append+fsync; Redis = APPEND/
-    // streams; object stores = None → caller falls back to whole-object rewrite/segments.
-    fn appender(&self, key: &str) -> Option<Box<dyn Appender>> { None }
-
-    // Best-effort exclusion (§6.3). Local = O_EXCL file; cloud = conditional-PUT; None.
-    fn try_lock(&self, key: &str, ttl: Duration) -> Result<Option<Lock>>;
-}
-```
-
-**Sync, deliberately** (consistent with §6.5):
-
-1. Search is CPU-over-RAM and never touches the backend (§13.4) — there is no query IO
-   to make async.
-2. Every backend *can* be sync: the sans-IO S3/GCS crates pair with a blocking HTTP
-   client; `redis-rs` has a blocking mode; local files are sync.
-3. A sync trait is `dyn`-safe out of the box → genuine runtime plug-and-play
-   (`Box<dyn Backend>`). Async trait methods are not `dyn`-safe without `async-trait`
-   (boxed futures), which makes plug-and-play *worse*.
-4. An async core would have an enormous blast radius against the §6.5 sync design, for
-   no payoff on the non-bottleneck path.
-
-> Decision: a backend whose only client is async (e.g. `google-cloud-storage`) owns a
-> small runtime and `block_on`s **internally** — the async is quarantined inside that
-> one impl; the trait and core stay sync. (`block_on` panics if called from within a
-> caller's existing async context; the documented `spawn_blocking` integration (§12)
-> avoids that.)
-
-Selection is by **URL scheme**: `file://`, `s3://`, `gs://`, `redis://`.
-
-### 13.3 The backends
-
-| backend | crate (pure-Rust, sans-IO / blocking) | append? | auth crypto | TLS |
+| backend | crate (pure-Rust, sans-IO / blocking) | append? | auth | TLS |
 |---|---|---|---|---|
-| Local FS | `std::fs` | native (fsync) | — | — |
-| Redis / Valkey | `redis` (blocking) | native (`APPEND`/streams) | — | only `rediss://` |
-| Amazon S3 (+ R2/MinIO) | `rusty-s3` (sans-IO) + blocking HTTP | none (whole-object) | Sigv4 = HMAC-SHA256 (pure RustCrypto) | yes |
-| Google Cloud Storage | `tame-gcs` (sans-IO) + blocking HTTP | none (whole-object) | OAuth2 svc-account = RSA-JWT | yes |
+| Local FS (default) | `std::fs` | native (fsync) | — | — |
+| Amazon S3 (+ R2/MinIO) | `rusty-s3` (sans-IO) + blocking HTTP | none (whole-object) | Sigv4 = HMAC-SHA256 (pure RustCrypto) | yes (§13.6) |
+| Google Cloud Storage | `tame-gcs` (sans-IO) + blocking HTTP | none (whole-object) | OAuth2 svc-account = RSA-JWT | yes (§13.6) |
 
 S3 and GCS are **different APIs needing different clients** — not one "cloud" backend.
 `rusty-s3`/`tame-gcs` are sans-IO (build/sign requests, parse responses; bring your own
 transport), so the SDK layer itself adds no async and no TLS.
 
-### 13.4 Effect on functionality and speed
+### 13.3 Memory tier (the shared working set)
 
-**Search is backend-independent.** Every search path — exact cosine, ANN walk
-(HNSW/IVF), int8/binary two-pass, BM25, hybrid RRF — runs over **in-RAM** structures.
-The backend is never in the query hot path, so query *results and latency are identical*
-across all backends. What changes, and only for network backends:
+Where the in-RAM working state (the vectors + the derived indexes) is held so it can be
+**shared across processes** and **reloaded without a rebuild**:
 
-| op | local | network (S3/GCS/Redis) |
+| tier | crate | role |
 |---|---|---|
-| search | RAM | **identical** — RAM |
-| `open` | one bulk read | **download data/log into RAM**, then rebuild caches (one-time; grows with size) |
-| write durability | fsync (~0.1–2 ms) | **network round-trip** (Redis sub-ms–ms; S3/GCS ~20–100 ms+) |
-| append | native | Redis native; S3/GCS → whole-object rewrite (**O(store)**) or segmented objects (incremental, a real engine addition) |
+| Local process RAM (default) | — (`Vec<f32>`) | the working set *is* the process heap; nothing shared |
+| Redis / Valkey | `redis` (blocking, plain TCP) | shared, rebuildable cache of the working set across workers |
+| Memcached | pure-Rust client | same, but **evictable** — weakest; cache-only, never authoritative |
 
-So the cloud tradeoff is **cheaper near-incremental writes** (ship only the small
-`data`/`log` delta; drop+rebuild `ann`/`fts`) for a **costlier `open`** (rebuild from the
-download) — which fits nidus's load-once-serve-many shape.
+It is **model (a)** throughout: the external store is a *shared cache* of the serialized
+in-RAM state (the same thing `index_cache.rs` writes locally, §9 — just shared/remote and
+covering the vectors too). It is **rebuildable from the persistence tier**, so an empty or
+evicted store is never fatal — exactly the derived-cache contract. Wins: N stateless search
+workers share one copy instead of each rebuilding; restart is a load, not a rebuild.
 
-> Expectation to name: a network backend does **not** make nidus larger-than-RAM. The
-> whole store still loads into the process and search still runs in RAM; the backend
-> only changes where the bytes durably live (and enables shared state across processes).
-> Larger-than-RAM remains the separate, deferred mmap/spill seam (§9).
+Pure-Rust and sync: `redis-rs` blocking mode over plain TCP (`redis://`) needs **no TLS**;
+Valkey is a drop-in Redis fork (same protocol). Memcached has no persistence, no data
+structures, and evicts at will — usable only as a throwaway cache tier.
 
-### 13.5 Two usage modes (both supported)
+### 13.4 The traits — object-granular, sync (both axes)
 
-- **Live backing store.** A store's `data`/`log` (and optionally caches) live on the
-  backend; writes durably round-trip per §13.4. Best for low-write-rate / dev /
-  small-scale use (nidus's positioning) and, for Redis, shared state across processes.
-- **Snapshot / backup.** PUT/GET the whole store as one archive (the existing
-  `cli`-feature `tar.gz`). This is *exactly* object-granular, so all backends do it
-  trivially and the live local path is untouched — the simplest first increment.
+Two small traits, one per axis. The persistence trait is the **common denominator** of
+local files / S3 / GCS — whole-object put/get/list/delete plus an **optional append**
+capability (local native; object stores emulate). The memory trait is load/store of the
+shared working-set blob:
 
-### 13.6 The zero-FFI decision — RESOLVED: pragmatic, under a hard build-time budget
+```rust
+// sketch — not final
+pub trait Persistence: Send + Sync {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;     // whole object
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;    // atomic whole-object write
+    fn delete(&self, key: &str) -> Result<()>;
+    fn list(&self) -> Result<Vec<String>>;
+    fn appender(&self, key: &str) -> Option<Box<dyn Appender>> { None } // local native; cloud None
+    fn try_lock(&self, key: &str, ttl: Duration) -> Result<Option<Lock>>; // O_EXCL / conditional-PUT
+}
 
-The thesis (§1) forbids C/`*-sys`. S3/GCS need HTTPS → a TLS stack. Resolved dependency
-trees confirm the wall and the one escape:
+pub trait MemoryTier: Send + Sync {        // local RAM is the trivial impl
+    fn load(&self, key: &str) -> Result<Option<Vec<u8>>>;     // pull the shared working set
+    fn store(&self, key: &str, bytes: &[u8], ttl: Option<Duration>) -> Result<()>;
+}
+```
+
+**Sync, deliberately** (consistent with §6.5):
+
+1. Search is CPU-over-RAM and never touches either backend (§13.1) — no query IO to make async.
+2. Every backend *can* be sync: sans-IO S3/GCS + a blocking HTTP client; `redis-rs`
+   blocking; local files and local RAM are sync.
+3. A sync trait is `dyn`-safe out of the box → genuine runtime plug-and-play. Async trait
+   methods are not `dyn`-safe without `async-trait` (boxed futures) — worse plug-and-play.
+4. An async core has an enormous blast radius against the §6.5 sync design, for no payoff
+   on the non-bottleneck path.
+
+> Decision: a backend whose only client is async owns a small runtime and `block_on`s
+> **internally** — quarantined inside that one impl; the traits and core stay sync.
+> (`block_on` panics inside a caller's async context; the `spawn_blocking` integration
+> (§12) avoids that.)
+
+Selection is by **URL scheme** — persistence: `file://`, `s3://`, `gs://`; memory: local
+(default), `redis://`, `memcache://`.
+
+### 13.5 Effect on speed (independent of both axes)
+
+**Search is backend-independent.** Every path — exact cosine, ANN walk (HNSW/IVF),
+int8/binary two-pass, BM25, hybrid RRF — runs over **in-RAM** structures, so query
+*results and latency are identical* regardless of persistence or memory tier. What
+changes is only `open`/cold-start and writes:
+
+| op | local FS + local RAM | network persistence (S3/GCS) | shared memory tier (Redis/Valkey) |
+|---|---|---|---|
+| search | RAM | identical — RAM | identical — RAM |
+| `open` / cold start | bulk read + (maybe) rebuild caches | download `data`/`log`, rebuild caches | **load prebuilt working set** (skip rebuild) |
+| write durability | fsync (~0.1–2 ms) | round-trip (~20–100 ms+); append → whole-object rewrite **O(store)** or segments | n/a (truth is the persistence tier) |
+
+So the persistence tradeoff is **cheaper near-incremental writes** (ship the small
+`data`/`log` delta; drop+rebuild `ann`/`fts`) for a **costlier `open`**; the memory tier's
+payoff is the opposite end — a **fast, shared cold start** (load the working set instead of
+rebuilding it).
+
+> Neither axis makes nidus larger-than-RAM. The working set still lives in each process's
+> RAM to be scanned; the tiers only change *where the durable bytes live* and *whether the
+> warm working set is shared*. Larger-than-RAM stays the deferred mmap/spill seam (§9).
+
+### 13.6 Persistence build-time / TLS decision (S3/GCS only) — RESOLVED
+
+This concerns **only the S3/GCS persistence backends** — they need HTTPS, hence a TLS
+stack. The memory tier (Redis/Valkey/Memcached) is plain TCP, pure-Rust, and **unaffected**.
+Resolved dependency trees confirm the wall and the one escape:
 
 - `rustls` defaults to `aws-lc-sys` (C); its `ring` provider compiles C+asm; `reqwest`'s
   rustls path pulls `ring`; `google-cloud-storage` pulls `ring` **and** OpenSSL.
@@ -884,6 +917,16 @@ and **(B) purist** — hold zero-FFI via `rustls-rustcrypto` + hand-rolled auth.
 > is *not* a capacity upgrade: S3/GCS change where bytes durably live, not the
 > RAM-bound search model (§13.4) — "outgrow" means durability/sharing, not larger-than-RAM.
 
-Redis over plain TCP (`redis://`) needs no TLS; only `rediss://` exercises `ring`'s TLS.
-Local FS needs nothing. **The standing guardrail: the whole crate's clean build stays
-under a minute — CI asserts it (§9, the build-time gate).**
+The memory tier over plain TCP (`redis://`, `memcache://`) needs no TLS; only a TLS'd
+persistence target (`s3://`, `gs://`, or `rediss://` if ever used) exercises `ring`. Local
+FS needs nothing. **The standing guardrail: the whole crate's clean build stays under a
+minute — CI asserts it (§9, the build-time gate).**
+
+### 13.7 Persistence usage modes (both supported)
+
+- **Live backing store.** A store's `data`/`log` (and optionally caches) live on the
+  persistence backend; writes durably round-trip per §13.5. Best for low-write-rate / dev /
+  small-scale use (nidus's positioning).
+- **Snapshot / backup.** PUT/GET the whole store as one archive (the existing `cli`-feature
+  `tar.gz`). This is *exactly* object-granular, so every persistence backend does it
+  trivially and the live local path is untouched — the simplest first increment.
