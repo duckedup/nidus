@@ -335,6 +335,36 @@ pub struct SearchOpts {
     pub min_score: Option<f32>,
 }
 
+/// Options for a hybrid (vector + BM25) search, fused with Reciprocal Rank Fusion.
+///
+/// RRF ranks by *position* in each leg, not raw score, so the incomparable scales of
+/// cosine/euclidean/dot-product and unbounded BM25 never need normalizing, and a doc
+/// missing from one leg is carried by the other. There is no `min_score`: a fused RRF
+/// score has no interpretable scale (threshold the legs via the pure methods instead).
+#[derive(Clone, Debug)]
+pub struct HybridOpts {
+    /// Final result count after fusion.
+    pub top_k: usize,
+    /// Metadata filter applied to *both* legs before fusion.
+    pub filter: Filter,
+    /// RRF rank-bias constant `k`: larger flattens the weight of top ranks. Default 60.
+    pub rrf_k: f32,
+    /// How deep to pull each leg before fusing (clamped up to at least `top_k`). Larger
+    /// improves fusion recall at linear cost. Default 100.
+    pub candidates: usize,
+}
+
+impl Default for HybridOpts {
+    fn default() -> Self {
+        Self {
+            top_k: 10,
+            filter: Filter::default(),
+            rrf_k: 60.0,
+            candidates: 100,
+        }
+    }
+}
+
 /// One search result. Carries its source `collection` (ids are unique only within a
 /// collection) and the matched record's `attrs`, but deliberately not its vector.
 #[derive(Clone, Debug, PartialEq)]

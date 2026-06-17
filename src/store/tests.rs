@@ -2577,3 +2577,80 @@ fn hybrid_collection_text_and_vector_coexist() {
     assert_eq!(thits.len(), 1);
     assert_eq!(thits[0].id, "a");
 }
+
+use crate::model::HybridOpts;
+
+#[test]
+fn hybrid_search_fuses_vector_and_text() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .unwrap();
+    // a: strong vector match, weak text. b: weak vector, strong text. c: text-only.
+    let mut a = Record::new("a", vec![1.0, 0.0, 0.0], BTreeMap::new());
+    a.attrs.insert(
+        "body".to_string(),
+        Value::Str("unrelated words".to_string()),
+    );
+    let mut b = Record::new("b", vec![0.0, 1.0, 0.0], BTreeMap::new());
+    b.attrs.insert(
+        "body".to_string(),
+        Value::Str("quantum physics lecture".to_string()),
+    );
+    let c = doc("c", "quantum physics quantum physics");
+    store.upsert("docs", &[a, b, c]).unwrap();
+
+    let opts = HybridOpts {
+        top_k: 10,
+        ..Default::default()
+    };
+    let hits = store
+        .hybrid_search(
+            &["docs"],
+            &[1.0, 0.0, 0.0],
+            &FtsQuery::new("body", "quantum physics"),
+            &opts,
+        )
+        .unwrap();
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    // All three surface: a via the vector leg, b and c via the text leg.
+    assert!(ids.contains(&"a"));
+    assert!(ids.contains(&"b"));
+    assert!(
+        ids.contains(&"c"),
+        "text-only doc ranked by its BM25 leg alone"
+    );
+    // Fused scores are descending.
+    for w in hits.windows(2) {
+        assert!(w[0].score >= w[1].score);
+    }
+}
+
+#[test]
+fn hybrid_search_is_deterministic() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                doc("x", "alpha beta"),
+                doc("y", "alpha gamma"),
+                doc("z", "beta gamma"),
+            ],
+        )
+        .unwrap();
+    let opts = HybridOpts::default();
+    let q = FtsQuery::new("body", "alpha beta");
+    let a = store
+        .hybrid_search(&["docs"], &[0.0, 0.0, 0.0], &q, &opts)
+        .unwrap();
+    let b = store
+        .hybrid_search(&["docs"], &[0.0, 0.0, 0.0], &q, &opts)
+        .unwrap();
+    let ids_a: Vec<&str> = a.iter().map(|h| h.id.as_str()).collect();
+    let ids_b: Vec<&str> = b.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids_a, ids_b);
+}

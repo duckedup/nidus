@@ -4,7 +4,7 @@
 //! and the approximate [`search_ann`](Store::search_ann). The quantized first-pass
 //! search it dispatches to lives in [`super::quant`].
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::Result;
 
@@ -12,7 +12,7 @@ use super::scoring::{PARALLEL_SCAN_WORK_FLOOR, parallel_topk, score_chunk};
 use super::{ScanOrder, Store, oom};
 use crate::config::Config;
 use crate::filter;
-use crate::model::{Distance, Filter, Footprint, FtsQuery, Hit, SearchOpts};
+use crate::model::{Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts, SearchOpts, Value};
 use crate::search::{TopK, dot, euclidean_neg_sq, normalize};
 
 impl Store {
@@ -393,6 +393,63 @@ impl Store {
                 .then_with(|| a.collection.cmp(&b.collection))
                 .then_with(|| a.id.cmp(&b.id))
         });
+        Ok(hits)
+    }
+
+    /// Hybrid search: fuse a vector query and a BM25 text query into one ranking with
+    /// Reciprocal Rank Fusion. Each leg is run independently (reusing
+    /// [`search`](Self::search) and [`text_search`](Self::text_search) with the shared
+    /// `filter`, pulled `candidates` deep), then a doc's fused score is the sum over the
+    /// legs of `1 / (rrf_k + rank + 1)`. A doc present in only one leg is carried by it.
+    /// Results are tie-broken by `(collection, id)` for determinism.
+    pub fn hybrid_search(
+        &self,
+        collections: &[&str],
+        vector: &[f32],
+        text: &FtsQuery,
+        opts: &HybridOpts,
+    ) -> Result<Vec<Hit>> {
+        if opts.top_k == 0 {
+            return Ok(Vec::new());
+        }
+        // Pull each leg at least `top_k` deep so fusion can fill `top_k`.
+        let leg_opts = SearchOpts {
+            top_k: opts.candidates.max(opts.top_k),
+            filter: opts.filter.clone(),
+            min_score: None,
+        };
+        let vector_leg = self.search(collections, vector, &leg_opts)?;
+        let text_leg = self.text_search(collections, text, &leg_opts)?;
+
+        // Fuse by reciprocal rank, keyed by (collection, id), carrying attrs.
+        let k = opts.rrf_k;
+        let mut fused: HashMap<(String, String), (f32, BTreeMap<String, Value>)> = HashMap::new();
+        for (rank, h) in vector_leg.into_iter().enumerate() {
+            let e = fused.entry((h.collection, h.id)).or_insert((0.0, h.attrs));
+            e.0 += 1.0 / (k + rank as f32 + 1.0);
+        }
+        for (rank, h) in text_leg.into_iter().enumerate() {
+            let e = fused.entry((h.collection, h.id)).or_insert((0.0, h.attrs));
+            e.0 += 1.0 / (k + rank as f32 + 1.0);
+        }
+
+        let mut hits: Vec<Hit> = fused
+            .into_iter()
+            .map(|((collection, id), (score, attrs))| Hit {
+                collection,
+                id,
+                score,
+                attrs,
+            })
+            .collect();
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.collection.cmp(&b.collection))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        hits.truncate(opts.top_k);
         Ok(hits)
     }
 

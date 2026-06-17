@@ -43,8 +43,8 @@ pub use anyhow::Result;
 pub use config::{Config, Fsync, OpenMode};
 pub use fts::Language;
 pub use model::{
-    AnnConfig, AnnKind, Distance, Filter, Footprint, FtsQuery, Hit, Predicate, QuantKind,
-    Quantization, Record, SearchOpts, Value,
+    AnnConfig, AnnKind, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts, Predicate,
+    QuantKind, Quantization, Record, SearchOpts, Value,
 };
 
 use std::collections::BTreeMap;
@@ -241,6 +241,26 @@ impl Nidus {
         };
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.text_search(&refs, query, opts)
+    }
+
+    /// Hybrid search over a [`Scope`]: fuse a vector query and a BM25 text query into a
+    /// single ranking with Reciprocal Rank Fusion (see [`HybridOpts`]). A doc that
+    /// surfaces in only one leg (e.g. a text-only doc, or one whose vector matches but
+    /// whose text does not) is still ranked by that leg.
+    pub fn hybrid_search<'a>(
+        &self,
+        scope: impl Into<Scope<'a>>,
+        vector: &[f32],
+        text: &FtsQuery,
+        opts: &HybridOpts,
+    ) -> Result<Vec<Hit>> {
+        let names: Vec<String> = match scope.into() {
+            Scope::Collection(c) => vec![c.to_string()],
+            Scope::Collections(cs) => cs.iter().map(|s| s.to_string()).collect(),
+            Scope::All => self.store.collections(),
+        };
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.store.hybrid_search(&refs, vector, text, opts)
     }
 
     // ── Maintenance ──────────────────────────────────────────────────────
