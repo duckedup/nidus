@@ -93,7 +93,13 @@ pub struct HybridSearchRequest {
 }
 
 /// Body of `POST /collections/{name}/fts-schema`: the attribute fields to full-text
-/// index (US English analyzer).
+/// index. Every field uses the US English analyzer — the only [`Language`] today.
+///
+/// Forward-compat note: when a second language ships, expressing per-field language
+/// over the wire means evolving `fields` from `Vec<String>` to a typed
+/// `Vec<{ field, language }>`. That is a breaking wire change, deliberately deferred
+/// until there is a second language to choose (the library API already takes
+/// `(field, Language)` pairs, so only this DTO + handler need to grow).
 #[derive(Debug, Deserialize)]
 pub struct FtsSchemaRequest {
     pub fields: Vec<String>,

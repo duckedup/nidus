@@ -133,11 +133,11 @@ impl FieldIndex {
         }
     }
 
-    /// Live BM25 score for every doc matching at least one term of `query_text`, as
-    /// `(id, score)`. Unranked (the caller feeds these into the shared top-k heap so
-    /// scope/filter/top-k apply uniformly with vector search).
-    pub(crate) fn score(&self, query_text: &str) -> Vec<(&str, f32)> {
-        let query_terms = analyze(query_text, self.lang);
+    /// Live BM25 score for every doc matching at least one already-analyzed
+    /// `query_term`, as `(id, score)`. Unranked (the caller feeds these into the shared
+    /// top-k heap so scope/filter/top-k apply uniformly with vector search). Takes
+    /// pre-analyzed terms so a multi-collection query is analyzed once, not per field.
+    pub(crate) fn score(&self, query_terms: &[String]) -> Vec<(&str, f32)> {
         if query_terms.is_empty() || self.doc_count == 0 {
             return Vec::new();
         }
@@ -149,7 +149,7 @@ impl FieldIndex {
         // De-dup query terms: a repeated query term doesn't change BM25 here (we score
         // document term frequency, not query term frequency).
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for term in &query_terms {
+        for term in query_terms {
             if !seen.insert(term.as_str()) {
                 continue;
             }
@@ -220,18 +220,45 @@ impl Fts {
         let mut key = vec![FTS_CACHE_VERSION];
         key.extend_from_slice(&K1.to_le_bytes());
         key.extend_from_slice(&B.to_le_bytes());
-        // BTreeMap iterates key-sorted, so the encoding is deterministic.
+        // BTreeMap iterates key-sorted, so the encoding is deterministic. Serializing a
+        // BTreeMap of owned/Copy types is infallible; a silent drop here would weaken the
+        // cache's validity (two schemas could share a key), so we assert rather than skip.
         let sorted: std::collections::BTreeMap<&String, &Vec<(String, Language)>> =
             self.schema.iter().collect();
-        if let Ok(bytes) = bincode::serialize(&sorted) {
-            key.extend_from_slice(&bytes);
-        }
+        let bytes = bincode::serialize(&sorted).expect("FTS schema serialization is infallible");
+        key.extend_from_slice(&bytes);
         key
     }
 
     /// The declared `(field, language)` list for `collection`, if any.
     pub(crate) fn schema_for(&self, collection: &str) -> Option<&[(String, Language)]> {
         self.schema.get(collection).map(Vec::as_slice)
+    }
+
+    /// The analyzer language declared for `collection`.`field`, if it is indexed.
+    pub(crate) fn field_language(&self, collection: &str, field: &str) -> Option<Language> {
+        self.fields
+            .get(&(collection.to_string(), field.to_string()))
+            .map(FieldIndex::language)
+    }
+
+    /// Fraction of indexed docs that are tombstoned (dead) across all field indexes —
+    /// the FTS analog of the dead-row ratio, used to trigger an auto-compact rebuild for
+    /// text-only workloads (whose deletes leave no data rows). `0.0` when nothing is
+    /// indexed. Reads the per-field `tombstones`/`doc_count`.
+    pub(crate) fn tombstone_ratio(&self) -> f32 {
+        let mut tomb: u64 = 0;
+        let mut live: u64 = 0;
+        for idx in self.fields.values() {
+            tomb += idx.tombstones as u64;
+            live += idx.doc_count;
+        }
+        let total = tomb + live;
+        if total == 0 {
+            0.0
+        } else {
+            tomb as f32 / total as f32
+        }
     }
 
     /// Declare (or redeclare) `collection`'s full-text fields, discarding any existing
@@ -303,19 +330,21 @@ impl Fts {
         }
     }
 
-    /// BM25-score `query_text` against `collection`.`field`, as `(id, score)` for live
-    /// matches. Empty when the field isn't indexed or nothing matches.
+    /// BM25-score already-analyzed `query_terms` against `collection`.`field`, as
+    /// `(id, score)` for live matches. Empty when the field isn't indexed or nothing
+    /// matches. The caller analyzes the query once (per [`field_language`]) and reuses
+    /// the term list across collections.
     pub(crate) fn score(
         &self,
         collection: &str,
         field: &str,
-        query_text: &str,
+        query_terms: &[String],
     ) -> Vec<(&str, f32)> {
         match self
             .fields
             .get(&(collection.to_string(), field.to_string()))
         {
-            Some(idx) => idx.score(query_text),
+            Some(idx) => idx.score(query_terms),
             None => Vec::new(),
         }
     }
@@ -333,10 +362,15 @@ mod tests {
         idx
     }
 
+    /// Analyze a query string into terms (the analysis the store does once per query).
+    fn q(query: &str) -> Vec<String> {
+        analyze(query, Language::English)
+    }
+
     /// `score` ranked descending, for assertions.
     fn ranked(idx: &FieldIndex, query: &str) -> Vec<(String, f32)> {
         let mut v: Vec<(String, f32)> = idx
-            .score(query)
+            .score(&q(query))
             .into_iter()
             .map(|(id, s)| (id.to_string(), s))
             .collect();
@@ -364,8 +398,8 @@ mod tests {
     fn query_is_stemmed_to_match_documents() {
         let idx = idx_with(&[("d1", "developers love running tests")]);
         // "run" (query) stems to the same root as "running" (doc).
-        assert_eq!(idx.score("run").len(), 1);
-        assert_eq!(idx.score("RUNNING").len(), 1);
+        assert_eq!(idx.score(&q("run")).len(), 1);
+        assert_eq!(idx.score(&q("RUNNING")).len(), 1);
     }
 
     #[test]
@@ -375,7 +409,7 @@ mod tests {
         idx.tombstone("d1");
         assert_eq!(idx.doc_count, 1);
         assert!(!idx.contains("d1"));
-        let hits = idx.score("alpha");
+        let hits = idx.score(&q("alpha"));
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, "d2");
     }
@@ -385,8 +419,8 @@ mod tests {
         let mut idx = idx_with(&[("d1", "alpha beta")]);
         idx.index("d1", "gamma delta");
         assert_eq!(idx.doc_count, 1); // still one live doc
-        assert!(idx.score("alpha").is_empty(), "old term gone");
-        assert_eq!(idx.score("gamma").len(), 1, "new term present");
+        assert!(idx.score(&q("alpha")).is_empty(), "old term gone");
+        assert_eq!(idx.score(&q("gamma")).len(), 1, "new term present");
     }
 
     #[test]
@@ -394,7 +428,7 @@ mod tests {
         // A term present in all docs has df == N; the BM25+ `1 +` keeps idf > 0, so
         // scores never go negative (which would invert ranking).
         let idx = idx_with(&[("d1", "common"), ("d2", "common"), ("d3", "common")]);
-        let hits = idx.score("common");
+        let hits = idx.score(&q("common"));
         assert_eq!(hits.len(), 3);
         assert!(
             hits.iter().all(|(_, s)| *s > 0.0),
@@ -420,9 +454,9 @@ mod tests {
     #[test]
     fn empty_and_unknown_queries_return_nothing() {
         let idx = idx_with(&[("d1", "alpha")]);
-        assert!(idx.score("").is_empty());
-        assert!(idx.score("the and of").is_empty()); // all stopwords
-        assert!(idx.score("zzz").is_empty()); // unknown term
+        assert!(idx.score(&q("")).is_empty());
+        assert!(idx.score(&q("the and of")).is_empty()); // all stopwords
+        assert!(idx.score(&q("zzz")).is_empty()); // unknown term
     }
 
     #[test]

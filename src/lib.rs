@@ -186,6 +186,17 @@ impl Nidus {
         self.store.get_all(collection)
     }
 
+    /// Resolve a [`Scope`] to the concrete collection names it covers — shared by
+    /// `list`/`search`/`text_search`/`hybrid_search` so the resolution lives in one
+    /// place.
+    fn scope_names<'a>(&self, scope: impl Into<Scope<'a>>) -> Vec<String> {
+        match scope.into() {
+            Scope::Collection(c) => vec![c.to_string()],
+            Scope::Collections(cs) => cs.iter().map(|s| s.to_string()).collect(),
+            Scope::All => self.store.collections(),
+        }
+    }
+
     /// List records matching `filter` across a [`Scope`], without vector scoring.
     /// Skips `offset` matches and returns up to `limit` more, in insertion order,
     /// all with `score: 0.0`. Pass `offset = 0` for the first page; advance by
@@ -197,11 +208,7 @@ impl Nidus {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<Hit>> {
-        let names: Vec<String> = match scope.into() {
-            Scope::Collection(c) => vec![c.to_string()],
-            Scope::Collections(cs) => cs.iter().map(|s| s.to_string()).collect(),
-            Scope::All => self.store.collections(),
-        };
+        let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.list(&refs, filter, offset, limit)
     }
@@ -214,11 +221,7 @@ impl Nidus {
         query: &[f32],
         opts: &SearchOpts,
     ) -> Result<Vec<Hit>> {
-        let names: Vec<String> = match scope.into() {
-            Scope::Collection(c) => vec![c.to_string()],
-            Scope::Collections(cs) => cs.iter().map(|s| s.to_string()).collect(),
-            Scope::All => self.store.collections(),
-        };
+        let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.search(&refs, query, opts)
     }
@@ -234,11 +237,7 @@ impl Nidus {
         query: &FtsQuery,
         opts: &SearchOpts,
     ) -> Result<Vec<Hit>> {
-        let names: Vec<String> = match scope.into() {
-            Scope::Collection(c) => vec![c.to_string()],
-            Scope::Collections(cs) => cs.iter().map(|s| s.to_string()).collect(),
-            Scope::All => self.store.collections(),
-        };
+        let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.text_search(&refs, query, opts)
     }
@@ -254,11 +253,7 @@ impl Nidus {
         text: &FtsQuery,
         opts: &HybridOpts,
     ) -> Result<Vec<Hit>> {
-        let names: Vec<String> = match scope.into() {
-            Scope::Collection(c) => vec![c.to_string()],
-            Scope::Collections(cs) => cs.iter().map(|s| s.to_string()).collect(),
-            Scope::All => self.store.collections(),
-        };
+        let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.hybrid_search(&refs, vector, text, opts)
     }

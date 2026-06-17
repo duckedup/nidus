@@ -2,11 +2,12 @@
 //!
 //! The core stays an in-process, synchronous library; this module is the optional
 //! server seam the SPEC anticipates — a separate wrapper, not a change to the core.
-//! The store is held behind `Arc<Mutex<Nidus>>` and every operation runs on a
+//! The store is held behind `Arc<RwLock<Nidus>>` and every operation runs on a
 //! blocking task (`spawn_blocking`), the exact pattern the README/CLAUDE.md
-//! prescribe for driving the synchronous store from async code: lock, run the
-//! CPU/IO-bound op off the async executor, drop the lock — never held across an
-//! `.await`. Endpoints map 1:1 to the public API.
+//! prescribe for driving the synchronous store from async code: take the lock
+//! (shared for reads, exclusive for writes), run the CPU/IO-bound op off the async
+//! executor, drop the lock — never held across an `.await`. Endpoints map 1:1 to
+//! the public API.
 
 pub mod dto;
 
@@ -259,15 +260,22 @@ async fn search(
             min_score,
             filter,
         };
-        let refs: Vec<&str> = scope.iter().map(String::as_str).collect();
-        if refs.is_empty() {
-            db.search(Scope::All, &query, &opts)
-        } else {
-            db.search(Scope::Collections(&refs), &query, &opts)
-        }
+        scoped(&scope, |s| db.search(s, &query, &opts))
     })
     .await?;
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+}
+
+/// Resolve a wire `scope` (an empty list means "every collection") and run `f` with the
+/// corresponding [`Scope`]. Shared by the `/search`, `/text-search`, `/hybrid-search`,
+/// and `/list` handlers so the empty-means-all rule lives in one place.
+fn scoped<T>(scope: &[String], f: impl FnOnce(Scope) -> anyhow::Result<T>) -> anyhow::Result<T> {
+    let refs: Vec<&str> = scope.iter().map(String::as_str).collect();
+    if refs.is_empty() {
+        f(Scope::All)
+    } else {
+        f(Scope::Collections(&refs))
+    }
 }
 
 async fn list(
@@ -281,12 +289,7 @@ async fn list(
             limit,
             filter,
         } = req;
-        let refs: Vec<&str> = scope.iter().map(String::as_str).collect();
-        if refs.is_empty() {
-            db.list(Scope::All, &filter, offset, limit)
-        } else {
-            db.list(Scope::Collections(&refs), &filter, offset, limit)
-        }
+        scoped(&scope, |s| db.list(s, &filter, offset, limit))
     })
     .await?;
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
@@ -328,12 +331,7 @@ async fn text_search(
             filter,
         };
         let q = FtsQuery::new(field, query);
-        let refs: Vec<&str> = scope.iter().map(String::as_str).collect();
-        if refs.is_empty() {
-            db.text_search(Scope::All, &q, &opts)
-        } else {
-            db.text_search(Scope::Collections(&refs), &q, &opts)
-        }
+        scoped(&scope, |s| db.text_search(s, &q, &opts))
     })
     .await?;
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
@@ -361,12 +359,7 @@ async fn hybrid_search(
             candidates,
         };
         let q = FtsQuery::new(field, text);
-        let refs: Vec<&str> = scope.iter().map(String::as_str).collect();
-        if refs.is_empty() {
-            db.hybrid_search(Scope::All, &vector, &q, &opts)
-        } else {
-            db.hybrid_search(Scope::Collections(&refs), &vector, &q, &opts)
-        }
+        scoped(&scope, |s| db.hybrid_search(s, &vector, &q, &opts))
     })
     .await?;
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))

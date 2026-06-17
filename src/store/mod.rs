@@ -291,6 +291,18 @@ impl Store {
         //    A no-op when no collection declares FTS.
         store.load_or_build_fts()?;
 
+        // 10. Auto-compact for FTS tombstone pressure too. Text-only docs occupy no data
+        //     rows, so their deletes/overwrites never raise `dead_rows` and the step-6
+        //     check can't see them — a churning text-only collection would otherwise let
+        //     dead postings grow without bound. `compact` rebuilds the index (dropping
+        //     tombstones). Checked after the index is built, so the ratio is meaningful;
+        //     if step 6 already compacted, the ratio is ~0 and this is a no-op.
+        if let Some(threshold) = store.config.auto_compact
+            && store.fts.tombstone_ratio() > threshold
+        {
+            store.compact()?;
+        }
+
         Ok(store)
     }
 

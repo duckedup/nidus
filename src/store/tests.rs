@@ -2709,3 +2709,82 @@ fn fts_cache_persists_and_reloads() {
         );
     }
 }
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn text_only_churn_auto_compacts_fts_on_reopen() {
+    // Text-only docs create no data rows, so churning them never raises `dead_rows`
+    // and the dead-row auto-compact can't see it. The FTS tombstone-ratio trigger gives
+    // these workloads automatic relief (nidus-b6i PR feedback).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store
+            .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+            .unwrap();
+        // Insert 4 ids, then overwrite each several times → many tombstones, zero rows.
+        for round in 0..5 {
+            for i in 0..4 {
+                let body = format!("term{round} shared");
+                store
+                    .upsert("docs", &[doc(&format!("d{i}"), &body)])
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            store.footprint().dead_rows,
+            0,
+            "no data rows for text-only docs"
+        );
+        assert!(
+            store.fts.tombstone_ratio() > 0.5,
+            "churn should accumulate FTS tombstones"
+        );
+        store.persist_index().unwrap();
+    }
+    // Reopen → the FTS tombstone ratio (> auto_compact 0.5) triggers a compaction that
+    // rebuilds the index and drops the tombstones.
+    let store = Store::open(Config::new(&path, 2)).unwrap();
+    assert_eq!(
+        store.fts.tombstone_ratio(),
+        0.0,
+        "reopen auto-compacted the FTS index"
+    );
+    let hits = store
+        .text_search(
+            &["docs"],
+            &FtsQuery::new("body", "shared"),
+            &default_opts(10),
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 4, "all four live docs still searchable");
+}
+
+#[test]
+fn text_search_across_collections_analyzes_once() {
+    // Multi-collection text search returns a correct merged ranking (and analyzes the
+    // query once per language internally).
+    let mut store = Store::in_memory(3).unwrap();
+    for c in ["a", "b"] {
+        store
+            .set_fts_schema(c, &[("body".to_string(), Language::English)])
+            .unwrap();
+    }
+    store.upsert("a", &[doc("a1", "running fast")]).unwrap();
+    store.upsert("b", &[doc("b1", "runners run")]).unwrap();
+    let hits = store
+        .text_search(
+            &["a", "b"],
+            &FtsQuery::new("body", "run"),
+            &default_opts(10),
+        )
+        .unwrap();
+    let mut ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["a1", "b1"],
+        "stemmed match across both collections"
+    );
+}

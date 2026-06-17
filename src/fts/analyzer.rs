@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// The analyzer language for a full-text field. Extensible; only English is implemented
 /// today (the variant gates the stopword set + stemmer in [`analyze`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Language {
     /// US English: ASCII-folding lowercase, English stopwords, Porter stemming.
     #[default]

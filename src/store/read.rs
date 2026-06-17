@@ -12,6 +12,7 @@ use super::scoring::{PARALLEL_SCAN_WORK_FLOOR, parallel_topk, score_chunk};
 use super::{ScanOrder, Store, oom};
 use crate::config::Config;
 use crate::filter;
+use crate::fts::Language;
 use crate::model::{Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts, SearchOpts, Value};
 use crate::search::{TopK, dot, euclidean_neg_sq, normalize};
 
@@ -364,11 +365,21 @@ impl Store {
             return Ok(Vec::new());
         }
         let mut topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
+        // Analyze the query text once per distinct field language across the scope
+        // (collections usually share one), not once per collection.
+        let mut analyzed: HashMap<Language, Vec<String>> = HashMap::new();
         for &col_name in collections {
             let Some(col) = self.collections.get(col_name) else {
                 continue;
             };
-            for (id, score) in self.fts.score(col_name, &query.field, &query.text) {
+            let Some(lang) = self.fts.field_language(col_name, &query.field) else {
+                continue; // this collection doesn't full-text-index the field
+            };
+            analyzed
+                .entry(lang)
+                .or_insert_with(|| crate::fts::analyze(&query.text, lang));
+            let terms = &analyzed[&lang];
+            for (id, score) in self.fts.score(col_name, &query.field, terms) {
                 if let Some(min) = opts.min_score
                     && score < min
                 {
