@@ -131,7 +131,10 @@ server fault (see [Errors](#errors)).
 | `POST /collections/{name}/upsert` | insert or overwrite records | `upsert` |
 | `POST /collections/{name}/delete` | delete by ids or by filter | `delete` / `delete_where` |
 | `GET /collections/{name}/records` | every record in a collection | `get_all` |
+| `POST /collections/{name}/fts-schema` | declare full-text-indexed fields | `set_fts_schema` |
 | `POST /search` | nearest-neighbour search | `search` |
+| `POST /text-search` | BM25 full-text search | `text_search` |
+| `POST /hybrid-search` | fused vector + BM25 (RRF) | `hybrid_search` |
 | `POST /list` | metadata-only query (no vector) | `list` |
 | `POST /flush` | flush buffered writes to disk | `flush` |
 | `POST /compact` | reclaim dead rows and superseded log records | `compact` |
@@ -176,31 +179,42 @@ the knobs that apply to the chosen index are reported):
 
 Returns the collection names as a JSON array: `["docs", "notes"]`.
 
-### `POST /collections/{name}` · `DELETE /collections/{name}`
+### `POST /collections/{name}`
 
-Create or drop a collection. The body is ignored.
+Create a collection. The body is ignored. Upsert auto-creates a collection, so an
+explicit create is only needed to register an empty one (e.g. to attach metadata
+before any records land).
 
 ```bash
-curl -s -X POST   localhost:7700/collections/docs   # → {"created": "docs"}
+curl -s -X POST localhost:7700/collections/docs   # → {"created": "docs"}
+```
+
+### `DELETE /collections/{name}`
+
+Drop a collection and its records. The body is ignored.
+
+```bash
 curl -s -X DELETE localhost:7700/collections/docs   # → {"dropped": "docs"}
 ```
 
-Upsert auto-creates a collection, so an explicit create is only needed to register
-an empty one (e.g. to attach metadata before any records land).
+### `GET /collections/{name}/meta`
 
-### `GET /collections/{name}/meta` · `PUT /collections/{name}/meta`
+Read a collection's free-form string→string metadata map.
 
-Read or replace a collection's free-form string→string metadata map. `PUT`
-replaces the whole map.
+```bash
+curl -s localhost:7700/collections/docs/meta
+# → {"model": "text-embedding-3-small", "owner": "search-team"}
+```
+
+### `PUT /collections/{name}/meta`
+
+Replace a collection's metadata map wholesale.
 
 ```bash
 curl -s -X PUT localhost:7700/collections/docs/meta \
   -H 'content-type: application/json' \
   -d '{"model": "text-embedding-3-small", "owner": "search-team"}'
 # → {"ok": true}
-
-curl -s localhost:7700/collections/docs/meta
-# → {"model": "text-embedding-3-small", "owner": "search-team"}
 ```
 
 ### `POST /collections/{name}/upsert`
@@ -276,6 +290,44 @@ Returns hits sorted by descending score:
 [{"collection": "docs", "id": "a", "score": 1.0, "attrs": {"lang": {"Str": "rust"}}}]
 ```
 
+### `POST /collections/{name}/fts-schema`
+
+Declare which attribute fields of a collection are full-text indexed for BM25 (US
+English analyzer). Run it once before (or after) upserting; see
+[Full-text search](/guides/search/#full-text-search-bm25) for the ranking model.
+
+```bash
+curl -s -X POST localhost:7700/collections/docs/fts-schema \
+  -H 'content-type: application/json' \
+  -d '{"fields": ["body"]}'
+# → {"ok": true}
+```
+
+### `POST /text-search`
+
+BM25 full-text search of a declared field. Returns the same hit shape as `/search`.
+Takes `field`, `query`, `scope`, `top_k`, `filter`, and `min_score` — here a **raw
+BM25** floor (not cosine).
+
+```bash
+curl -s localhost:7700/text-search \
+  -H 'content-type: application/json' \
+  -d '{"field": "body", "query": "running quickly", "scope": ["docs"], "top_k": 5}'
+```
+
+### `POST /hybrid-search`
+
+Fuse a vector query and a BM25 text query with Reciprocal Rank Fusion. Takes `vector`
++ `field` + `text`, plus `top_k`, `filter`, `rrf_k` (default 60), and `candidates`
+(default 100). There is no `min_score` (a fused RRF score has no absolute scale).
+Returns the same hit shape as `/search`.
+
+```bash
+curl -s localhost:7700/hybrid-search \
+  -H 'content-type: application/json' \
+  -d '{"vector": [1,0,0], "field": "body", "text": "vector database", "top_k": 5}'
+```
+
 ### `POST /list`
 
 Metadata-only query — no vector, no scoring. Same `scope` and `filter` as search,
@@ -294,10 +346,18 @@ The `filter` in both `/search` and `/list` is an AND of predicates: `Eq`, `Ne`,
 `Glob`, `In`, `NotIn`, `Lt`, `Le`, `Gt`, `Ge`. See
 [Search & filters](/guides/search/) for the full predicate grammar.
 
-### `POST /flush` · `POST /compact`
+### `POST /flush`
 
-Maintenance. `flush` forces buffered writes to disk; `compact` rewrites the store
-to reclaim `dead_rows` and superseded log records. Both return `{"ok": true}`.
+Force buffered writes to disk (relevant under `Fsync::OnFlush`). Returns `{"ok": true}`.
+
+```bash
+curl -s -X POST localhost:7700/flush   # → {"ok": true}
+```
+
+### `POST /compact`
+
+Rewrite the store to reclaim `dead_rows` and superseded log records. Returns
+`{"ok": true}`.
 
 ```bash
 curl -s -X POST localhost:7700/compact   # → {"ok": true}

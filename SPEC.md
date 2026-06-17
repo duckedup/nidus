@@ -587,6 +587,24 @@ build until a real need exists.
   build at `query_threads == 1` is unchanged and deterministic; a parallel build
   varies slightly with thread count (insertion order), with equivalent recall.
   Incremental `upsert` stays serial. IVF build is already cheap and stays serial.
+- **Full-text search (BM25) + hybrid + optional vectors.** A collection can declare
+  full-text-indexed attribute fields (`create_collection_with_fts` / `set_fts_schema`,
+  persisted as a `SetFtsSchema` op). nidus then maintains an in-RAM inverted index per
+  `(collection, field)` and answers `text_search(FtsQuery)` by BM25, reusing the same
+  `Hit`/`Filter`/scope/top-k machinery as vector search. `hybrid_search` fuses a vector
+  and a BM25 query with **Reciprocal Rank Fusion** (rank-based, so the incomparable
+  cosine/BM25 scales need no normalization). The analyzer is pure-Rust, zero-FFI
+  (lowercase → Unicode tokenize → English stopwords → Porter stem) behind a `Language`
+  enum (US English today; the seam is open for more). To support pure-text corpora,
+  `Record.vector` is now `Option`: a **text-only** doc (`Record::text_only`) carries no
+  embedding, occupies no data row, and is found by full-text/metadata queries but never
+  by vector search — coexisting with vector-bearing docs in one collection (a new
+  append-only `UpsertText` op carries it; the `data` format is unchanged). The FTS index
+  is a derived cache like ANN; today it rebuilds from the replayed docs on `open` (an
+  on-disk `fts` cache, sharing the ANN cache codec, is the planned follow-up).
+- **Shared index-cache codec.** ANN and the forthcoming FTS cache share one framing
+  module (`NIDUS\0` header + validity key + watermark + `bincode` + CRC32, atomic
+  temp/fsync/rename), so a derived index persists/loads through a single source.
 
 ### Still deferred (designed-for, not built)
 

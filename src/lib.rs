@@ -13,7 +13,7 @@
 //!
 //! let mut db = Nidus::open(Config::new("/tmp/store", 3))?;
 //! db.create_collection("docs")?;
-//! db.upsert("docs", &[Record { id: "a".into(), vector: vec![1.0, 0.0, 0.0], attrs: BTreeMap::new() }])?;
+//! db.upsert("docs", &[Record::new("a", vec![1.0, 0.0, 0.0], BTreeMap::new())])?;
 //! let hits = db.search("docs", &[1.0, 0.0, 0.0], &SearchOpts { top_k: 5, ..Default::default() })?;
 //! # anyhow::Ok(())
 //! ```
@@ -22,7 +22,9 @@ mod ann;
 mod config;
 mod data;
 mod filter;
+mod fts;
 mod glob;
+mod index_cache;
 mod lock;
 mod log;
 mod model;
@@ -39,9 +41,10 @@ pub mod server;
 
 pub use anyhow::Result;
 pub use config::{Config, Fsync, OpenMode};
+pub use fts::Language;
 pub use model::{
-    AnnConfig, AnnKind, Distance, Filter, Footprint, Hit, Predicate, QuantKind, Quantization,
-    Record, SearchOpts, Value,
+    AnnConfig, AnnKind, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts, Predicate,
+    QuantKind, Quantization, Record, SearchOpts, Value,
 };
 
 use std::collections::BTreeMap;
@@ -120,6 +123,29 @@ impl Nidus {
         self.store.create_collection(name)
     }
 
+    /// Create `collection` and declare its full-text-indexed fields up front (each a
+    /// `(field, language)` pair). The recommended way to enable [BM25 full-text
+    /// search](Self::text_search): indexing is fully incremental from the first upsert.
+    pub fn create_collection_with_fts(
+        &mut self,
+        name: &str,
+        fields: &[(String, Language)],
+    ) -> Result<()> {
+        self.store.create_collection_with_fts(name, fields)
+    }
+
+    /// Declare (or redeclare) which attribute fields of `collection` are full-text
+    /// indexed for BM25 search, each with its analyzer [`Language`]. May be called
+    /// before or after upserting — declaring it on a collection that already holds docs
+    /// builds the index from them once. Redeclaring rebuilds the affected fields.
+    pub fn set_fts_schema(
+        &mut self,
+        collection: &str,
+        fields: &[(String, Language)],
+    ) -> Result<()> {
+        self.store.set_fts_schema(collection, fields)
+    }
+
     pub fn drop_collection(&mut self, name: &str) -> Result<()> {
         self.store.drop_collection(name)
     }
@@ -160,6 +186,17 @@ impl Nidus {
         self.store.get_all(collection)
     }
 
+    /// Resolve a [`Scope`] to the concrete collection names it covers — shared by
+    /// `list`/`search`/`text_search`/`hybrid_search` so the resolution lives in one
+    /// place.
+    fn scope_names<'a>(&self, scope: impl Into<Scope<'a>>) -> Vec<String> {
+        match scope.into() {
+            Scope::Collection(c) => vec![c.to_string()],
+            Scope::Collections(cs) => cs.iter().map(|s| s.to_string()).collect(),
+            Scope::All => self.store.collections(),
+        }
+    }
+
     /// List records matching `filter` across a [`Scope`], without vector scoring.
     /// Skips `offset` matches and returns up to `limit` more, in insertion order,
     /// all with `score: 0.0`. Pass `offset = 0` for the first page; advance by
@@ -171,11 +208,7 @@ impl Nidus {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<Hit>> {
-        let names: Vec<String> = match scope.into() {
-            Scope::Collection(c) => vec![c.to_string()],
-            Scope::Collections(cs) => cs.iter().map(|s| s.to_string()).collect(),
-            Scope::All => self.store.collections(),
-        };
+        let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.list(&refs, filter, offset, limit)
     }
@@ -188,13 +221,41 @@ impl Nidus {
         query: &[f32],
         opts: &SearchOpts,
     ) -> Result<Vec<Hit>> {
-        let names: Vec<String> = match scope.into() {
-            Scope::Collection(c) => vec![c.to_string()],
-            Scope::Collections(cs) => cs.iter().map(|s| s.to_string()).collect(),
-            Scope::All => self.store.collections(),
-        };
+        let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.search(&refs, query, opts)
+    }
+
+    /// Full-text (BM25) search over a [`Scope`] for `query` — the indexed field plus
+    /// query text — merged into one ranking. Requires the field to be declared in the
+    /// collection's FTS schema (see [`set_fts_schema`](Self::set_fts_schema)). Reuses
+    /// [`SearchOpts`] (`top_k`, `filter`); here `min_score` is a raw BM25 floor rather
+    /// than a cosine one. Text-only and vector-bearing docs are both eligible.
+    pub fn text_search<'a>(
+        &self,
+        scope: impl Into<Scope<'a>>,
+        query: &FtsQuery,
+        opts: &SearchOpts,
+    ) -> Result<Vec<Hit>> {
+        let names = self.scope_names(scope);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.store.text_search(&refs, query, opts)
+    }
+
+    /// Hybrid search over a [`Scope`]: fuse a vector query and a BM25 text query into a
+    /// single ranking with Reciprocal Rank Fusion (see [`HybridOpts`]). A doc that
+    /// surfaces in only one leg (e.g. a text-only doc, or one whose vector matches but
+    /// whose text does not) is still ranked by that leg.
+    pub fn hybrid_search<'a>(
+        &self,
+        scope: impl Into<Scope<'a>>,
+        vector: &[f32],
+        text: &FtsQuery,
+        opts: &HybridOpts,
+    ) -> Result<Vec<Hit>> {
+        let names = self.scope_names(scope);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.store.hybrid_search(&refs, vector, text, opts)
     }
 
     // ── Maintenance ──────────────────────────────────────────────────────

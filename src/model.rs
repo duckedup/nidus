@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::fts::Language;
+
 /// The similarity / distance metric used for scoring. Pinned at store creation
 /// (stored in the data header) — reopening with a different metric is an error.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,15 +226,46 @@ pub enum Value {
     List(Vec<String>),
 }
 
-/// A document: a caller-supplied id, its embedding, and typed metadata.
+/// A document: a caller-supplied id, an **optional** embedding, and typed metadata.
+///
+/// `vector` is `None` for a **text-only** document — one with no embedding, indexed and
+/// retrieved purely by full-text search and metadata. Such a doc occupies no row in the
+/// vector matrix and never appears in a vector `search`; it coexists in the same
+/// collection as vector-bearing docs. When `Some`, the vector's length must equal the
+/// store dimension. Use [`Record::new`] for a vector doc and [`Record::text_only`] for a
+/// text-only one.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     /// Caller-supplied identity; the upsert key (idempotent within a collection).
     pub id: String,
-    /// The embedding. Length must equal the store dimension.
-    pub vector: Vec<f32>,
+    /// The embedding, or `None` for a text-only doc. When `Some`, length must equal the
+    /// store dimension. Over the wire / in backups the field may be omitted (→ `None`)
+    /// and is elided when absent, so a text-only doc is just `{ id, attrs }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<Vec<f32>>,
     /// Arbitrary typed metadata.
     pub attrs: BTreeMap<String, Value>,
+}
+
+impl Record {
+    /// A vector-bearing document. `vector`'s length must equal the store dimension.
+    pub fn new(id: impl Into<String>, vector: Vec<f32>, attrs: BTreeMap<String, Value>) -> Self {
+        Self {
+            id: id.into(),
+            vector: Some(vector),
+            attrs,
+        }
+    }
+
+    /// A text-only document — no embedding. Indexed and retrieved by full-text search
+    /// and metadata only; never appears in a vector `search`.
+    pub fn text_only(id: impl Into<String>, attrs: BTreeMap<String, Value>) -> Self {
+        Self {
+            id: id.into(),
+            vector: None,
+            attrs,
+        }
+    }
 }
 
 /// A single attribute predicate. Predicates are AND-combined inside a [`Filter`].
@@ -269,6 +302,28 @@ pub enum Predicate {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Filter(pub Vec<Predicate>);
 
+/// A full-text query: the indexed `field` to search and the raw query `text`. The text
+/// is analyzed (lowercase → tokenize → stopword → stem) with the field's configured
+/// language at query time, exactly as documents were at index time, so a query term
+/// matches a stored term when they share a stem.
+#[derive(Clone, Debug)]
+pub struct FtsQuery {
+    /// The full-text-indexed attribute field to search (declared in the FTS schema).
+    pub field: String,
+    /// Raw query text.
+    pub text: String,
+}
+
+impl FtsQuery {
+    /// A query over `field` for `text`.
+    pub fn new(field: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            text: text.into(),
+        }
+    }
+}
+
 /// Query parameters for a search.
 #[derive(Clone, Debug, Default)]
 pub struct SearchOpts {
@@ -278,6 +333,36 @@ pub struct SearchOpts {
     pub filter: Filter,
     /// Drop results scoring below this cosine similarity.
     pub min_score: Option<f32>,
+}
+
+/// Options for a hybrid (vector + BM25) search, fused with Reciprocal Rank Fusion.
+///
+/// RRF ranks by *position* in each leg, not raw score, so the incomparable scales of
+/// cosine/euclidean/dot-product and unbounded BM25 never need normalizing, and a doc
+/// missing from one leg is carried by the other. There is no `min_score`: a fused RRF
+/// score has no interpretable scale (threshold the legs via the pure methods instead).
+#[derive(Clone, Debug)]
+pub struct HybridOpts {
+    /// Final result count after fusion.
+    pub top_k: usize,
+    /// Metadata filter applied to *both* legs before fusion.
+    pub filter: Filter,
+    /// RRF rank-bias constant `k`: larger flattens the weight of top ranks. Default 60.
+    pub rrf_k: f32,
+    /// How deep to pull each leg before fusing (clamped up to at least `top_k`). Larger
+    /// improves fusion recall at linear cost. Default 100.
+    pub candidates: usize,
+}
+
+impl Default for HybridOpts {
+    fn default() -> Self {
+        Self {
+            top_k: 10,
+            filter: Filter::default(),
+            rrf_k: 60.0,
+            candidates: 100,
+        }
+    }
 }
 
 /// One search result. Carries its source `collection` (ids are unique only within a
@@ -333,5 +418,21 @@ pub enum Op {
     Delete {
         collection: String,
         id: String,
+    },
+    /// Upsert a **text-only** document — no embedding, so no `row` into the data
+    /// segment. Appended after the original variants so existing logs (which never
+    /// contain it) still decode: bincode tags enum variants by declaration index, so
+    /// new variants must only ever be added at the end.
+    UpsertText {
+        collection: String,
+        id: String,
+        attrs: BTreeMap<String, Value>,
+    },
+    /// Declare a collection's full-text-indexed fields (the FTS schema). Replayed on
+    /// open to rebuild the inverted index; re-emitted by `compact`. Appended at the end
+    /// for the same forward-compatibility reason as `UpsertText`.
+    SetFtsSchema {
+        collection: String,
+        fields: Vec<(String, Language)>,
     },
 }

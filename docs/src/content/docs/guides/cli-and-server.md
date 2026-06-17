@@ -100,6 +100,14 @@ echo '[1,0,0]' | nidus search --dir ./store docs \
 nidus list --dir ./store docs --where '[{"Eq":["lang",{"Str":"rust"}]}]'
 nidus list --dir ./store docs --offset 100 -n 100   # next page
 
+# Full-text search (BM25): declare which fields are indexed, then query by text
+nidus set-fts-schema --dir ./store docs --field body --field title
+nidus text-search --dir ./store body "running quickly" -k 5
+nidus text-search --dir ./store body "rust" --in docs --where '[{"Eq":["lang",{"Str":"rust"}]}]'
+
+# Hybrid search: fuse a vector (stdin) and a BM25 text query with RRF
+echo '[1,0,0]' | nidus hybrid-search --dir ./store body "vector database" -k 5
+
 # Inspect, maintain
 nidus collections --dir ./store
 nidus get        --dir ./store docs

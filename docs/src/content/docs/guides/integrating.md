@@ -37,7 +37,7 @@ fn to_record(c: Chunk) -> Record {
         None => Value::Null,
     });
     attrs.insert("tags".into(), Value::List(c.tags));
-    Record { id: c.chunk_id, vector: c.embedding, attrs }
+    Record::new(c.chunk_id, c.embedding, attrs)
 }
 ```
 

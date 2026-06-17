@@ -50,6 +50,61 @@ fn default_limit() -> usize {
     100
 }
 
+fn default_rrf_k() -> f32 {
+    60.0
+}
+
+fn default_candidates() -> usize {
+    100
+}
+
+/// Body of `POST /text-search` (BM25). An empty `scope` searches every collection.
+#[derive(Debug, Deserialize)]
+pub struct TextSearchRequest {
+    pub field: String,
+    pub query: String,
+    #[serde(default)]
+    pub scope: Vec<String>,
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+    /// A raw BM25 score floor (not cosine).
+    #[serde(default)]
+    pub min_score: Option<f32>,
+    #[serde(default)]
+    pub filter: Filter,
+}
+
+/// Body of `POST /hybrid-search`: fuse a vector query and a BM25 text query (RRF).
+#[derive(Debug, Deserialize)]
+pub struct HybridSearchRequest {
+    pub vector: Vec<f32>,
+    pub field: String,
+    pub text: String,
+    #[serde(default)]
+    pub scope: Vec<String>,
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+    #[serde(default)]
+    pub filter: Filter,
+    #[serde(default = "default_rrf_k")]
+    pub rrf_k: f32,
+    #[serde(default = "default_candidates")]
+    pub candidates: usize,
+}
+
+/// Body of `POST /collections/{name}/fts-schema`: the attribute fields to full-text
+/// index. Every field uses the US English analyzer — the only [`Language`] today.
+///
+/// Forward-compat note: when a second language ships, expressing per-field language
+/// over the wire means evolving `fields` from `Vec<String>` to a typed
+/// `Vec<{ field, language }>`. That is a breaking wire change, deliberately deferred
+/// until there is a second language to choose (the library API already takes
+/// `(field, Language)` pairs, so only this DTO + handler need to grow).
+#[derive(Debug, Deserialize)]
+pub struct FtsSchemaRequest {
+    pub fields: Vec<String>,
+}
+
 /// Body of `POST /list`. Metadata-only query (no vector). An empty `scope`
 /// lists from every collection. `offset` skips matches for pagination.
 #[derive(Debug, Deserialize)]

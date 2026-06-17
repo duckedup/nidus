@@ -25,19 +25,11 @@ fn int8_state(store: &Store) -> &Int8State {
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 fn rec(id: &str, vector: Vec<f32>) -> Record {
-    Record {
-        id: id.to_string(),
-        vector,
-        attrs: BTreeMap::new(),
-    }
+    Record::new(id, vector, BTreeMap::new())
 }
 
 fn rec_with(id: &str, vector: Vec<f32>, attrs: BTreeMap<String, Value>) -> Record {
-    Record {
-        id: id.to_string(),
-        vector,
-        attrs,
-    }
+    Record::new(id, vector, attrs)
 }
 
 fn default_opts(top_k: usize) -> SearchOpts {
@@ -382,7 +374,7 @@ fn get_all_includes_vector() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].id, "doc1");
     // Vector should be unit-normalized (already unit here).
-    assert_eq!(records[0].vector.len(), 3);
+    assert_eq!(records[0].vector.as_deref().unwrap().len(), 3);
 }
 
 #[test]
@@ -526,6 +518,8 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         quant: None,
         ann: None,
         ann_dirty: false,
+        fts: crate::fts::Fts::default(),
+        fts_dirty: false,
         in_memory: true,
         row_to_doc: Vec::new(),
         scan_order: std::sync::RwLock::new(None),
@@ -841,7 +835,11 @@ fn euclidean_does_not_normalize() {
     store.create_collection("col").unwrap();
     store.upsert("col", &[rec("doc1", vec![3.0, 4.0])]).unwrap();
     let records = store.get_all("col");
-    assert_eq!(records[0].vector, vec![3.0, 4.0], "raw vectors preserved");
+    assert_eq!(
+        records[0].vector,
+        Some(vec![3.0, 4.0]),
+        "raw vectors preserved"
+    );
 }
 
 #[test]
@@ -892,7 +890,11 @@ fn dotproduct_does_not_normalize() {
     store.create_collection("col").unwrap();
     store.upsert("col", &[rec("doc1", vec![3.0, 4.0])]).unwrap();
     let records = store.get_all("col");
-    assert_eq!(records[0].vector, vec![3.0, 4.0], "raw vectors preserved");
+    assert_eq!(
+        records[0].vector,
+        Some(vec![3.0, 4.0]),
+        "raw vectors preserved"
+    );
 }
 
 #[test]
@@ -934,7 +936,7 @@ fn euclidean_survives_reopen() {
         )
         .unwrap();
         let records = store.get_all("col");
-        assert_eq!(records[0].vector, vec![1.0, 2.0, 3.0]);
+        assert_eq!(records[0].vector, Some(vec![1.0, 2.0, 3.0]));
         let hits = store
             .search(&["col"], &[1.0, 2.0, 3.0], &default_opts(5))
             .unwrap();
@@ -2263,4 +2265,526 @@ fn ann_selective_filter_respects_min_score() {
     assert!(hits.iter().all(|h| h.score >= 0.99));
     // d0 is `rare` (index 0) and identical to the query → it must be present.
     assert_eq!(hits[0].id, "d0");
+}
+
+// ── Optional vectors: text-only documents ──────────────────────────────────
+
+/// A text-only record (no embedding) — coexists with vector docs in a collection.
+fn text_rec(id: &str, attrs: BTreeMap<String, Value>) -> Record {
+    Record::text_only(id, attrs)
+}
+
+fn attrs_one(key: &str, val: &str) -> BTreeMap<String, Value> {
+    let mut m = BTreeMap::new();
+    m.insert(key.to_string(), Value::Str(val.to_string()));
+    m
+}
+
+#[test]
+fn text_only_upsert_adds_no_row() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert("col", &[text_rec("t1", attrs_one("kind", "note"))])
+        .unwrap();
+    // No vector ⇒ no data row, no vector_bytes, but it is a live doc.
+    let fp = store.footprint();
+    assert_eq!(fp.rows, 0);
+    assert_eq!(fp.vector_bytes, 0);
+    assert_eq!(fp.doc_count, 1);
+    // get_all returns it with vector None.
+    let recs = store.get_all("col");
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].id, "t1");
+    assert_eq!(recs[0].vector, None);
+}
+
+#[test]
+fn vector_search_excludes_text_only_docs() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert(
+            "col",
+            &[
+                rec("v1", vec![1.0, 0.0, 0.0]),
+                text_rec("t1", attrs_one("kind", "note")),
+            ],
+        )
+        .unwrap();
+    let hits = store
+        .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(10))
+        .unwrap();
+    // Only the vector doc is ranked; the text-only doc never appears.
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "v1");
+}
+
+#[test]
+fn list_includes_text_only_docs() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert(
+            "col",
+            &[
+                rec("v1", vec![1.0, 0.0, 0.0]),
+                text_rec("t1", attrs_one("kind", "note")),
+            ],
+        )
+        .unwrap();
+    let hits = store.list(&["col"], &Filter::default(), 0, 10).unwrap();
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["v1", "t1"],
+        "rowed doc first, then text-only by id"
+    );
+}
+
+#[test]
+fn doc_can_switch_between_vector_and_text_only() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert("col", &[rec("d", vec![1.0, 0.0, 0.0])])
+        .unwrap();
+    assert_eq!(store.footprint().rows, 1);
+    // Re-upsert the same id as text-only: the old row becomes dead.
+    store
+        .upsert("col", &[text_rec("d", attrs_one("kind", "note"))])
+        .unwrap();
+    assert_eq!(store.footprint().doc_count, 1);
+    assert_eq!(store.footprint().dead_rows, 1);
+    // It no longer appears in vector search.
+    let hits = store
+        .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(10))
+        .unwrap();
+    assert!(hits.is_empty());
+    // Re-upsert with a vector again: searchable once more.
+    store
+        .upsert("col", &[rec("d", vec![0.0, 1.0, 0.0])])
+        .unwrap();
+    let hits = store
+        .search(&["col"], &[0.0, 1.0, 0.0], &default_opts(10))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "d");
+}
+
+#[test]
+fn delete_text_only_doc_leaves_no_dead_row() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert("col", &[text_rec("t1", attrs_one("kind", "note"))])
+        .unwrap();
+    assert_eq!(store.delete("col", &["t1"]).unwrap(), 1);
+    assert_eq!(store.footprint().dead_rows, 0);
+    assert_eq!(store.footprint().doc_count, 0);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn text_only_docs_survive_reopen_and_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store
+            .upsert(
+                "col",
+                &[
+                    rec("v1", vec![3.0, 4.0]),
+                    text_rec("t1", attrs_one("kind", "note")),
+                    text_rec("t2", attrs_one("kind", "memo")),
+                ],
+            )
+            .unwrap();
+        store.compact().unwrap();
+    }
+    // Reopen: the UpsertText log records must replay back into live docs.
+    let store = Store::open(Config::new(&path, 2)).unwrap();
+    assert_eq!(store.footprint().doc_count, 3);
+    assert_eq!(store.footprint().rows, 1, "only the vector doc has a row");
+    let all = store.get_all("col");
+    let mut text_only: Vec<&str> = all
+        .iter()
+        .filter(|r| r.vector.is_none())
+        .map(|r| r.id.as_str())
+        .collect();
+    text_only.sort();
+    assert_eq!(text_only, vec!["t1", "t2"]);
+}
+
+// ── Full-text search (BM25) ─────────────────────────────────────────────────
+
+use crate::Language;
+use crate::model::FtsQuery;
+
+fn doc(id: &str, body: &str) -> Record {
+    let mut attrs = BTreeMap::new();
+    attrs.insert("body".to_string(), Value::Str(body.to_string()));
+    Record::text_only(id, attrs)
+}
+
+#[test]
+fn text_search_ranks_and_stems() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                doc("a", "the cat sat on the mat"),
+                doc("b", "cats are running and cats keep running"),
+                doc("c", "a dog barked loudly"),
+            ],
+        )
+        .unwrap();
+    let hits = store
+        .text_search(
+            &["docs"],
+            &FtsQuery::new("body", "running cats"),
+            &default_opts(10),
+        )
+        .unwrap();
+    // b mentions the query terms most; c matches nothing.
+    assert_eq!(hits[0].id, "b");
+    assert!(!hits.iter().any(|h| h.id == "c"));
+}
+
+#[test]
+fn text_search_indexes_docs_upserted_before_schema() {
+    // Declaring the schema after upserts must index the existing docs.
+    let mut store = Store::in_memory(3).unwrap();
+    store.upsert("docs", &[doc("a", "alpha beta")]).unwrap();
+    store
+        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .unwrap();
+    let hits = store
+        .text_search(
+            &["docs"],
+            &FtsQuery::new("body", "alpha"),
+            &default_opts(10),
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "a");
+}
+
+#[test]
+fn text_search_respects_filter_and_delete() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .unwrap();
+    let mut a = doc("a", "shared term");
+    a.attrs
+        .insert("lang".to_string(), Value::Str("rust".to_string()));
+    let mut b = doc("b", "shared term");
+    b.attrs
+        .insert("lang".to_string(), Value::Str("go".to_string()));
+    store.upsert("docs", &[a, b]).unwrap();
+
+    // Filter to lang=rust → only a.
+    let opts = SearchOpts {
+        top_k: 10,
+        filter: Filter(vec![Predicate::Eq(
+            "lang".to_string(),
+            Value::Str("rust".to_string()),
+        )]),
+        min_score: None,
+    };
+    let hits = store
+        .text_search(&["docs"], &FtsQuery::new("body", "shared"), &opts)
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["a"]
+    );
+
+    // Delete a → no longer found.
+    store.delete("docs", &["a"]).unwrap();
+    let hits = store
+        .text_search(
+            &["docs"],
+            &FtsQuery::new("body", "shared"),
+            &default_opts(10),
+        )
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["b"]
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn text_search_survives_reopen_and_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store
+            .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+            .unwrap();
+        store
+            .upsert(
+                "docs",
+                &[
+                    doc("a", "searching for needles"),
+                    doc("b", "haystack of hay"),
+                ],
+            )
+            .unwrap();
+        store.delete("docs", &["b"]).unwrap();
+        store.compact().unwrap();
+    }
+    let store = Store::open(Config::new(&path, 2)).unwrap();
+    let hits = store
+        .text_search(
+            &["docs"],
+            &FtsQuery::new("body", "needle"),
+            &default_opts(10),
+        )
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["a"]
+    );
+}
+
+#[test]
+fn hybrid_collection_text_and_vector_coexist() {
+    // A collection can hold vector docs and full-text fields on the same records.
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .unwrap();
+    let mut r = Record::new("a", vec![1.0, 0.0, 0.0], BTreeMap::new());
+    r.attrs.insert(
+        "body".to_string(),
+        Value::Str("vector and text together".to_string()),
+    );
+    store.upsert("docs", &[r]).unwrap();
+
+    // Vector search finds it.
+    let vhits = store
+        .search(&["docs"], &[1.0, 0.0, 0.0], &default_opts(10))
+        .unwrap();
+    assert_eq!(vhits.len(), 1);
+    // Text search finds it too.
+    let thits = store
+        .text_search(&["docs"], &FtsQuery::new("body", "text"), &default_opts(10))
+        .unwrap();
+    assert_eq!(thits.len(), 1);
+    assert_eq!(thits[0].id, "a");
+}
+
+use crate::model::HybridOpts;
+
+#[test]
+fn hybrid_search_fuses_vector_and_text() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .unwrap();
+    // a: strong vector match, weak text. b: weak vector, strong text. c: text-only.
+    let mut a = Record::new("a", vec![1.0, 0.0, 0.0], BTreeMap::new());
+    a.attrs.insert(
+        "body".to_string(),
+        Value::Str("unrelated words".to_string()),
+    );
+    let mut b = Record::new("b", vec![0.0, 1.0, 0.0], BTreeMap::new());
+    b.attrs.insert(
+        "body".to_string(),
+        Value::Str("quantum physics lecture".to_string()),
+    );
+    let c = doc("c", "quantum physics quantum physics");
+    store.upsert("docs", &[a, b, c]).unwrap();
+
+    let opts = HybridOpts {
+        top_k: 10,
+        ..Default::default()
+    };
+    let hits = store
+        .hybrid_search(
+            &["docs"],
+            &[1.0, 0.0, 0.0],
+            &FtsQuery::new("body", "quantum physics"),
+            &opts,
+        )
+        .unwrap();
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    // All three surface: a via the vector leg, b and c via the text leg.
+    assert!(ids.contains(&"a"));
+    assert!(ids.contains(&"b"));
+    assert!(
+        ids.contains(&"c"),
+        "text-only doc ranked by its BM25 leg alone"
+    );
+    // Fused scores are descending.
+    for w in hits.windows(2) {
+        assert!(w[0].score >= w[1].score);
+    }
+}
+
+#[test]
+// Miri evaluates `ln` (in BM25's idf) non-deterministically by design, so the fused
+// RRF scores vary by an ULP run-to-run under Miri — the very stability this asserts.
+// The tie-break determinism it checks holds under real float semantics.
+#[cfg_attr(miri, ignore)]
+fn hybrid_search_is_deterministic() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                doc("x", "alpha beta"),
+                doc("y", "alpha gamma"),
+                doc("z", "beta gamma"),
+            ],
+        )
+        .unwrap();
+    let opts = HybridOpts::default();
+    let q = FtsQuery::new("body", "alpha beta");
+    let a = store
+        .hybrid_search(&["docs"], &[0.0, 0.0, 0.0], &q, &opts)
+        .unwrap();
+    let b = store
+        .hybrid_search(&["docs"], &[0.0, 0.0, 0.0], &q, &opts)
+        .unwrap();
+    let ids_a: Vec<&str> = a.iter().map(|h| h.id.as_str()).collect();
+    let ids_b: Vec<&str> = b.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids_a, ids_b);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn fts_cache_persists_and_reloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store
+            .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+            .unwrap();
+        store
+            .upsert("docs", &[doc("a", "alpha beta"), doc("b", "beta gamma")])
+            .unwrap();
+        // Write the fts cache out of band.
+        store.persist_index().unwrap();
+        assert!(path.join("fts").exists(), "fts cache file written");
+    }
+    // Reopen: cache watermark == log offset → adopted, results intact.
+    {
+        let store = Store::open(Config::new(&path, 2)).unwrap();
+        let hits = store
+            .text_search(&["docs"], &FtsQuery::new("body", "beta"), &default_opts(10))
+            .unwrap();
+        let mut ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+    // A write after the cache was persisted must still be reflected on the next open
+    // (watermark mismatch → rebuild from the live docs, including the new doc).
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store.upsert("docs", &[doc("c", "gamma delta")]).unwrap();
+        // (no persist_index here — the cache is now stale)
+    }
+    {
+        let store = Store::open(Config::new(&path, 2)).unwrap();
+        let hits = store
+            .text_search(
+                &["docs"],
+                &FtsQuery::new("body", "delta"),
+                &default_opts(10),
+            )
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            vec!["c"]
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn text_only_churn_auto_compacts_fts_on_reopen() {
+    // Text-only docs create no data rows, so churning them never raises `dead_rows`
+    // and the dead-row auto-compact can't see it. The FTS tombstone-ratio trigger gives
+    // these workloads automatic relief (nidus-b6i PR feedback).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store
+            .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+            .unwrap();
+        // Insert 4 ids, then overwrite each several times → many tombstones, zero rows.
+        for round in 0..5 {
+            for i in 0..4 {
+                let body = format!("term{round} shared");
+                store
+                    .upsert("docs", &[doc(&format!("d{i}"), &body)])
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            store.footprint().dead_rows,
+            0,
+            "no data rows for text-only docs"
+        );
+        assert!(
+            store.fts.tombstone_ratio() > 0.5,
+            "churn should accumulate FTS tombstones"
+        );
+        store.persist_index().unwrap();
+    }
+    // Reopen → the FTS tombstone ratio (> auto_compact 0.5) triggers a compaction that
+    // rebuilds the index and drops the tombstones.
+    let store = Store::open(Config::new(&path, 2)).unwrap();
+    assert_eq!(
+        store.fts.tombstone_ratio(),
+        0.0,
+        "reopen auto-compacted the FTS index"
+    );
+    let hits = store
+        .text_search(
+            &["docs"],
+            &FtsQuery::new("body", "shared"),
+            &default_opts(10),
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 4, "all four live docs still searchable");
+}
+
+#[test]
+fn text_search_across_collections_analyzes_once() {
+    // Multi-collection text search returns a correct merged ranking (and analyzes the
+    // query once per language internally).
+    let mut store = Store::in_memory(3).unwrap();
+    for c in ["a", "b"] {
+        store
+            .set_fts_schema(c, &[("body".to_string(), Language::English)])
+            .unwrap();
+    }
+    store.upsert("a", &[doc("a1", "running fast")]).unwrap();
+    store.upsert("b", &[doc("b1", "runners run")]).unwrap();
+    let hits = store
+        .text_search(
+            &["a", "b"],
+            &FtsQuery::new("body", "run"),
+            &default_opts(10),
+        )
+        .unwrap();
+    let mut ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["a1", "b1"],
+        "stemmed match across both collections"
+    );
 }

@@ -17,11 +17,7 @@ fn rec(id: &str, vector: Vec<f32>, path: &str, kind: &str) -> Record {
     let mut attrs = BTreeMap::new();
     attrs.insert("path".to_string(), Value::Str(path.to_string()));
     attrs.insert("kind".to_string(), Value::Str(kind.to_string()));
-    Record {
-        id: id.to_string(),
-        vector,
-        attrs,
-    }
+    Record::new(id, vector, attrs)
 }
 
 fn print_hits(label: &str, hits: &[nidus::Hit]) {

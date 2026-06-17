@@ -2,11 +2,12 @@
 //!
 //! The core stays an in-process, synchronous library; this module is the optional
 //! server seam the SPEC anticipates — a separate wrapper, not a change to the core.
-//! The store is held behind `Arc<Mutex<Nidus>>` and every operation runs on a
+//! The store is held behind `Arc<RwLock<Nidus>>` and every operation runs on a
 //! blocking task (`spawn_blocking`), the exact pattern the README/CLAUDE.md
-//! prescribe for driving the synchronous store from async code: lock, run the
-//! CPU/IO-bound op off the async executor, drop the lock — never held across an
-//! `.await`. Endpoints map 1:1 to the public API.
+//! prescribe for driving the synchronous store from async code: take the lock
+//! (shared for reads, exclusive for writes), run the CPU/IO-bound op off the async
+//! executor, drop the lock — never held across an `.await`. Endpoints map 1:1 to
+//! the public API.
 
 pub mod dto;
 
@@ -24,8 +25,11 @@ use axum::{
 use serde_json::{Value as JsonValue, json};
 use tokio::net::TcpListener;
 
-use crate::{Nidus, Record, Scope, SearchOpts};
-use dto::{AnnDto, DeleteRequest, FootprintDto, HitDto, ListRequest, SearchRequest, UpsertRequest};
+use crate::{FtsQuery, HybridOpts, Language, Nidus, Record, Scope, SearchOpts};
+use dto::{
+    AnnDto, DeleteRequest, FootprintDto, FtsSchemaRequest, HitDto, HybridSearchRequest,
+    ListRequest, SearchRequest, TextSearchRequest, UpsertRequest,
+};
 
 /// How `nidus serve` is configured beyond the store itself.
 pub struct ServeConfig {
@@ -98,7 +102,10 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/collections/{name}/upsert", post(upsert))
         .route("/collections/{name}/delete", post(delete_records))
         .route("/collections/{name}/records", get(records))
+        .route("/collections/{name}/fts-schema", post(set_fts_schema))
         .route("/search", post(search))
+        .route("/text-search", post(text_search))
+        .route("/hybrid-search", post(hybrid_search))
         .route("/list", post(list))
         .route("/flush", post(flush))
         .route("/compact", post(compact))
@@ -253,15 +260,22 @@ async fn search(
             min_score,
             filter,
         };
-        let refs: Vec<&str> = scope.iter().map(String::as_str).collect();
-        if refs.is_empty() {
-            db.search(Scope::All, &query, &opts)
-        } else {
-            db.search(Scope::Collections(&refs), &query, &opts)
-        }
+        scoped(&scope, |s| db.search(s, &query, &opts))
     })
     .await?;
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+}
+
+/// Resolve a wire `scope` (an empty list means "every collection") and run `f` with the
+/// corresponding [`Scope`]. Shared by the `/search`, `/text-search`, `/hybrid-search`,
+/// and `/list` handlers so the empty-means-all rule lives in one place.
+fn scoped<T>(scope: &[String], f: impl FnOnce(Scope) -> anyhow::Result<T>) -> anyhow::Result<T> {
+    let refs: Vec<&str> = scope.iter().map(String::as_str).collect();
+    if refs.is_empty() {
+        f(Scope::All)
+    } else {
+        f(Scope::Collections(&refs))
+    }
 }
 
 async fn list(
@@ -275,12 +289,77 @@ async fn list(
             limit,
             filter,
         } = req;
-        let refs: Vec<&str> = scope.iter().map(String::as_str).collect();
-        if refs.is_empty() {
-            db.list(Scope::All, &filter, offset, limit)
-        } else {
-            db.list(Scope::Collections(&refs), &filter, offset, limit)
-        }
+        scoped(&scope, |s| db.list(s, &filter, offset, limit))
+    })
+    .await?;
+    Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+}
+
+async fn set_fts_schema(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<FtsSchemaRequest>,
+) -> Result<Json<JsonValue>, ApiError> {
+    run_write(st, move |db| {
+        let decl: Vec<(String, Language)> = req
+            .fields
+            .iter()
+            .map(|f| (f.clone(), Language::English))
+            .collect();
+        db.set_fts_schema(&name, &decl)
+    })
+    .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn text_search(
+    State(st): State<AppState>,
+    Json(req): Json<TextSearchRequest>,
+) -> Result<Json<Vec<HitDto>>, ApiError> {
+    let hits = run_read(st, move |db| {
+        let TextSearchRequest {
+            field,
+            query,
+            scope,
+            top_k,
+            min_score,
+            filter,
+        } = req;
+        let opts = SearchOpts {
+            top_k,
+            min_score,
+            filter,
+        };
+        let q = FtsQuery::new(field, query);
+        scoped(&scope, |s| db.text_search(s, &q, &opts))
+    })
+    .await?;
+    Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+}
+
+async fn hybrid_search(
+    State(st): State<AppState>,
+    Json(req): Json<HybridSearchRequest>,
+) -> Result<Json<Vec<HitDto>>, ApiError> {
+    let hits = run_read(st, move |db| {
+        let HybridSearchRequest {
+            vector,
+            field,
+            text,
+            scope,
+            top_k,
+            filter,
+            rrf_k,
+            candidates,
+        } = req;
+        let opts = HybridOpts {
+            top_k,
+            filter,
+            rrf_k,
+            candidates,
+        };
+        let q = FtsQuery::new(field, text);
+        scoped(&scope, |s| db.hybrid_search(s, &vector, &q, &opts))
     })
     .await?;
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
@@ -475,6 +554,71 @@ mod tests {
         assert_eq!(stats["ann"], JsonValue::Null); // exact search by default
         assert_eq!(stats["collections"], json!(["docs"]));
         assert_eq!(stats["footprint"]["doc_count"], 2);
+    }
+
+    /// Full-text + hybrid search over HTTP: declare schema, upsert (incl. a text-only
+    /// doc), then text-search and hybrid-search.
+    #[tokio::test]
+    async fn fts_and_hybrid_over_http() {
+        let app = test_router(3);
+
+        // Declare the FTS schema for `docs`.`body`.
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/docs/fts-schema",
+                json!({"fields": ["body"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Upsert a vector doc and a text-only doc (vector omitted).
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "a", "vector": [1, 0, 0], "attrs": {"body": {"Str": "the quick brown fox"}}},
+                    {"id": "b", "attrs": {"body": {"Str": "foxes are running quickly"}}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await["upserted"], 2);
+
+        // Text search: "running" stems to match doc b.
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/text-search",
+                json!({"field": "body", "query": "run", "top_k": 5}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        assert_eq!(hits[0]["id"], "b");
+
+        // Hybrid: vector favours a, text favours b — both surface.
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/hybrid-search",
+                json!({"vector": [1, 0, 0], "field": "body", "text": "fox", "top_k": 5}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ids: Vec<String> = json_body(resp)
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(ids.contains(&"a".to_string()) && ids.contains(&"b".to_string()));
     }
 
     #[test]

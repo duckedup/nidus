@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use super::{Collection, DocEntry, Store, oom};
 use crate::config::{Fsync, OpenMode};
 use crate::filter;
+use crate::fts::Language;
 use crate::model::{Distance, Filter, Op, Record, Value};
 use crate::search::normalize;
 
@@ -47,7 +48,13 @@ impl Store {
     pub fn drop_collection(&mut self, name: &str) -> Result<()> {
         self.check_writable()?;
         if let Some(col) = self.collections.remove(name) {
-            self.dead_rows += col.docs.len();
+            // Only rowed docs leave a reclaimable data row behind.
+            self.dead_rows += col.docs.values().filter(|e| e.row.is_some()).count();
+            // Drop the collection's FTS schema + field indexes.
+            if self.fts.is_active() {
+                self.fts.drop_collection(name);
+                self.fts_dirty = true;
+            }
             self.log.append(&Op::DropCollection {
                 collection: name.to_string(),
             })?;
@@ -56,6 +63,51 @@ impl Store {
             self.invalidate_scan_order();
         }
         Ok(())
+    }
+
+    /// Declare `collection`'s full-text-indexed fields (the per-collection FTS schema),
+    /// then build the field indexes from its existing live docs. Settable any time;
+    /// `create_collection_with_fts` is the up-front path that shares this code so a
+    /// fresh collection indexes incrementally from its first upsert with no build pass.
+    /// Redeclaring discards and rebuilds the affected field indexes.
+    pub fn set_fts_schema(
+        &mut self,
+        collection: &str,
+        fields: &[(String, Language)],
+    ) -> Result<()> {
+        self.check_writable()?;
+        // Implicitly create the collection if absent (matches set_meta / replay leniency).
+        self.collections
+            .entry(collection.to_string())
+            .or_insert_with(Collection::new);
+        self.log.append(&Op::SetFtsSchema {
+            collection: collection.to_string(),
+            fields: fields.to_vec(),
+        })?;
+        self.maybe_sync()?;
+        self.fts.set_schema(collection, fields);
+        // Build the field indexes from docs already in the collection (sorted ids →
+        // reproducible docnums). For a brand-new collection this loop is empty.
+        let col = &self.collections[collection];
+        let mut ids: Vec<&String> = col.docs.keys().collect();
+        ids.sort();
+        for id in ids {
+            let attrs = &col.docs[id].attrs;
+            self.fts.index_doc(collection, id, attrs);
+        }
+        self.fts_dirty = true;
+        Ok(())
+    }
+
+    /// Create `collection` (idempotent) and declare its full-text fields up front. The
+    /// recommended FTS path: indexing is fully incremental from the first upsert.
+    pub fn create_collection_with_fts(
+        &mut self,
+        name: &str,
+        fields: &[(String, Language)],
+    ) -> Result<()> {
+        self.create_collection(name)?;
+        self.set_fts_schema(name, fields)
     }
 
     pub fn set_meta(&mut self, collection: &str, meta: BTreeMap<String, String>) -> Result<()> {
@@ -85,12 +137,15 @@ impl Store {
 
         let dim = self.data.dimension();
 
-        // Validate all vectors first (fail fast before any mutation).
+        // Validate all present vectors first (fail fast before any mutation). A
+        // text-only record (`vector: None`) is exempt — it occupies no data row.
         for rec in records {
-            if rec.vector.len() != dim {
+            if let Some(v) = &rec.vector
+                && v.len() != dim
+            {
                 bail!(
                     "vector length {} does not match store dimension {}",
-                    rec.vector.len(),
+                    v.len(),
                     dim
                 );
             }
@@ -115,9 +170,11 @@ impl Store {
         // vector matrix past the cap. Clean refusal, no rollback, store stays fully
         // usable for reads/search. (Counts physical rows incl. dead ones; compact()
         // reclaims headroom.)
+        // Only vector-bearing records grow the matrix; text-only ones cost no rows.
+        let vector_count = records.iter().filter(|r| r.vector.is_some()).count() as u64;
         if let Some(cap) = self.config.max_vector_bytes {
             let projected =
-                (self.data.row_count() + records.len() as u64) * self.data.dimension() as u64 * 4;
+                (self.data.row_count() + vector_count) * self.data.dimension() as u64 * 4;
             if projected > cap {
                 bail!(
                     "upsert would grow the vector matrix to {projected} bytes, exceeding \
@@ -133,7 +190,8 @@ impl Store {
         // Phase 0: reserve every growable buffer up-front, fallibly, so the commit
         // phase (Phase 5) can never reallocate / OOM. Nothing is mutated here, so an
         // OOM just returns — no rollback needed (data + log untouched).
-        let mut staged: Vec<(String, u64, BTreeMap<String, Value>)> = Vec::new();
+        // `row` is `Some` for a vector-bearing record, `None` for a text-only one.
+        let mut staged: Vec<(String, Option<u64>, BTreeMap<String, Value>)> = Vec::new();
         staged
             .try_reserve_exact(records.len())
             .map_err(|_| oom("upsert staging entries", records.len()))?;
@@ -167,19 +225,26 @@ impl Store {
         // reserves fallibly; the `max_vector_bytes` cap guards the dominant memory.
         let should_normalize = self.config.distance == Distance::Cosine;
         for rec in records {
-            let mut v = rec.vector.clone();
-            if should_normalize {
-                normalize(&mut v);
-            }
-            match self.data.append(&v) {
-                Ok(row) => staged.push((rec.id.clone(), row, rec.attrs.clone())),
-                Err(e) => {
-                    self.data
-                        .truncate_to(data_mark)
-                        .context("rollback data after failed append")?;
-                    return Err(e);
+            let row = match &rec.vector {
+                Some(v) => {
+                    let mut v = v.clone();
+                    if should_normalize {
+                        normalize(&mut v);
+                    }
+                    match self.data.append(&v) {
+                        Ok(row) => Some(row),
+                        Err(e) => {
+                            self.data
+                                .truncate_to(data_mark)
+                                .context("rollback data after failed append")?;
+                            return Err(e);
+                        }
+                    }
                 }
-            }
+                // Text-only doc: no embedding, no data row.
+                None => None,
+            };
+            staged.push((rec.id.clone(), row, rec.attrs.clone()));
         }
 
         // Phase 2: fsync data before writing log records.
@@ -197,11 +262,18 @@ impl Store {
                 collection: collection.to_string(),
             })
             .into_iter()
-            .chain(staged.iter().map(|(id, row, attrs)| Op::Upsert {
-                collection: collection.to_string(),
-                id: id.clone(),
-                row: *row,
-                attrs: attrs.clone(),
+            .chain(staged.iter().map(|(id, row, attrs)| match row {
+                Some(row) => Op::Upsert {
+                    collection: collection.to_string(),
+                    id: id.clone(),
+                    row: *row,
+                    attrs: attrs.clone(),
+                },
+                None => Op::UpsertText {
+                    collection: collection.to_string(),
+                    id: id.clone(),
+                    attrs: attrs.clone(),
+                },
             }));
         for op in log_ops {
             if let Err(e) = self.log.append(&op) {
@@ -225,17 +297,30 @@ impl Store {
         }
         let col = self.collections.get_mut(collection).unwrap();
         let ann_on = self.ann.is_some();
+        let fts_on = self.fts.is_active();
         let mut new_owners: Vec<(u64, String)> = Vec::new();
         let mut count = 0usize;
         for (id, row, attrs) in staged {
-            if col.docs.contains_key(&id) {
-                self.dead_rows += 1; // overwriting: the old row becomes dead
+            // Only a vector-bearing new doc joins the ANN index.
+            if ann_on && let Some(r) = row {
+                new_owners.push((r, id.clone()));
             }
-            if ann_on {
-                new_owners.push((row, id.clone()));
+            // Index the doc's text into any FTS fields (no-op if this collection has no
+            // schema). Done before the attrs move into the index. O(batch).
+            if fts_on {
+                self.fts.index_doc(collection, &id, &attrs);
             }
-            col.docs.insert(id, DocEntry { row, attrs });
+            // Overwriting a *rowed* doc leaves its old row dead.
+            if let Some(old) = col.docs.insert(id, DocEntry { row, attrs })
+                && old.row.is_some()
+            {
+                self.dead_rows += 1;
+            }
             count += 1;
+        }
+
+        if fts_on {
+            self.fts_dirty = true;
         }
 
         // Quantize only the rows this batch appended (O(batch)); refits lazily.
@@ -268,20 +353,29 @@ impl Store {
 
         let mut count = 0usize;
         for &id in ids {
-            if col.docs.remove(id).is_some() {
+            let Some(old) = col.docs.remove(id) else {
+                continue;
+            };
+            // Only a rowed doc leaves a reclaimable data row.
+            if old.row.is_some() {
                 self.dead_rows += 1;
-                self.log.append(&Op::Delete {
-                    collection: collection.to_string(),
-                    id: id.to_string(),
-                })?;
-                count += 1;
             }
+            // Tombstone the doc in any FTS field indexes (no-op when none).
+            self.fts.remove_doc(collection, id);
+            self.log.append(&Op::Delete {
+                collection: collection.to_string(),
+                id: id.to_string(),
+            })?;
+            count += 1;
         }
 
         if count > 0 {
             self.maybe_sync()?;
             // Docs were removed — drop the cached scan order.
             self.invalidate_scan_order();
+            if self.fts.is_active() {
+                self.fts_dirty = true;
+            }
         }
 
         Ok(count)
@@ -321,13 +415,19 @@ impl Store {
     pub fn compact(&mut self) -> Result<()> {
         self.check_writable()?;
 
-        // 1. Assign fresh contiguous row indices to live docs.
-        //    Walk collections in sorted order for determinism.
-        let live_rows: usize = self.collections.values().map(|c| c.docs.len()).sum();
+        // 1. Assign fresh contiguous row indices to live *rowed* docs (text-only docs
+        //    carry no vector and are re-emitted as `UpsertText`). Walk collections in
+        //    sorted order for determinism.
+        let rowed: usize = self
+            .collections
+            .values()
+            .flat_map(|c| c.docs.values())
+            .filter(|e| e.row.is_some())
+            .count();
         let mut new_rows: Vec<f32> = Vec::new();
         new_rows
-            .try_reserve_exact(live_rows * self.data.dimension())
-            .map_err(|_| oom("compacted vector matrix", live_rows * self.data.dimension()))?;
+            .try_reserve_exact(rowed * self.data.dimension())
+            .map_err(|_| oom("compacted vector matrix", rowed * self.data.dimension()))?;
         let mut next_row: u64 = 0;
 
         // Build the new ops list for the log: CreateCollection + SetMeta + Upserts.
@@ -362,32 +462,48 @@ impl Store {
                 });
             }
 
+            // Re-emit the FTS schema so a post-compact replay restores it.
+            if let Some(fields) = self.fts.schema_for(col_name) {
+                log_ops.push(Op::SetFtsSchema {
+                    collection: col_name.clone(),
+                    fields: fields.to_vec(),
+                });
+            }
+
             // Assign new rows to live docs (sorted by id for determinism).
             let mut doc_ids: Vec<&String> = col.docs.keys().collect();
             doc_ids.sort();
 
             for id in doc_ids {
                 let entry = &col.docs[id];
-                // Copy the vector from the old data segment.
-                let vec_slice = self.data.row(entry.row);
-                new_rows.extend_from_slice(vec_slice);
+                match entry.row {
+                    Some(old_row) => {
+                        // Copy the vector from the old data segment to its new row.
+                        let vec_slice = self.data.row(old_row);
+                        new_rows.extend_from_slice(vec_slice);
 
-                let new_row = next_row;
-                next_row += 1;
+                        let new_row = next_row;
+                        next_row += 1;
 
-                // Emit Upsert with new row index.
-                log_ops.push(Op::Upsert {
-                    collection: col_name.clone(),
-                    id: id.clone(),
-                    row: new_row,
-                    attrs: entry.attrs.clone(),
-                });
-
-                updates.push(PendingUpdate {
-                    col: col_name.clone(),
-                    id: id.clone(),
-                    new_row,
-                });
+                        log_ops.push(Op::Upsert {
+                            collection: col_name.clone(),
+                            id: id.clone(),
+                            row: new_row,
+                            attrs: entry.attrs.clone(),
+                        });
+                        updates.push(PendingUpdate {
+                            col: col_name.clone(),
+                            id: id.clone(),
+                            new_row,
+                        });
+                    }
+                    // Text-only doc: no vector to relocate; re-emit as UpsertText.
+                    None => log_ops.push(Op::UpsertText {
+                        collection: col_name.clone(),
+                        id: id.clone(),
+                        attrs: entry.attrs.clone(),
+                    }),
+                }
             }
         }
 
@@ -400,7 +516,7 @@ impl Store {
             if let Some(col) = self.collections.get_mut(&update.col)
                 && let Some(entry) = col.docs.get_mut(&update.id)
             {
-                entry.row = update.new_row;
+                entry.row = Some(update.new_row);
             }
         }
 
@@ -414,6 +530,14 @@ impl Store {
         //     its on-disk cache. Best effort: the cache is derived, so a persist
         //     failure must not fail the compaction.
         self.rebuild_ann();
+
+        // 5c. Rebuild the FTS index from the live docs (drops tombstones, renumbers
+        //     docnums). Reads attrs, so it is unaffected by the row renumbering. Done
+        //     before persist so the refreshed `fts` cache matches the rewritten log.
+        self.rebuild_fts();
+
+        // 5d. Refresh both on-disk caches. Best effort: a persist failure must not fail
+        //     the compaction (the caches are derived).
         let _ = self.persist_index();
 
         // 6. Rows were renumbered — drop the cached scan order.

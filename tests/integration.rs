@@ -12,11 +12,7 @@ use nidus::{
 fn rec(id: &str, vector: Vec<f32>, kind: &str) -> Record {
     let mut attrs = BTreeMap::new();
     attrs.insert("kind".to_string(), Value::Str(kind.to_string()));
-    Record {
-        id: id.to_string(),
-        vector,
-        attrs,
-    }
+    Record::new(id, vector, attrs)
 }
 
 fn opts(top_k: usize) -> SearchOpts {

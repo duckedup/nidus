@@ -19,6 +19,7 @@ use anyhow::{Result, anyhow, bail};
 use crate::ann::Ann;
 use crate::config::{Config, OpenMode};
 use crate::data::DataSegment;
+use crate::fts::Fts;
 use crate::lock::WriteLock;
 use crate::log::OpLog;
 use crate::model::{Distance, Op};
@@ -39,9 +40,11 @@ use quant::Quant;
 /// sorted by `row` (see [`Store::scan_order`]).
 type ScanOrder = Vec<(u64, String, String)>;
 
-/// One document's entry within a collection.
+/// One document's entry within a collection. `row` is `None` for a text-only doc (no
+/// embedding, so no row in the data matrix); such docs are full-text/metadata only and
+/// never enter the vector scan or ANN index.
 struct DocEntry {
-    row: u64,
+    row: Option<u64>,
     attrs: BTreeMap<String, crate::model::Value>,
 }
 
@@ -93,6 +96,13 @@ pub struct Store {
     /// `persist_index`/load). Lets `persist_index` skip a redundant write and tracks
     /// whether the on-disk `ann` cache is current. Meaningless when ANN is off.
     ann_dirty: bool,
+    /// Full-text (BM25) index, keyed per declared `(collection, field)`. Empty (inert)
+    /// until a collection declares an FTS schema; loaded from the `fts` cache on open
+    /// when current, else rebuilt from the live docs.
+    fts: Fts,
+    /// The in-RAM FTS index has changes not yet written to the `fts` cache (mirrors
+    /// `ann_dirty`). Meaningless when FTS is inactive.
+    fts_dirty: bool,
     /// True for in-memory stores (no backing directory) — they never persist the ANN
     /// cache. `open`ed (file-backed) stores set this false.
     in_memory: bool,
@@ -157,6 +167,7 @@ impl Store {
         // 5. Replay ops into the in-RAM index.
         let mut collections: HashMap<String, Collection> = HashMap::new();
         let mut dead_rows: usize = 0;
+        let mut fts = Fts::default();
 
         for op in ops {
             match op {
@@ -167,7 +178,8 @@ impl Store {
                 }
                 Op::DropCollection { collection } => {
                     if let Some(col) = collections.remove(&collection) {
-                        dead_rows += col.docs.len();
+                        // Only rowed docs leave a reclaimable data row behind.
+                        dead_rows += col.docs.values().filter(|e| e.row.is_some()).count();
                     }
                 }
                 Op::SetMeta { collection, meta } => {
@@ -189,18 +201,48 @@ impl Store {
                     let col = collections
                         .entry(collection)
                         .or_insert_with(Collection::new);
-                    // If overwriting an existing id, the old row becomes dead.
-                    if col.docs.contains_key(&id) {
-                        dead_rows += 1;
-                    }
-                    col.docs.insert(id, DocEntry { row, attrs });
-                }
-                Op::Delete { collection, id } => {
-                    if let Some(col) = collections.get_mut(&collection)
-                        && col.docs.remove(&id).is_some()
+                    // Overwriting a *rowed* doc leaves its old row dead.
+                    if let Some(old) = col.docs.insert(
+                        id,
+                        DocEntry {
+                            row: Some(row),
+                            attrs,
+                        },
+                    ) && old.row.is_some()
                     {
                         dead_rows += 1;
                     }
+                }
+                Op::UpsertText {
+                    collection,
+                    id,
+                    attrs,
+                } => {
+                    let col = collections
+                        .entry(collection)
+                        .or_insert_with(Collection::new);
+                    if let Some(old) = col.docs.insert(id, DocEntry { row: None, attrs })
+                        && old.row.is_some()
+                    {
+                        dead_rows += 1;
+                    }
+                }
+                Op::Delete { collection, id } => {
+                    if let Some(col) = collections.get_mut(&collection)
+                        && let Some(old) = col.docs.remove(&id)
+                        && old.row.is_some()
+                    {
+                        dead_rows += 1;
+                    }
+                }
+                Op::SetFtsSchema { collection, fields } => {
+                    // The collection exists implicitly (matches SetMeta leniency); the
+                    // field indexes are (re)built from the live docs once replay finishes
+                    // (see `rebuild_fts`).
+                    collections
+                        .entry(collection.clone())
+                        .or_insert_with(Collection::new);
+                    fts.set_schema(&collection, &fields);
                 }
             }
         }
@@ -223,6 +265,8 @@ impl Store {
             quant,
             ann,
             ann_dirty: false,
+            fts,
+            fts_dirty: false,
             in_memory: false,
             row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
@@ -242,6 +286,22 @@ impl Store {
         // 8. Load the ANN index from its cache (incrementally catching up any rows
         //    added since), or rebuild it from the vectors if there is no valid cache.
         store.load_or_build_ann()?;
+        // 9. Load the FTS index from its `fts` cache when it is exactly current, else
+        //    rebuild it from the replayed docs (the schema was restored during replay).
+        //    A no-op when no collection declares FTS.
+        store.load_or_build_fts()?;
+
+        // 10. Auto-compact for FTS tombstone pressure too. Text-only docs occupy no data
+        //     rows, so their deletes/overwrites never raise `dead_rows` and the step-6
+        //     check can't see them — a churning text-only collection would otherwise let
+        //     dead postings grow without bound. `compact` rebuilds the index (dropping
+        //     tombstones). Checked after the index is built, so the ratio is meaningful;
+        //     if step 6 already compacted, the ratio is ~0 and this is a no-op.
+        if let Some(threshold) = store.config.auto_compact
+            && store.fts.tombstone_ratio() > threshold
+        {
+            store.compact()?;
+        }
 
         Ok(store)
     }
@@ -279,6 +339,8 @@ impl Store {
             quant,
             ann,
             ann_dirty: false,
+            fts: Fts::default(),
+            fts_dirty: false,
             in_memory: true,
             row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
@@ -297,9 +359,12 @@ impl Store {
         let mut live_rows: Vec<u64> = Vec::new();
         for (col_name, col) in &self.collections {
             for (id, entry) in &col.docs {
-                if (entry.row as usize) < row_to_doc.len() {
-                    row_to_doc[entry.row as usize] = Some((col_name.clone(), id.clone()));
-                    live_rows.push(entry.row);
+                // Text-only docs (row None) have no vector — they never enter the index.
+                if let Some(row) = entry.row
+                    && (row as usize) < row_to_doc.len()
+                {
+                    row_to_doc[row as usize] = Some((col_name.clone(), id.clone()));
+                    live_rows.push(row);
                 }
             }
         }
@@ -371,10 +436,21 @@ impl Store {
     /// no-op when ANN is off, the store is in-memory or read-only, or nothing changed
     /// since the last persist.
     pub fn persist_index(&mut self) -> Result<()> {
+        // The on-disk caches are never written for an in-memory or read-only store.
+        if self.in_memory || self.config.open_mode == OpenMode::ReadOnly {
+            return Ok(());
+        }
+        self.persist_ann()?;
+        self.persist_fts()?;
+        Ok(())
+    }
+
+    /// Persist the ANN cache if dirty (gating shared via [`Self::persist_index`]).
+    fn persist_ann(&mut self) -> Result<()> {
         let Some(cfg) = self.config.ann else {
             return Ok(());
         };
-        if self.in_memory || self.config.open_mode == OpenMode::ReadOnly || !self.ann_dirty {
+        if !self.ann_dirty {
             return Ok(());
         }
         let Some(ann) = self.ann.as_ref() else {
@@ -391,6 +467,46 @@ impl Store {
             self.config.quantization.map(|q| q.kind),
         )?;
         self.ann_dirty = false;
+        Ok(())
+    }
+
+    /// Persist the FTS index to the `fts` cache if dirty. The validity key is the
+    /// declared schema + analyzer/BM25 params; the watermark is the current log offset,
+    /// so on open the cache is adopted only when nothing has been written since (any
+    /// later write → the offset differs → rebuild). Reuses the shared
+    /// [`crate::index_cache`] codec.
+    fn persist_fts(&mut self) -> Result<()> {
+        if !self.fts.is_active() || !self.fts_dirty {
+            return Ok(());
+        }
+        let path = self.config.path.join("fts");
+        let watermark = self.log.offset()?;
+        crate::index_cache::save(&path, &self.fts.cache_key(), watermark, &self.fts)?;
+        self.fts_dirty = false;
+        Ok(())
+    }
+
+    /// On `open`: adopt the `fts` cache when it is valid for the current schema **and**
+    /// its watermark equals the current log offset (i.e. nothing was written after it
+    /// was persisted — the clean-reopen fast path). Otherwise rebuild from the replayed
+    /// docs. No-op when FTS is inactive.
+    fn load_or_build_fts(&mut self) -> Result<()> {
+        if !self.fts.is_active() {
+            return Ok(());
+        }
+        let path = self.config.path.join("fts");
+        let key = self.fts.cache_key();
+        let current = self.log.offset()?;
+        if let Some((cached, watermark)) = crate::index_cache::load::<Fts>(&path, &key)?
+            && watermark == current
+        {
+            // The cache reflects the store exactly as it stands.
+            self.fts = cached;
+            self.fts_dirty = false;
+            return Ok(());
+        }
+        // Absent, stale (schema/params changed), or the store changed since persist.
+        self.rebuild_fts();
         Ok(())
     }
 
@@ -414,5 +530,35 @@ impl Store {
             ann.insert_rows(&walk, &new_rows);
         }
         self.ann_dirty = true;
+    }
+
+    // ── FTS index lifecycle ───────────────────────────────────────────────────────
+
+    /// Rebuild the full-text index from all live docs (used on `open` after replay and
+    /// after `compact` renumbers). Clears the field indexes (keeping the declared
+    /// schema), then re-indexes every doc of every FTS collection in a deterministic
+    /// order (sorted collection, then sorted id) so docnums are reproducible. No-op when
+    /// FTS is inactive.
+    fn rebuild_fts(&mut self) {
+        if !self.fts.is_active() {
+            return;
+        }
+        self.fts.clear_indexes();
+        let mut col_names: Vec<String> = self.collections.keys().cloned().collect();
+        col_names.sort();
+        for col_name in &col_names {
+            if self.fts.schema_for(col_name).is_none() {
+                continue;
+            }
+            let col = &self.collections[col_name];
+            let mut ids: Vec<&String> = col.docs.keys().collect();
+            ids.sort();
+            for id in ids {
+                let attrs = &col.docs[id].attrs;
+                self.fts.index_doc(col_name, id, attrs);
+            }
+        }
+        // The rebuilt index isn't on disk yet.
+        self.fts_dirty = true;
     }
 }
