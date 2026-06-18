@@ -1,0 +1,142 @@
+---
+/**
+ * nidus — custom splash hero.
+ *
+ * Replaces Starlight's default Hero on the landing page. The signature moment:
+ * the nest illustration sits in a warm ember glow, overlaid with a live
+ * "nearest-neighbour weave" — eggs (vectors) as nodes, threads drawn between
+ * the closest neighbours on load. Woodland nest meets k-NN search.
+ *
+ * Tagline + actions are read from page frontmatter (`hero:` block) so the copy
+ * stays in the .mdx; the headline + visual are owned here.
+ */
+import { Image } from "astro:assets";
+import nest from "../assets/nidus.svg";
+
+const { hero } = Astro.locals.starlightRoute.entry.data;
+const tagline = hero?.tagline ?? "";
+const actions = hero?.actions ?? [];
+
+// The nearest-neighbour weave. One query node (the egg being placed) and its
+// neighbours; edges are drawn shortest-first so the load animation reads as a
+// search settling into place. Coordinates live in a 0–100 viewBox.
+const query = { x: 50, y: 46 };
+const eggs = [
+  { x: 30, y: 30, r: 3.4, gold: false },
+  { x: 71, y: 28, r: 3.0, gold: true },
+  { x: 22, y: 60, r: 2.6, gold: false },
+  { x: 78, y: 62, r: 3.2, gold: false },
+  { x: 44, y: 74, r: 2.4, gold: true },
+  { x: 64, y: 72, r: 2.8, gold: false },
+];
+// Connect the query to each neighbour, nearest first (the k-NN result order).
+const edges = eggs
+  .map((e) => ({ e, d: Math.hypot(e.x - query.x, e.y - query.y) }))
+  .sort((a, b) => a.d - b.d)
+  .map(({ e }, i) => ({ x: e.x, y: e.y, order: i }));
+---
+
+<div class="nd-hero not-content">
+  <div class="nd-hero__copy">
+    <p class="nd-eyebrow">Latin <span aria-hidden="true">·</span> <em>nidus</em>, a nest</p>
+    <h1 class="nd-headline">
+      A nest for your <span class="nd-flourish">vectors</span>.
+    </h1>
+    <p class="nd-tagline">{tagline}</p>
+
+    {
+      actions.length > 0 && (
+        <div class="nd-actions">
+          {actions.map((action) => (
+            <a
+              href={action.link}
+              class:list={["nd-btn", `nd-btn--${action.variant ?? "primary"}`]}
+            >
+              <span>{action.text}</span>
+              {action.variant === "primary" && (
+                <span class="nd-btn__arrow" aria-hidden="true">
+                  →
+                </span>
+              )}
+            </a>
+          ))}
+        </div>
+      )
+    }
+
+    <p class="nd-proof">
+      <span class="nd-proof__prompt" aria-hidden="true">$</span>
+      <code>cargo add nidus</code>
+    </p>
+  </div>
+
+  <div class="nd-hero__art" aria-hidden="true">
+    <div class="nd-glow"></div>
+    <Image src={nest} alt="" class="nd-nest" loading="eager" />
+
+    <svg
+      class="nd-weave"
+      viewBox="0 0 100 100"
+      preserveAspectRatio="xMidYMid meet"
+      role="presentation"
+    >
+      {
+        edges.map((e) => {
+          const len = Math.hypot(e.x - query.x, e.y - query.y);
+          return (
+            <line
+              class="nd-weave__edge"
+              x1={query.x}
+              y1={query.y}
+              x2={e.x}
+              y2={e.y}
+              pathLength="1"
+              style={`--edge-len:${len};--i:${e.order}`}
+            />
+          );
+        })
+      }
+      {
+        eggs.map((egg, i) => (
+          <circle
+            class:list={["nd-weave__egg", { "is-gold": egg.gold }]}
+            cx={egg.x}
+            cy={egg.y}
+            r={egg.r}
+            style={`--i:${i}`}
+          />
+        ))
+      }
+      <circle class="nd-weave__query" cx={query.x} cy={query.y} r="3.6" />
+    </svg>
+  </div>
+</div>
+
+<script>
+  // Reveal cards as they scroll into view. Pure progressive enhancement:
+  // if JS is off or motion is reduced, the CSS leaves everything visible.
+  // Runs on `astro:page-load` so it also fires after view-transition navigation.
+  function initReveal() {
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const targets = document.querySelectorAll("[data-reveal]");
+    if (!targets.length) return;
+    if (reduce || !("IntersectionObserver" in window)) {
+      targets.forEach((el) => el.classList.add("is-visible"));
+      return;
+    }
+    const io = new IntersectionObserver(
+      (entries, obs) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            entry.target.classList.add("is-visible");
+            obs.unobserve(entry.target);
+          }
+        }
+      },
+      { rootMargin: "0px 0px -10% 0px", threshold: 0.1 },
+    );
+    targets.forEach((el) => io.observe(el));
+  }
+
+  document.addEventListener("astro:page-load", initReveal);
+</script>

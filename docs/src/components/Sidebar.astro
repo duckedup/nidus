@@ -1,0 +1,156 @@
+---
+/**
+ * nidus — custom single sidebar.
+ *
+ * Icon-led, collapsible sections. Each top-level group is a native <details>
+ * accordion: click the section to reveal its pages. The section holding the
+ * current page is open on load. No right-hand TOC, no column dividers — the
+ * sidebar's own ground tone separates it, not a border.
+ */
+import { Icon } from "@astrojs/starlight/components";
+import PageToc from "./PageToc.astro";
+
+const { sidebar, toc } = Astro.locals.starlightRoute;
+
+// Flatten the page's table of contents into a single list (keeping depth for
+// indentation) and drop the synthetic "Overview" entry. Rendered under the
+// active page link as the sidebar's second tier.
+function flattenToc(items) {
+  return items.flatMap((i) => [i, ...flattenToc(i.children ?? [])]);
+}
+const tocItems = (toc?.items ? flattenToc(toc.items) : []).filter(
+  (i) => i.slug !== "_top",
+);
+
+// Section → icon. Keyed by the group label set in astro.config's `sidebar`.
+const ICONS = {
+  "Start here": "rocket",
+  Guides: "open-book",
+  "HTTP API": "laptop",
+  Reference: "list-format",
+};
+
+/** Does this entry (or any descendant) point at the current page? */
+function hasCurrent(entry) {
+  if (entry.type === "link") return entry.isCurrent;
+  return entry.entries.some(hasCurrent);
+}
+---
+
+<nav class="nd-nav" aria-label="Documentation">
+  <ul class="nd-nav__list">
+    {
+      sidebar.map((entry) =>
+        entry.type === "group" ? (
+          <li class="nd-group">
+            <details class="nd-details" open={hasCurrent(entry)}>
+              <summary class="nd-summary">
+                <span class="nd-summary__icon">
+                  <Icon name={ICONS[entry.label] ?? "open-book"} size="1.1em" />
+                </span>
+                <span class="nd-summary__label">{entry.label}</span>
+                <span class="nd-summary__chev">
+                  <Icon name="right-caret" size="1em" />
+                </span>
+              </summary>
+              <ul class="nd-sublist">
+                {entry.entries.map((sub) =>
+                  sub.type === "link" ? (
+                    <li>
+                      <a
+                        href={sub.href}
+                        class:list={["nd-link", { "is-current": sub.isCurrent }]}
+                        aria-current={sub.isCurrent ? "page" : undefined}
+                      >
+                        {sub.label}
+                      </a>
+                      {sub.isCurrent && <PageToc items={tocItems} />}
+                    </li>
+                  ) : (
+                    <li class="nd-subgroup">
+                      <span class="nd-subgroup__label">{sub.label}</span>
+                      <ul class="nd-sublist">
+                        {sub.entries.map(
+                          (leaf) =>
+                            leaf.type === "link" && (
+                              <li>
+                                <a
+                                  href={leaf.href}
+                                  class:list={[
+                                    "nd-link",
+                                    { "is-current": leaf.isCurrent },
+                                  ]}
+                                  aria-current={
+                                    leaf.isCurrent ? "page" : undefined
+                                  }
+                                >
+                                  {leaf.label}
+                                </a>
+                              </li>
+                            ),
+                        )}
+                      </ul>
+                    </li>
+                  ),
+                )}
+              </ul>
+            </details>
+          </li>
+        ) : (
+          <li>
+            <a
+              href={entry.href}
+              class:list={[
+                "nd-link nd-link--solo",
+                { "is-current": entry.isCurrent },
+              ]}
+              aria-current={entry.isCurrent ? "page" : undefined}
+            >
+              {entry.label}
+            </a>
+            {entry.isCurrent && <PageToc items={tocItems} />}
+          </li>
+        ),
+      )
+    }
+  </ul>
+</nav>
+
+<script>
+  // Scroll-spy for the in-sidebar page TOC: highlight the section currently in
+  // view. Re-runs on every view-transition navigation via `astro:page-load`.
+  function initTocSpy() {
+    const links = Array.from(
+      document.querySelectorAll(".nd-toc__link"),
+    ) as HTMLAnchorElement[];
+    if (!links.length) return;
+
+    const byTarget = new Map<Element, HTMLAnchorElement>();
+    for (const link of links) {
+      const id = decodeURIComponent(new URL(link.href).hash.slice(1));
+      const target = id && document.getElementById(id);
+      if (target) byTarget.set(target, link);
+    }
+
+    let active: HTMLAnchorElement | null = null;
+    const setActive = (link: HTMLAnchorElement | undefined) => {
+      if (!link || link === active) return;
+      active?.classList.remove("is-active");
+      link.classList.add("is-active");
+      active = link;
+    };
+
+    const io = new IntersectionObserver(
+      (entries) => {
+        const visible = entries
+          .filter((e) => e.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+        if (visible[0]) setActive(byTarget.get(visible[0].target));
+      },
+      { rootMargin: "0px 0px -72% 0px", threshold: 0 },
+    );
+    byTarget.forEach((_link, target) => io.observe(target));
+  }
+
+  document.addEventListener("astro:page-load", initTocSpy);
+</script>
