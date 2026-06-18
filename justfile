@@ -87,16 +87,18 @@ ci-cli: fmt-check lint-cli test-cli
 # ── Docs site (Astro + Starlight, in docs/) ─────────────────────────────────
 
 # Run the docs dev server with live reload (installs deps on first run)
+# `--bun` forces Bun's runtime so Astro doesn't shell out to system Node
+# (Astro needs Node >=22.12; many machines still ship an older system Node).
 docs:
-    cd docs && bun install && bun run dev
+    cd docs && bun install && bun --bun run dev
 
 # Build the docs site to docs/dist/
 docs-build:
-    cd docs && bun install && bun run build
+    cd docs && bun install && bun --bun run build
 
 # Preview the production docs build locally
 docs-preview:
-    cd docs && bun run preview
+    cd docs && bun --bun run preview
 
 # ── Build ──────────────────────────────────────────────────────────────────
 

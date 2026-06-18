@@ -217,14 +217,21 @@ a.site-title img {
   text-decoration-color: var(--sl-color-accent);
 }
 
-/* ── Single sidebar: icon-led, collapsible sections (src/components/Sidebar) ─ */
+/* ── Single sidebar: "the branch" (src/components/Sidebar.astro) ───────────
+   Three unmistakable tiers, drawn from the nest itself:
+     1. section  — a branch: icon chip + label + chevron
+     2. page     — a twig hung off a hairline guide rail; the active page
+                   lights its segment of the rail teal (no floating tick)
+     3. headings — the active page's own sections on a finer, deeper rail with
+                   a lit node, so "inside this page" never reads as a sibling.
+   The rails make hierarchy legible at a glance; one teal accent says where you
+   are; the darker ground (not a border) separates the column. */
 
-/* No column divider — the sidebar's darker ground separates it, not a border. */
 .sidebar-pane {
   border-inline-end: none !important;
 }
 .sidebar-content {
-  padding: 0.75rem 0.5rem 2rem;
+  padding: 1rem 0.7rem 2.5rem;
 }
 
 .nd-nav__list,
@@ -234,22 +241,23 @@ a.site-title img {
   padding: 0;
 }
 .nd-group {
-  margin-bottom: 0.1rem;
+  margin-bottom: 0.15rem;
 }
 
-/* Section header — the clickable accordion summary */
+/* ── Tier 1 — section header (the branch) ──────────────────────────────── */
 .nd-summary {
   display: flex;
   align-items: center;
-  gap: 0.65rem;
-  padding: 0.52rem 0.65rem;
-  border-radius: 0.6rem;
+  gap: 0.6rem;
+  padding: 0.48rem 0.6rem;
+  border-radius: 0.55rem;
   cursor: pointer;
   list-style: none;
   user-select: none;
   font-weight: 600;
-  font-size: 0.92rem;
-  color: var(--sl-color-white);
+  font-size: 0.93rem;
+  letter-spacing: -0.01em;
+  color: var(--sl-color-gray-1);
   transition: background-color 0.16s ease, color 0.16s ease;
 }
 .nd-summary::-webkit-details-marker,
@@ -258,20 +266,26 @@ a.site-title img {
   content: "";
 }
 .nd-summary:hover {
-  background: color-mix(in srgb, var(--nd-teal) 11%, transparent);
+  background: color-mix(in srgb, var(--nd-teal) 10%, transparent);
+  color: var(--sl-color-white);
 }
 .nd-summary:focus-visible {
   outline: 2px solid var(--sl-color-accent);
   outline-offset: 2px;
 }
+/* Icon chip — a 1.5rem square that doubles as the rail's anchor point. */
 .nd-summary__icon {
   display: inline-flex;
   align-items: center;
-  color: var(--nd-teal);
-  transition: transform 0.2s var(--nd-ease);
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 0.45rem;
+  color: var(--sl-color-gray-3);
+  transition: color 0.18s ease, background-color 0.18s ease;
 }
 .nd-details[open] > .nd-summary .nd-summary__icon {
-  color: var(--nd-teal-bright);
+  color: var(--nd-teal);
 }
 .nd-summary__label {
   flex: 1;
@@ -279,27 +293,40 @@ a.site-title img {
 .nd-summary__chev {
   display: inline-flex;
   align-items: center;
-  color: var(--sl-color-gray-3);
-  transition: transform 0.22s var(--nd-ease);
+  color: var(--sl-color-gray-4);
+  transition: transform 0.22s var(--nd-ease), color 0.16s ease;
 }
 .nd-details[open] > .nd-summary .nd-summary__chev {
   transform: rotate(90deg);
 }
 
-/* Sub-pages */
-.nd-sublist {
-  padding-left: 2.05rem;
-  margin: 0.1rem 0 0.55rem;
+/* "You are here" — the section holding the current page keeps a lit icon chip
+   and brighter label even when scrolled past, so the active branch is obvious. */
+.nd-group.is-active > .nd-details > .nd-summary {
+  color: var(--sl-color-white);
+}
+.nd-group.is-active > .nd-details > .nd-summary .nd-summary__icon {
+  color: var(--nd-teal-bright);
+  background: color-mix(in srgb, var(--nd-teal) 16%, transparent);
+}
+
+/* ── Tier 2 — page list (twigs on a guide rail) ────────────────────────── */
+.nd-details > .nd-sublist {
+  position: relative;
+  margin: 0.25rem 0 0.6rem;
+  margin-left: 1.35rem; /* aligns the rail under the section icon's centre */
+  padding-left: 0.85rem;
+  border-left: 1px solid var(--sl-color-hairline-light);
 }
 .nd-link {
   position: relative;
   display: block;
-  padding: 0.36rem 0.65rem;
-  border-radius: 0.5rem;
+  padding: 0.36rem 0.6rem;
+  border-radius: 0.45rem;
   color: var(--sl-color-gray-2);
   text-decoration: none;
   line-height: 1.35;
-  font-size: 0.9rem;
+  font-size: 0.89rem;
   transition: background-color 0.16s ease, color 0.16s ease;
 }
 .nd-link:hover {
@@ -308,70 +335,93 @@ a.site-title img {
 }
 .nd-link.is-current {
   color: var(--sl-color-accent-high);
-  background: var(--sl-color-accent-low);
+  background: color-mix(in srgb, var(--sl-color-accent-low) 88%, transparent);
   font-weight: 600;
 }
-/* Teal tick marking the current page */
+/* The active page lights its full segment of the rail — a solid teal bar that
+   reads as "this twig", not a faint tick adrift to the left. */
 .nd-link.is-current::before {
   content: "";
   position: absolute;
-  left: -0.95rem;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 3px;
-  height: 1.05em;
+  left: calc(-0.85rem - 1px);
+  top: 0.18rem;
+  bottom: 0.18rem;
+  width: 2px;
   border-radius: 2px;
-  background: var(--nd-teal);
+  background: var(--nd-teal-bright);
 }
 .nd-link--solo {
   font-weight: 600;
-  color: var(--sl-color-white);
+  font-size: 0.93rem;
+  letter-spacing: -0.01em;
+  color: var(--sl-color-gray-1);
+  padding: 0.48rem 0.6rem;
+}
+.nd-link--solo.is-current {
+  color: var(--sl-color-accent-high);
 }
 
-/* Second tier — the active page's own sections (replaces the right TOC) */
+/* ── Tier 3 — on-this-page headings (a finer rail, a lit node) ─────────────
+   Set deeper and quieter than the page list so it reads as the current page's
+   own contents, never as more sibling pages. */
 .nd-toc {
   list-style: none;
-  margin: 0.15rem 0 0.4rem;
-  padding: 0;
   position: relative;
+  margin: 0.3rem 0 0.55rem;
+  margin-left: 0.45rem;
+  padding-left: 0.8rem;
+  border-left: 1px solid var(--sl-color-hairline);
 }
 .nd-toc__link {
+  position: relative;
   display: block;
-  padding: 0.26rem 0.65rem;
-  padding-left: calc(0.95rem + var(--toc-depth, 0) * 0.85rem);
-  border-radius: 0.45rem;
-  font-size: 0.83rem;
+  padding: 0.24rem 0.55rem;
+  padding-left: calc(0.55rem + var(--toc-depth, 0) * 0.8rem);
+  border-radius: 0.4rem;
+  font-size: 0.82rem;
   line-height: 1.3;
   color: var(--sl-color-gray-3);
   text-decoration: none;
   transition: color 0.16s ease, background-color 0.16s ease;
 }
-/* Top-level sections (H2) act as group headers: a little air above each one
-   chunks the list, and the H3s beneath read as a tucked-in cluster. */
+/* H2s chunk the list: a little air above, the H3s beneath read as a cluster. */
 .nd-toc__link[data-depth="2"] {
-  margin-top: 0.6rem;
+  margin-top: 0.45rem;
   color: var(--sl-color-gray-2);
   font-weight: 600;
 }
 .nd-toc > li:first-child .nd-toc__link[data-depth="2"] {
-  margin-top: 0.2rem;
+  margin-top: 0;
 }
 .nd-toc__link:hover {
   color: var(--sl-color-white);
-  background: color-mix(in srgb, var(--nd-teal) 8%, transparent);
+  background: color-mix(in srgb, var(--nd-teal) 7%, transparent);
 }
 .nd-toc__link.is-active {
   color: var(--sl-color-accent-high);
   font-weight: 600;
 }
+/* A lit node on the rail marks the heading currently in view. */
+.nd-toc__link.is-active::before {
+  content: "";
+  position: absolute;
+  left: calc(-0.8rem - 2px);
+  top: 50%;
+  transform: translateY(-50%);
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--nd-teal-bright);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--nd-teal) 22%, transparent);
+}
 
 .nd-subgroup__label {
   display: block;
-  padding: 0.5rem 0.65rem 0.2rem;
-  font-size: 0.72rem;
-  letter-spacing: 0.06em;
+  padding: 0.5rem 0.6rem 0.2rem;
+  font-size: 0.7rem;
+  letter-spacing: 0.07em;
   text-transform: uppercase;
-  color: var(--sl-color-gray-3);
+  color: var(--sl-color-gray-4);
 }
 
 /* Inline + block code */
