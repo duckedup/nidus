@@ -118,11 +118,11 @@ differ slightly from the serial one (recall stays equivalent).
 ### `persistence`
 
 `String` — where the durable `data`/`log` bytes live (default `""` = local files under
-[`path`](#path)). An [`open_persistence`](/guides/backends/) location: a path / `file://`,
+[`path`](#path)). An [`open_persistence`](/guides/storage-backends/) location: a path / `file://`,
 or `s3://<bucket>[/<prefix>]` / `gs://<bucket>[/<prefix>]` for a **live object-store-backed
 store** (each segment is rewritten as one whole object on flush — `O(object)`, suited to
 low write rates, under an advisory writer lock). With an object store, pass `dimension`
-explicitly — the remote header is not peeked. See [Storage backends](/guides/backends/).
+explicitly — the remote header is not peeked. See [Storage backends](/guides/storage-backends/).
 
 ### `memory`
 
@@ -131,6 +131,7 @@ process heap; nothing shared). A Redis-family URL — `redis://` / `rediss://` /
 `valkey://` / `valkeys://` / `keydb://` / `dragonfly://`, optionally `?prefix=<ns>` —
 publishes the serialized working set on `flush` and adopts it on `open`, so other workers
 skip the log replay. A rebuildable cache: an unreachable or evicted tier is never fatal.
+See [Memory stores](/guides/memory-stores/).
 
 ## `Fsync`
 

@@ -6,6 +6,10 @@ import starlight from "@astrojs/starlight";
 // Custom domain serves from the root, so `base` stays "/".
 export default defineConfig({
   site: "https://nidus.duckedup.org",
+  // The combined "backends" guide was split into Storage + Memory pages.
+  redirects: {
+    "/guides/backends/": "/guides/storage-backends/",
+  },
   integrations: [
     starlight({
       title: "nidus",
@@ -52,12 +56,18 @@ export default defineConfig({
           items: [
             { label: "How it works", link: "/guides/how-it-works/" },
             { label: "Storage & durability", link: "/guides/storage/" },
-            { label: "Storage backends", link: "/guides/backends/" },
+            { label: "Storage backends", link: "/guides/storage-backends/" },
+            { label: "Memory stores", link: "/guides/memory-stores/" },
             { label: "Search & filters", link: "/guides/search/" },
             { label: "Embedding in a host app", link: "/guides/integrating/" },
             { label: "Command line", link: "/guides/cli-and-server/" },
-            { label: "HTTP server & API", link: "/guides/http-server/" },
-            { label: "Running across a few boxes", link: "/guides/multi-box/" },
+            { label: "HTTP server", link: "/guides/http-server/" },
+          ],
+        },
+        {
+          label: "HTTP API",
+          items: [
+            { label: "Endpoint reference", link: "/reference/http-api/" },
           ],
         },
         {

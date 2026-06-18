@@ -7,9 +7,10 @@ nidus is durable by design with a tiny surface: two append-only files and a lock
 This page covers the on-disk format, what survives a crash, how dead rows are
 reclaimed, and how a second process reads a store another is writing.
 
-For the abstraction *behind* the files — the two-axis backend model and the
-`Persistence`/`MemoryTier` traits that make the storage layer pluggable — see
-[Storage backends](/guides/backends/).
+This page is about a store on **local disk**. To keep the durable data somewhere
+else — Amazon S3 or Google Cloud Storage — see [Storage backends](/guides/storage-backends/);
+to share the in-memory index across processes via Redis, see
+[Memory stores](/guides/memory-stores/).
 
 ## On-disk format
 
