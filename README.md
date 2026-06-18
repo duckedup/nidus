@@ -31,10 +31,11 @@ The bar is **build-and-ship speed**, not zero-C absolutism. The enemy is the
 *multi-minute* C/C++ tree (DuckDB) or hundred-crate graph (LanceDB) — not a small,
 fast dependency.
 
-- **Builds in seconds** — the whole crate, with every backend, compiles in seconds
-  (CI asserts well under a minute). The only native code is `ring` (the TLS used by
-  the optional S3/GCS backends — a small C+asm compile); never a bundled C++ tree,
-  vendored OpenSSL, or `aws-lc`.
+- **Builds in seconds** — the whole crate, with every backend (local files, S3, GCS, and
+  the Redis/Valkey memory tier), compiles in seconds (CI asserts well under a minute). The
+  only native code is `ring` (the TLS used by the S3/GCS backends and `rediss://` — a small
+  C+asm compile); never a bundled C++ tree, vendored OpenSSL, or `aws-lc`. The Redis client
+  is sync/pure-Rust (no tokio).
 - **Zero `unsafe` in our code** (`#![forbid(unsafe_code)]`).
 - **Pure-Rust core** — the local store and search path are pure Rust with no native
   library; the cloud backends are sans-IO clients (`rusty-s3`/`tame-gcs`) over a small
@@ -46,7 +47,7 @@ fast dependency.
 
 ```toml
 [dependencies]
-nidus = "0.15"
+nidus = "0.16"
 ```
 
 ```rust
@@ -219,8 +220,8 @@ just serve ./store 768   # run `nidus serve` from the checkout
 
 The core recipes keep the seconds-long build path intact; the `cli` feature (which
 pulls clap + the tokio/axum stack) has its own opt-in recipes. Miri runs all of
-nidus's own logic, including the local file IO — only the network TLS paths in the
-S3/GCS backends are outside its reach.
+nidus's own logic, including the local file IO and the in-RAM object-store/memory-tier
+paths — only the network paths (S3/GCS TLS, the Redis socket) are outside its reach.
 
 Rust 1.96+ (pinned via `rust-toolchain.toml`), edition 2024.
 

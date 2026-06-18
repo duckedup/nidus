@@ -12,12 +12,18 @@ Both default to local, and they compose:
 - **Memory tier** — where the in-RAM *working set* is held for serving, so it can be
   shared across processes and reloaded without a rebuild. The [`MemoryTier`] trait.
 
-Today nidus ships the local implementations of both — `LocalFs` (a directory) and
-`LocalRam` (the process heap) — and exposes the traits as the seam any other backend
-plugs into. A file-backed store **runs over `LocalFs`**: its `data`/`log` segments are
-append handles the backend hands out, and its `ann`/`fts` caches and writer lock go
-through the same object operations — so the trait is the real substrate, not a wrapper
-bolted on the side.
+nidus ships several implementations of each axis, all selected by a location string:
+
+- **Persistence** — `LocalFs` (a directory, the default), plus `S3` (`s3://`, also R2/MinIO)
+  and `Gcs` (`gs://`) object stores.
+- **Memory tier** — `LocalRam` (the process heap, the default), plus `RedisTier`
+  (`redis://` and the RESP-compatible kin: Valkey, KeyDB, DragonflyDB).
+
+A file-backed store **runs over `LocalFs`**: its `data`/`log` segments are append handles
+the backend hands out, and its `ann`/`fts` caches and writer lock go through the same
+object operations — so the trait is the real substrate, not a wrapper bolted on the side.
+An object-backed store runs over the same trait: each segment is an in-RAM buffer the
+backend rewrites as one whole object on sync.
 
 ## Why the two axes are separate
 
@@ -97,6 +103,14 @@ and **reloaded without a rebuild**. It is a *cache* of the serialized working se
 a source of truth: an empty or evicted tier is never fatal, because the working set is
 always rebuildable from the persistence tier.
 
+What nidus publishes here is the **replay-derived index** — the per-collection
+`id → (row, attrs)` maps, the dead-row count, and the declared FTS schemas: the one piece
+of in-RAM state with no other cache, since every process would otherwise rebuild it by
+replaying the whole op log. The blob is **watermark-guarded** (the log byte offset + the
+data row count), so a store adopts it on `open` only when it matches the just-opened
+`data`/`log` exactly; otherwise it falls back to a normal replay. The store publishes a
+fresh snapshot on `flush`.
+
 ```rust
 use std::time::Duration;
 use nidus::Result;
@@ -121,6 +135,31 @@ tier.store("warm", b"...serialized working set...", None)?;
 # anyhow::Ok(())
 ```
 
+### `RedisTier`
+
+A **shared** tier over the Redis wire protocol, so several stateless workers pointed at
+the same server skip the log replay on cold start — the first to open publishes the
+working set, the rest adopt it. One blocking client (`redis-rs`, sync — no async runtime)
+covers the whole RESP-compatible family: **Redis, Valkey, KeyDB, and DragonflyDB**.
+Selected by URL scheme, plain TCP or TLS:
+
+- `redis://host:6379` · `valkey://…` · `keydb://…` · `dragonfly://…` — plain TCP
+- `rediss://…` · `valkeys://…` — TLS (reuses the same rustls + `ring` as the S3/GCS path)
+
+Append `?prefix=<ns>` to namespace the keys (`<ns>:workingset`), so distinct stores can
+share one server. The tier is a rebuildable cache: an unreachable or evicted server is
+never fatal — the store just replays the log locally.
+
+```rust
+use nidus::open_memory_tier;
+
+let tier = open_memory_tier("valkey://cache.internal:6379?prefix=docs")?;
+# anyhow::Ok(())
+```
+
+> Memcached is intentionally **not** supported: it is eviction-only with no durability
+> guarantees, the weakest fit for even a rebuildable cache.
+
 ## Selection by URL scheme
 
 Backends are addressed by a location string, so a store's home is a value, not a
@@ -136,13 +175,18 @@ let tier = open_memory_tier("local")?;
 # anyhow::Ok(())
 ```
 
-Available today: `file://` (local files), `local` (local RAM),
+**Persistence** locations: `file://<path>` or a bare path (local files),
 **`s3://<bucket>[/<prefix>]`** (Amazon S3 and S3-compatible stores — R2, MinIO), and
-**`gs://<bucket>[/<prefix>]`** (Google Cloud Storage). Credentials come from the
-standard environment — S3 from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION`
-(plus `AWS_ENDPOINT_URL` for R2/MinIO), GCS from a service-account key at
-`GOOGLE_APPLICATION_CREDENTIALS`. An unrecognized scheme is rejected with a clear error
-rather than a silent fallback, so a location string is always validated up front.
+**`gs://<bucket>[/<prefix>]`** (Google Cloud Storage). **Memory-tier** locations: `local`
+(or `""` / `ram`) for the process heap, and the Redis family
+**`redis://` / `rediss://` / `valkey://` / `valkeys://` / `keydb://` / `dragonfly://`**.
+
+Credentials come from the standard environment — S3 from
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION` (plus `AWS_ENDPOINT_URL` for
+R2/MinIO), GCS from a service-account key at `GOOGLE_APPLICATION_CREDENTIALS`, Redis from
+the URL itself. An unrecognized scheme is rejected with a clear error rather than a silent
+fallback, so a location string is always validated up front. The two axes compose: truth
+in S3, working set shared via Valkey, search always in local RAM.
 
 ```bash
 # Snapshot a local store straight to the cloud — the destination is just a location.
@@ -153,9 +197,20 @@ GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json \
   nidus backup --dir ./store --out gs://my-bucket/backups/store.tar.gz
 ```
 
-S3 and GCS are whole-object backends (`get`/`put`/`delete`/`list`) — there is no native
-append, so they serve snapshots and whole-object use, not a live append-backed
-`data`/`log` store.
+S3 and GCS are whole-object backends (`get`/`put`/`delete`/`list`) with no native append.
+A store can still **run live** on them: each `data`/`log` segment is buffered in RAM and
+rewritten as one whole object on every sync (an `ObjectAppender`). That makes a flush
+`O(object)` rather than an `O(batch)` append — fine for the low-write-rate / dev /
+small-scale use nidus targets, costly for write-heavy workloads. The writer lock on an
+object store is **advisory** (a TTL'd `lock` object via get-then-put, not race-free), which
+suits a single writer; concurrent writers want the snapshot mode below instead. Search is
+unaffected (it is always CPU-over-local-RAM).
+
+```bash
+# A live store whose data/log live in S3 (creds from the AWS environment):
+nidus upsert --dir ./meta --dim 768 --persistence s3://my-bucket/store docs < recs.json
+nidus search --dir ./meta --dim 768 --persistence s3://my-bucket/store docs -k 5 < q.json
+```
 
 ## Snapshots are object-granular
 

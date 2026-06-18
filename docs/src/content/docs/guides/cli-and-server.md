@@ -151,6 +151,33 @@ Candidate *selection* is approximate, but the final ranking is always the exact
 score over the over-fetched survivors. `nidus stats --ann …` echoes the active
 configuration. ANN cannot be combined with quantization.
 
+## Storage & memory backends
+
+By default a store is a local directory and its working set is the process heap. Two
+optional flags point each axis elsewhere (see [Storage backends](/guides/backends/) for
+the full model); both work on every store-opening command, including `serve`:
+
+```bash
+# --persistence: where the durable data/log live. A live object-store-backed store
+# (whole-object rewrite on flush). Pass --dim — the remote header is not peeked.
+nidus upsert --dir ./meta --dim 768 --persistence s3://my-bucket/store docs < recs.json
+nidus search --dir ./meta --dim 768 --persistence s3://my-bucket/store docs -k 5 < q.json
+
+# --memory: share the in-RAM working set across processes via Redis/Valkey/KeyDB/Dragonfly.
+# Each worker publishes on flush and adopts on open, skipping the log replay.
+nidus serve --dir ./store --dim 768 --memory redis://cache:6379?prefix=docs
+```
+
+`--persistence` accepts a path / `file://` (local, the default), `s3://<bucket>[/<prefix>]`,
+or `gs://<bucket>[/<prefix>]`; cloud credentials come from the standard environment
+(`AWS_*` / `GOOGLE_APPLICATION_CREDENTIALS`). `--memory` accepts `local` (the default) or a
+`redis://`/`rediss://`/`valkey://`/`valkeys://`/`keydb://`/`dragonfly://` URL. The axes
+compose, and search is identical either way — it always runs over local RAM.
+
+A live object-store-backed store rewrites the whole `data`/`log` object on each flush
+(`O(object)`, fine for low write rates) and takes an **advisory** writer lock — suited to a
+single writer; for many concurrent writers, prefer a local store and snapshot to the cloud.
+
 ## Backup & restore
 
 A store is just a directory, so you can always copy it by hand — but `nidus
@@ -182,6 +209,14 @@ nidus backup  --dir ./store --out file:///backups/store.tar.gz
 nidus backup  --dir ./store --out s3://my-bucket/backups/store.tar.gz
 # …or Google Cloud Storage (GOOGLE_APPLICATION_CREDENTIALS):
 nidus backup  --dir ./store --out gs://my-bucket/backups/store.tar.gz
+```
+
+The *source* store is a backend location too: pass `--persistence` to back up an
+object-store-backed store, and `nidus restore --persistence …` to restore into one:
+
+```bash
+nidus backup  --persistence s3://my-bucket/store --out ./store.tar.gz
+nidus restore --in ./store.tar.gz --persistence s3://my-bucket/store --dir ./meta
 ```
 
 The archive is an ordinary gzip-compressed tarball — `tar tzf store.tar.gz`

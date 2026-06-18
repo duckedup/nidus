@@ -513,6 +513,7 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         data: DataSegment::in_memory(2),
         log: OpLog::in_memory(),
         persistence: None,
+        memory: None,
         lock: None,
         collections: HashMap::new(),
         dead_rows: 0,
@@ -2788,4 +2789,131 @@ fn text_search_across_collections_analyzes_once() {
         vec!["a1", "b1"],
         "stemmed match across both collections"
     );
+}
+
+// ── Live object-store backing + shared memory tier (Miri-clean: all in-RAM) ──────
+//
+// Exercises the whole-object live-backing path (ObjectAppender rewrites the whole
+// `data`/`log` object on each sync) and the shared memory tier (publish on flush, adopt
+// on reopen) through a fake in-RAM whole-object Persistence — no files, no network, no
+// fsync — so it runs under Miri alongside the rest of the store logic.
+
+mod object_backed {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use anyhow::{Result, bail};
+
+    use super::*;
+    use crate::backend::{BackendLock, LocalRam, MemoryTier, Persistence};
+
+    /// A whole-object Persistence backed by an in-RAM map: no native appender (forcing an
+    /// `ObjectAppender`) and no native lock (forcing the advisory object lock) — exactly
+    /// the shape S3/GCS present, but synchronous and Miri-clean.
+    #[derive(Default)]
+    struct InMemObjectStore {
+        objects: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl Persistence for InMemObjectStore {
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.objects.lock().unwrap().get(key).cloned())
+        }
+        fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), bytes.to_vec());
+            Ok(())
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+        fn list(&self) -> Result<Vec<String>> {
+            let mut keys: Vec<String> = self.objects.lock().unwrap().keys().cloned().collect();
+            keys.sort();
+            Ok(keys)
+        }
+        fn try_lock(&self, _key: &str, _ttl: Duration) -> Result<Option<Box<dyn BackendLock>>> {
+            bail!("InMemObjectStore has no native lock — advisory lock is used instead")
+        }
+        fn has_native_lock(&self) -> bool {
+            false
+        }
+    }
+
+    fn cfg() -> Config {
+        Config::new("/unused/object-store", 3)
+            .open_mode(OpenMode::ReadWrite)
+            .auto_compact(None)
+    }
+
+    fn has_key(backend: &Arc<dyn Persistence>, key: &str) -> bool {
+        backend.get(key).unwrap().is_some()
+    }
+
+    #[test]
+    fn live_object_backing_round_trips_through_a_shared_tier() {
+        let backend: Arc<dyn Persistence> = Arc::new(InMemObjectStore::default());
+        let tier = Arc::new(LocalRam::new());
+
+        // 1. Open over the object backend + shared tier; write, flush, close.
+        {
+            let mem: Box<dyn MemoryTier> = Box::new(tier.clone());
+            let mut store =
+                Store::open_with(cfg(), "s3://bucket/store", backend.clone(), Some(mem)).unwrap();
+            store.create_collection("col").unwrap();
+            store
+                .upsert(
+                    "col",
+                    &[rec("a", vec![1.0, 0.0, 0.0]), rec("b", vec![0.0, 1.0, 0.0])],
+                )
+                .unwrap();
+            store.flush().unwrap();
+        }
+
+        // The data/log live as whole objects on the backend, and flush published the
+        // working set to the shared tier.
+        assert!(has_key(&backend, "data"), "data object written");
+        assert!(has_key(&backend, "log"), "log object written");
+        assert!(
+            tier.load("workingset").unwrap().is_some(),
+            "working set published to the tier"
+        );
+        // The advisory lock object was released on close.
+        assert!(!has_key(&backend, "lock"), "lock released on drop");
+
+        // 2. Reopen over the same backend + tier: data is intact and searchable (the
+        //    index came from the adopted working set, which by construction matches a
+        //    fresh replay of the same log).
+        let mem: Box<dyn MemoryTier> = Box::new(tier.clone());
+        let store =
+            Store::open_with(cfg(), "s3://bucket/store", backend.clone(), Some(mem)).unwrap();
+        let hits = store
+            .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(5))
+            .unwrap();
+        assert_eq!(hits[0].id, "a", "nearest neighbour survives the round-trip");
+        assert_eq!(hits.len(), 2, "both rows present after reopen");
+    }
+
+    #[test]
+    fn advisory_lock_excludes_a_second_live_writer() {
+        let backend: Arc<dyn Persistence> = Arc::new(InMemObjectStore::default());
+
+        let first = Store::open_with(cfg(), "s3://bucket/store", backend.clone(), None).unwrap();
+        // A second writer over the same backend is refused while the first holds the lock.
+        let err = Store::open_with(cfg(), "s3://bucket/store", backend.clone(), None)
+            .err()
+            .expect("second open must be locked out");
+        assert!(err.to_string().contains("locked"), "{err}");
+
+        // Releasing the first lets a new writer in.
+        drop(first);
+        assert!(
+            Store::open_with(cfg(), "s3://bucket/store", backend.clone(), None).is_ok(),
+            "lock is reclaimable after the holder drops"
+        );
+    }
 }

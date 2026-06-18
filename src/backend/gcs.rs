@@ -229,9 +229,13 @@ impl Persistence for Gcs {
 
     fn try_lock(&self, _key: &str, _ttl: Duration) -> Result<Option<Box<dyn BackendLock>>> {
         bail!(
-            "the GCS backend does not support writer locking — it is for snapshots and \
-             whole-object use, not a lock-coordinated live store"
+            "the GCS backend has no native writer lock — a live object-backed store uses \
+             the advisory lock (Store::acquire_lock) instead of calling try_lock"
         )
+    }
+
+    fn has_native_lock(&self) -> bool {
+        false
     }
 }
 

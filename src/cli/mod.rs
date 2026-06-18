@@ -75,6 +75,18 @@ struct StoreArgs {
     /// Build PRNG seed (deterministic index). Applies to both ANN kinds. Ignored without `--ann`.
     #[arg(long)]
     ann_seed: Option<u64>,
+    /// Where the durable bytes live (SPEC §13.2). Omit (or a path / `file://…`) for local
+    /// files under `--dir`; `s3://<bucket>[/<prefix>]` or `gs://<bucket>[/<prefix>]` for a
+    /// live object-store-backed store (whole-object rewrite on flush). With an object
+    /// store pass `--dim` — the remote header is not peeked. Credentials come from the
+    /// standard environment (AWS_*/GOOGLE_APPLICATION_CREDENTIALS).
+    #[arg(long)]
+    persistence: Option<String>,
+    /// Share the in-RAM working set across processes (SPEC §13.3): a `redis://…` (or
+    /// `valkey://…`, `keydb://…`, `dragonfly://…`) URL. Omit (or `local`) to keep it
+    /// process-local. The working set is published on flush and adopted on open.
+    #[arg(long)]
+    memory: Option<String>,
 }
 
 impl StoreArgs {
@@ -83,7 +95,13 @@ impl StoreArgs {
     /// value is read from an existing store's header. When neither is available
     /// — no store yet and no `--dim` — creation cannot proceed, so we ask for it.
     fn resolve(&self) -> Result<(usize, Distance)> {
-        let peeked = crate::data::peek_header(&self.dir.join("data"))?;
+        // The local-file header peek only applies to a local store; an object-store
+        // location (`s3://`/`gs://`) has no peekable local `data`, so `--dim` is required.
+        let peeked = if self.is_object_store() {
+            None
+        } else {
+            crate::data::peek_header(&self.dir.join("data"))?
+        };
         let dimension = match (self.dim, peeked) {
             (Some(d), _) => d,
             (None, Some((d, _))) => d,
@@ -98,6 +116,27 @@ impl StoreArgs {
             (None, None) => Distance::default(),
         };
         Ok((dimension, distance))
+    }
+
+    /// Whether `--persistence` names a (non-local) object store.
+    fn is_object_store(&self) -> bool {
+        self.persistence.as_deref().is_some_and(|p| {
+            let p = p.to_ascii_lowercase();
+            p.starts_with("s3://") || p.starts_with("gs://") || p.starts_with("gcs://")
+        })
+    }
+
+    /// Build the open [`Config`] from these args — the single place the store flags
+    /// (`--dim`/`--distance`/`--ann*`/`--persistence`/`--memory`/mode) are assembled, so
+    /// the read and serve paths can't drift.
+    fn config(&self, mode: OpenMode) -> Result<Config> {
+        let (dim, distance) = self.resolve()?;
+        Ok(Config::new(self.dir.clone(), dim)
+            .distance(distance)
+            .ann(self.ann_config())
+            .persistence(self.persistence.clone().unwrap_or_default())
+            .memory(self.memory.clone().unwrap_or_default())
+            .open_mode(mode))
     }
 
     /// Build the `Option<AnnConfig>` from the `--ann*` flags. `None` (no `--ann`)
@@ -323,22 +362,31 @@ enum Command {
     /// consistent, lock-free snapshot without blocking writes. Ideal for a
     /// pre-upgrade backup or a periodic cron snapshot.
     Backup {
-        /// Store directory to back up.
+        /// Store directory to back up (the source when `--persistence` is omitted).
         #[arg(long, short = 'd')]
         dir: PathBuf,
-        /// Output archive location — a local path, `file://…`, or another backend's
-        /// URL. Defaults to `<dir-name>-<unix-secs>.tar.gz` in the current directory.
+        /// Read the source store from this persistence location instead of `--dir` —
+        /// e.g. `s3://bucket/store` or `gs://bucket/store` for an object-backed store.
+        #[arg(long)]
+        persistence: Option<String>,
+        /// Output archive location — a local path, `file://…`, `s3://…`, or `gs://…`.
+        /// Defaults to `<dir-name>-<unix-secs>.tar.gz` in the current directory.
         #[arg(long, short = 'o')]
         out: Option<String>,
     },
     /// Restore a store from a `nidus backup` archive (`.tar.gz`).
     Restore {
-        /// Backup archive location to restore from (a local path or `file://…`).
+        /// Backup archive location to restore from (a local path, `file://…`, `s3://…`).
         #[arg(long = "in", short = 'i')]
         input: String,
-        /// Target store directory (created if absent).
+        /// Target store directory (created if absent; the target when `--persistence`
+        /// is omitted).
         #[arg(long, short = 'd')]
         dir: PathBuf,
+        /// Restore into this persistence location instead of `--dir` — e.g.
+        /// `s3://bucket/store` for an object-backed store.
+        #[arg(long)]
+        persistence: Option<String>,
         /// Overwrite an existing store without prompting (for cron / scripts).
         #[arg(long, short = 'y')]
         yes: bool,
@@ -535,11 +583,24 @@ pub fn run(cli: Cli) -> Result<()> {
             db.compact()?;
             print_json(&serde_json::json!({ "ok": true }))
         }
-        Command::Backup { dir, out } => {
+        Command::Backup {
+            dir,
+            persistence,
+            out,
+        } => {
             let out = out.unwrap_or_else(|| backup::default_out_name(&dir));
-            print_json(&backup::backup(&dir, &out)?)
+            let source = persistence.unwrap_or_else(|| dir.to_string_lossy().into_owned());
+            print_json(&backup::backup(&source, &out)?)
         }
-        Command::Restore { input, dir, yes } => print_json(&backup::restore(&input, &dir, yes)?),
+        Command::Restore {
+            input,
+            dir,
+            persistence,
+            yes,
+        } => {
+            let target = persistence.unwrap_or_else(|| dir.to_string_lossy().into_owned());
+            print_json(&backup::restore(&input, &target, yes)?)
+        }
         Command::Stats { store } => {
             let db = open(&store, false)?;
             print_json(&serde_json::json!({
@@ -564,13 +625,7 @@ fn open(store: &StoreArgs, mutating: bool) -> Result<Nidus> {
     } else {
         OpenMode::ReadOnly
     };
-    let (dim, distance) = store.resolve()?;
-    Nidus::open(
-        Config::new(store.dir.clone(), dim)
-            .distance(distance)
-            .ann(store.ann_config())
-            .open_mode(mode),
-    )
+    Nidus::open(store.config(mode)?)
 }
 
 fn serve(
@@ -584,13 +639,7 @@ fn serve(
     } else {
         OpenMode::ReadWrite
     };
-    let (dim, distance) = store.resolve()?;
-    let db = Nidus::open(
-        Config::new(store.dir.clone(), dim)
-            .distance(distance)
-            .ann(store.ann_config())
-            .open_mode(mode),
-    )?;
+    let db = Nidus::open(store.config(mode)?)?;
     // An explicit --token wins; otherwise fall back to the NIDUS_TOKEN env var.
     let token = token.or_else(|| std::env::var("NIDUS_TOKEN").ok().filter(|t| !t.is_empty()));
     let cfg = crate::server::ServeConfig {
@@ -725,6 +774,8 @@ mod tests {
             ann_n_probe: None,
             ann_overscan: None,
             ann_seed: None,
+            persistence: None,
+            memory: None,
         };
         assert_eq!(args.resolve().unwrap(), (5, Distance::Euclidean));
     }
@@ -735,7 +786,7 @@ mod tests {
             Cli::try_parse_from(["nidus", "backup", "--dir", "/tmp/s", "-o", "/tmp/s.tar.gz"])
                 .unwrap();
         match cli.command {
-            Command::Backup { dir, out } => {
+            Command::Backup { dir, out, .. } => {
                 assert_eq!(dir, PathBuf::from("/tmp/s"));
                 assert_eq!(out.as_deref(), Some("/tmp/s.tar.gz"));
             }
@@ -762,7 +813,9 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Command::Restore { input, dir, yes } => {
+            Command::Restore {
+                input, dir, yes, ..
+            } => {
                 assert_eq!(input, "/tmp/s.tar.gz");
                 assert_eq!(dir, PathBuf::from("/tmp/s2"));
                 assert!(yes);
@@ -863,6 +916,8 @@ mod tests {
             ann_n_probe: None,
             ann_overscan: None,
             ann_seed: None,
+            persistence: None,
+            memory: None,
         };
         let err = args.resolve().unwrap_err().to_string();
         assert!(err.contains("--dim"), "unexpected error: {err}");

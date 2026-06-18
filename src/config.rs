@@ -76,6 +76,18 @@ pub struct Config {
     /// better. Parallelizes *one* query across cores — leave it at `1` when you already
     /// have query-level concurrency (many readers under `Arc<RwLock<Nidus>>`).
     pub query_threads: usize,
+    /// Where the durable bytes live (SPEC §13.2): a [`crate::open_persistence`] location
+    /// — empty (default) or `file://`/bare path → local files under [`path`](Self::path);
+    /// `s3://…` / `gs://…` → a live object-store-backed store (whole-object rewrite on
+    /// flush). Empty defaults to `path`, so existing callers are unchanged.
+    pub persistence: String,
+    /// Where the in-RAM working set is *shared* (SPEC §13.3): a
+    /// [`crate::open_memory_tier`] location. Empty / `local` / `ram` (default) → the
+    /// process heap only (nothing shared). A `redis://…` (or `valkey://…`, …) URL
+    /// publishes the serialized working set on `flush` and loads it on `open`, so other
+    /// workers skip the log replay + index rebuild. A rebuildable cache — an unreachable
+    /// or evicted tier is never fatal.
+    pub memory: String,
 }
 
 impl Config {
@@ -93,6 +105,8 @@ impl Config {
             quantization: None,
             ann: None,
             query_threads: 1,
+            persistence: String::new(),
+            memory: String::new(),
         }
     }
 
@@ -149,6 +163,20 @@ impl Config {
     /// Set the number of worker threads for a single exact search (`1` = serial).
     pub fn query_threads(mut self, n: usize) -> Self {
         self.query_threads = n;
+        self
+    }
+
+    /// Set the persistence location (`s3://…` / `gs://…` for a live object-store-backed
+    /// store; empty or a path → local files). See [`persistence`](Self::persistence).
+    pub fn persistence(mut self, location: impl Into<String>) -> Self {
+        self.persistence = location.into();
+        self
+    }
+
+    /// Set the shared memory-tier location (`redis://…` / `valkey://…`; empty/`local` →
+    /// the process heap only). See [`memory`](Self::memory).
+    pub fn memory(mut self, location: impl Into<String>) -> Self {
+        self.memory = location.into();
         self
     }
 }

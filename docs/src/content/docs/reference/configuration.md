@@ -21,7 +21,9 @@ let cfg = Config::new("/path/to/store", 768)
     .max_vector_bytes(None)          // no ceiling (default)
     .quantization(None)              // int8 two-pass search (default: off)
     .ann(None)                       // approximate-nearest-neighbour index (default: off)
-    .query_threads(1);               // worker threads per exact search (default: 1)
+    .query_threads(1)                // worker threads per exact search (default: 1)
+    .persistence("")                 // durable bytes: "" = local; "s3://…"/"gs://…"
+    .memory("");                     // shared working set: "" = local; "redis://…"
 # let _ = cfg;
 ```
 
@@ -112,6 +114,23 @@ parallelizes the from-scratch graph **build** (on `open` with no cache, and on
 Incremental `upsert` and the serial build at `1` are unchanged; note a parallel build
 is non-deterministic (insertion order varies), so a graph built with threads can
 differ slightly from the serial one (recall stays equivalent).
+
+### `persistence`
+
+`String` — where the durable `data`/`log` bytes live (default `""` = local files under
+[`path`](#path)). An [`open_persistence`](/guides/backends/) location: a path / `file://`,
+or `s3://<bucket>[/<prefix>]` / `gs://<bucket>[/<prefix>]` for a **live object-store-backed
+store** (each segment is rewritten as one whole object on flush — `O(object)`, suited to
+low write rates, under an advisory writer lock). With an object store, pass `dimension`
+explicitly — the remote header is not peeked. See [Storage backends](/guides/backends/).
+
+### `memory`
+
+`String` — where the in-RAM working set is *shared* (default `""`/`local`/`ram` = the
+process heap; nothing shared). A Redis-family URL — `redis://` / `rediss://` /
+`valkey://` / `valkeys://` / `keydb://` / `dragonfly://`, optionally `?prefix=<ns>` —
+publishes the serialized working set on `flush` and adopts it on `open`, so other workers
+skip the log replay. A rebuildable cache: an unreachable or evicted tier is never fatal.
 
 ## `Fsync`
 
