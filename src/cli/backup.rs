@@ -191,6 +191,8 @@ pub fn restore(
     let (dimension, distance) = crate::data::header_from_bytes(&data)
         .context("restored data has no readable nidus header")?;
     let db = Nidus::open(
+        // The path arg is unused: a non-empty `persistence(target_location)` drives the
+        // open, so `"."` is just a placeholder (see `Store::open`'s location resolution).
         Config::new(".", dimension)
             .distance(distance)
             .persistence(target_location)

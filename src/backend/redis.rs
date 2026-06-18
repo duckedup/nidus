@@ -101,10 +101,11 @@ impl MemoryTier for RedisTier {
     fn store(&self, key: &str, bytes: &[u8], ttl: Option<Duration>) -> Result<()> {
         let k = self.namespaced(key);
         match ttl {
-            // SET key value EX <seconds> — round sub-second ttls up to 1s (0 would be
-            // an immediate-expiry no-op, surprising for a "store this for a moment").
+            // SETEX key <seconds> value — clamp any non-`None` ttl up to ≥ 1s: Redis
+            // rejects `EX 0` as an invalid expire time, and a sub-second ttl truncates to
+            // 0, so a caller asking to "store this briefly" must still get a valid expiry.
             Some(d) => {
-                let secs = d.as_secs().max(if d.is_zero() { 0 } else { 1 });
+                let secs = d.as_secs().max(1);
                 self.run(|conn| conn.set_ex(&k, bytes, secs))
             }
             None => self.run(|conn| conn.set(&k, bytes)),
@@ -232,6 +233,14 @@ mod tests {
         assert_eq!(
             tier.load("warm").unwrap().as_deref(),
             Some(b"hot".as_slice())
+        );
+
+        // A zero/sub-second ttl is clamped to ≥1s (Redis rejects `EX 0`), so this stores
+        // rather than erroring.
+        tier.store("brief", b"x", Some(Duration::ZERO)).unwrap();
+        assert_eq!(
+            tier.load("brief").unwrap().as_deref(),
+            Some(b"x".as_slice())
         );
 
         // The prefix was applied on the wire (`nidus:workingset`, not `workingset`).

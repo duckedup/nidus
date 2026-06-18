@@ -256,12 +256,17 @@ impl Store {
             scan_order: std::sync::RwLock::new(None),
         };
 
+        // Whether the in-RAM index now differs from any tier snapshot — true if we built
+        // it from the log, or if a compaction below rewrote `data`/`log` (new watermark).
+        let mut tier_stale = !from_tier;
+
         // 6. Auto-compact if the dead-row ratio exceeds the threshold.
         if let Some(threshold) = store.config.auto_compact {
             let total_rows = store.data.row_count() as usize;
             let ratio = store.dead_rows as f32 / total_rows.max(1) as f32;
             if ratio > threshold {
                 store.compact()?;
+                tier_stale = true;
             }
         }
 
@@ -285,12 +290,14 @@ impl Store {
             && store.fts.tombstone_ratio() > threshold
         {
             store.compact()?;
+            tier_stale = true;
         }
 
         // 11. Warm the shared memory tier for peers: if we built the index from the log
-        //     (didn't adopt a tier snapshot, or a compaction above changed it), publish
-        //     the fresh working set. Best-effort — the tier is a rebuildable cache.
-        if !from_tier {
+        //     (didn't adopt a tier snapshot) or a compaction above rewrote the store,
+        //     publish the fresh working set so peers can adopt the current state instead
+        //     of replaying. Best-effort — the tier is a rebuildable cache.
+        if tier_stale {
             store.publish_working_set();
         }
 
@@ -372,6 +379,11 @@ impl Store {
     /// The `data`/`log` append handle for `key`: the backend's native [`Appender`] when
     /// it has one (local files), else an [`ObjectAppender`] — an in-RAM buffer rewritten
     /// as a whole object on sync — over the shared backend handle (object stores).
+    ///
+    /// Note: the object-store path loads the whole object into RAM here, *before* `open`
+    /// checks `max_vector_bytes`. So for object stores that "refuse before allocating"
+    /// guard (§6.6) relaxes to "refuse after one full copy is resident" — inherent to a
+    /// whole-object backend, and acceptable at nidus's dev/small-scale positioning.
     fn appender_for(persistence: &Arc<dyn Persistence>, key: &str) -> Result<Box<dyn Appender>> {
         match persistence.appender(key)? {
             Some(native) => Ok(native),
