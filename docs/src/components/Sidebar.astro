@@ -42,7 +42,7 @@ function hasCurrent(entry) {
     {
       sidebar.map((entry) =>
         entry.type === "group" ? (
-          <li class="nd-group">
+          <li class:list={["nd-group", { "is-active": hasCurrent(entry) }]}>
             <details class="nd-details" open={hasCurrent(entry)}>
               <summary class="nd-summary">
                 <span class="nd-summary__icon">
