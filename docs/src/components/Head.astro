@@ -1,0 +1,9 @@
+---
+// Extends Starlight's default <head> to enable Astro view transitions, so
+// navigating between docs cross-fades instead of flashing a blank page.
+import Default from "@astrojs/starlight/components/Head.astro";
+import { ClientRouter } from "astro:transitions";
+---
+
+<Default><slot /></Default>
+<ClientRouter />

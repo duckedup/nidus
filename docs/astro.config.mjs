@@ -20,13 +20,24 @@ export default defineConfig({
         src: "./src/assets/nidus.svg",
         alt: "nidus",
       },
+      components: {
+        // Custom splash hero: the nest in an ember glow, overlaid with a live
+        // nearest-neighbour weave. See src/components/Hero.astro.
+        Hero: "./src/components/Hero.astro",
+        // One sidebar only: a custom left nav with icon-led, collapsible
+        // sections. PageSidebar is emptied to drop the right-hand TOC.
+        Sidebar: "./src/components/Sidebar.astro",
+        PageSidebar: "./src/components/PageSidebar.astro",
+        // Adds Astro view transitions for flash-free navigation.
+        Head: "./src/components/Head.astro",
+      },
       // Code blocks wear Everforest — a warm, woodland palette that matches the
       // nest. Dark theme first, light second; Starlight switches with the page.
       expressiveCode: {
         themes: ["everforest-dark", "everforest-light"],
         styleOverrides: {
-          borderRadius: "0.5rem",
-          borderColor: "var(--sl-color-gray-5)",
+          borderRadius: "0.6rem",
+          borderColor: "var(--sl-color-hairline)",
         },
       },
       social: [

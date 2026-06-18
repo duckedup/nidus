@@ -3,74 +3,69 @@ title: nidus
 description: A small, pure-Rust vector store for development and small-scale use. Exact or approximate (HNSW/IVF) nearest-neighbour search — cosine, dot, or Euclidean — over a single append-only directory. No FFI, no C, no SQL, no query engine.
 template: splash
 hero:
-  tagline: A small, pure-Rust vector store for development and small-scale use — exact or approximate nearest-neighbour search, no FFI, no C, no SQL.
-  image:
-    alt: nidus
-    file: ../../assets/nidus.svg
+  tagline: Keep vectors and their metadata in a single directory, then ask which ones sit closest to a query. A small, pure-Rust vector store you embed like any other crate.
   actions:
     - text: Get started
       link: /getting-started/
-      icon: right-arrow
       variant: primary
     - text: View on GitHub
       link: https://github.com/duckedup/nidus
-      icon: external
       variant: minimal
 ---
 
 import { Code } from '@astrojs/starlight/components';
 
-<Code code={`db.search("code", &query, &SearchOpts { top_k: 5, ..Default::default() })?;`} lang="rust" />
-
 <p class="lede not-content">
-  <strong>nidus (Latin, "nest") is a vector store, not a database.</strong> Chunk
-  some source → embed each chunk → store the vectors and metadata → ask for
-  nearest neighbours. It does exactly that and nothing more, so it{" "}
-  <strong>compiles in seconds</strong> and embeds as a normal Rust dependency —
-  no C++ toolchain, no SQL engine, no ten-minute cold build.
+  <strong>nidus (Latin, "nest") is a vector store, not a database.</strong> Embed
+  your chunks, store each vector with its metadata, and ask for the nearest
+  neighbours to a query. It's the storage-and-search core you build{" "}
+  <strong>semantic search, code indexing, and RAG</strong> on — sized for
+  development and small-scale use.
 </p>
+
+<Code code={`let hits = db.search("code", &query, &SearchOpts { top_k: 5, ..Default::default() })?;`} lang="rust" />
 
 <p class="section-kicker not-content">Why it exists</p>
 
 <div class="feature-grid not-content">
-  <article class="feature">
-    <span class="num">01</span>
-    <h3>Exact or approximate search</h3>
-    <p>Exact by default — 100% recall, fast at the target scale (≤ a few million vectors, comfortably in RAM). Score by cosine, dot, or Euclidean. Opt into an approximate index (HNSW or IVF) or int8 quantization when you want to trade some recall for speed at larger scale.</p>
+  <article class="feature" data-reveal>
+    <span class="twig" aria-hidden="true">❧</span>
+    <h3>Search by similarity</h3>
+    <p>Hand nidus a query vector and get the closest records back, ranked with scores. Exact by default — 100% recall at the scale it targets — by cosine, dot, or Euclidean. Reach for an approximate index (HNSW or IVF) or int8/binary quantization when you want more speed.</p>
   </article>
-  <article class="feature">
-    <span class="num">02</span>
-    <h3>Pure-Rust, zero FFI</h3>
-    <p>Never a crate that compiles C or links a native library. <code>#![forbid(unsafe_code)]</code>. cargo build is just rustc — and the whole crate runs under Miri, file IO included.</p>
+  <article class="feature" data-reveal style="--reveal-delay:0.08s">
+    <span class="twig" aria-hidden="true">❧</span>
+    <h3>Filter while you search</h3>
+    <p>Store typed metadata — Str, Int, Bool, List — beside every vector and narrow the results before they score: equality, ranges, globs, sets, negation. Group records into collections that share one embedding space and query them in a single call.</p>
   </article>
-  <article class="feature">
-    <span class="num">03</span>
+  <article class="feature" data-reveal style="--reveal-delay:0.04s">
+    <span class="twig" aria-hidden="true">❧</span>
     <h3>One directory, crash-safe</h3>
-    <p>An append-only flat-f32 matrix plus a framed, CRC-checked op log. A crash loses at most the in-flight batch; a torn tail is recovered on open.</p>
+    <p>A whole store is a single append-only directory, fsync'd per batch and CRC-checked. A crash loses at most the in-flight write, and a torn tail repairs itself the moment you reopen — nothing to back up but a folder.</p>
   </article>
-  <article class="feature">
-    <span class="num">04</span>
-    <h3>Typed metadata &amp; filters</h3>
-    <p>Attach Str / Int / Bool / List / Null attributes and filter — equality, ranges, globs, sets, and negation — before scoring. Many collections share one embedding space, searchable in one call.</p>
+  <article class="feature" data-reveal style="--reveal-delay:0.12s">
+    <span class="twig" aria-hidden="true">❧</span>
+    <h3>From a folder to the cloud</h3>
+    <p>Start against a local directory, then move the same store to S3, GCS, or Redis/Valkey by changing one URL — no migration, no rewrite. Begin on a laptop and grow into the cloud when you need to.</p>
   </article>
 </div>
 
 <p class="section-kicker not-content">Where to next</p>
 
 <div class="next-grid not-content">
-  <a class="next-card" href="/getting-started/">
+  <a class="next-card" href="/getting-started/" data-reveal>
     <span class="next-title">Getting started</span>
     <p>Add the dependency, open a store, index records, run your first search.</p>
   </a>
-  <a class="next-card" href="/guides/how-it-works/">
+  <a class="next-card" href="/guides/how-it-works/" data-reveal style="--reveal-delay:0.06s">
     <span class="next-title">How it works</span>
-    <p>The storage model and search path, end to end.</p>
+    <p>The storage model and the search path, end to end.</p>
   </a>
-  <a class="next-card" href="/guides/storage/">
+  <a class="next-card" href="/guides/storage/" data-reveal style="--reveal-delay:0.06s">
     <span class="next-title">Storage &amp; durability</span>
     <p>The on-disk format, the fsync contract, and lock-free readers.</p>
   </a>
-  <a class="next-card" href="/reference/api/">
+  <a class="next-card" href="/reference/api/" data-reveal style="--reveal-delay:0.12s">
     <span class="next-title">API reference</span>
     <p>Every public type and method, with signatures.</p>
   </a>

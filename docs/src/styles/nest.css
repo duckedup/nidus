@@ -1,10 +1,10 @@
 /* ────────────────────────────────────────────────────────────────────────
-   nidus — "nest" theme
+   nidus — "living nest" theme
 
-   A warm, woodland reading surface. Bark and parchment grounds, generous
-   negative space, hairline rules, one teal accent — the painted egg. Gold
-   (the nest's flowers) is the single flourish, used sparingly. Fraunces
-   (display) + Hanken Grotesk (text) + JetBrains Mono (code).
+   A warm woodland reading surface with a pulse. Bark and parchment grounds,
+   a warm ember glow behind the hero, hairline rules, paper grain, and one
+   teal accent — the painted egg — with gold (the nest's flowers) as the single
+   flourish. Fraunces (display) + Hanken Grotesk (text) + JetBrains Mono (code).
 
    Palette (lifted from the nest mark)
      Bark        #2A1A10  #3A2316  #532D17  #774627  #8B5A30  #B98541
@@ -28,10 +28,14 @@
 
   /* Brand tokens */
   --nd-teal: #4f9d97;
+  --nd-teal-bright: #5fbab2;
   --nd-teal-deep: #2f807a;
   --nd-gold: #e0a93f;
+  --nd-gold-bright: #f0bc55;
   --nd-bark: #532d17;
   --nd-moss: #8c9a3b;
+
+  --nd-ease: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 /* ── Dark theme (default) — bark ground, parchment text ────────────────────*/
@@ -48,16 +52,32 @@
   --sl-color-gray-4: #6b5240;
   --sl-color-gray-5: #4a3526;
   --sl-color-gray-6: #33231a;
-  --sl-color-black: #271810;
+  --sl-color-black: #241710;
 
-  --sl-color-bg-nav: rgba(39, 24, 16, 0.72);
+  --sl-color-bg-nav: rgba(33, 20, 13, 0.7);
   --sl-color-bg-sidebar: var(--sl-color-black);
   --sl-color-hairline: #3c2a1d;
   --sl-color-hairline-light: #4a3526;
   --sl-color-hairline-shade: #21140d;
   --sl-color-bg-inline-code: #3a2718;
-  --sl-color-text-invert: #271810;
+  --sl-color-text-invert: #241710;
   --nd-surface: #33231a;
+  --nd-surface-raised: #3c2a1d;
+
+  /* Atmosphere: a warm ember glow + soft card elevation */
+  --nd-ember: radial-gradient(
+    60rem 40rem at 78% -8%,
+    color-mix(in srgb, var(--nd-gold) 16%, transparent),
+    transparent 62%
+  );
+  --nd-ember-2: radial-gradient(
+    44rem 36rem at 6% 4%,
+    color-mix(in srgb, var(--nd-teal) 11%, transparent),
+    transparent 60%
+  );
+  --nd-card-shadow: 0 1px 0 color-mix(in srgb, #fff 4%, transparent) inset,
+    0 14px 34px -18px rgba(0, 0, 0, 0.7);
+  --nd-grain-opacity: 0.05;
 }
 
 /* ── Light theme — parchment ground, bark text ─────────────────────────────*/
@@ -76,7 +96,7 @@
   --sl-color-gray-7: #f3ecdd;
   --sl-color-black: #faf5ea;
 
-  --sl-color-bg-nav: rgba(250, 245, 234, 0.78);
+  --sl-color-bg-nav: rgba(250, 245, 234, 0.76);
   --sl-color-bg-sidebar: var(--sl-color-black);
   --sl-color-hairline: #e3d6c1;
   --sl-color-hairline-light: #ebe0cf;
@@ -84,6 +104,21 @@
   --sl-color-bg-inline-code: #ece1cf;
   --sl-color-text-invert: #faf5ea;
   --nd-surface: #fffdf8;
+  --nd-surface-raised: #fffefb;
+
+  --nd-ember: radial-gradient(
+    60rem 40rem at 78% -8%,
+    color-mix(in srgb, var(--nd-gold) 22%, transparent),
+    transparent 60%
+  );
+  --nd-ember-2: radial-gradient(
+    44rem 36rem at 6% 4%,
+    color-mix(in srgb, var(--nd-teal) 12%, transparent),
+    transparent 58%
+  );
+  --nd-card-shadow: 0 1px 2px rgba(83, 45, 23, 0.04),
+    0 18px 40px -24px rgba(83, 45, 23, 0.28);
+  --nd-grain-opacity: 0.035;
 }
 
 /* ── Global polish ─────────────────────────────────────────────────────────*/
@@ -97,6 +132,18 @@ body {
   text-rendering: optimizeLegibility;
 }
 
+/* Paper grain — a faint woven tooth over the whole ground. Fixed so it reads
+   as the surface itself, not a scrolling layer. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: var(--nd-grain-opacity);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
 /* Frosted, hairline-bottomed top bar. Scoped to the <header> element only:
    Starlight nests a second `.header` (the content row in Header.astro) inside the
    fixed bar, so an unscoped `.header` border draws a doubled hairline. */
@@ -108,7 +155,6 @@ header.header {
 
 /* Display type — Fraunces, optical, calm */
 .site-title,
-.hero h1,
 .sl-markdown-content :is(h1, h2),
 .feature h3,
 .next-card .next-title {
@@ -133,10 +179,24 @@ a.site-title img {
   font-weight: 560;
   letter-spacing: -0.012em;
 }
+/* Section headings lean on space + a small leaf mark, not a full-width rule. */
 .sl-markdown-content h2 {
-  margin-top: 2.75rem;
-  padding-top: 1.75rem;
-  border-top: 1px solid var(--sl-color-hairline);
+  margin-top: 3rem;
+  position: relative;
+}
+.sl-markdown-content h2::before {
+  content: "❧";
+  position: absolute;
+  left: -1.5rem;
+  color: var(--nd-gold);
+  font-size: 0.7em;
+  top: 0.28em;
+  opacity: 0.85;
+}
+@media (max-width: 50rem) {
+  .sl-markdown-content h2::before {
+    display: none;
+  }
 }
 .sl-markdown-content :is(h3, h4) {
   font-weight: 600;
@@ -145,7 +205,11 @@ a.site-title img {
 
 /* Links: quiet by default, teal on hover */
 .sl-markdown-content a:not(:where(.not-content *)) {
-  text-decoration-color: color-mix(in srgb, var(--sl-color-accent) 45%, transparent);
+  text-decoration-color: color-mix(
+    in srgb,
+    var(--sl-color-accent) 45%,
+    transparent
+  );
   text-underline-offset: 0.22em;
   transition: text-decoration-color 0.15s ease, color 0.15s ease;
 }
@@ -153,29 +217,161 @@ a.site-title img {
   text-decoration-color: var(--sl-color-accent);
 }
 
-/* Sidebar: airier, lighter, teal active state */
+/* ── Single sidebar: icon-led, collapsible sections (src/components/Sidebar) ─ */
+
+/* No column divider — the sidebar's darker ground separates it, not a border. */
+.sidebar-pane {
+  border-inline-end: none !important;
+}
 .sidebar-content {
-  padding-top: 1rem;
+  padding: 0.75rem 0.5rem 2rem;
 }
-.sidebar-content .large {
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  font-size: 0.7rem;
+
+.nd-nav__list,
+.nd-sublist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.nd-group {
+  margin-bottom: 0.1rem;
+}
+
+/* Section header — the clickable accordion summary */
+.nd-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.52rem 0.65rem;
+  border-radius: 0.6rem;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
   font-weight: 600;
+  font-size: 0.92rem;
+  color: var(--sl-color-white);
+  transition: background-color 0.16s ease, color 0.16s ease;
+}
+.nd-summary::-webkit-details-marker,
+.nd-summary::marker {
+  display: none;
+  content: "";
+}
+.nd-summary:hover {
+  background: color-mix(in srgb, var(--nd-teal) 11%, transparent);
+}
+.nd-summary:focus-visible {
+  outline: 2px solid var(--sl-color-accent);
+  outline-offset: 2px;
+}
+.nd-summary__icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--nd-teal);
+  transition: transform 0.2s var(--nd-ease);
+}
+.nd-details[open] > .nd-summary .nd-summary__icon {
+  color: var(--nd-teal-bright);
+}
+.nd-summary__label {
+  flex: 1;
+}
+.nd-summary__chev {
+  display: inline-flex;
+  align-items: center;
   color: var(--sl-color-gray-3);
+  transition: transform 0.22s var(--nd-ease);
 }
-a.sidebar-link {
-  border-radius: 0.4rem;
-  transition: background-color 0.15s ease, color 0.15s ease;
+.nd-details[open] > .nd-summary .nd-summary__chev {
+  transform: rotate(90deg);
 }
-a.sidebar-link:hover {
-  background: color-mix(in srgb, var(--sl-color-accent) 12%, transparent);
+
+/* Sub-pages */
+.nd-sublist {
+  padding-left: 2.05rem;
+  margin: 0.1rem 0 0.55rem;
 }
-a.sidebar-link[aria-current="page"],
-a.sidebar-link[aria-current="page"]:hover {
-  background: var(--sl-color-accent-low);
+.nd-link {
+  position: relative;
+  display: block;
+  padding: 0.36rem 0.65rem;
+  border-radius: 0.5rem;
+  color: var(--sl-color-gray-2);
+  text-decoration: none;
+  line-height: 1.35;
+  font-size: 0.9rem;
+  transition: background-color 0.16s ease, color 0.16s ease;
+}
+.nd-link:hover {
+  color: var(--sl-color-white);
+  background: color-mix(in srgb, var(--nd-teal) 9%, transparent);
+}
+.nd-link.is-current {
   color: var(--sl-color-accent-high);
-  font-weight: 500;
+  background: var(--sl-color-accent-low);
+  font-weight: 600;
+}
+/* Teal tick marking the current page */
+.nd-link.is-current::before {
+  content: "";
+  position: absolute;
+  left: -0.95rem;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 1.05em;
+  border-radius: 2px;
+  background: var(--nd-teal);
+}
+.nd-link--solo {
+  font-weight: 600;
+  color: var(--sl-color-white);
+}
+
+/* Second tier — the active page's own sections (replaces the right TOC) */
+.nd-toc {
+  list-style: none;
+  margin: 0.15rem 0 0.4rem;
+  padding: 0;
+  position: relative;
+}
+.nd-toc__link {
+  display: block;
+  padding: 0.26rem 0.65rem;
+  padding-left: calc(0.95rem + var(--toc-depth, 0) * 0.85rem);
+  border-radius: 0.45rem;
+  font-size: 0.83rem;
+  line-height: 1.3;
+  color: var(--sl-color-gray-3);
+  text-decoration: none;
+  transition: color 0.16s ease, background-color 0.16s ease;
+}
+/* Top-level sections (H2) act as group headers: a little air above each one
+   chunks the list, and the H3s beneath read as a tucked-in cluster. */
+.nd-toc__link[data-depth="2"] {
+  margin-top: 0.6rem;
+  color: var(--sl-color-gray-2);
+  font-weight: 600;
+}
+.nd-toc > li:first-child .nd-toc__link[data-depth="2"] {
+  margin-top: 0.2rem;
+}
+.nd-toc__link:hover {
+  color: var(--sl-color-white);
+  background: color-mix(in srgb, var(--nd-teal) 8%, transparent);
+}
+.nd-toc__link.is-active {
+  color: var(--sl-color-accent-high);
+  font-weight: 600;
+}
+
+.nd-subgroup__label {
+  display: block;
+  padding: 0.5rem 0.65rem 0.2rem;
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--sl-color-gray-3);
 }
 
 /* Inline + block code */
@@ -187,8 +383,16 @@ a.sidebar-link[aria-current="page"]:hover {
 .expressive-code {
   margin: 1.4rem 0;
 }
+/* Let ExpressiveCode own the corner radius (set in astro.config). The code body
+   must stay square-topped so it meets a title/terminal bar flush — rounding it
+   here punched notches into the seam. The frame clips to its own radius. */
+.expressive-code .frame {
+  border-radius: 0.6rem;
+  overflow: hidden;
+}
 .expressive-code .frame pre {
-  border-radius: 0.5rem;
+  border: none;
+  border-radius: 0;
 }
 
 /* Tables + blockquotes: hairlines only */
@@ -206,52 +410,421 @@ a.sidebar-link[aria-current="page"]:hover {
   font-style: normal;
 }
 
-/* ── Splash / landing hero ─────────────────────────────────────────────────*/
+/* ── Deep-docs layout: fewer borders, one sidebar, calm reading column ──── */
 
-.hero {
-  padding-block: 1.5rem 2.5rem;
+/* Drop the rule between the title block and the body — space does the work. */
+.content-panel + .content-panel {
+  border-top: none !important;
 }
-.hero h1 {
-  font-size: clamp(2.6rem, 1.8rem + 3.4vw, 4.25rem);
-  line-height: 1.02;
+.content-panel {
+  padding-block: 1.25rem;
 }
-.hero .tagline {
+/* Safety net: the right TOC column is removed via the PageSidebar override;
+   make sure nothing reserves space or draws its old divider. */
+.right-sidebar,
+.right-sidebar-container {
+  border: none !important;
+}
+
+/* With no right sidebar, give the reading column a comfortable measure and
+   let it sit just right of the nav rather than stranded in dead centre. */
+.main-pane {
+  --sl-content-width: 50rem;
+}
+.sl-markdown-content {
+  margin-inline: auto;
+}
+
+/* The page title, sized to lead each doc */
+.content-panel h1#_top {
+  font-size: clamp(2.1rem, 1.7rem + 1.6vw, 2.9rem);
+  line-height: 1.08;
+  margin-bottom: 0.4rem;
+}
+
+/* Asides / callouts — retinted from Starlight's stock blue/purple/red to the
+   nest palette: tip → egg-teal, note → moss, caution → gold, danger → blush. */
+.starlight-aside {
+  border-inline-start-width: 2px;
+  border-radius: 0 0.5rem 0.5rem 0;
+}
+.starlight-aside--tip {
+  --sl-color-asides-text-accent: var(--nd-teal);
+  --sl-color-asides-border: var(--nd-teal);
+  background-color: color-mix(in srgb, var(--nd-teal) 9%, transparent);
+}
+.starlight-aside--note {
+  --sl-color-asides-text-accent: var(--nd-moss);
+  --sl-color-asides-border: var(--nd-moss);
+  background-color: color-mix(in srgb, var(--nd-moss) 10%, transparent);
+}
+.starlight-aside--caution {
+  --sl-color-asides-text-accent: var(--nd-gold);
+  --sl-color-asides-border: var(--nd-gold);
+  background-color: color-mix(in srgb, var(--nd-gold) 11%, transparent);
+}
+.starlight-aside--danger {
+  --sl-color-asides-text-accent: #d98c7d;
+  --sl-color-asides-border: #d98c7d;
+  background-color: color-mix(in srgb, #d98c7d 12%, transparent);
+}
+.starlight-aside__title {
   font-family: var(--sl-font);
-  color: var(--sl-color-gray-3);
-  font-size: clamp(1.05rem, 1rem + 0.6vw, 1.3rem);
-  line-height: 1.6;
-  max-width: 42ch;
-}
-/* A whisper of warmth behind the mark — the only flourish */
-.hero > img,
-.hero .hero-html img {
-  filter: drop-shadow(0 0.6rem 2.4rem color-mix(in srgb, var(--nd-gold) 22%, transparent));
-}
-.hero .actions a[data-variant="primary"] {
-  background: var(--sl-color-accent);
-  border-color: var(--sl-color-accent);
-  color: var(--sl-color-text-invert);
-}
-.hero .actions a[data-variant="primary"]:hover {
-  background: var(--nd-teal);
-  border-color: var(--nd-teal);
-  color: #1a0f08;
-}
-.hero .actions a[data-variant="minimal"] {
-  border-color: var(--sl-color-hairline-light);
 }
 
-/* ── Bespoke feature cards (landing) ───────────────────────────────────────*/
+/* ════════════════════════════════════════════════════════════════════════
+   Splash / landing
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* Lay the ember glow behind the whole splash main column. */
+.page > .main-frame .main-pane > main {
+  position: relative;
+}
+body:has(.nd-hero) .main-pane::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: var(--nd-ember), var(--nd-ember-2);
+}
+
+/* Keep splash content above the grain layer. */
+.sl-container,
+.nd-hero {
+  position: relative;
+  z-index: 1;
+}
+
+/* ── Hero ──────────────────────────────────────────────────────────────── */
+
+.nd-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+  align-items: center;
+  gap: clamp(1.5rem, 1rem + 3vw, 4rem);
+  padding-block: clamp(1.5rem, 1rem + 3vw, 3.5rem) clamp(2rem, 1rem + 3vw, 4rem);
+}
+@media (max-width: 50rem) {
+  .nd-hero {
+    grid-template-columns: 1fr;
+    text-align: center;
+  }
+}
+
+.nd-eyebrow {
+  font-family: var(--sl-font-mono);
+  font-size: 0.74rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--sl-color-gray-3);
+  margin: 0 0 1rem;
+}
+.nd-eyebrow em {
+  font-style: normal;
+  color: var(--nd-teal);
+}
+.nd-eyebrow span {
+  color: var(--sl-color-gray-4);
+  margin: 0 0.2em;
+}
+
+.nd-headline {
+  font-family: var(--nd-display);
+  font-optical-sizing: auto;
+  font-weight: 580;
+  font-variation-settings: "SOFT" 30, "WONK" 0;
+  font-size: clamp(2.7rem, 1.7rem + 4.4vw, 4.8rem);
+  line-height: 0.98;
+  letter-spacing: -0.02em;
+  color: var(--sl-color-white);
+  margin: 0 0 1.1rem;
+  text-wrap: balance;
+}
+.nd-flourish {
+  font-style: italic;
+  font-weight: 460;
+  font-variation-settings: "SOFT" 60, "WONK" 1;
+  color: var(--nd-teal);
+  position: relative;
+  white-space: nowrap;
+}
+/* A hand-drawn underline weave beneath the flourish word. */
+.nd-flourish::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -0.04em;
+  height: 0.5em;
+  background: no-repeat center/100% 100%
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='24' viewBox='0 0 200 24' fill='none'%3E%3Cpath d='M3 14C40 6 78 6 100 9C130 13 160 18 197 9' stroke='%23e0a93f' stroke-width='3.5' stroke-linecap='round'/%3E%3C/svg%3E");
+  opacity: 0.85;
+  transform: scaleX(0);
+  transform-origin: left center;
+  animation: nd-underline 0.7s var(--nd-ease) 0.85s both;
+}
+@media (max-width: 50rem) {
+  .nd-flourish::after {
+    transform-origin: center;
+  }
+}
+
+.nd-tagline {
+  font-family: var(--sl-font);
+  color: var(--sl-color-gray-2);
+  font-size: clamp(1.05rem, 1rem + 0.55vw, 1.28rem);
+  line-height: 1.6;
+  max-width: 40ch;
+  margin: 0 0 1.9rem;
+}
+@media (max-width: 50rem) {
+  .nd-tagline {
+    margin-inline: auto;
+  }
+}
+
+/* Buttons */
+.nd-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-bottom: 1.9rem;
+}
+@media (max-width: 50rem) {
+  .nd-actions {
+    justify-content: center;
+  }
+}
+.nd-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.7rem 1.3rem;
+  border-radius: 0.6rem;
+  border: 1px solid transparent;
+  font-weight: 600;
+  font-size: 0.98rem;
+  text-decoration: none;
+  transition: transform 0.18s var(--nd-ease), background-color 0.18s ease,
+    border-color 0.18s ease, box-shadow 0.18s ease;
+}
+.nd-btn--primary {
+  background: var(--nd-teal-deep);
+  color: #fbf7ee;
+  box-shadow: 0 10px 26px -12px color-mix(in srgb, var(--nd-teal) 80%, black);
+}
+.nd-btn--primary:hover {
+  background: var(--nd-teal);
+  transform: translateY(-2px);
+  box-shadow: 0 16px 34px -12px color-mix(in srgb, var(--nd-teal) 85%, black);
+}
+.nd-btn__arrow {
+  font-family: var(--sl-font-mono);
+  transition: transform 0.18s var(--nd-ease);
+}
+.nd-btn--primary:hover .nd-btn__arrow {
+  transform: translateX(3px);
+}
+.nd-btn--minimal,
+.nd-btn--secondary {
+  color: var(--sl-color-white);
+  border-color: var(--sl-color-hairline-light);
+  background: color-mix(in srgb, var(--nd-surface) 40%, transparent);
+}
+.nd-btn--minimal:hover,
+.nd-btn--secondary:hover {
+  border-color: color-mix(in srgb, var(--nd-teal) 55%, transparent);
+  transform: translateY(-2px);
+}
+
+/* Proof line — the receipt under the buttons */
+.nd-proof {
+  font-family: var(--sl-font-mono);
+  font-size: 0.82rem;
+  color: var(--sl-color-gray-3);
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin: 0;
+}
+@media (max-width: 50rem) {
+  .nd-proof {
+    justify-content: center;
+  }
+}
+.nd-proof code {
+  color: var(--sl-color-gray-1);
+  background: none;
+  padding: 0;
+}
+.nd-proof__prompt {
+  color: var(--nd-teal);
+}
+.nd-proof__sep {
+  color: var(--sl-color-gray-4);
+}
+.nd-proof__note {
+  color: var(--nd-gold);
+}
+
+/* ── Hero art: nest + nearest-neighbour weave ──────────────────────────── */
+
+.nd-hero__art {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  max-width: 30rem;
+  margin-inline: auto;
+  width: 100%;
+}
+.nd-glow {
+  position: absolute;
+  inset: 6%;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle at 50% 46%,
+    color-mix(in srgb, var(--nd-gold) 40%, transparent),
+    color-mix(in srgb, var(--nd-gold) 8%, transparent) 45%,
+    transparent 68%
+  );
+  filter: blur(6px);
+  animation: nd-breathe 7s ease-in-out infinite;
+}
+.nd-nest {
+  position: relative;
+  width: 100%;
+  height: auto;
+  filter: drop-shadow(
+    0 1.2rem 2.4rem color-mix(in srgb, #000 38%, transparent)
+  );
+  animation: nd-nest-in 1.1s var(--nd-ease) both;
+}
+
+.nd-weave {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.nd-weave__edge {
+  stroke: var(--nd-teal-bright);
+  stroke-width: 0.7;
+  stroke-linecap: round;
+  fill: none;
+  opacity: 0.55;
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: nd-draw 0.55s var(--nd-ease) forwards;
+  animation-delay: calc(0.55s + var(--i) * 0.12s);
+}
+.nd-weave__egg {
+  fill: var(--nd-teal-bright);
+  opacity: 0;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: nd-pop 0.5s var(--nd-ease) forwards;
+  animation-delay: calc(0.7s + var(--i) * 0.1s);
+  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--nd-teal) 70%, transparent));
+}
+.nd-weave__egg.is-gold {
+  fill: var(--nd-gold-bright);
+  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--nd-gold) 70%, transparent));
+}
+.nd-weave__query {
+  fill: #fbf7ee;
+  opacity: 0;
+  animation: nd-pop 0.5s var(--nd-ease) 0.45s forwards;
+  filter: drop-shadow(0 0 4px color-mix(in srgb, #fff 70%, transparent));
+}
+
+@keyframes nd-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes nd-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.2);
+  }
+  70% {
+    transform: scale(1.18);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes nd-nest-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes nd-breathe {
+  0%,
+  100% {
+    opacity: 0.85;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.04);
+  }
+}
+@keyframes nd-underline {
+  to {
+    transform: scaleX(1);
+  }
+}
+
+/* Page-load reveal for the copy column */
+.nd-hero__copy > * {
+  animation: nd-rise 0.7s var(--nd-ease) both;
+}
+.nd-eyebrow {
+  animation-delay: 0.05s;
+}
+.nd-headline {
+  animation-delay: 0.12s;
+}
+.nd-tagline {
+  animation-delay: 0.22s;
+}
+.nd-actions {
+  animation-delay: 0.32s;
+}
+.nd-proof {
+  animation-delay: 0.42s;
+}
+@keyframes nd-rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ── Lede + section kickers ───────────────────────────────────────────── */
 
 .lede {
-  font-size: 1.18rem;
-  line-height: 1.6;
+  font-size: 1.2rem;
+  line-height: 1.62;
   color: var(--sl-color-gray-2);
-  max-width: 60ch;
-  margin: 0.5rem 0 2.5rem;
+  max-width: 62ch;
+  margin: 0.5rem 0 3rem;
 }
 .lede strong {
   color: var(--sl-color-white);
+  font-weight: 600;
 }
 
 .section-kicker {
@@ -260,8 +833,23 @@ a.sidebar-link[aria-current="page"]:hover {
   letter-spacing: 0.18em;
   text-transform: uppercase;
   color: var(--sl-color-gray-3);
-  margin: 3rem 0 1.25rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 3.5rem 0 1.5rem;
 }
+.section-kicker::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(
+    to right,
+    var(--sl-color-hairline),
+    transparent
+  );
+}
+
+/* ── Feature cards ────────────────────────────────────────────────────── */
 
 .feature-grid {
   display: grid;
@@ -277,25 +865,50 @@ a.sidebar-link[aria-current="page"]:hover {
 .feature {
   position: relative;
   border: 1px solid var(--sl-color-hairline);
-  border-radius: 0.75rem;
-  background: color-mix(in srgb, var(--nd-surface) 55%, transparent);
-  padding: 1.6rem 1.6rem 1.5rem;
-  transition: border-color 0.2s ease, transform 0.2s ease, background-color 0.2s ease;
+  border-radius: 0.85rem;
+  background: color-mix(in srgb, var(--nd-surface-raised) 70%, transparent);
+  box-shadow: var(--nd-card-shadow);
+  padding: 1.7rem 1.7rem 1.55rem;
+  overflow: hidden;
+  transition: border-color 0.25s var(--nd-ease), transform 0.25s var(--nd-ease),
+    box-shadow 0.25s var(--nd-ease);
+}
+/* A teal hairline of light that sweeps across the top edge on hover. */
+.feature::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 2px;
+  background: linear-gradient(
+    to right,
+    transparent,
+    var(--nd-teal),
+    transparent
+  );
+  opacity: 0;
+  transition: opacity 0.25s ease;
 }
 .feature:hover {
-  border-color: color-mix(in srgb, var(--nd-teal) 55%, transparent);
-  transform: translateY(-2px);
+  border-color: color-mix(in srgb, var(--nd-teal) 50%, transparent);
+  transform: translateY(-3px);
+  box-shadow: var(--nd-card-shadow),
+    0 22px 40px -28px color-mix(in srgb, var(--nd-teal) 60%, black);
 }
-.feature .num {
-  font-family: var(--sl-font-mono);
-  font-size: 0.72rem;
-  letter-spacing: 0.1em;
+.feature:hover::before {
+  opacity: 0.9;
+}
+/* A small woven-twig glyph marks each feature — gold, the nest's flourish. */
+.feature .twig {
   color: var(--nd-gold);
+  font-size: 1rem;
+  line-height: 1;
+  display: block;
+  margin-bottom: 0.7rem;
 }
 .feature h3 {
-  margin: 0.45rem 0 0.5rem;
-  font-size: 1.32rem;
-  line-height: 1.2;
+  margin: 0 0 0.5rem;
+  font-size: 1.34rem;
+  line-height: 1.18;
   color: var(--sl-color-white);
 }
 .feature p {
@@ -303,8 +916,11 @@ a.sidebar-link[aria-current="page"]:hover {
   color: var(--sl-color-gray-3);
   line-height: 1.6;
 }
+.feature p code {
+  color: var(--sl-color-gray-1);
+}
 
-/* ── "Where next" nav cards ────────────────────────────────────────────────*/
+/* ── "Where next" nav cards ───────────────────────────────────────────── */
 
 .next-grid {
   display: grid;
@@ -319,28 +935,32 @@ a.sidebar-link[aria-current="page"]:hover {
 a.next-card {
   display: block;
   border: 1px solid var(--sl-color-hairline);
-  border-radius: 0.75rem;
+  border-radius: 0.85rem;
+  background: color-mix(in srgb, var(--nd-surface-raised) 45%, transparent);
   padding: 1.4rem 1.5rem;
   text-decoration: none;
   color: inherit;
-  transition: border-color 0.2s ease, transform 0.2s ease;
+  transition: border-color 0.25s var(--nd-ease), transform 0.25s var(--nd-ease),
+    background-color 0.25s ease;
 }
 a.next-card:hover {
-  border-color: color-mix(in srgb, var(--nd-teal) 60%, transparent);
-  transform: translateY(-2px);
+  border-color: color-mix(in srgb, var(--nd-teal) 55%, transparent);
+  background: color-mix(in srgb, var(--nd-surface-raised) 85%, transparent);
+  transform: translateY(-3px);
 }
 .next-card .next-title {
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  font-size: 1.12rem;
+  font-size: 1.14rem;
   color: var(--sl-color-white);
 }
 .next-card .next-title::after {
   content: "→";
+  margin-left: auto;
   font-family: var(--sl-font-mono);
   color: var(--nd-teal-deep);
-  transition: transform 0.2s ease;
+  transition: transform 0.2s var(--nd-ease);
 }
 :root[data-theme="dark"] .next-card .next-title::after {
   color: var(--nd-teal);
@@ -355,14 +975,41 @@ a.next-card:hover .next-title::after {
   line-height: 1.55;
 }
 
+/* ── Scroll reveal (progressive enhancement) ──────────────────────────── */
+
+[data-reveal] {
+  opacity: 0;
+  transform: translateY(16px);
+  transition: opacity 0.6s var(--nd-ease), transform 0.6s var(--nd-ease);
+  transition-delay: var(--reveal-delay, 0s);
+}
+[data-reveal].is-visible {
+  opacity: 1;
+  transform: none;
+}
+
+/* ── Reduced motion: hold the finished state, drop the choreography ─────── */
 @media (prefers-reduced-motion: reduce) {
-  .feature,
-  .feature:hover,
-  a.next-card,
-  a.next-card:hover,
-  a.sidebar-link,
-  .next-card .next-title::after {
-    transition: none;
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001s !important;
+    animation-delay: 0s !important;
+    transition: none !important;
+  }
+  .nd-flourish::after,
+  .nd-weave__egg,
+  .nd-weave__query,
+  .nd-nest,
+  .nd-hero__copy > * {
+    opacity: 1 !important;
+    transform: none !important;
+  }
+  .nd-weave__edge {
+    stroke-dashoffset: 0 !important;
+  }
+  [data-reveal] {
+    opacity: 1;
     transform: none;
   }
 }

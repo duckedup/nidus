@@ -1,0 +1,27 @@
+---
+/**
+ * The second tier of the sidebar: the current page's own sections, shown
+ * nested under the active page link. Replaces the removed right-hand TOC.
+ * `items` is the flattened, Overview-stripped table of contents.
+ */
+const { items } = Astro.props;
+---
+
+{
+  items.length > 0 && (
+    <ul class="nd-toc">
+      {items.map((it) => (
+        <li>
+          <a
+            href={`#${it.slug}`}
+            class="nd-toc__link"
+            data-depth={it.depth}
+            style={`--toc-depth:${Math.max(0, it.depth - 2)}`}
+          >
+            {it.text}
+          </a>
+        </li>
+      ))}
+    </ul>
+  )
+}
