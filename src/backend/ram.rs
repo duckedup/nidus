@@ -56,6 +56,17 @@ impl MemAppender {
     pub(crate) fn new() -> MemAppender {
         MemAppender::default()
     }
+
+    /// Wrap pre-existing bytes (the current contents of an object loaded from a backend).
+    pub(crate) fn from_bytes(buf: Vec<u8>) -> MemAppender {
+        MemAppender { buf }
+    }
+
+    /// The full current contents — what an [`ObjectAppender`](super::ObjectAppender)
+    /// writes back as a whole object on `sync`.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.buf
+    }
 }
 
 impl Appender for MemAppender {

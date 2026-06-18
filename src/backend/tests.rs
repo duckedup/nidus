@@ -24,24 +24,29 @@ fn validate_key_rejects_bad_names() {
 // ── Scheme parsing (pure, Miri-clean) ───────────────────────────────────────────
 
 #[test]
-fn memory_tier_remote_schemes_are_clear_not_yet() {
+fn memory_tier_redis_family_schemes_open() {
+    // Construction is lazy (no connection yet), so every RESP-family scheme resolves
+    // to a RedisTier without touching the network.
     for loc in [
         "redis://h:6379",
         "rediss://h",
         "valkey://h",
-        "memcache://h",
-        "memcached://h",
+        "valkeys://h",
+        "keydb://h",
+        "dragonfly://h/0",
+        "redis://h:6379/0?prefix=nidus",
     ] {
-        let err = open_memory_tier(loc).err().unwrap().to_string();
-        assert!(err.contains("not yet implemented"), "{loc}: {err}");
-        assert!(err.contains("Phase 2"), "{loc}: {err}");
+        assert!(open_memory_tier(loc).is_ok(), "{loc} should open");
     }
 }
 
 #[test]
 fn memory_tier_unknown_scheme_errors() {
-    let err = open_memory_tier("kafka://h").err().unwrap().to_string();
-    assert!(err.contains("unknown memory-tier location"), "{err}");
+    // Memcached is intentionally unsupported; so is any non-RESP scheme.
+    for loc in ["kafka://h", "memcache://h", "memcached://h"] {
+        let err = open_memory_tier(loc).err().unwrap().to_string();
+        assert!(err.contains("unknown memory-tier location"), "{loc}: {err}");
+    }
 }
 
 #[test]

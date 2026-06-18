@@ -13,17 +13,23 @@
 //! - [`write`]   — `upsert`/`delete`, `flush`, `compact`, collection lifecycle.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 
 use crate::ann::Ann;
-use crate::backend::{BackendLock, LocalFs, Persistence};
+use crate::backend::{
+    Appender, BackendLock, MemoryTier, ObjectAppender, Persistence, advisory_try_lock,
+    locked_error, open_memory_tier, open_persistence,
+};
 use crate::config::{Config, OpenMode};
 use crate::data::DataSegment;
 use crate::fts::Fts;
 use crate::log::OpLog;
 use crate::model::{Distance, Op};
 
+mod memtier;
 mod quant;
 mod read;
 mod scoring;
@@ -43,12 +49,17 @@ type ScanOrder = Vec<(u64, String, String)>;
 /// One document's entry within a collection. `row` is `None` for a text-only doc (no
 /// embedding, so no row in the data matrix); such docs are full-text/metadata only and
 /// never enter the vector scan or ANN index.
+///
+/// Serializable so the whole index can be published to / loaded from a shared
+/// [`MemoryTier`](crate::backend::MemoryTier) (the working-set snapshot, see [`memtier`]).
+#[derive(serde::Serialize, serde::Deserialize)]
 struct DocEntry {
     row: Option<u64>,
     attrs: BTreeMap<String, crate::model::Value>,
 }
 
 /// One logical namespace within the store.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Collection {
     meta: BTreeMap<String, String>,
     docs: HashMap<String, DocEntry>,
@@ -80,9 +91,17 @@ pub struct Store {
     data: DataSegment,
     log: OpLog,
     /// The persistence backend the store's objects (`data`/`log`/`ann`/`fts`/`lock`)
-    /// live on — a [`LocalFs`] for a file-backed store. `None` for an in-memory store
-    /// (no durable backing; the cache/lock paths short-circuit).
-    persistence: Option<Box<dyn Persistence>>,
+    /// live on — a [`LocalFs`](crate::backend::LocalFs) for a file-backed store, or an
+    /// object store ([`S3`](crate::backend::S3)/[`Gcs`](crate::backend::Gcs)) for a live
+    /// object-backed store. `None` for an in-memory store (no durable backing; the
+    /// cache/lock paths short-circuit). Held as an `Arc` so an [`ObjectAppender`] can
+    /// share the same backend handle to rewrite `data`/`log` whole-objects on sync.
+    persistence: Option<Arc<dyn Persistence>>,
+    /// The shared memory tier (SPEC §13.3), when a non-local one is configured. `None`
+    /// means the working set is the process heap only (the default). When `Some`, the
+    /// serialized working set is published on `flush` and adopted on `open` (skipping
+    /// the log replay + index rebuild). A rebuildable cache: tier errors are never fatal.
+    memory: Option<Box<dyn MemoryTier>>,
     /// Held for its `Drop` effect (releases the writer lock on close). `ReadOnly` stores
     /// and in-memory stores hold `None`.
     #[allow(dead_code)]
@@ -135,32 +154,49 @@ impl Store {
     /// that reference rows beyond the data file — the lock-free reader rule, §6.2),
     /// and auto-compact if the dead-row ratio exceeds `config.auto_compact`.
     pub fn open(config: Config) -> Result<Store> {
-        // 1. Open the persistence backend rooted at the store directory (created if
-        //    absent). Local today; the same code drives an object store once one exists.
-        let persistence: Box<dyn Persistence> = Box::new(LocalFs::new(&config.path)?);
+        // 1. Open the persistence backend (SPEC §13.2). Empty location → local files
+        //    under `config.path` (created if absent); `s3://…`/`gs://…` → a live
+        //    object-store-backed store. Held as `Arc` so the object-store appenders below
+        //    can share the same handle to rewrite whole objects on sync.
+        let location = if config.persistence.is_empty() {
+            config.path.to_string_lossy().into_owned()
+        } else {
+            config.persistence.clone()
+        };
+        let persistence: Arc<dyn Persistence> = open_persistence(&location)?.into();
 
-        // 2. Acquire the writer lock (ReadWrite only). `try_lock` reports contention as
-        //    `Ok(None)`, which we surface as a clear "store is locked" error.
+        // 2. Open the optional shared memory tier (SPEC §13.3). Empty/`local`/`ram` →
+        //    `None` (the working set is the process heap). A `redis://…`/`valkey://…`
+        //    URL → a shared, rebuildable working-set cache.
+        let memory = Self::open_memory(&config.memory)?;
+
+        Self::open_with(config, &location, persistence, memory)
+    }
+
+    /// Open over already-resolved backends — the body shared by [`open`](Self::open) and
+    /// the backend-injection tests. `location` is only used in the "store is locked"
+    /// message. The persistence backend may be local (native append + `O_EXCL` lock) or a
+    /// whole-object store (an [`ObjectAppender`] per segment + the advisory object lock).
+    pub(crate) fn open_with(
+        config: Config,
+        location: &str,
+        persistence: Arc<dyn Persistence>,
+        memory: Option<Box<dyn MemoryTier>>,
+    ) -> Result<Store> {
+        // 3. Acquire the writer lock (ReadWrite only) — native `O_EXCL` on local files,
+        //    or the advisory object lock on a whole-object store.
         let lock = if config.open_mode == OpenMode::ReadWrite {
-            match persistence.try_lock("lock", config.lock_ttl)? {
-                Some(l) => Some(l),
-                None => bail!(
-                    "store is locked by another writer (e.g. a running `nidus serve`): {} \
-                     — stop that process, or send writes through it instead of opening \
-                     the store a second time",
-                    config.path.join("lock").display()
-                ),
-            }
+            Some(Self::acquire_lock(&persistence, location, config.lock_ttl)?)
         } else {
             None
         };
 
-        // 3. Open the data segment through the backend's native appender. First refuse —
-        //    before allocating — to load a data file whose vectors already exceed the
-        //    configured cap, turning a would-be allocation abort into a clear error.
-        let data_ap = persistence
-            .appender("data")?
-            .context("persistence backend does not provide a native data segment")?;
+        // 4. Open the data segment through the backend's appender (a native file handle
+        //    on local FS; an in-RAM buffer rewritten whole on sync for an object store).
+        //    First refuse — before allocating — to load a data file whose vectors already
+        //    exceed the configured cap, turning a would-be allocation abort into a clear
+        //    error.
+        let data_ap = Self::appender_for(&persistence, "data")?;
         if let Some(cap) = config.max_vector_bytes {
             let vector_bytes = data_ap
                 .len()?
@@ -174,15 +210,193 @@ impl Store {
         }
         let data = DataSegment::open_with(data_ap, config.dimension, config.distance)?;
 
-        // 4. Open and replay the op log through the backend's appender.
-        let log_ap = persistence
-            .appender("log")?
-            .context("persistence backend does not provide a native op log")?;
+        // 5. Open the op log through the backend's appender (replaying torn tails). The
+        //    decoded `ops` are the fallback source for building the in-RAM index.
+        let log_ap = Self::appender_for(&persistence, "log")?;
         let (log, ops) = OpLog::open_with(log_ap)?;
 
         let row_count = data.row_count();
 
-        // 5. Replay ops into the in-RAM index.
+        // 6. Build the in-RAM index. Prefer the shared memory tier's serialized working
+        //    set when it is exactly current (skipping the replay) — SPEC §13.3; otherwise
+        //    replay the log ops, then publish the fresh working set so peers can adopt it.
+        let watermark = log.offset()?;
+        let key = memtier::working_set_key(&config);
+        let adopted = memtier::try_adopt(memory.as_deref(), &key, row_count, watermark)?;
+        let from_tier = adopted.is_some();
+        let (collections, dead_rows, fts) = match adopted {
+            Some(index) => index.into_parts(),
+            None => Self::replay_ops(ops, row_count),
+        };
+
+        let quant = match config.quantization {
+            Some(q) => Some(Quant::empty(q.kind, data.dimension(), config.distance)?),
+            None => None,
+        };
+        let ann = config
+            .ann
+            .map(|a| Ann::empty(a, data.dimension(), config.distance));
+
+        let mut store = Store {
+            config,
+            data,
+            log,
+            persistence: Some(persistence),
+            memory,
+            lock,
+            collections,
+            dead_rows,
+            quant,
+            ann,
+            ann_dirty: false,
+            fts,
+            fts_dirty: false,
+            in_memory: false,
+            row_to_doc: Vec::new(),
+            scan_order: std::sync::RwLock::new(None),
+        };
+
+        // Whether the in-RAM index now differs from any tier snapshot — true if we built
+        // it from the log, or if a compaction below rewrote `data`/`log` (new watermark).
+        let mut tier_stale = !from_tier;
+
+        // 6. Auto-compact if the dead-row ratio exceeds the threshold.
+        if let Some(threshold) = store.config.auto_compact {
+            let total_rows = store.data.row_count() as usize;
+            let ratio = store.dead_rows as f32 / total_rows.max(1) as f32;
+            if ratio > threshold {
+                store.compact()?;
+                tier_stale = true;
+            }
+        }
+
+        // 7. Build the quantized matrix from the loaded vectors, if enabled.
+        store.rebuild_quant();
+        // 8. Load the ANN index from its cache (incrementally catching up any rows
+        //    added since), or rebuild it from the vectors if there is no valid cache.
+        store.load_or_build_ann()?;
+        // 9. Load the FTS index from its `fts` cache when it is exactly current, else
+        //    rebuild it from the replayed docs (the schema was restored during replay).
+        //    A no-op when no collection declares FTS.
+        store.load_or_build_fts()?;
+
+        // 10. Auto-compact for FTS tombstone pressure too. Text-only docs occupy no data
+        //     rows, so their deletes/overwrites never raise `dead_rows` and the step-6
+        //     check can't see them — a churning text-only collection would otherwise let
+        //     dead postings grow without bound. `compact` rebuilds the index (dropping
+        //     tombstones). Checked after the index is built, so the ratio is meaningful;
+        //     if step 6 already compacted, the ratio is ~0 and this is a no-op.
+        if let Some(threshold) = store.config.auto_compact
+            && store.fts.tombstone_ratio() > threshold
+        {
+            store.compact()?;
+            tier_stale = true;
+        }
+
+        // 11. Warm the shared memory tier for peers: if we built the index from the log
+        //     (didn't adopt a tier snapshot) or a compaction above rewrote the store,
+        //     publish the fresh working set so peers can adopt the current state instead
+        //     of replaying. Best-effort — the tier is a rebuildable cache.
+        if tier_stale {
+            store.publish_working_set();
+        }
+
+        Ok(store)
+    }
+
+    /// An in-memory store (no files, no lock). For tests.
+    pub fn in_memory(dimension: usize) -> Result<Store> {
+        Self::in_memory_with(dimension, Distance::default())
+    }
+
+    /// An in-memory store with a specific distance metric.
+    pub fn in_memory_with(dimension: usize, distance: Distance) -> Result<Store> {
+        Self::in_memory_cfg(
+            Config::new("/dev/null/in-memory", dimension)
+                .distance(distance)
+                .open_mode(OpenMode::ReadWrite)
+                .auto_compact(None),
+        )
+    }
+
+    /// An in-memory store with full config control.
+    pub fn in_memory_cfg(config: Config) -> Result<Store> {
+        let quant = match config.quantization {
+            Some(q) => Some(Quant::empty(q.kind, config.dimension, config.distance)?),
+            None => None,
+        };
+        let ann = config
+            .ann
+            .map(|a| Ann::empty(a, config.dimension, config.distance));
+        Ok(Store {
+            data: DataSegment::in_memory_with(config.dimension, config.distance),
+            log: OpLog::in_memory(),
+            persistence: None,
+            memory: None,
+            lock: None,
+            collections: HashMap::new(),
+            dead_rows: 0,
+            quant,
+            ann,
+            ann_dirty: false,
+            fts: Fts::default(),
+            fts_dirty: false,
+            in_memory: true,
+            row_to_doc: Vec::new(),
+            scan_order: std::sync::RwLock::new(None),
+            config,
+        })
+    }
+
+    // ── Backend wiring helpers ───────────────────────────────────────────────────
+
+    /// Open the configured shared memory tier (SPEC §13.3). Empty / `local` / `ram` →
+    /// `None` (the working set is the process heap only, the default — no external tier,
+    /// no publish/adopt overhead). Any other location → the resolved tier.
+    fn open_memory(location: &str) -> Result<Option<Box<dyn MemoryTier>>> {
+        match location {
+            "" | "local" | "ram" => Ok(None),
+            loc => Ok(Some(open_memory_tier(loc)?)),
+        }
+    }
+
+    /// Acquire the writer lock: the backend's native `O_EXCL` lock (local files) or, on a
+    /// whole-object store with no native lock, the advisory object lock. Contention is a
+    /// clear "store is locked" error in both cases.
+    fn acquire_lock(
+        persistence: &Arc<dyn Persistence>,
+        location: &str,
+        ttl: Duration,
+    ) -> Result<Box<dyn BackendLock>> {
+        let acquired = if persistence.has_native_lock() {
+            persistence.try_lock("lock", ttl)?
+        } else {
+            advisory_try_lock(persistence, "lock", ttl)?
+        };
+        acquired.ok_or_else(|| locked_error(location))
+    }
+
+    /// The `data`/`log` append handle for `key`: the backend's native [`Appender`] when
+    /// it has one (local files), else an [`ObjectAppender`] — an in-RAM buffer rewritten
+    /// as a whole object on sync — over the shared backend handle (object stores).
+    ///
+    /// Note: the object-store path loads the whole object into RAM here, *before* `open`
+    /// checks `max_vector_bytes`. So for object stores that "refuse before allocating"
+    /// guard (§6.6) relaxes to "refuse after one full copy is resident" — inherent to a
+    /// whole-object backend, and acceptable at nidus's dev/small-scale positioning.
+    fn appender_for(persistence: &Arc<dyn Persistence>, key: &str) -> Result<Box<dyn Appender>> {
+        match persistence.appender(key)? {
+            Some(native) => Ok(native),
+            None => Ok(Box::new(ObjectAppender::open(persistence.clone(), key)?)),
+        }
+    }
+
+    /// Replay the decoded log `ops` into the in-RAM index — the source of truth when no
+    /// shared working-set snapshot is adopted. Returns the collections, the dead-row
+    /// count, and the FTS index with its declared schemas restored (postings are rebuilt
+    /// later by [`load_or_build_fts`](Self::load_or_build_fts)). `Upsert`s referencing a
+    /// row beyond the data file are ignored (the lock-free reader rule, §6.2).
+    fn replay_ops(ops: Vec<Op>, row_count: u64) -> (HashMap<String, Collection>, usize, Fts) {
         let mut collections: HashMap<String, Collection> = HashMap::new();
         let mut dead_rows: usize = 0;
         let mut fts = Fts::default();
@@ -255,8 +469,7 @@ impl Store {
                 }
                 Op::SetFtsSchema { collection, fields } => {
                     // The collection exists implicitly (matches SetMeta leniency); the
-                    // field indexes are (re)built from the live docs once replay finishes
-                    // (see `rebuild_fts`).
+                    // field indexes are (re)built from the live docs once replay finishes.
                     collections
                         .entry(collection.clone())
                         .or_insert_with(Collection::new);
@@ -264,108 +477,7 @@ impl Store {
                 }
             }
         }
-
-        let quant = match config.quantization {
-            Some(q) => Some(Quant::empty(q.kind, data.dimension(), config.distance)?),
-            None => None,
-        };
-        let ann = config
-            .ann
-            .map(|a| Ann::empty(a, data.dimension(), config.distance));
-
-        let mut store = Store {
-            config,
-            data,
-            log,
-            persistence: Some(persistence),
-            lock,
-            collections,
-            dead_rows,
-            quant,
-            ann,
-            ann_dirty: false,
-            fts,
-            fts_dirty: false,
-            in_memory: false,
-            row_to_doc: Vec::new(),
-            scan_order: std::sync::RwLock::new(None),
-        };
-
-        // 6. Auto-compact if the dead-row ratio exceeds the threshold.
-        if let Some(threshold) = store.config.auto_compact {
-            let total_rows = store.data.row_count() as usize;
-            let ratio = store.dead_rows as f32 / total_rows.max(1) as f32;
-            if ratio > threshold {
-                store.compact()?;
-            }
-        }
-
-        // 7. Build the quantized matrix from the loaded vectors, if enabled.
-        store.rebuild_quant();
-        // 8. Load the ANN index from its cache (incrementally catching up any rows
-        //    added since), or rebuild it from the vectors if there is no valid cache.
-        store.load_or_build_ann()?;
-        // 9. Load the FTS index from its `fts` cache when it is exactly current, else
-        //    rebuild it from the replayed docs (the schema was restored during replay).
-        //    A no-op when no collection declares FTS.
-        store.load_or_build_fts()?;
-
-        // 10. Auto-compact for FTS tombstone pressure too. Text-only docs occupy no data
-        //     rows, so their deletes/overwrites never raise `dead_rows` and the step-6
-        //     check can't see them — a churning text-only collection would otherwise let
-        //     dead postings grow without bound. `compact` rebuilds the index (dropping
-        //     tombstones). Checked after the index is built, so the ratio is meaningful;
-        //     if step 6 already compacted, the ratio is ~0 and this is a no-op.
-        if let Some(threshold) = store.config.auto_compact
-            && store.fts.tombstone_ratio() > threshold
-        {
-            store.compact()?;
-        }
-
-        Ok(store)
-    }
-
-    /// An in-memory store (no files, no lock). For tests.
-    pub fn in_memory(dimension: usize) -> Result<Store> {
-        Self::in_memory_with(dimension, Distance::default())
-    }
-
-    /// An in-memory store with a specific distance metric.
-    pub fn in_memory_with(dimension: usize, distance: Distance) -> Result<Store> {
-        Self::in_memory_cfg(
-            Config::new("/dev/null/in-memory", dimension)
-                .distance(distance)
-                .open_mode(OpenMode::ReadWrite)
-                .auto_compact(None),
-        )
-    }
-
-    /// An in-memory store with full config control.
-    pub fn in_memory_cfg(config: Config) -> Result<Store> {
-        let quant = match config.quantization {
-            Some(q) => Some(Quant::empty(q.kind, config.dimension, config.distance)?),
-            None => None,
-        };
-        let ann = config
-            .ann
-            .map(|a| Ann::empty(a, config.dimension, config.distance));
-        Ok(Store {
-            data: DataSegment::in_memory_with(config.dimension, config.distance),
-            log: OpLog::in_memory(),
-            persistence: None,
-            lock: None,
-            collections: HashMap::new(),
-            dead_rows: 0,
-            quant,
-            ann,
-            ann_dirty: false,
-            fts: Fts::default(),
-            fts_dirty: false,
-            in_memory: true,
-            row_to_doc: Vec::new(),
-            scan_order: std::sync::RwLock::new(None),
-            config,
-        })
+        (collections, dead_rows, fts)
     }
 
     // ── ANN index lifecycle ─────────────────────────────────────────────────────

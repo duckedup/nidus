@@ -184,9 +184,13 @@ impl Persistence for S3 {
 
     fn try_lock(&self, _key: &str, _ttl: Duration) -> Result<Option<Box<dyn BackendLock>>> {
         bail!(
-            "the S3 backend does not support writer locking — it is for snapshots and \
-             whole-object use, not a lock-coordinated live store"
+            "the S3 backend has no native writer lock — a live object-backed store uses \
+             the advisory lock (Store::acquire_lock) instead of calling try_lock"
         )
+    }
+
+    fn has_native_lock(&self) -> bool {
+        false
     }
 }
 

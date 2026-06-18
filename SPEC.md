@@ -640,10 +640,10 @@ build until a real need exists.
 - **Pluggable storage & memory backends.** Generalize the §5 local directory along two
   orthogonal axes behind two sync traits: a **persistence** backend (durable `data`/`log`
   — local files / S3 / GCS) and a shared **memory tier** (the warm working set — local RAM
-  / Redis / Valkey / Memcached), selected by URL scheme (`file://`, `s3://`, `gs://`;
-  `redis://`, `memcache://`). The on-disk *object set* (`data`/`log` + derived caches) is
+  / Redis / Valkey / KeyDB / Dragonfly), selected by URL scheme (`file://`, `s3://`, `gs://`;
+  `redis://`, `valkey://`, …). The on-disk *object set* (`data`/`log` + derived caches) is
   unchanged — only *where the bytes live* and *whether the working set is shared*. Search
-  stays in local RAM, never over the wire. Fully designed in §13.
+  stays in local RAM, never over the wire. Built — see §13.
 
 ---
 
@@ -727,28 +727,34 @@ a `Config` (§4.1) and calls `Nidus::open(config)`. A search-only process opens 
 
 ---
 
-## 13. Storage & memory backends (designed, not built)
+## 13. Storage & memory backends (built)
 
 §5 describes one configuration: a local directory, with vectors held in local process
 RAM. This section generalizes that along **two independent axes**, behind two small sync
-traits. The **trait surface, the local backends, and the live store's wiring onto them
-are built** (`src/backend/`: `Persistence` + `Appender` + `BackendLock` and `MemoryTier`,
-with `LocalFs` and `LocalRam`, selected by URL scheme — nidus-870.2 Phase 1; the store's
-`data`/`log` segments run over `Persistence::appender` and its `ann`/`fts` caches over
-`get`/`put`/`try_lock` — nidus-vnu); snapshot/backup is routed through `Persistence`
-too, so `nidus backup --out <loc>` writes the archive object to any backend (§13.7).
-The **S3 and GCS persistence backends are built** (`src/backend/s3.rs`,
-`src/backend/gcs.rs`: whole-object get/put/delete/list over sans-IO `rusty-s3` /
-`tame-gcs`+`tame-oauth` + `ureq`, selected by `s3://…` / `gs://…` — nidus-870.4). The
-Redis/Valkey/Memcached memory tier remains **designed-for, not built** (the seam in §9).
+traits — and **both axes are now built end to end** (`src/backend/`).
+
+- The **trait surface + local backends + live-store wiring** (`Persistence` + `Appender` +
+  `BackendLock` and `MemoryTier`, `LocalFs`/`LocalRam`, URL-scheme selection): nidus-870.2
+  Phase 1 + nidus-vnu — the store's `data`/`log` segments run over `Persistence::appender`,
+  its `ann`/`fts` caches over `get`/`put`/`try_lock`; snapshot/backup is routed through
+  `Persistence` too (§13.7).
+- The **S3 + GCS persistence backends** (`s3.rs`/`gcs.rs`: whole-object get/put/delete/list
+  over sans-IO `rusty-s3` / `tame-gcs`+`tame-oauth` + `ureq`): nidus-870.4. A store also
+  **runs live** on them via an `ObjectAppender` (in-RAM segment buffer, whole-object rewrite
+  on sync) plus an advisory object lock — nidus-cgr (the race-free conditional-PUT lock is
+  the nidus-a7c follow-up).
+- The **shared Redis memory tier** (`redis.rs`: one blocking `redis-rs` client over the RESP
+  family — Redis/Valkey/KeyDB/DragonflyDB — plain or TLS), with the store publishing the
+  serialized working set on `flush` and adopting it on `open`: nidus-870.3. Memcached is
+  intentionally **not** built (eviction-only, the weakest cache fit).
 
 - **Persistence** — where the durable *source-of-truth* bytes (`data`/`log`) live:
   **local files** (default), **S3**, or **GCS**. Optimized for durability and cost.
 - **Memory tier** — where the in-RAM *working set* is held for serving: **local process
-  RAM** (default), or a shared external in-memory store — **Redis, Valkey, Memcached**.
+  RAM** (default), or a shared external store — **Redis / Valkey / KeyDB / DragonflyDB**.
   Optimized for fast access and sharing.
 
-The axes are orthogonal and compose (e.g. truth in S3, working set shared via Redis, scan
+The axes are orthogonal and compose (e.g. truth in S3, working set shared via Valkey, scan
 in local RAM); both default to local.
 
 ### 13.1 Two axes, and why search is independent of both
@@ -807,18 +813,24 @@ Where the in-RAM working state (the vectors + the derived indexes) is held so it
 | tier | crate | role |
 |---|---|---|
 | Local process RAM (default) | — (`Vec<f32>`) | the working set *is* the process heap; nothing shared |
-| Redis / Valkey | `redis` (blocking, plain TCP) | shared, rebuildable cache of the working set across workers |
-| Memcached | pure-Rust client | same, but **evictable** — weakest; cache-only, never authoritative |
+| Redis / Valkey / KeyDB / Dragonfly | `redis` (blocking; plain TCP or TLS) | shared, rebuildable cache of the working set across workers (**built**) |
+| Memcached | — | **not built** — eviction-only, no durability/structures; the weakest cache fit |
 
 It is **model (a)** throughout: the external store is a *shared cache* of the serialized
-in-RAM state (the same thing `index_cache.rs` writes locally, §9 — just shared/remote and
-covering the vectors too). It is **rebuildable from the persistence tier**, so an empty or
-evicted store is never fatal — exactly the derived-cache contract. Wins: N stateless search
-workers share one copy instead of each rebuilding; restart is a load, not a rebuild.
+in-RAM state (the same framing `index_cache.rs` writes locally, §9 — just shared/remote). It
+is **rebuildable from the persistence tier**, so an empty or evicted store is never fatal —
+exactly the derived-cache contract. Wins: N stateless search workers share one copy instead
+of each rebuilding; restart is a load, not a rebuild.
 
-Pure-Rust and sync: `redis-rs` blocking mode over plain TCP (`redis://`) needs **no TLS**;
-Valkey is a drop-in Redis fork (same protocol). Memcached has no persistence, no data
-structures, and evicts at will — usable only as a throwaway cache tier.
+**What is shared** is the replay-derived index (per-collection `id → (row, attrs)`, dead-row
+count, FTS schemas) — the one in-RAM structure with no other cache, reusing the
+`index_cache.rs` frame/decode codec. It is **watermark-guarded** (the log byte offset + data
+row count): a store adopts the blob on `open` only when it matches the just-opened
+`data`/`log` exactly, else replays the log; it publishes a fresh blob on `flush`.
+
+Pure-Rust and sync: one `redis-rs` blocking client speaks RESP, so it covers Redis and its
+wire-compatible kin — **Valkey, KeyDB, DragonflyDB** — selected by URL scheme. Plain
+`redis://` needs **no TLS**; `rediss://` reuses the same rustls + `ring` as S3/GCS.
 
 ### 13.4 The traits — object-granular, sync (both axes)
 
@@ -860,7 +872,7 @@ pub trait MemoryTier: Send + Sync {        // local RAM is the trivial impl
 > (§12) avoids that.)
 
 Selection is by **URL scheme** — persistence: `file://`, `s3://`, `gs://`; memory: local
-(default), `redis://`, `memcache://`.
+(default), `redis://`/`valkey://`/`keydb://`/`dragonfly://` (plain) and `rediss://`/`valkeys://` (TLS).
 
 ### 13.5 Effect on speed (independent of both axes)
 
@@ -887,7 +899,7 @@ rebuilding it).
 ### 13.6 Persistence build-time / TLS decision (S3/GCS only) — RESOLVED
 
 This concerns **only the S3/GCS persistence backends** — they need HTTPS, hence a TLS
-stack. The memory tier (Redis/Valkey/Memcached) is plain TCP, pure-Rust, and **unaffected**.
+stack. The memory tier (Redis/Valkey/KeyDB/Dragonfly) is plain TCP or TLS, pure-Rust, and **unaffected**.
 Resolved dependency trees confirm the wall and the one escape:
 
 - `rustls` defaults to `aws-lc-sys` (C); its `ring` provider compiles C+asm; `reqwest`'s
@@ -926,16 +938,19 @@ and **(B) purist** — hold zero-FFI via `rustls-rustcrypto` + hand-rolled auth.
 > is *not* a capacity upgrade: S3/GCS change where bytes durably live, not the
 > RAM-bound search model (§13.4) — "outgrow" means durability/sharing, not larger-than-RAM.
 
-The memory tier over plain TCP (`redis://`, `memcache://`) needs no TLS; only a TLS'd
+The memory tier over plain TCP (`redis://`, `valkey://`) needs no TLS; only a TLS'd
 persistence target (`s3://`, `gs://`, or `rediss://` if ever used) exercises `ring`. Local
 FS needs nothing. **The standing guardrail: the whole crate's clean build stays under a
 minute — CI asserts it (§9, the build-time gate).**
 
 ### 13.7 Persistence usage modes (both supported)
 
-- **Live backing store.** A store's `data`/`log` (and optionally caches) live on the
-  persistence backend; writes durably round-trip per §13.5. Best for low-write-rate / dev /
-  small-scale use (nidus's positioning).
+- **Live backing store (built).** A store's `data`/`log` live on the persistence backend;
+  writes durably round-trip per §13.5. On an object store with no native append, each
+  segment is an in-RAM buffer rewritten as one whole object on sync (`ObjectAppender`,
+  `O(object)` per flush) under an advisory object lock (race-free conditional-PUT locking is
+  the nidus-a7c follow-up). Best for low-write-rate / dev / small-scale, single-writer use
+  (nidus's positioning).
 - **Snapshot / backup (built).** PUT/GET the whole store as one archive (the `cli`-feature
   `tar.gz`). This is *exactly* object-granular, so every persistence backend does it
   trivially. `nidus backup --out <loc>` reads the source store's `data`/`log` objects via

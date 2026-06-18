@@ -6,7 +6,7 @@ description: Use nidus from the terminal with the `nidus` binary — create, ups
 Besides the Rust library, nidus ships a `nidus` binary: a command-line tool for
 working with a store directly. It operates on an ordinary store directory — the
 very same format the library reads and writes. The same binary also runs an HTTP
-server; that has its own [HTTP server & API](/guides/http-server/) page.
+server; that has its own [HTTP server](/guides/http-server/) page.
 
 The binary is optional. The library has no dependency on it: `cargo add nidus`
 pulls in only the pure-Rust core. The binary is built behind a `cli` feature, so
@@ -149,7 +149,35 @@ HNSW knobs: `--ann-m`, `--ann-ef-construction`, `--ann-ef-search`. IVF knobs:
 `--ann-n-lists`, `--ann-n-probe`. `--ann-overscan` and `--ann-seed` apply to both.
 Candidate *selection* is approximate, but the final ranking is always the exact
 score over the over-fetched survivors. `nidus stats --ann …` echoes the active
-configuration. ANN cannot be combined with quantization.
+configuration.
+
+## Storage & memory backends
+
+By default a store is a local directory and its working set is the process heap. Two
+optional flags point each axis elsewhere — see [Storage backends](/guides/storage-backends/)
+and [Memory stores](/guides/memory-stores/) for the full model; both work on every
+store-opening command, including `serve`:
+
+```bash
+# --persistence: where the durable data/log live. A live object-store-backed store
+# (whole-object rewrite on flush). Pass --dim — the remote header is not peeked.
+nidus upsert --dir ./meta --dim 768 --persistence s3://my-bucket/store docs < recs.json
+nidus search --dir ./meta --dim 768 --persistence s3://my-bucket/store docs -k 5 < q.json
+
+# --memory: share the in-RAM working set across processes via Redis/Valkey/KeyDB/Dragonfly.
+# Each worker publishes on flush and adopts on open, skipping the log replay.
+nidus serve --dir ./store --dim 768 --memory redis://cache:6379?prefix=docs
+```
+
+`--persistence` accepts a path / `file://` (local, the default), `s3://<bucket>[/<prefix>]`,
+or `gs://<bucket>[/<prefix>]`; cloud credentials come from the standard environment
+(`AWS_*` / `GOOGLE_APPLICATION_CREDENTIALS`). `--memory` accepts `local` (the default) or a
+`redis://`/`rediss://`/`valkey://`/`valkeys://`/`keydb://`/`dragonfly://` URL. The axes
+compose, and search is identical either way — it always runs over local RAM.
+
+A live object-store-backed store rewrites the whole `data`/`log` object on each flush
+(`O(object)`, fine for low write rates) and takes an **advisory** writer lock — suited to a
+single writer; for many concurrent writers, prefer a local store and snapshot to the cloud.
 
 ## Backup & restore
 
@@ -172,7 +200,7 @@ nidus restore --in ./store.tar.gz --dir ./restored
 nidus restore --in ./store.tar.gz --dir ./store --yes
 ```
 
-The archive's `--out`/`--in` is a [storage-backend](/guides/backends/) location, so
+The archive's `--out`/`--in` is a [storage-backend](/guides/storage-backends/) location, so
 besides a plain path it accepts a `file://` URL, an `s3://` bucket, or a `gs://` bucket
 — the snapshot is written and read as one object on whatever backend the location names:
 
@@ -182,6 +210,14 @@ nidus backup  --dir ./store --out file:///backups/store.tar.gz
 nidus backup  --dir ./store --out s3://my-bucket/backups/store.tar.gz
 # …or Google Cloud Storage (GOOGLE_APPLICATION_CREDENTIALS):
 nidus backup  --dir ./store --out gs://my-bucket/backups/store.tar.gz
+```
+
+The *source* store is a backend location too: pass `--persistence` to back up an
+object-store-backed store, and `nidus restore --persistence …` to restore into one:
+
+```bash
+nidus backup  --persistence s3://my-bucket/store --out ./store.tar.gz
+nidus restore --in ./store.tar.gz --persistence s3://my-bucket/store --dir ./meta
 ```
 
 The archive is an ordinary gzip-compressed tarball — `tar tzf store.tar.gz`
@@ -215,6 +251,6 @@ JSON:
 nidus serve --dir ./store --dim 768 --addr 127.0.0.1:7700
 ```
 
-The complete network workflow, authentication, request limits, and the
-endpoint-by-endpoint reference live on the dedicated
-[HTTP server & API](/guides/http-server/) page.
+The complete network workflow, authentication, and request limits are on the
+[HTTP server](/guides/http-server/) page; the endpoint-by-endpoint reference is the
+[HTTP API](/reference/http-api/).

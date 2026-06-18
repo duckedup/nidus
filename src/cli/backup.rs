@@ -27,7 +27,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::Serialize;
 
-use crate::backend::{LocalFs, Persistence, open_object_location};
+use crate::backend::{Persistence, open_object_location};
 use crate::{Config, Nidus, OpenMode};
 
 /// Source-of-truth objects that make up the durable, portable state of a store.
@@ -71,22 +71,20 @@ struct Manifest {
     log_bytes: u64,
 }
 
-/// Snapshot the store at `store_dir` into a gzip-compressed tar **object** at
-/// `out_location` (a persistence location — a local path/`file://` today, `s3://`
-/// once implemented).
-pub fn backup(store_dir: &Path, out_location: &str) -> Result<BackupReport> {
-    // Read the source store's durable objects through its (local) backend — `data`
-    // first, then `log`, for the consistent lock-free snapshot (see the module docs).
-    let src = LocalFs::new(store_dir)?;
-    let data = src.get("data")?.with_context(|| {
-        format!(
-            "no nidus store at {} (no `data` object)",
-            store_dir.display()
-        )
-    })?;
+/// Snapshot the store at the persistence location `source` into a gzip-compressed tar
+/// **object** at `out_location`. Both are [`open_persistence`](crate::open_persistence)
+/// locations — a local path/`file://`, or an `s3://`/`gs://` object store — so a store
+/// living on any backend can be snapshotted to any backend.
+pub fn backup(source: &str, out_location: &str) -> Result<BackupReport> {
+    // Read the source store's durable objects through its backend — `data` first, then
+    // `log`, for the consistent lock-free snapshot (see the module docs).
+    let src = crate::open_persistence(source)?;
+    let data = src
+        .get("data")?
+        .with_context(|| format!("no nidus store at {source} (no `data` object)"))?;
     let log = src.get("log")?.unwrap_or_default();
     let (dimension, distance) = crate::data::header_from_bytes(&data)
-        .with_context(|| format!("{} has no readable nidus header", store_dir.display()))?;
+        .with_context(|| format!("{source} has no readable nidus header"))?;
 
     let created_unix = now_unix();
 
@@ -121,7 +119,7 @@ pub fn backup(store_dir: &Path, out_location: &str) -> Result<BackupReport> {
 
     Ok(BackupReport {
         backup: out_location.to_string(),
-        source: store_dir.display().to_string(),
+        source: source.to_string(),
         dimension,
         distance: format!("{distance:?}"),
         data_bytes: data.len() as u64,
@@ -130,28 +128,30 @@ pub fn backup(store_dir: &Path, out_location: &str) -> Result<BackupReport> {
     })
 }
 
-/// Restore the store in the archive at `in_location` into `dir`.
+/// Restore the store in the archive at `in_location` into the persistence location
+/// `target` (a local path/`file://`, or an `s3://`/`gs://` object store).
 ///
-/// If `dir` already holds a store, the caller must confirm: with
+/// If `target` already holds a store, the caller must confirm: with
 /// `assume_yes == false` we prompt on stderr and read one line from stdin;
 /// anything but `y`/`yes` (including EOF / a non-interactive pipe) aborts.
-pub fn restore(in_location: &str, dir: &Path, assume_yes: bool) -> Result<RestoreReport> {
-    if store_present(dir) && !assume_yes && !confirm_overwrite(dir)? {
-        bail!(
-            "aborted: {} already contains a store (pass -y/--yes to overwrite)",
-            dir.display()
-        );
+pub fn restore(
+    in_location: &str,
+    target_location: &str,
+    assume_yes: bool,
+) -> Result<RestoreReport> {
+    // Extract the source-of-truth objects into the target store's backend. `put`
+    // validates each key (rejecting any path separators / `..`), so a hand-crafted
+    // traversal entry can never escape the store.
+    let target = crate::open_persistence(target_location)?;
+
+    if store_present(target.as_ref()) && !assume_yes && !confirm_overwrite(target_location)? {
+        bail!("aborted: {target_location} already contains a store (pass -y/--yes to overwrite)");
     }
 
     let (src, key) = open_object_location(in_location)?;
     let archive = src
         .get(&key)?
         .with_context(|| format!("backup archive not found: {in_location}"))?;
-
-    // Extract the source-of-truth objects into the target store's backend. `put`
-    // validates each key (rejecting any path separators / `..`), so a hand-crafted
-    // traversal entry can never escape the store directory.
-    let target = LocalFs::new(dir)?;
     let mut tar = tar::Archive::new(GzDecoder::new(&archive[..]));
     let mut found_data = false;
     for entry in tar.entries().context("malformed backup archive")? {
@@ -191,14 +191,17 @@ pub fn restore(in_location: &str, dir: &Path, assume_yes: bool) -> Result<Restor
     let (dimension, distance) = crate::data::header_from_bytes(&data)
         .context("restored data has no readable nidus header")?;
     let db = Nidus::open(
-        Config::new(dir.to_path_buf(), dimension)
+        // The path arg is unused: a non-empty `persistence(target_location)` drives the
+        // open, so `"."` is just a placeholder (see `Store::open`'s location resolution).
+        Config::new(".", dimension)
             .distance(distance)
+            .persistence(target_location)
             .open_mode(OpenMode::ReadOnly),
     )
     .context("restored store failed to open — the archive may be corrupt")?;
 
     Ok(RestoreReport {
-        restored_to: dir.display().to_string(),
+        restored_to: target_location.to_string(),
         source_archive: in_location.to_string(),
         dimension,
         distance: format!("{distance:?}"),
@@ -234,19 +237,18 @@ fn append_bytes<W: std::io::Write>(
     Ok(())
 }
 
-/// Does `dir` already hold store files we'd overwrite?
-fn store_present(dir: &Path) -> bool {
-    dir.join("data").exists() || dir.join("log").exists()
+/// Does the target backend already hold store objects we'd overwrite? Backend errors
+/// read as "absent" (the safe direction — the restore then proceeds and surfaces any
+/// real failure on `put`).
+fn store_present(p: &dyn Persistence) -> bool {
+    matches!(p.get("data"), Ok(Some(_))) || matches!(p.get("log"), Ok(Some(_)))
 }
 
 /// Prompt on stderr; return `true` only on an explicit yes. EOF or a
 /// non-interactive pipe reads as empty → `false` (safe default).
-fn confirm_overwrite(dir: &Path) -> Result<bool> {
+fn confirm_overwrite(target: &str) -> Result<bool> {
     use std::io::Write;
-    eprint!(
-        "{} already contains a store; overwrite it? [y/N] ",
-        dir.display()
-    );
+    eprint!("{target} already contains a store; overwrite it? [y/N] ");
     std::io::stderr().flush()?;
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
@@ -290,13 +292,18 @@ mod tests {
         let archive = arc.path().join("snap.tar.gz");
         make_store(src.path());
 
-        let report = backup(src.path(), &archive.to_string_lossy()).unwrap();
+        let report = backup(&src.path().to_string_lossy(), &archive.to_string_lossy()).unwrap();
         assert_eq!(report.dimension, 3);
         assert!(archive.exists());
 
         // Restore into a fresh (empty) directory.
         let restored = dst.path().join("store");
-        let rr = restore(&archive.to_string_lossy(), &restored, true).unwrap();
+        let rr = restore(
+            &archive.to_string_lossy(),
+            &restored.to_string_lossy(),
+            true,
+        )
+        .unwrap();
         assert_eq!(rr.records, 2);
         assert_eq!(rr.collections, vec!["docs".to_string()]);
 
@@ -327,11 +334,11 @@ mod tests {
         // `file://<abs path>` destination exercises the URL-scheme path.
         let archive = src.path().join("via-url.tar.gz");
         let url = format!("file://{}", archive.display());
-        backup(src.path(), &url).unwrap();
+        backup(&src.path().to_string_lossy(), &url).unwrap();
         assert!(archive.exists());
 
         let restored = dst.path().join("store");
-        let rr = restore(&url, &restored, true).unwrap();
+        let rr = restore(&url, &restored.to_string_lossy(), true).unwrap();
         assert_eq!(rr.records, 2);
     }
 
@@ -344,9 +351,14 @@ mod tests {
         make_store(src.path());
         make_store(target.path()); // target already holds a store
 
-        backup(src.path(), &archive.to_string_lossy()).unwrap();
+        backup(&src.path().to_string_lossy(), &archive.to_string_lossy()).unwrap();
         // assume_yes == false with no interactive stdin (EOF) → abort.
-        let err = restore(&archive.to_string_lossy(), target.path(), false).unwrap_err();
+        let err = restore(
+            &archive.to_string_lossy(),
+            &target.path().to_string_lossy(),
+            false,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("already contains a store"));
     }
 
@@ -354,7 +366,7 @@ mod tests {
     fn backup_rejects_missing_store() {
         let empty = tempfile::tempdir().unwrap();
         let archive = empty.path().join("snap.tar.gz");
-        let err = backup(empty.path(), &archive.to_string_lossy()).unwrap_err();
+        let err = backup(&empty.path().to_string_lossy(), &archive.to_string_lossy()).unwrap_err();
         assert!(err.to_string().contains("no nidus store"));
     }
 }

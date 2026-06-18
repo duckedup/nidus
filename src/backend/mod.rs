@@ -4,13 +4,13 @@
 //! independent, composable axes**, each behind a small **sync, `dyn`-safe** trait:
 //!
 //! - [`Persistence`] — where the durable *source-of-truth* bytes (`data`/`log`) and
-//!   the derived caches (`ann`/`fts`) live. [`LocalFs`] (default) today; S3/GCS are
-//!   the planned members (Phase 3). Object-granular: whole-object get/put/delete/list,
-//!   plus an **optional** native [`Appender`] capability (local files have it; object
-//!   stores return `None` and rewrite whole objects) and a best-effort [`try_lock`].
+//!   the derived caches (`ann`/`fts`) live. [`LocalFs`] (default), plus [`S3`] and
+//!   [`Gcs`] object stores. Object-granular: whole-object get/put/delete/list, plus an
+//!   **optional** native [`Appender`] capability (local files have it; object stores
+//!   return `None` and rewrite whole objects) and a best-effort [`try_lock`].
 //! - [`MemoryTier`] — where the in-RAM working set is held so it can be *shared* and
-//!   *reloaded without a rebuild*. [`LocalRam`] (default — the process heap) today;
-//!   Redis/Valkey/Memcached are planned (Phase 2).
+//!   *reloaded without a rebuild*. [`LocalRam`] (default — the process heap) and a
+//!   [`RedisTier`] over the RESP family (Redis/Valkey/KeyDB/DragonflyDB).
 //!
 //! Both are **sync deliberately** (SPEC §13.4): search is CPU-over-RAM and never
 //! touches a backend, every backend *can* be sync, and a sync trait is `dyn`-safe out
@@ -22,6 +22,7 @@
 //! writer lock go through `get`/`put`/`try_lock`. Routing snapshot/backup through
 //! [`Persistence`] lands alongside the remote backends, where it first becomes meaningful.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -29,7 +30,9 @@ use anyhow::{Result, bail};
 mod cloud;
 mod gcs;
 mod local;
+mod object;
 mod ram;
+mod redis;
 mod s3;
 
 #[cfg(test)]
@@ -37,8 +40,11 @@ mod tests;
 
 pub use gcs::Gcs;
 pub use local::{FileAppender, LocalFs};
+pub use object::ObjectAppender;
+pub(crate) use object::{advisory_try_lock, locked_error};
 pub use ram::LocalRam;
 pub(crate) use ram::MemAppender;
+pub use redis::RedisTier;
 pub use s3::S3;
 
 /// Where the durable bytes live: whole **named byte objects** in two classes —
@@ -76,6 +82,14 @@ pub trait Persistence: Send + Sync {
     /// `Err` only on a real IO failure. `ttl` reclaims a lock older than it (a
     /// crashed holder).
     fn try_lock(&self, key: &str, ttl: Duration) -> Result<Option<Box<dyn BackendLock>>>;
+
+    /// Whether [`try_lock`](Self::try_lock) provides a real exclusive lock (local
+    /// `O_EXCL`). Whole-object stores return `false`: they have no atomic create-if-absent
+    /// here yet, so a live object-backed store falls back to the advisory get-then-put
+    /// lock ([`advisory_try_lock`]) instead of calling `try_lock`. Default `true`.
+    fn has_native_lock(&self) -> bool {
+        true
+    }
 }
 
 /// A durable, append-shaped byte stream — the native local-FS capability that the
@@ -151,6 +165,17 @@ pub trait MemoryTier: Send + Sync {
     fn store(&self, key: &str, bytes: &[u8], ttl: Option<Duration>) -> Result<()>;
 }
 
+/// Share one tier behind several handles: `Arc<dyn MemoryTier>` (or `Arc<LocalRam>`) is
+/// itself a [`MemoryTier`], so multiple stores can publish to / adopt from one instance.
+impl<T: MemoryTier + ?Sized> MemoryTier for Arc<T> {
+    fn load(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        (**self).load(key)
+    }
+    fn store(&self, key: &str, bytes: &[u8], ttl: Option<Duration>) -> Result<()> {
+        (**self).store(key, bytes, ttl)
+    }
+}
+
 /// Reject a key that is not a single flat object name — no path separators, no `..`,
 /// not empty. Shared by every backend so keys behave identically across local and
 /// (future) object stores.
@@ -185,33 +210,29 @@ pub fn open_persistence(location: &str) -> Result<Box<dyn Persistence>> {
 /// Open a **memory tier** backend from a URL/location string (SPEC §13.3):
 ///
 /// - empty, `local`, or `ram` → [`LocalRam`] (the process heap; nothing shared).
-/// - `redis://…` / `rediss://…` / `valkey://…` → "not yet" (planned, Phase 2).
-/// - `memcache://…` / `memcached://…` → "not yet" (planned, Phase 2).
+/// - `redis://…` / `rediss://…` (TLS), and the RESP-compatible aliases `valkey://…`,
+///   `valkeys://…`, `keydb://…`, `dragonfly://…` → a shared [`RedisTier`].
+///
+/// An unrecognized scheme is rejected with a clear error rather than a silent fallback.
 pub fn open_memory_tier(location: &str) -> Result<Box<dyn MemoryTier>> {
     match location {
         "" | "local" | "ram" => return Ok(Box::new(LocalRam::new())),
         _ => {}
     }
-    for scheme in ["redis", "rediss", "valkey"] {
+    for scheme in REDIS_SCHEMES {
         if strip_scheme(location, scheme).is_some() {
-            bail!(
-                "the Redis/Valkey memory tier ({location:?}) is not yet implemented \
-                 (planned: SPEC §13.3, nidus-870 Phase 2)"
-            );
-        }
-    }
-    for scheme in ["memcache", "memcached"] {
-        if strip_scheme(location, scheme).is_some() {
-            bail!(
-                "the Memcached memory tier ({location:?}) is not yet implemented \
-                 (planned: SPEC §13.3, nidus-870 Phase 2)"
-            );
+            return Ok(Box::new(RedisTier::from_url(location)?));
         }
     }
     bail!(
-        "unknown memory-tier location {location:?} (expected `local`, `redis://…`, or `memcache://…`)"
+        "unknown memory-tier location {location:?} \
+         (expected `local`, or a Redis-family URL like `redis://…` / `valkey://…`)"
     )
 }
+
+/// The RESP-protocol URL schemes [`open_memory_tier`] routes to [`RedisTier`] — Redis
+/// and its wire-compatible kin (Valkey, KeyDB, DragonflyDB), plain and TLS.
+const REDIS_SCHEMES: [&str; 6] = ["redis", "rediss", "valkey", "valkeys", "keydb", "dragonfly"];
 
 /// Open the persistence backend holding a single named **object** addressed by
 /// `location` — splitting it into a backend root and an object key at the last `/`

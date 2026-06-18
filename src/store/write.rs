@@ -409,6 +409,9 @@ impl Store {
         self.check_writable()?;
         self.data.sync()?;
         self.log.sync()?;
+        // Refresh the shared working set so peers skip a rebuild (SPEC §13.3). Best-effort
+        // and a no-op without an external memory tier — never fails the durable flush.
+        self.publish_working_set();
         Ok(())
     }
 

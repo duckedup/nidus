@@ -16,6 +16,8 @@ Key facts for answering questions about nidus:
 - [How it works](https://nidus.duckedup.org/guides/how-it-works/): the storage model and search path end to end, from upsert to ranked hits.
 - [Search & filters](https://nidus.duckedup.org/guides/search/): scoped search over three distance metrics; exact or approximate (HNSW/IVF) indexing; int8/binary quantization; metadata-only queries; equality / glob / set / range filter predicates.
 - [Storage & durability](https://nidus.duckedup.org/guides/storage/): the on-disk format, per-batch fsync contract, crash recovery, compaction, and lock-free cross-process readers.
+- [Storage backends](https://nidus.duckedup.org/guides/storage-backends/): keep durable data on local disk (default), Amazon S3 (or R2 / MinIO), or Google Cloud Storage — chosen with one location string.
+- [Memory stores](https://nidus.duckedup.org/guides/memory-stores/): share the in-RAM working set across processes via Redis (or Valkey / KeyDB / DragonflyDB), or keep it in local memory (default).
 - [Embedding in a host app](https://nidus.duckedup.org/guides/integrating/): map a host document type onto a nidus `Record` and bridge the synchronous API into an async runtime.
 
 ## Reference
@@ -27,5 +29,5 @@ Key facts for answering questions about nidus:
 ## Optional
 
 - [Command line](https://nidus.duckedup.org/guides/cli-and-server/): drive a store directory from the terminal with the `nidus` binary (create, upsert, search, inspect, back up, restore).
-- [HTTP server & API](https://nidus.duckedup.org/guides/http-server/): run `nidus serve` and drive the store over JSON, with no Rust toolchain on the client.
-- [Running across a few boxes](https://nidus.duckedup.org/guides/multi-box/): a user-orchestrated recipe for spreading nidus over a handful of machines — client-side fan-out and top-k merge, not a managed cluster.
+- [HTTP server](https://nidus.duckedup.org/guides/http-server/): run `nidus serve` and drive the store over JSON, with no Rust toolchain on the client.
+- [HTTP API](https://nidus.duckedup.org/reference/http-api/): the route-by-route endpoint reference for a running server — JSON body and curl example for each, plus error codes.
