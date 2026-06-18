@@ -77,7 +77,7 @@ pub trait Persistence: Send + Sync {
 ```
 
 `key` is a single flat object name (`"data"`, `"ann"`, …); path separators and `..`
-are rejected, so keys behave identically on local files and (any future) object store.
+are rejected, so keys behave identically on local files and object stores.
 
 ### `LocalFs`
 
@@ -95,6 +95,30 @@ fs.put("note", b"hello")?;
 assert_eq!(fs.get("note")?.as_deref(), Some(b"hello".as_slice()));
 # anyhow::Ok(())
 ```
+
+### `S3`
+
+Amazon S3 and S3-compatible stores (Cloudflare R2, MinIO), selected by
+`s3://<bucket>[/<prefix>]`. Whole-object `get`/`put`/`delete`/`list` over a sans-IO
+`rusty-s3` client (Sigv4 signing = pure-Rust HMAC) executed with a small blocking HTTP
+client (`ureq`, TLS via rustls + `ring`) — no `aws-lc`, no OpenSSL, no async runtime.
+Credentials come from the standard AWS environment:
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` (plus `AWS_SESSION_TOKEN`
+if set, and `AWS_ENDPOINT_URL` to point at R2/MinIO).
+
+There is no native append (`appender` returns `None`) and no native lock
+(`has_native_lock` is `false`): a store running live on S3 buffers each segment in RAM
+and rewrites it as one whole object on sync (`ObjectAppender`), under the advisory lock —
+see [live object-store backing](#selection-by-url-scheme) below.
+
+### `Gcs`
+
+Google Cloud Storage, selected by `gs://<bucket>[/<prefix>]` (alias `gcs://`). Same
+whole-object shape as `S3` over the sans-IO `tame-gcs` + `tame-oauth` clients (the OAuth2
+service-account JWT is RSA-signed via `ring`). Credentials come from a service-account
+key: a path in `GOOGLE_APPLICATION_CREDENTIALS`, or the JSON inline in
+`GOOGLE_APPLICATION_CREDENTIALS_JSON`. Like `S3`, it is whole-object only — live backing
+goes through the same `ObjectAppender` + advisory lock.
 
 ## Memory tier: a shared, rebuildable working set
 
