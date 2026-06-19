@@ -36,7 +36,10 @@ fast dependency.
   only native code is `ring` (the TLS used by the S3/GCS backends and `rediss://` — a small
   C+asm compile); never a bundled C++ tree, vendored OpenSSL, or `aws-lc`. The Redis client
   is sync/pure-Rust (no tokio).
-- **Zero `unsafe` in our code** (`#![forbid(unsafe_code)]`).
+- **Near-zero `unsafe` in our code** (`#![deny(unsafe_code)]`). The one exception is the
+  opt-in [`Config::mmap`](https://nidus.duckedup.org/reference/configuration/#mmap) path —
+  a single scoped `mmap` call for serving large stores from disk; every other `unsafe` is a
+  hard compile error.
 - **Pure-Rust core** — the local store and search path are pure Rust with no native
   library; the cloud backends are sans-IO clients (`rusty-s3`/`tame-gcs`) over a small
   blocking HTTP client.
@@ -47,7 +50,7 @@ fast dependency.
 
 ```toml
 [dependencies]
-nidus = "0.19"
+nidus = "0.20"
 ```
 
 ```rust
@@ -221,15 +224,16 @@ just serve ./store 768   # run `nidus serve` from the checkout
 The core recipes keep the seconds-long build path intact; the `cli` feature (which
 pulls clap + the tokio/axum stack) has its own opt-in recipes. Miri runs all of
 nidus's own logic, including the local file IO and the in-RAM object-store/memory-tier
-paths — only the network paths (S3/GCS TLS, the Redis socket) are outside its reach.
+paths — only the network paths (S3/GCS TLS, the Redis socket) and the opt-in `mmap`
+syscall are outside its reach.
 
 Rust 1.96+ (pinned via `rust-toolchain.toml`), edition 2024.
 
 ## Design
 
 The full design — data model, on-disk format, durability/concurrency model, the
-opt-in modes (approximate ANN/HNSW + IVF, scalar/binary quantization), and the
-remaining deferred seams (mmap, …) — lives in
+opt-in modes (approximate ANN/HNSW + IVF, scalar/binary quantization, memory-mapped
+larger-than-RAM stores), and the remaining deferred seams — lives in
 [`SPEC.md`](SPEC.md). Each module also carries its own contract in `src/<module>/SPEC.md`.
 
 ## License

@@ -2660,6 +2660,191 @@ fn segmented_survives_reopen() {
     }
 }
 
+// ── Memory-mapped immutable segments (SPEC §9 / §14.6 phase 3) ──────────────
+
+/// Write a sealed, multi-segment store to disk at `path` and return the vectors written.
+/// Sealing past `seal` rows produces immutable segments that a later `mmap` open can map.
+fn write_sealed_store(path: &std::path::Path, n: usize, dim: usize, seal: u64) -> Vec<Vec<f32>> {
+    let data = random_unit_vectors(n, dim, 7);
+    let mut s = Store::open(
+        Config::new(path, dim)
+            .auto_compact(None)
+            .segment_max_rows(Some(seal)),
+    )
+    .unwrap();
+    let recs: Vec<Record> = data
+        .iter()
+        .enumerate()
+        .map(|(i, v)| rec(&format!("d{i}"), v.clone()))
+        .collect();
+    for batch in recs.chunks(64) {
+        s.upsert("col", batch).unwrap();
+    }
+    s.flush().unwrap();
+    data
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn mmap_search_matches_ram_load() {
+    // The whole contract: a memory-mapped open answers byte-for-byte identically to the
+    // RAM-loaded open of the same on-disk store — same ids AND same scores, every query.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let (n, dim, k) = (500usize, 16, 10);
+    write_sealed_store(&path, n, dim, 64);
+    let queries = random_unit_vectors(20, dim, 8);
+
+    // Collect the RAM-load results first, then drop that handle (releasing the writer lock)
+    // before opening the mmap handle over the same directory.
+    let ram_results: Vec<Vec<(String, f32)>> = {
+        let ram = Store::open(Config::new(&path, dim).auto_compact(None).mmap(false)).unwrap();
+        queries
+            .iter()
+            .map(|q| {
+                ram.search(&["col"], q, &default_opts(k))
+                    .unwrap()
+                    .into_iter()
+                    .map(|h| (h.id, h.score))
+                    .collect()
+            })
+            .collect()
+    };
+
+    let mapped = Store::open(Config::new(&path, dim).auto_compact(None).mmap(true)).unwrap();
+    for (q, expected) in queries.iter().zip(&ram_results) {
+        let got: Vec<(String, f32)> = mapped
+            .search(&["col"], q, &default_opts(k))
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.id, h.score))
+            .collect();
+        assert_eq!(
+            &got, expected,
+            "mmap search must match the RAM-loaded search exactly"
+        );
+    }
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn mmap_excludes_deleted_rows_in_mapped_segments() {
+    // Deleting a row that lives in a sealed (mapped) segment removes it from results: the
+    // live index is independent of the data backing, so a tombstone hides a mapped row.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let dim = 4;
+    let data = write_sealed_store(&path, 100, dim, 32);
+
+    let mut s = Store::open(Config::new(&path, dim).auto_compact(None).mmap(true)).unwrap();
+    s.delete("col", &["d10"]).unwrap(); // d10 lives in the first sealed (mapped) segment
+    let hits = s.search(&["col"], &data[10], &default_opts(5)).unwrap();
+    assert!(
+        hits.iter().all(|h| h.id != "d10"),
+        "a deleted row in a mapped segment must not appear"
+    );
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn mmap_compact_collapses_mapped_base() {
+    // Compaction must work even when the base `data` segment is memory-mapped: it reopens
+    // the base writable, atomically rewrites it, and collapses to a single exact segment.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let dim = 8;
+    let data = write_sealed_store(&path, 200, dim, 64); // base `data` + several sealed segments
+
+    let mut s = Store::open(Config::new(&path, dim).auto_compact(None).mmap(true)).unwrap();
+    for i in 0..50 {
+        s.delete("col", &[format!("d{i}").as_str()]).unwrap();
+    }
+    s.compact().unwrap();
+    assert_eq!(
+        s.data.segment_count(),
+        1,
+        "compaction collapses every segment into one"
+    );
+    // A surviving doc is still its own nearest neighbour after the collapse.
+    let hits = s.search(&["col"], &data[120], &default_opts(1)).unwrap();
+    assert_eq!(hits[0].id, "d120");
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn mmap_single_segment_store_stays_ram() {
+    // A store with no sealing is one segment — the active one, which is never mapped. Opening
+    // it with mmap on is harmless: it loads to RAM and behaves exactly as without the flag.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let dim = 4;
+    let data = random_unit_vectors(20, dim, 5);
+    {
+        let mut s = Store::open(Config::new(&path, dim)).unwrap();
+        let recs: Vec<Record> = data
+            .iter()
+            .enumerate()
+            .map(|(i, v)| rec(&format!("d{i}"), v.clone()))
+            .collect();
+        s.upsert("col", &recs).unwrap();
+        s.flush().unwrap();
+    }
+    let s = Store::open(Config::new(&path, dim).mmap(true)).unwrap();
+    let hits = s.search(&["col"], &data[3], &default_opts(1)).unwrap();
+    assert_eq!(hits[0].id, "d3");
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn mmap_with_per_segment_index_keeps_recall() {
+    // mmap composes with the Phase-2 per-segment IVF: cold segments are both mapped AND
+    // indexed, and search over them still tracks exact recall.
+    let (n, dim, k) = (2000usize, 32, 10);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let queries = random_unit_vectors(40, dim, 4);
+
+    let data = {
+        let all = random_unit_vectors(n, dim, 3);
+        let mut s = Store::open(
+            Config::new(&path, dim)
+                .auto_compact(None)
+                .segment_max_rows(Some(256))
+                .segment_index_min_rows(Some(64)),
+        )
+        .unwrap();
+        let recs: Vec<Record> = all
+            .iter()
+            .enumerate()
+            .map(|(i, v)| rec(&format!("d{i}"), v.clone()))
+            .collect();
+        for batch in recs.chunks(256) {
+            s.upsert("col", batch).unwrap();
+        }
+        s.flush().unwrap();
+        all
+    };
+    let truth = exact_store(dim, &data);
+
+    let mapped = Store::open(
+        Config::new(&path, dim)
+            .auto_compact(None)
+            .segment_max_rows(Some(256))
+            .segment_index_min_rows(Some(64))
+            .mmap(true),
+    )
+    .unwrap();
+    assert!(
+        mapped.seg_indexes.iter().filter(|x| x.is_some()).count() >= 2,
+        "cold segments should be indexed over the mapped data"
+    );
+    let recall = mean_recall(&mapped, &truth, &queries, k);
+    assert!(
+        recall >= 0.80,
+        "mmap + per-segment IVF recall@{k} = {recall:.3}, expected >= 0.80"
+    );
+}
+
 // ── Full-text search (BM25) ─────────────────────────────────────────────────
 
 use crate::Language;

@@ -6,7 +6,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::backend::Appender;
 use crate::model::Distance;
 
+mod mmap;
 mod segments;
+pub use mmap::MappedSegment;
 pub use segments::Segments;
 
 // ── Header constants ──────────────────────────────────────────────────────────
@@ -18,15 +20,28 @@ const VERSION: u16 = 1;
 /// Total header size in bytes (cache-line aligned).
 pub(crate) const HEADER_LEN: usize = 64;
 
-/// The vector segment. Holds every row in memory; appends go to the tail of the
-/// backing [`Appender`] (a local file, or RAM for an in-memory store) and are mirrored
-/// in `vectors`.
+/// Where a segment's f32 rows physically live.
+enum Backing {
+    /// Rows resident in RAM (a flat row-major `f32` buffer). The active (appendable)
+    /// segment, in-memory stores, and any segment not memory-mapped use this — appends
+    /// extend the `Vec`, and it is the only writable backing.
+    Ram(Vec<f32>),
+    /// Rows served zero-copy from a read-only memory-map of an **immutable** segment file
+    /// (SPEC §9 / §14.6 phase 3). `rows` is the whole-row count computed from the mapped
+    /// length at open. Never written — appends/truncate/rewrite are rejected on this backing.
+    Mmap { map: MappedSegment, rows: u64 },
+}
+
+/// The vector segment. Either holds every row in RAM (the default — appends go to the tail
+/// of the backing [`Appender`] and are mirrored in the in-RAM buffer) or, for an immutable
+/// segment opened with `Config::mmap`, serves rows zero-copy from a memory-map of its file.
 pub struct DataSegment {
     dimension: usize,
     distance: Distance,
-    vectors: Vec<f32>,
-    /// `None` when the segment is in-memory only (no durable backing). `Some` wraps the
-    /// persistence backend's append handle — a `FileAppender` for a local store.
+    backing: Backing,
+    /// `None` when the segment is in-memory only (no durable backing) or memory-mapped
+    /// (immutable, read-only). `Some` wraps the persistence backend's append handle — a
+    /// `FileAppender` for a local store — for the writable RAM-backed active segment.
     appender: Option<Box<dyn Appender>>,
     /// Test-only fault seam: when `Some(n)`, the next `n` appends succeed and the
     /// one after fails — lets tests exercise mid-batch rollback deterministically
@@ -301,8 +316,59 @@ impl DataSegment {
         Ok(DataSegment {
             dimension,
             distance,
-            vectors,
+            backing: Backing::Ram(vectors),
             appender: Some(appender),
+            #[cfg(test)]
+            fail_after: None,
+        })
+    }
+
+    /// Open an **immutable** segment as a read-only memory-map at `path` (SPEC §9 / §14.6
+    /// phase 3). Verifies the 64-byte header against `(dimension, distance)` and computes the
+    /// whole-row count from the mapped length — but never reads the rows into RAM; they are
+    /// served zero-copy from the map by [`row`](Self::row). The caller guarantees the segment
+    /// is immutable (a sealed segment, never the active one), which is what makes the map sound.
+    pub fn open_mmap(
+        path: &std::path::Path,
+        dimension: usize,
+        distance: Distance,
+    ) -> Result<DataSegment> {
+        let map = MappedSegment::open(path)?;
+        let bytes = map.bytes();
+        if (bytes.len() as u64) < HEADER_LEN as u64 {
+            bail!(
+                "mmap'd segment at {} is truncated: {} bytes (need at least {} for header)",
+                path.display(),
+                bytes.len(),
+                HEADER_LEN
+            );
+        }
+        let mut header_buf = [0u8; HEADER_LEN];
+        header_buf.copy_from_slice(&bytes[..HEADER_LEN]);
+        let (stored_dim, stored_distance) =
+            decode_header(&header_buf).context("invalid mmap'd segment header")?;
+        if stored_dim != dimension {
+            bail!(
+                "mmap'd segment dimension mismatch: file has {stored_dim}, requested {dimension}"
+            );
+        }
+        if stored_distance != distance {
+            bail!(
+                "mmap'd segment distance mismatch: file has {stored_distance:?}, requested {distance:?}"
+            );
+        }
+        let row_stride = dimension * 4;
+        let data_bytes = bytes.len() as u64 - HEADER_LEN as u64;
+        let rows = if row_stride == 0 {
+            0
+        } else {
+            data_bytes / row_stride as u64
+        };
+        Ok(DataSegment {
+            dimension,
+            distance,
+            backing: Backing::Mmap { map, rows },
+            appender: None,
             #[cfg(test)]
             fail_after: None,
         })
@@ -319,11 +385,36 @@ impl DataSegment {
         DataSegment {
             dimension,
             distance,
-            vectors: Vec::new(),
+            backing: Backing::Ram(Vec::new()),
             appender: None,
             #[cfg(test)]
             fail_after: None,
         }
+    }
+
+    /// A writable RAM-backed segment over `appender` **without** loading any existing rows —
+    /// valid only as the immediate target of a [`rewrite`](Self::rewrite) (compaction), which
+    /// atomically replaces the whole object. Lets `Segments::rewrite` collapse onto a base
+    /// segment that may currently be memory-mapped, without first paging it into RAM.
+    pub(crate) fn rewrite_target(
+        appender: Box<dyn Appender>,
+        dimension: usize,
+        distance: Distance,
+    ) -> DataSegment {
+        DataSegment {
+            dimension,
+            distance,
+            backing: Backing::Ram(Vec::new()),
+            appender: Some(appender),
+            #[cfg(test)]
+            fail_after: None,
+        }
+    }
+
+    /// Whether this segment is served from a read-only memory-map (immutable). Mutating it
+    /// (append/truncate/rewrite) is rejected; `Segments` reopens it writable when needed.
+    pub(crate) fn is_mmap(&self) -> bool {
+        matches!(self.backing, Backing::Mmap { .. })
     }
 
     /// The pinned dimension.
@@ -333,19 +424,26 @@ impl DataSegment {
 
     /// Number of rows currently stored.
     pub fn row_count(&self) -> u64 {
-        (self.vectors.len() / self.dimension.max(1)) as u64
+        match &self.backing {
+            Backing::Ram(v) => (v.len() / self.dimension.max(1)) as u64,
+            Backing::Mmap { rows, .. } => *rows,
+        }
     }
 
-    /// Borrow the entire flat f32 buffer (all rows, contiguous).
+    /// Borrow the entire flat f32 buffer (all rows, contiguous). For a memory-mapped segment
+    /// this is a zero-copy view of the mapped bytes past the header.
     pub fn vectors(&self) -> &[f32] {
-        &self.vectors
+        match &self.backing {
+            Backing::Ram(v) => v,
+            Backing::Mmap { map, rows } => mmap_rows(map, *rows, self.dimension),
+        }
     }
 
-    /// Borrow row `i` as a `dimension`-length slice.
+    /// Borrow row `i` as a `dimension`-length slice (from the RAM buffer or the mmap view).
     pub fn row(&self, i: u64) -> &[f32] {
         let dim = self.dimension;
         let start = i as usize * dim;
-        &self.vectors[start..start + dim]
+        &self.vectors()[start..start + dim]
     }
 
     /// Append one vector (length must equal `dimension`), returning its row index.
@@ -365,6 +463,7 @@ impl DataSegment {
             );
         }
         let row_index = self.row_count();
+        let dim = self.dimension;
 
         // Test-only fault injection (see `fail_after`). Fires before any mutation,
         // so a failed append leaves RAM + file exactly as they were.
@@ -376,14 +475,16 @@ impl DataSegment {
             self.fail_after = Some(n - 1);
         }
 
+        // A memory-mapped segment is immutable — only the RAM-backed active segment grows.
+        let Backing::Ram(vectors) = &mut self.backing else {
+            bail!("cannot append to a memory-mapped (immutable) segment");
+        };
+
         // Reserve RAM first: an OOM here returns an error before the file is
         // touched, so the append stays atomic (and never aborts the process).
-        self.vectors.try_reserve(self.dimension).map_err(|_| {
-            anyhow!(
-                "out of memory growing vector matrix by {} bytes",
-                self.dimension * 4
-            )
-        })?;
+        vectors
+            .try_reserve(dim)
+            .map_err(|_| anyhow!("out of memory growing vector matrix by {} bytes", dim * 4))?;
 
         // Write to the backing appender first (if backed), then mirror into RAM. The
         // appender rolls a partial write back to the boundary it started at, so a torn
@@ -394,8 +495,11 @@ impl DataSegment {
                 .with_context(|| format!("failed to append row {row_index} to data file"))?;
         }
 
-        // Infallible — capacity reserved above.
-        self.vectors.extend_from_slice(vector);
+        // Infallible — capacity reserved above. `backing` is still `Ram` (re-borrowed because
+        // the appender borrow above ended).
+        if let Backing::Ram(vectors) = &mut self.backing {
+            vectors.extend_from_slice(vector);
+        }
         Ok(row_index)
     }
 
@@ -404,20 +508,23 @@ impl DataSegment {
     /// `row_count()` before a batch and calls this to undo a failed one. `rows`
     /// must not exceed the current row count.
     pub fn truncate_to(&mut self, rows: u64) -> Result<()> {
-        let keep_floats = rows as usize * self.dimension;
-        if keep_floats > self.vectors.len() {
-            bail!(
-                "truncate_to({}) exceeds current row count {}",
-                rows,
-                self.row_count()
-            );
+        let dim = self.dimension;
+        let cur_rows = self.row_count();
+        let Backing::Ram(vectors) = &mut self.backing else {
+            bail!("cannot truncate a memory-mapped (immutable) segment");
+        };
+        let keep_floats = rows as usize * dim;
+        if keep_floats > vectors.len() {
+            bail!("truncate_to({rows}) exceeds current row count {cur_rows}");
         }
         if let Some(ap) = self.appender.as_mut() {
-            let good_end = HEADER_LEN as u64 + rows * (self.dimension as u64) * 4;
+            let good_end = HEADER_LEN as u64 + rows * (dim as u64) * 4;
             ap.truncate_to(good_end)
                 .context("failed to truncate data file")?;
         }
-        self.vectors.truncate(keep_floats);
+        if let Backing::Ram(vectors) = &mut self.backing {
+            vectors.truncate(keep_floats);
+        }
         Ok(())
     }
 
@@ -458,10 +565,21 @@ impl DataSegment {
             ap.rewrite(&buf).context("failed to rewrite data file")?;
         }
 
-        // Swap in-RAM buffer.
-        self.vectors = try_clone_floats(rows)?;
+        // Swap in a fresh RAM buffer — a rewrite always lands RAM-backed and writable (it is
+        // the compaction target), even if this segment was previously memory-mapped.
+        self.backing = Backing::Ram(try_clone_floats(rows)?);
         Ok(())
     }
+}
+
+/// Reinterpret a memory-mapped segment's row bytes as `&[f32]` (zero-copy). On the on-disk
+/// layout this cast always succeeds: `mmap` returns a page-aligned base and the header is a
+/// fixed 64 bytes, so the row region starts 4-byte-aligned, and its length (`rows × dim × 4`)
+/// is a multiple of 4. The cast is **little-endian only** — callers gate the mmap path on a
+/// little-endian target (SPEC §5.1), so `bytemuck`'s byte reinterpret matches the f32 layout.
+fn mmap_rows(map: &MappedSegment, rows: u64, dimension: usize) -> &[f32] {
+    let end = HEADER_LEN + rows as usize * dimension * 4;
+    bytemuck::cast_slice(&map.bytes()[HEADER_LEN..end])
 }
 
 /// Copy `rows` into a fresh `Vec<f32>`, reserving fallibly so an OOM surfaces as an
@@ -892,5 +1010,64 @@ mod tests {
         assert_eq!(seg2.row_count(), 2);
         assert_eq!(seg2.row(0), &[1.0_f32, 2.0]);
         assert_eq!(seg2.row(1), &[7.0_f32, 8.0]);
+    }
+
+    // ── Memory-mapped segments (SPEC §9 / §14.6 phase 3) ──────────────────
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn file_open_mmap_reads_rows_zero_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg");
+        let rows = [[1.0_f32, 2.0, 3.0], [4.0, 5.0, 6.0], [-1.0, 0.5, 9.0]];
+        {
+            let mut seg = DataSegment::open(&path, 3, Distance::default()).unwrap();
+            for r in &rows {
+                seg.append(r).unwrap();
+            }
+            seg.sync().unwrap();
+        }
+        // Map the immutable file and verify rows match the RAM-loaded view byte-for-byte.
+        let mapped = DataSegment::open_mmap(&path, 3, Distance::default()).unwrap();
+        assert!(mapped.is_mmap());
+        assert_eq!(mapped.row_count(), 3);
+        for (i, r) in rows.iter().enumerate() {
+            assert_eq!(mapped.row(i as u64), r, "mmap row {i}");
+        }
+        assert_eq!(
+            mapped.vectors(),
+            &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, -1.0, 0.5, 9.0]
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn file_open_mmap_validates_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg");
+        {
+            let mut seg = DataSegment::open(&path, 3, Distance::default()).unwrap();
+            seg.append(&[1.0, 2.0, 3.0]).unwrap();
+            seg.sync().unwrap();
+        }
+        // A dimension or metric that disagrees with the header is rejected, like `open_with`.
+        assert!(DataSegment::open_mmap(&path, 4, Distance::default()).is_err());
+        assert!(DataSegment::open_mmap(&path, 3, Distance::Euclidean).is_err());
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn mmap_segment_rejects_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg");
+        {
+            let mut seg = DataSegment::open(&path, 2, Distance::default()).unwrap();
+            seg.append(&[1.0, 2.0]).unwrap();
+            seg.sync().unwrap();
+        }
+        // A mapped segment is immutable: every write path errors rather than corrupting it.
+        let mut mapped = DataSegment::open_mmap(&path, 2, Distance::default()).unwrap();
+        assert!(mapped.append(&[3.0, 4.0]).is_err());
+        assert!(mapped.truncate_to(0).is_err());
     }
 }

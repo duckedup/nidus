@@ -3952,15 +3952,17 @@ dependencies = [
 
 [[package]]
 name = "nidus"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "axum",
  "bincode",
+ "bytemuck",
  "clap",
  "crc32fast",
  "flate2",
  "http",
+ "memmap2",
  "redis",
  "rusty-s3",
  "serde",

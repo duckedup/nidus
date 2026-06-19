@@ -47,20 +47,22 @@ stays under a minute** (it is ~seconds today).
    backends, §13) — **never** a crate that compiles a *large* C tree (DuckDB's C++,
    `aws-lc-sys`, vendored OpenSSL). `just deps` stays short; CI asserts the build-time
    ceiling.
-2. **Zero `unsafe` in *our* code.** `#![forbid(unsafe_code)]`. No `flock`, no `mmap`,
-   no `extern "C"` written by us. (A dependency's internal `unsafe`/C is fine; ours is
-   not.)
+2. **Near-zero `unsafe` in *our* code.** `#![deny(unsafe_code)]` with exactly **one** scoped
+   `#[allow]`: the single `Mmap::map` call behind `Config::mmap` (the memory-mapped-segment
+   seam, §9 / §14.6 phase 3 — a deliberate, opt-in FFI choice). No `flock`, no `extern "C"`
+   written by us, and no other `unsafe` anywhere — every other use is still a hard compile
+   error. (A dependency's internal `unsafe`/C is fine; ours, beyond that one site, is not.)
 3. **Fast builds over zero-C.** `cargo build` stays in **seconds**. The pure-Rust core
    needs no C toolchain; the always-compiled storage backends (§13) add `ring` (small
    C/asm) to the default tree, so a C toolchain *is* required — but the build stays in
    seconds, which is the property that actually matters.
 4. **Miri covers all *our* logic.** Our code — codecs, filters, distance math, file IO
-   — runs under Miri. A dependency's native/FFI paths (a backend's TLS) cannot, so the
-   tests that exercise them are `#[cfg_attr(miri, ignore)]` like the fsync tests (§11).
-   This is narrower than "the whole crate runs under Miri," and a deliberate trade for
-   frictionless pluggable backends (§13.6).
+   — runs under Miri. A dependency's native/FFI paths (a backend's TLS) and the `mmap`
+   syscall cannot, so the tests that exercise them are `#[cfg_attr(miri, ignore)]` like the
+   fsync tests (§11). This is narrower than "the whole crate runs under Miri," and a
+   deliberate trade for frictionless pluggable backends (§13.6) and the mmap seam (§9).
 
-Compiling a *large* C tree, or adding an `unsafe` block to *our* code, is a change to
+Compiling a *large* C tree, or adding a *second* `unsafe` site to *our* code, is a change to
 *what nidus is*. File an issue and decide deliberately.
 
 ---
@@ -84,7 +86,9 @@ Compiling a *large* C tree, or adding an `unsafe` block to *our* code, is a chan
   as the opt-in `Config::ann` mode (§9). Exact brute-force remains the default —
   whole-store search makes the scanned `N` potentially large, which is exactly what
   motivated the seam.
-- Larger-than-RAM / memory-mapped operation — deferred seam (§9).
+- Larger-than-RAM / memory-mapped operation was a deferred seam; it has since shipped as
+  the opt-in `Config::mmap` mode — immutable segments served from a read-only memory-map
+  while the active segment stays in RAM (§9 / §14.6 phase 3).
 - Quantization — int8 scalar and binary (sign-bit) quantization have since shipped
   (§9, opt-in via `Config::quantization`).
 - SQL, a query planner, transactions spanning multiple operations, multi-writer
@@ -631,12 +635,25 @@ build until a real need exists.
   module (`NIDUS\0` header + validity key + watermark + `bincode` + CRC32, atomic
   temp/fsync/rename), so a derived index persists/loads through a single source.
 
+- **mmap immutable segments.** `Config::mmap` swaps the single "row `i` → `&[f32]`"
+  accessor for a memory-map of each **immutable** (sealed) segment instead of reading it
+  into an in-RAM `Vec<f32>`; the active (appendable) segment stays in RAM. The OS pages a
+  cold segment in on touch, so a store can hold more vectors than fit in RAM, with zero-copy
+  load and cross-process page sharing. The cost is the one conscious FFI/`unsafe` opt-in nidus
+  permits: `memmap2` (a thin, fast-compiling wrapper over the platform `mmap` — no C to build),
+  with the only `unsafe` in the crate being the single `Mmap::map` call (`#![deny(unsafe_code)]`
+  + one scoped `#[allow]`); the byte→f32 reinterpret is a safe alignment-checked `bytemuck`
+  cast. Default **off** (all-RAM, unchanged). Effective only for a **local-FS** store with
+  sealed segments (it needs `segment_max_rows` to produce immutable segments and a mappable
+  local file; an object-store / in-memory store silently stays all-RAM), and **little-endian**
+  hosts (the on-disk f32 layout, §5.1). Applied per segment, it is the §14.6 phase-3 leg of the
+  segment scale model. Reads map through the same accessor, so results are identical to the
+  RAM path — exact, filter-respecting, ANN/quant-compatible. (Compaction of a mapped store
+  materializes the live set in RAM like any compaction, so it is bounded by RAM even when the
+  store is not.)
+
 ### Still deferred (designed-for, not built)
 
-- **mmap.** Replace the single "row `i` → `&[f32]`" accessor: index into a mapped
-  region instead of the in-RAM `Vec<f32>`. Gains zero-copy load, cross-process page
-  sharing, >RAM. Cost: FFI (`unsafe`) — would relax the zero-FFI thesis, so it is a
-  conscious future choice, not a default.
 - **Pluggable storage & memory backends.** Generalize the §5 local directory along two
   orthogonal axes behind two sync traits: a **persistence** backend (durable `data`/`log`
   — local files / S3 / GCS) and a shared **memory tier** (the warm working set — local RAM
@@ -810,8 +827,8 @@ So Redis/Valkey/Memcached are **not** persistence (S3 is cheaper and durable for
 **not** a way to search data that never enters local RAM. They are the shared-memory
 **model (a)**: the working set lives in the external store so many stateless workers share
 one copy and a cold start skips the rebuild — but each worker still loads it into its own
-RAM to serve. Neither axis makes nidus larger-than-RAM (§9 mmap remains the only path to
-that).
+RAM to serve. Neither axis makes nidus larger-than-RAM — that is what the opt-in `Config::mmap`
+mode is for (§9 / §14.6 phase 3): immutable segments mapped from disk, paged in on touch.
 
 ### 13.2 Persistence backends (the durable source of truth)
 
@@ -935,7 +952,8 @@ rebuilding it).
 
 > Neither axis makes nidus larger-than-RAM. The working set still lives in each process's
 > RAM to be scanned; the tiers only change *where the durable bytes live* and *whether the
-> warm working set is shared*. Larger-than-RAM stays the deferred mmap/spill seam (§9).
+> warm working set is shared*. Larger-than-RAM is a separate axis — the opt-in `Config::mmap`
+> mode, which maps immutable segments from disk (§9 / §14.6 phase 3).
 
 ### 13.6 Persistence build-time / TLS decision (S3/GCS only) — RESOLVED
 
@@ -1003,7 +1021,7 @@ minute — CI asserts it (§9, the build-time gate).**
 
 ---
 
-## 14. Scaling the storage model: segments (Phases 1–2 built; later phases proposed)
+## 14. Scaling the storage model: segments (Phases 1–3 built; later phases proposed)
 
 nidus's thesis is **ease and a local→cloud continuum** (§1): the same store and the same
 API run on a laptop and, by changing a location string, on a shared object store. The
@@ -1014,9 +1032,10 @@ limit. This section describes the storage model that turns **scale into a quanti
 architecture rather than a separate mode**. It evolves over the existing seams (the §9 mmap
 seam, the append-only format), not a rewrite, and changes no public API (§4).
 
-**Phases 1–2 are built** (the segment format + manifest + WAL→segment sealing, and the
-per-segment IVF / exhaustive-tail split — §14.6). The remaining phases (mmap, reader-refresh,
-cluster) are designed here but not yet built; each is additive over the same on-disk format.
+**Phases 1–3 are built** (the segment format + manifest + WAL→segment sealing; the
+per-segment IVF / exhaustive-tail split; and per-segment mmap — §14.6). The remaining phases
+(reader-refresh, cluster) are designed here but not yet built; each is additive over the same
+on-disk format.
 
 ### 14.1 Principle: the durable objects are the store; a process is a cache over them
 
@@ -1100,8 +1119,10 @@ a segment is the natural object boundary for a batch).
 
 - **Exact-by-default, zero-config locally.** No tuning knob (`ef`/`nprobe`/…) is ever a
   precondition to getting answers; any index is automatic-by-size or opt-in, never required.
-- **`#![forbid(unsafe_code)]` in our code; clean build well under a minute; no heavy/native
-  deps** (§1, §13.6). mmap remains the one conscious FFI opt-in (§9), now applied per segment.
+- **Near-zero `unsafe` in our code; clean build well under a minute; no heavy/native deps**
+  (§1, §13.6). mmap is the one conscious FFI opt-in (§9) — `#![deny(unsafe_code)]` plus the
+  single scoped `Mmap::map` site — now built and applied per segment (phase 3, opt-in, off by
+  default). No other `unsafe` is permitted.
 - **One embedding space per store; the §4 public API is unchanged.** This is an internal
   storage rearchitecture — `open`/`upsert`/`search`/`flush`/`compact` keep their signatures.
 
@@ -1130,7 +1151,10 @@ single-node payoff before any distribution work:
    it names." See the on-disk details below.
 2. **Per-segment IVF + exhaustive tail.** *(built)* The brute-force-tail / indexed-cold split,
    opt-in by size via `Config::segment_index_min_rows` (default off → fully exact). See §14.3.
-3. **mmap per segment.** >RAM on one node (the §9 mmap seam, scoped to a segment).
+3. **mmap per segment.** *(built)* >RAM on one node: with `Config::mmap`, each **immutable**
+   segment is served from a read-only memory-map (the §9 mmap seam scoped to a segment) while
+   the active segment stays in RAM; cold segments page in on touch. Local-FS + little-endian +
+   sealed-segments only; off by default; results are identical to the RAM path. See §9.
 4. **Manifest-versioned reader refresh.** Readers detect a newer manifest and adopt it atomically.
 5. **Cluster mode.** Shared backend + writer lease (heartbeat over nidus-a7c) + fencing of
    segment/manifest writes; readers refresh per phase 4.

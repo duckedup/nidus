@@ -24,6 +24,7 @@ let cfg = Config::new("/path/to/store", 768)
     .query_threads(1)                // worker threads per exact search (default: 1)
     .segment_max_rows(None)          // seal the active segment past N rows (default: off)
     .segment_index_min_rows(None)    // IVF-index sealed segments past N rows (default: off)
+    .mmap(false)                     // memory-map immutable segments instead of RAM (default: off)
     .persistence("")                 // durable bytes: "" = local; "s3://…"/"gs://…"
     .memory("");                     // shared working set: "" = local; "redis://…"
 # let _ = cfg;
@@ -142,6 +143,23 @@ without [`segment_max_rows`](#segment_max_rows) (a store only gets immutable seg
 index once sealing is enabled), and is ignored when [`ann`](#ann) is set (that global index
 already covers every row). See
 [approximate search](/guides/search/#per-segment-indexing-at-scale).
+
+### `mmap`
+
+`bool` — default `false` (every segment held in RAM, unchanged). When `true`, each **immutable**
+(sealed) segment is served from a read-only **memory-map** of its file instead of being read into
+RAM, while the **active** segment — which still takes appends — stays in RAM. The OS pages a cold
+segment in on touch, so a store can hold more vectors than fit in memory. This is nidus's one
+opt-in use of memory-mapping (an `mmap` syscall); search reads go through the same row accessor,
+so **results are identical to the all-RAM path** — exact, filter-respecting, and compatible with
+quantization and the [ANN](#ann) / [per-segment](#segment_index_min_rows) indexes.
+
+Effective only for a **local-filesystem** store with sealed segments: it needs
+[`segment_max_rows`](#segment_max_rows) to produce immutable segments and a mappable local file,
+so an object-store (`s3://`/`gs://`) or in-memory store silently stays all-RAM. It also requires a
+little-endian host (the on-disk f32 layout). Note that [`compaction`](/guides/storage/#compaction)
+still materializes the live set in RAM, so a compaction is bounded by memory even when the store
+is not. See [larger-than-RAM stores](/guides/storage/#larger-than-ram-memory-mapped-segments).
 
 ### `persistence`
 

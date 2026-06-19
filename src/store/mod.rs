@@ -230,7 +230,12 @@ impl Store {
 
         // 5. Open every segment the manifest names into one global row space. The cap is
         //    enforced before any segment loads into RAM (§6.6, generalized across segments).
-        let data = Segments::open(persistence.clone(), &manifest, config.max_vector_bytes)?;
+        let data = Segments::open(
+            persistence.clone(),
+            &manifest,
+            config.max_vector_bytes,
+            config.mmap,
+        )?;
 
         // A store with no manifest on disk gets one written now — initializing a fresh
         // store and migrating a legacy one in the same step. ReadOnly stores never write

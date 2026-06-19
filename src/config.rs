@@ -100,6 +100,16 @@ pub struct Config {
     /// gets immutable segments to index — when sealing is enabled), and is ignored when a
     /// global [`ann`](Self::ann) index is configured (that index already covers every row).
     pub segment_index_min_rows: Option<u64>,
+    /// Memory-map immutable segments from disk instead of loading them into RAM (SPEC §9 /
+    /// §14.6 phase 3 — the one conscious FFI/mmap opt-in). `false` (the default) holds every
+    /// segment in RAM, exactly as before. When `true`, each **sealed** segment is mapped
+    /// read-only (the OS pages it in on touch), while the **active** segment — which still
+    /// takes appends — stays in RAM; this is what lets a store grow past one node's RAM.
+    /// Effective only for a **local-FS** store with sealed segments: it needs
+    /// [`segment_max_rows`](Self::segment_max_rows) to produce immutable segments, and a
+    /// mappable local file (an object-store / in-memory store silently keeps everything in
+    /// RAM). Search reads map through the same row accessor, so results are identical.
+    pub mmap: bool,
     /// Where the in-RAM working set is *shared* (SPEC §13.3): a
     /// [`crate::open_memory_tier`] location. Empty / `local` / `ram` (default) → the
     /// process heap only (nothing shared). A `redis://…` (or `valkey://…`, …) URL
@@ -126,6 +136,7 @@ impl Config {
             query_threads: 1,
             segment_max_rows: None,
             segment_index_min_rows: None,
+            mmap: false,
             persistence: String::new(),
             memory: String::new(),
         }
@@ -198,6 +209,13 @@ impl Config {
     /// [`segment_index_min_rows`](Self::segment_index_min_rows).
     pub fn segment_index_min_rows(mut self, rows: Option<u64>) -> Self {
         self.segment_index_min_rows = rows;
+        self
+    }
+
+    /// Enable memory-mapping of immutable segments (`false` = all-RAM, the default). See
+    /// [`mmap`](Self::mmap).
+    pub fn mmap(mut self, on: bool) -> Self {
+        self.mmap = on;
         self
     }
 

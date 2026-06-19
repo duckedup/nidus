@@ -22,6 +22,7 @@
 //! writer lock go through `get`/`put`/`try_lock`. Routing snapshot/backup through
 //! [`Persistence`] lands alongside the remote backends, where it first becomes meaningful.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,6 +95,15 @@ pub trait Persistence: Send + Sync {
     /// `Err` only on a real IO failure. `ttl` reclaims a lock older than it (a
     /// crashed holder).
     fn try_lock(&self, key: &str, ttl: Duration) -> Result<Option<Box<dyn BackendLock>>>;
+
+    /// The filesystem path of object `key`, when this backend stores it as a plain local
+    /// file that can be memory-mapped (SPEC §9 / §14.6 phase 3). `None` for object-store and
+    /// in-RAM backends — those cannot be mapped, so a caller with `Config::mmap` falls back to
+    /// loading the segment into RAM. The default is `None`; [`LocalFs`] overrides it.
+    fn local_path(&self, key: &str) -> Option<PathBuf> {
+        let _ = key;
+        None
+    }
 
     /// Whether [`try_lock`](Self::try_lock) provides a real exclusive lock (local
     /// `O_EXCL`). Whole-object stores return `false`: a live object-backed store goes
