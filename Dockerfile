@@ -15,6 +15,12 @@
 #     -e NIDUS_TOKEN=$SECRET \
 #     -e AWS_ACCESS_KEY_ID=… -e AWS_SECRET_ACCESS_KEY=… -e AWS_REGION=… \
 #     duckedup/nidus:latest
+#
+# Credentials are read from the standard cloud environment: static keys (AWS_*,
+# GOOGLE_APPLICATION_CREDENTIALS_JSON) as above, or — when those are absent — the keyless
+# chains (EKS IRSA / ECS / EC2 instance role for S3; the GKE/GCE metadata server, i.e.
+# Workload Identity, for GCS). On EKS/GKE the role env and tokens are injected by the
+# platform when the pod's ServiceAccount is annotated, so no keys need to be set here.
 
 # ── Build stage ─────────────────────────────────────────────────────────────
 # Pinned to the BUILD platform (never emulated): we cross-compile to the requested

@@ -75,6 +75,16 @@ nidus search --dir ./meta --dim 768 --persistence s3://my-bucket/store docs -k 5
 reads the local folder's header to learn the dimension, and there isn't one for a remote
 store.
 
+**Keyless credentials.** When `AWS_ACCESS_KEY_ID` is unset, nidus follows the standard AWS
+chain and fetches temporary credentials automatically, refreshing them before they expire:
+
+- **EKS / IRSA** — a pod with `AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE` (injected when
+  its ServiceAccount is annotated with a role) is exchanged at STS.
+- **ECS / Fargate** — the task-role endpoint (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`).
+- **EC2 instance role** — IMDSv2, tried last. Set `AWS_EC2_METADATA_DISABLED=true` to skip it.
+
+So on EKS, ECS, or an EC2 instance you can leave the keys unset entirely.
+
 ### Google Cloud Storage
 
 Point `--persistence` at a `gs://` bucket and supply a service-account key, either as a
@@ -86,6 +96,10 @@ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json
 
 nidus upsert --dir ./meta --dim 768 --persistence gs://my-bucket/store docs < recs.json
 ```
+
+With **no** key set, nidus falls back to the GCE/GKE **metadata server**, so a GKE pod using
+[Workload Identity](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity)
+(its ServiceAccount bound to a Google service account) authenticates with no key file.
 
 ## Local vs. cloud: what changes
 

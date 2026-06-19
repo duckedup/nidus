@@ -19,6 +19,11 @@ credentials:
     AWS_SECRET_ACCESS_KEY: ci-dummy
     AWS_REGION: us-east-1
 
+# Exercise the self-managed web-identity template (projected token volume + role env).
+awsWebIdentity:
+  enabled: true
+  roleArn: arn:aws:iam::123456789012:role/nidus-ci
+
 ingress:
   enabled: true
   hosts:

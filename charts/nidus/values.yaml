@@ -62,12 +62,18 @@ auth:
   existingSecretKey: token
 
 # ── Backend credentials (→ env) ─────────────────────────────────────────────────
-# nidus authenticates to the object store with STATIC credentials read from the
-# environment — there is no keyless IAM-role / IRSA / GKE Workload Identity path yet.
-#   S3 (s3://):  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (+ optional AWS_SESSION_TOKEN,
-#                AWS_REGION, AWS_ENDPOINT_URL for R2/MinIO).
-#   GCS (gs://): a service-account key as GOOGLE_APPLICATION_CREDENTIALS_JSON (the key
-#                JSON inline). Put it in an existing Secret and list it below.
+# Two ways to authenticate:
+#  (a) Keyless (recommended on EKS/GKE) — leave `credentials` empty and bind the
+#      ServiceAccount to a cloud role via `serviceAccount.annotations`:
+#        EKS/IRSA: eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/<role>
+#        GKE WI:   iam.gke.io/gcp-service-account: <sa>@<project>.iam.gserviceaccount.com
+#      nidus picks up the injected web-identity token (S3) or metadata server (GCS) and
+#      refreshes the temporary credentials automatically. ECS/EC2 instance roles also work.
+#  (b) Static keys, supplied here:
+#        S3 (s3://):  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (+ optional AWS_SESSION_TOKEN,
+#                     AWS_REGION, AWS_ENDPOINT_URL for R2/MinIO).
+#        GCS (gs://): a service-account key as GOOGLE_APPLICATION_CREDENTIALS_JSON (key JSON
+#                     inline). Put it in an existing Secret and list it below.
 credentials:
   # Inline key/value pairs are written to a chart-managed Secret and loaded via
   # envFrom. e.g.
@@ -80,6 +86,20 @@ credentials:
   # secrets (SealedSecrets, External Secrets Operator, or a hand-made Secret). For GCS,
   # the Secret holds a GOOGLE_APPLICATION_CREDENTIALS_JSON key with the SA key JSON.
   existingSecrets: []
+
+# Self-managed AWS web identity (IRSA-style) for S3 on clusters WITHOUT the EKS pod-identity
+# webhook — e.g. self-hosted Kubernetes federated to AWS IAM through an OIDC provider. The
+# chart projects a ServiceAccount token and points nidus at it (sets AWS_ROLE_ARN and
+# AWS_WEB_IDENTITY_TOKEN_FILE), so S3 authenticates with no static keys. On EKS leave this
+# disabled — the webhook injects the equivalent automatically from the SA annotation.
+awsWebIdentity:
+  enabled: false
+  # The IAM role to assume (→ AWS_ROLE_ARN). Required when enabled.
+  roleArn: ""
+  # Projected-token audience; must match the audience configured on the IAM OIDC provider.
+  audience: sts.amazonaws.com
+  # Token lifetime before kubelet rotates the projected file (nidus re-reads it each refresh).
+  expirationSeconds: 3600
 
 # Escape hatches for anything not modeled above.
 extraEnv: []

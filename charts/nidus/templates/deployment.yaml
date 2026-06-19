@@ -110,6 +110,13 @@ spec:
                   name: {{ .Values.auth.existingSecret }}
                   key: {{ .Values.auth.existingSecretKey }}
             {{- end }}
+            {{- if .Values.awsWebIdentity.enabled }}
+            # Self-managed web identity: nidus exchanges this projected token at STS.
+            - name: AWS_ROLE_ARN
+              value: {{ .Values.awsWebIdentity.roleArn | quote }}
+            - name: AWS_WEB_IDENTITY_TOKEN_FILE
+              value: /var/run/secrets/nidus/aws/token
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -138,9 +145,23 @@ spec:
             # readOnlyRootFilesystem is on; give the process a writable scratch dir.
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.awsWebIdentity.enabled }}
+            - name: aws-iam-token
+              mountPath: /var/run/secrets/nidus/aws
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if .Values.awsWebIdentity.enabled }}
+        - name: aws-iam-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: {{ .Values.awsWebIdentity.audience | quote }}
+                  expirationSeconds: {{ .Values.awsWebIdentity.expirationSeconds }}
+                  path: token
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

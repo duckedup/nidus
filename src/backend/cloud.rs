@@ -17,10 +17,19 @@ pub(crate) struct Http {
 
 impl Http {
     pub(crate) fn new() -> Http {
+        Http::new_with_timeout(None)
+    }
+
+    /// Like [`new`](Self::new) but with an overall per-request timeout. Used for the
+    /// credential-metadata calls (STS / ECS / EC2 IMDS): off-cloud the link-local IMDS
+    /// address is unroutable, so a short timeout turns a multi-second hang into a quick,
+    /// clear "no credentials" error.
+    pub(crate) fn new_with_timeout(timeout: Option<std::time::Duration>) -> Http {
         // `http_status_as_error(false)`: a 4xx/5xx comes back as a normal response so a
         // backend can distinguish 404 (absent → `None`) from a transport failure.
         let config = ureq::config::Config::builder()
             .http_status_as_error(false)
+            .timeout_global(timeout)
             .build();
         Http {
             agent: Agent::new_with_config(config),

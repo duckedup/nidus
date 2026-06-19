@@ -60,8 +60,40 @@ before the replacement starts.
 
 ## Authenticating to the backends
 
-nidus uses **static credentials** read from the environment. There is no keyless
-IAM-role / IRSA / GKE Workload Identity path yet — supply explicit keys.
+### Keyless (recommended on EKS / GKE)
+
+Leave `credentials` empty and bind the ServiceAccount to a cloud role via
+`serviceAccount.annotations`:
+
+```yaml
+serviceAccount:
+  annotations:
+    # EKS / IRSA (S3):
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/nidus
+    # GKE Workload Identity (GCS):
+    # iam.gke.io/gcp-service-account: nidus@my-project.iam.gserviceaccount.com
+```
+
+nidus exchanges the injected web-identity token at STS (S3) or reads the GKE/GCE metadata
+server (GCS), and refreshes the temporary credentials automatically. ECS/Fargate task roles
+and EC2 instance roles are picked up the same way. No long-lived keys in the cluster.
+
+#### Self-managed web identity (non-EKS clusters)
+
+On a cluster without the EKS pod-identity webhook — self-hosted Kubernetes federated to AWS
+IAM via an OIDC provider — enable `awsWebIdentity`. The chart projects a ServiceAccount
+token and points nidus at it, so S3 authenticates with no static keys:
+
+```yaml
+awsWebIdentity:
+  enabled: true
+  roleArn: arn:aws:iam::123456789012:role/nidus
+  audience: sts.amazonaws.com   # must match the IAM OIDC provider's audience
+```
+
+(On EKS leave this off — the webhook injects the equivalent from the SA annotation.)
+
+### Static keys
 
 **S3 (`s3://`)** — `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (plus optional
 `AWS_SESSION_TOKEN`, `AWS_REGION`, and `AWS_ENDPOINT_URL` for R2/MinIO):
