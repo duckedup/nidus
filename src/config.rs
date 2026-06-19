@@ -117,6 +117,18 @@ pub struct Config {
     /// workers skip the log replay + index rebuild. A rebuildable cache — an unreachable
     /// or evicted tier is never fatal.
     pub memory: String,
+    /// Cooperating instances over one **shared** backend (SPEC §14.6 phase 5): several nidus
+    /// processes open the *same* store — one [`ReadWrite`](OpenMode::ReadWrite) writer that
+    /// holds a heartbeated **lease** and advances the manifest on every commit, and any number
+    /// of [`ReadOnly`](OpenMode::ReadOnly) readers that pick up its writes via
+    /// [`refresh`](crate::Nidus::refresh). Default `false` (single-node).
+    ///
+    /// When `true`, the store is rejected unless **both** [`persistence`](Self::persistence) is
+    /// a shared object store (`s3://…`/`gs://…`) **and** [`memory`](Self::memory) is a shared
+    /// tier (`redis://…`) — local files / process RAM are single-node by definition. It is not
+    /// a managed cluster: there is no coordinator, replication, or rebalancing — the object
+    /// store plus the versioned manifest *are* the coordination.
+    pub cluster: bool,
 }
 
 impl Config {
@@ -139,6 +151,7 @@ impl Config {
             mmap: false,
             persistence: String::new(),
             memory: String::new(),
+            cluster: false,
         }
     }
 
@@ -230,6 +243,14 @@ impl Config {
     /// the process heap only). See [`memory`](Self::memory).
     pub fn memory(mut self, location: impl Into<String>) -> Self {
         self.memory = location.into();
+        self
+    }
+
+    /// Enable cooperating-instances cluster mode (requires shared object-store
+    /// [`persistence`](Self::persistence) **and** a shared [`memory`](Self::memory) tier).
+    /// See [`cluster`](Self::cluster).
+    pub fn cluster(mut self, on: bool) -> Self {
+        self.cluster = on;
         self
     }
 }

@@ -134,6 +134,59 @@ Whichever backend you choose, a store is the same small set of named pieces:
 Only `data` and `log` matter for durability; the caches can be deleted and are rebuilt
 from scratch when the store next opens, so a missing or stale cache is never a problem.
 
+## Cooperating instances (cluster)
+
+When the durable bytes live on a **shared** object store and the working set is shared
+through a [memory tier](/guides/memory-stores/), several nidus processes can cooperate over
+the *same* store: one writer and any number of read-only searchers. Turn it on with
+[`Config::cluster(true)`](/reference/configuration/#cluster):
+
+```rust
+use nidus::{Config, Nidus, OpenMode};
+
+// The writer instance — holds the lease, takes writes.
+let mut writer = Nidus::open(
+    Config::new("cluster-store", 768)
+        .persistence("s3://my-bucket/store")
+        .memory("redis://cache:6379")
+        .cluster(true),
+)?;
+
+// A search instance — read-only, no lock; tracks the writer.
+let mut reader = Nidus::open(
+    Config::new("cluster-store", 768)
+        .persistence("s3://my-bucket/store")
+        .memory("redis://cache:6379")
+        .cluster(true)
+        .open_mode(OpenMode::ReadOnly),
+)?;
+
+// … the writer commits; the reader catches up on demand …
+writer.flush()?;
+reader.refresh()?; // adopts the writer's latest committed state
+# anyhow::Ok(())
+```
+
+How it works:
+
+- **One writer, leased.** A cluster writer holds a renewing **lease** on the store (the
+  object-store writer lock, evolved). It is renewed automatically on every write, so an active
+  writer keeps it indefinitely; if a writer goes silent past
+  [`lock_ttl`](/reference/configuration/#lock_ttl) another may take over, and the original is
+  **fenced** — its next write fails cleanly instead of corrupting the store. There is never
+  more than one live writer.
+- **Many readers, refreshing.** Every commit advances the manifest version, so a `ReadOnly`
+  instance picks up the writer's changes with a single cheap [`refresh()`](/reference/api/#refresh)
+  — no reopen. Call it on whatever cadence you like (per request, on a timer); it is a no-op
+  when nothing changed.
+- **Required pieces.** Cluster mode needs **both** a shared object store *and* a shared memory
+  tier — a local-filesystem or process-RAM store is single-node by definition and is rejected
+  with a clear error.
+
+This is deliberately small: there is no coordinator, no replication, and no rebalancing. The
+object store plus the versioned manifest *are* the coordination — the same architecture as a
+single node, just with more readers.
+
 ## Writing your own backend
 
 The backends above are implementations of one small, synchronous Rust trait,

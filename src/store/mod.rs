@@ -21,8 +21,8 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::ann::{Ann, IvfIndex, Walk};
 use crate::backend::{
-    BackendLock, MemoryTier, Persistence, appender_for, locked_error, object_try_lock,
-    open_memory_tier, open_persistence,
+    BackendLock, ClusterLease, MemoryTier, Persistence, appender_for, locked_error,
+    object_try_lock, open_memory_tier, open_persistence,
 };
 use crate::config::{Config, OpenMode};
 use crate::data::Segments;
@@ -108,6 +108,11 @@ pub struct Store {
     /// and in-memory stores hold `None`.
     #[allow(dead_code)]
     lock: Option<Box<dyn BackendLock>>,
+    /// The cluster writer **lease** (SPEC §14.6 phase 5), held in place of `lock` by a
+    /// cluster-mode [`ReadWrite`](crate::OpenMode::ReadWrite) writer. Renewed before every
+    /// write batch (op-driven, no background thread) and fences a superseded writer; released
+    /// on drop. `None` outside cluster mode and for readers / in-memory stores.
+    lease: Option<ClusterLease>,
     collections: HashMap<String, Collection>,
     /// Rows no longer referenced (deleted or overwritten), for compaction tracking.
     dead_rows: usize,
@@ -201,12 +206,42 @@ impl Store {
         persistence: Arc<dyn Persistence>,
         memory: Option<Box<dyn MemoryTier>>,
     ) -> Result<Store> {
-        // 3. Acquire the writer lock (ReadWrite only) — native `O_EXCL` on local files,
-        //    or the advisory object lock on a whole-object store.
-        let lock = if config.open_mode == OpenMode::ReadWrite {
-            Some(Self::acquire_lock(&persistence, location, config.lock_ttl)?)
+        // 2b. Cluster mode (SPEC §14.6 phase 5) needs a *shared* backend: every cooperating
+        //     instance must reach the same durable objects and the same working set. Local
+        //     files / process RAM are single-node by definition, so reject them here — for
+        //     readers and writers alike (all instances must agree on the mode).
+        if config.cluster {
+            if persistence.has_native_lock() {
+                bail!(
+                    "cluster mode requires a shared object-store persistence backend \
+                     (s3://… or gs://…); a local-filesystem store is single-node"
+                );
+            }
+            if memory.is_none() {
+                bail!(
+                    "cluster mode requires a shared memory tier (e.g. redis://…); the \
+                     process-local working set cannot be shared between instances"
+                );
+            }
+        }
+
+        // 3. Acquire the writer handle (ReadWrite only). In cluster mode this is a heartbeated
+        //    lease (renewed per write batch, fences a superseded writer); otherwise the plain
+        //    writer lock — native `O_EXCL` on local files, or the object lock on a whole-object
+        //    store. Readers take neither.
+        let (lock, lease) = if config.open_mode == OpenMode::ReadWrite {
+            if config.cluster {
+                let lease = ClusterLease::acquire(&persistence, "lock", config.lock_ttl)?
+                    .ok_or_else(|| locked_error(location))?;
+                (None, Some(lease))
+            } else {
+                (
+                    Some(Self::acquire_lock(&persistence, location, config.lock_ttl)?),
+                    None,
+                )
+            }
         } else {
-            None
+            (None, None)
         };
 
         // 4. Read the manifest naming the live segments (SPEC §14.2). Absent → this is a
@@ -286,6 +321,7 @@ impl Store {
             persistence: Some(persistence),
             memory,
             lock,
+            lease,
             collections,
             dead_rows,
             quant,
@@ -382,6 +418,7 @@ impl Store {
             persistence: None,
             memory: None,
             lock: None,
+            lease: None,
             collections: HashMap::new(),
             dead_rows: 0,
             quant,

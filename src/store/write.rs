@@ -15,19 +15,47 @@ use crate::model::{Distance, Filter, Op, Record, Value};
 use crate::search::normalize;
 
 impl Store {
-    /// Reject mutations when in ReadOnly mode.
+    /// Reject mutations when in ReadOnly mode, and — in cluster mode — renew/fence the writer
+    /// lease before any durable write (SPEC §14.6 phase 5). Every mutating op calls this
+    /// first, so this is the single point where a superseded cluster writer is stopped before
+    /// it can clobber the shared store.
     fn check_writable(&self) -> Result<()> {
         if self.config.open_mode == OpenMode::ReadOnly {
             bail!("read-only store: mutations are not allowed");
         }
+        self.renew_lease()?;
         Ok(())
     }
 
-    /// Apply the fsync policy after a mutation: sync data then log under PerBatch.
+    /// Renew (and fence) the cluster writer lease — op-driven, no background thread. A no-op
+    /// outside cluster mode (no lease held); errors if this writer was superseded.
+    fn renew_lease(&self) -> Result<()> {
+        if let Some(lease) = &self.lease {
+            lease.renew()?;
+        }
+        Ok(())
+    }
+
+    /// In cluster mode, advance the manifest version and republish it as the universal
+    /// **commit counter** (SPEC §14.6 phase 5): every durable batch bumps it, so a reader
+    /// instance detects this commit with a single manifest read in
+    /// [`refresh`](crate::Nidus::refresh). A no-op outside cluster mode (single-node refresh
+    /// relies on the live log length instead) and for in-memory / read-only stores.
+    fn note_cluster_commit(&mut self) -> Result<()> {
+        if !self.config.cluster {
+            return Ok(());
+        }
+        self.data.bump_version();
+        self.persist_manifest()
+    }
+
+    /// Apply the fsync policy after a mutation: sync data then log under PerBatch, then (in
+    /// cluster mode) advance the published commit counter so peers see the batch.
     fn maybe_sync(&mut self) -> Result<()> {
         if self.config.fsync == Fsync::PerBatch {
             self.data.sync()?;
             self.log.sync()?;
+            self.note_cluster_commit()?;
         }
         Ok(())
     }
@@ -365,6 +393,12 @@ impl Store {
         self.extend_ann(collection, data_mark, &new_owners);
         // The doc set changed — drop the cached scan order (rebuilt on next query).
         self.invalidate_scan_order();
+        // Cluster: announce this committed batch via the manifest commit counter so reader
+        // instances detect it (this path commits durably itself, bypassing `maybe_sync`).
+        // Deferred to `flush()` under OnFlush; a no-op outside cluster mode.
+        if self.config.fsync == Fsync::PerBatch {
+            self.note_cluster_commit()?;
+        }
         Ok(count)
     }
 
@@ -445,6 +479,12 @@ impl Store {
         self.check_writable()?;
         self.data.sync()?;
         self.log.sync()?;
+        // Under OnFlush the per-batch path deferred the cluster commit-counter bump to here
+        // (PerBatch already bumped it in `maybe_sync`); advance it now that the batch is
+        // durable so peers see it. No-op outside cluster mode.
+        if self.config.fsync == Fsync::OnFlush {
+            self.note_cluster_commit()?;
+        }
         // Seal a large active-segment tail into an immutable segment (SPEC §14.4). No-op
         // unless `segment_max_rows` is set and the tail is over it.
         self.maybe_seal()?;

@@ -42,7 +42,7 @@ mod tests;
 pub use gcs::Gcs;
 pub use local::{FileAppender, LocalFs};
 pub use object::ObjectAppender;
-pub(crate) use object::{locked_error, object_try_lock};
+pub(crate) use object::{ClusterLease, locked_error, object_try_lock};
 pub use ram::LocalRam;
 pub(crate) use ram::MemAppender;
 pub use redis::RedisTier;

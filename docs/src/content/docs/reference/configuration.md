@@ -26,7 +26,8 @@ let cfg = Config::new("/path/to/store", 768)
     .segment_index_min_rows(None)    // IVF-index sealed segments past N rows (default: off)
     .mmap(false)                     // memory-map immutable segments instead of RAM (default: off)
     .persistence("")                 // durable bytes: "" = local; "s3://…"/"gs://…"
-    .memory("");                     // shared working set: "" = local; "redis://…"
+    .memory("")                      // shared working set: "" = local; "redis://…"
+    .cluster(false);                 // cooperating instances over a shared backend (default: off)
 # let _ = cfg;
 ```
 
@@ -178,6 +179,18 @@ process heap; nothing shared). A Redis-family URL — `redis://` / `rediss://` /
 publishes the serialized working set on `flush` and adopts it on `open`, so other workers
 skip the log replay. A rebuildable cache: an unreachable or evicted tier is never fatal.
 See [Memory stores](/guides/memory-stores/).
+
+### `cluster`
+
+`bool` — default `false` (single-node). When `true`, several nidus processes cooperate over
+one **shared** backend: a single [`ReadWrite`](#openmode) writer holds a renewing **lease** and
+advances the store on every commit, while any number of [`ReadOnly`](#openmode) readers pick up
+its writes with [`refresh()`](/reference/api/#refresh). It is rejected unless **both**
+[`persistence`](#persistence) is a shared object store (`s3://…`/`gs://…`) **and**
+[`memory`](#memory) is a shared tier (`redis://…`) — local files / process RAM are single-node
+by definition. There is no coordinator, replication, or rebalancing; the object store plus the
+versioned manifest are the coordination. See
+[cooperating instances](/guides/storage-backends/#cooperating-instances-cluster).
 
 ## `Fsync`
 
