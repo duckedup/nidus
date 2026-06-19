@@ -83,10 +83,39 @@ pub trait Persistence: Send + Sync {
     /// when this call created it, `Ok(Some(false))` when it already existed (lost the
     /// race — **not** an error), and `Ok(None)` when the backend offers no atomic
     /// create-if-absent (the object-lock caller then falls back to the best-effort
-    /// advisory put). `Err` is a real IO failure. Default: unsupported (`None`).
+    /// advisory put). `Err` is a real IO failure.
+    ///
+    /// This is the `expected: None` case of [`put_cas`](Self::put_cas) — the default impl
+    /// delegates there, so a backend gets create-if-absent for free once it implements
+    /// `put_cas`. (Kept as its own method because the writer-lock paths read more clearly
+    /// in create-if-absent terms.)
     fn try_create_exclusive(&self, key: &str, bytes: &[u8]) -> Result<Option<bool>> {
-        let _ = (key, bytes);
-        Ok(None)
+        match self.put_cas(key, bytes, None)? {
+            CasOutcome::Written(_) => Ok(Some(true)),
+            CasOutcome::Stale => Ok(Some(false)),
+            CasOutcome::Unsupported => Ok(None),
+        }
+    }
+
+    /// Read an object together with an opaque **CAS token** (an S3 `ETag` / GCS generation)
+    /// identifying its current version, for a later conditional [`put_cas`](Self::put_cas).
+    /// `Ok(None)` when the object is absent. The token is `None` when the backend supports no
+    /// compare-and-swap — the default impl returns [`get`](Self::get)'s bytes with no token,
+    /// so a caller that finds `None` knows to fall back to a plain [`put`](Self::put).
+    fn get_cas(&self, key: &str) -> Result<Option<(Vec<u8>, Option<String>)>> {
+        Ok(self.get(key)?.map(|bytes| (bytes, None)))
+    }
+
+    /// Atomically write `bytes` to `key` **only if** its current CAS token equals
+    /// `expected` (`Some(token)`), or **only if it does not exist** (`None`) — the
+    /// compare-and-swap that fences a superseded cluster writer (SPEC §14.6): a stale
+    /// writer's token no longer matches, so its write is refused rather than clobbering a
+    /// peer's committed state (S3 `If-Match`/`If-None-Match`, GCS `ifGenerationMatch`). See
+    /// [`CasOutcome`]. Default: [`Unsupported`](CasOutcome::Unsupported) — the caller falls
+    /// back to a plain [`put`](Self::put).
+    fn put_cas(&self, key: &str, bytes: &[u8], expected: Option<&str>) -> Result<CasOutcome> {
+        let _ = (key, bytes, expected);
+        Ok(CasOutcome::Unsupported)
     }
 
     /// Best-effort exclusive lock on `key` (the writer-exclusion primitive, §6.3).
@@ -169,6 +198,22 @@ pub trait Appender: Send + Sync {
     }
 }
 
+/// The outcome of a compare-and-swap object write ([`Persistence::put_cas`]).
+pub enum CasOutcome {
+    /// The write committed. Carries the object's **new** CAS token when the backend reports
+    /// one (S3 returns it as the response `ETag`); `None` when the backend has no cheap way
+    /// to report it, in which case the caller re-reads via [`Persistence::get_cas`] to learn
+    /// the new token before its next conditional write.
+    Written(Option<String>),
+    /// The precondition failed: the object's current token differs from `expected` (a
+    /// concurrent writer changed it since), or — for `expected: None` — the object already
+    /// exists. **Not an error**: the caller treats it as "lost the race / I am fenced".
+    Stale,
+    /// This backend offers no compare-and-swap; the caller falls back to a plain
+    /// [`put`](Persistence::put). (The default [`put_cas`](Persistence::put_cas) returns this.)
+    Unsupported,
+}
+
 /// A held backend lock, released on drop (RAII). Returned by
 /// [`Persistence::try_lock`]; the concrete guard owns whatever the backend needs to
 /// release (a lock file, a conditional-PUT marker, …). `Send + Sync` for the same
@@ -210,13 +255,23 @@ impl<T: MemoryTier + ?Sized> MemoryTier for Arc<T> {
 /// `max_vector_bytes` check (§6.6) can run. So for object stores that "refuse before
 /// allocating" guard relaxes to "refuse after one full copy is resident" — inherent to a
 /// whole-object backend, and acceptable at nidus's dev/small-scale positioning.
+/// `cas` selects the [`ObjectAppender`] commit discipline for an object-store segment:
+/// `false` (the default) rewrites the whole object on every sync; `true` (cluster mode,
+/// SPEC §14.6) makes each sync a **compare-and-swap** so a superseded writer's whole-object
+/// rewrite is fenced rather than clobbering a peer's committed bytes. Native local-FS
+/// appenders ignore it (cluster mode requires an object store, never a local file).
 pub(crate) fn appender_for(
     persistence: &Arc<dyn Persistence>,
     key: &str,
+    cas: bool,
 ) -> Result<Box<dyn Appender>> {
     match persistence.appender(key)? {
         Some(native) => Ok(native),
-        None => Ok(Box::new(ObjectAppender::open(persistence.clone(), key)?)),
+        None => Ok(Box::new(ObjectAppender::open(
+            persistence.clone(),
+            key,
+            cas,
+        )?)),
     }
 }
 

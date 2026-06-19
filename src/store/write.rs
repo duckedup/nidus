@@ -8,9 +8,11 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, bail};
 
 use super::{Collection, DocEntry, Store, oom};
+use crate::backend::CasOutcome;
 use crate::config::{Fsync, OpenMode};
 use crate::filter;
 use crate::fts::Language;
+use crate::manifest::MANIFEST_KEY;
 use crate::model::{Distance, Filter, Op, Record, Value};
 use crate::search::normalize;
 
@@ -80,15 +82,44 @@ impl Store {
     }
 
     /// Publish the current segment set as the `manifest` — the atomic commit point for a
-    /// seal/compaction. No-op for in-memory or read-only stores (no durable manifest).
+    /// seal/compaction (and, in cluster mode, every durable batch). No-op for in-memory or
+    /// read-only stores (no durable manifest).
+    ///
+    /// In cluster mode the publish is a **compare-and-swap** against the manifest token this
+    /// writer last wrote ([`manifest_cas`](Store::manifest_cas), SPEC §14.6 / nidus-ahw): a
+    /// writer superseded mid-batch finds the on-disk manifest changed under it and is fenced
+    /// here, at the commit point, before its stale segment set can become the truth. On a
+    /// backend without CAS the publish degrades to a plain put (fenced only per-batch by the
+    /// lease). Outside cluster mode it is the plain atomic put it always was.
     fn persist_manifest(&mut self) -> Result<()> {
         if self.in_memory || self.config.open_mode == OpenMode::ReadOnly {
             return Ok(());
         }
-        if let Some(p) = self.persistence.as_deref() {
-            self.data.manifest().store(p)?;
+        let Some(p) = self.persistence.clone() else {
+            return Ok(());
+        };
+        let manifest = self.data.manifest();
+        if !self.config.cluster {
+            return manifest.store(p.as_ref());
         }
-        Ok(())
+        let bytes = manifest.encode()?;
+        match p.put_cas(MANIFEST_KEY, &bytes, self.manifest_cas.as_deref())? {
+            CasOutcome::Written(new) => {
+                self.manifest_cas = match new {
+                    Some(t) => Some(t),
+                    None => p.get_cas(MANIFEST_KEY)?.and_then(|(_, t)| t),
+                };
+                Ok(())
+            }
+            CasOutcome::Stale => bail!(
+                "writer lease lost: the manifest was committed by another writer — this \
+                 instance was superseded (its lease was taken over while it stalled mid-batch); \
+                 stop writing and reopen"
+            ),
+            // No CAS on this backend — publish plainly (advisory; the per-batch lease fence
+            // still applies). Keep `manifest_cas` `None` so we stay on this path.
+            CasOutcome::Unsupported => manifest.store(p.as_ref()),
+        }
     }
 
     pub fn create_collection(&mut self, name: &str) -> Result<()> {

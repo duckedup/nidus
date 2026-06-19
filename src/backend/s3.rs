@@ -15,11 +15,12 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use http::HeaderMap;
 use rusty_s3::actions::{DeleteObject, GetObject, ListObjectsV2, PutObject};
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 use url::Url;
 
-use super::{BackendLock, Persistence, validate_key};
+use super::{BackendLock, CasOutcome, Persistence, validate_key};
 use crate::backend::cloud::Http;
 
 /// How long a presigned URL is valid. Each request signs a fresh one; this only bounds
@@ -33,6 +34,11 @@ const PRESIGN_TTL: Duration = Duration::from_secs(300);
 /// are case-insensitive on the wire, so sending it lowercase is equally fine.
 const IF_NONE_MATCH_HEADER: &str = "if-none-match";
 const IF_NONE_MATCH_ANY: &str = "*";
+
+/// The `If-Match: <etag>` precondition that makes a PUT a compare-and-swap (it succeeds only
+/// when the object's current `ETag` equals the one this writer last saw). Lowercase for the
+/// same SigV4 reason as [`IF_NONE_MATCH_HEADER`].
+const IF_MATCH_HEADER: &str = "if-match";
 
 /// An S3 (or S3-compatible) persistence backend rooted at a bucket and optional key
 /// prefix.
@@ -138,24 +144,36 @@ impl Persistence for S3 {
         }
     }
 
-    fn try_create_exclusive(&self, key: &str, bytes: &[u8]) -> Result<Option<bool>> {
+    fn get_cas(&self, key: &str) -> Result<Option<(Vec<u8>, Option<String>)>> {
         validate_key(key)?;
         let path = self.path(key);
-        // `If-None-Match: *` makes the PUT a create-if-absent. The header is *signed*
-        // (added to the request before signing), so it must be sent verbatim on the wire.
-        let mut action = PutObject::new(&self.bucket, Some(&self.creds), &path);
-        action
-            .headers_mut()
-            .insert(IF_NONE_MATCH_HEADER, IF_NONE_MATCH_ANY);
-        let url = action.sign(PRESIGN_TTL);
-        let (status, body) = self.http.put(
-            url.as_str(),
-            &[(IF_NONE_MATCH_HEADER, IF_NONE_MATCH_ANY)],
-            bytes,
-        )?;
+        let url = GetObject::new(&self.bucket, Some(&self.creds), &path).sign(PRESIGN_TTL);
+        let (status, body, headers) = self.http.get_h(url.as_str())?;
         match status {
-            s if (200..300).contains(&s) => Ok(Some(true)), // created — we won the lock
-            412 => Ok(Some(false)), // precondition failed: it already exists — lost the race
+            200 => Ok(Some((body, etag(&headers)))),
+            404 => Ok(None),
+            s => bail!("S3 GET {path} failed: HTTP {s}: {}", show(&body)),
+        }
+    }
+
+    fn put_cas(&self, key: &str, bytes: &[u8], expected: Option<&str>) -> Result<CasOutcome> {
+        validate_key(key)?;
+        let path = self.path(key);
+        // `If-Match: <etag>` makes the PUT a compare-and-swap; `If-None-Match: *` makes it a
+        // create-if-absent (`expected: None`). Either header is *signed* (added before signing)
+        // so it must be sent verbatim on the wire. A 412 means the precondition failed — a peer
+        // changed the object since `expected` (or it already exists), i.e. we are fenced.
+        let (name, value) = match expected {
+            Some(etag) => (IF_MATCH_HEADER, etag),
+            None => (IF_NONE_MATCH_HEADER, IF_NONE_MATCH_ANY),
+        };
+        let mut action = PutObject::new(&self.bucket, Some(&self.creds), &path);
+        action.headers_mut().insert(name, value);
+        let url = action.sign(PRESIGN_TTL);
+        let (status, body, headers) = self.http.put_h(url.as_str(), &[(name, value)], bytes)?;
+        match status {
+            s if (200..300).contains(&s) => Ok(CasOutcome::Written(etag(&headers))),
+            412 => Ok(CasOutcome::Stale),
             s => bail!(
                 "S3 conditional PUT {path} failed: HTTP {s}: {}",
                 show(&body)
@@ -230,6 +248,15 @@ impl Persistence for S3 {
 /// Read an env var, treating empty as unset.
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
+}
+
+/// The object's `ETag` (S3's CAS version token) from a response, if present. Returned
+/// verbatim, quotes and all, so it round-trips back into a signed `If-Match`.
+fn etag(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 /// A short, lossy view of an error response body for messages.
@@ -382,6 +409,50 @@ mod tests {
         assert_eq!(s3.try_create_exclusive("lock", b"3").unwrap(), Some(true));
     }
 
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn compare_and_swap_round_trips_against_mock_s3() {
+        let server = mock::MockS3::start();
+        let s3 = S3::build(
+            &server.endpoint(),
+            UrlStyle::Path,
+            "bucket",
+            "",
+            creds(),
+            "us-east-1".to_string(),
+        )
+        .unwrap();
+
+        // Create-if-absent (`expected: None`) wins, then loses once the object exists.
+        let CasOutcome::Written(tok0) = s3.put_cas("m", b"v0", None).unwrap() else {
+            panic!("create-if-absent should win on an empty key");
+        };
+        assert!(tok0.is_some(), "the write reports the new ETag");
+        assert!(matches!(
+            s3.put_cas("m", b"vX", None).unwrap(),
+            CasOutcome::Stale
+        ));
+
+        // get_cas returns the current token; a CAS against it succeeds and mints a new token.
+        let (bytes, tok) = s3.get_cas("m").unwrap().unwrap();
+        assert_eq!(bytes, b"v0");
+        assert_eq!(
+            tok, tok0,
+            "get_cas reports the same ETag the write returned"
+        );
+        let CasOutcome::Written(tok1) = s3.put_cas("m", b"v1", tok.as_deref()).unwrap() else {
+            panic!("a CAS against the current token should win");
+        };
+        assert_ne!(tok0, tok1, "the token advances on each write");
+
+        // A CAS against the now-stale token is fenced; the current value is unchanged.
+        assert!(matches!(
+            s3.put_cas("m", b"v2", tok0.as_deref()).unwrap(),
+            CasOutcome::Stale
+        ));
+        assert_eq!(s3.get("m").unwrap().as_deref(), Some(&b"v1"[..]));
+    }
+
     /// A minimal in-process S3-shaped HTTP server: just enough of the object + list
     /// API to exercise the backend's request execution and response handling. It
     /// ignores auth (the signature is rusty-s3's concern, asserted offline above).
@@ -396,12 +467,19 @@ mod tests {
             port: u16,
         }
 
+        /// Object bytes + a monotonic generation (the mock's `ETag` source), plus the next
+        /// generation to mint — enough to model S3's `If-Match`/`If-None-Match` conditionals.
+        #[derive(Default)]
+        pub(super) struct State {
+            objects: HashMap<String, (Vec<u8>, u64)>,
+            next_gen: u64,
+        }
+
         impl MockS3 {
             pub(super) fn start() -> MockS3 {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 let port = listener.local_addr().unwrap().port();
-                let store: Arc<Mutex<HashMap<String, Vec<u8>>>> =
-                    Arc::new(Mutex::new(HashMap::new()));
+                let store: Arc<Mutex<State>> = Arc::new(Mutex::new(State::default()));
                 thread::spawn(move || {
                     for conn in listener.incoming() {
                         let Ok(conn) = conn else { break };
@@ -418,7 +496,7 @@ mod tests {
             }
         }
 
-        fn serve(mut stream: TcpStream, store: Arc<Mutex<HashMap<String, Vec<u8>>>>) {
+        fn serve(mut stream: TcpStream, store: Arc<Mutex<State>>) {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut request_line = String::new();
             if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
@@ -428,9 +506,10 @@ mod tests {
             let method = parts.next().unwrap_or("").to_string();
             let target = parts.next().unwrap_or("").to_string();
 
-            // Read headers; capture Content-Length and any If-None-Match precondition.
+            // Read headers; capture Content-Length and the conditional preconditions.
             let mut content_length = 0usize;
             let mut if_none_match = false;
+            let mut if_match: Option<String> = None;
             loop {
                 let mut line = String::new();
                 if reader.read_line(&mut line).is_err() {
@@ -446,6 +525,9 @@ mod tests {
                 }
                 if let Some(v) = lower.strip_prefix("if-none-match:") {
                     if_none_match = v.trim() == "*";
+                }
+                if let Some(v) = lower.strip_prefix("if-match:") {
+                    if_match = Some(v.trim().to_string());
                 }
             }
             let mut body = vec![0u8; content_length];
@@ -463,14 +545,16 @@ mod tests {
                 .unwrap_or("")
                 .to_string();
 
+            // The `ETag` of the object written/read, echoed in the response (the CAS token).
+            let mut etag: Option<String> = None;
             let (status, payload): (&str, Vec<u8>) = if is_list {
-                let map = store.lock().unwrap();
+                let st = store.lock().unwrap();
                 let mut xml =
                     String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>");
-                let mut names: Vec<&String> = map.keys().collect();
+                let mut names: Vec<&String> = st.objects.keys().collect();
                 names.sort();
                 for k in names {
-                    let size = map[k].len();
+                    let size = st.objects[k].0.len();
                     xml.push_str(&format!(
                         "<Contents><Key>{k}</Key><ETag>\"x\"</ETag>\
                          <LastModified>1970-01-01T00:00:00.000Z</LastModified>\
@@ -480,30 +564,46 @@ mod tests {
                 xml.push_str("</ListBucketResult>");
                 ("200 OK", xml.into_bytes())
             } else {
+                let mut st = store.lock().unwrap();
+                let cur_etag = |st: &State| st.objects.get(&key).map(|(_, g)| format!("\"{g}\""));
                 match method.as_str() {
                     // `If-None-Match: *` → create-if-absent: 412 when the key already exists.
-                    "PUT" if if_none_match && store.lock().unwrap().contains_key(&key) => {
+                    "PUT" if if_none_match && st.objects.contains_key(&key) => {
+                        ("412 Precondition Failed", Vec::new())
+                    }
+                    // `If-Match: <etag>` → compare-and-swap: 412 unless it matches the current one.
+                    "PUT" if if_match.is_some() && if_match != cur_etag(&st) => {
                         ("412 Precondition Failed", Vec::new())
                     }
                     "PUT" => {
-                        store.lock().unwrap().insert(key, body);
+                        st.next_gen += 1;
+                        let g = st.next_gen;
+                        st.objects.insert(key, (body, g));
+                        etag = Some(format!("\"{g}\""));
                         ("200 OK", Vec::new())
                     }
                     "DELETE" => {
-                        store.lock().unwrap().remove(&key);
+                        st.objects.remove(&key);
                         ("204 No Content", Vec::new())
                     }
-                    "GET" => match store.lock().unwrap().get(&key) {
-                        Some(v) => ("200 OK", v.clone()),
+                    "GET" => match st.objects.get(&key) {
+                        Some((v, g)) => {
+                            etag = Some(format!("\"{g}\""));
+                            ("200 OK", v.clone())
+                        }
                         None => ("404 Not Found", Vec::new()),
                     },
                     _ => ("405 Method Not Allowed", Vec::new()),
                 }
             };
 
+            let etag_header = match &etag {
+                Some(e) => format!("ETag: {e}\r\n"),
+                None => String::new(),
+            };
             let _ = write!(
                 stream,
-                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {status}\r\n{etag_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
                 payload.len()
             );
             let _ = stream.write_all(&payload);

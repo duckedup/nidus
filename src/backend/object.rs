@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
-use super::{Appender, BackendLock, MemAppender, Persistence, validate_key};
+use super::{Appender, BackendLock, CasOutcome, MemAppender, Persistence, validate_key};
 
 /// An append handle backed by a single whole object on a [`Persistence`] backend: edits
 /// buffer in RAM and become durable as one atomic `put` on [`sync`](Appender::sync).
@@ -32,26 +32,71 @@ pub struct ObjectAppender {
     key: String,
     /// In-RAM mirror of the object's bytes — the append point and read source.
     buf: MemAppender,
+    /// Compare-and-swap fencing (cluster mode, SPEC §14.6). `None` = plain mode: every sync
+    /// unconditionally rewrites the object (the single-writer default). `Some(token)` = CAS
+    /// mode: each sync is a conditional write against `token` — the object's version when this
+    /// writer last wrote/read it (inner `None` = "expected absent") — so a sync by a writer a
+    /// peer has superseded is **refused** instead of clobbering the peer's committed bytes.
+    cas_token: Option<Option<String>>,
 }
 
 impl ObjectAppender {
     /// Open the object `key` on `persistence`, loading its current bytes into the RAM
-    /// buffer (absent object → empty, matching a fresh local segment).
-    pub fn open(persistence: Arc<dyn Persistence>, key: &str) -> Result<ObjectAppender> {
+    /// buffer (absent object → empty, matching a fresh local segment). `cas` selects the
+    /// commit discipline (see [`appender_for`](super::appender_for)); in CAS mode the
+    /// object's current version token is captured here for the first conditional sync.
+    pub fn open(persistence: Arc<dyn Persistence>, key: &str, cas: bool) -> Result<ObjectAppender> {
         validate_key(key)?;
-        let bytes = persistence.get(key)?.unwrap_or_default();
+        let (bytes, cas_token) = if cas {
+            match persistence.get_cas(key)? {
+                Some((bytes, token)) => (bytes, Some(token)),
+                None => (Vec::new(), Some(None)), // absent → expect-absent on first write
+            }
+        } else {
+            (persistence.get(key)?.unwrap_or_default(), None)
+        };
         Ok(ObjectAppender {
             persistence,
             key: key.to_string(),
             buf: MemAppender::from_bytes(bytes),
+            cas_token,
         })
     }
 
-    /// Persist the whole buffer as one atomic object write.
-    fn flush_object(&self) -> Result<()> {
-        self.persistence
-            .put(&self.key, self.buf.bytes())
-            .with_context(|| format!("rewrite object {:?} on sync", self.key))
+    /// Persist the whole buffer as one atomic object write. In CAS mode the write is
+    /// conditional on the captured token and a mismatch **fences** this writer (a hard error)
+    /// rather than overwriting a peer's bytes; the token is advanced on success.
+    fn flush_object(&mut self) -> Result<()> {
+        let Some(token) = self.cas_token.clone() else {
+            return self
+                .persistence
+                .put(&self.key, self.buf.bytes())
+                .with_context(|| format!("rewrite object {:?} on sync", self.key));
+        };
+        match self
+            .persistence
+            .put_cas(&self.key, self.buf.bytes(), token.as_deref())?
+        {
+            CasOutcome::Written(new) => {
+                self.cas_token = Some(match new {
+                    Some(t) => Some(t),
+                    // Backend reported no new token — re-read it for the next conditional write.
+                    None => self.persistence.get_cas(&self.key)?.and_then(|(_, t)| t),
+                });
+                Ok(())
+            }
+            CasOutcome::Stale => bail!(
+                "writer fenced: object {:?} was modified by another writer — this instance was \
+                 superseded (its lease was taken over while it stalled); stop writing and reopen",
+                self.key
+            ),
+            // No CAS on this backend: fall back to a plain rewrite (advisory, as the non-cluster
+            // path). Cluster correctness then rests on the per-batch lease fence alone.
+            CasOutcome::Unsupported => self
+                .persistence
+                .put(&self.key, self.buf.bytes())
+                .with_context(|| format!("rewrite object {:?} on sync", self.key)),
+        }
     }
 }
 

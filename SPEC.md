@@ -669,10 +669,9 @@ build until a real need exists.
   into immutable **segments** + a write-ahead log + a manifest, so scaling (datasets past
   one node's RAM, incremental cloud writes, cooperating instances) becomes a *quantity* of
   one architecture rather than a separate mode. Brute-force stays the exact default for the
-  small/recent tail; an IVF index covers the cold bulk. **Phases 1–4 (the segment format +
-  manifest + WAL→segment sealing, per-segment IVF, per-segment mmap, and manifest-versioned
-  reader refresh) are built — see §14**; the remaining phase (cluster) is designed in §14 but
-  not yet built.
+  small/recent tail; an IVF index covers the cold bulk. **Phases 1–5 (the segment format +
+  manifest + WAL→segment sealing, per-segment IVF, per-segment mmap, manifest-versioned reader
+  refresh, and cooperating-instances cluster mode) are built — see §14.**
 
 ---
 
@@ -1163,25 +1162,33 @@ single-node payoff before any distribution work:
    sealed-segments only; off by default; results are identical to the RAM path. See §9.
 4. **Manifest-versioned reader refresh.** *(built)* A lock-free `ReadOnly` reader adopts a
    separate writer's newer committed state in place via `Nidus::refresh()` — no reopen. It
-   re-reads the manifest and, when the version advanced (a seal/compaction) or the `log` grew
-   (an append/delete), re-opens the segment set and replays the log into a fresh in-RAM index
-   at one consistent point, swapping it in atomically (a failure leaves the prior snapshot
-   serving). Returns whether newer state was adopted; a writer / in-memory store is a no-op.
+   re-reads the manifest and, when the version advanced (a commit) or the `log` grew, moves to
+   the newer state at one consistent point, swapping it in atomically (a failure leaves the prior
+   snapshot serving). Returns whether newer state was adopted; a writer / in-memory store is a
+   no-op. Two fast paths keep it cheap (nidus-bdg): when a **shared memory tier** holds a snapshot
+   matching the new row-count + log watermark, the reader **adopts** it and skips the log replay
+   (mirroring `open`); and when the segment **list** is unchanged (plain appends, no
+   seal/compaction), it re-reads **only the active segment** object and reuses every immutable
+   segment — avoiding the dominant cost (re-fetching the whole set) on an object store. A
+   restructure (seal/compaction changes the list) takes the full re-open.
 5. **Cluster mode.** *(built)* Cooperating instances over one **shared** backend, enabled by
    `Config::cluster` (rejected unless persistence is a shared object store **and** a shared
    memory tier is set — local FS / process RAM are single-node). One `ReadWrite` writer holds
    a **lease** (the §6.3 object lock evolved: it carries an owner token and is **renewed on
    every write batch** — op-driven, no background thread — so an active writer keeps it while
-   an idle one past the TTL can be taken over); the renewal **fences** a superseded writer,
-   which fails its next batch rather than clobbering. The fence is checked per write batch, so a
-   writer that stalls for longer than the lease TTL *mid-batch* while a replacement takes over is
-   a residual split-brain window — closing it with a compare-and-swap (`If-Match` / generation)
-   manifest write is a planned follow-up (nidus-ahw); the intended deployment is a single writer.
-   Every commit advances the manifest
-   version (the universal **commit counter**), so any number of `ReadOnly` readers pick up the
-   writer's changes with a single manifest read via `refresh()` (phase 4). It is not a managed
-   cluster — no coordinator, replication, or rebalancing; the object store plus the versioned
-   manifest *are* the coordination.
+   an idle one past the TTL can be taken over); the renewal **fences** a superseded writer at the
+   start of each batch. The narrower window the per-batch renew cannot cover — a writer that
+   stalls past the lease TTL *mid-batch* while a replacement takes over — is closed by
+   **compare-and-swap on every durable object write** (nidus-ahw): each cluster write of a
+   segment/`log`/`manifest` object is conditional on the version the writer last saw (S3
+   `If-Match`, GCS `ifGenerationMatch`; create-if-absent for a fresh object), so a superseded
+   writer's write is *refused* — it fails cleanly rather than clobbering the peer's committed
+   bytes. A backend without CAS degrades to the per-batch lease fence alone. Every commit advances
+   the manifest version (the universal **commit counter**), so any number of `ReadOnly` readers
+   pick up the writer's changes with a single manifest read via `refresh()` (phase 4). It is not a
+   managed cluster — no coordinator, replication, or rebalancing; the object store plus the
+   versioned manifest *are* the coordination. (Remaining hardening: verification against real
+   S3/GCS buckets — the in-RAM/offline coverage exercises the logic and request construction.)
 
 **Phase-1 on-disk model (built).** A store is `manifest` + N segment objects + `log` (the
 WAL). Each segment carries the existing §5.1 header (magic/version/dim/distance) + f32 rows;

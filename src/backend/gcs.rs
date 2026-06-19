@@ -18,13 +18,14 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use http::HeaderMap;
 use http::header::{AUTHORIZATION, HeaderValue};
 use tame_gcs::common::Conditionals;
 use tame_gcs::objects::{InsertObjectOptional, ListOptional, ListResponse, Object};
 use tame_gcs::{ApiResponse, BucketName, ObjectId};
 use tame_oauth::gcp::{ServiceAccountInfo, ServiceAccountProvider, TokenOrRequest, TokenProvider};
 
-use super::{BackendLock, Persistence, validate_key};
+use super::{BackendLock, CasOutcome, Persistence, validate_key};
 use crate::backend::cloud::Http;
 
 /// The OAuth2 scope for reading and writing GCS objects.
@@ -116,13 +117,20 @@ impl Gcs {
 
     /// Attach a fresh bearer token to a request and execute it.
     fn run_authed(&self, req: http::Request<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
+        let (status, body, _headers) = self.run_authed_h(req)?;
+        Ok((status, body))
+    }
+
+    /// Like [`run_authed`](Self::run_authed) but also returns the response headers — the
+    /// compare-and-swap path reads the object's generation (`x-goog-generation`) from them.
+    fn run_authed_h(&self, req: http::Request<Vec<u8>>) -> Result<(u16, Vec<u8>, HeaderMap)> {
         let token = self.token()?;
         let (mut parts, body) = req.into_parts();
         parts.headers.insert(
             AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {token}")).context("build GCS auth header")?,
         );
-        self.http.run(http::Request::from_parts(parts, body))
+        self.http.run_h(http::Request::from_parts(parts, body))
     }
 
     fn object_id(&self, key: &str) -> Result<ObjectId<'static>> {
@@ -161,15 +169,35 @@ impl Persistence for Gcs {
         }
     }
 
-    fn try_create_exclusive(&self, key: &str, bytes: &[u8]) -> Result<Option<bool>> {
+    fn get_cas(&self, key: &str) -> Result<Option<(Vec<u8>, Option<String>)>> {
         validate_key(key)?;
         let oid = self.object_id(key)?;
-        // `ifGenerationMatch=0` makes the insert succeed only if no live version of the
-        // object exists — GCS's create-if-absent. The conditional is a signed query param
-        // baked into the request URI (no extra header to carry on the wire).
+        let req = Object::default()
+            .download(&oid, None)
+            .map_err(gcs_err)?
+            .map(|_empty| Vec::new());
+        let (status, body, headers) = self.run_authed_h(req)?;
+        match status {
+            200 => Ok(Some((body, generation(&headers)))),
+            404 => Ok(None),
+            s => bail!("GCS download {key} failed: HTTP {s}: {}", show(&body)),
+        }
+    }
+
+    fn put_cas(&self, key: &str, bytes: &[u8], expected: Option<&str>) -> Result<CasOutcome> {
+        validate_key(key)?;
+        let oid = self.object_id(key)?;
+        // `ifGenerationMatch=<gen>` makes the insert a compare-and-swap; `=0` makes it a
+        // create-if-absent (`expected: None`). It is a signed query param baked into the URI
+        // (no extra header on the wire). A non-numeric `expected` can never match a real
+        // generation, so it maps to a value (-1) that fails the precondition cleanly.
+        let want_gen = match expected {
+            Some(t) => t.parse::<i64>().unwrap_or(-1),
+            None => 0,
+        };
         let optional = InsertObjectOptional {
             conditionals: Conditionals {
-                if_generation_match: Some(0),
+                if_generation_match: Some(want_gen),
                 ..Default::default()
             },
             ..Default::default()
@@ -179,8 +207,10 @@ impl Persistence for Gcs {
             .map_err(gcs_err)?;
         let (status, body) = self.run_authed(req)?;
         match status {
-            s if (200..300).contains(&s) => Ok(Some(true)), // created — we won the lock
-            412 => Ok(Some(false)), // precondition failed: it already exists — lost the race
+            // Created/overwritten. The new generation is not parsed from the insert response;
+            // the caller re-reads it via `get_cas` before its next conditional write.
+            s if (200..300).contains(&s) => Ok(CasOutcome::Written(None)),
+            412 => Ok(CasOutcome::Stale), // precondition failed — a peer changed it / it exists
             s => bail!(
                 "GCS conditional insert {key} failed: HTTP {s}: {}",
                 show(&body)
@@ -275,6 +305,15 @@ fn gcs_err(e: tame_gcs::Error) -> anyhow::Error {
     anyhow::anyhow!("GCS request build failed: {e}")
 }
 
+/// The object's generation (GCS's CAS version token) from a download response's
+/// `x-goog-generation` header, if present.
+fn generation(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-goog-generation")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
 fn show(body: &[u8]) -> String {
     String::from_utf8_lossy(body).chars().take(300).collect()
 }
@@ -342,6 +381,38 @@ mod tests {
         let uri = req.uri().to_string();
         // The create-if-absent precondition rides as a query param on the insert URI.
         assert!(uri.contains("ifGenerationMatch=0"), "{uri}");
+    }
+
+    #[test]
+    fn compare_and_swap_insert_uri_carries_the_expected_generation() {
+        let gcs = Gcs {
+            bucket: "my-bucket".to_string(),
+            prefix: String::new(),
+            auth: dummy_auth(),
+            http: Http::new(),
+        };
+        let oid = gcs.object_id("manifest").unwrap();
+        // A compare-and-swap against a known generation rides as `ifGenerationMatch=<gen>`.
+        let optional = InsertObjectOptional {
+            conditionals: Conditionals {
+                if_generation_match: Some(42),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let req = Object::default()
+            .insert_simple(&oid, b"x".to_vec(), 1, Some(optional))
+            .unwrap();
+        let uri = req.uri().to_string();
+        assert!(uri.contains("ifGenerationMatch=42"), "{uri}");
+    }
+
+    #[test]
+    fn cas_generation_parsing_maps_a_bad_token_to_a_failing_precondition() {
+        // A non-numeric `expected` can never equal a real generation, so it must map to a
+        // precondition that fails cleanly (-1) rather than silently succeeding.
+        assert_eq!("17".parse::<i64>().unwrap_or(-1), 17);
+        assert_eq!("not-a-generation".parse::<i64>().unwrap_or(-1), -1);
     }
 
     #[test]

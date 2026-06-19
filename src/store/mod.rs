@@ -28,7 +28,7 @@ use crate::config::{Config, OpenMode};
 use crate::data::Segments;
 use crate::fts::Fts;
 use crate::log::OpLog;
-use crate::manifest::Manifest;
+use crate::manifest::{MANIFEST_KEY, Manifest};
 use crate::model::{AnnConfig, Distance, Op};
 
 mod memtier;
@@ -169,6 +169,13 @@ pub struct Store {
     /// Set after each replay; only a [`ReadOnly`](crate::OpenMode::ReadOnly) reader reads it
     /// back (a writer is itself the source of truth and never refreshes).
     loaded_log_offset: u64,
+    /// The CAS token (S3 `ETag` / GCS generation) of the `manifest` object as this writer last
+    /// wrote or read it — the compare-and-swap fence for the **commit point** (SPEC §14.6,
+    /// nidus-ahw). A cluster writer publishes each manifest conditionally on this token, so a
+    /// writer superseded mid-batch finds the token changed and fails its commit rather than
+    /// making its stale segment set the truth. `None` outside cluster mode, for readers, and on
+    /// a backend without CAS (the publish then degrades to a plain put, fenced only per-batch).
+    manifest_cas: Option<String>,
 }
 
 impl Store {
@@ -270,6 +277,12 @@ impl Store {
             None => Manifest::fresh(config.dimension, config.distance),
         };
 
+        // Compare-and-swap fencing applies to a cluster **writer**'s object writes (manifest,
+        // segments, log): each durable rewrite is conditional on the version it last saw, so a
+        // writer superseded mid-batch is fenced instead of clobbering a peer (SPEC §14.6,
+        // nidus-ahw). Readers never write, so they take the plain path.
+        let cas = config.cluster && config.open_mode == OpenMode::ReadWrite;
+
         // 5. Open every segment the manifest names into one global row space. The cap is
         //    enforced before any segment loads into RAM (§6.6, generalized across segments).
         let data = Segments::open(
@@ -277,6 +290,7 @@ impl Store {
             &manifest,
             config.max_vector_bytes,
             config.mmap,
+            cas,
         )?;
 
         // A store with no manifest on disk gets one written now — initializing a fresh
@@ -287,9 +301,18 @@ impl Store {
             data.manifest().store(persistence.as_ref())?;
         }
 
+        // Capture the manifest's CAS token for a cluster writer — the fence anchor for every
+        // later conditional commit (nidus-ahw). Read whether we just wrote it or adopted an
+        // existing one; `None` on a backend without CAS (publish then degrades to a plain put).
+        let manifest_cas = if cas {
+            persistence.get_cas(MANIFEST_KEY)?.and_then(|(_, t)| t)
+        } else {
+            None
+        };
+
         // 6. Open the op log through the backend's appender (replaying torn tails). The
         //    decoded `ops` are the fallback source for building the in-RAM index.
-        let log_ap = appender_for(&persistence, "log")?;
+        let log_ap = appender_for(&persistence, "log", cas)?;
         let (log, ops) = OpLog::open_with(log_ap)?;
 
         let row_count = data.row_count();
@@ -334,6 +357,7 @@ impl Store {
             row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
             loaded_log_offset: watermark,
+            manifest_cas,
         };
 
         // Whether the in-RAM index now differs from any tier snapshot — true if we built
@@ -431,6 +455,7 @@ impl Store {
             row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
             loaded_log_offset: 0,
+            manifest_cas: None,
             config,
         };
         // Align `seg_indexes` to the (single, empty) segment so a later seal can update it
@@ -503,32 +528,70 @@ impl Store {
         // length stale, but it also bumps the version, so we reload via the version check
         // regardless.
         let on_disk_log_len = self.log.offset()?;
-        if manifest.version == self.data.version() && on_disk_log_len == self.loaded_log_offset {
+        let changed =
+            manifest.version != self.data.version() || on_disk_log_len != self.loaded_log_offset;
+        if !changed {
             return Ok(false);
         }
+        // What *kind* of change: a restructure (seal/compaction altered the segment list) needs a
+        // full re-open; an unchanged list means only the active segment grew (the incremental fast
+        // path). Keyed on the segment list, not the version — in cluster mode the version is the
+        // commit counter and advances on every batch (nidus-bdg).
+        let restructured = !self.data.segment_names_match(&manifest.segments);
 
-        // Re-open the segment set at the new manifest into one global row space — picking up
-        // rows appended to the active segment, newly-sealed segments, and a compaction's
-        // collapsed base. The §6.6 cap is re-enforced before any segment loads into RAM.
-        // Built into a local so a failure here leaves the live snapshot untouched.
-        let data = Segments::open(
-            persistence.clone(),
-            &manifest,
-            self.config.max_vector_bytes,
-            self.config.mmap,
-        )?;
+        // Re-read the segment objects. The **incremental** fast path (nidus-bdg) handles the
+        // common case — only the active segment grew (plain appends, manifest version unchanged)
+        // — by re-reading just the active segment object and reusing every immutable segment
+        // (they never change), which avoids re-fetching the whole set (the dominant cost on an
+        // object store). A version change means a seal/compaction restructured the set, so re-open
+        // it whole. Both build into locals first so a failure leaves the live snapshot untouched;
+        // `replaced` carries the whole new set on the version-change path, else `None`.
+        // Exactly one of these is populated: the whole new set (restructure) or the staged
+        // active segment (incremental). Both are locals — `self.data` is not touched until the
+        // final swap, so a failure above leaves the reader on its prior consistent snapshot.
+        let mut replaced: Option<Segments> = None;
+        let mut pending = None;
+        let row_count = if restructured {
+            // The §6.6 cap is re-enforced before any segment loads into RAM.
+            let data = Segments::open(
+                persistence.clone(),
+                &manifest,
+                self.config.max_vector_bytes,
+                self.config.mmap,
+                false, // a reader never writes — plain appenders, no CAS fencing
+            )?;
+            let rows = data.row_count();
+            replaced = Some(data);
+            rows
+        } else {
+            let staged = self.data.reopen_active(self.config.max_vector_bytes)?;
+            let rows = staged.row_count();
+            pending = Some(staged);
+            rows
+        };
 
-        // Re-read and replay the log (a fresh handle — the cached one's object may have been
-        // replaced by a compaction) into a fresh index, bounded by the freshly-sized segments
-        // (§6.2: ignore any `Upsert` past the segment row count we just observed).
-        let (log, ops) = OpLog::open_with(appender_for(&persistence, "log")?)?;
-        let row_count = data.row_count();
+        // Re-read the log (a fresh handle — the cached object may have been replaced by a
+        // compaction) and rebuild the in-RAM index, bounded by the freshly-sized segments
+        // (§6.2: ignore any `Upsert` past the row count we just observed). Prefer the shared
+        // memory tier's snapshot when it is exactly current — adopting it skips the log replay
+        // entirely (tier-aware refresh, mirroring the open path), else replay the ops.
+        let (log, ops) = OpLog::open_with(appender_for(&persistence, "log", false)?)?;
         let watermark = log.offset()?;
-        let (collections, dead_rows, fts) = Self::replay_ops(ops, row_count);
+        let key = memtier::working_set_key(&self.config);
+        let (collections, dead_rows, fts) =
+            match memtier::try_adopt(self.memory.as_deref(), &key, row_count, watermark)? {
+                Some(index) => index.into_parts(),
+                None => Self::replay_ops(ops, row_count),
+            };
 
-        // Every fallible load has succeeded — swap the new snapshot in atomically, then
-        // rebuild the derived indexes over it with the same builders `open` uses.
-        self.data = data;
+        // Every fallible load has succeeded — swap the new snapshot in atomically (the active
+        // segment in place, or the whole set on a restructure), then rebuild the derived indexes
+        // over it with the same builders `open` uses.
+        match (replaced, pending) {
+            (Some(data), _) => self.data = data,
+            (None, Some(staged)) => self.data.install_active(staged, manifest.version),
+            (None, None) => unreachable!("refresh staged neither a full set nor an active segment"),
+        }
         self.log = log;
         self.collections = collections;
         self.dead_rows = dead_rows;

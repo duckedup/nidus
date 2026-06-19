@@ -528,6 +528,7 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         row_to_doc: Vec::new(),
         scan_order: std::sync::RwLock::new(None),
         loaded_log_offset: 0,
+        manifest_cas: None,
     };
     store.create_collection("col").unwrap();
     store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
@@ -3718,31 +3719,69 @@ fn cluster_mode_rejects_a_local_filesystem_store() {
 
 mod object_backed {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use anyhow::{Result, bail};
 
     use super::*;
-    use crate::backend::{BackendLock, LocalRam, MemoryTier, Persistence};
+    use crate::backend::{BackendLock, CasOutcome, LocalRam, MemoryTier, Persistence};
 
     /// A whole-object Persistence backed by an in-RAM map: no native appender (forcing an
     /// `ObjectAppender`) and no native lock (forcing the advisory object lock) — exactly
-    /// the shape S3/GCS present, but synchronous and Miri-clean.
+    /// the shape S3/GCS present, but synchronous and Miri-clean. Each object carries a
+    /// monotonic **generation** (a globally-increasing counter), modelling an S3 `ETag` /
+    /// GCS generation so the compare-and-swap paths (`get_cas`/`put_cas`) are exercised.
     #[derive(Default)]
     struct InMemObjectStore {
-        objects: Mutex<HashMap<String, Vec<u8>>>,
+        objects: Mutex<HashMap<String, (Vec<u8>, u64)>>,
+        next_gen: AtomicU64,
+        /// Per-key read count (`get` + `get_cas`), so a test can assert which objects a
+        /// refresh fetched — e.g. that an incremental refresh skips immutable segments.
+        gets: Mutex<HashMap<String, u64>>,
+    }
+
+    impl InMemObjectStore {
+        /// Mint a fresh, never-reused generation token for a write.
+        fn bump(&self) -> u64 {
+            self.next_gen.fetch_add(1, Ordering::Relaxed) + 1
+        }
+        /// Record a read of `key`.
+        fn note_get(&self, key: &str) {
+            *self
+                .gets
+                .lock()
+                .unwrap()
+                .entry(key.to_string())
+                .or_insert(0) += 1;
+        }
+        /// How many times `key` has been read.
+        fn get_count(&self, key: &str) -> u64 {
+            self.gets.lock().unwrap().get(key).copied().unwrap_or(0)
+        }
+        /// Forget all read counts (call before the action under test).
+        fn reset_gets(&self) {
+            self.gets.lock().unwrap().clear();
+        }
     }
 
     impl Persistence for InMemObjectStore {
         fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-            Ok(self.objects.lock().unwrap().get(key).cloned())
+            self.note_get(key);
+            Ok(self
+                .objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|(b, _)| b.clone()))
         }
         fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+            let g = self.bump();
             self.objects
                 .lock()
                 .unwrap()
-                .insert(key.to_string(), bytes.to_vec());
+                .insert(key.to_string(), (bytes.to_vec(), g));
             Ok(())
         }
         fn delete(&self, key: &str) -> Result<()> {
@@ -3754,16 +3793,32 @@ mod object_backed {
             keys.sort();
             Ok(keys)
         }
-        fn try_create_exclusive(&self, key: &str, bytes: &[u8]) -> Result<Option<bool>> {
-            // Atomic create-if-absent under the map lock — the race-free primitive S3/GCS give
-            // (S3 If-None-Match:*, GCS ifGenerationMatch=0), so the cluster lease takes its
-            // race-free path in tests rather than the advisory fallback.
+        fn get_cas(&self, key: &str) -> Result<Option<(Vec<u8>, Option<String>)>> {
+            self.note_get(key);
+            Ok(self
+                .objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|(b, g)| (b.clone(), Some(g.to_string()))))
+        }
+        fn put_cas(&self, key: &str, bytes: &[u8], expected: Option<&str>) -> Result<CasOutcome> {
+            // Atomic compare-and-swap under the map lock — the conditional-write primitive
+            // S3/GCS give (If-Match / ifGenerationMatch, and If-None-Match:* / =0 when
+            // `expected` is None). `try_create_exclusive` rides the `None` arm via its default.
             let mut objs = self.objects.lock().unwrap();
-            if objs.contains_key(key) {
-                return Ok(Some(false));
+            let current = objs.get(key).map(|(_, g)| g.to_string());
+            let matches = match (expected, &current) {
+                (None, None) => true,                     // create-if-absent: must be absent
+                (Some(want), Some(have)) => want == have, // compare current token
+                _ => false,                               // absent-vs-present or token mismatch
+            };
+            if !matches {
+                return Ok(CasOutcome::Stale);
             }
-            objs.insert(key.to_string(), bytes.to_vec());
-            Ok(Some(true))
+            let g = self.next_gen.fetch_add(1, Ordering::Relaxed) + 1;
+            objs.insert(key.to_string(), (bytes.to_vec(), g));
+            Ok(CasOutcome::Written(Some(g.to_string())))
         }
         fn try_lock(&self, _key: &str, _ttl: Duration) -> Result<Option<Box<dyn BackendLock>>> {
             bail!("InMemObjectStore has no native lock — advisory lock is used instead")
@@ -4029,5 +4084,131 @@ mod object_backed {
                 .collect();
             assert_eq!(got, exp, "query {q:?}");
         }
+    }
+
+    #[test]
+    fn cluster_cas_fences_a_superseded_writer_and_preserves_committed_data() {
+        let backend: Arc<dyn Persistence> = Arc::new(InMemObjectStore::default());
+        let tier = Arc::new(LocalRam::new());
+
+        let mut w = cluster_writer(&backend, &tier);
+        w.create_collection("col").unwrap();
+        w.upsert("col", &[rec("a", vec![1.0, 0.0, 0.0])]).unwrap();
+
+        // Simulate a peer that took over the lease and committed its own batch: it rewrites the
+        // shared durable objects, advancing their compare-and-swap tokens and stranding this
+        // now-superseded writer's anchors. (Its `lock` object is left untouched so the per-batch
+        // lease *renew* still passes — this isolates the CAS fence from the lease fence, exercising
+        // exactly the mid-batch window the lease alone cannot close: nidus-ahw.)
+        for key in ["data", "log", "manifest"] {
+            let bytes = backend.get(key).unwrap().unwrap();
+            backend.put(key, &bytes).unwrap(); // identical bytes, fresh generation token
+        }
+
+        // The superseded writer's next durable write is refused by the compare-and-swap — it
+        // fails cleanly instead of clobbering the peer's committed bytes.
+        let err = w
+            .upsert("col", &[rec("b", vec![0.0, 1.0, 0.0])])
+            .expect_err("a superseded cluster writer must be fenced before it clobbers the store");
+        let msg = format!("{err:#}"); // include the error source chain (the fence is the cause)
+        assert!(
+            msg.contains("fenced") || msg.contains("superseded"),
+            "expected a fencing error, got: {msg}"
+        );
+
+        // The committed state survived intact: a fresh reader sees exactly the peer's "a",
+        // never the fenced writer's "b".
+        let r = cluster_reader(&backend, &tier);
+        let ids: Vec<String> = r.get_all("col").into_iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn cluster_manifest_commit_is_compare_and_swapped() {
+        // Isolate the manifest commit's CAS (the structural commit point) using OnFlush, where
+        // `flush` is the sole committer: after a peer bumps only the `manifest` token, the next
+        // flush's manifest compare-and-swap must fail rather than republish a stale segment set.
+        let backend: Arc<dyn Persistence> = Arc::new(InMemObjectStore::default());
+        let tier = Arc::new(LocalRam::new());
+        let mem: Box<dyn MemoryTier> = Box::new(tier.clone());
+        let mut w = Store::open_with(
+            cluster_cfg().fsync(crate::config::Fsync::OnFlush),
+            "s3://bucket/store",
+            backend.clone(),
+            Some(mem),
+        )
+        .unwrap();
+        w.create_collection("col").unwrap();
+        w.upsert("col", &[rec("a", vec![1.0, 0.0, 0.0])]).unwrap();
+        w.flush().unwrap();
+
+        // A peer republishes the manifest out-of-band, advancing its CAS token.
+        let m = backend.get("manifest").unwrap().unwrap();
+        backend.put("manifest", &m).unwrap();
+
+        // The next flush commits the manifest conditionally on the token this writer last wrote
+        // — now stale — so it is fenced at the commit point.
+        let err = w
+            .flush()
+            .expect_err("a stale manifest commit must be compare-and-swapped out");
+        assert!(err.to_string().contains("lease lost"), "{err}");
+    }
+
+    #[test]
+    fn cluster_incremental_refresh_skips_immutable_segments() {
+        // Keep a concrete handle for the GET-count assertions while passing a trait object to
+        // the store helpers.
+        let raw = Arc::new(InMemObjectStore::default());
+        let backend: Arc<dyn Persistence> = raw.clone();
+        let tier = Arc::new(LocalRam::new());
+
+        // `segment_max_rows = 2` seals the base after two rows, so the store ends up with an
+        // immutable base segment ("data") plus a fresh active segment ("seg-00000001").
+        let mem: Box<dyn MemoryTier> = Box::new(tier.clone());
+        let mut w = Store::open_with(
+            cluster_cfg().segment_max_rows(Some(2)),
+            "s3://bucket/store",
+            backend.clone(),
+            Some(mem),
+        )
+        .unwrap();
+        w.create_collection("col").unwrap();
+        w.upsert("col", &[rec("a", vec![1.0, 0.0, 0.0])]).unwrap();
+        w.upsert("col", &[rec("b", vec![0.0, 1.0, 0.0])]).unwrap();
+        w.upsert("col", &[rec("c", vec![0.0, 0.0, 1.0])]).unwrap(); // seals [a,b]→data, c→seg-1
+
+        let mut r = cluster_reader(&backend, &tier);
+        assert_eq!(r.get_all("col").len(), 3);
+
+        // A plain append to the active segment — no new seal, so the segment *list* is unchanged
+        // and the reader takes the incremental fast path.
+        w.upsert("col", &[rec("d", vec![1.0, 1.0, 0.0])]).unwrap();
+
+        raw.reset_gets();
+        assert!(r.refresh().unwrap(), "the commit is detected");
+        assert_eq!(
+            raw.get_count("data"),
+            0,
+            "the immutable base segment must not be re-fetched on an incremental refresh"
+        );
+        assert!(
+            raw.get_count("seg-00000001") >= 1,
+            "the active segment is re-read to pick up the appended row"
+        );
+        assert_eq!(
+            r.get_all("col").len(),
+            4,
+            "the new row is visible after refresh"
+        );
+
+        // A seal *does* restructure the list → the next refresh re-opens the whole set.
+        w.upsert("col", &[rec("e", vec![0.5, 0.5, 0.0])]).unwrap(); // seg-1 now [c,d] → seals, e→seg-2
+        raw.reset_gets();
+        assert!(r.refresh().unwrap());
+        assert!(
+            raw.get_count("data") >= 1,
+            "a restructure (seal) re-opens every segment, including the immutable base"
+        );
+        assert_eq!(r.get_all("col").len(), 5);
     }
 }
