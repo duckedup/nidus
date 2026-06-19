@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 
+mod aws_creds;
 mod cloud;
 mod gcs;
 mod local;

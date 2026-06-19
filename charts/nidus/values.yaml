@@ -62,12 +62,18 @@ auth:
   existingSecretKey: token
 
 # ── Backend credentials (→ env) ─────────────────────────────────────────────────
-# nidus authenticates to the object store with STATIC credentials read from the
-# environment — there is no keyless IAM-role / IRSA / GKE Workload Identity path yet.
-#   S3 (s3://):  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (+ optional AWS_SESSION_TOKEN,
-#                AWS_REGION, AWS_ENDPOINT_URL for R2/MinIO).
-#   GCS (gs://): a service-account key as GOOGLE_APPLICATION_CREDENTIALS_JSON (the key
-#                JSON inline). Put it in an existing Secret and list it below.
+# Two ways to authenticate:
+#  (a) Keyless (recommended on EKS/GKE) — leave `credentials` empty and bind the
+#      ServiceAccount to a cloud role via `serviceAccount.annotations`:
+#        EKS/IRSA: eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/<role>
+#        GKE WI:   iam.gke.io/gcp-service-account: <sa>@<project>.iam.gserviceaccount.com
+#      nidus picks up the injected web-identity token (S3) or metadata server (GCS) and
+#      refreshes the temporary credentials automatically. ECS/EC2 instance roles also work.
+#  (b) Static keys, supplied here:
+#        S3 (s3://):  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (+ optional AWS_SESSION_TOKEN,
+#                     AWS_REGION, AWS_ENDPOINT_URL for R2/MinIO).
+#        GCS (gs://): a service-account key as GOOGLE_APPLICATION_CREDENTIALS_JSON (key JSON
+#                     inline). Put it in an existing Secret and list it below.
 credentials:
   # Inline key/value pairs are written to a chart-managed Secret and loaded via
   # envFrom. e.g.

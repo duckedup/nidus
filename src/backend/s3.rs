@@ -1,8 +1,11 @@
 //! [`S3`]: an Amazon S3 (and S3-compatible: R2, MinIO, …) [`Persistence`] backend.
 //!
 //! Selected by `s3://<bucket>[/<prefix>]`, with credentials/region/endpoint from the
-//! standard AWS environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-//! `AWS_SESSION_TOKEN`, `AWS_REGION`/`AWS_DEFAULT_REGION`, `AWS_ENDPOINT_URL`). Object
+//! standard AWS environment. Region/endpoint come from `AWS_REGION`/`AWS_DEFAULT_REGION`
+//! and `AWS_ENDPOINT_URL`; **credentials** resolve through [`AwsCredentials`] — static
+//! `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`), or the
+//! keyless chain (EKS IRSA web identity, ECS task role, EC2 instance role), refreshed as
+//! they expire. Object
 //! ops are whole-object `get`/`put`/`delete`/`list`; there is **no native append**
 //! (`appender` returns `None`), so S3 is for snapshots and whole-object use, not as a
 //! live append-backed `data`/`log` store.
@@ -17,10 +20,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use http::HeaderMap;
 use rusty_s3::actions::{DeleteObject, GetObject, ListObjectsV2, PutObject};
-use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
+use rusty_s3::{Bucket, S3Action, UrlStyle};
 use url::Url;
 
 use super::{BackendLock, CasOutcome, Persistence, validate_key};
+use crate::backend::aws_creds::AwsCredentials;
 use crate::backend::cloud::Http;
 
 /// How long a presigned URL is valid. Each request signs a fresh one; this only bounds
@@ -44,7 +48,7 @@ const IF_MATCH_HEADER: &str = "if-match";
 /// prefix.
 pub struct S3 {
     bucket: Bucket,
-    creds: Credentials,
+    creds: AwsCredentials,
     /// Key prefix within the bucket (`""` or `"a/b"`, never trailing-slashed). Object
     /// keys map to `<prefix>/<key>`.
     prefix: String,
@@ -63,14 +67,7 @@ impl S3 {
             bail!("s3:// URL is missing a bucket name (expected s3://<bucket>[/<prefix>])");
         }
 
-        let key = env("AWS_ACCESS_KEY_ID")
-            .context("AWS_ACCESS_KEY_ID is not set (required for the s3:// backend)")?;
-        let secret = env("AWS_SECRET_ACCESS_KEY")
-            .context("AWS_SECRET_ACCESS_KEY is not set (required for the s3:// backend)")?;
-        let creds = match env("AWS_SESSION_TOKEN") {
-            Some(token) => Credentials::new_with_token(key, secret, token),
-            None => Credentials::new(key, secret),
-        };
+        let creds = AwsCredentials::from_env()?;
         let region = env("AWS_REGION")
             .or_else(|| env("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|| "us-east-1".to_string());
@@ -94,7 +91,7 @@ impl S3 {
         style: UrlStyle,
         bucket: &str,
         prefix: &str,
-        creds: Credentials,
+        creds: AwsCredentials,
         region: String,
     ) -> Result<S3> {
         let endpoint = Url::parse(endpoint)
@@ -123,7 +120,8 @@ impl Persistence for S3 {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         validate_key(key)?;
         let path = self.path(key);
-        let url = GetObject::new(&self.bucket, Some(&self.creds), &path).sign(PRESIGN_TTL);
+        let creds = self.creds.get()?;
+        let url = GetObject::new(&self.bucket, Some(&creds), &path).sign(PRESIGN_TTL);
         let (status, body) = self.http.get(url.as_str())?;
         match status {
             200 => Ok(Some(body)),
@@ -135,7 +133,8 @@ impl Persistence for S3 {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
         validate_key(key)?;
         let path = self.path(key);
-        let url = PutObject::new(&self.bucket, Some(&self.creds), &path).sign(PRESIGN_TTL);
+        let creds = self.creds.get()?;
+        let url = PutObject::new(&self.bucket, Some(&creds), &path).sign(PRESIGN_TTL);
         let (status, body) = self.http.put(url.as_str(), &[], bytes)?;
         if (200..300).contains(&status) {
             Ok(())
@@ -147,7 +146,8 @@ impl Persistence for S3 {
     fn get_cas(&self, key: &str) -> Result<Option<(Vec<u8>, Option<String>)>> {
         validate_key(key)?;
         let path = self.path(key);
-        let url = GetObject::new(&self.bucket, Some(&self.creds), &path).sign(PRESIGN_TTL);
+        let creds = self.creds.get()?;
+        let url = GetObject::new(&self.bucket, Some(&creds), &path).sign(PRESIGN_TTL);
         let (status, body, headers) = self.http.get_h(url.as_str())?;
         match status {
             200 => Ok(Some((body, etag(&headers)))),
@@ -167,7 +167,8 @@ impl Persistence for S3 {
             Some(etag) => (IF_MATCH_HEADER, etag),
             None => (IF_NONE_MATCH_HEADER, IF_NONE_MATCH_ANY),
         };
-        let mut action = PutObject::new(&self.bucket, Some(&self.creds), &path);
+        let creds = self.creds.get()?;
+        let mut action = PutObject::new(&self.bucket, Some(&creds), &path);
         action.headers_mut().insert(name, value);
         let url = action.sign(PRESIGN_TTL);
         let (status, body, headers) = self.http.put_h(url.as_str(), &[(name, value)], bytes)?;
@@ -184,7 +185,8 @@ impl Persistence for S3 {
     fn delete(&self, key: &str) -> Result<()> {
         validate_key(key)?;
         let path = self.path(key);
-        let url = DeleteObject::new(&self.bucket, Some(&self.creds), &path).sign(PRESIGN_TTL);
+        let creds = self.creds.get()?;
+        let url = DeleteObject::new(&self.bucket, Some(&creds), &path).sign(PRESIGN_TTL);
         let (status, body) = self.http.delete(url.as_str())?;
         // 204 on success; 404 means already gone — both fine (delete is idempotent).
         if (200..300).contains(&status) || status == 404 {
@@ -202,8 +204,9 @@ impl Persistence for S3 {
         };
         let mut keys = Vec::new();
         let mut token: Option<String> = None;
+        let creds = self.creds.get()?;
         loop {
-            let mut action = self.bucket.list_objects_v2(Some(&self.creds));
+            let mut action = self.bucket.list_objects_v2(Some(&creds));
             if !want_prefix.is_empty() {
                 action.query_mut().insert("prefix", want_prefix.clone());
             }
@@ -269,8 +272,8 @@ fn show(body: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    fn creds() -> Credentials {
-        Credentials::new("AKIDEXAMPLE", "secret")
+    fn creds() -> AwsCredentials {
+        AwsCredentials::Static(rusty_s3::Credentials::new("AKIDEXAMPLE", "secret"))
     }
 
     // ── Offline: presigned-URL construction (Miri-clean) ────────────────────────
@@ -286,7 +289,8 @@ mod tests {
             "us-east-1".to_string(),
         )
         .unwrap();
-        let url = GetObject::new(&s3.bucket, Some(&s3.creds), &s3.path("data")).sign(PRESIGN_TTL);
+        let creds = s3.creds.get().unwrap();
+        let url = GetObject::new(&s3.bucket, Some(&creds), &s3.path("data")).sign(PRESIGN_TTL);
         let u = url.as_str();
         assert!(
             u.starts_with("https://my-bucket.s3.us-east-1.amazonaws.com/data?"),
@@ -322,7 +326,8 @@ mod tests {
         )
         .unwrap();
         let path = s3.path("lock");
-        let mut action = PutObject::new(&s3.bucket, Some(&s3.creds), &path);
+        let creds = s3.creds.get().unwrap();
+        let mut action = PutObject::new(&s3.bucket, Some(&creds), &path);
         action
             .headers_mut()
             .insert(IF_NONE_MATCH_HEADER, IF_NONE_MATCH_ANY);

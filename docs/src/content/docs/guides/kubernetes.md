@@ -73,9 +73,26 @@ replacement acquires it immediately instead of waiting out the lock TTL.
 
 ## Authenticating to the backends
 
-nidus authenticates to its backends with **static credentials** from the environment —
-there is no keyless IAM-role / IRSA / GKE Workload Identity path yet. Supply explicit
-keys:
+### Keyless (recommended on EKS / GKE)
+
+The cleanest option: bind the ServiceAccount to a cloud role and leave `credentials` empty.
+
+```yaml
+serviceAccount:
+  annotations:
+    # EKS / IRSA (S3):
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/nidus
+    # GKE Workload Identity (GCS):
+    # iam.gke.io/gcp-service-account: nidus@my-project.iam.gserviceaccount.com
+```
+
+nidus exchanges the pod's injected web-identity token at STS (S3) or reads the GKE/GCE
+metadata server (GCS), refreshing the temporary credentials automatically. ECS/Fargate task
+roles and EC2 instance roles work the same way — no long-lived keys in the cluster.
+
+### Static keys
+
+Otherwise supply keys explicitly:
 
 - **S3** — `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (plus optional
   `AWS_SESSION_TOKEN`, `AWS_REGION`, and `AWS_ENDPOINT_URL` for R2/MinIO), via

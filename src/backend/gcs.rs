@@ -1,10 +1,11 @@
 //! [`Gcs`]: a Google Cloud Storage [`Persistence`] backend.
 //!
-//! Selected by `gs://<bucket>[/<prefix>]` (alias `gcs://`), authenticated with a
-//! service-account key whose path is in `GOOGLE_APPLICATION_CREDENTIALS` (or the JSON
-//! inline in `GOOGLE_APPLICATION_CREDENTIALS_JSON`). Like [`S3`](super::S3) it is a
-//! whole-object backend (`get`/`put`/`delete`/`list`, no native append) — for
-//! snapshots and whole-object use.
+//! Selected by `gs://<bucket>[/<prefix>]` (alias `gcs://`). Authenticated with a
+//! service-account key — its path in `GOOGLE_APPLICATION_CREDENTIALS`, or the JSON inline
+//! in `GOOGLE_APPLICATION_CREDENTIALS_JSON` — and, when neither is set, the GCE/GKE
+//! **metadata server** (Workload Identity), so a pod with a bound service account needs no
+//! key file. Like [`S3`](super::S3) it is a whole-object backend (`get`/`put`/`delete`/
+//! `list`, no native append) — for snapshots and whole-object use.
 //!
 //! [`tame-gcs`](tame_gcs) and [`tame-oauth`](tame_oauth) are sans-IO: they build the
 //! GCS request (and the OAuth2 token-exchange request) as [`http::Request`]s, which
@@ -23,7 +24,10 @@ use http::header::{AUTHORIZATION, HeaderValue};
 use tame_gcs::common::Conditionals;
 use tame_gcs::objects::{InsertObjectOptional, ListOptional, ListResponse, Object};
 use tame_gcs::{ApiResponse, BucketName, ObjectId};
-use tame_oauth::gcp::{ServiceAccountInfo, ServiceAccountProvider, TokenOrRequest, TokenProvider};
+use tame_oauth::gcp::{
+    MetadataServerProvider, ServiceAccountInfo, ServiceAccountProvider, TokenOrRequest,
+    TokenProvider,
+};
 
 use super::{BackendLock, CasOutcome, Persistence, validate_key};
 use crate::backend::cloud::Http;
@@ -31,20 +35,29 @@ use crate::backend::cloud::Http;
 /// The OAuth2 scope for reading and writing GCS objects.
 const SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 
+/// How GCS obtains an access token: an explicit service-account key, or the GCE/GKE
+/// metadata server (Workload Identity). Both implement [`TokenProvider`], so [`Gcs::token`]
+/// drives either through one generic helper.
+enum GcsAuth {
+    ServiceAccount(ServiceAccountProvider),
+    Metadata(MetadataServerProvider),
+}
+
 /// A Google Cloud Storage persistence backend rooted at a bucket and optional key
 /// prefix.
 pub struct Gcs {
     bucket: String,
     /// Key prefix within the bucket (`""` or `"a/b"`, never trailing-slashed).
     prefix: String,
-    auth: ServiceAccountProvider,
+    auth: GcsAuth,
     http: Http,
 }
 
 impl Gcs {
     /// Build from the part of a `gs://` URL after the scheme: `<bucket>[/<prefix>]`.
-    /// Service-account credentials come from `GOOGLE_APPLICATION_CREDENTIALS` (a path)
-    /// or `GOOGLE_APPLICATION_CREDENTIALS_JSON` (the key JSON inline).
+    /// Credentials come from a service-account key (`GOOGLE_APPLICATION_CREDENTIALS_JSON`
+    /// inline, or `GOOGLE_APPLICATION_CREDENTIALS` as a path) or, when neither is set, the
+    /// GCE/GKE metadata server (Workload Identity).
     pub(crate) fn from_url(rest: &str) -> Result<Gcs> {
         let (bucket, prefix) = match rest.split_once('/') {
             Some((b, p)) => (b, p.trim_end_matches('/')),
@@ -54,21 +67,29 @@ impl Gcs {
             bail!("gs:// URL is missing a bucket name (expected gs://<bucket>[/<prefix>])");
         }
 
-        let json = match env("GOOGLE_APPLICATION_CREDENTIALS_JSON") {
-            Some(j) => j,
-            None => {
-                let path = env("GOOGLE_APPLICATION_CREDENTIALS").context(
-                    "neither GOOGLE_APPLICATION_CREDENTIALS nor \
-                     GOOGLE_APPLICATION_CREDENTIALS_JSON is set (required for the gs:// backend)",
-                )?;
-                std::fs::read_to_string(&path)
-                    .with_context(|| format!("failed to read service-account key at {path}"))?
-            }
+        // A key (inline JSON or a file path) if provided; otherwise fall back to the
+        // metadata server so a Workload-Identity-bound pod authenticates without a key.
+        let key_json = match env("GOOGLE_APPLICATION_CREDENTIALS_JSON") {
+            Some(j) => Some(j),
+            None => match env("GOOGLE_APPLICATION_CREDENTIALS") {
+                Some(path) => Some(
+                    std::fs::read_to_string(&path)
+                        .with_context(|| format!("failed to read service-account key at {path}"))?,
+                ),
+                None => None,
+            },
         };
-        let info = ServiceAccountInfo::deserialize(json)
-            .map_err(|e| anyhow::anyhow!("invalid GCS service-account key: {e}"))?;
-        let auth = ServiceAccountProvider::new(info)
-            .map_err(|e| anyhow::anyhow!("failed to initialise GCS service-account auth: {e}"))?;
+        let auth = match key_json {
+            Some(json) => {
+                let info = ServiceAccountInfo::deserialize(json)
+                    .map_err(|e| anyhow::anyhow!("invalid GCS service-account key: {e}"))?;
+                let provider = ServiceAccountProvider::new(info).map_err(|e| {
+                    anyhow::anyhow!("failed to initialise GCS service-account auth: {e}")
+                })?;
+                GcsAuth::ServiceAccount(provider)
+            }
+            None => GcsAuth::Metadata(MetadataServerProvider::new(None)),
+        };
 
         Ok(Gcs {
             bucket: bucket.to_string(),
@@ -88,30 +109,12 @@ impl Gcs {
     }
 
     /// A currently-valid OAuth2 access token, fetching (and caching, inside the
-    /// provider) one via the token endpoint when needed.
+    /// provider) one via the token endpoint when needed. Dispatches to whichever
+    /// provider this backend resolved.
     fn token(&self) -> Result<String> {
-        match self
-            .auth
-            .get_token(&[SCOPE])
-            .map_err(|e| anyhow::anyhow!("GCS token request failed: {e}"))?
-        {
-            TokenOrRequest::Token(t) => Ok(t.access_token),
-            TokenOrRequest::Request {
-                request,
-                scope_hash,
-                ..
-            } => {
-                let (status, body) = self.http.run(request)?;
-                let resp = http::Response::builder()
-                    .status(status)
-                    .body(body)
-                    .context("build GCS token response")?;
-                let token = self
-                    .auth
-                    .parse_token_response(scope_hash, resp)
-                    .map_err(|e| anyhow::anyhow!("failed to parse GCS token response: {e}"))?;
-                Ok(token.access_token)
-            }
+        match &self.auth {
+            GcsAuth::ServiceAccount(p) => token_from(p, &self.http),
+            GcsAuth::Metadata(p) => token_from(p, &self.http),
         }
     }
 
@@ -301,6 +304,33 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
+/// Resolve an access token from any [`TokenProvider`]: return the cached token, or run the
+/// provider's sans-IO token request through `http` and parse the response. Shared by both
+/// [`GcsAuth`] variants so the service-account and metadata-server paths can't drift.
+fn token_from<P: TokenProvider>(provider: &P, http: &Http) -> Result<String> {
+    match provider
+        .get_token(&[SCOPE])
+        .map_err(|e| anyhow::anyhow!("GCS token request failed: {e}"))?
+    {
+        TokenOrRequest::Token(t) => Ok(t.access_token),
+        TokenOrRequest::Request {
+            request,
+            scope_hash,
+            ..
+        } => {
+            let (status, body) = http.run(request)?;
+            let resp = http::Response::builder()
+                .status(status)
+                .body(body)
+                .context("build GCS token response")?;
+            let token = provider
+                .parse_token_response(scope_hash, resp)
+                .map_err(|e| anyhow::anyhow!("failed to parse GCS token response: {e}"))?;
+            Ok(token.access_token)
+        }
+    }
+}
+
 fn gcs_err(e: tame_gcs::Error) -> anyhow::Error {
     anyhow::anyhow!("GCS request build failed: {e}")
 }
@@ -429,7 +459,7 @@ mod tests {
     /// A throwaway provider built from a syntactically-valid (but non-functional)
     /// service-account key — enough to construct a `Gcs` for the URL/path tests, which
     /// never actually request a token.
-    fn dummy_auth() -> ServiceAccountProvider {
+    fn dummy_auth() -> GcsAuth {
         // A minimal RSA private key (PKCS#8) generated for tests only — never used to
         // sign a real request here. Parsing it just has to succeed.
         let json = r#"{
@@ -443,6 +473,6 @@ mod tests {
             "token_uri": "https://oauth2.googleapis.com/token"
         }"#;
         let info = ServiceAccountInfo::deserialize(json).unwrap();
-        ServiceAccountProvider::new(info).unwrap()
+        GcsAuth::ServiceAccount(ServiceAccountProvider::new(info).unwrap())
     }
 }
