@@ -281,6 +281,21 @@ impl Nidus {
         self.store.compact()
     }
 
+    /// Adopt a separate writer's newer committed state into a lock-free
+    /// [`ReadOnly`](OpenMode::ReadOnly) handle without reopening the store. A `ReadOnly`
+    /// handle is a consistent snapshot taken when it opened; `refresh` advances it to the
+    /// store's current committed state — picking up the writer's appends, seals, deletes,
+    /// and compactions — at a single consistent point (never a torn mix).
+    ///
+    /// Returns `Ok(true)` when newer state was adopted and `Ok(false)` when the handle was
+    /// already current — the cheap common case, a single small manifest read plus a `log`
+    /// stat, so it is safe to call before a batch of queries. A `ReadWrite` handle (already
+    /// the source of truth) and an in-memory store always return `Ok(false)`. This is the
+    /// basis for a search-only process tracking a store another process is writing.
+    pub fn refresh(&mut self) -> Result<bool> {
+        self.store.refresh()
+    }
+
     /// Write the approximate-nearest-neighbour index ([`Config::ann`]) to its on-disk
     /// cache so the next [`open`](Self::open) loads it instead of rebuilding the graph
     /// (the expensive part of opening an ANN store). This is an explicit, out-of-band

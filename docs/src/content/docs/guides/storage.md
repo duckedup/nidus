@@ -161,6 +161,38 @@ never a torn read — even while the writer is mid-append: a not-yet-named segme
 row past *S* is simply invisible until its commit. This is the lock-free basis for
 search-only processes reading a store another process is writing.
 
+### Refreshing a reader
+
+A `ReadOnly` snapshot is fixed at the moment it opened. To pick up a writer's later
+commits — appends, deletes, seals, compactions — without reopening, call
+[`refresh()`](/reference/api/#refresh):
+
+```rust
+use nidus::{Config, Nidus, OpenMode, Scope, SearchOpts};
+
+let mut reader = Nidus::open(
+    Config::new("/path/to/store", 768).open_mode(OpenMode::ReadOnly),
+)?;
+
+// … later, after another process has written more …
+let query = vec![0.0; 768];
+if reader.refresh()? {
+    // newer state adopted; queries now see it
+}
+let hits = reader.search(Scope::All, &query, &SearchOpts::default())?;
+# let _ = hits;
+# anyhow::Ok(())
+```
+
+`refresh` re-reads the `manifest` and, when a newer version is published (a seal or
+compaction) or the `log` has grown (an append or delete), re-opens the segment set and
+replays the log into a fresh index at a single consistent point — then swaps it in
+**atomically** (a failure leaves the prior snapshot serving, never a torn mix). It
+returns `true` when newer state was adopted and `false` when the reader was already
+current — the cheap common case (a small `manifest` read plus a `log` stat, no segment
+or index work), so it is safe to call before a batch of queries. A `ReadWrite` handle is
+already the source of truth, so its `refresh` is always a no-op.
+
 Only one **writer** (`OpenMode::ReadWrite`, the default) may hold a store at a
 time, enforced by the `O_EXCL` `lock` file. A stale lock left by a crashed writer
 is reclaimed after [`Config::lock_ttl`](/reference/configuration/#lock_ttl)

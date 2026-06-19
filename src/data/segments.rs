@@ -153,6 +153,14 @@ impl Segments {
         self.segs.last().unwrap().data.row_count()
     }
 
+    /// The manifest version this segment set was loaded/sealed at — the Phase-4
+    /// reader-refresh signal (SPEC §14.6): a [`ReadOnly`](crate::OpenMode::ReadOnly) reader
+    /// adopts a newer manifest when the on-disk version exceeds this. Bumped on every
+    /// seal/rewrite (the structural commits); plain appends leave it unchanged.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
     /// `(base, rows)` for each segment in global-row order — the last entry is the active
     /// (appendable) segment. Lets the store align a per-segment IVF index to each segment's
     /// global row range `[base, base + rows)` (SPEC §14.3) without exposing segment internals.

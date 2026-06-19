@@ -171,6 +171,7 @@ impl Nidus {
 
     pub fn flush(&mut self) -> Result<()>;     // fsync both files
     pub fn compact(&mut self) -> Result<()>;   // reclaim dead rows / log churn
+    pub fn refresh(&mut self) -> Result<bool>; // ReadOnly: adopt a writer's newer state (§14.6)
 }
 
 /// Which collections a search ranks over. Scores are comparable across
@@ -371,7 +372,10 @@ record's referenced row is already durable in `data`.
 A reader process opens by reading `data` (size S → `S/dim` rows) then replaying
 `log`, and **ignores any record referencing a row ≥ S/dim**. Result: a consistent,
 possibly-slightly-stale snapshot of whatever was committed when it read — never a
-torn vector, never a half-record. No read lock required.
+torn vector, never a half-record. No read lock required. The snapshot is advanced in
+place by `Nidus::refresh()` (§14.6 phase 4), which re-applies this same rule at a newer
+manifest version without reopening — the basis for a search-only process tracking a store
+another process is writing.
 
 ### 6.3 Writer/writer exclusion — best-effort, pure std
 Two concurrent writers would corrupt the append stream. A writer acquires
@@ -665,9 +669,10 @@ build until a real need exists.
   into immutable **segments** + a write-ahead log + a manifest, so scaling (datasets past
   one node's RAM, incremental cloud writes, cooperating instances) becomes a *quantity* of
   one architecture rather than a separate mode. Brute-force stays the exact default for the
-  small/recent tail; an IVF index covers the cold bulk. **Phase 1 (the segment format,
-  manifest, and WAL→segment sealing) is built — see §14**; the later phases (per-segment IVF,
-  mmap, reader-refresh, cluster) are designed in §14 but not yet built.
+  small/recent tail; an IVF index covers the cold bulk. **Phases 1–4 (the segment format +
+  manifest + WAL→segment sealing, per-segment IVF, per-segment mmap, and manifest-versioned
+  reader refresh) are built — see §14**; the remaining phase (cluster) is designed in §14 but
+  not yet built.
 
 ---
 
@@ -1021,7 +1026,7 @@ minute — CI asserts it (§9, the build-time gate).**
 
 ---
 
-## 14. Scaling the storage model: segments (Phases 1–3 built; later phases proposed)
+## 14. Scaling the storage model: segments (Phases 1–4 built; cluster proposed)
 
 nidus's thesis is **ease and a local→cloud continuum** (§1): the same store and the same
 API run on a laptop and, by changing a location string, on a shared object store. The
@@ -1032,10 +1037,10 @@ limit. This section describes the storage model that turns **scale into a quanti
 architecture rather than a separate mode**. It evolves over the existing seams (the §9 mmap
 seam, the append-only format), not a rewrite, and changes no public API (§4).
 
-**Phases 1–3 are built** (the segment format + manifest + WAL→segment sealing; the
-per-segment IVF / exhaustive-tail split; and per-segment mmap — §14.6). The remaining phases
-(reader-refresh, cluster) are designed here but not yet built; each is additive over the same
-on-disk format.
+**Phases 1–4 are built** (the segment format + manifest + WAL→segment sealing; the
+per-segment IVF / exhaustive-tail split; per-segment mmap; and manifest-versioned reader
+refresh — §14.6). The remaining phase (cluster) is designed here but not yet built; it is
+additive over the same on-disk format.
 
 ### 14.1 Principle: the durable objects are the store; a process is a cache over them
 
@@ -1155,7 +1160,12 @@ single-node payoff before any distribution work:
    segment is served from a read-only memory-map (the §9 mmap seam scoped to a segment) while
    the active segment stays in RAM; cold segments page in on touch. Local-FS + little-endian +
    sealed-segments only; off by default; results are identical to the RAM path. See §9.
-4. **Manifest-versioned reader refresh.** Readers detect a newer manifest and adopt it atomically.
+4. **Manifest-versioned reader refresh.** *(built)* A lock-free `ReadOnly` reader adopts a
+   separate writer's newer committed state in place via `Nidus::refresh()` — no reopen. It
+   re-reads the manifest and, when the version advanced (a seal/compaction) or the `log` grew
+   (an append/delete), re-opens the segment set and replays the log into a fresh in-RAM index
+   at one consistent point, swapping it in atomically (a failure leaves the prior snapshot
+   serving). Returns whether newer state was adopted; a writer / in-memory store is a no-op.
 5. **Cluster mode.** Shared backend + writer lease (heartbeat over nidus-a7c) + fencing of
    segment/manifest writes; readers refresh per phase 4.
 
@@ -1176,8 +1186,9 @@ migrated**: `data` becomes the base segment and a manifest is written on open (R
 a ReadOnly open reads through a synthesized in-RAM manifest and writes nothing).
 
 **Consistency.** A reader always sees a single manifest version — the exact live segment set
-at the version it loaded, never a torn mix — and (phase 4) will move to a newer manifest
-atomically (swap the manifest pointer, then drop segments no longer referenced). This
-preserves the §6 crash-safety and lock-free-reader guarantees: a half-written or
-not-yet-named segment is invisible until its manifest commit, exactly as a row past size `S`
-is today.
+at the version it loaded, never a torn mix — and (phase 4, `Nidus::refresh()`) moves to a
+newer manifest atomically: it builds the new segment set + replayed index into locals and
+swaps them in only once every fallible step succeeds, then drops segments no longer
+referenced (a failure mid-refresh leaves the prior snapshot serving). This preserves the §6
+crash-safety and lock-free-reader guarantees: a half-written or not-yet-named segment is
+invisible until its manifest commit, exactly as a row past size `S` is today.

@@ -526,6 +526,7 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         in_memory: true,
         row_to_doc: Vec::new(),
         scan_order: std::sync::RwLock::new(None),
+        loaded_log_offset: 0,
     };
     store.create_collection("col").unwrap();
     store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
@@ -3401,6 +3402,298 @@ fn orphan_segment_not_in_manifest_is_ignored() {
         4,
         "data intact at pre-crash state"
     );
+}
+
+// ── Manifest-versioned reader refresh (SPEC §14.6 phase 4) ──────────────────
+
+/// Open a lock-free `ReadOnly` reader over `path` — the search-only handle that tracks a
+/// separate writer via [`Store::refresh`]. Auto-compaction is off (a reader never compacts).
+fn open_reader(path: &std::path::Path, dim: usize) -> Store {
+    Store::open(
+        Config::new(path, dim)
+            .open_mode(OpenMode::ReadOnly)
+            .auto_compact(None),
+    )
+    .unwrap()
+}
+
+/// The `(id, score)` ranking a search returns — the comparable shape for parity assertions.
+fn ranking(store: &Store, query: &[f32], k: usize) -> Vec<(String, f32)> {
+    store
+        .search(&["col"], query, &default_opts(k))
+        .unwrap()
+        .into_iter()
+        .map(|h| (h.id, h.score))
+        .collect()
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn refresh_adopts_a_writers_appends() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let mut w = Store::open(Config::new(&path, 2).auto_compact(None)).unwrap();
+    w.create_collection("col").unwrap();
+    w.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+
+    // The reader opens at a snapshot that holds only "a".
+    let mut r = open_reader(&path, 2);
+    assert_eq!(r.get_all("col").len(), 1);
+
+    // The writer commits a second doc. The reader does not see it until it refreshes.
+    w.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
+    let before = ranking(&r, &[0.0, 1.0], 5);
+    assert_eq!(before.len(), 1, "still the open-time snapshot");
+    assert_eq!(before[0].0, "a");
+
+    assert!(r.refresh().unwrap(), "refresh adopts the new write");
+    let after = ranking(&r, &[0.0, 1.0], 5);
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0].0, "b");
+    assert!((after[0].1 - 1.0).abs() < 1e-5);
+
+    // Idempotent: with nothing newer committed, a second refresh is a cheap no-op.
+    assert!(!r.refresh().unwrap(), "already current");
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn refresh_is_a_noop_when_nothing_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let mut w = Store::open(Config::new(&path, 2).auto_compact(None)).unwrap();
+    w.create_collection("col").unwrap();
+    w.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+
+    let mut r = open_reader(&path, 2);
+    assert!(!r.refresh().unwrap(), "nothing committed since open");
+    assert!(!r.refresh().unwrap(), "still current");
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn refresh_adopts_deletes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let mut w = Store::open(Config::new(&path, 2).auto_compact(None)).unwrap();
+    w.create_collection("col").unwrap();
+    w.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+    w.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
+
+    let mut r = open_reader(&path, 2);
+    assert_eq!(r.get_all("col").len(), 2);
+
+    w.delete("col", &["a"]).unwrap();
+    assert!(r.refresh().unwrap(), "the delete is adopted");
+    let ids: Vec<String> = r.get_all("col").into_iter().map(|rec| rec.id).collect();
+    assert_eq!(ids, vec!["b".to_string()]);
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn refresh_adopts_a_seal_and_matches_a_fresh_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    // Seal every 3 active rows so the writer grows multiple segments.
+    let mut w = Store::open(
+        Config::new(&path, 2)
+            .auto_compact(None)
+            .segment_max_rows(Some(3)),
+    )
+    .unwrap();
+    for record in angled(2) {
+        w.upsert("col", &[record]).unwrap();
+    }
+    let mut r = open_reader(&path, 2);
+    assert_eq!(
+        r.data.segment_count(),
+        1,
+        "reader opened on a single segment"
+    );
+
+    // Drive the writer past two seal points.
+    for record in angled(8).into_iter().skip(2) {
+        w.upsert("col", &[record]).unwrap();
+    }
+    w.flush().unwrap();
+    assert!(w.data.segment_count() >= 2, "writer sealed at least once");
+
+    assert!(
+        r.refresh().unwrap(),
+        "the seal advances the manifest version"
+    );
+    assert_eq!(
+        r.data.segment_count(),
+        w.data.segment_count(),
+        "reader adopts the new segment set"
+    );
+    assert_eq!(r.data.version(), w.data.version());
+
+    // Search parity against a reader freshly opened over the same on-disk store.
+    let fresh = open_reader(&path, 2);
+    for q in random_unit_vectors(12, 2, 5) {
+        assert_eq!(ranking(&r, &q, 6), ranking(&fresh, &q, 6), "query {q:?}");
+    }
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn refresh_adopts_a_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let mut w = Store::open(Config::new(&path, 3).auto_compact(None)).unwrap();
+    w.create_collection("col").unwrap();
+    w.upsert("col", &[rec("a", vec![1.0, 0.0, 0.0])]).unwrap();
+    w.upsert("col", &[rec("b", vec![0.0, 1.0, 0.0])]).unwrap();
+    // Overwrite "a" → one dead row.
+    w.upsert("col", &[rec("a", vec![0.0, 0.0, 1.0])]).unwrap();
+
+    let mut r = open_reader(&path, 3);
+    assert_eq!(r.dead_rows, 1, "reader sees the dead row pre-compaction");
+
+    w.compact().unwrap();
+    assert!(r.refresh().unwrap(), "the compaction is adopted");
+    assert_eq!(r.dead_rows, 0, "compaction reclaimed the dead row");
+
+    // The compacted store still answers correctly through the reader.
+    let hits = r
+        .search(&["col"], &[0.0, 0.0, 1.0], &default_opts(5))
+        .unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].id, "a");
+    let fresh = open_reader(&path, 3);
+    for q in random_unit_vectors(8, 3, 9) {
+        assert_eq!(ranking(&r, &q, 5), ranking(&fresh, &q, 5));
+    }
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn refresh_is_a_noop_on_a_writer_and_in_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let mut w = Store::open(Config::new(&path, 2).auto_compact(None)).unwrap();
+    w.create_collection("col").unwrap();
+    w.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+    assert!(
+        !w.refresh().unwrap(),
+        "a writer is already the source of truth"
+    );
+
+    let mut mem = Store::in_memory(2).unwrap();
+    mem.create_collection("col").unwrap();
+    assert!(!mem.refresh().unwrap(), "an in-memory store has no backend");
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn refresh_keeps_recall_with_per_segment_indexing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let dim = 8;
+    let data = random_unit_vectors(240, dim, 3);
+
+    // Writer seals every 64 rows and IVF-indexes any sealed segment ≥ 64 rows (cold), while
+    // the active tail stays exact (SPEC §14.3).
+    let mut w = Store::open(
+        Config::new(&path, dim)
+            .auto_compact(None)
+            .segment_max_rows(Some(64))
+            .segment_index_min_rows(Some(64)),
+    )
+    .unwrap();
+    for (i, v) in data.iter().enumerate().take(80) {
+        w.upsert("col", &[rec(&format!("d{i}"), v.clone())])
+            .unwrap();
+    }
+
+    let mut r = Store::open(
+        Config::new(&path, dim)
+            .open_mode(OpenMode::ReadOnly)
+            .auto_compact(None)
+            .segment_max_rows(Some(64))
+            .segment_index_min_rows(Some(64)),
+    )
+    .unwrap();
+
+    // Writer commits the rest, sealing and indexing further cold segments.
+    for (i, v) in data.iter().enumerate().skip(80) {
+        w.upsert("col", &[rec(&format!("d{i}"), v.clone())])
+            .unwrap();
+    }
+    w.flush().unwrap();
+    assert!(r.refresh().unwrap());
+
+    // The refreshed reader matches a fresh reader over the same store, indexes and all.
+    let fresh = Store::open(
+        Config::new(&path, dim)
+            .open_mode(OpenMode::ReadOnly)
+            .auto_compact(None)
+            .segment_max_rows(Some(64))
+            .segment_index_min_rows(Some(64)),
+    )
+    .unwrap();
+    for q in random_unit_vectors(15, dim, 11) {
+        assert_eq!(ranking(&r, &q, 10), ranking(&fresh, &q, 10), "query {q:?}");
+    }
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn refresh_composes_with_a_memory_mapped_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let dim = 16;
+    let data = random_unit_vectors(300, dim, 4);
+
+    let mut w = Store::open(
+        Config::new(&path, dim)
+            .auto_compact(None)
+            .segment_max_rows(Some(64)),
+    )
+    .unwrap();
+    for (i, v) in data.iter().enumerate().take(70) {
+        w.upsert("col", &[rec(&format!("d{i}"), v.clone())])
+            .unwrap();
+    }
+    w.flush().unwrap();
+
+    // A memory-mapped reader: immutable segments are mapped from disk, the active stays RAM.
+    let mut r = Store::open(
+        Config::new(&path, dim)
+            .open_mode(OpenMode::ReadOnly)
+            .auto_compact(None)
+            .segment_max_rows(Some(64))
+            .mmap(true),
+    )
+    .unwrap();
+
+    for (i, v) in data.iter().enumerate().skip(70) {
+        w.upsert("col", &[rec(&format!("d{i}"), v.clone())])
+            .unwrap();
+    }
+    w.flush().unwrap();
+    assert!(
+        r.refresh().unwrap(),
+        "the mapped reader adopts the new segments"
+    );
+
+    let fresh = Store::open(
+        Config::new(&path, dim)
+            .open_mode(OpenMode::ReadOnly)
+            .auto_compact(None)
+            .segment_max_rows(Some(64))
+            .mmap(true),
+    )
+    .unwrap();
+    for q in random_unit_vectors(15, dim, 13) {
+        assert_eq!(ranking(&r, &q, 10), ranking(&fresh, &q, 10), "query {q:?}");
+    }
 }
 
 // ── Live object-store backing + shared memory tier (Miri-clean: all in-RAM) ──────
