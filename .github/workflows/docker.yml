@@ -1,12 +1,25 @@
 name: Docker
 
-# Publish the `nidus serve` image to Docker Hub. Fires when the release workflow
-# pushes a `v<version>` tag (so the image version always matches a real release),
-# and can be run by hand against any ref.
+# Build and push the `nidus serve` image to Docker Hub.
+#
+# NOT triggered by `push: tags`: the release workflow creates the `v<version>` tag
+# with the default GITHUB_TOKEN, and GitHub deliberately does not start a new workflow
+# run from a GITHUB_TOKEN-pushed tag (the anti-recursion rule). So `release.yml` calls
+# this workflow directly (workflow_call) once it has cut a release. It can also be run
+# by hand (workflow_dispatch) to (re)publish a specific version.
 on:
-  push:
-    tags: ["v*"]
+  workflow_call:
+    inputs:
+      version:
+        description: "Released version to tag the image with, e.g. 0.25.0 (no leading v)."
+        required: true
+        type: string
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to tag the image with. Defaults to Cargo.toml's version."
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -15,31 +28,37 @@ jobs:
   publish:
     name: Build and push image
     runs-on: ubuntu-latest
-    # Skip cleanly on a fork / PR where the Docker Hub secrets aren't configured,
-    # rather than failing the login step.
+    # Skip cleanly on a fork where the Docker Hub secrets aren't configured.
     if: ${{ github.repository == 'duckedup/nidus' }}
     steps:
       - uses: actions/checkout@v6
 
-      # The image repo. Override with a `DOCKERHUB_IMAGE` repo variable (e.g. if the
-      # Docker Hub namespace differs); defaults to the canonical name.
-      - name: Resolve image name
-        id: image
-        run: echo "name=${DOCKERHUB_IMAGE:-duckedup/nidus}" >> "$GITHUB_OUTPUT"
+      # Resolve the version (call input wins; manual runs fall back to Cargo.toml),
+      # its moving minor (1.2 from 1.2.3), and the image repo. Override the repo with a
+      # `DOCKERHUB_IMAGE` variable (e.g. a different Docker Hub namespace).
+      - name: Resolve version and image name
+        id: vars
+        run: |
+          VERSION="${{ inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "minor=$(echo "$VERSION" | cut -d. -f1,2)" >> "$GITHUB_OUTPUT"
+          echo "image=${DOCKERHUB_IMAGE:-duckedup/nidus}" >> "$GITHUB_OUTPUT"
         env:
           DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
 
       # Tags: the released version (1.2.3), the moving minor (1.2), and `latest`.
-      # Derived from the git tag by metadata-action.
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ steps.image.outputs.name }}
+          images: ${{ steps.vars.outputs.image }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=${{ steps.vars.outputs.version }}
+            type=raw,value=${{ steps.vars.outputs.minor }}
+            type=raw,value=latest
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

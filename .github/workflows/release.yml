@@ -212,3 +212,15 @@ jobs:
           ### Changes
 
           $NOTES"
+
+  # The tag above is pushed with GITHUB_TOKEN, which cannot trigger the Docker
+  # workflow on its own (the anti-recursion rule). So call it directly here, once a
+  # release has actually been cut, to build and push the matching image.
+  publish-docker:
+    name: Publish Docker image
+    needs: [check-version, github-release]
+    if: "!failure() && !cancelled() && needs.check-version.outputs.should_release == 'true'"
+    uses: ./.github/workflows/docker.yml
+    with:
+      version: ${{ needs.check-version.outputs.version }}
+    secrets: inherit
