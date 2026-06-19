@@ -1026,7 +1026,7 @@ minute — CI asserts it (§9, the build-time gate).**
 
 ---
 
-## 14. Scaling the storage model: segments (Phases 1–4 built; cluster proposed)
+## 14. Scaling the storage model: segments (Phases 1–5 built)
 
 nidus's thesis is **ease and a local→cloud continuum** (§1): the same store and the same
 API run on a laptop and, by changing a location string, on a shared object store. The
@@ -1037,10 +1037,9 @@ limit. This section describes the storage model that turns **scale into a quanti
 architecture rather than a separate mode**. It evolves over the existing seams (the §9 mmap
 seam, the append-only format), not a rewrite, and changes no public API (§4).
 
-**Phases 1–4 are built** (the segment format + manifest + WAL→segment sealing; the
-per-segment IVF / exhaustive-tail split; per-segment mmap; and manifest-versioned reader
-refresh — §14.6). The remaining phase (cluster) is designed here but not yet built; it is
-additive over the same on-disk format.
+**Phases 1–5 are built** (the segment format + manifest + WAL→segment sealing; the
+per-segment IVF / exhaustive-tail split; per-segment mmap; manifest-versioned reader refresh;
+and cluster mode — §14.6), each additive over the same on-disk format.
 
 ### 14.1 Principle: the durable objects are the store; a process is a cache over them
 
@@ -1136,14 +1135,16 @@ a segment is the natural object boundary for a batch).
 - **Larger than one node's RAM:** hold/mmap a subset of segments; cold segments stay on the
   backend until touched.
 - **Incremental cloud writes:** one new segment per batch — no whole-object rewrite (§13.7).
-- **Cooperating instances (cluster):** the segments + WAL + manifest on a *shared* backend
-  are the shared truth; instances are stateless caches over them. One writer appends segments
-  and advances the manifest — elected by the §6.3 writer lock (race-free over object stores,
-  nidus-a7c); readers serve from their cached subset and **refresh when the manifest version
-  advances**. Cluster mode is then a *consequence* of this model — a shared backend plus a
-  versioned manifest — not a parallel architecture. It requires a shared persistence backend
-  **and** a shared memory tier; local FS / local RAM are single-node by definition and are
-  rejected for cluster mode.
+- **Cooperating instances (cluster):** *(built — `Config::cluster`)* the segments + WAL +
+  manifest on a *shared* backend are the shared truth; instances are stateless caches over
+  them. One writer appends segments and advances the manifest — holding a heartbeated lease
+  evolved from the §6.3 writer lock (race-free over object stores, nidus-a7c), renewed
+  op-driven and fencing a superseded writer; readers serve from their cached subset and
+  **refresh when the manifest version advances** (which it does on every commit — the
+  universal commit counter). Cluster mode is a *consequence* of this model — a shared backend
+  plus a versioned manifest — not a parallel architecture. It requires a shared persistence
+  backend **and** a shared memory tier; local FS / local RAM are single-node by definition and
+  are rejected for cluster mode.
 
 Each phase is additive over the format and shippable alone; the order front-loads the
 single-node payoff before any distribution work:
@@ -1166,8 +1167,17 @@ single-node payoff before any distribution work:
    (an append/delete), re-opens the segment set and replays the log into a fresh in-RAM index
    at one consistent point, swapping it in atomically (a failure leaves the prior snapshot
    serving). Returns whether newer state was adopted; a writer / in-memory store is a no-op.
-5. **Cluster mode.** Shared backend + writer lease (heartbeat over nidus-a7c) + fencing of
-   segment/manifest writes; readers refresh per phase 4.
+5. **Cluster mode.** *(built)* Cooperating instances over one **shared** backend, enabled by
+   `Config::cluster` (rejected unless persistence is a shared object store **and** a shared
+   memory tier is set — local FS / process RAM are single-node). One `ReadWrite` writer holds
+   a **lease** (the §6.3 object lock evolved: it carries an owner token and is **renewed on
+   every write batch** — op-driven, no background thread — so an active writer keeps it while
+   an idle one past the TTL can be taken over); the renewal **fences** a superseded writer,
+   which fails its next write rather than clobbering. Every commit advances the manifest
+   version (the universal **commit counter**), so any number of `ReadOnly` readers pick up the
+   writer's changes with a single manifest read via `refresh()` (phase 4). It is not a managed
+   cluster — no coordinator, replication, or rebalancing; the object store plus the versioned
+   manifest *are* the coordination.
 
 **Phase-1 on-disk model (built).** A store is `manifest` + N segment objects + `log` (the
 WAL). Each segment carries the existing §5.1 header (magic/version/dim/distance) + f32 rows;

@@ -515,6 +515,7 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         persistence: None,
         memory: None,
         lock: None,
+        lease: None,
         collections: HashMap::new(),
         dead_rows: 0,
         quant: None,
@@ -3696,6 +3697,18 @@ fn refresh_composes_with_a_memory_mapped_reader() {
     }
 }
 
+#[cfg_attr(miri, ignore)]
+#[test]
+fn cluster_mode_rejects_a_local_filesystem_store() {
+    // Cluster mode needs a shared backend; a local-FS store is single-node and is refused
+    // with a clear error (the shared-memory check is never reached).
+    let dir = tempfile::tempdir().unwrap();
+    let Err(err) = Store::open(Config::new(dir.path(), 2).cluster(true)) else {
+        panic!("a local-filesystem cluster store must be rejected");
+    };
+    assert!(err.to_string().contains("object-store"), "{err}");
+}
+
 // ── Live object-store backing + shared memory tier (Miri-clean: all in-RAM) ──────
 //
 // Exercises the whole-object live-backing path (ObjectAppender rewrites the whole
@@ -3740,6 +3753,17 @@ mod object_backed {
             let mut keys: Vec<String> = self.objects.lock().unwrap().keys().cloned().collect();
             keys.sort();
             Ok(keys)
+        }
+        fn try_create_exclusive(&self, key: &str, bytes: &[u8]) -> Result<Option<bool>> {
+            // Atomic create-if-absent under the map lock — the race-free primitive S3/GCS give
+            // (S3 If-None-Match:*, GCS ifGenerationMatch=0), so the cluster lease takes its
+            // race-free path in tests rather than the advisory fallback.
+            let mut objs = self.objects.lock().unwrap();
+            if objs.contains_key(key) {
+                return Ok(Some(false));
+            }
+            objs.insert(key.to_string(), bytes.to_vec());
+            Ok(Some(true))
         }
         fn try_lock(&self, _key: &str, _ttl: Duration) -> Result<Option<Box<dyn BackendLock>>> {
             bail!("InMemObjectStore has no native lock — advisory lock is used instead")
@@ -3809,9 +3833,9 @@ mod object_backed {
 
         let first = Store::open_with(cfg(), "s3://bucket/store", backend.clone(), None).unwrap();
         // A second writer over the same backend is refused while the first holds the lock.
-        let err = Store::open_with(cfg(), "s3://bucket/store", backend.clone(), None)
-            .err()
-            .expect("second open must be locked out");
+        let Err(err) = Store::open_with(cfg(), "s3://bucket/store", backend.clone(), None) else {
+            panic!("second open must be locked out");
+        };
         assert!(err.to_string().contains("locked"), "{err}");
 
         // Releasing the first lets a new writer in.
@@ -3820,5 +3844,190 @@ mod object_backed {
             Store::open_with(cfg(), "s3://bucket/store", backend.clone(), None).is_ok(),
             "lock is reclaimable after the holder drops"
         );
+    }
+
+    // ── Cluster mode: shared backend + writer lease + commit-counter refresh (§14.6 ph5) ──
+
+    fn cluster_cfg() -> Config {
+        cfg().cluster(true)
+    }
+
+    /// A cluster writer over a shared object backend + shared tier.
+    fn cluster_writer(backend: &Arc<dyn Persistence>, tier: &Arc<LocalRam>) -> Store {
+        let mem: Box<dyn MemoryTier> = Box::new(tier.clone());
+        Store::open_with(
+            cluster_cfg(),
+            "s3://bucket/store",
+            backend.clone(),
+            Some(mem),
+        )
+        .unwrap()
+    }
+
+    /// A lock-free cluster reader over the same shared backend + tier.
+    fn cluster_reader(backend: &Arc<dyn Persistence>, tier: &Arc<LocalRam>) -> Store {
+        let mem: Box<dyn MemoryTier> = Box::new(tier.clone());
+        Store::open_with(
+            cluster_cfg().open_mode(OpenMode::ReadOnly),
+            "s3://bucket/store",
+            backend.clone(),
+            Some(mem),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cluster_mode_requires_a_shared_memory_tier() {
+        let backend: Arc<dyn Persistence> = Arc::new(InMemObjectStore::default());
+        // Object-store persistence is fine, but with no shared memory tier cluster is rejected.
+        let Err(err) = Store::open_with(cluster_cfg(), "s3://bucket/store", backend.clone(), None)
+        else {
+            panic!("cluster without a memory tier must be rejected");
+        };
+        assert!(err.to_string().contains("shared memory tier"), "{err}");
+    }
+
+    #[test]
+    fn cluster_writer_lease_excludes_a_second_writer() {
+        let backend: Arc<dyn Persistence> = Arc::new(InMemObjectStore::default());
+        let tier = Arc::new(LocalRam::new());
+
+        let first = cluster_writer(&backend, &tier);
+        // A second cluster writer over the same backend is fenced out by the live lease.
+        let mem: Box<dyn MemoryTier> = Box::new(tier.clone());
+        let Err(err) = Store::open_with(
+            cluster_cfg(),
+            "s3://bucket/store",
+            backend.clone(),
+            Some(mem),
+        ) else {
+            panic!("second cluster writer must be locked out");
+        };
+        assert!(err.to_string().contains("locked"), "{err}");
+
+        // Releasing the first lets a new writer take the lease.
+        drop(first);
+        let mem: Box<dyn MemoryTier> = Box::new(tier.clone());
+        assert!(
+            Store::open_with(
+                cluster_cfg(),
+                "s3://bucket/store",
+                backend.clone(),
+                Some(mem)
+            )
+            .is_ok(),
+            "lease is reclaimable after the holder drops"
+        );
+    }
+
+    #[test]
+    fn cluster_lease_renews_across_many_batches() {
+        let backend: Arc<dyn Persistence> = Arc::new(InMemObjectStore::default());
+        let tier = Arc::new(LocalRam::new());
+        let mut w = cluster_writer(&backend, &tier);
+        w.create_collection("col").unwrap();
+        // Many sequential batches: op-driven renewal must keep the lease alive throughout
+        // (no background thread), so none of these errors.
+        for i in 0..25 {
+            w.upsert("col", &[rec(&format!("d{i}"), vec![1.0, 0.0, 0.0])])
+                .unwrap();
+        }
+        w.flush().unwrap();
+        assert_eq!(w.get_all("col").len(), 25);
+    }
+
+    #[test]
+    fn cluster_lease_fences_a_superseded_writer() {
+        let backend: Arc<dyn Persistence> = Arc::new(InMemObjectStore::default());
+        let tier = Arc::new(LocalRam::new());
+        let mut w = cluster_writer(&backend, &tier);
+        w.create_collection("col").unwrap();
+        w.upsert("col", &[rec("a", vec![1.0, 0.0, 0.0])]).unwrap();
+
+        // Simulate a peer taking over the lease while this writer was paused (a fresh stamp
+        // under a *different* owner — what a stale-reclaim by another instance writes).
+        backend.put("lock", b"9999999999 other-writer-77").unwrap();
+
+        // The next mutation renews-and-fences first, so it errors before clobbering the store.
+        let err = w
+            .upsert("col", &[rec("b", vec![0.0, 1.0, 0.0])])
+            .expect_err("a superseded writer must be fenced");
+        assert!(err.to_string().contains("lease lost"), "{err}");
+        // The fenced write left no trace: "b" never landed.
+        assert_eq!(w.get_all("col").len(), 1);
+    }
+
+    #[test]
+    fn cluster_reader_refreshes_on_every_commit() {
+        let backend: Arc<dyn Persistence> = Arc::new(InMemObjectStore::default());
+        let tier = Arc::new(LocalRam::new());
+
+        let mut w = cluster_writer(&backend, &tier);
+        w.create_collection("col").unwrap();
+        w.upsert("col", &[rec("a", vec![1.0, 0.0, 0.0])]).unwrap();
+
+        let mut r = cluster_reader(&backend, &tier);
+        assert_eq!(r.get_all("col").len(), 1);
+        let v0 = r.data.version();
+
+        // A *plain* append (no seal) — on an object store this bumps neither the log's
+        // visible length nor (pre-phase-5) the manifest. The commit-counter makes it visible.
+        w.upsert("col", &[rec("b", vec![0.0, 1.0, 0.0])]).unwrap();
+        assert!(
+            r.refresh().unwrap(),
+            "the commit advanced the manifest version"
+        );
+        assert!(r.data.version() > v0, "reader adopted the newer version");
+        assert_eq!(r.get_all("col").len(), 2);
+        let hits = r
+            .search(&["col"], &[0.0, 1.0, 0.0], &default_opts(5))
+            .unwrap();
+        assert_eq!(hits[0].id, "b");
+
+        // Nothing newer committed → a refresh is a no-op.
+        assert!(!r.refresh().unwrap(), "already current");
+    }
+
+    #[test]
+    fn cluster_reader_matches_a_fresh_open_after_refresh() {
+        let backend: Arc<dyn Persistence> = Arc::new(InMemObjectStore::default());
+        let tier = Arc::new(LocalRam::new());
+
+        let mut w = cluster_writer(&backend, &tier);
+        w.create_collection("col").unwrap();
+        w.upsert("col", &[rec("a", vec![1.0, 0.0, 0.0])]).unwrap();
+
+        let mut r = cluster_reader(&backend, &tier);
+
+        // Several more commits: appends, an overwrite, a delete.
+        w.upsert("col", &[rec("b", vec![0.0, 1.0, 0.0])]).unwrap();
+        w.upsert("col", &[rec("c", vec![0.0, 0.0, 1.0])]).unwrap();
+        w.upsert("col", &[rec("a", vec![0.5, 0.5, 0.0])]).unwrap(); // overwrite
+        w.delete("col", &["b"]).unwrap();
+        w.flush().unwrap();
+
+        assert!(r.refresh().unwrap());
+        // The refreshed reader matches a reader freshly opened over the same shared store.
+        let fresh = cluster_reader(&backend, &tier);
+        for q in [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.5, 0.5, 0.0],
+        ] {
+            let got: Vec<(String, f32)> = r
+                .search(&["col"], &q, &default_opts(5))
+                .unwrap()
+                .into_iter()
+                .map(|h| (h.id, h.score))
+                .collect();
+            let exp: Vec<(String, f32)> = fresh
+                .search(&["col"], &q, &default_opts(5))
+                .unwrap()
+                .into_iter()
+                .map(|h| (h.id, h.score))
+                .collect();
+            assert_eq!(got, exp, "query {q:?}");
+        }
     }
 }

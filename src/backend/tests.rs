@@ -204,6 +204,76 @@ fn object_lock_reclaims_a_stale_holder() {
     }
 }
 
+// ── Cluster writer lease (pure/in-RAM, Miri-clean) ──────────────────────────────
+
+#[test]
+fn cluster_lease_excludes_renews_and_releases() {
+    for atomic in [true, false] {
+        let backend = MapBackend::arc(atomic);
+        let ttl = Duration::from_secs(60);
+
+        let lease = ClusterLease::acquire(&backend, "lock", ttl)
+            .unwrap()
+            .expect("first acquire wins");
+        // A second acquire while it is live → contention (Ok(None), not an error).
+        assert!(
+            ClusterLease::acquire(&backend, "lock", ttl)
+                .unwrap()
+                .is_none()
+        );
+        // Renewing keeps it ours (the op-driven heartbeat) — never errors while we own it.
+        lease.renew().unwrap();
+        lease.renew().unwrap();
+        // Drop releases the lease object so a fresh writer can take it.
+        drop(lease);
+        assert!(backend.get("lock").unwrap().is_none(), "released on drop");
+        assert!(
+            ClusterLease::acquire(&backend, "lock", ttl)
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[test]
+fn cluster_lease_renew_fences_a_superseded_writer() {
+    let backend = MapBackend::arc(true);
+    let lease = ClusterLease::acquire(&backend, "lock", Duration::from_secs(60))
+        .unwrap()
+        .unwrap();
+    // A peer takes over (a fresh stamp under a different owner).
+    backend.put("lock", b"9999999999 other-owner").unwrap();
+    // The superseded writer's next renew detects it and refuses — the fence.
+    let err = lease
+        .renew()
+        .expect_err("a superseded lease must fail to renew");
+    assert!(err.to_string().contains("lease lost"), "{err}");
+    // And dropping the fenced lease must NOT delete the peer's lease object.
+    drop(lease);
+    assert_eq!(
+        backend.get("lock").unwrap().as_deref(),
+        Some(&b"9999999999 other-owner"[..])
+    );
+}
+
+#[test]
+fn cluster_lease_renew_reclaims_a_vanished_lease() {
+    for atomic in [true, false] {
+        let backend = MapBackend::arc(atomic);
+        let lease = ClusterLease::acquire(&backend, "lock", Duration::from_secs(60))
+            .unwrap()
+            .unwrap();
+        // The lease object disappears (e.g. a peer found it stale and deleted it, but no one
+        // re-created it). Renew should re-establish our ownership rather than error.
+        backend.delete("lock").unwrap();
+        lease.renew().unwrap();
+        assert!(
+            backend.get("lock").unwrap().is_some(),
+            "lease re-created on renew"
+        );
+    }
+}
+
 // ── LocalFs object ops (file-backed, Miri-ignored) ──────────────────────────────
 
 #[cfg_attr(miri, ignore)]

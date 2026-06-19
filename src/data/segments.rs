@@ -161,6 +161,15 @@ impl Segments {
         self.version
     }
 
+    /// Advance the manifest version by one and return it — the cluster **commit counter**
+    /// (SPEC §14.6 phase 5). In cluster mode the writer calls this on every durable batch so
+    /// the published manifest version strictly increases on *any* change (not just seals), and
+    /// a reader's [`refresh`](crate::Nidus::refresh) detects every commit with one manifest read.
+    pub fn bump_version(&mut self) -> u64 {
+        self.version += 1;
+        self.version
+    }
+
     /// `(base, rows)` for each segment in global-row order — the last entry is the active
     /// (appendable) segment. Lets the store align a per-segment IVF index to each segment's
     /// global row range `[base, base + rows)` (SPEC §14.3) without exposing segment internals.
