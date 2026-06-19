@@ -20,8 +20,8 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::ann::Ann;
 use crate::backend::{
-    Appender, BackendLock, MemoryTier, ObjectAppender, Persistence, advisory_try_lock,
-    locked_error, open_memory_tier, open_persistence,
+    Appender, BackendLock, MemoryTier, ObjectAppender, Persistence, locked_error, object_try_lock,
+    open_memory_tier, open_persistence,
 };
 use crate::config::{Config, OpenMode};
 use crate::data::DataSegment;
@@ -361,8 +361,9 @@ impl Store {
     }
 
     /// Acquire the writer lock: the backend's native `O_EXCL` lock (local files) or, on a
-    /// whole-object store with no native lock, the advisory object lock. Contention is a
-    /// clear "store is locked" error in both cases.
+    /// whole-object store with no native lock, the object lock (race-free conditional-PUT
+    /// where the backend supports it, advisory otherwise). Contention is a clear "store is
+    /// locked" error in both cases.
     fn acquire_lock(
         persistence: &Arc<dyn Persistence>,
         location: &str,
@@ -371,7 +372,7 @@ impl Store {
         let acquired = if persistence.has_native_lock() {
             persistence.try_lock("lock", ttl)?
         } else {
-            advisory_try_lock(persistence, "lock", ttl)?
+            object_try_lock(persistence, "lock", ttl)?
         };
         acquired.ok_or_else(|| locked_error(location))
     }

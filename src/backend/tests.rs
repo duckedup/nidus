@@ -114,6 +114,96 @@ fn open_memory_tier_local_aliases() {
     }
 }
 
+// ── object_try_lock over a whole-object backend (pure/in-RAM, Miri-clean) ───────
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// A whole-object [`Persistence`] backed by an in-RAM map, parameterised by whether it
+/// offers the atomic create-if-absent primitive — so one type exercises both the
+/// race-free conditional-create lock path and the advisory get-then-put fallback.
+struct MapBackend {
+    objects: Mutex<HashMap<String, Vec<u8>>>,
+    atomic_create: bool,
+}
+
+impl MapBackend {
+    fn arc(atomic_create: bool) -> Arc<dyn Persistence> {
+        Arc::new(MapBackend {
+            objects: Mutex::new(HashMap::new()),
+            atomic_create,
+        })
+    }
+}
+
+impl Persistence for MapBackend {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.objects.lock().unwrap().get(key).cloned())
+    }
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), bytes.to_vec());
+        Ok(())
+    }
+    fn delete(&self, key: &str) -> Result<()> {
+        self.objects.lock().unwrap().remove(key);
+        Ok(())
+    }
+    fn list(&self) -> Result<Vec<String>> {
+        Ok(self.objects.lock().unwrap().keys().cloned().collect())
+    }
+    fn try_create_exclusive(&self, key: &str, bytes: &[u8]) -> Result<Option<bool>> {
+        if !self.atomic_create {
+            return Ok(None); // forces the advisory fallback
+        }
+        let mut map = self.objects.lock().unwrap();
+        if map.contains_key(key) {
+            Ok(Some(false)) // already exists — lost the race
+        } else {
+            map.insert(key.to_string(), bytes.to_vec());
+            Ok(Some(true)) // created
+        }
+    }
+    fn try_lock(&self, _key: &str, _ttl: Duration) -> Result<Option<Box<dyn BackendLock>>> {
+        anyhow::bail!("no native lock");
+    }
+    fn has_native_lock(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn object_lock_is_exclusive_and_releases_on_drop() {
+    // Both backends behave the same on the happy path — race-free and advisory.
+    for atomic in [true, false] {
+        let backend = MapBackend::arc(atomic);
+        let ttl = Duration::from_secs(60);
+
+        let guard = object_try_lock(&backend, "lock", ttl).unwrap();
+        assert!(guard.is_some(), "first acquire wins (atomic={atomic})");
+        // A live holder → contention returns Ok(None), never an error.
+        assert!(object_try_lock(&backend, "lock", ttl).unwrap().is_none());
+        // Dropping the guard deletes the lock object, freeing it.
+        drop(guard);
+        assert!(backend.get("lock").unwrap().is_none(), "released on drop");
+        assert!(object_try_lock(&backend, "lock", ttl).unwrap().is_some());
+    }
+}
+
+#[test]
+fn object_lock_reclaims_a_stale_holder() {
+    for atomic in [true, false] {
+        let backend = MapBackend::arc(atomic);
+        // Plant a lock stamped far in the past (a crashed holder).
+        backend.put("lock", b"1").unwrap();
+        // With a zero TTL every existing lock is already stale → reclaimable.
+        let guard = object_try_lock(&backend, "lock", Duration::from_secs(0)).unwrap();
+        assert!(guard.is_some(), "stale lock reclaimed (atomic={atomic})");
+    }
+}
+
 // ── LocalFs object ops (file-backed, Miri-ignored) ──────────────────────────────
 
 #[cfg_attr(miri, ignore)]

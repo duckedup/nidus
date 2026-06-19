@@ -32,9 +32,20 @@ impl Http {
         finish(self.agent.get(url).call().map_err(net_err)?)
     }
 
-    /// `PUT url` with `body`.
-    pub(crate) fn put(&self, url: &str, body: &[u8]) -> Result<(u16, Vec<u8>)> {
-        finish(self.agent.put(url).send(body).map_err(net_err)?)
+    /// `PUT url` with `body` and any extra request `headers` (e.g. a signed
+    /// `If-None-Match: *` for a conditional create — those headers must be sent
+    /// verbatim because they are part of the SigV4 signature).
+    pub(crate) fn put(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<(u16, Vec<u8>)> {
+        let mut req = self.agent.put(url);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        finish(req.send(body).map_err(net_err)?)
     }
 
     /// `DELETE url`.

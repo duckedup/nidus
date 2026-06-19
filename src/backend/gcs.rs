@@ -19,7 +19,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use http::header::{AUTHORIZATION, HeaderValue};
-use tame_gcs::objects::{ListOptional, ListResponse, Object};
+use tame_gcs::common::Conditionals;
+use tame_gcs::objects::{InsertObjectOptional, ListOptional, ListResponse, Object};
 use tame_gcs::{ApiResponse, BucketName, ObjectId};
 use tame_oauth::gcp::{ServiceAccountInfo, ServiceAccountProvider, TokenOrRequest, TokenProvider};
 
@@ -160,6 +161,33 @@ impl Persistence for Gcs {
         }
     }
 
+    fn try_create_exclusive(&self, key: &str, bytes: &[u8]) -> Result<Option<bool>> {
+        validate_key(key)?;
+        let oid = self.object_id(key)?;
+        // `ifGenerationMatch=0` makes the insert succeed only if no live version of the
+        // object exists — GCS's create-if-absent. The conditional is a signed query param
+        // baked into the request URI (no extra header to carry on the wire).
+        let optional = InsertObjectOptional {
+            conditionals: Conditionals {
+                if_generation_match: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let req = Object::default()
+            .insert_simple(&oid, bytes.to_vec(), bytes.len() as u64, Some(optional))
+            .map_err(gcs_err)?;
+        let (status, body) = self.run_authed(req)?;
+        match status {
+            s if (200..300).contains(&s) => Ok(Some(true)), // created — we won the lock
+            412 => Ok(Some(false)), // precondition failed: it already exists — lost the race
+            s => bail!(
+                "GCS conditional insert {key} failed: HTTP {s}: {}",
+                show(&body)
+            ),
+        }
+    }
+
     fn delete(&self, key: &str) -> Result<()> {
         validate_key(key)?;
         let oid = self.object_id(key)?;
@@ -290,6 +318,30 @@ mod tests {
         let uri = req.uri().to_string();
         assert!(uri.contains("/b/my-bucket/o/data"), "{uri}");
         assert!(uri.contains("alt=media"), "{uri}");
+    }
+
+    #[test]
+    fn conditional_insert_uri_carries_if_generation_match_zero() {
+        let gcs = Gcs {
+            bucket: "my-bucket".to_string(),
+            prefix: String::new(),
+            auth: dummy_auth(),
+            http: Http::new(),
+        };
+        let oid = gcs.object_id("lock").unwrap();
+        let optional = InsertObjectOptional {
+            conditionals: Conditionals {
+                if_generation_match: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let req = Object::default()
+            .insert_simple(&oid, b"x".to_vec(), 1, Some(optional))
+            .unwrap();
+        let uri = req.uri().to_string();
+        // The create-if-absent precondition rides as a query param on the insert URI.
+        assert!(uri.contains("ifGenerationMatch=0"), "{uri}");
     }
 
     #[test]
