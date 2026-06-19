@@ -9,7 +9,7 @@ use anyhow::{Result, bail};
 use super::Store;
 use super::scoring::{parallel_topk, score_chunk_bin, score_chunk_i8};
 use crate::ann::Walk;
-use crate::data::DataSegment;
+use crate::data::Segments;
 use crate::model::{Distance, Hit, QuantKind, SearchOpts};
 use crate::search::{QuantParams, TopK, pack_signs, pack_signs_into};
 
@@ -20,7 +20,7 @@ use crate::search::{QuantParams, TopK, pack_signs, pack_signs_into};
 /// while holding `&mut self.ann` for build/insert.
 pub(super) fn ann_walk_for<'a>(
     quant: Option<&'a Quant>,
-    data: &'a DataSegment,
+    data: &'a Segments,
     distance: Distance,
 ) -> Walk<'a> {
     match quant {
@@ -120,13 +120,17 @@ impl Store {
     /// re-fits the scale and re-quantizes; binary repacks sign bits (scale-free).
     pub(super) fn rebuild_quant(&mut self) {
         let dim = self.data.dimension();
+        let row_count = self.data.row_count();
+        // O(N) full rebuild (open/compact/refit): `vectors()` is borrowed for a
+        // single-segment store and concatenated only across multiple segments.
         let all = self.data.vectors();
+        let all: &[f32] = &all;
         match self.quant {
             None => {}
             Some(Quant::Int8(ref mut s)) => {
                 s.params = QuantParams::from_vectors(all);
                 s.vectors = s.params.quantize_all(all);
-                s.params_rows = self.data.row_count();
+                s.params_rows = row_count;
             }
             Some(Quant::Binary(ref mut s)) => {
                 s.words_per_row = dim.div_ceil(64);
@@ -154,22 +158,32 @@ impl Store {
             self.rebuild_quant();
             return;
         }
-        let all = self.data.vectors();
+        // Copy just the batch's new rows out of `data` (O(batch)) before touching the
+        // quant state, so this stays incremental even on a multi-segment store (where the
+        // new rows may span the active segment) and avoids borrowing `data` and `quant` at
+        // once.
+        let new_count = (total - prev_rows) as usize;
+        let mut batch: Vec<f32> = Vec::with_capacity(new_count * dim);
+        for row in prev_rows..total {
+            batch.extend_from_slice(self.data.row(row));
+        }
         match self.quant {
             None => {}
             Some(Quant::Int8(ref mut s)) => {
                 s.vectors.resize(total as usize * dim, 0);
-                for row in prev_rows as usize..total as usize {
-                    let base = row * dim;
-                    let (src, dst) = (&all[base..base + dim], &mut s.vectors[base..base + dim]);
+                for i in 0..new_count {
+                    let src = &batch[i * dim..(i + 1) * dim];
+                    let row = prev_rows as usize + i;
+                    let dst = &mut s.vectors[row * dim..(row + 1) * dim];
                     s.params.quantize(src, dst);
                 }
             }
             Some(Quant::Binary(ref mut s)) => {
                 let wpr = s.words_per_row;
                 s.words.resize(total as usize * wpr, 0);
-                for row in prev_rows as usize..total as usize {
-                    let src = &all[row * dim..(row + 1) * dim];
+                for i in 0..new_count {
+                    let src = &batch[i * dim..(i + 1) * dim];
+                    let row = prev_rows as usize + i;
                     pack_signs_into(src, &mut s.words[row * wpr..(row + 1) * wpr]);
                 }
             }

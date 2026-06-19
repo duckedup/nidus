@@ -22,6 +22,7 @@ let cfg = Config::new("/path/to/store", 768)
     .quantization(None)              // int8 two-pass search (default: off)
     .ann(None)                       // approximate-nearest-neighbour index (default: off)
     .query_threads(1)                // worker threads per exact search (default: 1)
+    .segment_max_rows(None)          // seal the active segment past N rows (default: off)
     .persistence("")                 // durable bytes: "" = local; "s3://…"/"gs://…"
     .memory("");                     // shared working set: "" = local; "redis://…"
 # let _ = cfg;
@@ -114,6 +115,17 @@ parallelizes the from-scratch graph **build** (on `open` with no cache, and on
 Incremental `upsert` and the serial build at `1` are unchanged; note a parallel build
 is non-deterministic (insertion order varies), so a graph built with threads can
 differ slightly from the serial one (recall stays equivalent).
+
+### `segment_max_rows`
+
+`Option<u64>` — default `None`. A store keeps its vectors in one or more **segments**
+named by a small `manifest` (the first is the base `data` segment). When this is set,
+the active (appendable) segment is sealed into an **immutable** segment once it grows past
+this many rows, and a fresh active segment begins; the new manifest is published
+atomically (the commit point). `None` — the default — keeps the store a single segment,
+behaving exactly as it always has. A soft bound: a single `upsert` batch is never split,
+so a segment can exceed it by one batch. Most stores never need this; see
+[Storage](/guides/storage/#segments) for the on-disk picture.
 
 ### `persistence`
 

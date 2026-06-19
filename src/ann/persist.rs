@@ -102,10 +102,10 @@ pub(crate) fn load(
 mod tests {
     use super::*;
     use crate::ann::Walk;
-    use crate::data::DataSegment;
+    use crate::data::Segments;
 
-    fn seg(dim: usize, rows: &[Vec<f32>]) -> DataSegment {
-        let mut d = DataSegment::in_memory(dim);
+    fn seg(dim: usize, rows: &[Vec<f32>]) -> Segments {
+        let mut d = Segments::in_memory_with(dim, Distance::Cosine);
         for r in rows {
             d.append(r).unwrap();
         }

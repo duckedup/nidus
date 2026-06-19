@@ -81,6 +81,13 @@ pub struct Config {
     /// `s3://…` / `gs://…` → a live object-store-backed store (whole-object rewrite on
     /// flush). Empty defaults to `path`, so existing callers are unchanged.
     pub persistence: String,
+    /// Roll the active segment into an immutable one once it reaches this many rows
+    /// (SPEC §14.2/§14.4 — "WAL→segment"). `None` (the default) never auto-seals, so a
+    /// store stays a single segment and behaves exactly as the pre-segment monolith did.
+    /// When set, `upsert`/`flush` seal the active segment past the threshold and start a
+    /// fresh one; the segment set is named by the `manifest`, the atomic commit point.
+    /// A soft bound: a single batch is never split, so a segment can exceed it by one batch.
+    pub segment_max_rows: Option<u64>,
     /// Where the in-RAM working set is *shared* (SPEC §13.3): a
     /// [`crate::open_memory_tier`] location. Empty / `local` / `ram` (default) → the
     /// process heap only (nothing shared). A `redis://…` (or `valkey://…`, …) URL
@@ -105,6 +112,7 @@ impl Config {
             quantization: None,
             ann: None,
             query_threads: 1,
+            segment_max_rows: None,
             persistence: String::new(),
             memory: String::new(),
         }
@@ -163,6 +171,12 @@ impl Config {
     /// Set the number of worker threads for a single exact search (`1` = serial).
     pub fn query_threads(mut self, n: usize) -> Self {
         self.query_threads = n;
+        self
+    }
+
+    /// Set the active-segment seal threshold in rows (`None` = never seal, single segment).
+    pub fn segment_max_rows(mut self, rows: Option<u64>) -> Self {
+        self.segment_max_rows = rows;
         self
     }
 

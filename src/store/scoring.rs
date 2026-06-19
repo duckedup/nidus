@@ -4,7 +4,7 @@
 
 use anyhow::{Result, anyhow};
 
-use crate::data::DataSegment;
+use crate::data::Segments;
 use crate::search::{TopK, dot_i8, euclidean_neg_sq_i8, hamming};
 
 /// Minimum total scan *work* — candidate rows × dimension — before a parallel search
@@ -19,7 +19,7 @@ pub(super) const PARALLEL_SCAN_WORK_FLOOR: usize = 1 << 20;
 /// parallel work: each worker scores one chunk independently, then the caller
 /// merges the per-chunk heaps. Pure read of `data` (shared `&` across threads).
 pub(super) fn score_chunk<'a>(
-    data: &DataSegment,
+    data: &Segments,
     chunk: &[(u64, &'a str, &'a str)],
     q: &[f32],
     score_fn: fn(&[f32], &[f32]) -> f32,

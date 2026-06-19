@@ -648,7 +648,9 @@ build until a real need exists.
   into immutable **segments** + a write-ahead log + a manifest, so scaling (datasets past
   one node's RAM, incremental cloud writes, cooperating instances) becomes a *quantity* of
   one architecture rather than a separate mode. Brute-force stays the exact default for the
-  small/recent tail; an IVF index covers the cold bulk. Designed in §14, not built.
+  small/recent tail; an IVF index covers the cold bulk. **Phase 1 (the segment format,
+  manifest, and WAL→segment sealing) is built — see §14**; the later phases (per-segment IVF,
+  mmap, reader-refresh, cluster) are designed in §14 but not yet built.
 
 ---
 
@@ -670,8 +672,12 @@ src/
 ├── filter/       Filter/Predicate evaluation against a record's attrs
 ├── search/       distance kernels (cosine/dot/euclidean; f32/int8/binary Hamming) +
 │                 bounded top-k heap + min_score; SearchOpts, Hit
-├── data/         flat f32 segment: header, append, row accessor (the mmap seam)
-├── log/          op-log codec: len + payload + crc32, replay, torn-tail recovery
+├── data/         segment store: mod.rs (DataSegment — header, append, row accessor;
+│                 the mmap seam) + segments.rs (Segments — the live segment set as one
+│                 dense global row space; seal/rewrite over the manifest, §14)
+├── manifest/     the manifest object: live-segment set + pins, [crc32][bincode],
+│                 atomic put = the seal/compaction commit point (§14.2)
+├── log/          op-log codec (the WAL): len + payload + crc32, replay, torn-tail recovery
 ├── lock/         O_EXCL writer lock (pure std)
 ├── index_cache.rs  shared codec for derived caches (ann/fts): framed, CRC'd,
 │                 validity-keyed; a stale/missing/torn load → rebuild (never fatal)
@@ -703,7 +709,8 @@ matching the common convention; no hand-rolled error enum.
 
 Build order (bottom-up, each with tests, keeping `cargo build` in seconds):
 `config → crc → model → glob → filter → search → data → log → lock → index_cache →
-ann/fts → backend → store → lib` (the `cli`/`server` binary layers sit above `lib`,
+ann/fts → backend → manifest → store → lib` (the `data` segment aggregator and `manifest`
+sit over `backend`; the `cli`/`server` binary layers sit above `lib`,
 behind the `cli` feature). The shared type vocabulary in `model` is frozen as
 signatures first so the modules above can be implemented independently and still
 compile together.
@@ -996,16 +1003,20 @@ minute — CI asserts it (§9, the build-time gate).**
 
 ---
 
-## 14. Scaling the storage model: segments (proposed, not built)
+## 14. Scaling the storage model: segments (Phase 1 built; later phases proposed)
 
 nidus's thesis is **ease and a local→cloud continuum** (§1): the same store and the same
-API run on a laptop and, by changing a location string, on a shared object store. Today's
-engine is the simplest thing that satisfies that at local scale — one in-RAM `data` matrix
-+ one `log`, the whole working set loaded on `open` (§5), the whole object rewritten on each
-cloud sync (§13.7). That monolith is also the root of every scaling limit. This section
-proposes the storage model that turns **scale into a quantity of one architecture rather
-than a separate mode**. It is a design, not built; it evolves over the existing seams (the
-§9 mmap seam, the append-only format), not a rewrite, and changes no public API (§4).
+API run on a laptop and, by changing a location string, on a shared object store. The
+original engine was the simplest thing that satisfies that at local scale — one in-RAM
+`data` matrix + one `log`, the whole working set loaded on `open` (§5), the whole object
+rewritten on each cloud sync (§13.7). That monolith was also the root of every scaling
+limit. This section describes the storage model that turns **scale into a quantity of one
+architecture rather than a separate mode**. It evolves over the existing seams (the §9 mmap
+seam, the append-only format), not a rewrite, and changes no public API (§4).
+
+**Phase 1 is built** (the segment format, the manifest, and WAL→segment sealing — §14.6).
+The remaining phases (per-segment IVF, mmap, reader-refresh, cluster) are designed here but
+not yet built; each is additive over the same on-disk format.
 
 ### 14.1 Principle: the durable objects are the store; a process is a cache over them
 
@@ -1094,17 +1105,37 @@ a segment is the natural object boundary for a batch).
 Each phase is additive over the format and shippable alone; the order front-loads the
 single-node payoff before any distribution work:
 
-1. **Segment format + manifest + WAL→segment.** Replace the monolith; replay the log into
-   segments; reads follow the manifest. (Generalizes the §6.2 reader rule from "ignore rows
-   past size S" to "read the manifest, read the segments it names.")
+1. **Segment format + manifest + WAL→segment.** *(built)* The monolith is gone: vectors live
+   in an ordered set of segment objects presented as one dense **global row space**
+   (so search/quant/ANN still address vectors by global row, unchanged); a `manifest` object
+   names the live segments, the **last** being the active appendable one. The §6.2 reader
+   rule generalizes from "ignore rows past size S" to "read the manifest, open the segments
+   it names." See the on-disk details below.
 2. **Per-segment IVF at compaction + exhaustive tail.** The brute-force-tail / indexed-cold split.
 3. **mmap per segment.** >RAM on one node (the §9 mmap seam, scoped to a segment).
 4. **Manifest-versioned reader refresh.** Readers detect a newer manifest and adopt it atomically.
 5. **Cluster mode.** Shared backend + writer lease (heartbeat over nidus-a7c) + fencing of
    segment/manifest writes; readers refresh per phase 4.
 
+**Phase-1 on-disk model (built).** A store is `manifest` + N segment objects + `log` (the
+WAL). Each segment carries the existing §5.1 header (magic/version/dim/distance) + f32 rows;
+the first segment keeps the name `data` so a single-segment store is byte-compatible with the
+pre-segment layout (and `peek_header`/snapshot/legacy readers keep resolving `data`). Sealed
+segments mint monotonic `seg-NNNNNNNN` names. The `manifest` is a `[crc32][bincode]` object
+holding the pinned dimension/distance, the ordered segment names, the next-id counter, and a
+monotonic version; it is published with an atomic whole-object `put` — the **commit point**.
+**Sealing** (`Config::segment_max_rows`, default off → a single-segment store identical to the
+old monolith) rotates the active segment to immutable and starts a fresh one — no data is
+moved — then publishes the new manifest; a crash before that publish leaves the prior manifest
+in force and the fresh segment an ignored orphan. **Compaction** collapses every segment back
+into one fresh `data` segment, republishes the manifest, and reclaims the now-unreferenced
+objects. A store opened with no manifest (a pre-segment `data`+`log` store) is **transparently
+migrated**: `data` becomes the base segment and a manifest is written on open (ReadWrite only —
+a ReadOnly open reads through a synthesized in-RAM manifest and writes nothing).
+
 **Consistency.** A reader always sees a single manifest version — the exact live segment set
-at the version it loaded, never a torn mix — and moves to a newer manifest atomically (swap
-the manifest pointer, then drop segments no longer referenced). This preserves the §6
-crash-safety and lock-free-reader guarantees: a half-written segment is simply not yet named
-by the manifest, so it is invisible until its commit, exactly as a row past size `S` is today.
+at the version it loaded, never a torn mix — and (phase 4) will move to a newer manifest
+atomically (swap the manifest pointer, then drop segments no longer referenced). This
+preserves the §6 crash-safety and lock-free-reader guarantees: a half-written or
+not-yet-named segment is invisible until its manifest commit, exactly as a row past size `S`
+is today.

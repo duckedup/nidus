@@ -28,6 +28,7 @@ mod glob;
 mod index_cache;
 mod lock;
 mod log;
+mod manifest;
 mod model;
 mod search;
 mod store;
