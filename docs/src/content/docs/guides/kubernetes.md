@@ -90,6 +90,17 @@ nidus exchanges the pod's injected web-identity token at STS (S3) or reads the G
 metadata server (GCS), refreshing the temporary credentials automatically. ECS/Fargate task
 roles and EC2 instance roles work the same way — no long-lived keys in the cluster.
 
+On a cluster **without** the EKS webhook (self-hosted Kubernetes federated to AWS IAM via an
+OIDC provider), enable `awsWebIdentity` and the chart projects the ServiceAccount token and
+wires `AWS_ROLE_ARN` / `AWS_WEB_IDENTITY_TOKEN_FILE` itself:
+
+```yaml
+awsWebIdentity:
+  enabled: true
+  roleArn: arn:aws:iam::123456789012:role/nidus
+  audience: sts.amazonaws.com   # must match the IAM OIDC provider's audience
+```
+
 ### Static keys
 
 Otherwise supply keys explicitly:

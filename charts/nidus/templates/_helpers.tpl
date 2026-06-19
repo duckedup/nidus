@@ -93,4 +93,7 @@ here at render time with an actionable message instead.
 {{- fail "nidus.memory must be a Redis-family URL (redis://, rediss://, valkey://, keydb://, dragonfly://), or set nidus.memorySecret.name to source it from a Secret" -}}
 {{- end -}}
 {{- end -}}
+{{- if and .Values.awsWebIdentity.enabled (not .Values.awsWebIdentity.roleArn) -}}
+{{- fail "awsWebIdentity.enabled=true requires awsWebIdentity.roleArn (the IAM role to assume)" -}}
+{{- end -}}
 {{- end }}
