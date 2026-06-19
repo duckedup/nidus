@@ -4,7 +4,9 @@
 //!
 //! Everything outside this module — including the `&[u8]` → `&[f32]` reinterpret in
 //! [`DataSegment`](super::DataSegment) — stays in safe Rust (the cast goes through
-//! `bytemuck`'s alignment-checked [`try_cast_slice`](bytemuck::try_cast_slice)).
+//! `bytemuck::cast_slice`, sound by the on-disk layout invariant: `mmap` returns a
+//! page-aligned base and the fixed 64-byte header leaves the row region 4-aligned with a
+//! length that is a multiple of `size_of::<f32>()` — see `mmap_rows` in the parent module).
 
 use std::fs::File;
 use std::path::Path;

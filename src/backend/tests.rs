@@ -119,52 +119,98 @@ fn open_memory_tier_local_aliases() {
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// A whole-object [`Persistence`] backed by an in-RAM map, parameterised by whether it
-/// offers the atomic create-if-absent primitive — so one type exercises both the
-/// race-free conditional-create lock path and the advisory get-then-put fallback.
+/// The map + a monotonic generation counter, behind one lock (so a CAS read-modify-write is
+/// atomic and there is no lock-ordering between map and counter).
+struct MapState {
+    objects: HashMap<String, (Vec<u8>, u64)>, // bytes + the version it was written at
+    next_gen: u64,
+}
+
+/// A whole-object [`Persistence`] backed by an in-RAM map. `cas == true` models a real
+/// compare-and-swap object store (S3/GCS): every write mints a fresh generation, and
+/// [`get_cas`](Persistence::get_cas)/[`put_cas`](Persistence::put_cas) are honoured (so
+/// [`try_create_exclusive`](Persistence::try_create_exclusive) works for free through its
+/// default delegation, exactly as the live backends do). `cas == false` models a backend with
+/// no atomic primitive at all — the advisory get-then-put fallback. `inject_renew` is a test
+/// hook: when set, the next `get_cas` performs one "concurrent peer write" right after reading,
+/// so a reclaimer's token goes stale in the read→write gap (the TOCTOU the CAS reclaim fences).
 struct MapBackend {
-    objects: Mutex<HashMap<String, Vec<u8>>>,
-    atomic_create: bool,
+    state: Mutex<MapState>,
+    cas: bool,
+    inject_renew: Mutex<Option<Vec<u8>>>,
 }
 
 impl MapBackend {
-    fn arc(atomic_create: bool) -> Arc<dyn Persistence> {
+    fn arc(cas: bool) -> Arc<dyn Persistence> {
+        Self::arc_injecting(cas, None)
+    }
+    fn arc_injecting(cas: bool, renew_with: Option<Vec<u8>>) -> Arc<dyn Persistence> {
         Arc::new(MapBackend {
-            objects: Mutex::new(HashMap::new()),
-            atomic_create,
+            state: Mutex::new(MapState {
+                objects: HashMap::new(),
+                next_gen: 0,
+            }),
+            cas,
+            inject_renew: Mutex::new(renew_with),
         })
     }
 }
 
 impl Persistence for MapBackend {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self.objects.lock().unwrap().get(key).cloned())
-    }
-    fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
-        self.objects
+        Ok(self
+            .state
             .lock()
             .unwrap()
-            .insert(key.to_string(), bytes.to_vec());
+            .objects
+            .get(key)
+            .map(|(b, _)| b.clone()))
+    }
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        s.next_gen += 1;
+        let g = s.next_gen;
+        s.objects.insert(key.to_string(), (bytes.to_vec(), g));
         Ok(())
     }
     fn delete(&self, key: &str) -> Result<()> {
-        self.objects.lock().unwrap().remove(key);
+        self.state.lock().unwrap().objects.remove(key);
         Ok(())
     }
     fn list(&self) -> Result<Vec<String>> {
-        Ok(self.objects.lock().unwrap().keys().cloned().collect())
+        Ok(self.state.lock().unwrap().objects.keys().cloned().collect())
     }
-    fn try_create_exclusive(&self, key: &str, bytes: &[u8]) -> Result<Option<bool>> {
-        if !self.atomic_create {
-            return Ok(None); // forces the advisory fallback
+    fn get_cas(&self, key: &str) -> Result<Option<(Vec<u8>, Option<String>)>> {
+        if !self.cas {
+            return Ok(self.get(key)?.map(|b| (b, None)));
         }
-        let mut map = self.objects.lock().unwrap();
-        if map.contains_key(key) {
-            Ok(Some(false)) // already exists — lost the race
-        } else {
-            map.insert(key.to_string(), bytes.to_vec());
-            Ok(Some(true)) // created
+        let snap = self.state.lock().unwrap().objects.get(key).cloned();
+        // Test hook: a peer renews in the read→write gap, bumping the generation so the token
+        // we return below is already stale by the time the caller's `put_cas` runs.
+        if let Some(fresh) = self.inject_renew.lock().unwrap().take() {
+            self.put(key, &fresh)?;
         }
+        Ok(snap.map(|(b, g)| (b, Some(g.to_string()))))
+    }
+    fn put_cas(&self, key: &str, bytes: &[u8], expected: Option<&str>) -> Result<CasOutcome> {
+        if !self.cas {
+            return Ok(CasOutcome::Unsupported); // forces the advisory fallback
+        }
+        let mut s = self.state.lock().unwrap();
+        let current = s.objects.get(key).map(|(_, g)| g.to_string());
+        let matches = match (expected, current.as_deref()) {
+            (None, None) => true,         // create-if-absent: absent → write
+            (None, Some(_)) => false,     // create-if-absent: present → fail
+            (Some(t), Some(c)) => t == c, // conditional overwrite: tokens must match
+            (Some(_), None) => false,     // expected a version but it is gone → fail
+        };
+        if !matches {
+            return Ok(CasOutcome::Stale);
+        }
+        s.next_gen += 1;
+        let g = s.next_gen;
+        s.objects.insert(key.to_string(), (bytes.to_vec(), g));
+        Ok(CasOutcome::Written(Some(g.to_string())))
     }
     fn try_lock(&self, _key: &str, _ttl: Duration) -> Result<Option<Box<dyn BackendLock>>> {
         anyhow::bail!("no native lock");
@@ -176,13 +222,13 @@ impl Persistence for MapBackend {
 
 #[test]
 fn object_lock_is_exclusive_and_releases_on_drop() {
-    // Both backends behave the same on the happy path — race-free and advisory.
-    for atomic in [true, false] {
-        let backend = MapBackend::arc(atomic);
+    // Both backends behave the same on the happy path — CAS (race-free) and advisory.
+    for cas in [true, false] {
+        let backend = MapBackend::arc(cas);
         let ttl = Duration::from_secs(60);
 
         let guard = object_try_lock(&backend, "lock", ttl).unwrap();
-        assert!(guard.is_some(), "first acquire wins (atomic={atomic})");
+        assert!(guard.is_some(), "first acquire wins (cas={cas})");
         // A live holder → contention returns Ok(None), never an error.
         assert!(object_try_lock(&backend, "lock", ttl).unwrap().is_none());
         // Dropping the guard deletes the lock object, freeing it.
@@ -194,22 +240,46 @@ fn object_lock_is_exclusive_and_releases_on_drop() {
 
 #[test]
 fn object_lock_reclaims_a_stale_holder() {
-    for atomic in [true, false] {
-        let backend = MapBackend::arc(atomic);
+    for cas in [true, false] {
+        let backend = MapBackend::arc(cas);
         // Plant a lock stamped far in the past (a crashed holder).
         backend.put("lock", b"1").unwrap();
-        // With a zero TTL every existing lock is already stale → reclaimable.
+        // With a zero TTL every existing lock is already stale → reclaimable. On a CAS backend
+        // this goes through the conditional `put_cas` reclaim; advisory backends overwrite.
         let guard = object_try_lock(&backend, "lock", Duration::from_secs(0)).unwrap();
-        assert!(guard.is_some(), "stale lock reclaimed (atomic={atomic})");
+        assert!(guard.is_some(), "stale lock reclaimed (cas={cas})");
     }
+}
+
+#[test]
+fn object_lock_does_not_steal_a_lease_renewed_in_the_reclaim_gap() {
+    // The TOCTOU fix (nidus-5kj): a reclaimer reads a stale lock's token, but the holder renews
+    // (a fresh stamp + token) in the gap before the reclaiming write. The CAS-gated reclaim must
+    // refuse rather than delete-and-overwrite a lease that came back to life.
+    let renewed = b"9999999999 live-holder".to_vec();
+    let backend = MapBackend::arc_injecting(true, Some(renewed.clone()));
+    // Plant a stale lock (epoch stamp → already past any TTL).
+    backend.put("lock", b"0 old-holder").unwrap();
+    // ttl 60s: the planted stamp is ancient, so the reclaim is attempted — but the injected
+    // renew moves the token first, so the conditional write loses the race.
+    let got = object_try_lock(&backend, "lock", Duration::from_secs(60)).unwrap();
+    assert!(
+        got.is_none(),
+        "must not steal a lease renewed in the reclaim gap"
+    );
+    assert_eq!(
+        backend.get("lock").unwrap().as_deref(),
+        Some(renewed.as_slice()),
+        "the holder's renewed lease must survive the refused reclaim",
+    );
 }
 
 // ── Cluster writer lease (pure/in-RAM, Miri-clean) ──────────────────────────────
 
 #[test]
 fn cluster_lease_excludes_renews_and_releases() {
-    for atomic in [true, false] {
-        let backend = MapBackend::arc(atomic);
+    for cas in [true, false] {
+        let backend = MapBackend::arc(cas);
         let ttl = Duration::from_secs(60);
 
         let lease = ClusterLease::acquire(&backend, "lock", ttl)
@@ -258,8 +328,8 @@ fn cluster_lease_renew_fences_a_superseded_writer() {
 
 #[test]
 fn cluster_lease_renew_reclaims_a_vanished_lease() {
-    for atomic in [true, false] {
-        let backend = MapBackend::arc(atomic);
+    for cas in [true, false] {
+        let backend = MapBackend::arc(cas);
         let lease = ClusterLease::acquire(&backend, "lock", Duration::from_secs(60))
             .unwrap()
             .unwrap();
