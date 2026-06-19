@@ -170,9 +170,12 @@ pub fn object_try_lock(
 /// The shared acquire core for both [`object_try_lock`] and [`ClusterLease`]: write `body`
 /// to lock object `key`, returning `Some(())` if we now hold it (the object was absent and
 /// we created it, or its prior holder was stale and we reclaimed it) and `None` if a live
-/// holder owns it (contention — not an error). Race-free via
-/// [`Persistence::try_create_exclusive`] where the backend has it; best-effort get-then-put
-/// (**advisory**) otherwise.
+/// holder owns it (contention — not an error). On a CAS-capable backend (S3/GCS) **both**
+/// paths are race-free: a fresh acquire via [`Persistence::try_create_exclusive`], and a
+/// stale reclaim via a conditional [`put_cas`](Persistence::put_cas) gated on the stale
+/// object's token (so a holder that renews in the read→write gap is not robbed of a live
+/// lease). A backend with no compare-and-swap falls back to a best-effort get-then-put
+/// (**advisory**).
 fn try_claim(
     persistence: &Arc<dyn Persistence>,
     key: &str,
@@ -189,13 +192,41 @@ fn try_claim(
         None => return advisory_claim(persistence, key, ttl, now, body), // no atomic primitive
     }
 
-    // A lock object exists. Reclaim only if its holder is stale (older than `ttl`).
-    let held_at = persistence.get(key)?.map(|b| parse_stamp(&b)).unwrap_or(0);
-    if now.saturating_sub(held_at) < ttl.as_secs() {
+    // A lock object exists. Reclaim only if its holder is stale (older than `ttl`). Capture the
+    // holder's **CAS token** alongside its stamp so the reclaim can be conditional (nidus-5kj):
+    // between this read and our write the holder might renew (a live lease coming back from the
+    // brink of its TTL), and an unconditional delete-then-create would *steal* it. A
+    // compare-and-swap gated on the token we read refuses in exactly that case.
+    let Some((held, token)) = persistence.get_cas(key)? else {
+        // Vanished since the create attempt above — race a fresh atomic create for it.
+        return reclaim_create(persistence, key, body);
+    };
+    if now.saturating_sub(parse_stamp(&held)) < ttl.as_secs() {
         return Ok(None); // a live holder owns it
     }
-    // Stale: the prior holder crashed. Delete it, then re-attempt the atomic create so
-    // that among several writers reclaiming at once exactly one wins (still race-free).
+    match token {
+        // CAS-capable backend (S3/GCS): reclaim with a compare-and-swap gated on the stale
+        // object's token. A holder that renewed in the gap (its token moved) or a peer that
+        // reclaimed first (likewise) defeats us cleanly — fully race-free, no live lease stolen.
+        Some(tok) => match persistence.put_cas(key, body, Some(&tok))? {
+            CasOutcome::Written(_) => Ok(Some(())),
+            CasOutcome::Stale => Ok(None), // holder renewed, or a peer reclaimed first
+            CasOutcome::Unsupported => reclaim_create(persistence, key, body),
+        },
+        // No conditional-overwrite CAS (create-if-absent only): fall back to the best-effort
+        // delete-then-create reclaim (one winner among reclaimers, but not fenced against a
+        // holder renewing in the gap — the limit of a backend without compare-and-swap).
+        None => reclaim_create(persistence, key, body),
+    }
+}
+
+/// Best-effort stale reclaim for a backend without conditional-overwrite CAS: clear the stale
+/// object then race a fresh atomic create, so among several reclaimers exactly one wins.
+fn reclaim_create(
+    persistence: &Arc<dyn Persistence>,
+    key: &str,
+    body: &[u8],
+) -> Result<Option<()>> {
     persistence.delete(key).context("clear stale lock object")?;
     match persistence.try_create_exclusive(key, body)? {
         Some(true) => Ok(Some(())),

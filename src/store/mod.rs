@@ -213,6 +213,10 @@ impl Store {
         persistence: Arc<dyn Persistence>,
         memory: Option<Box<dyn MemoryTier>>,
     ) -> Result<Store> {
+        // 2a. Backend-independent cross-field config invariants (e.g. quantization vs
+        //     per-segment indexing) — reject before any IO so a bad config fails fast.
+        config.validate()?;
+
         // 2b. Cluster mode (SPEC §14.6 phase 5) needs a *shared* backend: every cooperating
         //     instance must reach the same durable objects and the same working set. Local
         //     files / process RAM are single-node by definition, so reject them here — for
@@ -429,6 +433,7 @@ impl Store {
 
     /// An in-memory store with full config control.
     pub fn in_memory_cfg(config: Config) -> Result<Store> {
+        config.validate()?;
         let quant = match config.quantization {
             Some(q) => Some(Quant::empty(q.kind, config.dimension, config.distance)?),
             None => None,

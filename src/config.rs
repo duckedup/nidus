@@ -4,6 +4,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use anyhow::{Result, bail};
+
 use crate::model::{AnnConfig, Distance, Quantization};
 
 /// How aggressively writes are flushed to disk.
@@ -99,6 +101,8 @@ pub struct Config {
     /// [`segment_max_rows`](Self::segment_max_rows) (a store only seals — and thus only
     /// gets immutable segments to index — when sealing is enabled), and is ignored when a
     /// global [`ann`](Self::ann) index is configured (that index already covers every row).
+    /// Cannot be combined with [`quantization`](Self::quantization) (rejected at open): a
+    /// per-segment search never consults the quantized matrix, so the two do not compose.
     pub segment_index_min_rows: Option<u64>,
     /// Memory-map immutable segments from disk instead of loading them into RAM (SPEC §9 /
     /// §14.6 phase 3 — the one conscious FFI/mmap opt-in). `false` (the default) holds every
@@ -253,6 +257,31 @@ impl Config {
         self.cluster = on;
         self
     }
+
+    /// Validate cross-field invariants that do not depend on the backend — called by every
+    /// store constructor before any IO. (Backend-specific checks, e.g. cluster mode needing a
+    /// shared store, live in `Store::open_with`, which has the resolved backend in hand.)
+    pub(crate) fn validate(&self) -> Result<()> {
+        // Quantization and per-segment indexing do not yet compose. Once a sealed segment is
+        // IVF-indexed, `search` fans out per-segment (the cold IVF legs plus an exact f32 tail)
+        // and never consults the quantized matrix — so quantization would be built and
+        // maintained at full memory/CPU cost yet have no effect. Reject the combination so the
+        // trade-off is an explicit choice rather than a silent no-op (nidus-tku). Sealing
+        // *without* indexing (`segment_max_rows` alone) keeps quantization fully in effect — the
+        // quantized matrix spans every segment — so that pairing stays allowed.
+        if self.quantization.is_some()
+            && self.segment_max_rows.is_some()
+            && self.segment_index_min_rows.is_some()
+        {
+            bail!(
+                "Config::quantization cannot be combined with per-segment indexing \
+                 (segment_max_rows + segment_index_min_rows): once a segment is IVF-indexed, \
+                 search fans out per-segment and never uses the quantized matrix, so \
+                 quantization would cost memory and CPU with no effect — enable one or the other"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -280,5 +309,36 @@ mod tests {
         assert_eq!(c.open_mode, OpenMode::ReadOnly);
         assert_eq!(c.auto_compact, None);
         assert_eq!(c.lock_ttl, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn quantization_and_per_segment_indexing_are_mutually_exclusive() {
+        // All three set → per-segment indexing activates and shadows quantization → rejected.
+        let bad = Config::new("/tmp/s", 8)
+            .quantization(Some(Quantization::default()))
+            .segment_max_rows(Some(1000))
+            .segment_index_min_rows(Some(500));
+        let err = bad
+            .validate()
+            .expect_err("the combination must be rejected")
+            .to_string();
+        assert!(err.contains("quantization"), "{err}");
+        assert!(err.contains("per-segment indexing"), "{err}");
+    }
+
+    #[test]
+    fn quantization_with_sealing_but_no_indexing_is_allowed() {
+        // Sealing alone keeps quantization fully in effect (the matrix spans every segment).
+        let ok = Config::new("/tmp/s", 8)
+            .quantization(Some(Quantization::default()))
+            .segment_max_rows(Some(1000));
+        assert!(ok.validate().is_ok());
+
+        // segment_index_min_rows without segment_max_rows is itself a no-op (nothing seals to
+        // index), so it does not shadow quantization either.
+        let ok2 = Config::new("/tmp/s", 8)
+            .quantization(Some(Quantization::default()))
+            .segment_index_min_rows(Some(500));
+        assert!(ok2.validate().is_ok());
     }
 }
