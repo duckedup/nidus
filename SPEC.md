@@ -644,6 +644,11 @@ build until a real need exists.
   `redis://`, `valkey://`, …). The on-disk *object set* (`data`/`log` + derived caches) is
   unchanged — only *where the bytes live* and *whether the working set is shared*. Search
   stays in local RAM, never over the wire. Built — see §13.
+- **Segment-based storage (the scale model).** Evolve the single in-RAM matrix + one log
+  into immutable **segments** + a write-ahead log + a manifest, so scaling (datasets past
+  one node's RAM, incremental cloud writes, cooperating instances) becomes a *quantity* of
+  one architecture rather than a separate mode. Brute-force stays the exact default for the
+  small/recent tail; an IVF index covers the cold bulk. Designed in §14, not built.
 
 ---
 
@@ -988,3 +993,118 @@ minute — CI asserts it (§9, the build-time gate).**
   path / `file://` today, `s3://` once that backend lands); `nidus restore --in <loc>` GETs
   it and PUTs the objects into the target store. The capture order (`data` then `log`) plus
   the lock-free reader rule (§6.2) keep a hot snapshot consistent without a writer lock.
+
+---
+
+## 14. Scaling the storage model: segments (proposed, not built)
+
+nidus's thesis is **ease and a local→cloud continuum** (§1): the same store and the same
+API run on a laptop and, by changing a location string, on a shared object store. Today's
+engine is the simplest thing that satisfies that at local scale — one in-RAM `data` matrix
++ one `log`, the whole working set loaded on `open` (§5), the whole object rewritten on each
+cloud sync (§13.7). That monolith is also the root of every scaling limit. This section
+proposes the storage model that turns **scale into a quantity of one architecture rather
+than a separate mode**. It is a design, not built; it evolves over the existing seams (the
+§9 mmap seam, the append-only format), not a rewrite, and changes no public API (§4).
+
+### 14.1 Principle: the durable objects are the store; a process is a cache over them
+
+The source of truth is a set of objects on the persistence backend (§13.2). A running nidus
+is a **cache-and-serve layer** over those objects: it loads what it needs into local RAM
+(later, mmap'd disk) to score, and never treats RAM as authoritative — RAM is reconstructable
+from the objects, always.
+
+This *is* the local→cloud continuum, expressed in the data layout. Local: the objects sit on
+the local FS and the cache is your process RAM. Cloud: the objects sit on S3/GCS and the
+cache is the node's RAM. Same architecture; the only difference is **where the bytes live and
+how much is resident**. Scale is a quantity, not a mode — the property the rest of the design
+exists to deliver.
+
+### 14.2 Segments: the unit of everything
+
+A **segment** is a small, **immutable**, self-contained chunk of records — its vectors, its
+attrs, and its own optional index (IVF lists, FTS postings). Once written it is never
+mutated: only created, merged, or dropped. The store becomes three things:
+
+- a **write-ahead log** (the op-log, §5.2, evolved) holding in-flight, not-yet-segmented writes;
+- a set of **immutable segments** (the bulk of the data);
+- a tiny **manifest** naming the live segments (the atomic commit point — swapping it
+  publishes a new state).
+
+Immutability is what unlocks everything else, because each scaling limit of the monolith
+dissolves into a segment operation:
+
+| Limit (monolith) | Resolution (segments) |
+|---|---|
+| whole dataset must fit in RAM | hold / mmap a *subset* of segments; the rest stay cold on the backend |
+| cloud sync rewrites the whole object (`O(store)`, §13.7) | a write is a **new small segment object** — `O(write)`, append-only |
+| no unit of distribution | a shard is a **set of segments** |
+| ANN index hard to maintain over a mutable store | build an index **once per immutable segment**; never mutate it |
+| compaction rewrites everything | **background merge** of small segments into bigger ones |
+
+### 14.3 Brute-force is the tail, not the engine
+
+Exactness stays the default by making brute-force the strategy for the **small/recent**
+slice rather than the whole store. The unindexed WAL tail and small segments are scored
+**exhaustively** (exact, zero build, zero parameters); large or merged segments carry an
+**IVF index** built once at merge time. So "exact vs approximate" stops being a global mode
+the user selects — it is a per-segment property that follows size:
+
+- a laptop store is a few small segments, all brute-forced → **100% recall, no knobs**;
+- a large store is mostly indexed segments plus a brute-forced tail → fast, still exact on
+  the fresh data, with the same code path.
+
+The segment index is **IVF (centroid/list), not the HNSW graph**: list-structured indexes
+have far lower roundtrip count and write-amplification against object storage than a
+pointer-chasing graph, and they rebuild cleanly per immutable segment. nidus already ships
+`ivf.rs`; this is choosing it for the object-backed path.
+
+### 14.4 Writes: log first, index asynchronously
+
+A write appends to the WAL and is durable on fsync/PUT (§6.4) — and **immediately queryable**
+via the exhaustive tail scan, before any index exists. Turning WAL records into a segment
+(and building that segment's IVF index) happens **off the commit path** — lazily on
+flush/compact, or a future background step — so write latency never waits on index build.
+Batched/group commits amortize the per-batch fsync/PUT (already the §6.4 per-batch policy;
+a segment is the natural object boundary for a batch).
+
+### 14.5 What stays fixed (non-negotiables)
+
+- **Exact-by-default, zero-config locally.** No tuning knob (`ef`/`nprobe`/…) is ever a
+  precondition to getting answers; any index is automatic-by-size or opt-in, never required.
+- **`#![forbid(unsafe_code)]` in our code; clean build well under a minute; no heavy/native
+  deps** (§1, §13.6). mmap remains the one conscious FFI opt-in (§9), now applied per segment.
+- **One embedding space per store; the §4 public API is unchanged.** This is an internal
+  storage rearchitecture — `open`/`upsert`/`search`/`flush`/`compact` keep their signatures.
+
+### 14.6 What it unlocks, and the phasing
+
+- **Larger than one node's RAM:** hold/mmap a subset of segments; cold segments stay on the
+  backend until touched.
+- **Incremental cloud writes:** one new segment per batch — no whole-object rewrite (§13.7).
+- **Cooperating instances (cluster):** the segments + WAL + manifest on a *shared* backend
+  are the shared truth; instances are stateless caches over them. One writer appends segments
+  and advances the manifest — elected by the §6.3 writer lock (race-free over object stores,
+  nidus-a7c); readers serve from their cached subset and **refresh when the manifest version
+  advances**. Cluster mode is then a *consequence* of this model — a shared backend plus a
+  versioned manifest — not a parallel architecture. It requires a shared persistence backend
+  **and** a shared memory tier; local FS / local RAM are single-node by definition and are
+  rejected for cluster mode.
+
+Each phase is additive over the format and shippable alone; the order front-loads the
+single-node payoff before any distribution work:
+
+1. **Segment format + manifest + WAL→segment.** Replace the monolith; replay the log into
+   segments; reads follow the manifest. (Generalizes the §6.2 reader rule from "ignore rows
+   past size S" to "read the manifest, read the segments it names.")
+2. **Per-segment IVF at compaction + exhaustive tail.** The brute-force-tail / indexed-cold split.
+3. **mmap per segment.** >RAM on one node (the §9 mmap seam, scoped to a segment).
+4. **Manifest-versioned reader refresh.** Readers detect a newer manifest and adopt it atomically.
+5. **Cluster mode.** Shared backend + writer lease (heartbeat over nidus-a7c) + fencing of
+   segment/manifest writes; readers refresh per phase 4.
+
+**Consistency.** A reader always sees a single manifest version — the exact live segment set
+at the version it loaded, never a torn mix — and moves to a newer manifest atomically (swap
+the manifest pointer, then drop segments no longer referenced). This preserves the §6
+crash-safety and lock-free-reader guarantees: a half-written segment is simply not yet named
+by the manifest, so it is invisible until its commit, exactly as a row past size `S` is today.
