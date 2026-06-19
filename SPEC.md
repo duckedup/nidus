@@ -1173,7 +1173,11 @@ single-node payoff before any distribution work:
    a **lease** (the §6.3 object lock evolved: it carries an owner token and is **renewed on
    every write batch** — op-driven, no background thread — so an active writer keeps it while
    an idle one past the TTL can be taken over); the renewal **fences** a superseded writer,
-   which fails its next write rather than clobbering. Every commit advances the manifest
+   which fails its next batch rather than clobbering. The fence is checked per write batch, so a
+   writer that stalls for longer than the lease TTL *mid-batch* while a replacement takes over is
+   a residual split-brain window — closing it with a compare-and-swap (`If-Match` / generation)
+   manifest write is a planned follow-up (nidus-ahw); the intended deployment is a single writer.
+   Every commit advances the manifest
    version (the universal **commit counter**), so any number of `ReadOnly` readers pick up the
    writer's changes with a single manifest read via `refresh()` (phase 4). It is not a managed
    cluster — no coordinator, replication, or rebalancing; the object store plus the versioned
