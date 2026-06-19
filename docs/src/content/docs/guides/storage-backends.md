@@ -170,11 +170,14 @@ reader.refresh()?; // adopts the writer's latest committed state
 How it works:
 
 - **One writer, leased.** A cluster writer holds a renewing **lease** on the store (the
-  object-store writer lock, evolved). It is renewed automatically on every write, so an active
-  writer keeps it indefinitely; if a writer goes silent past
+  object-store writer lock, evolved). It is renewed automatically at the start of every write
+  batch, so an active writer keeps it indefinitely; if a writer goes silent past
   [`lock_ttl`](/reference/configuration/#lock_ttl) another may take over, and the original is
-  **fenced** — its next write fails cleanly instead of corrupting the store. There is never
-  more than one live writer.
+  **fenced** — its next batch sees it no longer holds the lease and fails cleanly rather than
+  clobbering the store. The fence is checked per batch, so the intended deployment is a single
+  writer (a second exists only to take over a dead one); hardening the narrow window where a
+  writer stalls for longer than `lock_ttl` *mid-batch* while a replacement starts is a planned
+  follow-up.
 - **Many readers, refreshing.** Every commit advances the manifest version, so a `ReadOnly`
   instance picks up the writer's changes with a single cheap [`refresh()`](/reference/api/#refresh)
   — no reopen. Call it on whatever cadence you like (per request, on a timer); it is a no-op
