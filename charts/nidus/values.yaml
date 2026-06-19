@@ -1,0 +1,155 @@
+# Default values for the nidus chart.
+# See the chart README for a walkthrough; every nidus.* value maps to a NIDUS_*
+# environment variable consumed by `nidus serve`.
+
+# ── Image ─────────────────────────────────────────────────────────────────────
+image:
+  repository: duckedup/nidus
+  # Tag defaults to the chart's appVersion when left empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# ── nidus store configuration (→ NIDUS_* env) ──────────────────────────────────
+# The image runs with NIDUS_REQUIRE_REMOTE=true: it refuses to start unless backed
+# by a *shared, non-local* store. So `dim`, `persistence`, and `memory` are REQUIRED;
+# the chart fails fast at render time if any is missing.
+nidus:
+  # Embedding dimension — pinned when the store is first created. REQUIRED.
+  dim: 0
+
+  # Durable bytes — an object store. REQUIRED.
+  #   s3://<bucket>[/<prefix>]   or   gs://<bucket>[/<prefix>]
+  persistence: ""
+
+  # Shared in-RAM working set — a Redis-family tier. REQUIRED.
+  #   redis://host:6379   (also valkey://, keydb://, dragonfly://; rediss:// for TLS)
+  memory: ""
+
+  # Distance metric: "" (cosine, the default) | cosine | euclidean | dot.
+  # Only honored when the store is first created.
+  distance: ""
+
+  # Max request/upsert body size in bytes. "" leaves the server default (256 MiB).
+  maxBodyBytes: ""
+
+  # Approximate-nearest-neighbour index: "" (exact brute force) | hnsw | ivf.
+  ann: ""
+  # Optional ANN tuning — each non-empty key becomes a NIDUS_ANN_* env var.
+  # m, efConstruction, efSearch, nLists, nProbe, overscan, seed
+  annParams: {}
+
+# ── Bearer-token auth ───────────────────────────────────────────────────────────
+# Strongly recommended whenever the Service is reachable beyond localhost. When
+# enabled, every request except GET /health needs `Authorization: Bearer <token>`.
+auth:
+  enabled: false
+  # Provide the token inline (stored in a chart-managed Secret)…
+  token: ""
+  # …or point at a key in a Secret you manage yourself (takes precedence).
+  existingSecret: ""
+  existingSecretKey: token
+
+# ── Backend credentials (→ env) ─────────────────────────────────────────────────
+# nidus reads cloud credentials from the standard environment (AWS_*, GOOGLE_*, …).
+credentials:
+  # Inline key/value pairs are written to a chart-managed Secret and loaded via
+  # envFrom. e.g.
+  #   AWS_ACCESS_KEY_ID: "AKIA…"
+  #   AWS_SECRET_ACCESS_KEY: "…"
+  #   AWS_REGION: "us-east-1"
+  #   AWS_ENDPOINT_URL: "http://minio:9000"   # for MinIO / non-AWS S3
+  inline: {}
+  # Existing Secrets to load wholesale via envFrom (e.g. workload-identity output,
+  # SealedSecrets, External Secrets Operator).
+  existingSecrets: []
+
+# Escape hatches for anything not modeled above.
+extraEnv: []
+extraEnvFrom: []
+
+# ── Workload ────────────────────────────────────────────────────────────────────
+# `nidus serve` is a SINGLE writer: it holds an exclusive lock on the shared backend.
+# Keep replicaCount at 1. With >1, the extra pods lose the lock race and crash-loop.
+# Real multi-instance HA (cluster mode) is not yet exposed by the server.
+replicaCount: 1
+
+# Recreate (not RollingUpdate): the old writer must terminate — releasing its lock on
+# SIGTERM — before the replacement starts, or the new pod hits a held-lock error.
+updateStrategy:
+  type: Recreate
+
+# Give the writer time to flush and release its lock on SIGTERM before SIGKILL.
+terminationGracePeriodSeconds: 30
+
+resources: {}
+  # limits:
+  #   cpu: "2"
+  #   memory: 2Gi
+  # requests:
+  #   cpu: 500m
+  #   memory: 512Mi
+
+# The image already runs as nonroot (uid 65532) and writes nothing to local disk.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Probes hit the unauthenticated /health endpoint.
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 3
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 3
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
+
+# ── Service ───────────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP
+  port: 7700
+  annotations: {}
+
+# ── Ingress ───────────────────────────────────────────────────────────────────
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: nidus.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# ── ServiceAccount ──────────────────────────────────────────────────────────────
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}

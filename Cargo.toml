@@ -17,8 +17,8 @@ repository = "https://github.com/duckedup/nidus"
 license = "MIT"
 keywords = ["vector", "embeddings", "search", "embedded", "database"]
 categories = ["database-implementations", "data-structures"]
-# Keep the published crate lean: drop issue-tracker, agent, and CI infra.
-exclude = [".beads/", ".claude/", ".github/", "AGENTS.md", "justfile", "benchmarks/"]
+# Keep the published crate lean: drop issue-tracker, agent, CI, and deploy infra.
+exclude = [".beads/", ".claude/", ".github/", "AGENTS.md", "justfile", "benchmarks/", "charts/", "Dockerfile", ".dockerignore"]
 
 [lib]
 name = "nidus"

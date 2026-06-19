@@ -1,0 +1,28 @@
+# Values used by CI (helm lint/template + chart-testing) to render the chart with
+# all required fields satisfied. Not a runnable deployment — credentials are dummies.
+nidus:
+  dim: 768
+  persistence: s3://example-bucket/nidus
+  memory: redis://nidus-redis:6379
+  ann: hnsw
+  annParams:
+    m: 32
+    efSearch: 128
+
+auth:
+  enabled: true
+  token: ci-dummy-token
+
+credentials:
+  inline:
+    AWS_ACCESS_KEY_ID: ci-dummy
+    AWS_SECRET_ACCESS_KEY: ci-dummy
+    AWS_REGION: us-east-1
+
+ingress:
+  enabled: true
+  hosts:
+    - host: nidus.ci.example
+      paths:
+        - path: /
+          pathType: Prefix
