@@ -96,6 +96,12 @@ A store that predates this format (just `data` + `log`, no `manifest`) is migrat
 transparently on the first read-write open — `data` becomes the base segment and a
 manifest is written. A read-only open of such a store writes nothing.
 
+Segments are also the unit of **indexing at scale**: with
+[`Config::segment_index_min_rows`](/reference/configuration/#segment_index_min_rows) set, a
+sealed segment large enough to cross that threshold gets its own IVF index (the active tail
+stays exact), so searches over a large store walk the cold segments and brute-force only the
+fresh data. See [per-segment indexing](/guides/search/#per-segment-indexing-at-scale).
+
 ## Cross-process readers
 
 A store can be opened **read-only** by other processes while one process holds

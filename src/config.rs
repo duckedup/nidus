@@ -88,6 +88,18 @@ pub struct Config {
     /// fresh one; the segment set is named by the `manifest`, the atomic commit point.
     /// A soft bound: a single batch is never split, so a segment can exceed it by one batch.
     pub segment_max_rows: Option<u64>,
+    /// Build a per-segment IVF index over each **immutable** segment that holds at least
+    /// this many rows (SPEC §14.3 — "brute-force is the tail, not the engine"). `None`
+    /// (the default) never indexes a segment, so every row is brute-forced — exact, 100%
+    /// recall, the zero-config local default. When set, a sealed segment with `≥ rows`
+    /// vectors carries an IVF index (built once at seal/compaction); the **active**
+    /// segment (the recent WAL tail) and any smaller sealed segment stay exhaustive. So
+    /// "exact vs approximate" becomes a per-segment property that follows size: the fresh
+    /// data is always exact, the cold bulk is indexed. Has no effect without
+    /// [`segment_max_rows`](Self::segment_max_rows) (a store only seals — and thus only
+    /// gets immutable segments to index — when sealing is enabled), and is ignored when a
+    /// global [`ann`](Self::ann) index is configured (that index already covers every row).
+    pub segment_index_min_rows: Option<u64>,
     /// Where the in-RAM working set is *shared* (SPEC §13.3): a
     /// [`crate::open_memory_tier`] location. Empty / `local` / `ram` (default) → the
     /// process heap only (nothing shared). A `redis://…` (or `valkey://…`, …) URL
@@ -113,6 +125,7 @@ impl Config {
             ann: None,
             query_threads: 1,
             segment_max_rows: None,
+            segment_index_min_rows: None,
             persistence: String::new(),
             memory: String::new(),
         }
@@ -177,6 +190,14 @@ impl Config {
     /// Set the active-segment seal threshold in rows (`None` = never seal, single segment).
     pub fn segment_max_rows(mut self, rows: Option<u64>) -> Self {
         self.segment_max_rows = rows;
+        self
+    }
+
+    /// Set the minimum row count for a sealed segment to be IVF-indexed (`None` = never
+    /// index, the exact brute-force default). See
+    /// [`segment_index_min_rows`](Self::segment_index_min_rows).
+    pub fn segment_index_min_rows(mut self, rows: Option<u64>) -> Self {
+        self.segment_index_min_rows = rows;
         self
     }
 

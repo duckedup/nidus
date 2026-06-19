@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::ann::Ann;
+use crate::ann::{Ann, IvfIndex, Walk};
 use crate::backend::{
     BackendLock, MemoryTier, Persistence, appender_for, locked_error, object_try_lock,
     open_memory_tier, open_persistence,
@@ -29,7 +29,7 @@ use crate::data::Segments;
 use crate::fts::Fts;
 use crate::log::OpLog;
 use crate::manifest::Manifest;
-use crate::model::{Distance, Op};
+use crate::model::{AnnConfig, Distance, Op};
 
 mod memtier;
 mod quant;
@@ -117,6 +117,15 @@ pub struct Store {
     /// May coexist with `quant`: the index walk then scores `quant`'s codes and the
     /// f32 rerank in `search_ann` restores accuracy (nidus-ndu).
     ann: Option<Ann>,
+    /// Per-segment IVF indexes, aligned by position with `data`'s segment set
+    /// (`seg_indexes[i]` indexes segment `i`'s global row range). `None` = that segment is
+    /// brute-forced — always the active (last) segment, plus any immutable segment below
+    /// [`Config::segment_index_min_rows`](crate::Config::segment_index_min_rows). Empty
+    /// when per-segment indexing is off (the default) or a global `ann` index is configured
+    /// (which already covers every row). This is the "brute-force tail / indexed cold
+    /// segments" split (SPEC §14.3): the index walk picks candidates from the cold segments,
+    /// the exhaustive scan covers the fresh tail, and both feed one merged top-k.
+    seg_indexes: Vec<Option<IvfIndex>>,
     /// The in-RAM ANN index has unpersisted changes (rows inserted since the last
     /// `persist_index`/load). Lets `persist_index` skip a redundant write and tracks
     /// whether the on-disk `ann` cache is current. Meaningless when ANN is off.
@@ -269,6 +278,7 @@ impl Store {
             dead_rows,
             quant,
             ann,
+            seg_indexes: Vec::new(),
             ann_dirty: false,
             fts,
             fts_dirty: false,
@@ -296,6 +306,10 @@ impl Store {
         // 8. Load the ANN index from its cache (incrementally catching up any rows
         //    added since), or rebuild it from the vectors if there is no valid cache.
         store.load_or_build_ann()?;
+        // 8b. Build the per-segment IVF indexes over the cold (immutable) segments, when
+        //     per-segment indexing is on (SPEC §14.3). No-op for the default exact store
+        //     and when a global ANN index is configured.
+        store.build_segment_indexes();
         // 9. Load the FTS index from its `fts` cache when it is exactly current, else
         //    rebuild it from the replayed docs (the schema was restored during replay).
         //    A no-op when no collection declares FTS.
@@ -349,7 +363,7 @@ impl Store {
         let ann = config
             .ann
             .map(|a| Ann::empty(a, config.dimension, config.distance));
-        Ok(Store {
+        let mut store = Store {
             data: Segments::in_memory_with(config.dimension, config.distance),
             log: OpLog::in_memory(),
             persistence: None,
@@ -359,6 +373,7 @@ impl Store {
             dead_rows: 0,
             quant,
             ann,
+            seg_indexes: Vec::new(),
             ann_dirty: false,
             fts: Fts::default(),
             fts_dirty: false,
@@ -366,7 +381,11 @@ impl Store {
             row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
             config,
-        })
+        };
+        // Align `seg_indexes` to the (single, empty) segment so a later seal can update it
+        // incrementally. No-op unless per-segment indexing is on.
+        store.build_segment_indexes();
+        Ok(store)
     }
 
     // ── Backend wiring helpers ───────────────────────────────────────────────────
@@ -687,6 +706,97 @@ impl Store {
             ann.insert_rows(&walk, &new_rows);
         }
         self.ann_dirty = true;
+    }
+
+    // ── Per-segment index lifecycle (SPEC §14.3) ─────────────────────────────────
+
+    /// Per-segment IVF indexing is active when [`Config::segment_index_min_rows`] is set
+    /// **and** no global `ann` index is configured. A global index already covers every
+    /// row, so the per-segment split would be redundant — that path takes precedence and
+    /// per-segment indexing stays off.
+    fn seg_indexing_on(&self) -> bool {
+        self.ann.is_none() && self.config.segment_index_min_rows.is_some()
+    }
+
+    /// The IVF tuning every per-segment index is built with — size-driven defaults
+    /// (`n_lists = 0` → ~√rows). One tuning point keeps the knob a single concept.
+    fn segment_ivf_config() -> AnnConfig {
+        AnnConfig::ivf()
+    }
+
+    /// (Re)build the per-segment IVF indexes from scratch over the current segment set:
+    /// an [`IvfIndex`] over each **immutable** segment holding at least
+    /// `segment_index_min_rows` rows, `None` for the active segment and any smaller one.
+    /// Refreshes the reverse map first so walked candidates resolve to docs. O(indexed
+    /// rows) — runs on `open` and after `compact`; the cheaper incremental
+    /// [`index_just_sealed`](Self::index_just_sealed) handles a single seal. No-op unless
+    /// per-segment indexing is on.
+    fn build_segment_indexes(&mut self) {
+        self.seg_indexes = Vec::new();
+        if !self.seg_indexing_on() {
+            return;
+        }
+        let min = self.config.segment_index_min_rows.unwrap();
+        // The IVF walk resolves candidate rows through the reverse map; rebuild it so it
+        // covers every live row of the segments we are about to index.
+        self.rebuild_row_to_doc();
+        let ranges = self.data.segment_ranges();
+        let active = ranges.len() - 1;
+        let cfg = Self::segment_ivf_config();
+        let dim = self.data.dimension();
+        let distance = self.config.distance;
+        let workers = self.config.query_threads;
+        let walk = Walk::exact(&self.data, distance);
+        let mut indexes: Vec<Option<IvfIndex>> = Vec::with_capacity(ranges.len());
+        for (i, &(base, rows)) in ranges.iter().enumerate() {
+            if i != active && rows >= min {
+                let mut ix = IvfIndex::new(cfg, dim, distance);
+                let segment_rows: Vec<u64> = (base..base + rows).collect();
+                ix.build(&walk, &segment_rows, workers);
+                indexes.push(Some(ix));
+            } else {
+                indexes.push(None);
+            }
+        }
+        self.seg_indexes = indexes;
+    }
+
+    /// After a successful seal, index the just-sealed segment (now immutable, the
+    /// second-to-last) if it meets the threshold and append a `None` slot for the fresh
+    /// active segment — keeping `seg_indexes` aligned with the segment set without
+    /// re-running k-means on the already-built segments. Falls back to a full
+    /// [`build_segment_indexes`](Self::build_segment_indexes) if the alignment is somehow
+    /// off. No-op unless per-segment indexing is on.
+    fn index_just_sealed(&mut self) {
+        if !self.seg_indexing_on() {
+            return;
+        }
+        let ranges = self.data.segment_ranges();
+        let sealed = ranges.len() - 2; // the seal pushed a new active; this just froze.
+        if self.seg_indexes.len() != sealed + 1 {
+            // Not aligned to the pre-seal segment count — rebuild defensively.
+            self.build_segment_indexes();
+            return;
+        }
+        let min = self.config.segment_index_min_rows.unwrap();
+        let (base, rows) = ranges[sealed];
+        // The sealed segment's rows were active until now — make sure they resolve.
+        self.rebuild_row_to_doc();
+        let built = if rows >= min {
+            let mut ix = IvfIndex::new(
+                Self::segment_ivf_config(),
+                self.data.dimension(),
+                self.config.distance,
+            );
+            let walk = Walk::exact(&self.data, self.config.distance);
+            let segment_rows: Vec<u64> = (base..base + rows).collect();
+            ix.build(&walk, &segment_rows, self.config.query_threads);
+            Some(ix)
+        } else {
+            None
+        };
+        self.seg_indexes[sealed] = built;
+        self.seg_indexes.push(None);
     }
 
     // ── FTS index lifecycle ───────────────────────────────────────────────────────

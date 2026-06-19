@@ -271,6 +271,37 @@ derived data: deleting the `ann` file only costs a one-time rebuild.
   rerank over those candidates restores accuracy. Recall runs a little below the
   exact-walk index, so widen `ef_search`/`n_probe` and `overscan` if you need it back.
 
+## Per-segment indexing at scale
+
+`Config::ann` above is a **single global** index over every row. There is a second,
+size-driven way to index that keeps the freshest data exact: when a store is split into
+[segments](/guides/storage/#segments), nidus can IVF-index only the **cold, immutable**
+segments and leave the recent write tail exhaustive.
+
+```rust
+use nidus::{Config, Nidus};
+
+let db = Nidus::open(
+    Config::new("./store", 768)
+        .segment_max_rows(Some(100_000))        // seal a segment every 100k rows
+        .segment_index_min_rows(Some(100_000)), // IVF-index each sealed segment
+)?;
+# anyhow::Ok(())
+```
+
+With [`segment_index_min_rows`](/reference/configuration/#segment_index_min_rows) set, a
+sealed segment of at least that many rows gets its own IVF index (built once when it seals);
+the **active** segment — everything written since the last seal — and any smaller segment
+stay brute-forced. A search then **fans out**: it scans the exhaustive tail exactly and
+walks each cold segment's index for candidates, merging both into one ranking with an exact
+f32 rerank. So "exact vs approximate" follows size automatically — the fresh data is always
+exact, only the cold bulk is approximate.
+
+This is **off by default** (`segment_index_min_rows = None` → every segment brute-forced →
+100% recall, zero knobs), and it is ignored when a global `ann` index is set (that index
+already covers every row). The same approximate-recall and deleted-row notes above apply to
+the cold segments.
+
 ## Full-text search (BM25)
 
 Alongside vector search, a collection can declare **full-text-indexed fields** and be

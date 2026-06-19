@@ -1003,7 +1003,7 @@ minute — CI asserts it (§9, the build-time gate).**
 
 ---
 
-## 14. Scaling the storage model: segments (Phase 1 built; later phases proposed)
+## 14. Scaling the storage model: segments (Phases 1–2 built; later phases proposed)
 
 nidus's thesis is **ease and a local→cloud continuum** (§1): the same store and the same
 API run on a laptop and, by changing a location string, on a shared object store. The
@@ -1014,9 +1014,9 @@ limit. This section describes the storage model that turns **scale into a quanti
 architecture rather than a separate mode**. It evolves over the existing seams (the §9 mmap
 seam, the append-only format), not a rewrite, and changes no public API (§4).
 
-**Phase 1 is built** (the segment format, the manifest, and WAL→segment sealing — §14.6).
-The remaining phases (per-segment IVF, mmap, reader-refresh, cluster) are designed here but
-not yet built; each is additive over the same on-disk format.
+**Phases 1–2 are built** (the segment format + manifest + WAL→segment sealing, and the
+per-segment IVF / exhaustive-tail split — §14.6). The remaining phases (mmap, reader-refresh,
+cluster) are designed here but not yet built; each is additive over the same on-disk format.
 
 ### 14.1 Principle: the durable objects are the store; a process is a cache over them
 
@@ -1053,22 +1053,39 @@ dissolves into a segment operation:
 | ANN index hard to maintain over a mutable store | build an index **once per immutable segment**; never mutate it |
 | compaction rewrites everything | **background merge** of small segments into bigger ones |
 
-### 14.3 Brute-force is the tail, not the engine
+### 14.3 Brute-force is the tail, not the engine *(built)*
 
 Exactness stays the default by making brute-force the strategy for the **small/recent**
-slice rather than the whole store. The unindexed WAL tail and small segments are scored
-**exhaustively** (exact, zero build, zero parameters); large or merged segments carry an
-**IVF index** built once at merge time. So "exact vs approximate" stops being a global mode
-the user selects — it is a per-segment property that follows size:
+slice rather than the whole store. The active (appendable) segment — the recent WAL tail —
+and any small sealed segment are scored **exhaustively** (exact, zero build, zero parameters);
+a large **immutable** segment carries an **IVF index** built once when it is sealed (and
+rebuilt at compaction). So "exact vs approximate" stops being a global mode the user selects
+— it is a per-segment property that follows size:
 
 - a laptop store is a few small segments, all brute-forced → **100% recall, no knobs**;
 - a large store is mostly indexed segments plus a brute-forced tail → fast, still exact on
   the fresh data, with the same code path.
 
+The trigger is an opt-in size threshold, `Config::segment_index_min_rows` (default `None` →
+**no segment is ever indexed**, so the local default stays 100%-recall exact). When set, a
+sealed segment with at least that many rows is IVF-indexed; the active segment never is. This
+keeps "automatic-by-size **or** opt-in" (§14.5) honest: segmentation alone (for incremental
+cloud writes) stays exact; indexing the cold bulk is a separate, explicit choice. A search
+**fans out** — brute-force the exhaustive tail, walk each cold segment's IVF for an
+over-fetched candidate set — and merges both legs into one bounded top-k with an exact f32
+rerank (the two row sets are disjoint, so no doc is double-counted). When a global `ann`
+index (§9) is configured it already covers every row, so it takes precedence and per-segment
+indexing stays off.
+
 The segment index is **IVF (centroid/list), not the HNSW graph**: list-structured indexes
 have far lower roundtrip count and write-amplification against object storage than a
-pointer-chasing graph, and they rebuild cleanly per immutable segment. nidus already ships
-`ivf.rs`; this is choosing it for the object-backed path.
+pointer-chasing graph, and they rebuild cleanly per immutable segment. nidus reuses the
+existing `ivf.rs` for the per-segment index.
+
+*(Built with a deliberate seam: per-segment IVF indexes are **rebuilt on `open`** from the
+immutable segments rather than cached to their own objects — IVF's k-means build is cheap.
+Persisting per-segment indexes as cache objects, parallel/quantized per-segment walks, and a
+background segment-merge step are additive follow-ups over this same format.)
 
 ### 14.4 Writes: log first, index asynchronously
 
@@ -1111,7 +1128,8 @@ single-node payoff before any distribution work:
    names the live segments, the **last** being the active appendable one. The §6.2 reader
    rule generalizes from "ignore rows past size S" to "read the manifest, open the segments
    it names." See the on-disk details below.
-2. **Per-segment IVF at compaction + exhaustive tail.** The brute-force-tail / indexed-cold split.
+2. **Per-segment IVF + exhaustive tail.** *(built)* The brute-force-tail / indexed-cold split,
+   opt-in by size via `Config::segment_index_min_rows` (default off → fully exact). See §14.3.
 3. **mmap per segment.** >RAM on one node (the §9 mmap seam, scoped to a segment).
 4. **Manifest-versioned reader refresh.** Readers detect a newer manifest and adopt it atomically.
 5. **Cluster mode.** Shared backend + writer lease (heartbeat over nidus-a7c) + fencing of

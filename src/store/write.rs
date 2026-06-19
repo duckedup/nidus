@@ -44,6 +44,9 @@ impl Store {
         };
         if self.data.active_rows() >= max && self.data.seal()? {
             self.persist_manifest()?;
+            // Index the segment that just froze (cold), if it meets the size threshold —
+            // SPEC §14.3. No-op unless per-segment indexing is on.
+            self.index_just_sealed();
         }
         Ok(())
     }
@@ -581,6 +584,12 @@ impl Store {
         //     its on-disk cache. Best effort: the cache is derived, so a persist
         //     failure must not fail the compaction.
         self.rebuild_ann();
+
+        // 5b-ii. Rebuild the per-segment IVF indexes. Compaction collapsed every segment
+        //     into one fresh active segment, so this leaves the store fully exact until it
+        //     seals again (the next over-threshold write re-seals + re-indexes). No-op
+        //     unless per-segment indexing is on.
+        self.build_segment_indexes();
 
         // 5c. Rebuild the FTS index from the live docs (drops tombstones, renumbers
         //     docnums). Reads attrs, so it is unaffected by the row renumbering. Done

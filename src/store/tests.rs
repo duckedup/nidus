@@ -519,6 +519,7 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         dead_rows: 0,
         quant: None,
         ann: None,
+        seg_indexes: Vec::new(),
         ann_dirty: false,
         fts: crate::fts::Fts::default(),
         fts_dirty: false,
@@ -2412,6 +2413,251 @@ fn text_only_docs_survive_reopen_and_compact() {
         .collect();
     text_only.sort();
     assert_eq!(text_only, vec!["t1", "t2"]);
+}
+
+// ── Per-segment IVF indexing (SPEC §14.3) ───────────────────────────────────
+
+/// An in-memory store that seals every `seal` rows and IVF-indexes any sealed segment
+/// with `≥ index_min` rows — the per-segment "exact tail / indexed cold" split.
+fn segmented_store(dim: usize, seal: u64, index_min: u64) -> Store {
+    Store::in_memory_cfg(
+        Config::new("/dev/null/in-memory", dim)
+            .distance(Distance::Cosine)
+            .open_mode(OpenMode::ReadWrite)
+            .auto_compact(None)
+            .segment_max_rows(Some(seal))
+            .segment_index_min_rows(Some(index_min)),
+    )
+    .unwrap()
+}
+
+#[test]
+fn segmented_indexes_build_as_segments_seal() {
+    // Seal at 4 rows; index any sealed segment with >= 2 rows. Insert in batches so the
+    // seal fires at the start of a later upsert.
+    let mut s = segmented_store(2, 4, 2);
+    s.create_collection("col").unwrap();
+    // 8 rows in batches of 2 → after 4 rows, the next upsert seals the first segment;
+    // after 8, the next seals the second.
+    for i in 0..5 {
+        s.upsert(
+            "col",
+            &[
+                rec(&format!("a{i}"), vec![(i as f32).cos(), (i as f32).sin()]),
+                rec(
+                    &format!("b{i}"),
+                    vec![(-(i as f32)).sin(), (i as f32).cos()],
+                ),
+            ],
+        )
+        .unwrap();
+    }
+    // seg_indexes is aligned with the segment set; the last (active) slot is never indexed.
+    assert_eq!(s.seg_indexes.len(), s.data.segment_count());
+    assert!(
+        s.seg_indexes.last().unwrap().is_none(),
+        "the active segment must stay exhaustive (never indexed)"
+    );
+    assert!(
+        s.seg_indexes.iter().filter(|x| x.is_some()).count() >= 1,
+        "at least one sealed segment should be IVF-indexed"
+    );
+}
+
+#[test]
+fn segmented_off_by_default_is_exact() {
+    // segment_max_rows set (a multi-segment store) but no index threshold → every segment
+    // is brute-forced, so results are byte-for-byte the exact single-segment store.
+    let dim = 8;
+    let data = random_unit_vectors(40, dim, 11);
+    let exact = exact_store(dim, &data);
+
+    let mut seg = Store::in_memory_cfg(
+        Config::new("/dev/null/in-memory", dim)
+            .auto_compact(None)
+            .segment_max_rows(Some(8)), // seals, but segment_index_min_rows is None
+    )
+    .unwrap();
+    let recs: Vec<Record> = data
+        .iter()
+        .enumerate()
+        .map(|(i, v)| rec(&format!("d{i}"), v.clone()))
+        .collect();
+    seg.upsert("col", &recs).unwrap();
+    assert!(
+        seg.seg_indexes.iter().all(Option::is_none),
+        "no segment may be indexed when segment_index_min_rows is unset"
+    );
+
+    let q = random_unit_vectors(1, dim, 99).pop().unwrap();
+    let got: Vec<String> = seg
+        .search(&["col"], &q, &default_opts(10))
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    let truth: Vec<String> = exact
+        .search(&["col"], &q, &default_opts(10))
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(got, truth, "unindexed multi-segment store must be exact");
+}
+
+#[test]
+fn segmented_small_segments_are_fully_probed_exact() {
+    // A small sealed segment has ~sqrt(rows) lists and n_probe (8) >= that, so it is fully
+    // probed — every row scored — and recall is exact. Query each stored vector and expect
+    // itself as the top hit, whether it lives in a sealed (indexed) segment or the tail.
+    let mut s = segmented_store(2, 4, 2);
+    s.create_collection("col").unwrap();
+    let vectors: Vec<Vec<f32>> = (0..12)
+        .map(|i| {
+            let t = i as f32 / 12.0 * std::f32::consts::TAU;
+            vec![t.cos(), t.sin()]
+        })
+        .collect();
+    for (i, v) in vectors.iter().enumerate() {
+        s.upsert("col", &[rec(&format!("d{i}"), v.clone())])
+            .unwrap();
+    }
+    // Force a final seal so the last full segment is indexed too.
+    s.flush().unwrap();
+    for (i, v) in vectors.iter().enumerate() {
+        let hits = s.search(&["col"], v, &default_opts(1)).unwrap();
+        assert_eq!(hits[0].id, format!("d{i}"), "row {i} should be its own NN");
+    }
+}
+
+#[test]
+fn segmented_skips_deleted_rows_in_cold_segments() {
+    let mut s = segmented_store(2, 4, 2);
+    s.create_collection("col").unwrap();
+    let vectors: Vec<Vec<f32>> = (0..12)
+        .map(|i| {
+            let t = i as f32 / 12.0 * std::f32::consts::TAU;
+            vec![t.cos(), t.sin()]
+        })
+        .collect();
+    for (i, v) in vectors.iter().enumerate() {
+        s.upsert("col", &[rec(&format!("d{i}"), v.clone())])
+            .unwrap();
+    }
+    s.flush().unwrap(); // seal the tail so its rows are indexed
+    // Delete a doc that lives in a sealed (indexed) segment, then query its exact vector.
+    s.delete("col", &["d1"]).unwrap();
+    let hits = s.search(&["col"], &vectors[1], &default_opts(3)).unwrap();
+    assert!(
+        hits.iter().all(|h| h.id != "d1"),
+        "a deleted row in a cold segment must not surface: {hits:?}"
+    );
+}
+
+#[test]
+fn segmented_compact_collapses_to_exact() {
+    let mut s = segmented_store(2, 4, 2);
+    s.create_collection("col").unwrap();
+    let vectors: Vec<Vec<f32>> = (0..12)
+        .map(|i| {
+            let t = i as f32 / 12.0 * std::f32::consts::TAU;
+            vec![t.cos(), t.sin()]
+        })
+        .collect();
+    for (i, v) in vectors.iter().enumerate() {
+        s.upsert("col", &[rec(&format!("d{i}"), v.clone())])
+            .unwrap();
+    }
+    s.flush().unwrap();
+    assert!(
+        s.data.segment_count() > 1,
+        "store should have sealed segments"
+    );
+    s.compact().unwrap();
+    // Compaction collapses every segment into one fresh active segment → fully exact.
+    assert_eq!(s.data.segment_count(), 1);
+    assert!(s.seg_indexes.iter().all(Option::is_none));
+    for (i, v) in vectors.iter().enumerate() {
+        let hits = s.search(&["col"], v, &default_opts(1)).unwrap();
+        assert_eq!(hits[0].id, format!("d{i}"));
+    }
+}
+
+// Ignored under Miri: a few thousand rows make recall meaningful but are far too slow at
+// Miri's ~100×. The dispatch/merge logic is exercised by the small tests above.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn segmented_recall_matches_exact() {
+    let (n, dim, k) = (2000usize, 32, 10);
+    let data = random_unit_vectors(n, dim, 3);
+    let queries = random_unit_vectors(40, dim, 4);
+    let truth = exact_store(dim, &data);
+
+    // Seal every 256 rows; index any sealed segment (>= 64 rows). Insert in 256-row
+    // batches so the store fans out into several indexed cold segments plus a tail.
+    let mut seg = segmented_store(dim, 256, 64);
+    let recs: Vec<Record> = data
+        .iter()
+        .enumerate()
+        .map(|(i, v)| rec(&format!("d{i}"), v.clone()))
+        .collect();
+    for batch in recs.chunks(256) {
+        seg.upsert("col", batch).unwrap();
+    }
+    assert!(
+        seg.seg_indexes.iter().filter(|x| x.is_some()).count() >= 2,
+        "expected several indexed cold segments"
+    );
+
+    let recall = mean_recall(&seg, &truth, &queries, k);
+    assert!(
+        recall >= 0.80,
+        "per-segment IVF recall@{k} = {recall:.3}, expected >= 0.80"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn segmented_survives_reopen() {
+    // The per-segment indexes are rebuilt on open from the (immutable) segments; a
+    // reopened segmented store must answer queries the same as before.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let vectors: Vec<Vec<f32>> = (0..12)
+        .map(|i| {
+            let t = i as f32 / 12.0 * std::f32::consts::TAU;
+            vec![t.cos(), t.sin()]
+        })
+        .collect();
+    {
+        let mut s = Store::open(
+            Config::new(&path, 2)
+                .auto_compact(None)
+                .segment_max_rows(Some(4))
+                .segment_index_min_rows(Some(2)),
+        )
+        .unwrap();
+        for (i, v) in vectors.iter().enumerate() {
+            s.upsert("col", &[rec(&format!("d{i}"), v.clone())])
+                .unwrap();
+        }
+        s.flush().unwrap();
+    }
+    let s = Store::open(
+        Config::new(&path, 2)
+            .auto_compact(None)
+            .segment_max_rows(Some(4))
+            .segment_index_min_rows(Some(2)),
+    )
+    .unwrap();
+    assert!(
+        s.seg_indexes.iter().filter(|x| x.is_some()).count() >= 1,
+        "cold-segment indexes should be rebuilt on open"
+    );
+    for (i, v) in vectors.iter().enumerate() {
+        let hits = s.search(&["col"], v, &default_opts(1)).unwrap();
+        assert_eq!(hits[0].id, format!("d{i}"), "row {i} after reopen");
+    }
 }
 
 // ── Full-text search (BM25) ─────────────────────────────────────────────────

@@ -10,10 +10,13 @@ use anyhow::Result;
 
 use super::scoring::{PARALLEL_SCAN_WORK_FLOOR, parallel_topk, score_chunk};
 use super::{ScanOrder, Store, oom};
+use crate::ann::Walk;
 use crate::config::Config;
 use crate::filter;
 use crate::fts::Language;
-use crate::model::{Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts, SearchOpts, Value};
+use crate::model::{
+    AnnConfig, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts, SearchOpts, Value,
+};
 use crate::search::{TopK, dot, euclidean_neg_sq, normalize};
 
 impl Store {
@@ -330,6 +333,14 @@ impl Store {
             return self.search_ann(collections, &q, opts, score_fn);
         }
 
+        // Per-segment fan-out: walk each cold segment's IVF index and brute-force the
+        // exhaustive tail (the active segment + any sub-threshold sealed segment), merged
+        // into one ranking (SPEC §14.3). Engaged only when at least one segment is indexed
+        // — i.e. `segment_index_min_rows` is set and a sealed segment has crossed it.
+        if self.seg_indexes.iter().any(Option::is_some) {
+            return self.search_segmented(collections, &q, opts, score_fn);
+        }
+
         // Gather the in-scope, filter-passing rows in physical-row order (for
         // cache-friendly sequential `data` access — nidus-33k). `with_sorted_scan`
         // hands back an already row-sorted scan, reusing the cached whole-store order
@@ -567,9 +578,29 @@ impl Store {
         let candidates = ann.search(&walk, q, n_candidates);
 
         let mut topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
-        for (row, _) in &candidates {
-            // Resolve the candidate row to its owning doc via the reverse map, then
-            // verify the doc still lives at this row (catches deletes/overwrites).
+        self.offer_candidates(&candidates, &scope, q, score_fn, opts, &mut topk);
+        Ok(self.hits_from_topk(topk))
+    }
+
+    /// Resolve walked candidate rows to their owning docs, drop the out-of-scope /
+    /// filtered / stale / below-`min_score` ones, exact-rerank the survivors, and offer
+    /// them into `topk`. The shared tail of every index-walk search — the global ANN path
+    /// ([`search_ann`](Self::search_ann)) and the per-segment fan-out
+    /// ([`search_segmented`](Self::search_segmented)) both funnel their candidate rows
+    /// through it. A candidate→doc lookup is a *hint*: it is re-verified against the live
+    /// index (`docs[id].row == row`), so deleted/overwritten rows are skipped. The walk's
+    /// own score is only a selection proxy (approximate under quantization), so the true
+    /// f32 score — and `min_score` — is recomputed here from the original vectors.
+    fn offer_candidates<'b>(
+        &'b self,
+        candidates: &[(u64, f32)],
+        scope: &std::collections::HashSet<&str>,
+        q: &[f32],
+        score_fn: fn(&[f32], &[f32]) -> f32,
+        opts: &SearchOpts,
+        topk: &mut TopK<(&'b str, &'b str)>,
+    ) {
+        for (row, _) in candidates {
             let Some(Some((col_name, id))) = self.row_to_doc.get(*row as usize) else {
                 continue;
             };
@@ -588,10 +619,6 @@ impl Store {
             if !filter::matches(&opts.filter, &entry.attrs) {
                 continue;
             }
-            // Rerank exactly: the walk's score is only a selection proxy (approximate
-            // under quantization), so the true f32 score — and `min_score` — is computed
-            // here from the original vectors, exactly as the quantized brute-force path
-            // reranks its first-pass candidates.
             let score = score_fn(q, self.data.row(*row));
             if let Some(min) = opts.min_score
                 && score < min
@@ -600,8 +627,86 @@ impl Store {
             }
             topk.offer(score, (col_name.as_str(), id.as_str()));
         }
+    }
 
-        Ok(self.hits_from_topk(topk))
+    /// Per-segment fan-out search (SPEC §14.3): brute-force the **exhaustive tail** (the
+    /// active segment plus any sealed segment below `segment_index_min_rows`) and **walk
+    /// each cold segment's IVF** for candidates, fusing both into one ranking.
+    ///
+    /// The two row sets are disjoint by construction — a row lives in exactly one segment,
+    /// and a segment is either indexed or brute-forced — so the legs never double-count a
+    /// doc. The exact leg scores every in-scope, filter-passing row of the unindexed
+    /// segments; the IVF leg over-fetches `top_k × overscan` candidates per cold segment,
+    /// then [`offer_candidates`](Self::offer_candidates) verifies, filters, and exact-reranks
+    /// them. The merged list is ordered by exact score (tie-broken by `(collection, id)`)
+    /// and truncated to `top_k`.
+    fn search_segmented(
+        &self,
+        collections: &[&str],
+        q: &[f32],
+        opts: &SearchOpts,
+        score_fn: fn(&[f32], &[f32]) -> f32,
+    ) -> Result<Vec<Hit>> {
+        if opts.top_k == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Global row ranges of the indexed (cold) segments — used to exclude their rows
+        // from the exhaustive tail leg (the IVF leg covers them).
+        let ranges = self.data.segment_ranges();
+        let indexed: Vec<(u64, u64)> = ranges
+            .iter()
+            .zip(&self.seg_indexes)
+            .filter_map(|(&(base, rows), ix)| ix.as_ref().map(|_| (base, base + rows)))
+            .collect();
+
+        // Exhaustive tail: in-scope, filter-passing rows that fall outside every indexed
+        // segment. Gathered straight from the live index (text-only docs carry no row),
+        // then row-sorted for cache-friendly sequential `data` access and scored exactly
+        // through the shared brute-force tail.
+        let mut scan: Vec<(u64, &str, &str)> = Vec::new();
+        for &col_name in collections {
+            let Some(col) = self.collections.get(col_name) else {
+                continue;
+            };
+            for (id, entry) in &col.docs {
+                let Some(row) = entry.row else { continue };
+                if indexed.iter().any(|&(s, e)| row >= s && row < e) {
+                    continue; // covered by the IVF leg
+                }
+                if !filter::matches(&opts.filter, &entry.attrs) {
+                    continue;
+                }
+                scan.push((row, col_name, id.as_str()));
+            }
+        }
+        scan.sort_unstable_by_key(|&(row, _, _)| row);
+        let mut hits = self.rank_scan(q, &mut scan, score_fn, opts)?;
+
+        // Indexed cold segments: walk each IVF for an over-fetched candidate set, then
+        // verify/filter/rerank into a bounded heap.
+        let scope: std::collections::HashSet<&str> = collections.iter().copied().collect();
+        let overscan = AnnConfig::ivf().overscan.max(1);
+        let n_candidates = opts.top_k.saturating_mul(overscan).max(opts.top_k);
+        let walk = Walk::exact(&self.data, self.config.distance);
+        let mut ivf_topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
+        for ix in self.seg_indexes.iter().flatten() {
+            let candidates = ix.search(&walk, q, n_candidates);
+            self.offer_candidates(&candidates, &scope, q, score_fn, opts, &mut ivf_topk);
+        }
+        hits.extend(self.hits_from_topk(ivf_topk));
+
+        // Merge the two legs into one ranking: highest exact score first, deterministic
+        // tie-break, then keep `top_k`.
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.collection.cmp(&b.collection))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        hits.truncate(opts.top_k);
+        Ok(hits)
     }
 
     /// Gather in-scope, filter-passing rows for the exact-prefilter fallback, bailing
