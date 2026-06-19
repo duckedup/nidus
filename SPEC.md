@@ -649,32 +649,58 @@ build until a real need exists.
 
 ## 10. Module layout
 
+A module that has grown to span several distinct concerns is a *directory* of
+sibling files (each owning one concern) with `mod.rs` holding the core type + glue,
+rather than one ever-growing file — `store/` and `backend/` are the worked examples.
+Child files see the parent's private items, so a split costs no extra `pub`.
+
 ```
 src/
-├── lib.rs       Public API (Nidus, Scope); #![forbid(unsafe_code)]; re-exports
-├── config.rs    Config, Fsync, OpenMode (§4.1)
-├── value.rs     Value + little-endian encode/decode
-├── record.rs    Record
-├── filter.rs    Predicate / Filter + matching against attrs
-├── glob.rs      minimal * ? [..] matcher (§7.1)
-├── search.rs    cosine kernel + bounded top-k heap + min_score; SearchOpts, Hit
-├── ann/         opt-in ANN index (Config::ann): hnsw.rs (graph) + ivf.rs (lists)
-├── data.rs      flat f32 segment: header, append, row accessor (the mmap seam)
-├── log.rs       op-log codec: len + payload + crc32, replay, torn-tail recovery
-├── lock.rs      O_EXCL writer lock (pure std)
-├── crc.rs       table CRC32 (zero-dep)
-└── store.rs     in-RAM index, write/read glue, compaction
-tests/           file-backed integration (temp dirs; #[cfg_attr(miri, ignore)] on fsync paths)
-examples/        demo.rs — end-to-end smoke: open → upsert → search (single + All scope)
+├── lib.rs        Public API (Nidus, Scope); #![forbid(unsafe_code)]; re-exports
+├── config.rs     Config, Fsync, OpenMode, ann/quant/memory/persistence settings (§4.1)
+├── model.rs      Shared type vocabulary: Value, Record, Predicate/Filter, Op,
+│                 Distance, Quantization, AnnConfig, FtsQuery (pure defs + serde)
+├── crc.rs        table CRC32 (zero-dep)
+├── glob/         minimal * ? [..] matcher (§7.1)
+├── filter/       Filter/Predicate evaluation against a record's attrs
+├── search/       distance kernels (cosine/dot/euclidean; f32/int8/binary Hamming) +
+│                 bounded top-k heap + min_score; SearchOpts, Hit
+├── data/         flat f32 segment: header, append, row accessor (the mmap seam)
+├── log/          op-log codec: len + payload + crc32, replay, torn-tail recovery
+├── lock/         O_EXCL writer lock (pure std)
+├── index_cache.rs  shared codec for derived caches (ann/fts): framed, CRC'd,
+│                 validity-keyed; a stale/missing/torn load → rebuild (never fatal)
+├── ann/          opt-in ANN index (Config::ann): hnsw.rs (graph) + ivf.rs (lists) +
+│                 persist.rs (cache round-trip)
+├── fts/          opt-in full-text (BM25) index: mod.rs + analyzer.rs (tokenize/stem)
+├── backend/      pluggable storage & memory (§13): mod.rs (Persistence/Appender/
+│                 MemoryTier/BackendLock traits + URL routing), local.rs (LocalFs +
+│                 FileAppender), ram.rs (LocalRam + MemAppender), object.rs
+│                 (ObjectAppender + object_try_lock), cloud.rs (shared ureq Http),
+│                 s3.rs, gcs.rs, redis.rs, tests.rs
+└── store/        the integrator: mod.rs (Store type, open/in_memory ctors, lock +
+                  ANN lifecycle glue), scoring.rs (scan kernels + parallel engine),
+                  quant.rs (int8/binary state + quantized two-pass search), read.rs
+                  (accessors, exact + ANN search), write.rs (upsert/delete/flush/
+                  compact), memtier.rs (working-set publish/adopt), tests.rs
+
+# ── `cli` feature only (the `nidus` binary, --features cli) ──
+├── bin/nidus.rs  thin entry point: parse args → cli::run
+├── cli/          clap subcommands over a store dir: mod.rs + backup.rs (snapshot)
+└── server/       axum/tokio HTTP wrapper over one Nidus: mod.rs + dto.rs (wire types)
+
+tests/            file-backed integration (temp dirs; #[cfg_attr(miri, ignore)] on fsync paths)
+examples/         demo.rs — end-to-end smoke: open → upsert → search (single + All scope)
 ```
 
 Errors propagate via `anyhow::Result` everywhere (`anyhow!`/`bail!`/`.context()`),
 matching the common convention; no hand-rolled error enum.
 
 Build order (bottom-up, each with tests, keeping `cargo build` in seconds):
-`config → crc → value → record → glob → filter → search → data → log → lock → store → lib`.
-The shared type vocabulary (`config`, `value`, `record`, `filter`, `search` types)
-is frozen as signatures first so modules can be implemented independently and still
+`config → crc → model → glob → filter → search → data → log → lock → index_cache →
+ann/fts → backend → store → lib` (the `cli`/`server` binary layers sit above `lib`,
+behind the `cli` feature). The shared type vocabulary in `model` is frozen as
+signatures first so the modules above can be implemented independently and still
 compile together.
 
 ---
@@ -741,8 +767,9 @@ traits — and **both axes are now built end to end** (`src/backend/`).
 - The **S3 + GCS persistence backends** (`s3.rs`/`gcs.rs`: whole-object get/put/delete/list
   over sans-IO `rusty-s3` / `tame-gcs`+`tame-oauth` + `ureq`): nidus-870.4. A store also
   **runs live** on them via an `ObjectAppender` (in-RAM segment buffer, whole-object rewrite
-  on sync) plus an advisory object lock — nidus-cgr (the race-free conditional-PUT lock is
-  the nidus-a7c follow-up).
+  on sync) plus a race-free object lock — nidus-cgr, made race-free in nidus-a7c via atomic
+  create-if-absent (S3 `If-None-Match: *`, GCS `ifGenerationMatch=0`); a backend without that
+  primitive falls back to the original advisory get-then-put.
 - The **shared Redis memory tier** (`redis.rs`: one blocking `redis-rs` client over the RESP
   family — Redis/Valkey/KeyDB/DragonflyDB — plain or TLS), with the store publishing the
   serialized working set on `flush` and adopting it on `open`: nidus-870.3. Memcached is
@@ -847,7 +874,9 @@ pub trait Persistence: Send + Sync {
     fn delete(&self, key: &str) -> Result<()>;
     fn list(&self) -> Result<Vec<String>>;
     fn appender(&self, key: &str) -> Option<Box<dyn Appender>> { None } // local native; cloud None
-    fn try_lock(&self, key: &str, ttl: Duration) -> Result<Option<Lock>>; // O_EXCL / conditional-PUT
+    fn try_create_exclusive(&self, key: &str, bytes: &[u8]) -> Result<Option<bool>> { Ok(None) }
+                                  // atomic create-if-absent (S3 If-None-Match / GCS ifGenerationMatch=0)
+    fn try_lock(&self, key: &str, ttl: Duration) -> Result<Option<Lock>>; // O_EXCL (local native lock)
 }
 
 pub trait MemoryTier: Send + Sync {        // local RAM is the trivial impl
@@ -948,9 +977,10 @@ minute — CI asserts it (§9, the build-time gate).**
 - **Live backing store (built).** A store's `data`/`log` live on the persistence backend;
   writes durably round-trip per §13.5. On an object store with no native append, each
   segment is an in-RAM buffer rewritten as one whole object on sync (`ObjectAppender`,
-  `O(object)` per flush) under an advisory object lock (race-free conditional-PUT locking is
-  the nidus-a7c follow-up). Best for low-write-rate / dev / small-scale, single-writer use
-  (nidus's positioning).
+  `O(object)` per flush) under a race-free object lock — atomic create-if-absent (S3
+  `If-None-Match: *`, GCS `ifGenerationMatch=0`, nidus-a7c), falling back to an advisory
+  get-then-put on a backend lacking the primitive. Best for low-write-rate / dev /
+  small-scale, single-writer use (nidus's positioning).
 - **Snapshot / backup (built).** PUT/GET the whole store as one archive (the `cli`-feature
   `tar.gz`). This is *exactly* object-granular, so every persistence backend does it
   trivially. `nidus backup --out <loc>` reads the source store's `data`/`log` objects via

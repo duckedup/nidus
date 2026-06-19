@@ -26,6 +26,14 @@ use crate::backend::cloud::Http;
 /// the window between signing and the (immediate) execution.
 const PRESIGN_TTL: Duration = Duration::from_secs(300);
 
+/// The `If-None-Match: *` precondition that makes a PUT a create-if-absent (it succeeds
+/// only when no object matches — i.e. none exists). The header name is **lowercase**:
+/// SigV4 signs canonical (lowercased) header names, and rusty-s3 signs the name as given,
+/// so it must already be lowercase here to match what AWS recomputes. HTTP header names
+/// are case-insensitive on the wire, so sending it lowercase is equally fine.
+const IF_NONE_MATCH_HEADER: &str = "if-none-match";
+const IF_NONE_MATCH_ANY: &str = "*";
+
 /// An S3 (or S3-compatible) persistence backend rooted at a bucket and optional key
 /// prefix.
 pub struct S3 {
@@ -122,11 +130,36 @@ impl Persistence for S3 {
         validate_key(key)?;
         let path = self.path(key);
         let url = PutObject::new(&self.bucket, Some(&self.creds), &path).sign(PRESIGN_TTL);
-        let (status, body) = self.http.put(url.as_str(), bytes)?;
+        let (status, body) = self.http.put(url.as_str(), &[], bytes)?;
         if (200..300).contains(&status) {
             Ok(())
         } else {
             bail!("S3 PUT {path} failed: HTTP {status}: {}", show(&body))
+        }
+    }
+
+    fn try_create_exclusive(&self, key: &str, bytes: &[u8]) -> Result<Option<bool>> {
+        validate_key(key)?;
+        let path = self.path(key);
+        // `If-None-Match: *` makes the PUT a create-if-absent. The header is *signed*
+        // (added to the request before signing), so it must be sent verbatim on the wire.
+        let mut action = PutObject::new(&self.bucket, Some(&self.creds), &path);
+        action
+            .headers_mut()
+            .insert(IF_NONE_MATCH_HEADER, IF_NONE_MATCH_ANY);
+        let url = action.sign(PRESIGN_TTL);
+        let (status, body) = self.http.put(
+            url.as_str(),
+            &[(IF_NONE_MATCH_HEADER, IF_NONE_MATCH_ANY)],
+            bytes,
+        )?;
+        match status {
+            s if (200..300).contains(&s) => Ok(Some(true)), // created — we won the lock
+            412 => Ok(Some(false)), // precondition failed: it already exists — lost the race
+            s => bail!(
+                "S3 conditional PUT {path} failed: HTTP {s}: {}",
+                show(&body)
+            ),
         }
     }
 
@@ -251,6 +284,33 @@ mod tests {
     }
 
     #[test]
+    fn conditional_put_url_signs_the_if_none_match_header() {
+        let s3 = S3::build(
+            "https://s3.us-east-1.amazonaws.com",
+            UrlStyle::VirtualHost,
+            "b",
+            "",
+            creds(),
+            "us-east-1".to_string(),
+        )
+        .unwrap();
+        let path = s3.path("lock");
+        let mut action = PutObject::new(&s3.bucket, Some(&s3.creds), &path);
+        action
+            .headers_mut()
+            .insert(IF_NONE_MATCH_HEADER, IF_NONE_MATCH_ANY);
+        let url = action.sign(PRESIGN_TTL);
+        let u = url.as_str();
+        // The conditional header is folded into the SigV4 signed-headers set (lowercased,
+        // as AWS canonicalisation requires), so it must travel with the request — assert it
+        // was signed under its canonical name (not silently dropped or upper-cased).
+        assert!(
+            u.contains("X-Amz-SignedHeaders=") && u.contains("if-none-match"),
+            "{u}"
+        );
+    }
+
+    #[test]
     fn try_lock_is_unsupported() {
         let s3 = S3::build(
             "https://s3.us-east-1.amazonaws.com",
@@ -295,6 +355,31 @@ mod tests {
         s3.delete("data").unwrap();
         assert!(s3.get("data").unwrap().is_none());
         s3.delete("data").unwrap(); // idempotent
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn conditional_create_is_create_if_absent_against_mock_s3() {
+        let server = mock::MockS3::start();
+        let s3 = S3::build(
+            &server.endpoint(),
+            UrlStyle::Path,
+            "bucket",
+            "",
+            creds(),
+            "us-east-1".to_string(),
+        )
+        .unwrap();
+
+        // First create wins (object absent → 200 → Some(true)).
+        assert_eq!(s3.try_create_exclusive("lock", b"1").unwrap(), Some(true));
+        // Second create loses the race (object present → 412 → Some(false)).
+        assert_eq!(s3.try_create_exclusive("lock", b"2").unwrap(), Some(false));
+        // The body is the first writer's — the losing create did not overwrite it.
+        assert_eq!(s3.get("lock").unwrap().as_deref(), Some(&b"1"[..]));
+        // Once deleted, a create can win again.
+        s3.delete("lock").unwrap();
+        assert_eq!(s3.try_create_exclusive("lock", b"3").unwrap(), Some(true));
     }
 
     /// A minimal in-process S3-shaped HTTP server: just enough of the object + list
@@ -343,8 +428,9 @@ mod tests {
             let method = parts.next().unwrap_or("").to_string();
             let target = parts.next().unwrap_or("").to_string();
 
-            // Read headers; capture Content-Length.
+            // Read headers; capture Content-Length and any If-None-Match precondition.
             let mut content_length = 0usize;
+            let mut if_none_match = false;
             loop {
                 let mut line = String::new();
                 if reader.read_line(&mut line).is_err() {
@@ -354,8 +440,12 @@ mod tests {
                 if line.is_empty() {
                     break;
                 }
-                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                let lower = line.to_ascii_lowercase();
+                if let Some(v) = lower.strip_prefix("content-length:") {
                     content_length = v.trim().parse().unwrap_or(0);
+                }
+                if let Some(v) = lower.strip_prefix("if-none-match:") {
+                    if_none_match = v.trim() == "*";
                 }
             }
             let mut body = vec![0u8; content_length];
@@ -391,6 +481,10 @@ mod tests {
                 ("200 OK", xml.into_bytes())
             } else {
                 match method.as_str() {
+                    // `If-None-Match: *` → create-if-absent: 412 when the key already exists.
+                    "PUT" if if_none_match && store.lock().unwrap().contains_key(&key) => {
+                        ("412 Precondition Failed", Vec::new())
+                    }
                     "PUT" => {
                         store.lock().unwrap().insert(key, body);
                         ("200 OK", Vec::new())

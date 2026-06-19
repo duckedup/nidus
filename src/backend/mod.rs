@@ -41,7 +41,7 @@ mod tests;
 pub use gcs::Gcs;
 pub use local::{FileAppender, LocalFs};
 pub use object::ObjectAppender;
-pub(crate) use object::{advisory_try_lock, locked_error};
+pub(crate) use object::{locked_error, object_try_lock};
 pub use ram::LocalRam;
 pub(crate) use ram::MemAppender;
 pub use redis::RedisTier;
@@ -76,6 +76,18 @@ pub trait Persistence: Send + Sync {
         Ok(None)
     }
 
+    /// Atomically create object `key` with `bytes` **only if it does not already
+    /// exist** — the create-if-absent primitive a race-free object writer lock needs
+    /// (S3 `If-None-Match: *`, GCS `ifGenerationMatch=0`). Returns `Ok(Some(true))`
+    /// when this call created it, `Ok(Some(false))` when it already existed (lost the
+    /// race — **not** an error), and `Ok(None)` when the backend offers no atomic
+    /// create-if-absent (the object-lock caller then falls back to the best-effort
+    /// advisory put). `Err` is a real IO failure. Default: unsupported (`None`).
+    fn try_create_exclusive(&self, key: &str, bytes: &[u8]) -> Result<Option<bool>> {
+        let _ = (key, bytes);
+        Ok(None)
+    }
+
     /// Best-effort exclusive lock on `key` (the writer-exclusion primitive, §6.3).
     /// `Ok(Some(guard))` on success — the lock releases when the guard drops;
     /// `Ok(None)` when another holder has it (contention is **not** an error);
@@ -84,9 +96,10 @@ pub trait Persistence: Send + Sync {
     fn try_lock(&self, key: &str, ttl: Duration) -> Result<Option<Box<dyn BackendLock>>>;
 
     /// Whether [`try_lock`](Self::try_lock) provides a real exclusive lock (local
-    /// `O_EXCL`). Whole-object stores return `false`: they have no atomic create-if-absent
-    /// here yet, so a live object-backed store falls back to the advisory get-then-put
-    /// lock ([`advisory_try_lock`]) instead of calling `try_lock`. Default `true`.
+    /// `O_EXCL`). Whole-object stores return `false`: a live object-backed store goes
+    /// through the [`object_try_lock`] path instead — race-free where the backend
+    /// implements [`try_create_exclusive`](Self::try_create_exclusive) (S3/GCS),
+    /// advisory otherwise. Default `true`.
     fn has_native_lock(&self) -> bool {
         true
     }

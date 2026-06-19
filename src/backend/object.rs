@@ -7,11 +7,13 @@
 //!   one atomic [`Persistence::put`] on `sync`/`rewrite`. So the segments keep their exact
 //!   append-then-fsync discipline; the object store just turns each "fsync" into a
 //!   whole-object rewrite (O(object), the cost §13.5 names).
-//! - [`advisory_try_lock`] is the writer lock for object stores: a best-effort
-//!   get-then-put lock object with a TTL, released by deleting it on drop. It is
-//!   **advisory** (not race-free — two writers racing the gap could both acquire), which
-//!   suits nidus's single-writer / low-write-rate positioning; a race-free conditional-PUT
-//!   lock is the follow-up (`If-None-Match` / `ifGenerationMatch=0`).
+//! - [`object_try_lock`] is the writer lock for object stores: a TTL'd lock object,
+//!   released by deleting it on drop. A fresh acquire goes through the backend's atomic
+//!   create-if-absent ([`Persistence::try_create_exclusive`] — S3 `If-None-Match: *`,
+//!   GCS `ifGenerationMatch=0`), so exactly one of N racing writers wins — **race-free**.
+//!   A backend without that primitive falls back to a best-effort get-then-put
+//!   (**advisory**: two writers racing the gap could both acquire), which still suits
+//!   nidus's single-writer / low-write-rate positioning.
 //!
 //! Both hold an `Arc` of the same backend the store uses, so segments, caches, and the
 //! lock all go through one client.
@@ -99,35 +101,82 @@ impl Drop for ObjectLock {
     }
 }
 
-/// Best-effort advisory writer lock over a whole-object backend (S3/GCS). `Ok(Some)` when
-/// the lock object is absent or older than `ttl` (a crashed holder — reclaimed); `Ok(None)`
-/// when a fresh holder has it (contention, never an error). **Advisory:** the read and the
-/// claiming write are not atomic, so two writers racing the gap could both acquire — fine
-/// for the single-writer/dev positioning, not for true concurrent writers.
-pub fn advisory_try_lock(
+/// Writer lock over a whole-object backend (S3/GCS). `Ok(Some)` when the lock object was
+/// absent (claimed) or older than `ttl` (a crashed holder — reclaimed); `Ok(None)` when a
+/// fresh holder has it (contention, never an error).
+///
+/// A fresh acquire uses the backend's atomic create-if-absent
+/// ([`Persistence::try_create_exclusive`]), so among N writers racing an unlocked store
+/// exactly one wins — **race-free**. Only a backend that returns `None` from that method
+/// (no atomic primitive) falls back to a best-effort get-then-put (**advisory** — the read
+/// and write are not atomic).
+pub fn object_try_lock(
     persistence: &Arc<dyn Persistence>,
     key: &str,
     ttl: Duration,
 ) -> Result<Option<Box<dyn BackendLock>>> {
     validate_key(key)?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Some(existing) = persistence.get(key)? {
-        let held_at = parse_stamp(&existing);
-        if now.saturating_sub(held_at) < ttl.as_secs() {
-            return Ok(None); // a live holder owns it
-        }
-        // else: stale (older than ttl) — reclaim by overwriting below.
+    let now = now_secs();
+    let stamp = now.to_string();
+
+    // Fast path: atomic create-if-absent. A fresh acquire (no prior holder) is fully
+    // race-free — exactly one of N racing writers gets `Some(true)`.
+    match persistence.try_create_exclusive(key, stamp.as_bytes())? {
+        Some(true) => return Ok(Some(guard(persistence, key))),
+        Some(false) => {} // a holder exists — fall through to the staleness check
+        None => return advisory_claim(persistence, key, ttl, now, &stamp), // no atomic primitive
+    }
+
+    // A lock object exists. Reclaim only if its holder is stale (older than `ttl`).
+    let held_at = persistence.get(key)?.map(|b| parse_stamp(&b)).unwrap_or(0);
+    if now.saturating_sub(held_at) < ttl.as_secs() {
+        return Ok(None); // a live holder owns it
+    }
+    // Stale: the prior holder crashed. Delete it, then re-attempt the atomic create so
+    // that among several writers reclaiming at once exactly one wins (still race-free).
+    persistence.delete(key).context("clear stale lock object")?;
+    match persistence.try_create_exclusive(key, stamp.as_bytes())? {
+        Some(true) => Ok(Some(guard(persistence, key))),
+        _ => Ok(None), // another writer reclaimed first
+    }
+}
+
+/// The best-effort get-then-put claim for a backend with no atomic create-if-absent.
+/// **Advisory** — the staleness read and the claiming write are not atomic, so two writers
+/// racing the gap could both acquire. Kept as the fallback for the single-writer positioning.
+fn advisory_claim(
+    persistence: &Arc<dyn Persistence>,
+    key: &str,
+    ttl: Duration,
+    now: u64,
+    stamp: &str,
+) -> Result<Option<Box<dyn BackendLock>>> {
+    if let Some(existing) = persistence.get(key)?
+        && now.saturating_sub(parse_stamp(&existing)) < ttl.as_secs()
+    {
+        return Ok(None); // a live holder owns it (else: stale — reclaim by overwriting below)
     }
     persistence
-        .put(key, now.to_string().as_bytes())
+        .put(key, stamp.as_bytes())
         .context("write advisory lock object")?;
-    Ok(Some(Box::new(ObjectLock {
+    Ok(Some(guard(persistence, key)))
+}
+
+/// Build the held-lock guard (deletes the lock object on drop).
+fn guard(persistence: &Arc<dyn Persistence>, key: &str) -> Box<dyn BackendLock> {
+    Box::new(ObjectLock {
         persistence: persistence.clone(),
         key: key.to_string(),
-    })))
+    })
+}
+
+/// Current unix time in seconds (a clock before the epoch reads as 0 — makes any lock
+/// look stale, the safe-to-reclaim direction).
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Parse the unix-seconds stamp a lock object stores; an unreadable body reads as `0`
