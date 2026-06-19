@@ -53,8 +53,16 @@ spec:
               value: {{ .Values.nidus.dim | quote }}
             - name: NIDUS_PERSISTENCE
               value: {{ .Values.nidus.persistence | quote }}
+            {{- if .Values.nidus.memorySecret.name }}
+            - name: NIDUS_MEMORY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.nidus.memorySecret.name }}
+                  key: {{ .Values.nidus.memorySecret.key }}
+            {{- else }}
             - name: NIDUS_MEMORY
               value: {{ .Values.nidus.memory | quote }}
+            {{- end }}
             {{- with .Values.nidus.distance }}
             - name: NIDUS_DISTANCE
               value: {{ . | quote }}

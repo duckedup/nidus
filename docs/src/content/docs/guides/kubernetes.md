@@ -71,18 +71,39 @@ backend. Keep `replicaCount: 1`; extra replicas lose the lock race and crash-loo
 the image handles `SIGTERM` it flushes and releases its lock on the way out, so the
 replacement acquires it immediately instead of waiting out the lock TTL.
 
-## Credentials
+## Authenticating to the backends
 
-In order of preference:
+nidus authenticates to its backends with **static credentials** from the environment —
+there is no keyless IAM-role / IRSA / GKE Workload Identity path yet. Supply explicit
+keys:
 
-1. **Workload identity** — annotate the ServiceAccount
-   (`serviceAccount.annotations`) for IRSA (EKS) or GKE Workload Identity and leave
-   `credentials` empty. No static keys in the cluster.
-2. **Existing Secrets** — `credentials.existingSecrets: [my-aws-creds]` loads them via
-   `envFrom`; `auth.existingSecret` / `auth.existingSecretKey` supply the token.
-   Works with SealedSecrets, External Secrets, etc.
-3. **Inline** — `credentials.inline` and `auth.token` are written to a chart-managed
-   Secret. Fine for a quick start; prefer 1 or 2 in production.
+- **S3** — `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (plus optional
+  `AWS_SESSION_TOKEN`, `AWS_REGION`, and `AWS_ENDPOINT_URL` for R2/MinIO), via
+  `credentials.inline` or an existing Secret.
+- **GCS** — a service-account key as `GOOGLE_APPLICATION_CREDENTIALS_JSON` (the key JSON
+  inline). Put it in a Secret and list it in `credentials.existingSecrets`.
+- **Redis** — credentials go in the URL (`rediss://user:pass@host:6380`; `rediss://`
+  for TLS). When the URL has a password, source it from a Secret with
+  `nidus.memorySecret` so it stays out of the rendered manifest:
+
+  ```sh
+  kubectl create secret generic nidus-redis \
+    --from-literal=NIDUS_MEMORY="rediss://default:s3cr3t@redis.example.com:6380"
+  ```
+  ```yaml
+  nidus:
+    memory: ""
+    memorySecret:
+      name: nidus-redis
+      key: NIDUS_MEMORY
+  ```
+
+Prefer **existing Secrets** (`credentials.existingSecrets`, `auth.existingSecret`,
+`nidus.memorySecret`) over inline values in production — they integrate with
+SealedSecrets, the External Secrets Operator, and similar. Inline values
+(`credentials.inline`, `auth.token`) are written to a chart-managed Secret and are
+handy for a quick start. The library guides cover the same credentials for the
+[object stores](/guides/storage-backends/) and the [memory tier](/guides/memory-stores/).
 
 ## Verify
 

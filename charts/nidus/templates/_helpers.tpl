@@ -87,8 +87,10 @@ here at render time with an actionable message instead.
 {{- if not (or (hasPrefix "s3://" $p) (hasPrefix "gs://" $p) (hasPrefix "gcs://" $p)) -}}
 {{- fail "nidus.persistence must be an object store: s3://<bucket>/<prefix> or gs://<bucket>/<prefix>" -}}
 {{- end -}}
+{{- if not .Values.nidus.memorySecret.name -}}
 {{- $m := .Values.nidus.memory | lower -}}
 {{- if not (or (hasPrefix "redis://" $m) (hasPrefix "rediss://" $m) (hasPrefix "valkey://" $m) (hasPrefix "valkeys://" $m) (hasPrefix "keydb://" $m) (hasPrefix "dragonfly://" $m)) -}}
-{{- fail "nidus.memory must be a Redis-family URL: redis:// (or rediss://, valkey://, keydb://, dragonfly://)" -}}
+{{- fail "nidus.memory must be a Redis-family URL (redis://, rediss://, valkey://, keydb://, dragonfly://), or set nidus.memorySecret.name to source it from a Secret" -}}
+{{- end -}}
 {{- end -}}
 {{- end }}

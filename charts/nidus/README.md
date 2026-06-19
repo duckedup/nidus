@@ -58,18 +58,57 @@ does not yet expose multi-instance cluster mode. The deployment uses the `Recrea
 strategy so a rollout terminates the old writer (which releases its lock on `SIGTERM`)
 before the replacement starts.
 
-## Credentials
+## Authenticating to the backends
 
-Three ways to supply backend credentials and the auth token, in order of preference:
+nidus uses **static credentials** read from the environment. There is no keyless
+IAM-role / IRSA / GKE Workload Identity path yet — supply explicit keys.
 
-1. **Workload identity** (no static keys): annotate the ServiceAccount
-   (`serviceAccount.annotations`) for IRSA (EKS) / Workload Identity (GKE) and leave
-   `credentials` empty.
-2. **Existing Secrets** you manage (SealedSecrets, External Secrets, …):
-   `credentials.existingSecrets: [my-aws-creds]` (loaded via `envFrom`) and
-   `auth.existingSecret` / `auth.existingSecretKey` for the token.
-3. **Inline** (`credentials.inline`, `auth.token`): written to a chart-managed Secret.
-   Convenient for trying it out; prefer 1 or 2 in production.
+**S3 (`s3://`)** — `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (plus optional
+`AWS_SESSION_TOKEN`, `AWS_REGION`, and `AWS_ENDPOINT_URL` for R2/MinIO):
+
+```yaml
+credentials:
+  inline:           # or keep these in an existing Secret (see below)
+    AWS_ACCESS_KEY_ID: "AKIA..."
+    AWS_SECRET_ACCESS_KEY: "..."
+    AWS_REGION: "us-east-1"
+```
+
+**GCS (`gs://`)** — a service-account key as `GOOGLE_APPLICATION_CREDENTIALS_JSON`
+(the key JSON inline). Keep the JSON in a Secret and reference it:
+
+```sh
+kubectl create secret generic gcs-key \
+  --from-literal=GOOGLE_APPLICATION_CREDENTIALS_JSON="$(cat sa-key.json)"
+```
+```yaml
+credentials:
+  existingSecrets: [gcs-key]
+```
+
+**Redis (`redis://` / `rediss://`)** — credentials live in the URL userinfo, and TLS
+uses the `rediss://` scheme. When the URL holds a password, set `memorySecret` so it
+never appears in the rendered manifest:
+
+```sh
+kubectl create secret generic nidus-redis \
+  --from-literal=NIDUS_MEMORY="rediss://default:s3cr3t@redis.example.com:6380"
+```
+```yaml
+nidus:
+  memory: ""                 # leave empty when sourcing from the Secret
+  memorySecret:
+    name: nidus-redis
+    key: NIDUS_MEMORY
+```
+
+### Where to put credentials
+
+- **Existing Secrets** (recommended): `credentials.existingSecrets: [my-creds]` loads a
+  Secret via `envFrom`; `auth.existingSecret` supplies the token; `nidus.memorySecret`
+  supplies the Redis URL. Works with SealedSecrets, External Secrets Operator, etc.
+- **Inline** (`credentials.inline`, `auth.token`): written to a chart-managed Secret —
+  convenient for a quick start; prefer existing Secrets in production.
 
 ## Common values
 

@@ -25,9 +25,17 @@ nidus:
   #   s3://<bucket>[/<prefix>]   or   gs://<bucket>[/<prefix>]
   persistence: ""
 
-  # Shared in-RAM working set — a Redis-family tier. REQUIRED.
-  #   redis://host:6379   (also valkey://, keydb://, dragonfly://; rediss:// for TLS)
+  # Shared in-RAM working set — a Redis-family tier. REQUIRED (set `memory` OR
+  # `memorySecret`). Credentials go in the URL userinfo and TLS uses the rediss://
+  # scheme: redis://host:6379, rediss://user:pass@host:6380 (also valkey://, keydb://,
+  # dragonfly://). When the URL carries a password, prefer `memorySecret` below so it
+  # never lands in the Deployment manifest in plain text.
   memory: ""
+  # Source the full NIDUS_MEMORY URL from a Secret instead of `memory` above. Use this
+  # for an authenticated Redis so the password stays out of rendered manifests/values.
+  memorySecret:
+    name: ""
+    key: NIDUS_MEMORY
 
   # Distance metric: "" (cosine, the default) | cosine | euclidean | dot.
   # Only honored when the store is first created.
@@ -54,7 +62,12 @@ auth:
   existingSecretKey: token
 
 # ── Backend credentials (→ env) ─────────────────────────────────────────────────
-# nidus reads cloud credentials from the standard environment (AWS_*, GOOGLE_*, …).
+# nidus authenticates to the object store with STATIC credentials read from the
+# environment — there is no keyless IAM-role / IRSA / GKE Workload Identity path yet.
+#   S3 (s3://):  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (+ optional AWS_SESSION_TOKEN,
+#                AWS_REGION, AWS_ENDPOINT_URL for R2/MinIO).
+#   GCS (gs://): a service-account key as GOOGLE_APPLICATION_CREDENTIALS_JSON (the key
+#                JSON inline). Put it in an existing Secret and list it below.
 credentials:
   # Inline key/value pairs are written to a chart-managed Secret and loaded via
   # envFrom. e.g.
@@ -63,8 +76,9 @@ credentials:
   #   AWS_REGION: "us-east-1"
   #   AWS_ENDPOINT_URL: "http://minio:9000"   # for MinIO / non-AWS S3
   inline: {}
-  # Existing Secrets to load wholesale via envFrom (e.g. workload-identity output,
-  # SealedSecrets, External Secrets Operator).
+  # Existing Secrets to load wholesale via envFrom — the recommended path for real
+  # secrets (SealedSecrets, External Secrets Operator, or a hand-made Secret). For GCS,
+  # the Secret holds a GOOGLE_APPLICATION_CREDENTIALS_JSON key with the SA key JSON.
   existingSecrets: []
 
 # Escape hatches for anything not modeled above.
