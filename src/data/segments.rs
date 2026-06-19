@@ -128,6 +128,23 @@ impl Segments {
         self.segs.last().unwrap().data.row_count()
     }
 
+    /// `(base, rows)` for each segment in global-row order — the last entry is the active
+    /// (appendable) segment. Lets the store align a per-segment IVF index to each segment's
+    /// global row range `[base, base + rows)` (SPEC §14.3) without exposing segment internals.
+    pub fn segment_ranges(&self) -> Vec<(u64, u64)> {
+        self.segs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (self.base[i], s.data.row_count()))
+            .collect()
+    }
+
+    /// Number of live segments (last is the active one).
+    #[cfg(test)]
+    pub fn segment_count(&self) -> usize {
+        self.segs.len()
+    }
+
     /// Borrow global row `R` as a `dimension`-length slice, dispatching to its owning
     /// segment. Single-segment stores (the default) take the direct fast path.
     pub fn row(&self, global: u64) -> &[f32] {
@@ -241,12 +258,6 @@ impl Segments {
             self.next_id,
             self.version,
         )
-    }
-
-    /// Number of live segments (test/introspection).
-    #[cfg(test)]
-    pub fn segment_count(&self) -> usize {
-        self.segs.len()
     }
 
     /// Test-only fault seam: arm the active segment so its `(n+1)`-th subsequent append
@@ -366,6 +377,19 @@ mod tests {
         assert_eq!(s.row(1), &[7.0, 6.0]);
         // After collapse, appends continue on the single base segment.
         assert_eq!(s.append(&[1.0, 1.0]).unwrap(), 2);
+    }
+
+    #[test]
+    fn segment_ranges_track_bases_and_counts() {
+        let rows = vec![
+            vec![1.0_f32, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 1.0],
+            vec![2.0, 3.0],
+        ];
+        let s = two_segment(2, &rows, 2);
+        // Two segments: [0,2) sealed, [2,4) active. Last entry is the active segment.
+        assert_eq!(s.segment_ranges(), vec![(0, 2), (2, 2)]);
     }
 
     #[test]

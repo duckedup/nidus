@@ -23,6 +23,7 @@ let cfg = Config::new("/path/to/store", 768)
     .ann(None)                       // approximate-nearest-neighbour index (default: off)
     .query_threads(1)                // worker threads per exact search (default: 1)
     .segment_max_rows(None)          // seal the active segment past N rows (default: off)
+    .segment_index_min_rows(None)    // IVF-index sealed segments past N rows (default: off)
     .persistence("")                 // durable bytes: "" = local; "s3://…"/"gs://…"
     .memory("");                     // shared working set: "" = local; "redis://…"
 # let _ = cfg;
@@ -126,6 +127,21 @@ atomically (the commit point). `None` — the default — keeps the store a sing
 behaving exactly as it always has. A soft bound: a single `upsert` batch is never split,
 so a segment can exceed it by one batch. Most stores never need this; see
 [Storage](/guides/storage/#segments) for the on-disk picture.
+
+### `segment_index_min_rows`
+
+`Option<u64>` — default `None`. Build a per-segment **IVF index** over each immutable
+segment that holds at least this many rows. `None` (the default) never indexes a segment,
+so every vector is brute-forced — **exact, 100% recall**, the zero-config local default.
+When set, a sealed segment with `≥ rows` vectors is IVF-indexed (built once at seal /
+compaction), while the **active** segment (the recent write tail) and any smaller sealed
+segment stay exhaustive. So "exact vs approximate" becomes a per-segment property that
+follows size: the fresh data is always exact, the cold bulk is indexed, and a search merges
+an exhaustive-tail scan with the cold segments' index walks into one ranking. Has no effect
+without [`segment_max_rows`](#segment_max_rows) (a store only gets immutable segments to
+index once sealing is enabled), and is ignored when [`ann`](#ann) is set (that global index
+already covers every row). See
+[approximate search](/guides/search/#per-segment-indexing-at-scale).
 
 ### `persistence`
 
