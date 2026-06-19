@@ -112,6 +112,54 @@ identical to the library — the server adds nothing and hides nothing.
 You can take a hot [backup](/guides/cli-and-server/#backup--restore) of a store
 while `nidus serve` is running: `nidus backup` does not take the writer lock.
 
+## Configuration from the environment
+
+Every `nidus serve` flag also reads from a matching `NIDUS_*` environment variable,
+so the server can be configured without a command line at all — the natural fit for
+a container or an orchestrator. An explicit flag always wins over the variable.
+
+| Variable | Flag | Purpose |
+| --- | --- | --- |
+| `NIDUS_DIR` | `--dir` | Store directory (unused, but still required, with an object store) |
+| `NIDUS_DIM` | `--dim` | Embedding dimension (required to create a store) |
+| `NIDUS_DISTANCE` | `--distance` | `cosine` \| `euclidean` \| `dot` |
+| `NIDUS_PERSISTENCE` | `--persistence` | Where durable bytes live — `s3://…`, `gs://…`, or a local path |
+| `NIDUS_MEMORY` | `--memory` | Shared working set — `redis://…` (or `valkey://…`, …) |
+| `NIDUS_ADDR` | `--addr` | Bind address (default `127.0.0.1:7700`) |
+| `NIDUS_TOKEN` | `--token` | Bearer token for auth |
+| `NIDUS_MAX_BODY_BYTES` | `--max-body-bytes` | Request/upsert size limit |
+| `NIDUS_READ_ONLY` | `--read-only` | Serve without the writer lock |
+| `NIDUS_ANN`, `NIDUS_ANN_*` | `--ann`, `--ann-*` | Approximate-index selection and tuning |
+| `NIDUS_REQUIRE_REMOTE` | `--require-remote` | Refuse to start on a local-only store (see below) |
+
+Cloud credentials come from the [standard environment](/guides/storage-backends/)
+for each backend (`AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS`, …).
+
+## Running in a container
+
+The published [`duckedup/nidus`](https://hub.docker.com/r/duckedup/nidus) image runs
+`nidus serve` configured entirely from the environment. It is built for **shared,
+non-local backends** — object-store persistence plus a Redis-family memory tier —
+because a container has no durable local disk: a local-file or process-RAM store
+would lose its data on every restart. The image bakes in `NIDUS_REQUIRE_REMOTE=true`,
+so it fails fast with a clear message rather than start a store it cannot persist.
+
+```bash
+docker run --rm -p 7700:7700 \
+  -e NIDUS_DIM=768 \
+  -e NIDUS_PERSISTENCE=s3://my-bucket/store \
+  -e NIDUS_MEMORY=redis://my-redis:6379 \
+  -e NIDUS_TOKEN="$NIDUS_TOKEN" \
+  -e AWS_ACCESS_KEY_ID=… -e AWS_SECRET_ACCESS_KEY=… -e AWS_REGION=… \
+  duckedup/nidus:latest
+```
+
+The image binds `0.0.0.0:7700` and exposes the unauthenticated `GET /health` for a
+readiness/liveness probe. It handles `SIGTERM` (the signal an orchestrator sends to
+stop a container): on stop it flushes and releases the writer lock, so a replacement
+instance re-acquires it immediately instead of waiting out the lock TTL. Set a
+`NIDUS_TOKEN` whenever the port is reachable beyond localhost.
+
 ## API reference
 
 Every store operation is an HTTP route — `GET /stats`, `POST /search`,

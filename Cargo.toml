@@ -9,7 +9,7 @@ default-members = ["."]
 
 [package]
 name = "nidus"
-version = "0.24.0"
+version = "0.25.0"
 edition = "2024"
 rust-version = "1.96"
 description = "A small, pure-Rust embeddable vector store: brute-force or ANN cosine search over a single append-only directory, with pluggable persistence (local files, S3, GCS). No SQL, no query engine; builds in seconds."
@@ -91,7 +91,7 @@ bytemuck = "1"
 # tokio/axum/tower stack for `nidus serve`. `nidus serve` wraps the synchronous
 # `Nidus` in `Arc<Mutex<…>>` + `spawn_blocking` — the exact async pattern the
 # README/CLAUDE.md prescribe for async callers.
-clap = { version = "4", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"], optional = true }
 axum = { version = "0.8", optional = true }
 tower = { version = "0.5", optional = true }

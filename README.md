@@ -50,7 +50,7 @@ fast dependency.
 
 ```toml
 [dependencies]
-nidus = "0.24"
+nidus = "0.25"
 ```
 
 ```rust

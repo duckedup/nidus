@@ -331,7 +331,8 @@ pub fn open_memory_tier(location: &str) -> Result<Box<dyn MemoryTier>> {
 
 /// The RESP-protocol URL schemes [`open_memory_tier`] routes to [`RedisTier`] — Redis
 /// and its wire-compatible kin (Valkey, KeyDB, DragonflyDB), plain and TLS.
-const REDIS_SCHEMES: [&str; 6] = ["redis", "rediss", "valkey", "valkeys", "keydb", "dragonfly"];
+pub(crate) const REDIS_SCHEMES: [&str; 6] =
+    ["redis", "rediss", "valkey", "valkeys", "keydb", "dragonfly"];
 
 /// Open the persistence backend holding a single named **object** addressed by
 /// `location` — splitting it into a backend root and an object key at the last `/`

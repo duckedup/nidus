@@ -56,7 +56,8 @@ struct AppState {
     token: Option<Arc<str>>,
 }
 
-/// Open the store, bind the address, and serve until Ctrl-C; flush on shutdown.
+/// Open the store, bind the address, and serve until a shutdown signal (Ctrl-C /
+/// SIGTERM); flush and release the writer lock on shutdown.
 pub async fn serve(db: Nidus, cfg: ServeConfig) -> anyhow::Result<()> {
     let state = AppState {
         db: Arc::new(RwLock::new(db)),
@@ -73,7 +74,7 @@ pub async fn serve(db: Nidus, cfg: ServeConfig) -> anyhow::Result<()> {
         ""
     };
     eprintln!(
-        "nidus serving on http://{} (Ctrl-C to stop){auth_note}",
+        "nidus serving on http://{} (Ctrl-C / SIGTERM to stop){auth_note}",
         cfg.addr
     );
 
@@ -137,8 +138,35 @@ async fn auth(State(st): State<AppState>, req: Request, next: Next) -> Response 
     next.run(req).await
 }
 
+/// Resolve on the first shutdown signal: Ctrl-C (SIGINT) everywhere, plus SIGTERM on
+/// Unix — the signal Docker/Kubernetes send to stop a container. Catching SIGTERM is
+/// what lets the graceful path below run (flush + writer-lock release on `Nidus` drop)
+/// before exit; without it the process is eventually SIGKILLed, the writer lock is
+/// never released, and a restarted pod must wait out the full lock TTL before it can
+/// re-acquire it. With it, a rolling restart hands the lock over immediately.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+            }
+            // If the handler can't be installed, just never fire this arm.
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────
