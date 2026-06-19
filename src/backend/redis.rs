@@ -10,6 +10,12 @@
 //! The non-`redis` schemes are pure aliases: they are rewritten to `redis://`/`rediss://`
 //! before being handed to the client, since the servers are protocol-identical.
 //!
+//! A `?cluster=true` query opens a **Redis/Valkey Cluster** client instead (via the `cluster`
+//! feature): the URL host is a seed node, the rest of the topology is discovered, and slot
+//! routing + `MOVED`/`ASK` redirection are handled by the client. Single-node and cluster
+//! connections share one code path — both are driven as `&mut dyn ConnectionLike` through the
+//! low-level [`Cmd`](redis::Cmd) API.
+//!
 //! As a [`MemoryTier`] this is **model (a)** (SPEC §13.3): a *shared, rebuildable* cache
 //! of the serialized working set, not a source of truth. `store` is `SET` (with `EX`
 //! when a ttl is given), `load` is `GET`; an evicted or absent key is `Ok(None)`, never
@@ -24,15 +30,25 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use redis::{Client, Commands};
+use redis::{Client, ConnectionLike, RedisResult, cluster::ClusterClient};
 
 use super::MemoryTier;
 
-/// A shared memory tier backed by a Redis-protocol server (Redis/Valkey/KeyDB/Dragonfly).
+/// A live blocking connection — a single-node [`redis::Connection`] or a
+/// [`ClusterConnection`](redis::cluster::ClusterConnection) — behind one object-safe trait
+/// so the rest of the tier is topology-agnostic. Commands are issued through the low-level
+/// [`Cmd`](redis::Cmd) API, which takes `&mut dyn ConnectionLike`.
+type Conn = Box<dyn ConnectionLike + Send>;
+
+/// A shared memory tier backed by a Redis-protocol server (Redis/Valkey/KeyDB/Dragonfly),
+/// either a single node or a **cluster** (slot-routed, with MOVED/ASK redirection handled by
+/// the client).
 pub struct RedisTier {
-    client: Client,
+    /// Opens a fresh connection. One boxed closure regardless of single-node vs cluster, so
+    /// the reconnect path below is shared.
+    open: Box<dyn Fn() -> RedisResult<Conn> + Send + Sync>,
     /// A cached blocking connection, lazily opened and reopened on failure.
-    conn: Mutex<Option<redis::Connection>>,
+    conn: Mutex<Option<Conn>>,
     /// Optional key namespace (`<prefix>:<key>`), from `?prefix=…` in the URL.
     prefix: String,
 }
@@ -40,15 +56,24 @@ pub struct RedisTier {
 impl RedisTier {
     /// Build from a memory-tier location: a `redis://`/`rediss://`/`valkey://`/
     /// `valkeys://`/`keydb://`/`dragonfly://` URL. An optional `?prefix=<ns>` query
-    /// namespaces every key (`<ns>:<key>`); it is stripped before the URL reaches the
-    /// client. The connection is opened lazily on first use, so construction never
-    /// blocks on the network.
+    /// namespaces every key (`<ns>:<key>`), and `?cluster=true` opens a Redis/Valkey
+    /// **Cluster** client (the URL host is a seed node — the rest of the topology is
+    /// discovered). Both are stripped before the URL reaches the client. The connection is
+    /// opened lazily on first use, so construction never blocks on the network.
     pub(crate) fn from_url(location: &str) -> Result<RedisTier> {
-        let (url, prefix) = normalize_url(location)?;
-        let client = Client::open(url.as_str())
-            .with_context(|| format!("invalid Redis memory-tier URL {url:?}"))?;
+        let (url, prefix, cluster) = normalize_url(location)?;
+        let open: Box<dyn Fn() -> RedisResult<Conn> + Send + Sync> = if cluster {
+            // The seed node bootstraps discovery of the full cluster (CLUSTER SLOTS).
+            let client = ClusterClient::new(vec![url.clone()])
+                .with_context(|| format!("invalid Redis cluster URL {url:?}"))?;
+            Box::new(move || client.get_connection().map(|c| Box::new(c) as Conn))
+        } else {
+            let client = Client::open(url.as_str())
+                .with_context(|| format!("invalid Redis memory-tier URL {url:?}"))?;
+            Box::new(move || client.get_connection().map(|c| Box::new(c) as Conn))
+        };
         Ok(RedisTier {
-            client,
+            open,
             conn: Mutex::new(None),
             prefix,
         })
@@ -67,21 +92,17 @@ impl RedisTier {
     /// Run `f` against a live connection, opening one if needed and retrying **once**
     /// on a connection-level failure (a server-side timeout or restart can silently
     /// drop the cached socket; the retry transparently reconnects).
-    fn run<T>(&self, f: impl Fn(&mut redis::Connection) -> redis::RedisResult<T>) -> Result<T> {
+    fn run<T>(&self, f: impl Fn(&mut dyn ConnectionLike) -> RedisResult<T>) -> Result<T> {
         let mut guard = self
             .conn
             .lock()
             .map_err(|_| anyhow!("Redis memory-tier connection lock poisoned"))?;
         for attempt in 0..2 {
             if guard.is_none() {
-                *guard = Some(
-                    self.client
-                        .get_connection()
-                        .context("failed to connect to the Redis memory tier")?,
-                );
+                *guard = Some((self.open)().context("failed to connect to the Redis memory tier")?);
             }
             let conn = guard.as_mut().expect("connection just ensured");
-            match f(conn) {
+            match f(conn.as_mut()) {
                 Ok(v) => return Ok(v),
                 // Drop the (possibly-dead) connection and let the next attempt reopen.
                 Err(e) if attempt == 0 && e.is_connection_dropped() => *guard = None,
@@ -95,29 +116,32 @@ impl RedisTier {
 impl MemoryTier for RedisTier {
     fn load(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let k = self.namespaced(key);
-        self.run(|conn| conn.get(&k))
+        // Low-level `Cmd::query` (vs the `Commands` helpers) because it takes
+        // `&mut dyn ConnectionLike`, so the same call drives a single-node or cluster
+        // connection without the trait being `Sized`.
+        self.run(|conn| redis::cmd("GET").arg(&k).query::<Option<Vec<u8>>>(conn))
     }
 
     fn store(&self, key: &str, bytes: &[u8], ttl: Option<Duration>) -> Result<()> {
         let k = self.namespaced(key);
-        match ttl {
-            // SETEX key <seconds> value — clamp any non-`None` ttl up to ≥ 1s: Redis
-            // rejects `EX 0` as an invalid expire time, and a sub-second ttl truncates to
-            // 0, so a caller asking to "store this briefly" must still get a valid expiry.
-            Some(d) => {
-                let secs = d.as_secs().max(1);
-                self.run(|conn| conn.set_ex(&k, bytes, secs))
-            }
-            None => self.run(|conn| conn.set(&k, bytes)),
+        let mut command = redis::cmd("SET");
+        command.arg(&k).arg(bytes);
+        if let Some(d) = ttl {
+            // `EX <seconds>` — clamp any non-`None` ttl up to ≥ 1s: Redis rejects `EX 0` as
+            // an invalid expire time, and a sub-second ttl truncates to 0, so a caller asking
+            // to "store this briefly" must still get a valid expiry.
+            command.arg("EX").arg(d.as_secs().max(1));
         }
+        self.run(|conn| command.query::<()>(conn))
     }
 }
 
-/// Rewrite a memory-tier location into a `redis-rs`-acceptable URL plus an optional key
-/// prefix. Maps the alias schemes onto Redis's own (`valkey`/`keydb`/`dragonfly` →
-/// `redis`, `valkeys` → `rediss`, since the servers are protocol-identical) and strips a
-/// trailing `?prefix=<ns>` query. Pure string logic — unit-tested directly.
-fn normalize_url(location: &str) -> Result<(String, String)> {
+/// Rewrite a memory-tier location into a `redis-rs`-acceptable URL plus the optional key
+/// prefix and a cluster flag. Maps the alias schemes onto Redis's own (`valkey`/`keydb`/
+/// `dragonfly` → `redis`, `valkeys` → `rediss`, since the servers are protocol-identical)
+/// and strips the `?prefix=<ns>` / `?cluster=<bool>` query keys. Pure string logic —
+/// unit-tested directly.
+fn normalize_url(location: &str) -> Result<(String, String, bool)> {
     let (scheme, rest) = location
         .split_once("://")
         .ok_or_else(|| anyhow!("Redis memory-tier location {location:?} is missing a scheme"))?;
@@ -126,24 +150,37 @@ fn normalize_url(location: &str) -> Result<(String, String)> {
         "rediss" | "valkeys" => "rediss",
         other => bail!("{other:?} is not a Redis-family scheme"),
     };
-    // Split off an optional `?prefix=<ns>` (the only query key we honour).
-    let (body, prefix) = match rest.split_once('?') {
-        Some((body, query)) => (body, parse_prefix(query)),
-        None => (rest, String::new()),
+    // Split off the query; we honour `prefix=<ns>` and `cluster=<bool>`.
+    let (body, prefix, cluster) = match rest.split_once('?') {
+        Some((body, query)) => (
+            body,
+            query_value(query, "prefix"),
+            query_flag(query, "cluster"),
+        ),
+        None => (rest, String::new(), false),
     };
     if body.is_empty() {
         bail!("Redis memory-tier location {location:?} is missing a host");
     }
-    Ok((format!("{canon}://{body}"), prefix))
+    Ok((format!("{canon}://{body}"), prefix, cluster))
 }
 
-/// Extract a `prefix=<ns>` value from a URL query string (the rest is ignored).
-fn parse_prefix(query: &str) -> String {
+/// Value of `<key>=…` in a URL query string (`""` if absent; the rest is ignored).
+fn query_value(query: &str, key: &str) -> String {
+    let needle = format!("{key}=");
     query
         .split('&')
-        .find_map(|kv| kv.strip_prefix("prefix="))
+        .find_map(|kv| kv.strip_prefix(&needle))
         .unwrap_or("")
         .to_string()
+}
+
+/// Whether a boolean query flag is truthy (`<key>=true` / `=1` / `=yes`).
+fn query_flag(query: &str, key: &str) -> bool {
+    matches!(
+        query_value(query, key).to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes"
+    )
 }
 
 #[cfg(test)]
@@ -161,21 +198,37 @@ mod tests {
             ("valkeys://h", "rediss://h"),
             ("REDIS://H", "redis://H"), // scheme is case-insensitive
         ] {
-            let (url, prefix) = normalize_url(loc).unwrap();
+            let (url, prefix, cluster) = normalize_url(loc).unwrap();
             assert_eq!(url, want, "{loc}");
             assert!(prefix.is_empty(), "{loc}");
+            assert!(!cluster, "{loc}");
         }
     }
 
     #[test]
     fn normalize_extracts_and_strips_prefix() {
-        let (url, prefix) = normalize_url("valkey://h:6379/0?prefix=nidus").unwrap();
+        let (url, prefix, _) = normalize_url("valkey://h:6379/0?prefix=nidus").unwrap();
         assert_eq!(url, "redis://h:6379/0");
         assert_eq!(prefix, "nidus");
         // A non-prefix query is simply dropped.
-        let (url, prefix) = normalize_url("redis://h?foo=bar").unwrap();
+        let (url, prefix, _) = normalize_url("redis://h?foo=bar").unwrap();
         assert_eq!(url, "redis://h");
         assert!(prefix.is_empty());
+    }
+
+    #[test]
+    fn normalize_detects_cluster_flag_with_prefix() {
+        // Cluster opt-in via `?cluster=true`, composable with `?prefix=`.
+        let (url, prefix, cluster) =
+            normalize_url("valkey://seed:6379?cluster=true&prefix=ns").unwrap();
+        assert_eq!(url, "redis://seed:6379");
+        assert_eq!(prefix, "ns");
+        assert!(cluster);
+        // Truthy variants, and default-off.
+        assert!(normalize_url("redis://h?cluster=1").unwrap().2);
+        assert!(normalize_url("rediss://h?cluster=yes").unwrap().2);
+        assert!(!normalize_url("redis://h?cluster=false").unwrap().2);
+        assert!(!normalize_url("redis://h").unwrap().2);
     }
 
     #[test]
@@ -187,17 +240,10 @@ mod tests {
 
     #[test]
     fn namespaced_prepends_prefix() {
-        let tier = RedisTier {
-            client: Client::open("redis://localhost").unwrap(),
-            conn: Mutex::new(None),
-            prefix: "nidus".to_string(),
-        };
+        // `from_url` only parses (no connection until first use), so this stays Miri-clean.
+        let tier = RedisTier::from_url("redis://localhost?prefix=nidus").unwrap();
         assert_eq!(tier.namespaced("warm"), "nidus:warm");
-        let flat = RedisTier {
-            client: Client::open("redis://localhost").unwrap(),
-            conn: Mutex::new(None),
-            prefix: String::new(),
-        };
+        let flat = RedisTier::from_url("redis://localhost").unwrap();
         assert_eq!(flat.namespaced("warm"), "warm");
     }
 

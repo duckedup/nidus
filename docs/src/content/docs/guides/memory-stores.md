@@ -45,6 +45,7 @@ anything by pointing at it.
 | Shared via Redis | `redis://host:6379` | Plain connection. |
 | Shared via Valkey / KeyDB / Dragonfly | `valkey://…`, `keydb://…`, `dragonfly://…` | Same Redis protocol; one client covers them all. |
 | Shared over TLS | `rediss://…` (or `valkeys://…`) | Encrypted connection. |
+| Redis / Valkey **Cluster** | `redis://seed:6379?cluster=true` | Slot-routed across nodes; the host is a seed. |
 
 ### Local memory (the default)
 
@@ -85,6 +86,18 @@ For an encrypted connection to a managed or remote server, use `rediss://` (or
 
 ```bash
 nidus serve --dir ./store --dim 768 --memory rediss://user:pass@cache.example.com:6380
+```
+
+### Redis / Valkey Cluster
+
+For a sharded, highly-available deployment, point `--memory` at a **cluster** with
+`?cluster=true`. The host is a seed node — nidus discovers the rest of the topology and the
+client routes each key to its slot's node (handling `MOVED`/`ASK` redirects). Works with any
+RESP-compatible cluster (Redis Cluster, Valkey Cluster), plain or over TLS.
+
+```bash
+nidus serve --dir ./store --dim 768 --memory redis://seed-node:6379?cluster=true
+nidus serve --dir ./store --dim 768 --memory rediss://seed:6380?cluster=true&prefix=docs
 ```
 
 ### Sharing one server across stores
