@@ -24,10 +24,17 @@
 FROM --platform=$BUILDPLATFORM rust:1-bookworm AS builder
 
 # Cross toolchains for both supported target arches. ring (ureq/redis TLS) is a small
-# C+asm compile and needs the target CC; cargo needs the matching linker.
+# C+asm compile and needs the target CC; cargo needs the matching linker. The
+# `libc6-dev-*-cross` packages carry the per-arch libc headers (e.g. aarch64's
+# `bits/libc-header-start.h`) — without them the cross gcc falls back to the host's
+# `/usr/include` and the ring build fails with a missing-header error. Both arches'
+# cross packages are installed so the build works whichever way it cross-compiles
+# (amd64 runner → arm64, or vice versa); they live in arch-specific paths and coexist
+# with the native toolchain.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         gcc-x86-64-linux-gnu gcc-aarch64-linux-gnu \
+        libc6-dev-amd64-cross libc6-dev-arm64-cross \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
