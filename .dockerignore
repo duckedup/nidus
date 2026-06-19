@@ -1,0 +1,15 @@
+# Keep the build context tiny and the image cache stable: ship only the crate
+# sources the build actually compiles. Everything below is irrelevant to
+# `cargo build --features cli`.
+target/
+benchmarks/target/
+docs/
+.git/
+.github/
+.beads/
+.claude/
+*.md
+.gitignore
+.dockerignore
+Dockerfile
+justfile

@@ -32,60 +32,65 @@ pub struct Cli {
 /// dimension and distance metric are read from the on-disk header, so `--dim`
 /// and `--distance` are only needed when creating a store (or to override and
 /// double-check an existing one — a mismatch is then a hard error).
+///
+/// Every flag also reads from a `NIDUS_*` environment variable (the flag still
+/// wins when both are given), so a container — e.g. the published Docker image —
+/// can be configured entirely through the environment with no command line.
 #[derive(Args, Debug)]
 struct StoreArgs {
-    /// Store directory (created on first write).
-    #[arg(long, short = 'd')]
+    /// Store directory (created on first write). Unused — but still required — when
+    /// `--persistence` names an object store, where the durable bytes live remotely.
+    #[arg(long, short = 'd', env = "NIDUS_DIR")]
     dir: PathBuf,
     /// Embedding dimension. Inferred from an existing store; required to create one.
-    #[arg(long)]
+    #[arg(long, env = "NIDUS_DIM")]
     dim: Option<usize>,
     /// Distance metric: cosine, euclidean, or dot. Inferred from an existing
     /// store; defaults to cosine when creating one.
-    #[arg(long)]
+    #[arg(long, env = "NIDUS_DISTANCE")]
     distance: Option<DistanceArg>,
     /// Open without taking the writer lock (rejects mutations).
-    #[arg(long)]
+    #[arg(long, env = "NIDUS_READ_ONLY")]
     read_only: bool,
     /// Opt into an approximate-nearest-neighbour index: `hnsw` or `ivf`. Omit for
     /// exact brute-force search (the default). Unlike `--dim`/`--distance`, the ANN
     /// choice is *not* stored in the header — pass it on every open (including
     /// `serve`) where you want the index built/consulted.
-    #[arg(long)]
+    #[arg(long, env = "NIDUS_ANN")]
     ann: Option<AnnKindArg>,
     /// HNSW: max neighbours per node above layer 0. Ignored without `--ann hnsw`.
-    #[arg(long)]
+    #[arg(long, env = "NIDUS_ANN_M")]
     ann_m: Option<usize>,
     /// HNSW: build-time beam width. Ignored without `--ann hnsw`.
-    #[arg(long)]
+    #[arg(long, env = "NIDUS_ANN_EF_CONSTRUCTION")]
     ann_ef_construction: Option<usize>,
     /// HNSW: search-time beam width. Ignored without `--ann hnsw`.
-    #[arg(long)]
+    #[arg(long, env = "NIDUS_ANN_EF_SEARCH")]
     ann_ef_search: Option<usize>,
     /// IVF: number of k-means lists (`0` = auto `~sqrt(n)`). Ignored without `--ann ivf`.
-    #[arg(long)]
+    #[arg(long, env = "NIDUS_ANN_N_LISTS")]
     ann_n_lists: Option<usize>,
     /// IVF: lists probed per query. Ignored without `--ann ivf`.
-    #[arg(long)]
+    #[arg(long, env = "NIDUS_ANN_N_PROBE")]
     ann_n_probe: Option<usize>,
     /// Candidate over-fetch multiple (`top_k * overscan`) before post-filter + rerank.
     /// Applies to both ANN kinds. Ignored without `--ann`.
-    #[arg(long)]
+    #[arg(long, env = "NIDUS_ANN_OVERSCAN")]
     ann_overscan: Option<usize>,
     /// Build PRNG seed (deterministic index). Applies to both ANN kinds. Ignored without `--ann`.
-    #[arg(long)]
+    #[arg(long, env = "NIDUS_ANN_SEED")]
     ann_seed: Option<u64>,
     /// Where the durable bytes live (SPEC §13.2). Omit (or a path / `file://…`) for local
     /// files under `--dir`; `s3://<bucket>[/<prefix>]` or `gs://<bucket>[/<prefix>]` for a
     /// live object-store-backed store (whole-object rewrite on flush). With an object
     /// store pass `--dim` — the remote header is not peeked. Credentials come from the
     /// standard environment (AWS_*/GOOGLE_APPLICATION_CREDENTIALS).
-    #[arg(long)]
+    #[arg(long, env = "NIDUS_PERSISTENCE")]
     persistence: Option<String>,
     /// Share the in-RAM working set across processes (SPEC §13.3): a `redis://…` (or
     /// `valkey://…`, `keydb://…`, `dragonfly://…`) URL. Omit (or `local`) to keep it
     /// process-local. The working set is published on flush and adopted on open.
-    #[arg(long)]
+    #[arg(long, env = "NIDUS_MEMORY")]
     memory: Option<String>,
 }
 
@@ -123,6 +128,17 @@ impl StoreArgs {
         self.persistence.as_deref().is_some_and(|p| {
             let p = p.to_ascii_lowercase();
             p.starts_with("s3://") || p.starts_with("gs://") || p.starts_with("gcs://")
+        })
+    }
+
+    /// Whether `--memory` names a (non-local) shared Redis-family tier — the same
+    /// RESP schemes [`crate::open_memory_tier`] routes to a `RedisTier`.
+    fn is_shared_memory(&self) -> bool {
+        self.memory.as_deref().is_some_and(|m| {
+            let m = m.to_ascii_lowercase();
+            crate::backend::REDIS_SCHEMES
+                .iter()
+                .any(|s| m.starts_with(&format!("{s}://")))
         })
     }
 
@@ -203,18 +219,25 @@ enum Command {
     Serve {
         #[command(flatten)]
         store: StoreArgs,
-        /// Address to bind.
-        #[arg(long, default_value = "127.0.0.1:7700")]
+        /// Address to bind. Bind `0.0.0.0:7700` to serve outside localhost (e.g. in
+        /// a container); pair it with `--token`.
+        #[arg(long, default_value = "127.0.0.1:7700", env = "NIDUS_ADDR")]
         addr: String,
         /// Require `Authorization: Bearer <token>` on every request except
-        /// `/health`. Falls back to the `NIDUS_TOKEN` env var. Strongly advised
-        /// when binding anything other than localhost.
-        #[arg(long)]
+        /// `/health`. Strongly advised when binding anything other than localhost.
+        #[arg(long, env = "NIDUS_TOKEN")]
         token: Option<String>,
         /// Maximum request body size in bytes (also the largest single upsert).
         /// Default 256 MiB.
-        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        #[arg(long, default_value_t = 256 * 1024 * 1024, env = "NIDUS_MAX_BODY_BYTES")]
         max_body_bytes: usize,
+        /// Refuse to start unless the store is backed by *shared, non-local* backends:
+        /// object-store `--persistence` (`s3://…`/`gs://…`) **and** a Redis-family
+        /// `--memory` tier (`redis://…`). This is the contract the published Docker
+        /// image runs under — a container has no durable local disk, so a local-file or
+        /// process-RAM store would silently lose data on restart.
+        #[arg(long, env = "NIDUS_REQUIRE_REMOTE")]
+        require_remote: bool,
     },
     /// List collections.
     Collections {
@@ -406,7 +429,8 @@ pub fn run(cli: Cli) -> Result<()> {
             addr,
             token,
             max_body_bytes,
-        } => serve(store, addr, token, max_body_bytes),
+            require_remote,
+        } => serve(store, addr, token, max_body_bytes, require_remote),
         Command::Collections { store } => {
             let db = open(&store, false)?;
             print_json(&db.collections())
@@ -633,15 +657,32 @@ fn serve(
     addr: String,
     token: Option<String>,
     max_body_bytes: usize,
+    require_remote: bool,
 ) -> Result<()> {
+    // The container contract: no durable local disk, so refuse anything that would
+    // keep its state process-local (a local-file store or process-RAM working set).
+    if require_remote {
+        if !store.is_object_store() {
+            bail!(
+                "--require-remote: --persistence must be an object store (s3://… or gs://…), got {:?}",
+                store.persistence.as_deref().unwrap_or("<local files>")
+            );
+        }
+        if !store.is_shared_memory() {
+            bail!(
+                "--require-remote: --memory must be a shared Redis-family tier (redis://…), got {:?}",
+                store.memory.as_deref().unwrap_or("<process RAM>")
+            );
+        }
+    }
     let mode = if store.read_only {
         OpenMode::ReadOnly
     } else {
         OpenMode::ReadWrite
     };
     let db = Nidus::open(store.config(mode)?)?;
-    // An explicit --token wins; otherwise fall back to the NIDUS_TOKEN env var.
-    let token = token.or_else(|| std::env::var("NIDUS_TOKEN").ok().filter(|t| !t.is_empty()));
+    // An empty --token / NIDUS_TOKEN (clap reads the env var) means no auth.
+    let token = token.filter(|t| !t.is_empty());
     let cfg = crate::server::ServeConfig {
         addr,
         token,
@@ -898,6 +939,77 @@ mod tests {
             }
             _ => panic!("expected Search"),
         }
+    }
+
+    /// A `StoreArgs` with the given persistence/memory and everything else defaulted —
+    /// keeps the backend-predicate tests below readable.
+    fn store_args(persistence: Option<&str>, memory: Option<&str>) -> StoreArgs {
+        StoreArgs {
+            dir: PathBuf::from("/tmp/s"),
+            dim: Some(8),
+            distance: None,
+            read_only: false,
+            ann: None,
+            ann_m: None,
+            ann_ef_construction: None,
+            ann_ef_search: None,
+            ann_n_lists: None,
+            ann_n_probe: None,
+            ann_overscan: None,
+            ann_seed: None,
+            persistence: persistence.map(str::to_string),
+            memory: memory.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn object_store_and_shared_memory_predicates() {
+        // Object-store persistence: the three accepted schemes (case-insensitive), and
+        // not a local path / file:// URL.
+        assert!(store_args(Some("s3://bucket/store"), None).is_object_store());
+        assert!(store_args(Some("gs://bucket/store"), None).is_object_store());
+        assert!(store_args(Some("GCS://Bucket/Store"), None).is_object_store());
+        assert!(!store_args(Some("file:///data"), None).is_object_store());
+        assert!(!store_args(Some("/data"), None).is_object_store());
+        assert!(!store_args(None, None).is_object_store());
+
+        // Shared memory: the Redis family, and not local / process RAM.
+        assert!(store_args(None, Some("redis://cache:6379")).is_shared_memory());
+        assert!(store_args(None, Some("rediss://cache:6379")).is_shared_memory());
+        assert!(store_args(None, Some("valkey://cache:6379")).is_shared_memory());
+        assert!(store_args(None, Some("dragonfly://cache:6379")).is_shared_memory());
+        assert!(!store_args(None, Some("local")).is_shared_memory());
+        assert!(!store_args(None, None).is_shared_memory());
+    }
+
+    #[test]
+    fn serve_require_remote_rejects_local_backends() {
+        // Local-file persistence (the default) is refused under --require-remote.
+        let err = serve(
+            store_args(None, Some("redis://c")),
+            "x".into(),
+            None,
+            1,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--persistence must be an object store"),
+            "{err}"
+        );
+
+        // Object store but process-RAM memory is refused too.
+        let err = serve(
+            store_args(Some("s3://b/s"), None),
+            "x".into(),
+            None,
+            1,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--memory must be a shared"), "{err}");
     }
 
     #[test]
