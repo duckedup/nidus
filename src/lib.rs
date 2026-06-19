@@ -1,9 +1,14 @@
-#![forbid(unsafe_code)]
+// `#![deny(unsafe_code)]`, not `forbid`: nidus is unsafe-free everywhere except the single
+// memory-map call in `src/data/mmap.rs` (the one conscious FFI opt-in, SPEC §9/§14.6), which
+// carries a scoped `#[allow(unsafe_code)]`. `deny` lets that one site opt in; every other use
+// of `unsafe` anywhere in the crate is still a hard compile error.
+#![deny(unsafe_code)]
 //! # nidus
 //!
 //! A small, pure-Rust embeddable vector store: brute-force cosine search over a
 //! single append-only directory, with typed metadata filters and many logical
-//! collections sharing one embedding space. No FFI, no C, no SQL.
+//! collections sharing one embedding space. No SQL, no query engine; safe Rust
+//! throughout but for the one opt-in memory-map call.
 //!
 //! See `SPEC.md` for the full design.
 //!

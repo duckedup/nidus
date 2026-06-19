@@ -42,6 +42,12 @@ impl LocalFs {
 }
 
 impl Persistence for LocalFs {
+    fn local_path(&self, key: &str) -> Option<PathBuf> {
+        // A plain file under the root — mappable. Reject malformed keys (the mmap caller
+        // then falls back to a RAM load) rather than surfacing an error from a path getter.
+        self.object_path(key).ok()
+    }
+
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let path = self.object_path(key)?;
         match std::fs::read(&path) {

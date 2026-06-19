@@ -46,7 +46,9 @@ collection → { id → (row, attrs) }
 
 The index is fully reproducible from the two files, so it is never itself
 persisted. After open, **search never touches disk** — it sweeps the in-RAM
-matrix.
+matrix. (The opt-in [`Config::mmap`](/guides/storage/#larger-than-ram-memory-mapped-segments)
+mode trades this for capacity: cold segments are mapped from disk and paged in on
+touch, so a store can outgrow RAM.)
 
 ## Upsert
 
@@ -104,6 +106,10 @@ chunked dot product, an allocation-free top-k scan, and a storage-order
   want it over the wire, [`nidus serve`](/guides/http-server/) exposes the whole
   store over HTTP.
 
-Each of those is a deferred *seam*, not a wall — mmap, an ANN index, and scalar
-quantization are all designed-for and additive over the same append-only file.
-They are simply not built until a real use case needs them.
+None of those are walls — they are *seams*, additive over the same append-only
+format. Several have since shipped as opt-in modes: an [ANN
+index](/guides/search/#approximate-search-ann), [scalar/binary
+quantization](/guides/search/#int8-scalar-quantization), and [memory-mapped
+larger-than-RAM stores](/guides/storage/#larger-than-ram-memory-mapped-segments).
+Each stays off by default, so the simple exact-in-RAM store is what you get until
+you opt in.

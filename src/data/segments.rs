@@ -55,6 +55,7 @@ impl Segments {
         persistence: Arc<dyn Persistence>,
         manifest: &Manifest,
         cap: Option<u64>,
+        mmap: bool,
     ) -> Result<Segments> {
         let dimension = manifest.dimension as usize;
         let distance = manifest.distance;
@@ -62,15 +63,12 @@ impl Segments {
             bail!("manifest names no segments — corrupt store");
         }
 
-        let mut segs: Vec<Seg> = Vec::new();
-        let mut base: Vec<u64> = Vec::new();
-        let mut acc_rows: u64 = 0;
+        // The cap (`max_vector_bytes`) bounds total vector bytes across every segment,
+        // residency-independent — it counts mmap'd segments too (§6.6, generalized).
         let mut acc_bytes: u64 = 0;
-        for name in &manifest.segments {
-            // Open the append handle once, size-check it (pre-allocation guard), then load.
-            let ap = appender_for(&persistence, name)?;
+        let mut tally = |seg_bytes: u64| -> Result<()> {
             if let Some(cap) = cap {
-                acc_bytes = acc_bytes.saturating_add(ap.len()?.saturating_sub(HEADER_LEN as u64));
+                acc_bytes = acc_bytes.saturating_add(seg_bytes);
                 if acc_bytes > cap {
                     bail!(
                         "store segments hold {acc_bytes} bytes of vectors, exceeding \
@@ -78,7 +76,34 @@ impl Segments {
                     );
                 }
             }
-            let data = DataSegment::open_with(ap, dimension, distance)?;
+            Ok(())
+        };
+
+        let mut segs: Vec<Seg> = Vec::new();
+        let mut base: Vec<u64> = Vec::new();
+        let mut acc_rows: u64 = 0;
+        let n = manifest.segments.len();
+        for (i, name) in manifest.segments.iter().enumerate() {
+            // Memory-map a segment only when it is **immutable** (not the active last segment),
+            // mmap is requested, the host is little-endian (the on-disk f32 layout, §5.1), and
+            // the backend stores it as a mappable local file. Otherwise load it into RAM.
+            let is_active = i == n - 1;
+            let local_path = (mmap && !is_active && cfg!(target_endian = "little"))
+                .then(|| persistence.local_path(name))
+                .flatten();
+            let data = match local_path {
+                Some(path) => {
+                    let data = DataSegment::open_mmap(&path, dimension, distance)?;
+                    tally(data.row_count() * dimension as u64 * 4)?;
+                    data
+                }
+                None => {
+                    // Open the append handle once, size-check it (pre-allocation guard), then load.
+                    let ap = appender_for(&persistence, name)?;
+                    tally(ap.len()?.saturating_sub(HEADER_LEN as u64))?;
+                    DataSegment::open_with(ap, dimension, distance)?
+                }
+            };
             base.push(acc_rows);
             acc_rows += data.row_count();
             segs.push(Seg {
@@ -240,8 +265,26 @@ impl Segments {
         // The base segment (always `BASE_SEGMENT`, by construction) is rewritten in place;
         // the rest become unreferenced.
         let dropped: Vec<String> = self.segs[1..].iter().map(|s| s.name.clone()).collect();
-        self.segs[0].data.rewrite(rows)?;
-        self.segs[0].name = BASE_SEGMENT.to_string();
+        if self.segs[0].data.is_mmap() {
+            // The base is memory-mapped (immutable) and has no writable appender. Open a fresh
+            // write handle over `BASE_SEGMENT` *without* paging the old rows into RAM, then let
+            // `rewrite` atomically replace the object. Replacing `segs[0]` drops the old map.
+            let (dim, distance) = (self.dimension(), self.distance);
+            let p = self
+                .persistence
+                .as_ref()
+                .expect("a memory-mapped segment implies a local-FS backend");
+            let ap = appender_for(p, BASE_SEGMENT)?;
+            let mut data = DataSegment::rewrite_target(ap, dim, distance);
+            data.rewrite(rows)?;
+            self.segs[0] = Seg {
+                name: BASE_SEGMENT.to_string(),
+                data,
+            };
+        } else {
+            self.segs[0].data.rewrite(rows)?;
+            self.segs[0].name = BASE_SEGMENT.to_string();
+        }
         self.segs.truncate(1);
         self.base = vec![0];
         self.version += 1;

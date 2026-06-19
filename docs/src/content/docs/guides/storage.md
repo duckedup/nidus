@@ -102,6 +102,44 @@ sealed segment large enough to cross that threshold gets its own IVF index (the 
 stays exact), so searches over a large store walk the cold segments and brute-force only the
 fresh data. See [per-segment indexing](/guides/search/#per-segment-indexing-at-scale).
 
+## Larger than RAM: memory-mapped segments
+
+By default nidus loads every segment into RAM on `open`. Set
+[`Config::mmap(true)`](/reference/configuration/#mmap) and each **immutable** (sealed)
+segment is instead served from a read-only **memory-map** of its file — the operating
+system pages a segment in on demand and reclaims it under pressure, so a store can hold
+more vectors than fit in memory. The **active** segment (the one still taking appends)
+stays in RAM.
+
+```rust
+use nidus::{Config, Nidus};
+
+// A local store with sealed segments, served larger-than-RAM.
+let store = Nidus::open(
+    Config::new("/path/to/store", 768)
+        .segment_max_rows(Some(1_000_000)) // produce immutable segments to map
+        .mmap(true),
+)?;
+# anyhow::Ok(())
+```
+
+Search over mapped segments goes through the same row accessor as the in-RAM path, so
+**results are identical** — still exact (or, with an [index](/guides/search/), the same
+approximate set), still filter- and `min_score`-respecting. It composes with quantization
+and the [per-segment indexes](/guides/search/#per-segment-indexing-at-scale): a cold
+segment can be both mapped and indexed.
+
+A few conditions apply:
+
+- It is effective only for a **local-filesystem** store with **sealed** segments — it
+  needs [`segment_max_rows`](/reference/configuration/#segment_max_rows) to create
+  immutable segments and a mappable local file. An object-store (`s3://`/`gs://`) or
+  in-memory store silently stays all-RAM.
+- The host must be **little-endian** (the on-disk `f32` layout). Other hosts fall back to
+  loading into RAM.
+- [Compaction](#compaction) still materializes the live set in RAM, so it is bounded by
+  memory even when the store as a whole is not — keep it infrequent on a very large store.
+
 ## Cross-process readers
 
 A store can be opened **read-only** by other processes while one process holds
