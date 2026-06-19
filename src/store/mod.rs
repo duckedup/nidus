@@ -157,6 +157,13 @@ pub struct Store {
     /// invalidate via `get_mut` (no lock contention). The duplicated id/collection
     /// strings cost ~one extra copy of the key set in RAM while the cache is live.
     scan_order: std::sync::RwLock<Option<ScanOrder>>,
+    /// The committed `log` byte-length the in-RAM index currently reflects — the
+    /// reader-refresh watermark (SPEC §14.6 phase 4). [`refresh`](Self::refresh) compares it
+    /// (together with the manifest version) against the on-disk state to tell, cheaply,
+    /// whether a separate writer has committed anything since this reader last loaded.
+    /// Set after each replay; only a [`ReadOnly`](crate::OpenMode::ReadOnly) reader reads it
+    /// back (a writer is itself the source of truth and never refreshes).
+    loaded_log_offset: u64,
 }
 
 impl Store {
@@ -290,6 +297,7 @@ impl Store {
             in_memory: false,
             row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
+            loaded_log_offset: watermark,
         };
 
         // Whether the in-RAM index now differs from any tier snapshot — true if we built
@@ -385,12 +393,119 @@ impl Store {
             in_memory: true,
             row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
+            loaded_log_offset: 0,
             config,
         };
         // Align `seg_indexes` to the (single, empty) segment so a later seal can update it
         // incrementally. No-op unless per-segment indexing is on.
         store.build_segment_indexes();
         Ok(store)
+    }
+
+    /// Adopt a separate writer's newer committed state into this lock-free
+    /// [`ReadOnly`](crate::OpenMode::ReadOnly) reader **without a full reopen** (SPEC §14.6
+    /// phase 4). Re-reads the `manifest` and, when it names a newer version or the `log` has
+    /// grown, re-opens the segment set and replays the log into a fresh in-RAM index at a
+    /// single consistent point — the §6.2 lock-free reader rule, advanced in place.
+    ///
+    /// Returns `Ok(true)` when newer state was adopted, `Ok(false)` when the reader was
+    /// already current (the cheap common case — one small manifest read plus a `log` stat,
+    /// no segment or index work) or the handle cannot refresh: a writer (already the source
+    /// of truth, its in-RAM state never trailing the disk) or an in-memory store (no backend
+    /// to track).
+    ///
+    /// **Atomic against a concurrent compaction.** The new segment set and replayed index are
+    /// built into locals first, and every step a concurrent seal/compaction can break —
+    /// re-opening the segments (one it may have already deleted) and re-reading the log — runs
+    /// *before* any field of `self` is touched. So that class of failure leaves the reader
+    /// serving its prior consistent snapshot, never a torn mix. The derived-index rebuilds run
+    /// after the swap over already-consistent data (a cache miss there rebuilds in RAM rather
+    /// than failing).
+    pub fn refresh(&mut self) -> Result<bool> {
+        // Only a lock-free ReadOnly reader over a durable backend tracks a separate writer.
+        // A writer holds the only mutating handle (the §6.3 lock excludes other writers), so
+        // its in-RAM state already is the truth; an in-memory store has no backend at all.
+        if self.in_memory || self.config.open_mode != OpenMode::ReadOnly {
+            return Ok(false);
+        }
+        let Some(persistence) = self.persistence.clone() else {
+            return Ok(false);
+        };
+
+        // Read the current manifest (synthesizing one for a legacy `data`+`log` store, as
+        // `open` does). Its pins must still match — a store's dimension/metric never change
+        // in place, so a mismatch here means the directory was swapped under us.
+        let manifest = match Manifest::load(persistence.as_ref())? {
+            Some(m) => {
+                if m.dimension as usize != self.config.dimension {
+                    bail!(
+                        "store dimension mismatch on refresh: manifest has {}, store opened \
+                         with {}",
+                        m.dimension,
+                        self.config.dimension
+                    );
+                }
+                if m.distance != self.config.distance {
+                    bail!(
+                        "store distance metric mismatch on refresh: manifest has {:?}, store \
+                         opened with {:?}",
+                        m.distance,
+                        self.config.distance
+                    );
+                }
+                m
+            }
+            None => Manifest::fresh(self.config.dimension, self.config.distance),
+        };
+
+        // Cheap currency check. The manifest version advances on every seal/compaction (the
+        // structural commits); every other write (upsert/delete/meta) appends to the `log`.
+        // So the reader is current exactly when both are unchanged. `self.log.offset()` stats
+        // the reader's existing log handle — live for plain appends (the writer extends the
+        // same object). A compaction replaces the log object, which can leave that cached
+        // length stale, but it also bumps the version, so we reload via the version check
+        // regardless.
+        let on_disk_log_len = self.log.offset()?;
+        if manifest.version == self.data.version() && on_disk_log_len == self.loaded_log_offset {
+            return Ok(false);
+        }
+
+        // Re-open the segment set at the new manifest into one global row space — picking up
+        // rows appended to the active segment, newly-sealed segments, and a compaction's
+        // collapsed base. The §6.6 cap is re-enforced before any segment loads into RAM.
+        // Built into a local so a failure here leaves the live snapshot untouched.
+        let data = Segments::open(
+            persistence.clone(),
+            &manifest,
+            self.config.max_vector_bytes,
+            self.config.mmap,
+        )?;
+
+        // Re-read and replay the log (a fresh handle — the cached one's object may have been
+        // replaced by a compaction) into a fresh index, bounded by the freshly-sized segments
+        // (§6.2: ignore any `Upsert` past the segment row count we just observed).
+        let (log, ops) = OpLog::open_with(appender_for(&persistence, "log")?)?;
+        let row_count = data.row_count();
+        let watermark = log.offset()?;
+        let (collections, dead_rows, fts) = Self::replay_ops(ops, row_count);
+
+        // Every fallible load has succeeded — swap the new snapshot in atomically, then
+        // rebuild the derived indexes over it with the same builders `open` uses.
+        self.data = data;
+        self.log = log;
+        self.collections = collections;
+        self.dead_rows = dead_rows;
+        self.fts = fts;
+        self.loaded_log_offset = watermark;
+        self.row_to_doc = Vec::new();
+        self.invalidate_scan_order();
+
+        self.rebuild_quant();
+        self.load_or_build_ann()?;
+        self.build_segment_indexes();
+        self.load_or_build_fts()?;
+
+        Ok(true)
     }
 
     // ── Backend wiring helpers ───────────────────────────────────────────────────
