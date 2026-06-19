@@ -184,14 +184,20 @@ let hits = reader.search(Scope::All, &query, &SearchOpts::default())?;
 # anyhow::Ok(())
 ```
 
-`refresh` re-reads the `manifest` and, when a newer version is published (a seal or
-compaction) or the `log` has grown (an append or delete), re-opens the segment set and
-replays the log into a fresh index at a single consistent point — then swaps it in
+`refresh` re-reads the `manifest` and, when a newer version is published or the `log`
+has grown, moves to the newer state at a single consistent point — then swaps it in
 **atomically** (a failure leaves the prior snapshot serving, never a torn mix). It
 returns `true` when newer state was adopted and `false` when the reader was already
 current — the cheap common case (a small `manifest` read plus a `log` stat, no segment
 or index work), so it is safe to call before a batch of queries. A `ReadWrite` handle is
 already the source of truth, so its `refresh` is always a no-op.
+
+It also stays cheap *when* there is new state. If only the active segment grew (plain
+appends — no seal or compaction changed the segment list), `refresh` re-reads just that
+one segment object and reuses every immutable segment, instead of re-fetching the whole
+set; a seal/compaction takes the full re-open. And when a shared
+[memory tier](/guides/memory-stores/) holds a snapshot matching the new state, the reader
+adopts it and skips the log replay entirely.
 
 Only one **writer** (`OpenMode::ReadWrite`, the default) may hold a store at a
 time, enforced by the `O_EXCL` `lock` file. A stale lock left by a crashed writer

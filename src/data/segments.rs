@@ -29,6 +29,21 @@ struct Seg {
     data: DataSegment,
 }
 
+/// A freshly re-read active segment plus the global row count it implies — staged by
+/// [`Segments::reopen_active`] so the store can finish all fallible IO before the one
+/// infallible swap ([`Segments::install_active`]), keeping an incremental refresh atomic.
+pub struct PendingActive {
+    data: DataSegment,
+    row_count: u64,
+}
+
+impl PendingActive {
+    /// The global row count once this staged active segment is installed.
+    pub fn row_count(&self) -> u64 {
+        self.row_count
+    }
+}
+
 /// The live segment set, addressed as one dense global row space. The last segment is the
 /// active (appendable) one; the rest are immutable.
 pub struct Segments {
@@ -44,6 +59,12 @@ pub struct Segments {
     next_id: u64,
     /// Monotonic manifest version (Phase-4 reader refresh).
     version: u64,
+    /// Compare-and-swap fencing for the object-store appenders (cluster mode, SPEC §14.6).
+    /// Threaded into every [`appender_for`] this set opens — the active segment, segments
+    /// minted on [`seal`](Self::seal), and the base on [`rewrite`](Self::rewrite) — so a
+    /// superseded cluster writer's whole-object rewrite is fenced. `false` for the
+    /// single-writer default and in-memory stores.
+    cas: bool,
 }
 
 impl Segments {
@@ -56,6 +77,7 @@ impl Segments {
         manifest: &Manifest,
         cap: Option<u64>,
         mmap: bool,
+        cas: bool,
     ) -> Result<Segments> {
         let dimension = manifest.dimension as usize;
         let distance = manifest.distance;
@@ -99,7 +121,7 @@ impl Segments {
                 }
                 None => {
                     // Open the append handle once, size-check it (pre-allocation guard), then load.
-                    let ap = appender_for(&persistence, name)?;
+                    let ap = appender_for(&persistence, name, cas)?;
                     tally(ap.len()?.saturating_sub(HEADER_LEN as u64))?;
                     DataSegment::open_with(ap, dimension, distance)?
                 }
@@ -119,7 +141,61 @@ impl Segments {
             base,
             next_id: manifest.next_id,
             version: manifest.version,
+            cas,
         })
+    }
+
+    /// Re-read **only** the active (last) segment object — picking up rows a separate writer
+    /// appended — leaving every immutable segment untouched (they never change). The result is
+    /// *staged*, not installed: the caller finishes its remaining fallible work and then calls
+    /// [`install_active`](Self::install_active), so a [`refresh`](crate::Nidus::refresh) that
+    /// races a concurrent writer stays atomic (all IO into locals, one infallible swap).
+    ///
+    /// This is the incremental refresh fast path (SPEC §14.6 / nidus-bdg): valid only when the
+    /// manifest version is unchanged (no seal/compaction restructured the set). On a version
+    /// change the caller re-opens the whole set via [`open`](Self::open). The `cap`
+    /// (`max_vector_bytes`) is re-checked against the grown total before the new bytes resolve.
+    pub fn reopen_active(&self, cap: Option<u64>) -> Result<PendingActive> {
+        let p = self
+            .persistence
+            .as_ref()
+            .expect("incremental refresh requires a durable backend");
+        let last = self.segs.len() - 1;
+        let dim = self.dimension();
+        // The active segment is never memory-mapped (mmap is for immutable segments only), so a
+        // plain RAM-loading appender is always correct here.
+        let ap = appender_for(p, &self.segs[last].name, false)?;
+        let data = DataSegment::open_with(ap, dim, self.distance)?;
+        let row_count = self.base[last] + data.row_count();
+        if let Some(cap) = cap {
+            let bytes = row_count.saturating_mul(dim as u64).saturating_mul(4);
+            if bytes > cap {
+                bail!(
+                    "store segments would hold {bytes} bytes of vectors after refresh, exceeding \
+                     max_vector_bytes ({cap} bytes)"
+                );
+            }
+        }
+        Ok(PendingActive { data, row_count })
+    }
+
+    /// Install a [`reopen_active`](Self::reopen_active)-staged active segment and adopt the new
+    /// manifest `version` — the infallible swap that completes an incremental refresh. Immutable
+    /// segments and bases are unchanged (only the active segment grows); adopting `version` keeps
+    /// the next [`refresh`](crate::Nidus::refresh) currency check accurate.
+    pub fn install_active(&mut self, pending: PendingActive, version: u64) {
+        let last = self.segs.len() - 1;
+        self.segs[last].data = pending.data;
+        self.version = version;
+    }
+
+    /// Whether `names` is exactly this set's current segment list (same names, same order) — the
+    /// **structural** change signal for [`refresh`](crate::Nidus::refresh): an unchanged list
+    /// means only the active segment grew (plain appends → incremental path); a changed list
+    /// means a seal/compaction restructured the set (→ full re-open). Used instead of the manifest
+    /// `version`, which in cluster mode advances on *every* commit (it is the commit counter).
+    pub fn segment_names_match(&self, names: &[String]) -> bool {
+        self.segs.len() == names.len() && self.segs.iter().zip(names).all(|(s, n)| &s.name == n)
     }
 
     /// An in-memory-only single-segment store (no backing objects, no manifest on disk).
@@ -134,6 +210,7 @@ impl Segments {
             base: vec![0],
             next_id: 1,
             version: 1,
+            cas: false,
         }
     }
 
@@ -257,7 +334,7 @@ impl Segments {
         let name = format!("seg-{:08}", self.next_id);
         let data = match &self.persistence {
             Some(p) => {
-                let ap = appender_for(p, &name)?;
+                let ap = appender_for(p, &name, self.cas)?;
                 let mut d = DataSegment::open_with(ap, self.dimension(), self.distance)?;
                 // Make the new (empty) segment's header durable before it is named by the
                 // manifest, so a crash can never leave the manifest pointing at a
@@ -291,7 +368,7 @@ impl Segments {
                 .persistence
                 .as_ref()
                 .expect("a memory-mapped segment implies a local-FS backend");
-            let ap = appender_for(p, BASE_SEGMENT)?;
+            let ap = appender_for(p, BASE_SEGMENT, self.cas)?;
             let mut data = DataSegment::rewrite_target(ap, dim, distance);
             data.rewrite(rows)?;
             self.segs[0] = Seg {

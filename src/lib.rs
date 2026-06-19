@@ -48,8 +48,8 @@ pub mod server;
 
 pub use anyhow::Result;
 pub use backend::{
-    Appender, BackendLock, LocalFs, LocalRam, MemoryTier, Persistence, open_memory_tier,
-    open_persistence,
+    Appender, BackendLock, CasOutcome, LocalFs, LocalRam, MemoryTier, Persistence,
+    open_memory_tier, open_persistence,
 };
 pub use config::{Config, Fsync, OpenMode};
 pub use fts::Language;

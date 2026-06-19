@@ -169,19 +169,23 @@ reader.refresh()?; // adopts the writer's latest committed state
 
 How it works:
 
-- **One writer, leased.** A cluster writer holds a renewing **lease** on the store (the
-  object-store writer lock, evolved). It is renewed automatically at the start of every write
-  batch, so an active writer keeps it indefinitely; if a writer goes silent past
+- **One writer, leased and fenced.** A cluster writer holds a renewing **lease** on the store
+  (the object-store writer lock, evolved). It is renewed automatically at the start of every
+  write batch, so an active writer keeps it indefinitely; if a writer goes silent past
   [`lock_ttl`](/reference/configuration/#lock_ttl) another may take over, and the original is
-  **fenced** — its next batch sees it no longer holds the lease and fails cleanly rather than
-  clobbering the store. The fence is checked per batch, so the intended deployment is a single
-  writer (a second exists only to take over a dead one); hardening the narrow window where a
-  writer stalls for longer than `lock_ttl` *mid-batch* while a replacement starts is a planned
-  follow-up.
+  **fenced** — its next batch sees it no longer holds the lease. Beyond that per-batch check,
+  every durable write is a **compare-and-swap**: each segment / log / manifest object is written
+  only if it still matches the version this writer last saw (S3 `If-Match`, GCS
+  `ifGenerationMatch`). So even a writer that stalls *mid-batch* past the TTL and is replaced has
+  its next write **refused** — it fails cleanly instead of clobbering the new writer's committed
+  data. The intended deployment is still a single writer; a second exists only to take over a
+  dead one.
 - **Many readers, refreshing.** Every commit advances the manifest version, so a `ReadOnly`
   instance picks up the writer's changes with a single cheap [`refresh()`](/reference/api/#refresh)
   — no reopen. Call it on whatever cadence you like (per request, on a timer); it is a no-op
-  when nothing changed.
+  when nothing changed. A refresh is incremental where it can be: it re-reads only the segment
+  that grew (reusing the immutable ones) and, when a shared memory tier holds a current snapshot,
+  adopts it instead of replaying the log.
 - **Required pieces.** Cluster mode needs **both** a shared object store *and* a shared memory
   tier — a local-filesystem or process-RAM store is single-node by definition and is rejected
   with a clear error.
@@ -198,3 +202,8 @@ native append for local files). If you want a store to live somewhere nidus does
 — another object store, a database, a tmpfs — implement that trait. The full method
 surface is in the [API reference](/reference/api/); the trait is sync on purpose, so it
 drops straight into a `Box<dyn Persistence>` chosen at runtime.
+
+Two methods are optional and only matter for cluster mode: `get_cas` / `put_cas` provide a
+compare-and-swap write (return `CasOutcome::Unsupported` by default). A backend that leaves
+them unimplemented works everywhere except as a cluster writer's shared store, where the
+fence falls back to the per-batch lease alone.
