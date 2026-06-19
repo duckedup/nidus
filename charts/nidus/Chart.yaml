@@ -1,0 +1,29 @@
+apiVersion: v2
+name: nidus
+description: |
+  A small, pure-Rust vector store served over HTTP. This chart runs `nidus serve`
+  backed by shared, non-local storage — an object store (S3/GCS) for durable bytes
+  and a Redis-family tier for the working set — the configuration a container needs
+  since it has no durable local disk.
+type: application
+
+# Chart version (SemVer) — bump on every change to the chart. Independent of the
+# nidus release line.
+version: 0.1.0
+
+# The nidus image version this chart defaults to. `image.tag` falls back to this,
+# so bumping appVersion is how you roll the default image forward.
+appVersion: "0.25.2"
+
+home: https://nidus.duckedup.org
+sources:
+  - https://github.com/duckedup/nidus
+keywords:
+  - vector
+  - embeddings
+  - search
+  - vector-database
+  - semantic-search
+maintainers:
+  - name: duckedup
+    url: https://github.com/duckedup

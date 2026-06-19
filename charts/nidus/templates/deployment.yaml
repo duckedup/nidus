@@ -1,0 +1,155 @@
+{{- include "nidus.validate" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "nidus.fullname" . }}
+  labels:
+    {{- include "nidus.labels" . | nindent 4 }}
+spec:
+  # Single writer — see values.yaml. Recreate ensures the old pod releases its lock
+  # before the new one starts.
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "nidus.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nidus.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- if eq (include "nidus.createSecret" .) "true" }}
+        # Roll the pod when the managed Secret's contents change.
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "nidus.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: nidus
+          image: {{ include "nidus.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 7700
+              protocol: TCP
+          env:
+            - name: NIDUS_DIM
+              value: {{ .Values.nidus.dim | quote }}
+            - name: NIDUS_PERSISTENCE
+              value: {{ .Values.nidus.persistence | quote }}
+            {{- if .Values.nidus.memorySecret.name }}
+            - name: NIDUS_MEMORY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.nidus.memorySecret.name }}
+                  key: {{ .Values.nidus.memorySecret.key }}
+            {{- else }}
+            - name: NIDUS_MEMORY
+              value: {{ .Values.nidus.memory | quote }}
+            {{- end }}
+            {{- with .Values.nidus.distance }}
+            - name: NIDUS_DISTANCE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.nidus.maxBodyBytes }}
+            - name: NIDUS_MAX_BODY_BYTES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.nidus.ann }}
+            - name: NIDUS_ANN
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.nidus.annParams.m }}
+            - name: NIDUS_ANN_M
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.nidus.annParams.efConstruction }}
+            - name: NIDUS_ANN_EF_CONSTRUCTION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.nidus.annParams.efSearch }}
+            - name: NIDUS_ANN_EF_SEARCH
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.nidus.annParams.nLists }}
+            - name: NIDUS_ANN_N_LISTS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.nidus.annParams.nProbe }}
+            - name: NIDUS_ANN_N_PROBE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.nidus.annParams.overscan }}
+            - name: NIDUS_ANN_OVERSCAN
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.nidus.annParams.seed }}
+            - name: NIDUS_ANN_SEED
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if and .Values.auth.enabled .Values.auth.existingSecret }}
+            - name: NIDUS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: {{ .Values.auth.existingSecretKey }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- $createSecret := eq (include "nidus.createSecret" .) "true" }}
+          {{- if or $createSecret .Values.credentials.existingSecrets .Values.extraEnvFrom }}
+          envFrom:
+            {{- if $createSecret }}
+            - secretRef:
+                name: {{ include "nidus.fullname" . }}
+            {{- end }}
+            {{- range .Values.credentials.existingSecrets }}
+            - secretRef:
+                name: {{ . }}
+            {{- end }}
+            {{- with .Values.extraEnvFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            # readOnlyRootFilesystem is on; give the process a writable scratch dir.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

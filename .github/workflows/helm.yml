@@ -1,0 +1,75 @@
+name: Helm chart
+
+# Lint/render the chart on every change, and publish it as an OCI artifact to
+# ghcr.io when a new chart version lands on main. Users then install with:
+#   helm install nidus oci://ghcr.io/duckedup/charts/nidus --version <x.y.z>
+on:
+  push:
+    branches: [main]
+    paths: ["charts/**", ".github/workflows/helm.yml"]
+  pull_request:
+    paths: ["charts/**", ".github/workflows/helm.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint and render
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: helm lint
+        run: helm lint charts/nidus --values charts/nidus/ci/test-values.yaml
+
+      - name: helm template (render must succeed and be valid YAML)
+        run: |
+          helm template nidus charts/nidus \
+            --values charts/nidus/ci/test-values.yaml > /tmp/rendered.yaml
+          # Catch obviously-broken manifests beyond what `helm lint` checks.
+          docker run --rm -i ghcr.io/yannh/kubeconform:latest \
+            -strict -summary -ignore-missing-schemas < /tmp/rendered.yaml
+
+      - name: Render must FAIL fast without required values
+        run: |
+          if helm template nidus charts/nidus >/dev/null 2>&1; then
+            echo "expected render to fail without nidus.dim/persistence/memory" >&2
+            exit 1
+          fi
+          echo "ok: chart rejects an incomplete config"
+
+  publish:
+    name: Publish OCI chart
+    needs: lint
+    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.repository == 'duckedup/nidus' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Publish if the chart version is new
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(helm show chart charts/nidus | awk '/^version:/ {print $2}')
+          REPO="oci://ghcr.io/${GITHUB_REPOSITORY_OWNER}/charts"
+          echo "$GHCR_TOKEN" | helm registry login ghcr.io -u "$GHCR_USER" --password-stdin
+          if helm pull "$REPO/nidus" --version "$VERSION" >/dev/null 2>&1; then
+            echo "nidus chart $VERSION already published — skipping (bump charts/nidus/Chart.yaml version to release)"
+            exit 0
+          fi
+          helm package charts/nidus --destination /tmp
+          helm push "/tmp/nidus-${VERSION}.tgz" "$REPO"
