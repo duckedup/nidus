@@ -13,17 +13,23 @@ write glue.
 
 ## The storage model
 
-A store is a directory with three files:
+A store is a directory:
 
 ```
 <dir>/
-  data    append-only, fixed-stride, row-major f32 matrix (header pins dimension)
-  log     append-only framed op stream: [len][bincode(Op)][crc32] — the commit record
-  lock    O_EXCL writer-exclusion lock file
+  manifest  names the live segments (the first is `data`); the atomic commit point
+  data      append-only, fixed-stride, row-major f32 matrix (header pins dimension)
+  log       append-only framed op stream: [len][bincode(Op)][crc32] — the commit record
+  lock      O_EXCL writer-exclusion lock file
+  seg-…     additional immutable segments, once a store grows past the seal threshold
 ```
 
 - **`data`** is the vectors: a flat `f32` matrix with a fixed stride (the pinned
-  dimension), row-major, **never rewritten in place**. New rows are appended.
+  dimension), row-major, **never rewritten in place**. New rows are appended. A store
+  holds one or more such **segments** presented as a single dense row space; by default
+  it is just `data` (see [Storage → Segments](/guides/storage/#segments)).
+- **`manifest`** names the live segments and pins the dimension/metric — a tiny
+  CRC-checked object, replaced atomically when a segment is sealed or compacted.
 - **`log`** is the commit record: an append-only stream of framed,
   CRC32-checked, bincode-encoded operations (`CreateCollection`, `Upsert`,
   `Delete`, …). This is what makes a write durable.

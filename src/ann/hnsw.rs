@@ -681,19 +681,19 @@ fn insert_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::DataSegment;
+    use crate::data::Segments;
     use crate::model::AnnConfig;
 
-    /// A tiny in-memory `DataSegment` of unit-ish vectors for Miri-clean graph tests.
-    fn seg(dim: usize, rows: &[Vec<f32>]) -> DataSegment {
-        let mut d = DataSegment::in_memory(dim);
+    /// A tiny in-memory `Segments` of unit-ish vectors for Miri-clean graph tests.
+    fn seg(dim: usize, rows: &[Vec<f32>]) -> Segments {
+        let mut d = Segments::in_memory_with(dim, Distance::Cosine);
         for r in rows {
             d.append(r).unwrap();
         }
         d
     }
 
-    fn build_graph(data: &DataSegment, n: u64) -> HnswGraph {
+    fn build_graph(data: &Segments, n: u64) -> HnswGraph {
         let mut g = HnswGraph::new(AnnConfig::hnsw(), data.dimension(), Distance::Cosine);
         let live: Vec<u64> = (0..n).collect();
         g.build(&Walk::exact(data, Distance::Cosine), &live, 1);

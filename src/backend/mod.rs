@@ -189,6 +189,27 @@ impl<T: MemoryTier + ?Sized> MemoryTier for Arc<T> {
     }
 }
 
+/// The append handle for segment/`log` object `key`: the backend's native [`Appender`]
+/// when it has one (local files — the `data`/`log` discipline of §6), else an
+/// [`ObjectAppender`] (an in-RAM buffer rewritten as a whole object on sync) over the
+/// shared backend handle (object stores). Shared by [`Store`](crate::Nidus)'s `data`/`log`
+/// wiring and the [`Segments`](crate::data::Segments) aggregator so every durable byte
+/// stream is opened identically.
+///
+/// Note: the object-store path loads the whole object into RAM here, *before* a caller's
+/// `max_vector_bytes` check (§6.6) can run. So for object stores that "refuse before
+/// allocating" guard relaxes to "refuse after one full copy is resident" — inherent to a
+/// whole-object backend, and acceptable at nidus's dev/small-scale positioning.
+pub(crate) fn appender_for(
+    persistence: &Arc<dyn Persistence>,
+    key: &str,
+) -> Result<Box<dyn Appender>> {
+    match persistence.appender(key)? {
+        Some(native) => Ok(native),
+        None => Ok(Box::new(ObjectAppender::open(persistence.clone(), key)?)),
+    }
+}
+
 /// Reject a key that is not a single flat object name — no path separators, no `..`,
 /// not empty. Shared by every backend so keys behave identically across local and
 /// (future) object stores.

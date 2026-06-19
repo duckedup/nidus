@@ -510,7 +510,7 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         .max_vector_bytes(Some(16));
     let mut store = Store {
         config,
-        data: DataSegment::in_memory(2),
+        data: Segments::in_memory_with(2, Distance::Cosine),
         log: OpLog::in_memory(),
         persistence: None,
         memory: None,
@@ -2788,6 +2788,187 @@ fn text_search_across_collections_analyzes_once() {
         ids,
         vec!["a1", "b1"],
         "stemmed match across both collections"
+    );
+}
+
+// ── Segments: seal / manifest / migration (SPEC §14, Phase 1) ────────────────────
+
+/// Eight distinct 2-D vectors at increasing angles — deterministic cosine ranking, so a
+/// multi-segment store and a single-segment one must agree exactly.
+fn angled(n: usize) -> Vec<Record> {
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / n as f32;
+            rec(&format!("doc{i}"), vec![1.0 - t, t])
+        })
+        .collect()
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn seal_on_threshold_creates_multiple_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        // Seal every 3 active rows: 7 single upserts → segments [data(3), seg-1(3), seg-2(1)].
+        let mut store = Store::open(Config::new(&path, 2).segment_max_rows(Some(3))).unwrap();
+        for r in angled(7) {
+            store.upsert("col", &[r]).unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.data.segment_count(), 3, "active sealed twice");
+        assert_eq!(store.footprint().rows, 7);
+    }
+    // The sealed segment objects are physically present, named by the manifest.
+    assert!(path.join("data").exists());
+    assert!(path.join("seg-00000001").exists());
+    assert!(path.join("seg-00000002").exists());
+    assert!(path.join("manifest").exists());
+
+    // Reopen: the manifest is read, every segment loaded into one global row space.
+    let store = Store::open(Config::new(&path, 2).open_mode(OpenMode::ReadOnly)).unwrap();
+    assert_eq!(store.data.segment_count(), 3);
+    assert_eq!(store.footprint().rows, 7);
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn multi_segment_search_matches_single_segment() {
+    let q = [0.6_f32, 0.4];
+    let recs = angled(8);
+
+    // Multi-segment store (seal every 2 rows).
+    let multi_dir = tempfile::tempdir().unwrap();
+    let multi_hits = {
+        let mut store =
+            Store::open(Config::new(multi_dir.path(), 2).segment_max_rows(Some(2))).unwrap();
+        for r in &recs {
+            store.upsert("col", std::slice::from_ref(r)).unwrap();
+        }
+        assert!(store.data.segment_count() > 1, "store should have sealed");
+        store.search(&["col"], &q, &default_opts(8)).unwrap()
+    };
+
+    // Single-segment store over the identical data.
+    let single_dir = tempfile::tempdir().unwrap();
+    let single_hits = {
+        let mut store = Store::open(Config::new(single_dir.path(), 2)).unwrap();
+        store.upsert("col", &recs).unwrap();
+        assert_eq!(store.data.segment_count(), 1);
+        store.search(&["col"], &q, &default_opts(8)).unwrap()
+    };
+
+    let ids = |hits: &[crate::model::Hit]| hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>();
+    assert_eq!(
+        ids(&multi_hits),
+        ids(&single_hits),
+        "ranking must match exactly"
+    );
+    for (m, s) in multi_hits.iter().zip(&single_hits) {
+        assert!(
+            (m.score - s.score).abs() < 1e-6,
+            "scores must match: {m:?} vs {s:?}"
+        );
+    }
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn compact_collapses_segments_and_reclaims_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let mut store = Store::open(Config::new(&path, 2).segment_max_rows(Some(2))).unwrap();
+    for r in angled(6) {
+        store.upsert("col", &[r]).unwrap();
+    }
+    assert!(store.data.segment_count() > 1);
+    assert!(path.join("seg-00000001").exists());
+
+    store.compact().unwrap();
+    assert_eq!(
+        store.data.segment_count(),
+        1,
+        "compaction collapses to one segment"
+    );
+    // The previously-sealed segment objects are reclaimed (no longer named by the manifest).
+    assert!(
+        !path.join("seg-00000001").exists(),
+        "orphaned segment object deleted"
+    );
+    assert_eq!(store.footprint().rows, 6);
+    drop(store);
+
+    let store = Store::open(Config::new(&path, 2).open_mode(OpenMode::ReadOnly)).unwrap();
+    assert_eq!(store.get_all("col").len(), 6);
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn legacy_store_without_manifest_migrates_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store.upsert("col", &angled(3)).unwrap();
+    }
+    // Simulate a pre-manifest (legacy) store: delete the manifest, keep `data` + `log`.
+    std::fs::remove_file(path.join("manifest")).unwrap();
+    assert!(!path.join("manifest").exists());
+
+    // Reopen ReadWrite: the `data` object becomes the implicit base segment and a fresh
+    // manifest is written (transparent migration) — the data is intact.
+    {
+        let store = Store::open(Config::new(&path, 2)).unwrap();
+        assert_eq!(store.get_all("col").len(), 3);
+    }
+    assert!(path.join("manifest").exists(), "migration wrote a manifest");
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn readonly_open_without_manifest_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store.upsert("col", &angled(2)).unwrap();
+    }
+    std::fs::remove_file(path.join("manifest")).unwrap();
+
+    // A read-only open reads through a synthesized in-RAM manifest but must not persist one.
+    let store = Store::open(Config::new(&path, 2).open_mode(OpenMode::ReadOnly)).unwrap();
+    assert_eq!(store.get_all("col").len(), 2);
+    assert!(
+        !path.join("manifest").exists(),
+        "read-only open must not write a manifest"
+    );
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn orphan_segment_not_in_manifest_is_ignored() {
+    // Models a crash *before* a seal's manifest swap: the fresh segment object exists but
+    // the manifest does not yet name it. On reopen it must be invisible — the store reads
+    // exactly the manifest's segment set, never a stray object (the §6.2 guarantee, §14).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let mut store = Store::open(Config::new(&path, 2).segment_max_rows(Some(3))).unwrap();
+        for r in angled(4) {
+            store.upsert("col", &[r]).unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.data.segment_count(), 2); // [data, seg-1]
+    }
+    // Drop a stray segment object the manifest does not reference (an interrupted seal).
+    std::fs::write(path.join("seg-00000099"), b"garbage-not-a-segment").unwrap();
+
+    let store = Store::open(Config::new(&path, 2).open_mode(OpenMode::ReadOnly)).unwrap();
+    assert_eq!(store.data.segment_count(), 2, "stray object ignored");
+    assert_eq!(
+        store.get_all("col").len(),
+        4,
+        "data intact at pre-crash state"
     );
 }
 

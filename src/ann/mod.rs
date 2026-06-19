@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::data::DataSegment;
+use crate::data::Segments;
 use crate::model::{AnnConfig, AnnKind, Distance};
 use crate::search::{QuantParams, dot_i8, euclidean_neg_sq_i8, hamming, pack_signs};
 
@@ -109,7 +109,7 @@ enum WalkQuant<'a> {
 /// Borrows the store's `data` and (when quantized) its code matrix, so it is cheap to
 /// build per query/build and `Sync` for the parallel HNSW build.
 pub(crate) struct Walk<'a> {
-    data: &'a DataSegment,
+    data: &'a Segments,
     score_fn: ScoreFn,
     quant: WalkQuant<'a>,
 }
@@ -139,7 +139,7 @@ fn i8_score(euclidean: bool, a: &[i8], b: &[i8]) -> f32 {
 
 impl<'a> Walk<'a> {
     /// The exact f32 walk (no quantization) — byte-for-byte the pre-nidus-ndu behavior.
-    pub(crate) fn exact(data: &'a DataSegment, distance: Distance) -> Self {
+    pub(crate) fn exact(data: &'a Segments, distance: Distance) -> Self {
         Walk {
             data,
             score_fn: score_fn_for(distance),
@@ -150,7 +150,7 @@ impl<'a> Walk<'a> {
     /// A walk that scores int8 codes (`codes` is row-major, `data.dimension()` per row);
     /// `params` is the store's shared quantization scale.
     pub(crate) fn int8(
-        data: &'a DataSegment,
+        data: &'a Segments,
         codes: &'a [i8],
         params: QuantParams,
         distance: Distance,
@@ -169,7 +169,7 @@ impl<'a> Walk<'a> {
 
     /// A walk that scores binary sign-bit codes (`words` is row-major, `wpr` words/row).
     /// Cosine only (binary codes are an angular proxy — enforced at `open`).
-    pub(crate) fn binary(data: &'a DataSegment, words: &'a [u64], wpr: usize) -> Self {
+    pub(crate) fn binary(data: &'a Segments, words: &'a [u64], wpr: usize) -> Self {
         Walk {
             data,
             score_fn: score_fn_for(Distance::Cosine),
@@ -179,7 +179,7 @@ impl<'a> Walk<'a> {
 
     /// The f32 data matrix (IVF k-means fits centroids from it; the exact variant scores
     /// rows from it).
-    pub(crate) fn data(&self) -> &DataSegment {
+    pub(crate) fn data(&self) -> &Segments {
         self.data
     }
 

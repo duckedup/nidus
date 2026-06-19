@@ -32,6 +32,34 @@ impl Store {
         Ok(())
     }
 
+    /// Seal the active segment into an immutable one and publish the new manifest when it
+    /// has grown past [`Config::segment_max_rows`] (SPEC §14.4 — "WAL→segment"). A no-op
+    /// when the threshold is unset (the default — single-segment store) or the active
+    /// segment is still under it. Called *before* a batch appends, so a seal failure leaves
+    /// the store byte-identical (the active segment is still valid and named by the manifest;
+    /// the fresh segment is durable and only becomes live once the manifest commits).
+    fn maybe_seal(&mut self) -> Result<()> {
+        let Some(max) = self.config.segment_max_rows else {
+            return Ok(());
+        };
+        if self.data.active_rows() >= max && self.data.seal()? {
+            self.persist_manifest()?;
+        }
+        Ok(())
+    }
+
+    /// Publish the current segment set as the `manifest` — the atomic commit point for a
+    /// seal/compaction. No-op for in-memory or read-only stores (no durable manifest).
+    fn persist_manifest(&mut self) -> Result<()> {
+        if self.in_memory || self.config.open_mode == OpenMode::ReadOnly {
+            return Ok(());
+        }
+        if let Some(p) = self.persistence.as_deref() {
+            self.data.manifest().store(p)?;
+        }
+        Ok(())
+    }
+
     pub fn create_collection(&mut self, name: &str) -> Result<()> {
         self.check_writable()?;
         // Idempotent: only create if absent.
@@ -165,6 +193,11 @@ impl Store {
             }
             return Ok(0);
         }
+
+        // Seal the active segment first if it has outgrown the threshold, so this batch's
+        // rows land in a fresh segment (SPEC §14.4). Before any append + before the marks
+        // below, so a seal failure leaves the store unchanged.
+        self.maybe_seal()?;
 
         // Capacity gate: refuse — before any append — a batch that would grow the
         // vector matrix past the cap. Clean refusal, no rollback, store stays fully
@@ -409,6 +442,9 @@ impl Store {
         self.check_writable()?;
         self.data.sync()?;
         self.log.sync()?;
+        // Seal a large active-segment tail into an immutable segment (SPEC §14.4). No-op
+        // unless `segment_max_rows` is set and the tail is over it.
+        self.maybe_seal()?;
         // Refresh the shared working set so peers skip a rebuild (SPEC §13.3). Best-effort
         // and a no-op without an external memory tier — never fails the durable flush.
         self.publish_working_set();
@@ -510,9 +546,21 @@ impl Store {
             }
         }
 
-        // 2. Rewrite data and log atomically (delegated to their modules).
-        self.data.rewrite(&new_rows)?;
+        // 2. Rewrite data and log atomically (delegated to their modules). Compaction
+        //    collapses every segment into one fresh base segment; `rewrite` returns the
+        //    names that are no longer referenced so their objects can be reclaimed, and
+        //    the new manifest is published as the commit point (SPEC §14.2).
+        let dropped = self.data.rewrite(&new_rows)?;
         self.log.rewrite(&log_ops)?;
+        self.persist_manifest()?;
+        if let Some(p) = self.persistence.as_deref() {
+            for name in &dropped {
+                // Best-effort: a leftover unreferenced segment object wastes space but is
+                // already invisible (the manifest no longer names it), so a delete failure
+                // must not fail the compaction.
+                let _ = p.delete(name);
+            }
+        }
 
         // 3. Update in-RAM DocEntry rows.
         for update in updates {

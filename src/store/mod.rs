@@ -1,7 +1,8 @@
 //! The integrator: in-RAM index + write/read glue + compaction. Composes
-//! [`DataSegment`](crate::data::DataSegment), [`OpLog`](crate::log::OpLog), and an
+//! [`Segments`](crate::data::Segments) (the live segment set as one global row space),
+//! [`OpLog`](crate::log::OpLog), the [`Manifest`](crate::manifest::Manifest), and an
 //! optional [`WriteLock`](crate::lock::WriteLock). Contract: see the root `SPEC.md`
-//! §3, §5–§8.
+//! §3, §5–§8, §14.
 //!
 //! This module holds the [`Store`] type, its constructors (`open`/`in_memory*`), and
 //! the ANN index lifecycle glue. The behaviour splits across child modules — each can
@@ -20,13 +21,14 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::ann::Ann;
 use crate::backend::{
-    Appender, BackendLock, MemoryTier, ObjectAppender, Persistence, locked_error, object_try_lock,
+    BackendLock, MemoryTier, Persistence, appender_for, locked_error, object_try_lock,
     open_memory_tier, open_persistence,
 };
 use crate::config::{Config, OpenMode};
-use crate::data::DataSegment;
+use crate::data::Segments;
 use crate::fts::Fts;
 use crate::log::OpLog;
+use crate::manifest::Manifest;
 use crate::model::{Distance, Op};
 
 mod memtier;
@@ -88,7 +90,7 @@ fn oom(what: &str, count: usize) -> anyhow::Error {
 /// held lock, etc.) but must keep these signatures — `lib.rs` calls them verbatim.
 pub struct Store {
     config: Config,
-    data: DataSegment,
+    data: Segments,
     log: OpLog,
     /// The persistence backend the store's objects (`data`/`log`/`ann`/`fts`/`lock`)
     /// live on — a [`LocalFs`](crate::backend::LocalFs) for a file-backed store, or an
@@ -191,28 +193,47 @@ impl Store {
             None
         };
 
-        // 4. Open the data segment through the backend's appender (a native file handle
-        //    on local FS; an in-RAM buffer rewritten whole on sync for an object store).
-        //    First refuse — before allocating — to load a data file whose vectors already
-        //    exceed the configured cap, turning a would-be allocation abort into a clear
-        //    error.
-        let data_ap = Self::appender_for(&persistence, "data")?;
-        if let Some(cap) = config.max_vector_bytes {
-            let vector_bytes = data_ap
-                .len()?
-                .saturating_sub(crate::data::HEADER_LEN as u64);
-            if vector_bytes > cap {
-                bail!(
-                    "data file holds {vector_bytes} bytes of vectors, exceeding \
-                     max_vector_bytes ({cap} bytes)"
-                );
+        // 4. Read the manifest naming the live segments (SPEC §14.2). Absent → this is a
+        //    fresh store or a legacy `data`+`log` store that predates the manifest; both
+        //    synthesize a single-segment manifest over the base `data` object (transparent
+        //    migration). The synthesized manifest is persisted below (ReadWrite only).
+        let on_disk = Manifest::load(persistence.as_ref())?;
+        let manifest = match &on_disk {
+            Some(m) => {
+                if m.dimension as usize != config.dimension {
+                    bail!(
+                        "store dimension mismatch: manifest has {}, requested {}",
+                        m.dimension,
+                        config.dimension
+                    );
+                }
+                if m.distance != config.distance {
+                    bail!(
+                        "store distance metric mismatch: manifest has {:?}, requested {:?}",
+                        m.distance,
+                        config.distance
+                    );
+                }
+                m.clone()
             }
-        }
-        let data = DataSegment::open_with(data_ap, config.dimension, config.distance)?;
+            None => Manifest::fresh(config.dimension, config.distance),
+        };
 
-        // 5. Open the op log through the backend's appender (replaying torn tails). The
+        // 5. Open every segment the manifest names into one global row space. The cap is
+        //    enforced before any segment loads into RAM (§6.6, generalized across segments).
+        let data = Segments::open(persistence.clone(), &manifest, config.max_vector_bytes)?;
+
+        // A store with no manifest on disk gets one written now — initializing a fresh
+        // store and migrating a legacy one in the same step. ReadOnly stores never write
+        // (lock-free readers stay strictly read-only); they read through the synthesized
+        // manifest in RAM.
+        if on_disk.is_none() && config.open_mode == OpenMode::ReadWrite {
+            data.manifest().store(persistence.as_ref())?;
+        }
+
+        // 6. Open the op log through the backend's appender (replaying torn tails). The
         //    decoded `ops` are the fallback source for building the in-RAM index.
-        let log_ap = Self::appender_for(&persistence, "log")?;
+        let log_ap = appender_for(&persistence, "log")?;
         let (log, ops) = OpLog::open_with(log_ap)?;
 
         let row_count = data.row_count();
@@ -329,7 +350,7 @@ impl Store {
             .ann
             .map(|a| Ann::empty(a, config.dimension, config.distance));
         Ok(Store {
-            data: DataSegment::in_memory_with(config.dimension, config.distance),
+            data: Segments::in_memory_with(config.dimension, config.distance),
             log: OpLog::in_memory(),
             persistence: None,
             memory: None,
@@ -375,21 +396,6 @@ impl Store {
             object_try_lock(persistence, "lock", ttl)?
         };
         acquired.ok_or_else(|| locked_error(location))
-    }
-
-    /// The `data`/`log` append handle for `key`: the backend's native [`Appender`] when
-    /// it has one (local files), else an [`ObjectAppender`] — an in-RAM buffer rewritten
-    /// as a whole object on sync — over the shared backend handle (object stores).
-    ///
-    /// Note: the object-store path loads the whole object into RAM here, *before* `open`
-    /// checks `max_vector_bytes`. So for object stores that "refuse before allocating"
-    /// guard (§6.6) relaxes to "refuse after one full copy is resident" — inherent to a
-    /// whole-object backend, and acceptable at nidus's dev/small-scale positioning.
-    fn appender_for(persistence: &Arc<dyn Persistence>, key: &str) -> Result<Box<dyn Appender>> {
-        match persistence.appender(key)? {
-            Some(native) => Ok(native),
-            None => Ok(Box::new(ObjectAppender::open(persistence.clone(), key)?)),
-        }
     }
 
     /// Replay the decoded log `ops` into the in-RAM index — the source of truth when no

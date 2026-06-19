@@ -16,14 +16,18 @@ to share the in-memory index across processes via Redis, see
 
 ```
 <dir>/
-  data    append-only, fixed-stride, row-major f32 matrix (header pins dimension)
-  log     append-only framed op stream: [len][bincode(Op)][crc32] — the commit record
-  lock    O_EXCL writer-exclusion lock file
+  manifest  names the live segments (the first is `data`) + pins dimension/metric
+  data      append-only, fixed-stride, row-major f32 matrix (header pins dimension)
+  log       append-only framed op stream: [len][bincode(Op)][crc32] — the commit record
+  lock      O_EXCL writer-exclusion lock file
+  seg-…     additional immutable segments (only once a store seals past the threshold)
 ```
 
 All on-disk encoding is **little-endian and explicit**. Every `log` record is
 length-prefixed and CRC32-checked, so a torn tail (a half-written final record
-after a crash) is detectable and is dropped on the next open.
+after a crash) is detectable and is dropped on the next open. The `manifest` is a
+`[crc32][bincode]` object replaced atomically — a reader sees one whole manifest
+version, never a torn mix.
 
 The `data` header pins the embedding **dimension** at creation. Reopening a store
 with a different dimension is a hard error — one embedding space per store, for
@@ -60,10 +64,11 @@ Resource exhaustion never corrupts a store:
 
 ## Compaction
 
-Because `data` is never rewritten in place, a `delete` or an overwriting
-`upsert` leaves the old row in the file as a **dead row** — still on disk, no
-longer referenced by the index. [`compact()`](/reference/api/#compact) rewrites
-`data` to drop dead rows and reclaim the space.
+Because segments are never rewritten in place, a `delete` or an overwriting
+`upsert` leaves the old row behind as a **dead row** — still on disk, no
+longer referenced by the index. [`compact()`](/reference/api/#compact) collapses
+every [segment](#segments) into one fresh `data` segment that drops the dead rows,
+publishes the new manifest, and reclaims the old segment objects.
 
 Compaction also runs automatically on `open` when the dead-row ratio exceeds
 [`Config::auto_compact`](/reference/configuration/#auto_compact) (default `0.5` —
@@ -71,6 +76,25 @@ half the rows dead). Set it to `None` to disable and compact only on demand.
 
 [`footprint()`](/reference/api/#footprint) reports `rows`, `dead_rows`, and
 `vector_bytes` so you can decide when a manual compaction is worth it.
+
+## Segments
+
+A store's vectors live in one or more **segments** — self-contained, immutable chunks of
+rows — named in order by the `manifest`. The last one is the **active** segment that new
+rows append to; the rest are sealed and never rewritten. The segments are presented to
+search as a single dense row space, so this is invisible to queries: the same exact
+brute-force scan runs whether a store is one segment or many.
+
+By default a store is a **single segment** (`data`) and behaves exactly as it always has.
+Set [`Config::segment_max_rows`](/reference/configuration/#segment_max_rows) to roll the
+active segment into a sealed one once it grows past *N* rows and start a fresh one — no
+data is copied; sealing just publishes a new `manifest`. Sealing and
+[compaction](#compaction) (which collapses every segment back into one) replace the
+manifest atomically, which is the store's commit point.
+
+A store that predates this format (just `data` + `log`, no `manifest`) is migrated
+transparently on the first read-write open — `data` becomes the base segment and a
+manifest is written. A read-only open of such a store writes nothing.
 
 ## Cross-process readers
 
@@ -86,11 +110,12 @@ let reader = Nidus::open(
 # anyhow::Ok(())
 ```
 
-A `ReadOnly` open takes **no lock**. It reads `data` to its current size *S*,
-replays `log`, and ignores any record that references a row ≥ *S*/dim. The
-result is a **consistent, possibly-stale snapshot** — never a torn read — even
-while the writer is mid-append. This is the lock-free basis for search-only
-processes reading a store another process is writing.
+A `ReadOnly` open takes **no lock**. It reads the `manifest`, loads the segments it
+names to their current total size *S*, replays `log`, and ignores any record that
+references a row ≥ *S*/dim. The result is a **consistent, possibly-stale snapshot** —
+never a torn read — even while the writer is mid-append: a not-yet-named segment or a
+row past *S* is simply invisible until its commit. This is the lock-free basis for
+search-only processes reading a store another process is writing.
 
 Only one **writer** (`OpenMode::ReadWrite`, the default) may hold a store at a
 time, enforced by the `O_EXCL` `lock` file. A stale lock left by a crashed writer

@@ -6,6 +6,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::backend::Appender;
 use crate::model::Distance;
 
+mod segments;
+pub use segments::Segments;
+
 // ── Header constants ──────────────────────────────────────────────────────────
 
 /// Magic bytes: "NIDUS\0"
