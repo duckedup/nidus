@@ -11,10 +11,11 @@
 //! before being handed to the client, since the servers are protocol-identical.
 //!
 //! A `?cluster=true` query opens a **Redis/Valkey Cluster** client instead (via the `cluster`
-//! feature): the URL host is a seed node, the rest of the topology is discovered, and slot
-//! routing + `MOVED`/`ASK` redirection are handled by the client. Single-node and cluster
-//! connections share one code path — both are driven as `&mut dyn ConnectionLike` through the
-//! low-level [`Cmd`](redis::Cmd) API.
+//! feature): the host is a seed node — or several, comma-separated, to tolerate one being
+//! down at startup (`redis://a,b,c?cluster=true`) — the rest of the topology is discovered,
+//! and slot routing + `MOVED`/`ASK` redirection are handled by the client. Single-node and
+//! cluster connections share one code path — both are driven as `&mut dyn ConnectionLike`
+//! through the low-level [`Cmd`](redis::Cmd) API.
 //!
 //! As a [`MemoryTier`] this is **model (a)** (SPEC §13.3): a *shared, rebuildable* cache
 //! of the serialized working set, not a source of truth. `store` is `SET` (with `EX`
@@ -57,17 +58,26 @@ impl RedisTier {
     /// Build from a memory-tier location: a `redis://`/`rediss://`/`valkey://`/
     /// `valkeys://`/`keydb://`/`dragonfly://` URL. An optional `?prefix=<ns>` query
     /// namespaces every key (`<ns>:<key>`), and `?cluster=true` opens a Redis/Valkey
-    /// **Cluster** client (the URL host is a seed node — the rest of the topology is
-    /// discovered). Both are stripped before the URL reaches the client. The connection is
-    /// opened lazily on first use, so construction never blocks on the network.
+    /// **Cluster** client over one or more comma-separated seed hosts
+    /// (`redis://a,b,c?cluster=true`) — the rest of the topology is discovered. Both query
+    /// keys are stripped before the URL reaches the client. The connection is opened lazily
+    /// on first use, so construction never blocks on the network.
     pub(crate) fn from_url(location: &str) -> Result<RedisTier> {
-        let (url, prefix, cluster) = normalize_url(location)?;
+        let (nodes, prefix, cluster) = normalize_url(location)?;
         let open: Box<dyn Fn() -> RedisResult<Conn> + Send + Sync> = if cluster {
-            // The seed node bootstraps discovery of the full cluster (CLUSTER SLOTS).
-            let client = ClusterClient::new(vec![url.clone()])
-                .with_context(|| format!("invalid Redis cluster URL {url:?}"))?;
+            // Every comma-separated host is a seed; the client bootstraps cluster discovery
+            // (CLUSTER SLOTS) from whichever is reachable, so several tolerate one being down.
+            let client = ClusterClient::new(nodes.clone())
+                .with_context(|| format!("invalid Redis cluster seed nodes {nodes:?}"))?;
             Box::new(move || client.get_connection().map(|c| Box::new(c) as Conn))
         } else {
+            if nodes.len() > 1 {
+                bail!("multiple comma-separated seed nodes require ?cluster=true: {nodes:?}");
+            }
+            let url = nodes
+                .into_iter()
+                .next()
+                .expect("normalize_url yields ≥1 node");
             let client = Client::open(url.as_str())
                 .with_context(|| format!("invalid Redis memory-tier URL {url:?}"))?;
             Box::new(move || client.get_connection().map(|c| Box::new(c) as Conn))
@@ -141,7 +151,7 @@ impl MemoryTier for RedisTier {
 /// `dragonfly` → `redis`, `valkeys` → `rediss`, since the servers are protocol-identical)
 /// and strips the `?prefix=<ns>` / `?cluster=<bool>` query keys. Pure string logic —
 /// unit-tested directly.
-fn normalize_url(location: &str) -> Result<(String, String, bool)> {
+fn normalize_url(location: &str) -> Result<(Vec<String>, String, bool)> {
     let (scheme, rest) = location
         .split_once("://")
         .ok_or_else(|| anyhow!("Redis memory-tier location {location:?} is missing a scheme"))?;
@@ -162,7 +172,39 @@ fn normalize_url(location: &str) -> Result<(String, String, bool)> {
     if body.is_empty() {
         bail!("Redis memory-tier location {location:?} is missing a host");
     }
-    Ok((format!("{canon}://{body}"), prefix, cluster))
+    Ok((expand_nodes(canon, body), prefix, cluster))
+}
+
+/// Expand `[userinfo@]host[,host…][/db]` into one full `scheme://…` URL per host, so a
+/// comma-separated cluster seed list becomes individual node URLs that each carry the shared
+/// credentials and database. A single host yields a one-element vec (the common case).
+fn expand_nodes(scheme: &str, body: &str) -> Vec<String> {
+    // Userinfo is everything before the last `@` (hosts never contain `@`, so a password
+    // containing one still splits correctly); the `/db` path, if any, follows the host list.
+    let (userinfo, hostpath) = match body.rsplit_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => (None, body),
+    };
+    let (hosts, path) = match hostpath.split_once('/') {
+        Some((h, p)) => (h, Some(p)),
+        None => (hostpath, None),
+    };
+    hosts
+        .split(',')
+        .map(|host| {
+            let mut url = format!("{scheme}://");
+            if let Some(u) = userinfo {
+                url.push_str(u);
+                url.push('@');
+            }
+            url.push_str(host);
+            if let Some(p) = path {
+                url.push('/');
+                url.push_str(p);
+            }
+            url
+        })
+        .collect()
 }
 
 /// Value of `<key>=…` in a URL query string (`""` if absent; the rest is ignored).
@@ -198,8 +240,8 @@ mod tests {
             ("valkeys://h", "rediss://h"),
             ("REDIS://H", "redis://H"), // scheme is case-insensitive
         ] {
-            let (url, prefix, cluster) = normalize_url(loc).unwrap();
-            assert_eq!(url, want, "{loc}");
+            let (nodes, prefix, cluster) = normalize_url(loc).unwrap();
+            assert_eq!(nodes, vec![want.to_string()], "{loc}");
             assert!(prefix.is_empty(), "{loc}");
             assert!(!cluster, "{loc}");
         }
@@ -207,21 +249,21 @@ mod tests {
 
     #[test]
     fn normalize_extracts_and_strips_prefix() {
-        let (url, prefix, _) = normalize_url("valkey://h:6379/0?prefix=nidus").unwrap();
-        assert_eq!(url, "redis://h:6379/0");
+        let (nodes, prefix, _) = normalize_url("valkey://h:6379/0?prefix=nidus").unwrap();
+        assert_eq!(nodes, vec!["redis://h:6379/0"]);
         assert_eq!(prefix, "nidus");
         // A non-prefix query is simply dropped.
-        let (url, prefix, _) = normalize_url("redis://h?foo=bar").unwrap();
-        assert_eq!(url, "redis://h");
+        let (nodes, prefix, _) = normalize_url("redis://h?foo=bar").unwrap();
+        assert_eq!(nodes, vec!["redis://h"]);
         assert!(prefix.is_empty());
     }
 
     #[test]
     fn normalize_detects_cluster_flag_with_prefix() {
         // Cluster opt-in via `?cluster=true`, composable with `?prefix=`.
-        let (url, prefix, cluster) =
+        let (nodes, prefix, cluster) =
             normalize_url("valkey://seed:6379?cluster=true&prefix=ns").unwrap();
-        assert_eq!(url, "redis://seed:6379");
+        assert_eq!(nodes, vec!["redis://seed:6379"]);
         assert_eq!(prefix, "ns");
         assert!(cluster);
         // Truthy variants, and default-off.
@@ -229,6 +271,35 @@ mod tests {
         assert!(normalize_url("rediss://h?cluster=yes").unwrap().2);
         assert!(!normalize_url("redis://h?cluster=false").unwrap().2);
         assert!(!normalize_url("redis://h").unwrap().2);
+    }
+
+    #[test]
+    fn normalize_expands_comma_separated_seed_list() {
+        // Each host becomes its own node URL, all sharing the scheme.
+        let (nodes, _, cluster) =
+            normalize_url("valkey://a:6379,b:6379,c:6379?cluster=true").unwrap();
+        assert_eq!(
+            nodes,
+            vec!["redis://a:6379", "redis://b:6379", "redis://c:6379"]
+        );
+        assert!(cluster);
+        // Shared userinfo and db are distributed to every node.
+        let (nodes, _, _) = normalize_url("rediss://u:p@a:1,b:2/0?cluster=true").unwrap();
+        assert_eq!(nodes, vec!["rediss://u:p@a:1/0", "rediss://u:p@b:2/0"]);
+        // A password containing '@' still splits at the userinfo boundary.
+        let (nodes, _, _) = normalize_url("redis://u:p@ss@a:1,b:2?cluster=true").unwrap();
+        assert_eq!(nodes, vec!["redis://u:p@ss@a:1", "redis://u:p@ss@b:2"]);
+    }
+
+    #[test]
+    fn from_url_rejects_seed_list_without_cluster() {
+        // A comma-separated list only makes sense for a cluster; demand the opt-in.
+        // (`.err()` avoids needing `Debug` on the closure-holding `RedisTier`.)
+        let err = RedisTier::from_url("redis://a:6379,b:6379")
+            .err()
+            .expect("multiple seeds without ?cluster should error")
+            .to_string();
+        assert!(err.contains("require ?cluster=true"), "{err}");
     }
 
     #[test]

@@ -100,6 +100,14 @@ nidus serve --dir ./store --dim 768 --memory redis://seed-node:6379?cluster=true
 nidus serve --dir ./store --dim 768 --memory rediss://seed:6380?cluster=true&prefix=docs
 ```
 
+List several **comma-separated seed nodes** so discovery still bootstraps if one is down at
+startup (they share the scheme, credentials, and database):
+
+```bash
+nidus serve --dir ./store --dim 768 \
+  --memory 'redis://node-a:6379,node-b:6379,node-c:6379?cluster=true'
+```
+
 ### Sharing one server across stores
 
 Add `?prefix=<name>` to namespace the keys, so several different stores can share one

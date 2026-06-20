@@ -28,9 +28,10 @@ nidus:
   # Shared in-RAM working set — a Redis-family tier. REQUIRED (set `memory` OR
   # `memorySecret`). Credentials go in the URL userinfo and TLS uses the rediss://
   # scheme: redis://host:6379, rediss://user:pass@host:6380 (also valkey://, keydb://,
-  # dragonfly://). Append ?cluster=true for a Redis/Valkey Cluster (the host is a seed
-  # node; the rest of the topology is discovered). When the URL carries a password, prefer
-  # `memorySecret` below so it never lands in the Deployment manifest in plain text.
+  # dragonfly://). Append ?cluster=true for a Redis/Valkey Cluster — one seed host, or
+  # several comma-separated (redis://a,b,c:6379?cluster=true); the rest of the topology is
+  # discovered. When the URL carries a password, prefer `memorySecret` below so it never
+  # lands in the Deployment manifest in plain text.
   memory: ""
   # Source the full NIDUS_MEMORY URL from a Secret instead of `memory` above. Use this
   # for an authenticated Redis so the password stays out of rendered manifests/values.
