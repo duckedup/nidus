@@ -9,7 +9,7 @@ default-members = ["."]
 
 [package]
 name = "nidus"
-version = "0.26.0"
+version = "0.27.0"
 edition = "2024"
 rust-version = "1.96"
 description = "A small, pure-Rust embeddable vector store: brute-force or ANN cosine search over a single append-only directory, with pluggable persistence (local files, S3, GCS). No SQL, no query engine; builds in seconds."
@@ -70,10 +70,11 @@ http = "1"
 # The shared MEMORY TIER over Redis (SPEC §13.3), also in the DEFAULT build. One
 # `redis-rs` blocking client covers Redis, Valkey, KeyDB, and DragonflyDB — all
 # RESP-protocol-compatible — selected by `redis://`/`rediss://`/`valkey://`/… URL
-# scheme. `default-features = false` keeps it SYNC (no tokio/async pulled); the
-# only extra is `tls-rustls` for `rediss://`, which reuses the rustls + `ring`
-# already present for ureq (NOT aws-lc, NOT a second TLS stack).
-redis = { version = "1", default-features = false, features = ["tls-rustls"] }
+# scheme. `default-features = false` keeps it SYNC (no tokio/async pulled). Extras:
+# `tls-rustls` for `rediss://` (reuses the rustls + `ring` already present for ureq —
+# NOT aws-lc, NOT a second TLS stack) and `cluster` for Redis/Valkey Cluster (slot
+# routing + MOVED/ASK), whose only added deps are `crc16` + `rand` — tiny, pure Rust.
+redis = { version = "1", default-features = false, features = ["tls-rustls", "cluster"] }
 
 # Memory-mapped immutable segments (SPEC §9 / §14.6 phase 3), in the DEFAULT build.
 # `memmap2` is the one conscious FFI/`unsafe` opt-in in nidus — a thin, fast-compiling
