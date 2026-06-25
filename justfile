@@ -100,6 +100,22 @@ docs-build:
 docs-preview:
     cd docs && bun --bun run preview
 
+# ── Client SDKs (in sdks/) ───────────────────────────────────────────────────
+
+# JS/TS SDK: typecheck + unit tests (mocked fetch — no server needed)
+sdk-js-test:
+    cd sdks/js && npm install && npm run typecheck && npm run test:unit
+
+# JS/TS SDK: full test incl. integration against a real `nidus serve`.
+# Builds the binary first and points the suite at it via NIDUS_BIN.
+sdk-js-test-all: build-cli
+    cd sdks/js && npm install && npm run typecheck && \
+      NIDUS_BIN={{justfile_directory()}}/target/release/nidus npm test
+
+# JS/TS SDK: build the dual ESM/CJS bundle + type declarations
+sdk-js-build:
+    cd sdks/js && npm install && npm run build
+
 # ── Build ──────────────────────────────────────────────────────────────────
 
 # Debug build for the current host
