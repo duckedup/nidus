@@ -1,0 +1,62 @@
+{
+  "name": "@duckedup/nidus",
+  "version": "0.1.0",
+  "description": "JavaScript/TypeScript client for nidus — a small, fast vector store. Connects to a local or remote `nidus serve` over HTTP.",
+  "type": "module",
+  "license": "MIT",
+  "author": "duckedup",
+  "homepage": "https://nidus.duckedup.org",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/duckedup/nidus.git",
+    "directory": "sdks/js"
+  },
+  "keywords": [
+    "nidus",
+    "vector",
+    "vector-store",
+    "vector-database",
+    "embeddings",
+    "semantic-search",
+    "similarity-search",
+    "client",
+    "sdk"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit.test.ts",
+    "test:integration": "vitest run test/integration.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

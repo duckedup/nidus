@@ -83,6 +83,12 @@ export default defineConfig({
           ],
         },
         {
+          label: "SDKs",
+          items: [
+            { label: "JavaScript / TypeScript", link: "/sdks/javascript/" },
+          ],
+        },
+        {
           label: "Reference",
           items: [
             { label: "API", link: "/reference/api/" },

@@ -86,6 +86,28 @@ jobs:
 
       - run: ${{ matrix.command }}
 
+  # The JS SDK (sdks/js) is independent of the Rust build: typecheck, unit tests
+  # (mocked fetch — no server needed), and the bundle build. The integration test
+  # against a real `nidus serve` runs locally via `just sdk-js-test-all`.
+  sdk-js:
+    name: JS SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdks/js/package-lock.json
+      - run: npm install
+        working-directory: sdks/js
+      - run: npm run typecheck
+        working-directory: sdks/js
+      - run: npm run test:unit
+        working-directory: sdks/js
+      - run: npm run build
+        working-directory: sdks/js
+
   miri:
     name: Miri
     runs-on: ubuntu-latest
