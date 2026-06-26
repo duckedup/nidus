@@ -64,6 +64,10 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
+      # Trusted publishing (OIDC) needs npm >= 11.5.1; Node 22 ships npm 10.
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
       - name: Install
         run: npm ci || npm install
 
@@ -76,10 +80,12 @@ jobs:
       - name: Build
         run: npm run build
 
+      # No NODE_AUTH_TOKEN: authentication is via OIDC trusted publishing.
+      # Configure the trusted publisher at npmjs.com → @duckedup/nidus →
+      # Settings → Trusted Publishing (org: duckedup, repo: nidus,
+      # workflow: sdk-js-release.yml). Provenance is emitted automatically.
       - name: Publish
         run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   github-release:
     name: Create GitHub Release
