@@ -46,9 +46,9 @@ scope are **merged into a single ranking**.
 ```rust
 use nidus::Scope;
 
-db.search("code", &q, &opts)?;                              // one collection (&str coerces)
+db.search("code", &q, &opts)?;                                // one collection
 db.search(Scope::Collections(&["code", "docs"]), &q, &opts)?; // a named subset
-db.search(Scope::All, &q, &opts)?;                          // the whole store
+db.search(Scope::All, &q, &opts)?;                            // the whole store
 # anyhow::Ok(())
 ```
 

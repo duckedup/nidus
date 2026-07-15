@@ -140,7 +140,11 @@ length must match the store dimension. `attrs` values are tagged
 curl -s localhost:7700/collections/docs/upsert \
   -H 'content-type: application/json' \
   -d '{"records": [
-        {"id": "a", "vector": [1,0,0], "attrs": {"lang": {"Str": "rust"}, "ts": {"Int": 1781000000}}}
+        {
+          "id": "a",
+          "vector": [1, 0, 0],
+          "attrs": {"lang": {"Str": "rust"}, "ts": {"Int": 1781000000}}
+        }
       ]}'
 # → {"upserted": 1}
 ```
@@ -238,7 +242,12 @@ plus `offset`/`limit` for pagination.
 ```bash
 curl -s localhost:7700/list \
   -H 'content-type: application/json' \
-  -d '{"scope": ["docs"], "filter": [{"Eq": ["lang", {"Str": "rust"}]}], "offset": 0, "limit": 100}'
+  -d '{
+        "scope": ["docs"],
+        "filter": [{"Eq": ["lang", {"Str": "rust"}]}],
+        "offset": 0,
+        "limit": 100
+      }'
 ```
 
 `limit` defaults to `100`, `offset` to `0`. The response shape matches search

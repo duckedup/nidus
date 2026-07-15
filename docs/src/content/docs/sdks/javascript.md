@@ -61,7 +61,9 @@ For an explicit attribute type, use the `v.*` helpers (`v.str`, `v.int`, `v.bool
 
 ```ts
 import { v } from "@duckedup/nidus";
-await db.upsert("docs", [{ id: "d", attrs: { tags: v.list(["a", "b"]), score: v.int(7) } }]);
+await db.upsert("docs", [
+  { id: "d", attrs: { tags: v.list(["a", "b"]), score: v.int(7) } },
+]);
 ```
 
 ## Filtering

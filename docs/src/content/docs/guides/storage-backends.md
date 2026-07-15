@@ -13,7 +13,8 @@ string. Nothing else about how you use nidus changes.
 nidus search --dir ./store docs -k 5 < query.json
 
 # The same store, kept in Amazon S3 instead
-nidus search --dir ./meta --dim 768 --persistence s3://my-bucket/store docs -k 5 < query.json
+nidus search --dir ./meta --dim 768 \
+  --persistence s3://my-bucket/store docs -k 5 < query.json
 ```
 
 From the Rust library it is one builder call:
@@ -68,7 +69,8 @@ export AWS_REGION=us-east-1
 # export AWS_ENDPOINT_URL=https://<accountid>.r2.cloudflarestorage.com
 
 nidus upsert --dir ./meta --dim 768 --persistence s3://my-bucket/store docs < recs.json
-nidus search --dir ./meta --dim 768 --persistence s3://my-bucket/store docs -k 5 < query.json
+nidus search --dir ./meta --dim 768 \
+  --persistence s3://my-bucket/store docs -k 5 < query.json
 ```
 
 `AWS_SESSION_TOKEN` is used if set. Pass `--dim` when the store lives in the cloud — nidus

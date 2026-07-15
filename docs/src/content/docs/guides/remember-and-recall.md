@@ -96,8 +96,8 @@ use nidus::embed::EmbedConfig;
 
 let config = EmbedConfig::new("text-embedding-3-large")   // model (empty = default)
     .api_key("sk-...")                                    // bearer token
-    .base_url("https://my-gateway.example.com")           // route through a gateway / proxy
-    .header("x-org-id", "acme");                           // extra header on every request
+    .base_url("https://my-gateway.example.com")           // route via a gateway
+    .header("x-org-id", "acme");                          // extra header per request
 # let _ = config;
 ```
 

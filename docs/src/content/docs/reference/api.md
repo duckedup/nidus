@@ -84,7 +84,7 @@ embedding space.
 ```rust
 pub struct Record {
     pub id: String,                  // caller-supplied; the upsert key
-    pub vector: Option<Vec<f32>>,    // Some: length must equal the dimension; None: text-only
+    pub vector: Option<Vec<f32>>,    // Some: length == dimension; None: text-only
     pub attrs: BTreeMap<String, Value>,
 }
 ```
