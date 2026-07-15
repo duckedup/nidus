@@ -134,11 +134,17 @@ jobs:
 
       - name: ingest build uses rustls/ring, never aws-lc/OpenSSL
         run: |
-          echo "::group::ingest dep tree (must show rustls + ring, must NOT show aws-lc/openssl)"
+          echo "::group::ingest dep tree (must show rustls + ring, must NOT show aws-lc/openssl-sys)"
           tree="$(cargo tree -e no-dev --features memory,embed-all,summarize-all)"
           echo "$tree" | grep -iE 'reqwest|rustls|ring' | sort -u
-          if echo "$tree" | grep -iE 'aws-lc|openssl|native-tls'; then
-            echo "::error::ingest build pulled a forbidden TLS backend (aws-lc / OpenSSL / native-tls)"
+          # Forbid the multi-minute C trees: aws-lc-sys, the OpenSSL C bindings
+          # (openssl-sys / vendored openssl), and native-tls (which pulls openssl-sys
+          # on Linux). NOT `openssl-probe` — that is a tiny PURE-RUST crate that only
+          # locates the system cert bundle for rustls-native-certs on Linux; despite
+          # the name it links no OpenSSL and compiles instantly, so it does not
+          # violate the build thesis. Match the real `*-sys` offenders, not the name.
+          if echo "$tree" | grep -iE 'aws-lc|openssl-sys|native-tls'; then
+            echo "::error::ingest build pulled a forbidden TLS backend (aws-lc / OpenSSL-sys / native-tls)"
             exit 1
           fi
           echo "ingest TLS backend is rustls + ring only"
