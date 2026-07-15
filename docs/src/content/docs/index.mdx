@@ -1,9 +1,9 @@
 ---
 title: nidus
-description: A small, pure-Rust vector store for development and small-scale use. Exact or approximate (HNSW/IVF) nearest-neighbour search — cosine, dot, or Euclidean — over a single append-only directory. No FFI, no C, no SQL, no query engine.
+description: A small, pure-Rust all-in-one memory — remember text, recall the relevant bits. Built-in embedding (and optional summarization) over an exact-or-approximate vector store, or bring your own vectors. No FFI, no C, no SQL, no query engine.
 template: splash
 hero:
-  tagline: Keep vectors and their metadata in a single directory, then ask which ones sit closest to a query. A small, pure-Rust vector store you embed like any other crate.
+  tagline: Remember text, recall the relevant bits. A small, pure-Rust memory that embeds for you — or takes the vectors you already have — and answers by similarity from a single directory.
   actions:
     - text: Get started
       link: /getting-started/
@@ -16,19 +16,25 @@ hero:
 import { Code } from '@astrojs/starlight/components';
 
 <p class="lede not-content">
-  <strong>nidus (Latin, "nest") is a vector store, not a database.</strong> Embed
-  your chunks, store each vector with its metadata, and ask for the nearest
-  neighbours to a query. It's the storage-and-search core you build{" "}
-  <strong>semantic search, code indexing, and RAG</strong> on — sized for
-  development and small-scale use.
+  <strong>nidus (Latin, "nest") is an all-in-one memory: remember text, recall the
+  relevant bits.</strong> Hand it natural language and it embeds the text for you —
+  optionally summarizing first — with the provider you choose, or bring your own
+  vectors. Underneath it's a vector store, not a database: the storage-and-search
+  core you build <strong>semantic search, code indexing, RAG, and agent
+  memory</strong> on — sized for development and small-scale use.
 </p>
 
-<Code code={`let hits = db.search("code", &query, &SearchOpts { top_k: 5, ..Default::default() })?;`} lang="rust" />
+<Code code={`let hits = memory.recall("notes", "how do users sign in?", &RecallOpts { top_k: 5, ..Default::default() }).await?;`} lang="rust" />
 
 <p class="section-kicker not-content">Why it exists</p>
 
 <div class="feature-grid not-content">
   <article class="feature" data-reveal>
+    <span class="twig" aria-hidden="true">❧</span>
+    <h3>Remember text, recall the relevant bits</h3>
+    <p>Hand nidus natural language and it embeds it for you — optionally summarizing first — with the provider you choose: Voyage, OpenAI, Ollama, Cohere, Gemini, Mistral, Jina, or any OpenAI-compatible endpoint. Already have vectors? The raw API is untouched — bring your own. The memory layer is opt-in and off by default, so the core stays lean.</p>
+  </article>
+  <article class="feature" data-reveal style="--reveal-delay:0.04s">
     <span class="twig" aria-hidden="true">❧</span>
     <h3>Search by similarity</h3>
     <p>Hand nidus a query vector and get the closest records back, ranked with scores. Exact by default — 100% recall at the scale it targets — by cosine, dot, or Euclidean. Reach for an approximate index (HNSW or IVF) or int8/binary quantization when you want more speed.</p>
@@ -38,12 +44,12 @@ import { Code } from '@astrojs/starlight/components';
     <h3>Filter while you search</h3>
     <p>Store typed metadata — Str, Int, Bool, List — beside every vector and narrow the results before they score: equality, ranges, globs, sets, negation. Group records into collections that share one embedding space and query them in a single call.</p>
   </article>
-  <article class="feature" data-reveal style="--reveal-delay:0.04s">
+  <article class="feature" data-reveal style="--reveal-delay:0.12s">
     <span class="twig" aria-hidden="true">❧</span>
     <h3>One directory, crash-safe</h3>
     <p>A whole store is a single append-only directory, fsync'd per batch and CRC-checked. A crash loses at most the in-flight write, and a torn tail repairs itself the moment you reopen — nothing to back up but a folder.</p>
   </article>
-  <article class="feature" data-reveal style="--reveal-delay:0.12s">
+  <article class="feature" data-reveal style="--reveal-delay:0.16s">
     <span class="twig" aria-hidden="true">❧</span>
     <h3>From a folder to the cloud</h3>
     <p>Start against a local directory, then move the same store to S3, GCS, or Redis/Valkey by changing one URL — no migration, no rewrite. Begin on a laptop and grow into the cloud when you need to.</p>
@@ -56,6 +62,10 @@ import { Code } from '@astrojs/starlight/components';
   <a class="next-card" href="/getting-started/" data-reveal>
     <span class="next-title">Getting started</span>
     <p>Add the dependency, open a store, index records, run your first search.</p>
+  </a>
+  <a class="next-card" href="/guides/remember-and-recall/" data-reveal style="--reveal-delay:0.06s">
+    <span class="next-title">Remember &amp; recall</span>
+    <p>Let nidus embed text for you — pick a provider, remember, recall.</p>
   </a>
   <a class="next-card" href="/guides/how-it-works/" data-reveal style="--reveal-delay:0.06s">
     <span class="next-title">How it works</span>

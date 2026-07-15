@@ -119,6 +119,42 @@ pub struct ListRequest {
     pub filter: Filter,
 }
 
+/// Body of `POST /collections/{name}/remember` (the `memory` feature).
+///
+/// Text in: the server embeds `text` (optionally summarizing it first when
+/// `mode` is `"summarize"`) and upserts a record under `id` with `attrs`. The
+/// embedder is chosen at serve time (`--embed-provider …`); a request to this
+/// route on a server started without one is a `400`.
+#[cfg(feature = "memory")]
+#[derive(Debug, Deserialize)]
+pub struct RememberRequest {
+    pub id: String,
+    pub text: String,
+    /// `"raw"` (embed the text as given, the default) or `"summarize"`
+    /// (summarize first, embed the summary — requires a summarizer).
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub attrs: BTreeMap<String, Value>,
+}
+
+/// Body of `POST /collections/{name}/recall` (the `memory` feature).
+///
+/// Query text in, ranked hits out: the server embeds `query` and runs a vector
+/// search over `collection`. Mirrors [`SearchRequest`] minus the caller-supplied
+/// vector (which the server produces from `query`).
+#[cfg(feature = "memory")]
+#[derive(Debug, Deserialize)]
+pub struct RecallRequest {
+    pub query: String,
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+    #[serde(default)]
+    pub min_score: Option<f32>,
+    #[serde(default)]
+    pub filter: Filter,
+}
+
 /// Serializable mirror of [`crate::Hit`] (which carries no serde derive).
 #[derive(Debug, Serialize)]
 pub struct HitDto {

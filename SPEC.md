@@ -11,11 +11,15 @@ This document is the source of truth for nidus's design. It records not just
 
 ## 1. Purpose & motivation
 
-nidus is the **local storage leg** for semantic-search and indexing tools: chunk
+nidus is an **all-in-one memory** for semantic-search, RAG, and indexing tools:
+remember text, recall the relevant bits. Classically that is a pipeline — chunk
 some source content → embed each chunk into a dense vector → store the vectors plus
-metadata → answer "nearest neighbours to this query vector" fast, in-process, with
-no hosted service. The source can be anything — code, documents, issues, wiki
-pages — nidus does not care; it stores vectors and metadata and ranks them.
+metadata → answer "nearest neighbours to this query vector" — and nidus can own the
+whole thing (built-in embedding, optionally summarizing first, with the provider of
+your choice) or just the storage-and-search core if you bring your own vectors. It
+runs fast, in-process, with no hosted service. The source can be anything — code,
+documents, issues, wiki pages — nidus does not care; it turns text into vectors,
+stores vectors and metadata, and ranks them.
 
 It exists because the obvious off-the-shelf options fail the *embedding* test —
 not the functionality test, the **build-and-ship** test:
@@ -30,9 +34,10 @@ not the functionality test, the **build-and-ship** test:
   + object_store**. Hundreds of crates and a query engine, to do a distance-ranked
   top-k. Same disease as DuckDB, transitively-Rust instead of FFI.
 
-The workload is a **vector store, not a database**: no joins, no SQL, no analytics,
-no larger-than-RAM scans (at the target scale). nidus is that store and nothing
-more.
+At its core the workload is a **vector store, not a database**: no joins, no SQL, no
+analytics, no larger-than-RAM scans (at the target scale). nidus is that store —
+plus an opt-in memory layer (embedding, optionally summarization) over it that stays
+off the default build — and nothing more.
 
 ### Thesis (the product *is* the constraints)
 

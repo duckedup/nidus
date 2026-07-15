@@ -12,6 +12,14 @@
 //! own `EmbedError`/`SummarizeError`) as they see fit; only transport errors
 //! that persist past the retry budget surface as an `Err`.
 
+// Every item here is shared retry infra whose ONLY consumers are the per-provider
+// adapters in `embed/` and `summarize/`. A feature set that enables a base
+// (`embed`/`summarize`/`memory`) but no provider adapter — or a single adapter
+// that happens not to use a given helper — compiles this module with some items
+// unreferenced, which is expected, not dead. Allow it module-wide rather than
+// dusting per-item attributes across the file.
+#![allow(dead_code)]
+
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -42,12 +50,6 @@ impl RetryPolicy {
 
     /// Retry on any 5xx server error. Used by Ollama (local), which treats
     /// client errors as terminal.
-    ///
-    /// `#[allow(dead_code)]`: this is shared retry infra. Only the Ollama
-    /// adapter consumes it today, so a feature set that omits `embed-ollama`
-    /// (e.g. a summarize-only build) would otherwise trip `-D dead_code`. It
-    /// stays available for any future adapter that wants 5xx-only retry.
-    #[allow(dead_code)]
     pub fn server_errors(max_retries: usize, base_delay_ms: u64) -> Self {
         Self {
             max_retries,
@@ -63,10 +65,7 @@ pub fn is_retryable_standard(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 529)
 }
 
-/// Any 5xx status. `#[allow(dead_code)]` for the same reason as
-/// [`RetryPolicy::server_errors`] — shared infra, only the Ollama adapter
-/// wires it today.
-#[allow(dead_code)]
+/// Any 5xx status.
 pub fn is_server_error(status: u16) -> bool {
     status >= 500
 }

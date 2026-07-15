@@ -202,7 +202,11 @@ impl Memory {
 /// pinning the identity + dimension on first use. Errors on a dimension mismatch
 /// with the store, or on an embedder identity that differs from what the
 /// collection was first written with.
-fn ensure_collection_and_pin<E: Embedder>(
+///
+/// `pub(crate)` so the HTTP server (`crate::server`) can reuse the exact same
+/// pin/identity logic when it embeds text on behalf of a network client — rather
+/// than reimplementing it and risking drift from this write path.
+pub(crate) fn ensure_collection_and_pin<E: Embedder>(
     db: &mut Nidus,
     embedder: &E,
     collection: &str,
@@ -269,6 +273,26 @@ async fn embed_and_store<E: Embedder>(
     Ok(())
 }
 
+/// Recall-side identity guard: refuse a recall whose embedder differs from the
+/// one `collection` was written with. Symmetric with the write-side pin —
+/// recalling with a different (even same-dimension) embedder than the collection
+/// was written with would silently return meaningless cross-space rankings, so
+/// refuse it up front. A collection with no pinned embedder (never written
+/// through `Memory`) imposes no constraint.
+///
+/// `pub(crate)` so the HTTP server reuses this exact guard on its recall path
+/// (the write side reuses [`ensure_collection_and_pin`]).
+pub(crate) fn guard_recall_identity<E: Embedder>(
+    db: &Nidus,
+    embedder: &E,
+    collection: &str,
+) -> anyhow::Result<()> {
+    if let Some(existing) = db.get_meta(collection).get(META_EMBEDDER) {
+        bail_if_identity_differs(collection, existing, &embedder_identity(embedder))?;
+    }
+    Ok(())
+}
+
 /// Embed `query_text` as a query and run a vector search mapped from `opts`.
 async fn recall_with<E: Embedder>(
     db: &Nidus,
@@ -277,12 +301,7 @@ async fn recall_with<E: Embedder>(
     query_text: &str,
     opts: &RecallOpts,
 ) -> anyhow::Result<Vec<Hit>> {
-    // Symmetric with the write-side pin: recalling with a different (even
-    // same-dimension) embedder than the collection was written with would
-    // silently return meaningless rankings, so refuse it up front.
-    if let Some(existing) = db.get_meta(collection).get(META_EMBEDDER) {
-        bail_if_identity_differs(collection, existing, &embedder_identity(embedder))?;
-    }
+    guard_recall_identity(db, embedder, collection)?;
     let query = embedder
         .embed_query(query_text)
         .await

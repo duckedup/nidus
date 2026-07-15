@@ -626,6 +626,13 @@ pub(crate) mod testutil {
     use std::thread;
 
     /// What the mock captured about the single request it served.
+    ///
+    /// `#[allow(dead_code)]`: this is shared test scaffolding. Which fields a
+    /// given provider's tests assert on varies (some check `method`, some only
+    /// `path`/`body`), so a single-provider build (e.g. only `embed-openai-compat`)
+    /// legitimately leaves one unread — that is not dead code, just unused by that
+    /// one adapter's suite.
+    #[allow(dead_code)]
     pub struct Captured {
         pub method: String,
         pub path: String,

@@ -125,6 +125,84 @@ describe("NidusClient request shaping", () => {
   });
 });
 
+describe("memory (remember/recall)", () => {
+  it("sends remember with the id/text body and normalized attrs, omitting mode", async () => {
+    const { fn, calls } = mockFetch({ ok: true, upserted: 1 });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const out = await db.remember("notes", "a", "the quick brown fox", {
+      attrs: { tag: "x", year: 2024 },
+    });
+    expect(out).toBeUndefined();
+    expect(calls[0]!.url).toBe("http://x/collections/notes/remember");
+    expect(calls[0]!.json).toEqual({
+      id: "a",
+      text: "the quick brown fox",
+      attrs: { tag: { Str: "x" }, year: { Int: 2024 } },
+    });
+    // `mode` is omitted so the server default ("raw") applies.
+    expect((calls[0]!.json as Record<string, unknown>).mode).toBeUndefined();
+  });
+
+  it("sends remember with mode:summarize and no attrs", async () => {
+    const { fn, calls } = mockFetch({ ok: true, upserted: 1 });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.remember("notes", "b", "a long article", { mode: "summarize" });
+    expect(calls[0]!.json).toEqual({
+      id: "b",
+      text: "a long article",
+      mode: "summarize",
+    });
+  });
+
+  it("sends recall with camelCase mapped to snake_case and decodes hit attrs", async () => {
+    const { fn, calls } = mockFetch([
+      { collection: "notes", id: "a", score: 0.99, attrs: { tag: { Str: "x" } } },
+    ]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const hits = await db.recall("notes", "quick fox", {
+      topK: 5,
+      minScore: 0.2,
+      filter: f.and(f.eq("tag", "x")),
+    });
+    expect(calls[0]!.url).toBe("http://x/collections/notes/recall");
+    expect(calls[0]!.json).toEqual({
+      query: "quick fox",
+      top_k: 5,
+      min_score: 0.2,
+      filter: [{ Eq: ["tag", { Str: "x" }] }],
+    });
+    expect(hits[0]).toEqual({
+      collection: "notes",
+      id: "a",
+      score: 0.99,
+      attrs: { tag: "x" },
+    });
+  });
+
+  it("sends recall with defaults: an empty filter and omitted top_k/min_score", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.recall("notes", "hello");
+    expect(calls[0]!.json).toEqual({ query: "hello", filter: [] });
+  });
+
+  it("surfaces a 400 (no embedder configured) as a NidusError", async () => {
+    const { fn } = mockFetch(
+      { error: "nidus serve was started without an embedder; pass --embed-provider …" },
+      400,
+    );
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const err = (await db.recall("notes", "hi").then(
+      () => null,
+      (e) => e,
+    )) as NidusError;
+    expect(err).toBeInstanceOf(NidusError);
+    expect(err.status).toBe(400);
+    expect(err.isBadRequest).toBe(true);
+    expect(err.message).toContain("--embed-provider");
+  });
+});
+
 describe("error handling", () => {
   it("throws NidusError carrying the server status and message", async () => {
     const { fn } = mockFetch({ error: "store is locked: /tmp/s/lock" }, 409);

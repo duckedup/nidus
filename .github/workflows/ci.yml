@@ -37,12 +37,15 @@ jobs:
   # The first three jobs build the pure library (default features) — the fast,
   # FFI-free core path. The `*-cli` jobs add `--features cli`, which pulls the
   # binary-only deps (clap + the tokio/axum stack) and compiles the `nidus`
-  # binary + its server. The `*-ingest` jobs add the off-by-default AI ingest
-  # layer (`--features memory,embed-all,summarize-all`), which pulls the async
-  # network edge (reqwest → hyper → rustls/ring). Keeping every non-core feature
-  # set on its own lane means a core-only change never waits on a heavier compile,
-  # and the library's purity is checked on its own. (Miri stays on the pure path
-  # below — it can run neither the async server nor the async ingest edge.)
+  # binary + its lean (raw-endpoint-only) server. The `*-serve` jobs add
+  # `--features serve` (the shipped binary: `cli` + the full ingest layer), which
+  # compiles the text-native `/remember` + `/recall` routes and drives them
+  # offline against in-process mocks. The `*-ingest` jobs add the off-by-default
+  # AI ingest layer (`--features memory,embed-all,summarize-all`), which pulls the
+  # async network edge (reqwest → hyper → rustls/ring). Keeping every non-core
+  # feature set on its own lane means a core-only change never waits on a heavier
+  # compile, and the library's purity is checked on its own. (Miri stays on the
+  # pure path below — it can run neither the async server nor the async ingest edge.)
   build:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
@@ -65,6 +68,12 @@ jobs:
           - name: test-cli
             components: ""
             command: cargo test --features cli
+          - name: clippy-serve
+            components: clippy
+            command: cargo clippy --all-targets --features serve -- -D warnings
+          - name: test-serve
+            components: ""
+            command: cargo test --features serve
           - name: clippy-ingest
             components: clippy
             command: cargo clippy --all-targets --features memory,embed-all,summarize-all -- -D warnings

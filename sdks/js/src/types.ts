@@ -150,3 +150,26 @@ export interface ListOptions {
   limit?: number;
   filter?: Filter;
 }
+
+/**
+ * Options for {@link NidusClient.remember} (text-native ingest). The server
+ * embeds the text and upserts; `mode: "summarize"` summarizes it first (and
+ * requires the server to have been started with a summarizer).
+ */
+export interface RememberOptions {
+  /**
+   * `"raw"` (embed the text as given, the default) or `"summarize"` (summarize
+   * first, then embed the summary — stamps `nidus.summary`/`nidus.source` attrs).
+   */
+  mode?: "raw" | "summarize";
+  /** Typed metadata to stamp on the stored record (plain JS values auto-normalized). */
+  attrs?: Record<string, AttrInput>;
+}
+
+/** Options for {@link NidusClient.recall} (embed the query text, then vector-search). */
+export interface RecallOptions {
+  topK?: number;
+  /** Cosine-similarity floor; hits below it are dropped. */
+  minScore?: number;
+  filter?: Filter;
+}

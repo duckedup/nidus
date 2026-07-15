@@ -95,6 +95,13 @@ summarize-all = ["summarize-anthropic", "summarize-openai"]
 # summarize-then-embed mode.
 memory = ["embed"]
 
+# `nidus serve` WITH the memory endpoints (server-side remember/recall over the
+# HTTP API — the SDKs send text, the server embeds/summarizes). Umbrella over the
+# CLI/server stack plus the full ingest layer, so the shipped binary and the JS
+# SDK's server-side memory work out of the box. `cli` alone still builds a lean
+# server with only the raw vector endpoints; the memory routes are `memory`-gated.
+serve = ["cli", "memory", "embed-all", "summarize-all"]
+
 # The core is four small pure-Rust crates with no C and no FFI. The S3/GCS
 # persistence backends (below) add a few more — still all pure Rust except `ring`
 # (ureq's TLS, a small C+asm compile) — and they are NOT feature-gated: outgrowing

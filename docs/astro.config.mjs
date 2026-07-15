@@ -14,7 +14,7 @@ export default defineConfig({
     starlight({
       title: "nidus",
       description:
-        "A small, pure-Rust vector store for development and small-scale use. Brute-force cosine search over a single append-only directory — no FFI, no C, no SQL, no query engine.",
+        "A small, pure-Rust all-in-one memory: remember text, recall the relevant bits. Built-in embedding (and optional summarization) over an exact-or-approximate vector store, or bring your own vectors — no FFI, no C, no SQL, no query engine.",
       logo: {
         // The nest mark — full-colour illustration, reads on light and dark.
         src: "./src/assets/nidus.svg",

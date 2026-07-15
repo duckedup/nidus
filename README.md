@@ -1,19 +1,25 @@
 # nidus
 
-A small, pure-Rust **vector store for development and small-scale use**.
-Nearest-neighbour search — cosine, dot, or Euclidean — over a single append-only
-directory, exact by default or approximate (HNSW/IVF) when you opt in, with typed
-metadata filters and many logical collections sharing one embedding space. No SQL,
-no query engine, and a build measured in seconds, not minutes.
+A small, pure-Rust **all-in-one memory**: remember text, recall the relevant bits.
+Hand it natural language and nidus embeds the text for you — optionally summarizing
+first — with the provider of your choice, or bring your own vectors. At its core
+it's a vector store for development and small-scale use: exact-by-default
+nearest-neighbour search — cosine, dot, or Euclidean — over a single append-only
+directory, approximate (HNSW/IVF) when you opt in, with typed metadata filters and
+many logical collections sharing one embedding space. No SQL, no query engine, and
+a build measured in seconds, not minutes.
 
 > _nidus_ (Latin, "nest") — a small place where things are kept safe.
 
 ## Why it exists
 
-nidus is the local storage leg for semantic-search and indexing tools: chunk some
-source → embed each chunk → store the vectors + metadata → ask for nearest
-neighbours. The obvious off-the-shelf options fail the **build-and-ship** test, not
-the functionality test:
+nidus is the memory layer for semantic-search, RAG, and indexing tools: remember
+text, recall the relevant bits. Classically that's a pipeline — chunk some source →
+embed each chunk → store the vectors + metadata → ask for nearest neighbours — and
+nidus can own the whole thing (embedding, and optionally summarizing, built in) or
+just the storage-and-search core if you already have vectors. Either way, the
+obvious off-the-shelf options fail the **build-and-ship** test, not the
+functionality test:
 
 - **DuckDB** (via `libduckdb-sys`) bundles a large C++ source tree and compiles it
   from scratch — multi-minute cold builds, a required C++ toolchain, a bloated
@@ -22,8 +28,9 @@ the functionality test:
   it drags in Arrow + DataFusion (a full SQL engine) + a columnar format — hundreds
   of crates to do `ORDER BY distance LIMIT k`.
 
-The workload is a *vector store, not a database*. nidus is that store and nothing
-more, so it **compiles in seconds** and embeds as a normal Rust dependency.
+The workload is a *vector store, not a database*. nidus is that store — with an
+opt-in memory layer over it, off by default — so it **compiles in seconds** and
+embeds as a normal Rust dependency.
 
 ### The constraints are the product
 
@@ -88,6 +95,13 @@ See [`examples/demo.rs`](examples/demo.rs) for an end-to-end run (`cargo run
 
 ## What it does
 
+- **Remember text, recall the relevant bits** *(opt-in)* — hand nidus natural
+  language and it embeds it for you, optionally summarizing first, with a provider of
+  your choice (Voyage, OpenAI, Ollama, Cohere, Gemini, Mistral, Jina, or any
+  OpenAI-compatible endpoint), then answers queries by similarity. The raw `Vec<f32>`
+  API is untouched — bring your own vectors and skip it entirely. Off by default, so
+  `cargo add nidus` stays a lean synchronous store. See the
+  [remember & recall guide](https://nidus.duckedup.org/guides/remember-and-recall/).
 - **Exact or approximate search** — exact by default (100% recall, fast at the target
   scale of ≤ a few million vectors, comfortably in RAM). Score by cosine, dot, or
   Euclidean (cosine the default; cosine vectors are unit-normalized on insert, so a

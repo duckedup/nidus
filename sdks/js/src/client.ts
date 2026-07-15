@@ -13,7 +13,9 @@ import type {
   HybridSearchOptions,
   ListOptions,
   NidusRecord,
+  RecallOptions,
   RecordInput,
+  RememberOptions,
   SearchOptions,
   Stats,
   TextSearchOptions,
@@ -217,6 +219,55 @@ export class NidusClient {
       scope: opts.scope ?? [],
       offset: opts.offset,
       limit: opts.limit,
+      filter: opts.filter ?? [],
+    });
+  }
+
+  // ── Memory (text-native) ──────────────────────────────────────────────────
+  //
+  // Available only when `nidus serve` was started with an embedder
+  // (`--embed-provider …`); otherwise these answer `400`. The server embeds the
+  // text/query — the client only sends strings.
+
+  /**
+   * Embed `text` and upsert it under `id` in `collection` (idempotent on `id`).
+   * With `opts.mode === "summarize"` the server summarizes first, embeds the
+   * summary, and stamps `nidus.summary`/`nidus.source` attrs (requires the
+   * server to have a summarizer). `opts.attrs` accept plain JS values or `v.*`
+   * helpers; they are normalized for you.
+   */
+  async remember(
+    collection: string,
+    id: string,
+    text: string,
+    opts: RememberOptions = {},
+  ): Promise<void> {
+    await this.request(
+      "POST",
+      `/collections/${enc(collection)}/remember`,
+      prune({
+        id,
+        text,
+        mode: opts.mode,
+        attrs: opts.attrs ? encodeAttrs(opts.attrs) : undefined,
+      }),
+    );
+  }
+
+  /**
+   * Embed `query` and vector-search `collection`, best-first (attrs decoded to
+   * plain JS values). Refused with a cross-model guard if the collection was
+   * written with a different embedder than the server's.
+   */
+  recall(
+    collection: string,
+    query: string,
+    opts: RecallOptions = {},
+  ): Promise<Hit[]> {
+    return this.searchRequest(`/collections/${enc(collection)}/recall`, {
+      query,
+      top_k: opts.topK,
+      min_score: opts.minScore,
       filter: opts.filter ?? [],
     });
   }

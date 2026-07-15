@@ -73,9 +73,10 @@ test-cli:
 build-cli:
     cargo build --release --features cli
 
-# Install the `nidus` binary from this checkout
+# Install the `nidus` binary from this checkout — with the memory endpoints, so
+# the installed `nidus serve` matches the shipped (binstall/Docker) binary.
 install:
-    cargo install --path . --features cli
+    cargo install --path . --features serve
 
 # Run `nidus serve` against a store (e.g. `just serve /tmp/store 384`)
 serve DIR DIM *ARGS:
@@ -83,6 +84,33 @@ serve DIR DIM *ARGS:
 
 # Pre-PR checks for the cli feature: format clean, no clippy warnings, tests green
 ci-cli: fmt-check lint-cli test-cli
+
+# ── `nidus serve` WITH memory endpoints (the `serve` umbrella feature) ───────
+# `serve` = `cli` + the full AI-ingest layer (memory + every embedder +
+# summarizer). This is the binary that ships via `cargo binstall` / Docker: the
+# `/remember` + `/recall` routes are compiled in, so the SDKs can send TEXT and
+# the server embeds/summarizes. Its own lane so a `cli`-only change never waits
+# on the heavier async-edge compile.
+
+# Lint the serve feature (server + memory routes + every provider adapter)
+lint-serve:
+    cargo clippy --all-targets --features serve -- -D warnings
+
+# Test the serve feature (server + memory routes, driven offline against mocks)
+test-serve:
+    cargo test --features serve
+
+# Release build of the shipped `nidus` binary (serve = cli + memory endpoints)
+build-serve:
+    cargo build --release --features serve
+
+# Run the memory-capable `nidus serve` (e.g. `just serve-memory /tmp/store 1536
+# --embed-provider openai --embed-api-key $OPENAI_API_KEY`)
+serve-memory DIR DIM *ARGS:
+    cargo run --features serve -- serve --dir {{ DIR }} --dim {{ DIM }} {{ ARGS }}
+
+# Pre-PR checks for the serve feature: format clean, no clippy warnings, tests green
+ci-serve: fmt-check lint-serve test-serve
 
 # ── AI ingest layer (the opt-in embed/summarize/memory features) ────────────
 # The off-by-default async network edge (reqwest → hyper → rustls/ring; NO new C

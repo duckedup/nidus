@@ -89,6 +89,32 @@ const hybrid = await db.hybridSearch({
 });
 ```
 
+## Remembering and recalling (text-native)
+
+When the server is started with an embedder (`nidus serve --embed-provider …`), you
+can send **text** and let the server embed it — no need to compute vectors client-side.
+`remember` embeds and upserts; `recall` embeds the query and vector-searches.
+
+```ts
+// Embed "the quick brown fox" and store it under id "a"
+await db.remember("notes", "a", "the quick brown fox", { attrs: { tag: "x" } });
+
+// Summarize first, then embed the summary (server also needs --summarize-provider).
+// The stored record additionally carries `nidus.summary` and `nidus.source` attrs.
+await db.remember("notes", "b", longArticle, { mode: "summarize" });
+
+// Embed the query text and search, best-first (attrs decoded to plain JS values)
+const hits = await db.recall("notes", "quick fox", {
+  topK: 5,
+  minScore: 0.2,
+  filter: f.and(f.eq("tag", "x")),
+});
+```
+
+Both throw a `NidusError` with status `400` if the server has no embedder configured
+(the message names `--embed-provider`); `mode: "summarize"` without a summarizer is
+likewise a `400`.
+
 ## Everything else
 
 ```ts
