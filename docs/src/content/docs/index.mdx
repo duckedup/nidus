@@ -25,7 +25,18 @@ import { Code } from '@astrojs/starlight/components';
   small-scale use.
 </p>
 
-<Code code={`let hits = memory.recall("notes", "how do users sign in?", &RecallOpts { top_k: 5, ..Default::default() }).await?;`} lang="rust" />
+<Code code={`// Text in — nidus embeds it for you.
+memory.remember(
+    "notes", "login",
+    "Users sign in with a bearer token.",
+    attrs, RememberMode::Raw,
+).await?;
+
+// Relevant text out — ranked by similarity.
+let hits = memory.recall("notes", "how do users sign in?", &RecallOpts {
+    top_k: 5,
+    ..Default::default()
+}).await?;`} lang="rust" />
 
 <p class="section-kicker not-content">Why it exists</p>
 

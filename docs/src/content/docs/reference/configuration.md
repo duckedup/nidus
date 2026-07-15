@@ -23,11 +23,11 @@ let cfg = Config::new("/path/to/store", 768)
     .ann(None)                       // approximate-nearest-neighbour index (default: off)
     .query_threads(1)                // worker threads per exact search (default: 1)
     .segment_max_rows(None)          // seal the active segment past N rows (default: off)
-    .segment_index_min_rows(None)    // IVF-index sealed segments past N rows (default: off)
-    .mmap(false)                     // memory-map immutable segments instead of RAM (default: off)
+    .segment_index_min_rows(None)    // IVF-index sealed segments (default: off)
+    .mmap(false)                     // memory-map immutable segments, not RAM (default: off)
     .persistence("")                 // durable bytes: "" = local; "s3://…"/"gs://…"
     .memory("")                      // shared working set: "" = local; "redis://…"
-    .cluster(false);                 // cooperating instances over a shared backend (default: off)
+    .cluster(false);                 // instances over a shared backend (default: off)
 # let _ = cfg;
 ```
 

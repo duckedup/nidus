@@ -103,7 +103,8 @@ nidus list --dir ./store docs --offset 100 -n 100   # next page
 # Full-text search (BM25): declare which fields are indexed, then query by text
 nidus set-fts-schema --dir ./store docs --field body --field title
 nidus text-search --dir ./store body "running quickly" -k 5
-nidus text-search --dir ./store body "rust" --in docs --where '[{"Eq":["lang",{"Str":"rust"}]}]'
+nidus text-search --dir ./store body "rust" --in docs \
+  --where '[{"Eq":["lang",{"Str":"rust"}]}]'
 
 # Hybrid search: fuse a vector (stdin) and a BM25 text query with RRF
 echo '[1,0,0]' | nidus hybrid-search --dir ./store body "vector database" -k 5
@@ -164,7 +165,7 @@ store-opening command, including `serve`:
 nidus upsert --dir ./meta --dim 768 --persistence s3://my-bucket/store docs < recs.json
 nidus search --dir ./meta --dim 768 --persistence s3://my-bucket/store docs -k 5 < q.json
 
-# --memory: share the in-RAM working set across processes via Redis/Valkey/KeyDB/Dragonfly.
+# --memory: share the in-RAM working set across processes via Redis/Valkey/KeyDB.
 # Each worker publishes on flush and adopts on open, skipping the log replay.
 nidus serve --dir ./store --dim 768 --memory redis://cache:6379?prefix=docs
 ```
@@ -236,7 +237,7 @@ snapshot is a one-line cron entry:
 
 ```bash
 # Every night at 02:00, snapshot into a dated file and keep the last 14.
-0 2 * * *  nidus backup --dir /srv/nidus/store --out /backups/store-$(date +\%F).tar.gz && \
+0 2 * * *  nidus backup --dir /srv/nidus/store --out /backups/$(date +\%F).tar.gz && \
            ls -1t /backups/store-*.tar.gz | tail -n +15 | xargs -r rm
 ```
 
