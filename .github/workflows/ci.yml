@@ -37,9 +37,15 @@ jobs:
   # The first three jobs build the pure library (default features) — the fast,
   # FFI-free core path. The `*-cli` jobs add `--features cli`, which pulls the
   # binary-only deps (clap + the tokio/axum stack) and compiles the `nidus`
-  # binary + its server. Keeping them separate means a core-only change never
-  # waits on the heavier cli compile, and the library's purity is checked on its
-  # own. (Miri stays on the pure path below — it can't run the async server.)
+  # binary + its lean (raw-endpoint-only) server. The `*-serve` jobs add
+  # `--features serve` (the shipped binary: `cli` + the full ingest layer), which
+  # compiles the text-native `/remember` + `/recall` routes and drives them
+  # offline against in-process mocks. The `*-ingest` jobs add the off-by-default
+  # AI ingest layer (`--features memory,embed-all,summarize-all`), which pulls the
+  # async network edge (reqwest → hyper → rustls/ring). Keeping every non-core
+  # feature set on its own lane means a core-only change never waits on a heavier
+  # compile, and the library's purity is checked on its own. (Miri stays on the
+  # pure path below — it can run neither the async server nor the async ingest edge.)
   build:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
@@ -62,6 +68,18 @@ jobs:
           - name: test-cli
             components: ""
             command: cargo test --features cli
+          - name: clippy-serve
+            components: clippy
+            command: cargo clippy --all-targets --features serve -- -D warnings
+          - name: test-serve
+            components: ""
+            command: cargo test --features serve
+          - name: clippy-ingest
+            components: clippy
+            command: cargo clippy --all-targets --features memory,embed-all,summarize-all -- -D warnings
+          - name: test-ingest
+            components: ""
+            command: cargo test --features memory,embed-all,summarize-all
     steps:
       - uses: actions/checkout@v6
 
@@ -85,6 +103,52 @@ jobs:
             ${{ runner.os }}-cargo-${{ matrix.name }}-
 
       - run: ${{ matrix.command }}
+
+  # Build-thesis guard (epic nidus-54l): the off-by-default AI ingest layer must
+  # not regress nidus's identity. This job asserts EMPIRICALLY, via the resolved
+  # dependency graph, that:
+  #   1. the DEFAULT build pulls NONE of reqwest / tokio / hyper (the async edge),
+  #      so `cargo add nidus` stays the pure, seconds-fast, dep-lean sync store; and
+  #   2. the ingest build's TLS is rustls + `ring` — the SAME small C+asm compile
+  #      already present for ureq/redis — with NO aws-lc-sys and NO OpenSSL (the
+  #      multi-minute C trees nidus exists to avoid).
+  # It complements the compile-time `cfg` invariant in tests/build_thesis.rs
+  # (built on the `test` and `test-ingest` lanes above). `-e no-dev` excludes
+  # dev-dependencies so a test-only crate can never mask a real regression.
+  build-thesis:
+    name: build-thesis (dep-absence guard)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: DEFAULT build pulls no async ingest edge
+        run: |
+          echo "::group::default dep tree (reqwest/tokio/hyper must be absent)"
+          if cargo tree -e no-dev | grep -iE '(^|[^-])(reqwest|tokio|hyper)( |$|v)'; then
+            echo "::error::default build pulled an AI-ingest async-edge crate (reqwest/tokio/hyper)"
+            exit 1
+          fi
+          echo "default build is pure: no reqwest / tokio / hyper"
+          echo "::endgroup::"
+
+      - name: ingest build uses rustls/ring, never aws-lc/OpenSSL
+        run: |
+          echo "::group::ingest dep tree (must show rustls + ring, must NOT show aws-lc/openssl-sys)"
+          tree="$(cargo tree -e no-dev --features memory,embed-all,summarize-all)"
+          echo "$tree" | grep -iE 'reqwest|rustls|ring' | sort -u
+          # Forbid the multi-minute C trees: aws-lc-sys, the OpenSSL C bindings
+          # (openssl-sys / vendored openssl), and native-tls (which pulls openssl-sys
+          # on Linux). NOT `openssl-probe` — that is a tiny PURE-RUST crate that only
+          # locates the system cert bundle for rustls-native-certs on Linux; despite
+          # the name it links no OpenSSL and compiles instantly, so it does not
+          # violate the build thesis. Match the real `*-sys` offenders, not the name.
+          if echo "$tree" | grep -iE 'aws-lc|openssl-sys|native-tls'; then
+            echo "::error::ingest build pulled a forbidden TLS backend (aws-lc / OpenSSL-sys / native-tls)"
+            exit 1
+          fi
+          echo "ingest TLS backend is rustls + ring only"
+          echo "::endgroup::"
 
   # The JS SDK (sdks/js) is independent of the Rust build: typecheck, unit tests
   # (mocked fetch — no server needed), and the bundle build. The integration test

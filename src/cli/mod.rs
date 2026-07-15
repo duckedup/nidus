@@ -15,6 +15,16 @@ use crate::{
     Scope, SearchOpts,
 };
 
+// AI-ingest (memory) wiring for `serve`: only under the `memory` feature (pulled
+// by the `serve` umbrella). A plain `cli` build has no `--embed-provider` flags.
+#[cfg(feature = "memory")]
+use std::sync::Arc;
+
+#[cfg(feature = "memory")]
+use crate::embed::{AnyEmbedder, EmbedConfig, EmbedProvider};
+#[cfg(all(feature = "memory", feature = "summarize"))]
+use crate::summarize::{AnySummarizer, SummarizeConfig, SummarizeProvider};
+
 mod backup;
 
 #[derive(Parser, Debug)]
@@ -190,6 +200,104 @@ impl StoreArgs {
     }
 }
 
+/// Embedder / summarizer configuration for the text-native memory routes
+/// (`/remember`, `/recall`) of `nidus serve`. Flattened into the `Serve`
+/// subcommand only when the `memory` feature is compiled in (the `serve`
+/// umbrella). With no `--embed-provider`, the server still starts — it just
+/// serves the raw vector endpoints, and the memory routes answer `400`.
+///
+/// `Default` (all-`None`) is used by tests and is the "no ingest configured"
+/// state.
+#[cfg(feature = "memory")]
+#[derive(Args, Debug, Default)]
+struct IngestArgs {
+    /// Embedding provider for `/remember` and `/recall`: voyage, openai, ollama,
+    /// cohere, gemini, mistral, jina, or openai-compat. Omit to serve only the
+    /// raw vector endpoints (the memory routes then answer 400).
+    #[arg(long, env = "NIDUS_EMBED_PROVIDER")]
+    embed_provider: Option<String>,
+    /// Embedding model. Defaults to the provider's default when omitted
+    /// (openai-compat has none — pass one).
+    #[arg(long, env = "NIDUS_EMBED_MODEL")]
+    embed_model: Option<String>,
+    /// API key for the embedding provider (some, e.g. Ollama, need none).
+    #[arg(long, env = "NIDUS_EMBED_API_KEY")]
+    embed_api_key: Option<String>,
+    /// Base-URL override for the embedding provider (required for openai-compat
+    /// and self-hosted gateways).
+    #[arg(long, env = "NIDUS_EMBED_BASE_URL")]
+    embed_base_url: Option<String>,
+
+    /// Summarizer provider enabling `mode: "summarize"` on `/remember`:
+    /// anthropic or openai. Omit for raw-embed only.
+    #[cfg(all(feature = "memory", feature = "summarize"))]
+    #[arg(long, env = "NIDUS_SUMMARIZE_PROVIDER")]
+    summarize_provider: Option<String>,
+    /// Summarizer model. Defaults to the provider's default when omitted.
+    #[cfg(all(feature = "memory", feature = "summarize"))]
+    #[arg(long, env = "NIDUS_SUMMARIZE_MODEL")]
+    summarize_model: Option<String>,
+    /// API key for the summarizer provider.
+    #[cfg(all(feature = "memory", feature = "summarize"))]
+    #[arg(long, env = "NIDUS_SUMMARIZE_API_KEY")]
+    summarize_api_key: Option<String>,
+    /// Base-URL override for the summarizer provider.
+    #[cfg(all(feature = "memory", feature = "summarize"))]
+    #[arg(long, env = "NIDUS_SUMMARIZE_BASE_URL")]
+    summarize_base_url: Option<String>,
+}
+
+#[cfg(feature = "memory")]
+impl IngestArgs {
+    /// Build the embedder from `--embed-provider …`, or `None` when the flag was
+    /// omitted (the server then serves only the raw endpoints). Async because
+    /// some adapters probe their dimension with a live call on construction.
+    async fn embedder(&self) -> Result<Option<Arc<AnyEmbedder>>> {
+        let Some(name) = self.embed_provider.as_deref() else {
+            return Ok(None);
+        };
+        let provider = EmbedProvider::from_name(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown embed provider '{name}'"))?;
+        // An empty model lets `AnyEmbedder::build` fill the provider default.
+        let mut config = EmbedConfig::new(self.embed_model.clone().unwrap_or_default());
+        if let Some(k) = &self.embed_api_key {
+            config = config.api_key(k);
+        }
+        if let Some(u) = &self.embed_base_url {
+            config = config.base_url(u);
+        }
+        let embedder = AnyEmbedder::build(provider, config)
+            .await
+            .map_err(|e| anyhow::anyhow!("building embedder '{name}': {e}"))?;
+        Ok(Some(Arc::new(embedder)))
+    }
+
+    /// Build the summarizer from `--summarize-provider …`, or `None` when omitted.
+    #[cfg(all(feature = "memory", feature = "summarize"))]
+    async fn summarizer(&self) -> Result<Option<Arc<AnySummarizer>>> {
+        let Some(name) = self.summarize_provider.as_deref() else {
+            return Ok(None);
+        };
+        let provider = SummarizeProvider::from_name(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown summarize provider '{name}'"))?;
+        let model = self
+            .summarize_model
+            .clone()
+            .unwrap_or_else(|| provider.default_model().to_string());
+        let mut config = SummarizeConfig::new(model);
+        if let Some(k) = &self.summarize_api_key {
+            config = config.api_key(k);
+        }
+        if let Some(u) = &self.summarize_base_url {
+            config = config.base_url(u);
+        }
+        let summarizer = AnySummarizer::build(provider, config)
+            .await
+            .map_err(|e| anyhow::anyhow!("building summarizer '{name}': {e}"))?;
+        Ok(Some(Arc::new(summarizer)))
+    }
+}
+
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum DistanceArg {
     Cosine,
@@ -238,6 +346,12 @@ enum Command {
         /// process-RAM store would silently lose data on restart.
         #[arg(long, env = "NIDUS_REQUIRE_REMOTE")]
         require_remote: bool,
+        /// Embedder / summarizer flags for the text-native `/remember` + `/recall`
+        /// routes. Present only when built with the `memory` feature (the `serve`
+        /// umbrella).
+        #[cfg(feature = "memory")]
+        #[command(flatten)]
+        ingest: IngestArgs,
     },
     /// List collections.
     Collections {
@@ -430,7 +544,17 @@ pub fn run(cli: Cli) -> Result<()> {
             token,
             max_body_bytes,
             require_remote,
-        } => serve(store, addr, token, max_body_bytes, require_remote),
+            #[cfg(feature = "memory")]
+            ingest,
+        } => serve(
+            store,
+            addr,
+            token,
+            max_body_bytes,
+            require_remote,
+            #[cfg(feature = "memory")]
+            ingest,
+        ),
         Command::Collections { store } => {
             let db = open(&store, false)?;
             print_json(&db.collections())
@@ -658,6 +782,7 @@ fn serve(
     token: Option<String>,
     max_body_bytes: usize,
     require_remote: bool,
+    #[cfg(feature = "memory")] ingest: IngestArgs,
 ) -> Result<()> {
     // The container contract: no durable local disk, so refuse anything that would
     // keep its state process-local (a local-file store or process-RAM working set).
@@ -683,14 +808,27 @@ fn serve(
     let db = Nidus::open(store.config(mode)?)?;
     // An empty --token / NIDUS_TOKEN (clap reads the env var) means no auth.
     let token = token.filter(|t| !t.is_empty());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    // Build the embedder/summarizer (async — some adapters probe on construction)
+    // on the same runtime that will drive the server. `None` when the flags were
+    // omitted: the server then serves only the raw endpoints.
+    #[cfg(feature = "memory")]
+    let embedder = rt.block_on(ingest.embedder())?;
+    #[cfg(all(feature = "memory", feature = "summarize"))]
+    let summarizer = rt.block_on(ingest.summarizer())?;
+
     let cfg = crate::server::ServeConfig {
         addr,
         token,
         max_body_bytes,
+        #[cfg(feature = "memory")]
+        embedder,
+        #[cfg(all(feature = "memory", feature = "summarize"))]
+        summarizer,
     };
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
     rt.block_on(crate::server::serve(db, cfg))
 }
 
@@ -733,6 +871,53 @@ mod tests {
                 assert_eq!(store.dim, Some(8));
                 assert!(!store.read_only);
                 assert_eq!(token, None);
+            }
+            _ => panic!("expected Serve"),
+        }
+    }
+
+    /// The `serve` memory flags parse into `IngestArgs` (present only under the
+    /// `memory` feature, which the `serve` umbrella pulls).
+    #[cfg(feature = "memory")]
+    #[test]
+    fn serve_parses_ingest_flags() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "serve",
+            "--dir",
+            "/tmp/s",
+            "--dim",
+            "3",
+            "--embed-provider",
+            "openai",
+            "--embed-model",
+            "text-embedding-3-small",
+            "--embed-api-key",
+            "sk-test",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Serve { ingest, .. } => {
+                assert_eq!(ingest.embed_provider.as_deref(), Some("openai"));
+                assert_eq!(
+                    ingest.embed_model.as_deref(),
+                    Some("text-embedding-3-small")
+                );
+                assert_eq!(ingest.embed_api_key.as_deref(), Some("sk-test"));
+                assert_eq!(ingest.embed_base_url, None);
+            }
+            _ => panic!("expected Serve"),
+        }
+    }
+
+    /// With no ingest flags, `IngestArgs` is all-`None` (memory routes then 400).
+    #[cfg(feature = "memory")]
+    #[test]
+    fn serve_without_ingest_flags_is_none() {
+        let cli = Cli::try_parse_from(["nidus", "serve", "--dir", "/tmp/s", "--dim", "3"]).unwrap();
+        match cli.command {
+            Command::Serve { ingest, .. } => {
+                assert_eq!(ingest.embed_provider, None);
             }
             _ => panic!("expected Serve"),
         }
@@ -991,6 +1176,8 @@ mod tests {
             None,
             1,
             true,
+            #[cfg(feature = "memory")]
+            IngestArgs::default(),
         )
         .unwrap_err()
         .to_string();
@@ -1006,6 +1193,8 @@ mod tests {
             None,
             1,
             true,
+            #[cfg(feature = "memory")]
+            IngestArgs::default(),
         )
         .unwrap_err()
         .to_string();

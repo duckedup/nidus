@@ -42,11 +42,14 @@ jobs:
             echo "Tag $TAG does not exist, will release"
           fi
 
-  # Build the `nidus` binary (the `cli` feature) for each target and upload it as
-  # a release artifact. Asset names are `nidus-<target>.tar.gz` (`.zip` on Windows),
-  # each holding the bare `nidus` binary — matching `[package.metadata.binstall]`
-  # so `cargo binstall nidus` resolves them. The library itself stays pure; only
-  # this opt-in feature pulls the clap/tokio/axum stack.
+  # Build the `nidus` binary (the `serve` feature = `cli` + the full AI-ingest
+  # layer) for each target and upload it as a release artifact. `serve` (not bare
+  # `cli`) is what ships so `cargo binstall` / Docker users get the text-native
+  # `/remember` + `/recall` endpoints out of the box. Asset names are
+  # `nidus-<target>.tar.gz` (`.zip` on Windows), each holding the bare `nidus`
+  # binary — matching `[package.metadata.binstall]` so `cargo binstall nidus`
+  # resolves them. The library itself stays pure; only this opt-in feature pulls
+  # the clap/tokio/axum + reqwest stack.
   build-binaries:
     name: Build ${{ matrix.target }}
     needs: check-version
@@ -92,11 +95,11 @@ jobs:
 
       - name: Build with cross
         if: matrix.use_cross
-        run: cross build --release --features cli --target ${{ matrix.target }}
+        run: cross build --release --features serve --target ${{ matrix.target }}
 
       - name: Build with cargo
         if: "!matrix.use_cross"
-        run: cargo build --release --features cli --target ${{ matrix.target }}
+        run: cargo build --release --features serve --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -205,8 +208,8 @@ jobs:
           As a CLI / server binary:
 
           \`\`\`sh
-          cargo binstall nidus            # prebuilt binary
-          cargo install nidus --features cli   # from source
+          cargo binstall nidus              # prebuilt binary (incl. memory endpoints)
+          cargo install nidus --features serve   # from source (server + memory)
           \`\`\`
 
           ### Changes

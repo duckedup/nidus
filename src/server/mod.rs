@@ -31,6 +31,15 @@ use dto::{
     ListRequest, SearchRequest, TextSearchRequest, UpsertRequest,
 };
 
+// ── AI-ingest (memory) imports: only under the `memory` feature (pulled by the
+// `serve` umbrella). Plain `cli` builds a lean server without these. ──
+#[cfg(feature = "memory")]
+use crate::embed::{AnyEmbedder, Embedder};
+#[cfg(all(feature = "memory", feature = "summarize"))]
+use crate::summarize::{AnySummarizer, SummarizeOpts, Summarizer};
+#[cfg(feature = "memory")]
+use dto::{RecallRequest, RememberRequest};
+
 /// How `nidus serve` is configured beyond the store itself.
 pub struct ServeConfig {
     /// Bind address.
@@ -42,6 +51,15 @@ pub struct ServeConfig {
     /// Maximum request body size in bytes. The store buffers each body in memory,
     /// so this is also the largest single upsert payload.
     pub max_body_bytes: usize,
+    /// Embedder that backs the text-native `/remember` and `/recall` routes. When
+    /// `None`, those routes answer `400` (the server was started without an
+    /// embedder). Built by the CLI from `--embed-provider …`.
+    #[cfg(feature = "memory")]
+    pub embedder: Option<Arc<AnyEmbedder>>,
+    /// Optional summarizer enabling `mode: "summarize"` on `/remember`. When
+    /// `None`, a summarize request answers `400`.
+    #[cfg(all(feature = "memory", feature = "summarize"))]
+    pub summarizer: Option<Arc<AnySummarizer>>,
 }
 
 /// Shared, cloneable handle to the one open store.
@@ -54,6 +72,12 @@ pub struct ServeConfig {
 struct AppState {
     db: Arc<RwLock<Nidus>>,
     token: Option<Arc<str>>,
+    /// Shared embedder for the `memory` routes; `None` disables them (→ `400`).
+    #[cfg(feature = "memory")]
+    embedder: Option<Arc<AnyEmbedder>>,
+    /// Shared summarizer for `mode: "summarize"`; `None` disables it (→ `400`).
+    #[cfg(all(feature = "memory", feature = "summarize"))]
+    summarizer: Option<Arc<AnySummarizer>>,
 }
 
 /// Open the store, bind the address, and serve until a shutdown signal (Ctrl-C /
@@ -62,6 +86,10 @@ pub async fn serve(db: Nidus, cfg: ServeConfig) -> anyhow::Result<()> {
     let state = AppState {
         db: Arc::new(RwLock::new(db)),
         token: cfg.token.map(Arc::from),
+        #[cfg(feature = "memory")]
+        embedder: cfg.embedder,
+        #[cfg(all(feature = "memory", feature = "summarize"))]
+        summarizer: cfg.summarizer,
     };
     let app = router(state.clone(), cfg.max_body_bytes);
 
@@ -91,7 +119,7 @@ pub async fn serve(db: Nidus, cfg: ServeConfig) -> anyhow::Result<()> {
 }
 
 fn router(state: AppState, max_body_bytes: usize) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/stats", get(stats))
         .route("/collections", get(list_collections))
@@ -109,7 +137,17 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/hybrid-search", post(hybrid_search))
         .route("/list", post(list))
         .route("/flush", post(flush))
-        .route("/compact", post(compact))
+        .route("/compact", post(compact));
+
+    // Text-native memory routes: the SDKs send TEXT and the server embeds /
+    // summarizes. Present only when the `memory` feature is compiled in (the
+    // `serve` umbrella); a plain `cli` build ships the raw endpoints above only.
+    #[cfg(feature = "memory")]
+    let router = router
+        .route("/collections/{name}/remember", post(remember))
+        .route("/collections/{name}/recall", post(recall));
+
+    router
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
@@ -403,6 +441,136 @@ async fn compact(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError
     Ok(Json(json!({ "ok": true })))
 }
 
+// ── Memory handlers (the `memory` feature) ───────────────────────────────────
+//
+// CRITICAL async/lock discipline (see the module docs): embedding and
+// summarizing are async network IO and MUST happen OUTSIDE the store `RwLock`
+// — the guard is never held across an `.await`. So each handler does the
+// network work lock-free first, then takes the lock only for the synchronous
+// store step. The pin/identity/search logic is REUSED from `crate::memory`
+// (the same code the in-process `Memory` uses), not reimplemented here.
+
+/// `POST /collections/{name}/remember` — text in. Optionally summarize, then
+/// embed (both lock-free), then upsert under the write lock. `mode` is `"raw"`
+/// (default) or `"summarize"`.
+#[cfg(feature = "memory")]
+async fn remember(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<RememberRequest>,
+) -> Result<Json<JsonValue>, ApiError> {
+    let embedder = st.embedder.clone().ok_or_else(missing_embedder_error)?;
+
+    let RememberRequest {
+        id,
+        text,
+        mode,
+        attrs,
+    } = req;
+    // `mut` only when a summarizer can stamp META_SUMMARY/META_SOURCE into it.
+    #[cfg_attr(not(all(feature = "memory", feature = "summarize")), allow(unused_mut))]
+    let mut attrs = attrs;
+
+    // 1) (Optional) summarize + 2) embed — all lock-free network IO.
+    let embed_text: String = match mode.as_deref() {
+        Some("summarize") => {
+            #[cfg(all(feature = "memory", feature = "summarize"))]
+            {
+                let summarizer = st.summarizer.clone().ok_or_else(|| {
+                    ApiError::bad_request(anyhow::anyhow!(
+                        "nidus serve was started without a summarizer; pass --summarize-provider …"
+                    ))
+                })?;
+                let summary = summarizer
+                    .summarize(&text, &SummarizeOpts::default())
+                    .await
+                    .map_err(anyhow::Error::new)?;
+                // Stamp the same attr keys the in-process `Memory` uses so a
+                // recall hit is explainable back to the source text.
+                attrs.insert(
+                    crate::memory::META_SUMMARY.to_string(),
+                    crate::Value::Str(summary.clone()),
+                );
+                attrs.insert(
+                    crate::memory::META_SOURCE.to_string(),
+                    crate::Value::Str(text.clone()),
+                );
+                summary
+            }
+            #[cfg(all(feature = "memory", not(feature = "summarize")))]
+            {
+                return Err(ApiError::bad_request(anyhow::anyhow!(
+                    "this build has no summarizer support; rebuild with --features serve"
+                )));
+            }
+        }
+        Some("raw") | None => text,
+        Some(other) => {
+            return Err(ApiError::bad_request(anyhow::anyhow!(
+                "unknown remember mode '{other}'; use 'raw' or 'summarize'"
+            )));
+        }
+    };
+    let vector = embedder
+        .embed(&embed_text)
+        .await
+        .map_err(anyhow::Error::new)?;
+
+    // 3) Store: pin the embedding-space identity (reused from `crate::memory`)
+    //    and upsert — the only step that takes the write lock.
+    let n = run_write(st, move |db| {
+        crate::memory::ensure_collection_and_pin(db, embedder.as_ref(), &name)?;
+        db.upsert(&name, &[Record::new(id, vector, attrs)])
+    })
+    .await?;
+    Ok(Json(json!({ "ok": true, "upserted": n })))
+}
+
+/// `POST /collections/{name}/recall` — query text in, ranked hits out. Embeds
+/// the query lock-free, then reads under the shared lock. Refuses a cross-model
+/// recall via the same identity guard the in-process `Memory` uses.
+#[cfg(feature = "memory")]
+async fn recall(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<RecallRequest>,
+) -> Result<Json<Vec<HitDto>>, ApiError> {
+    let embedder = st.embedder.clone().ok_or_else(missing_embedder_error)?;
+
+    let RecallRequest {
+        query,
+        top_k,
+        min_score,
+        filter,
+    } = req;
+
+    // Embed the query off-lock (network IO), then search under the read lock.
+    let vector = embedder
+        .embed_query(&query)
+        .await
+        .map_err(anyhow::Error::new)?;
+    let opts = SearchOpts {
+        top_k,
+        min_score,
+        filter,
+    };
+    let hits = run_read(st, move |db| {
+        crate::memory::guard_recall_identity(db, embedder.as_ref(), &name)?;
+        db.search(name.as_str(), &vector, &opts)
+    })
+    .await?;
+    Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+}
+
+/// The `400` returned when a memory route is hit but no embedder was configured
+/// at serve time.
+#[cfg(feature = "memory")]
+fn missing_embedder_error() -> ApiError {
+    ApiError::bad_request(anyhow::anyhow!(
+        "nidus serve was started without an embedder; pass --embed-provider … to enable /remember and /recall"
+    ))
+}
+
 /// Run a **read** operation on a blocking task under a shared lock — concurrent
 /// reads proceed in parallel.
 async fn run_read<F, T>(st: AppState, f: F) -> Result<T, ApiError>
@@ -459,6 +627,16 @@ impl ApiError {
             err,
         }
     }
+
+    /// A `400 Bad Request` with a caller-facing message (e.g. a memory route hit
+    /// on a server started without an embedder, or an unknown `remember` mode).
+    #[cfg(feature = "memory")]
+    fn bad_request(err: anyhow::Error) -> Self {
+        ApiError {
+            status: StatusCode::BAD_REQUEST,
+            err,
+        }
+    }
 }
 
 /// Map a store error to an HTTP status. Defaults to `500`; recognises the
@@ -470,6 +648,10 @@ fn classify(err: &anyhow::Error) -> StatusCode {
     } else if msg.contains("read-only store") {
         StatusCode::FORBIDDEN
     } else if msg.contains("store is locked") {
+        StatusCode::CONFLICT
+    } else if msg.contains("different embedding models") {
+        // remember/recall into a collection already pinned to another embedder:
+        // the request conflicts with the collection's committed embedding space.
         StatusCode::CONFLICT
     } else if msg.contains("max_vector_bytes") || msg.contains("out of memory") {
         StatusCode::INSUFFICIENT_STORAGE
@@ -511,6 +693,10 @@ mod tests {
         let state = AppState {
             db: Arc::new(RwLock::new(db)),
             token: None,
+            #[cfg(feature = "memory")]
+            embedder: None,
+            #[cfg(all(feature = "memory", feature = "summarize"))]
+            summarizer: None,
         };
         router(state, 16 * 1024 * 1024)
     }
@@ -662,6 +848,11 @@ mod tests {
             ),
             ("store is locked: /tmp/s/lock", StatusCode::CONFLICT),
             (
+                "collection 'x' was written with embedder 'a/b', but this Memory uses 'c/d'; \
+                 vectors from different embedding models are not comparable",
+                StatusCode::CONFLICT,
+            ),
+            (
                 "upsert would grow the vector matrix to 9 bytes, exceeding max_vector_bytes (8 bytes)",
                 StatusCode::INSUFFICIENT_STORAGE,
             ),
@@ -685,5 +876,231 @@ mod tests {
         let err = anyhow!("vector length 4 does not match store dimension 8")
             .context("while upserting into 'docs'");
         assert_eq!(classify(&err), StatusCode::BAD_REQUEST);
+    }
+}
+
+// ── Memory-route tests (the `memory` feature) ────────────────────────────────
+//
+// These drive the `/remember` + `/recall` handlers **offline**: the server's
+// embedder is an `OpenAiCompat` adapter pointed at a tiny in-process TCP mock
+// that always answers with a fixed `{"data":[{"embedding":[…],"index":0}]}`.
+// No real provider network is touched (mirrors the mock in `src/embed/*`).
+//
+// Requires `embed-openai-compat`: the mock is driven through the OpenAI-compatible
+// embedder, so a `memory` build with no provider adapter compiled (an `AnyEmbedder`
+// with zero variants) has nothing to exercise here. Every CI test lane that turns
+// on `memory` also enables `embed-all`, so coverage is unchanged.
+#[cfg(all(test, feature = "memory", feature = "embed-openai-compat"))]
+mod memory_tests {
+    use super::*;
+    use crate::embed::{EmbedConfig, EmbedProvider};
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::thread;
+    use tower::ServiceExt; // for `oneshot`
+
+    /// The fixed embedding every mock response carries — a 3-dim vector, so the
+    /// backing store is opened at dimension 3. A stored doc and any query embed
+    /// to the *same* vector, so recall scores it ~1.0.
+    const EMBED_BODY: &str = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
+    const DIM: usize = 3;
+
+    /// A multi-connection HTTP/1.1 mock: accepts connections forever on a
+    /// background thread, drains each request (headers + Content-Length body),
+    /// and replies with `EMBED_BODY`. Unlike the one-shot `embed::testutil`
+    /// mock, this survives the several calls a remember→recall flow makes
+    /// (dimension probe on build, then embed, then embed_query).
+    fn spawn_embed_mock() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                let header_end = loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break buf.len(),
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break pos + 4;
+                            }
+                        }
+                        Err(_) => break buf.len(),
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..header_end.min(buf.len())]).to_string();
+                let content_length = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                while buf.len() < header_end + content_length {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    EMBED_BODY.len(),
+                    EMBED_BODY
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A router whose memory routes are backed by the offline mock embedder.
+    async fn router_with_mock_embedder() -> Router {
+        let base = spawn_embed_mock();
+        let embedder = AnyEmbedder::build(
+            EmbedProvider::OpenAiCompat,
+            EmbedConfig::new("mock-model").base_url(base),
+        )
+        .await
+        .expect("build mock embedder");
+        let db = Nidus::open_in_memory(DIM).unwrap();
+        let state = AppState {
+            db: Arc::new(RwLock::new(db)),
+            token: None,
+            embedder: Some(Arc::new(embedder)),
+            #[cfg(all(feature = "memory", feature = "summarize"))]
+            summarizer: None,
+        };
+        router(state, 16 * 1024 * 1024)
+    }
+
+    /// A router with NO embedder configured — memory routes must answer `400`.
+    fn router_without_embedder() -> Router {
+        let db = Nidus::open_in_memory(DIM).unwrap();
+        let state = AppState {
+            db: Arc::new(RwLock::new(db)),
+            token: None,
+            embedder: None,
+            #[cfg(all(feature = "memory", feature = "summarize"))]
+            summarizer: None,
+        };
+        router(state, 16 * 1024 * 1024)
+    }
+
+    async fn json_body(resp: Response) -> JsonValue {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn post(path: &str, body: JsonValue) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// Remember text (server embeds via the mock), then recall it back.
+    #[tokio::test]
+    async fn remember_then_recall_over_http() {
+        let app = router_with_mock_embedder().await;
+
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/notes/remember",
+                json!({"id": "a", "text": "the quick brown fox", "attrs": {"tag": {"Str": "x"}}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["upserted"], 1);
+
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/notes/recall",
+                json!({"query": "quick fox", "top_k": 5}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        assert_eq!(hits[0]["id"], "a");
+        assert_eq!(hits[0]["attrs"]["tag"]["Str"], "x");
+    }
+
+    /// A server started without an embedder rejects the memory routes with `400`
+    /// and a message pointing at `--embed-provider`.
+    #[tokio::test]
+    async fn memory_routes_400_without_embedder() {
+        let app = router_without_embedder();
+
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/notes/remember",
+                json!({"id": "a", "text": "hi"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(resp).await;
+        assert!(
+            body["error"].as_str().unwrap().contains("--embed-provider"),
+            "message names the flag: {body}"
+        );
+
+        let resp = app
+            .oneshot(post("/collections/notes/recall", json!({"query": "hi"})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An unknown `mode` on `/remember` is a `400`, not a silent raw embed.
+    #[tokio::test]
+    async fn remember_rejects_unknown_mode() {
+        let app = router_with_mock_embedder().await;
+        let resp = app
+            .oneshot(post(
+                "/collections/notes/remember",
+                json!({"id": "a", "text": "hi", "mode": "bogus"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The wire DTOs deserialize from their documented shapes, defaults included.
+    #[test]
+    fn dto_serde() {
+        let r: RememberRequest =
+            serde_json::from_value(json!({"id": "a", "text": "hello", "attrs": {"k": {"Int": 1}}}))
+                .unwrap();
+        assert_eq!(r.id, "a");
+        assert_eq!(r.text, "hello");
+        assert!(r.mode.is_none());
+        assert_eq!(r.attrs.len(), 1);
+
+        // mode + minimal recall body (top_k defaults to 10).
+        let r: RememberRequest =
+            serde_json::from_value(json!({"id": "b", "text": "t", "mode": "summarize"})).unwrap();
+        assert_eq!(r.mode.as_deref(), Some("summarize"));
+        assert!(r.attrs.is_empty());
+
+        let q: RecallRequest = serde_json::from_value(json!({"query": "find me"})).unwrap();
+        assert_eq!(q.query, "find me");
+        assert_eq!(q.top_k, 10);
+        assert!(q.min_score.is_none());
     }
 }

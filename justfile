@@ -73,9 +73,10 @@ test-cli:
 build-cli:
     cargo build --release --features cli
 
-# Install the `nidus` binary from this checkout
+# Install the `nidus` binary from this checkout — with the memory endpoints, so
+# the installed `nidus serve` matches the shipped (binstall/Docker) binary.
 install:
-    cargo install --path . --features cli
+    cargo install --path . --features serve
 
 # Run `nidus serve` against a store (e.g. `just serve /tmp/store 384`)
 serve DIR DIM *ARGS:
@@ -83,6 +84,71 @@ serve DIR DIM *ARGS:
 
 # Pre-PR checks for the cli feature: format clean, no clippy warnings, tests green
 ci-cli: fmt-check lint-cli test-cli
+
+# ── `nidus serve` WITH memory endpoints (the `serve` umbrella feature) ───────
+# `serve` = `cli` + the full AI-ingest layer (memory + every embedder +
+# summarizer). This is the binary that ships via `cargo binstall` / Docker: the
+# `/remember` + `/recall` routes are compiled in, so the SDKs can send TEXT and
+# the server embeds/summarizes. Its own lane so a `cli`-only change never waits
+# on the heavier async-edge compile.
+
+# Lint the serve feature (server + memory routes + every provider adapter)
+lint-serve:
+    cargo clippy --all-targets --features serve -- -D warnings
+
+# Test the serve feature (server + memory routes, driven offline against mocks)
+test-serve:
+    cargo test --features serve
+
+# Release build of the shipped `nidus` binary (serve = cli + memory endpoints)
+build-serve:
+    cargo build --release --features serve
+
+# Run the memory-capable `nidus serve` (e.g. `just serve-memory /tmp/store 1536
+# --embed-provider openai --embed-api-key $OPENAI_API_KEY`)
+serve-memory DIR DIM *ARGS:
+    cargo run --features serve -- serve --dir {{ DIR }} --dim {{ DIM }} {{ ARGS }}
+
+# Pre-PR checks for the serve feature: format clean, no clippy warnings, tests green
+ci-serve: fmt-check lint-serve test-serve
+
+# ── AI ingest layer (the opt-in embed/summarize/memory features) ────────────
+# The off-by-default async network edge (reqwest → hyper → rustls/ring; NO new C
+# tree, NO aws-lc/OpenSSL) that turns nidus into an all-in-one "memory". Like
+# `cli`/`serve`, it lives OFF the core build path on purpose: the DEFAULT build
+# (`just ci`) pulls NONE of reqwest/tokio/hyper, so `cargo add nidus` stays the
+# pure, seconds-fast, sync vector store. The `build-thesis` guard (CI + the
+# integration test `tests/build_thesis.rs`) asserts that invariant. Being an
+# async-edge feature set, this layer is skipped by the Miri lanes — the same as
+# the cli/server stack.
+
+# Lint the embed feature set (base infra + every provider adapter)
+lint-embed:
+    cargo clippy --all-targets --features embed-all -- -D warnings
+
+# Test the embed feature set (base infra + every provider adapter)
+test-embed:
+    cargo test --features embed-all
+
+# Pre-PR checks for the embed features: format clean, no clippy warnings, tests green
+ci-embed: fmt-check lint-embed test-embed
+
+# Lint the summarize feature set (base infra + every provider adapter)
+lint-summarize:
+    cargo clippy --all-targets --features summarize-all -- -D warnings
+
+# Test the summarize feature set (base infra + every provider adapter)
+test-summarize:
+    cargo test --features summarize-all
+
+# Pre-PR checks for the summarize features: format clean, no clippy warnings, tests green
+ci-summarize: fmt-check lint-summarize test-summarize
+
+# Pre-PR checks for the FULL ingest layer (memory + every embedder + summarizer): build, lint, test
+ci-ingest: fmt-check
+    cargo clippy --all-targets --features memory,embed-all,summarize-all -- -D warnings
+    cargo test --features memory,embed-all,summarize-all
+    cargo build --release --features memory,embed-all,summarize-all
 
 # ── Docs site (Astro + Starlight, in docs/) ─────────────────────────────────
 
