@@ -16,12 +16,13 @@ hero:
 import { Code } from '@astrojs/starlight/components';
 
 <p class="lede not-content">
-  <strong>nidus (Latin, "nest") is an all-in-one memory: remember text, recall the
-  relevant bits.</strong> Hand it natural language and it embeds the text for you —
-  optionally summarizing first — with the provider you choose, or bring your own
-  vectors. Underneath it's a vector store, not a database: the storage-and-search
-  core you build <strong>semantic search, code indexing, RAG, and agent
-  memory</strong> on — sized for development and small-scale use.
+  <strong>nidus (Latin, "nest") is two things in one small, pure-Rust package.</strong>
+  It's a <strong>vector store</strong> — the storage-and-search core you build
+  semantic search, code indexing, RAG, and agent memory on — and an <strong>all-in-one
+  memory</strong> layered on top that embeds text for you, so you can remember natural
+  language and recall the relevant bits. Bring your own vectors, or let nidus make
+  them. Not a database, no SQL, no query engine — sized for development and
+  small-scale use.
 </p>
 
 <Code code={`let hits = memory.recall("notes", "how do users sign in?", &RecallOpts { top_k: 5, ..Default::default() }).await?;`} lang="rust" />
@@ -36,20 +37,15 @@ import { Code } from '@astrojs/starlight/components';
   </article>
   <article class="feature" data-reveal style="--reveal-delay:0.04s">
     <span class="twig" aria-hidden="true">❧</span>
-    <h3>Search by similarity</h3>
-    <p>Hand nidus a query vector and get the closest records back, ranked with scores. Exact by default — 100% recall at the scale it targets — by cosine, dot, or Euclidean. Reach for an approximate index (HNSW or IVF) or int8/binary quantization when you want more speed.</p>
+    <h3>Search by similarity, filter as you go</h3>
+    <p>Hand nidus a query and get the closest records back, ranked with scores — exact by default (100% recall at the scale it targets) by cosine, dot, or Euclidean, or an approximate index (HNSW/IVF) and int8/binary quantization when you want more speed. Store typed metadata beside every vector and narrow results before they score: equality, ranges, globs, sets, negation.</p>
   </article>
   <article class="feature" data-reveal style="--reveal-delay:0.08s">
-    <span class="twig" aria-hidden="true">❧</span>
-    <h3>Filter while you search</h3>
-    <p>Store typed metadata — Str, Int, Bool, List — beside every vector and narrow the results before they score: equality, ranges, globs, sets, negation. Group records into collections that share one embedding space and query them in a single call.</p>
-  </article>
-  <article class="feature" data-reveal style="--reveal-delay:0.12s">
     <span class="twig" aria-hidden="true">❧</span>
     <h3>One directory, crash-safe</h3>
     <p>A whole store is a single append-only directory, fsync'd per batch and CRC-checked. A crash loses at most the in-flight write, and a torn tail repairs itself the moment you reopen — nothing to back up but a folder.</p>
   </article>
-  <article class="feature" data-reveal style="--reveal-delay:0.16s">
+  <article class="feature" data-reveal style="--reveal-delay:0.12s">
     <span class="twig" aria-hidden="true">❧</span>
     <h3>From a folder to the cloud</h3>
     <p>Start against a local directory, then move the same store to S3, GCS, or Redis/Valkey by changing one URL — no migration, no rewrite. Begin on a laptop and grow into the cloud when you need to.</p>
