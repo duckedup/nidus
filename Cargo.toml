@@ -9,7 +9,7 @@ default-members = ["."]
 
 [package]
 name = "nidus"
-version = "0.27.0"
+version = "0.28.0"
 edition = "2024"
 rust-version = "1.96"
 description = "A small, pure-Rust embeddable vector store: brute-force or ANN cosine search over a single append-only directory, with pluggable persistence (local files, S3, GCS). No SQL, no query engine; builds in seconds."
@@ -33,12 +33,67 @@ name = "nidus"
 path = "src/bin/nidus.rs"
 required-features = ["cli"]
 
+# The all-in-one memory example (remember/recall over real providers). Gated on
+# the ingest features so the default `cargo build --examples`/test path skips it.
+[[example]]
+name = "memory"
+required-features = ["memory", "embed-all", "summarize-all"]
+
 [features]
 # Off by default — that is the whole point. With `cli` off, `cargo add nidus`
 # and `cargo tree -p nidus` (`just deps`) pull NOTHING beyond the four core
 # crates below, and the core build/test/Miri path stays pure and seconds-long.
 # Turning it on adds the binary-only deps (all pure Rust, zero FFI).
 cli = ["dep:clap", "dep:tokio", "dep:axum", "dep:tower", "dep:serde_json", "dep:tar", "dep:flate2"]
+
+# ── AI ingest layer (SPEC §9 / epic nidus-54l) — all OFF by default ──────────
+# nidus widens from a tight vector store to an all-in-one "memory": text in,
+# relevant text out. The transforms that prepare/query what's remembered —
+# EMBED (optional SUMMARIZE first) — live behind these off-by-default features at
+# the async edge, exactly like `cli`/`serve`. The DEFAULT build pulls NONE of
+# them, so `cargo add nidus` stays the pure, seconds-fast, dependency-lean sync
+# vector store. Turning them on adds `reqwest` (rustls-tls → reuses the `ring`
+# already present for ureq/redis; NO new C tree, NO aws-lc/OpenSSL) + `tokio` +
+# `serde_json`. `#![deny(unsafe_code)]` stays intact; Miri lanes skip this layer.
+#
+# `embed`/`summarize` are the base infra (traits, errors, configs, provider
+# enum, the shared retry helper). Each per-provider feature enables its base and
+# compiles just that adapter, so a caller pays only for the providers they use.
+embed = ["dep:reqwest", "dep:tokio", "dep:serde_json"]
+embed-voyage = ["embed"]
+embed-openai = ["embed"]
+embed-ollama = ["embed"]
+embed-cohere = ["embed"]
+embed-gemini = ["embed"]
+embed-mistral = ["embed"]
+embed-jina = ["embed"]
+# Generic OpenAI-compatible embedder: one adapter whose `base_url` override
+# reaches Azure OpenAI, Together, Fireworks, vLLM, LiteLLM, DeepInfra, … via the
+# standard `/v1/embeddings` shape.
+embed-openai-compat = ["embed"]
+# Every shipped embedder at once — the "support all providers" umbrella.
+embed-all = [
+    "embed-voyage",
+    "embed-openai",
+    "embed-ollama",
+    "embed-cohere",
+    "embed-gemini",
+    "embed-mistral",
+    "embed-jina",
+    "embed-openai-compat",
+]
+
+summarize = ["dep:reqwest", "dep:tokio", "dep:serde_json"]
+summarize-anthropic = ["summarize"]
+# OpenAI-compatible chat-completions summarizer: serves OpenAI, Azure, LiteLLM,
+# vLLM, Ollama `/v1`, … via `base_url`.
+summarize-openai = ["summarize"]
+summarize-all = ["summarize-anthropic", "summarize-openai"]
+
+# The headline all-in-one memory surface (remember/recall). `memory` alone gives
+# the Raw ingest path (embed the text); add a `summarize-*` feature for the
+# summarize-then-embed mode.
+memory = ["embed"]
 
 # The core is four small pure-Rust crates with no C and no FFI. The S3/GCS
 # persistence backends (below) add a few more — still all pure Rust except `ring`
@@ -93,7 +148,7 @@ bytemuck = "1"
 # `Nidus` in `Arc<Mutex<…>>` + `spawn_blocking` — the exact async pattern the
 # README/CLAUDE.md prescribe for async callers.
 clap = { version = "4", features = ["derive", "env"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"], optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "signal", "time"], optional = true }
 axum = { version = "0.8", optional = true }
 tower = { version = "0.5", optional = true }
 serde_json = { version = "1", optional = true }
@@ -102,6 +157,13 @@ serde_json = { version = "1", optional = true }
 # zlib. cli-feature-only, so the pure-`cargo add nidus` tree is untouched.
 tar = { version = "0.4", optional = true }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
+
+# AI-ingest-only dep — compiled ONLY under the `embed`/`summarize` features,
+# never by default library consumers. `default-features = false` + `rustls-tls`
+# reuses the rustls + `ring` TLS already pulled by ureq/redis (NOT aws-lc, NOT
+# OpenSSL — no new C tree); `json` gives typed request/response bodies.
+# Embeddings/summaries are single-shot request/response, so NO `stream` feature.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

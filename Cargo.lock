@@ -3970,7 +3970,7 @@ dependencies = [
 
 [[package]]
 name = "nidus"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3982,6 +3982,7 @@ dependencies = [
  "http",
  "memmap2",
  "redis",
+ "reqwest",
  "rusty-s3",
  "serde",
  "serde_json",

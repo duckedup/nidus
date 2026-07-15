@@ -84,6 +84,44 @@ serve DIR DIM *ARGS:
 # Pre-PR checks for the cli feature: format clean, no clippy warnings, tests green
 ci-cli: fmt-check lint-cli test-cli
 
+# ── AI ingest layer (the opt-in embed/summarize/memory features) ────────────
+# The off-by-default async network edge (reqwest → hyper → rustls/ring; NO new C
+# tree, NO aws-lc/OpenSSL) that turns nidus into an all-in-one "memory". Like
+# `cli`/`serve`, it lives OFF the core build path on purpose: the DEFAULT build
+# (`just ci`) pulls NONE of reqwest/tokio/hyper, so `cargo add nidus` stays the
+# pure, seconds-fast, sync vector store. The `build-thesis` guard (CI + the
+# integration test `tests/build_thesis.rs`) asserts that invariant. Being an
+# async-edge feature set, this layer is skipped by the Miri lanes — the same as
+# the cli/server stack.
+
+# Lint the embed feature set (base infra + every provider adapter)
+lint-embed:
+    cargo clippy --all-targets --features embed-all -- -D warnings
+
+# Test the embed feature set (base infra + every provider adapter)
+test-embed:
+    cargo test --features embed-all
+
+# Pre-PR checks for the embed features: format clean, no clippy warnings, tests green
+ci-embed: fmt-check lint-embed test-embed
+
+# Lint the summarize feature set (base infra + every provider adapter)
+lint-summarize:
+    cargo clippy --all-targets --features summarize-all -- -D warnings
+
+# Test the summarize feature set (base infra + every provider adapter)
+test-summarize:
+    cargo test --features summarize-all
+
+# Pre-PR checks for the summarize features: format clean, no clippy warnings, tests green
+ci-summarize: fmt-check lint-summarize test-summarize
+
+# Pre-PR checks for the FULL ingest layer (memory + every embedder + summarizer): build, lint, test
+ci-ingest: fmt-check
+    cargo clippy --all-targets --features memory,embed-all,summarize-all -- -D warnings
+    cargo test --features memory,embed-all,summarize-all
+    cargo build --release --features memory,embed-all,summarize-all
+
 # ── Docs site (Astro + Starlight, in docs/) ─────────────────────────────────
 
 # Run the docs dev server with live reload (installs deps on first run)

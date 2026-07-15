@@ -46,6 +46,34 @@ pub mod cli;
 #[cfg(feature = "cli")]
 pub mod server;
 
+// ── AI ingest layer (epic nidus-54l) — all behind off-by-default features ────
+// The async edge: text-native `remember`/`recall` on top of the sync store
+// core, which depends on NONE of this. See Cargo.toml `[features]`.
+//
+// Shared HTTP retry helper for every reqwest-based adapter (embed + summarize).
+#[cfg(any(feature = "embed", feature = "summarize"))]
+mod http;
+// Provider capability registry (Embed | Summarize): the single source of truth
+// the embed/summarize factories consult before dispatching.
+#[cfg(any(feature = "embed", feature = "summarize"))]
+pub mod providers;
+// Embedding abstraction + provider adapters + runtime `AnyEmbedder` selection.
+#[cfg(feature = "embed")]
+pub mod embed;
+// Single-shot summarization abstraction + provider adapters.
+#[cfg(feature = "summarize")]
+pub mod summarize;
+// Text-native memory API: `remember(text)` / `recall(query_text)`. Gated on the
+// `memory` feature (= `embed`) so building a bare provider (e.g. `embed-voyage`)
+// does not require this module to exist.
+#[cfg(feature = "memory")]
+mod memory;
+#[cfg(feature = "memory")]
+pub use memory::{META_DIM, META_EMBEDDER, Memory, RecallOpts, RememberMode};
+// The summarize-mode attr keys are only defined when summaries can be produced.
+#[cfg(all(feature = "memory", feature = "summarize"))]
+pub use memory::{META_SOURCE, META_SUMMARY};
+
 pub use anyhow::Result;
 pub use backend::{
     Appender, BackendLock, CasOutcome, LocalFs, LocalRam, MemoryTier, Persistence,
