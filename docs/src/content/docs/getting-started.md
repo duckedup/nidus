@@ -7,6 +7,12 @@ nidus is built for development and small-scale use. You add it as a dependency,
 open a store in a directory of your choosing, and call methods. There is nothing
 to install, no daemon to run, and no network.
 
+There are two ways in. This page takes the **vector-store** path: you bring the
+embeddings and nidus stores and searches them. If you'd rather hand nidus plain
+text and let it embed for you — remember natural language, recall the relevant
+bits — see [Remember & recall](/guides/remember-and-recall/); it's the same store
+with an embedding step wrapped around it.
+
 :::tip[Just want local search, no Rust?]
 If you'd rather not write Rust, install the `nidus` command-line tool — no
 toolchain required — and stand up a working local store in four commands. See
