@@ -117,20 +117,33 @@ function hasCurrent(entry) {
 </nav>
 
 <script>
-  // Scroll-spy for the in-sidebar page TOC: highlight the section currently in
-  // view. Re-runs on every view-transition navigation via `astro:page-load`.
+  // Scroll-spy for the in-sidebar page TOC. Highlights the section you're
+  // reading as you scroll, but a click on a TOC entry always wins: the clicked
+  // entry is pinned active until you actually scroll again (wheel/touch/keys).
+  // That's the only way to disambiguate — a short trailing section can't scroll
+  // its heading to the top, so several links resolve to the same bottom scroll
+  // position and position alone can't tell which one you clicked.
+  // Re-runs on every view-transition navigation via `astro:page-load`.
+  let teardownTocSpy: (() => void) | null = null;
+
   function initTocSpy() {
+    teardownTocSpy?.(); // drop the previous page's listeners
+    teardownTocSpy = null;
+
     const links = Array.from(
       document.querySelectorAll(".nd-toc__link"),
     ) as HTMLAnchorElement[];
     if (!links.length) return;
 
-    const byTarget = new Map<Element, HTMLAnchorElement>();
+    // Heading targets in document order (tops increase down the page).
+    const entries: { link: HTMLAnchorElement; target: HTMLElement }[] = [];
     for (const link of links) {
       const id = decodeURIComponent(new URL(link.href).hash.slice(1));
-      const target = id && document.getElementById(id);
-      if (target) byTarget.set(target, link);
+      const target = id ? document.getElementById(id) : null;
+      if (target) entries.push({ link, target });
     }
+    if (!entries.length) return;
+    const last = entries[entries.length - 1].link;
 
     let active: HTMLAnchorElement | null = null;
     const setActive = (link: HTMLAnchorElement | undefined) => {
@@ -140,16 +153,73 @@ function hasCurrent(entry) {
       active = link;
     };
 
-    const io = new IntersectionObserver(
-      (entries) => {
-        const visible = entries
-          .filter((e) => e.isIntersecting)
-          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
-        if (visible[0]) setActive(byTarget.get(visible[0].target));
-      },
-      { rootMargin: "0px 0px -72% 0px", threshold: 0 },
-    );
-    byTarget.forEach((_link, target) => io.observe(target));
+    const atBottom = () =>
+      window.innerHeight + window.scrollY >=
+      document.documentElement.scrollHeight - 2;
+
+    // The section you're reading is the last heading scrolled up past the top
+    // band (~top 28% of the viewport). At the very bottom the final heading may
+    // sit below that band with nothing left to scroll, so pin the last entry.
+    const fromScroll = () => {
+      if (atBottom()) return setActive(last);
+      const line = window.innerHeight * 0.28;
+      let current = entries[0].link;
+      for (const { link, target } of entries) {
+        if (target.getBoundingClientRect().top > line) break;
+        current = link;
+      }
+      setActive(current);
+    };
+
+    // A click expresses intent directly — pin it and stop tracking scroll until
+    // the user scrolls of their own accord.
+    let pinned = false;
+    let raf = 0;
+    const nav = document.querySelector(".nd-nav");
+    const onClick = (e: Event) => {
+      const a = (e.target as Element | null)?.closest(".nd-toc__link");
+      if (!a) return;
+      pinned = true;
+      setActive(a as HTMLAnchorElement);
+    };
+    const onScroll = () => {
+      if (pinned || raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        fromScroll();
+      });
+    };
+    const release = () => {
+      if (!pinned) return;
+      pinned = false;
+      fromScroll();
+    };
+
+    nav?.addEventListener("click", onClick);
+    window.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("wheel", release, { passive: true });
+    window.addEventListener("touchmove", release, { passive: true });
+    window.addEventListener("keydown", release);
+
+    teardownTocSpy = () => {
+      if (raf) cancelAnimationFrame(raf);
+      nav?.removeEventListener("click", onClick);
+      window.removeEventListener("scroll", onScroll);
+      window.removeEventListener("wheel", release);
+      window.removeEventListener("touchmove", release);
+      window.removeEventListener("keydown", release);
+    };
+
+    // Land on a deep-linked heading as pinned; otherwise track scroll position.
+    const hashed = location.hash
+      ? entries.find((e) => e.link.hash === location.hash)
+      : null;
+    if (hashed) {
+      pinned = true;
+      setActive(hashed.link);
+    } else {
+      fromScroll();
+    }
   }
 
   document.addEventListener("astro:page-load", initTocSpy);
