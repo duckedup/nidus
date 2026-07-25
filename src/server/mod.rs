@@ -64,6 +64,11 @@ pub struct ServeConfig {
     /// large upsert legitimately runs for minutes while a search is milliseconds. `None`
     /// disables it.
     pub write_timeout: Option<std::time::Duration>,
+    /// How long a request body may go without delivering a frame before it is abandoned
+    /// (nidus-6c2). An **idle** bound, not a total one: a body that keeps arriving is never
+    /// cut off however large it is. `None` disables it, which also removes the only thing
+    /// stopping a silent client from pinning a concurrency permit.
+    pub body_idle_timeout: Option<std::time::Duration>,
     /// Fail readiness once a read-only instance is staler than this (mirrors
     /// [`Config::max_staleness`](crate::Config::max_staleness)). `None` = no bound.
     pub max_staleness: Option<std::time::Duration>,
@@ -161,6 +166,7 @@ where
             concurrency,
             cfg.read_timeout,
             cfg.write_timeout,
+            cfg.body_idle_timeout,
         )),
         #[cfg(feature = "memory")]
         embedder: cfg.embedder,
@@ -1188,7 +1194,7 @@ fn test_state(db: Option<Nidus>) -> AppState {
         token: None,
         // Generous by default so an ordinary test never trips admission control; the
         // backpressure tests build their own tight `Limits`.
-        limits: Arc::new(limits::Limits::new(1024, None, None)),
+        limits: Arc::new(limits::Limits::new(1024, None, None, None)),
         #[cfg(feature = "memory")]
         embedder: None,
         #[cfg(all(feature = "memory", feature = "summarize"))]
@@ -1599,7 +1605,7 @@ mod tests {
     fn saturated_router() -> Router {
         let db = Nidus::open_in_memory(3).unwrap();
         let state = AppState {
-            limits: Arc::new(limits::Limits::new(0, None, None)),
+            limits: Arc::new(limits::Limits::new(0, None, None, None)),
             ..test_state(Some(db))
         };
         router(state, 16 * 1024 * 1024)
@@ -1662,6 +1668,7 @@ mod tests {
             limits: Arc::new(limits::Limits::new(
                 8,
                 Some(std::time::Duration::from_millis(50)),
+                None,
                 None,
             )),
             ..test_state(Some(db))

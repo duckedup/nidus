@@ -85,6 +85,12 @@ nidus:
   # scan already running finishes anyway.
   readTimeout: ""    # default 30
   writeTimeout: ""   # default 600
+  # Abandon a request body that stops delivering data for this many seconds ("" =
+  # server default of 15; "0" = no bound). An IDLE bound, so a large upsert over a
+  # slow link is never cut off. It exists because a request holds a concurrency
+  # permit while its body arrives: without it a client that sends headers and then
+  # goes silent pins one. Real slow-client defence belongs on the ingress.
+  bodyIdleTimeout: ""
   # Log level: error | warn | info (default) | debug | trace | off. Logs are one
   # key=value line per event on stderr, with a per-request id. `error` silences the
   # per-request access log; `debug` turns on writer-lease tracing.

@@ -531,6 +531,21 @@ enum Command {
             env = "NIDUS_WRITE_TIMEOUT"
         )]
         write_timeout: u64,
+        /// Abandon a request body that goes this many seconds without delivering data.
+        /// Default 15. `0` disables it.
+        ///
+        /// An **idle** bound, not a total one — the clock resets on every chunk, so a large
+        /// upload over a slow link is never cut off however long it takes. It exists because
+        /// a request holds a concurrency permit while its body arrives: without it, a client
+        /// that sends headers and then goes silent pins a permit (nidus-6c2). Setting it to
+        /// `0` removes that protection; real slow-client defence belongs at the proxy.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            default_value_t = 15,
+            env = "NIDUS_BODY_IDLE_TIMEOUT"
+        )]
+        body_idle_timeout: u64,
         /// Refresh this instance every N seconds so a `--read-only` reader stays current
         /// without a sidecar or cron calling `POST /refresh`. Omit to leave refreshing
         /// entirely to the caller (the default).
@@ -748,6 +763,7 @@ pub fn run(cli: Cli) -> Result<()> {
             max_concurrent_requests,
             read_timeout,
             write_timeout,
+            body_idle_timeout,
             refresh_interval,
             require_remote,
             #[cfg(feature = "memory")]
@@ -760,6 +776,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 max_concurrent_requests,
                 read_timeout,
                 write_timeout,
+                body_idle_timeout,
                 refresh_interval,
                 require_remote,
             },
@@ -999,6 +1016,7 @@ struct ServeArgs {
     max_concurrent_requests: usize,
     read_timeout: u64,
     write_timeout: u64,
+    body_idle_timeout: u64,
     refresh_interval: Option<u64>,
     require_remote: bool,
 }
@@ -1023,6 +1041,7 @@ fn serve(
         max_concurrent_requests,
         read_timeout,
         write_timeout,
+        body_idle_timeout,
         refresh_interval,
         require_remote,
     } = args;
@@ -1072,6 +1091,7 @@ fn serve(
         max_concurrent_requests,
         read_timeout: timeout_secs(read_timeout),
         write_timeout: timeout_secs(write_timeout),
+        body_idle_timeout: timeout_secs(body_idle_timeout),
         max_staleness: open_config.max_staleness,
         // A third of the lease TTL: frequent enough that a long batch cannot let the lease
         // lapse, infrequent enough to be a rounding error in object-store cost.
@@ -1563,6 +1583,7 @@ mod tests {
             max_concurrent_requests: 0,
             read_timeout: 30,
             write_timeout: 600,
+            body_idle_timeout: 15,
             refresh_interval: None,
             require_remote: true,
         }

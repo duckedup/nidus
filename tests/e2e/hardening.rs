@@ -7,6 +7,8 @@
 //! process that reads it, and `/metrics` served over a real socket.
 
 use serde_json::{Value, json};
+use std::io::Write as _;
+use std::net::TcpStream;
 use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
 use std::time::{Duration, Instant};
 
@@ -185,6 +187,86 @@ fn concurrent_load_beyond_the_limit_is_shed_not_queued() {
         counted >= shed as f64,
         "server counted {counted} shed, clients saw {shed}"
     );
+}
+
+/// **A client that withholds its request body must not pin a concurrency permit**
+/// (nidus-6c2).
+///
+/// The permit is taken before the handler runs and the handler is what awaits the body, so
+/// a client that sends complete headers with a `Content-Length` and then goes silent used
+/// to hold a permit for the whole request deadline — or forever with `--read-timeout 0`.
+/// Against `--max-concurrent-requests 1` that is a one-connection denial of service.
+///
+/// Driven over a raw socket rather than through an HTTP client, because no HTTP client will
+/// send headers promising a body and then refuse to send it — that is precisely the
+/// misbehaviour under test.
+///
+/// `--read-timeout 0` is set deliberately: it removes the bound that used to be the only
+/// thing containing this, so the test fails unless `--body-idle-timeout` is doing the work
+/// on its own. Without the fix the final assertion never passes, however long it waits.
+#[test]
+fn a_withheld_request_body_does_not_pin_a_permit() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), DIM)
+        .args([
+            "--max-concurrent-requests",
+            "1",
+            "--read-timeout",
+            "0",
+            "--body-idle-timeout",
+            "1",
+        ])
+        .start();
+
+    let addr = server.base_url().trim_start_matches("http://").to_string();
+    let mut silent = TcpStream::connect(&addr).expect("connect");
+    write!(
+        silent,
+        "POST /search HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Content-Length: 4096\r\n\r\n"
+    )
+    .expect("send headers");
+    silent.flush().expect("flush headers");
+
+    // The permit is now pinned: a normal request is shed while the silent one holds it.
+    // Poll rather than sleep-then-assert — the point is only that the pin exists at all,
+    // and on a loaded runner the headers may take a moment to be read.
+    let query = json!({ "query": vec![1.0f32; DIM], "top_k": 5 });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut pinned = false;
+    while Instant::now() < deadline {
+        if server.post("/search", &query).0 == 503 {
+            pinned = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        pinned,
+        "expected the silent client to hold the single permit\n--- server stderr ---\n{}",
+        server.stderr()
+    );
+
+    // …and it must be released once the body idles out, WITHOUT the silent client ever
+    // sending anything or the connection being closed. That release is the fix.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut recovered = None;
+    while Instant::now() < deadline {
+        let (status, _) = server.post("/search", &query);
+        if status == 200 {
+            recovered = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        recovered,
+        Some(200),
+        "the permit was never released — a silent client can deny service indefinitely\n\
+         --- server stderr ---\n{}",
+        server.stderr()
+    );
+    drop(silent);
 }
 
 /// Both timeout flags and the concurrency flag reach `ServeConfig` — the wiring the

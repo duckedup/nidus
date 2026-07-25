@@ -173,6 +173,7 @@ and how *long*.
 | `--max-concurrent-requests <n>` | `0` (auto) | Cap on store-touching requests in flight. Past it, requests are **shed** with `503`. Auto is 8× CPU cores, floored at 64. |
 | `--read-timeout <seconds>` | `30` | Deadline for a read (search, list, stats). `0` disables. |
 | `--write-timeout <seconds>` | `600` | Deadline for a mutation (upsert, delete, compact). `0` disables. |
+| `--body-idle-timeout <seconds>` | `15` | Abandon a request body that stops delivering data. `0` disables. |
 
 **A shed request is a retryable `503`.** It carries `Retry-After: 1` and a body of
 `{"error": …, "retryable": true}`. Nothing was attempted and the store is untouched,
@@ -204,6 +205,26 @@ The probe endpoints (`/health`, `/ready`, `/metrics`) are **never** shed and nev
 time out. They take no store lock, so they cost nothing to admit — and shedding a
 liveness probe under load would get a busy-but-healthy instance restarted, which is
 the opposite of what you want when the server is saturated.
+
+### Slow clients
+
+A request holds its concurrency permit while its body arrives, because that is what
+bounds how many bodies can be buffered at once against a store whose working set is
+in RAM. The consequence is that a client which sends headers and then goes quiet
+would occupy a permit for nothing.
+
+`--body-idle-timeout` closes that: a body that stops delivering data for that long
+is abandoned and the permit released. It is an **idle** bound, not a total one — the
+clock resets on every chunk, so a 256 MiB upsert over a slow link is never cut off
+however long it takes, while a silent client dies in seconds. (Same semantic as
+nginx's `client_body_timeout`.)
+
+Setting it to `0` removes the protection. Note that a stalled body surfaces as a
+`400`, not a `408` — the status is cosmetic; releasing the permit is the point.
+
+This shortens the window a slow client can occupy a permit; it does not eliminate
+it, and no setting here can. Genuine slow-client defence belongs at the same proxy
+that terminates TLS and rate-limits — see [Securing a deployment](#securing-a-deployment).
 
 ## Concurrency & durability
 
@@ -289,6 +310,7 @@ a container or an orchestrator. An explicit flag always wins over the variable.
 | `NIDUS_MAX_CONCURRENT_REQUESTS` | `--max-concurrent-requests` | In-flight cap; past it, `503` (`0` = auto) |
 | `NIDUS_READ_TIMEOUT` | `--read-timeout` | Read deadline in seconds (`0` = none) |
 | `NIDUS_WRITE_TIMEOUT` | `--write-timeout` | Write deadline in seconds (`0` = none) |
+| `NIDUS_BODY_IDLE_TIMEOUT` | `--body-idle-timeout` | Abandon a stalled request body after N seconds (`0` = none) |
 | `NIDUS_LOG` | — | Log level: `error` \| `warn` \| `info` \| `debug` \| `trace` \| `off` |
 | `NIDUS_READ_ONLY` | `--read-only` | Serve without the writer lock |
 | `NIDUS_ANN`, `NIDUS_ANN_*` | `--ann`, `--ann-*` | Approximate-index selection and tuning |

@@ -104,6 +104,10 @@ spec:
             - name: NIDUS_WRITE_TIMEOUT
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.nidus.bodyIdleTimeout }}
+            - name: NIDUS_BODY_IDLE_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.nidus.logLevel }}
             - name: NIDUS_LOG
               value: {{ . | quote }}

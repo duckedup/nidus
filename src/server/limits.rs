@@ -51,10 +51,13 @@
 //! **No per-IP rate limiting.** That belongs at the proxy that already terminates TLS in
 //! front of nidus (see the deployment guide); duplicating it here would be the wrong layer.
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::{
     Json,
+    body::{Body, Bytes},
     extract::{Request, State},
     http::{Method, StatusCode, header::RETRY_AFTER},
     middleware::Next,
@@ -80,6 +83,9 @@ pub(super) struct Limits {
     /// magnitude: a search is milliseconds, a large upsert legitimately takes minutes, and
     /// one bound tight enough for the first would abort the second mid-batch.
     write_timeout: Option<Duration>,
+    /// How long a request body may go without delivering a frame before it is abandoned
+    /// (nidus-6c2). See [`IdleTimeoutBody`].
+    body_idle_timeout: Option<Duration>,
 }
 
 impl Limits {
@@ -87,12 +93,14 @@ impl Limits {
         limit: usize,
         read_timeout: Option<Duration>,
         write_timeout: Option<Duration>,
+        body_idle_timeout: Option<Duration>,
     ) -> Limits {
         Limits {
             permits: Semaphore::new(limit),
             limit,
             read_timeout,
             write_timeout,
+            body_idle_timeout,
         }
     }
 
@@ -127,11 +135,24 @@ pub(super) fn resolve_concurrency(configured: usize) -> usize {
 /// Probes are exempt from both: they take no store lock (nidus-abx.1/.3 made sure of that),
 /// so they cost nothing to admit, and they are the one thing that must still answer when
 /// everything else is shedding.
-pub(super) async fn backpressure(State(st): State<AppState>, req: Request, next: Next) -> Response {
+pub(super) async fn backpressure(
+    State(st): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     if is_public(req.uri().path()) {
         return next.run(req).await;
     }
     let limits = &st.limits;
+
+    // Bound the body BEFORE anything waits on it (nidus-6c2). The permit below is taken
+    // ahead of the handler, and the handler is what awaits the body — so without this, a
+    // client that sends headers and then goes silent holds a permit for the whole request
+    // deadline, or forever if that deadline is disabled.
+    if let Some(idle) = limits.body_idle_timeout {
+        let (parts, body) = req.into_parts();
+        req = Request::from_parts(parts, Body::new(IdleTimeoutBody::new(body, idle)));
+    }
 
     let Ok(_permit) = limits.permits.try_acquire() else {
         super::metrics::http().shed.inc();
@@ -209,6 +230,96 @@ fn timed_out(after: Duration) -> Response {
         .into_response()
 }
 
+/// A request body that gives up if it goes quiet (nidus-6c2).
+///
+/// ## The hole this closes
+///
+/// A permit is acquired before the handler runs, and the handler is what awaits the body.
+/// So a client that sends complete headers with a `Content-Length` and then sends nothing
+/// pins a permit — reproduced with a raw socket: against `--max-concurrent-requests 1` and
+/// `--read-timeout 0`, one silent connection sheds every other request indefinitely. It is
+/// a slow-loris, aimed at admission control rather than at memory, and it is partly
+/// self-inflicted: before the concurrency cap existed there were no permits to exhaust.
+///
+/// ## Why *idle*, not total
+///
+/// The obvious fix — one deadline on the whole body — is wrong here. A legitimate upsert
+/// can be a 256 MiB payload over a slow link, so any total bound tight enough to be useful
+/// against a silent client would abort real uploads. What actually distinguishes an attack
+/// from a slow upload is **progress**: this resets its clock on every frame, so a body that
+/// keeps arriving is never cut off however long it takes, and one that stalls dies quickly.
+/// (Same semantic as nginx's `client_body_timeout`, and for the same reason.)
+///
+/// ## What it does not do
+///
+/// The permit is still held while the body arrives, which is deliberate — that is what
+/// bounds concurrent body buffering against a store whose working set is in RAM. So this
+/// shortens the window an attacker can pin a permit for; it does not remove it. Genuine
+/// slow-client defence belongs at the proxy, alongside the rate limiting and TLS the
+/// deployment guide already puts there.
+///
+/// A stalled body surfaces as a body-read error, which axum's extractors report as `400`
+/// rather than `408`. The status is cosmetic; releasing the permit is the point.
+struct IdleTimeoutBody {
+    inner: Body,
+    idle: Duration,
+    /// Armed on the first `Pending`, dropped whenever a frame lands — so the timer measures
+    /// the gap since the last byte, not the age of the request.
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl IdleTimeoutBody {
+    fn new(inner: Body, idle: Duration) -> IdleTimeoutBody {
+        IdleTimeoutBody {
+            inner,
+            idle,
+            sleep: None,
+        }
+    }
+}
+
+impl http_body::Body for IdleTimeoutBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, axum::Error>>> {
+        // Every field is `Unpin` (`axum::body::Body` is, and `Sleep` is behind a `Box`), so
+        // the pin can be projected away rather than carried through by hand.
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(frame) => {
+                // Progress: disarm, so the next gap is timed from here.
+                this.sleep = None;
+                Poll::Ready(frame)
+            }
+            Poll::Pending => {
+                let idle = this.idle;
+                let sleep = this
+                    .sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
+                match sleep.as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Some(Err(axum::Error::new(format!(
+                        "request body stalled: no data for {}s",
+                        idle.as_secs()
+                    ))))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// Whether a request mutates the store, and so gets the longer deadline.
 ///
 /// Method alone is not enough: the search routes are `POST` because a query vector does not
@@ -265,7 +376,7 @@ mod tests {
 
     #[test]
     fn in_flight_tracks_outstanding_permits() {
-        let l = Limits::new(2, None, None);
+        let l = Limits::new(2, None, None, None);
         assert_eq!(l.in_flight(), 0);
         let a = l.permits.try_acquire().unwrap();
         assert_eq!(l.in_flight(), 1);

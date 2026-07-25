@@ -3980,6 +3980,7 @@ dependencies = [
  "crc32fast",
  "flate2",
  "http",
+ "http-body",
  "memmap2",
  "redis",
  "reqwest",
