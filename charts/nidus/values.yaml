@@ -39,6 +39,24 @@ nidus:
     name: ""
     key: NIDUS_MEMORY
 
+  # Run as cooperating instances over the SAME shared store (SPEC §14.6). Required for
+  # standby promotion; needs both `persistence` (object store) and `memory` (Redis-family)
+  # to be shared, and is refused otherwise. Not a managed cluster — no coordinator,
+  # replication, or rebalancing: exactly one instance holds a fenced writer lease, and the
+  # object store's conditional writes are what make that safe.
+  cluster: false
+
+  # Stay up and wait for the writer handle instead of exiting when another instance holds
+  # it — this is what makes a replica a HOT STANDBY rather than a crash-looping pod. A
+  # standby reports NOT ready (so the Service skips it) until it is promoted, which happens
+  # within about `lockTtl` of the active writer dying. Pair with replicaCount > 1.
+  waitForLease: false
+
+  # Seconds before another instance may reclaim a stale writer lease (default 60 in nidus).
+  # This is also the standby promotion window, so it is the main failover-latency knob:
+  # lower means faster takeover, but too low risks fencing a writer that is merely slow.
+  lockTtl: 0
+
   # Distance metric: "" (cosine, the default) | cosine | euclidean | dot.
   # Only honored when the store is first created.
   distance: ""
@@ -108,13 +126,29 @@ extraEnv: []
 extraEnvFrom: []
 
 # ── Workload ────────────────────────────────────────────────────────────────────
-# `nidus serve` is a SINGLE writer: it holds an exclusive lock on the shared backend.
-# Keep replicaCount at 1. With >1, the extra pods lose the lock race and crash-loop.
-# Real multi-instance HA (cluster mode) is not yet exposed by the server.
+# `nidus serve` is a SINGLE writer: exactly one instance holds the writer handle on the
+# shared backend at a time. What the extra replicas do depends on how you configure them:
+#
+#   * DEFAULT (replicaCount: 1) — one writer, no standby. Simplest, and correct.
+#   * HOT STANDBY — set replicaCount > 1 AND nidus.waitForLease: true. The losers stay up
+#     waiting for the writer handle instead of exiting, and one is promoted within about
+#     nidus.lockTtl of the writer dying. They report NOT ready while waiting, so the
+#     Service routes only to the active writer.
+#   * replicaCount > 1 WITHOUT waitForLease — don't. The extra pods lose the lock race and
+#     crash-loop, which is an alert, not a design.
+#
+# Standby promotion needs cluster mode (nidus.cluster: true), which in turn needs a shared
+# object store AND a shared memory tier — a local-disk store is single-node by definition.
 replicaCount: 1
 
 # Recreate (not RollingUpdate): the old writer must terminate — releasing its lock on
 # SIGTERM — before the replacement starts, or the new pod hits a held-lock error.
+#
+# With `waitForLease: true` a RollingUpdate becomes viable, since the incoming pod waits
+# for the handle rather than failing: the old writer releases on SIGTERM and the new one is
+# promoted. Recreate stays the default because it is correct in every configuration, and
+# because a rolling update trades a brief write outage for one that is briefer but harder
+# to reason about. Change it deliberately, not by default.
 updateStrategy:
   type: Recreate
 
@@ -151,9 +185,13 @@ livenessProbe:
   periodSeconds: 10
   timeoutSeconds: 2
   failureThreshold: 3
+# Readiness is /ready, NOT /health: the two differ for a standby. /health means "the
+# process is alive" and answers even while an instance waits for the writer handle —
+# probing it for readiness would put a standby into the Service and have it answer 503 to
+# real traffic. /ready means "this instance has a store open and can serve".
 readinessProbe:
   httpGet:
-    path: /health
+    path: /ready
     port: http
   initialDelaySeconds: 3
   periodSeconds: 5

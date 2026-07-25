@@ -227,10 +227,48 @@ process-local working set cannot be shared:
 nidus serve --dir ./meta --dim 768 --cluster \
   --persistence s3://my-bucket/store --memory redis://cache:6379
 
-# Readers: no lease, and they pick up each of the writer's commits
+# Readers: no lease, so run as many as you like
 nidus serve --dir ./meta --dim 768 --cluster --read-only \
   --persistence s3://my-bucket/store --memory redis://cache:6379
 ```
+
+A reader loads the store's committed state when it starts and keeps serving that snapshot;
+`POST /refresh` advances it to whatever the writer has committed since, and answers
+`{"adopted": true}` when there was something new. Reads deliberately do not refresh on
+their own — that would add a metadata fetch to every query, which is the opposite of what
+a read-heavy fan-out wants — so poll it as often as your staleness tolerance requires.
+
+### Failover
+
+Only one instance may hold the writer handle. By default a second writer exits at once with
+a "locked" error, which is right for a one-off command but means a would-be standby just
+dies. `--wait-for-lease` changes that: the instance stays up, waits, and is **promoted
+automatically** within roughly `--lock-ttl` of the active writer dying.
+
+```bash
+# A standby: same store, same flags, but it waits for the handle instead of exiting
+nidus serve --dir ./meta --dim 768 --cluster --wait-for-lease \
+  --persistence s3://my-bucket/store --memory redis://cache:6379 --lock-ttl 15
+```
+
+While waiting, a standby reports `200` on `/health` (it is alive — waiting is its job) and
+`503` on `/ready` (it has no store, so it should get no traffic). Point your liveness probe
+at `/health` and your readiness probe at `/ready` and an orchestrator does the right thing
+on its own: keep the standby running, route around it, and route to it once promoted.
+
+Pass a number of seconds (`--wait-for-lease 300`) to give up after that long instead of
+waiting indefinitely — useful in a script that should not hang.
+
+`--lock-ttl` is the failover-latency knob: it bounds how long a dead writer's handle stays
+un-reclaimable, and so how long promotion takes. Lower is faster, but too low risks fencing
+a writer that is merely slow — a very large batch can outlast a short TTL.
+
+There is no election and no coordinator, and none is needed: the object store's conditional
+writes (`If-Match` on S3, `ifGenerationMatch` on GCS) are a linearizable compare-and-swap,
+so exactly one claimant can win the handle even when several try at the same instant. That
+is the same primitive a consensus protocol would give you, already durable and already
+shared — which is why a writer that stalls and wakes up superseded is *refused* rather than
+allowed to clobber its successor's commits.
 
 This is deliberately **not** a managed cluster: there is no coordinator, no replication, and
 no rebalancing. Writes are fenced (a superseded writer is refused rather than allowed to

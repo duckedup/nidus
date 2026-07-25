@@ -24,7 +24,7 @@ fn records(n: usize, dim: usize) -> Vec<Record> {
     (0..n)
         .map(|i| Record {
             id: i.to_string(),
-            vector: ds.vectors[i * dim..(i + 1) * dim].to_vec(),
+            vector: Some(ds.vectors[i * dim..(i + 1) * dim].to_vec()),
             attrs: BTreeMap::new(),
         })
         .collect()
@@ -134,7 +134,7 @@ fn bench_ingest(c: &mut Criterion) {
     let records: Vec<Record> = (0..n)
         .map(|i| Record {
             id: i.to_string(),
-            vector: ds.vectors[i * dim..(i + 1) * dim].to_vec(),
+            vector: Some(ds.vectors[i * dim..(i + 1) * dim].to_vec()),
             attrs: BTreeMap::new(),
         })
         .collect();

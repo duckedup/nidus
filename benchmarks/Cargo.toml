@@ -37,6 +37,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 
+# HTTP client for the `server` engine (the `nidus serve` adapter). Gated so the
+# default bench build stays library-only. Same crate nidus itself already uses for
+# its object-store backends, so this adds nothing new to the tree.
+ureq = { version = "3", optional = true }
+
 # Bundled DuckDB (compiles the C++ engine from source — self-contained, no system
 # libduckdb needed). `appender-arrow` enables Appender::append_record_batch, the only
 # way to bulk-load fixed-size FLOAT[] array columns from Rust (the row appender can't).
@@ -67,6 +72,10 @@ harness = false
 
 [features]
 default = []
+# `nidus serve` over HTTP — the same nidus as the `nidus` engine, but reached
+# through the server, so the parity table can show what the HTTP path costs.
+# Needs a built `nidus` binary (see `just bench-server`).
+server = ["dep:ureq"]
 duckdb = ["dep:duckdb"]   # bundled DuckDB C++ (self-contained)
 lancedb = [
     "dep:lancedb",

@@ -104,6 +104,39 @@ jobs:
 
       - run: ${{ matrix.command }}
 
+  # Bit-rot guard for the benchmark crate. `default-members = ["."]` means neither
+  # `cargo test` nor any lane above ever compiles `nidus-bench` — which is right (it
+  # keeps the core build seconds-long) but left it silently broken for some time: a
+  # `Record.vector` -> `Option<Vec<f32>>` change made every bench target fail to
+  # compile, so `just bench` was dead and no performance claim was verifiable.
+  # Compiling it here costs one cheap job and makes that impossible to repeat.
+  #
+  # Build only, never run: benchmark *timings* on a shared runner are meaningless
+  # (see tests/e2e/scale.rs for the same reasoning). `duckdb`/`lancedb` stay out —
+  # bundled C++ and Arrow+DataFusion are exactly the multi-minute compiles nidus
+  # avoids, and they are opt-in for a human comparing engines, not for CI.
+  bench-compiles:
+    name: bench-compiles (bit-rot guard)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+      # --features server covers the `nidus serve` engine adapter, which needs the
+      # binary at runtime but must still compile here.
+      - run: cargo clippy -p nidus-bench --all-targets --features server -- -D warnings
+
   # Build-thesis guard (epic nidus-54l): the off-by-default AI ingest layer must
   # not regress nidus's identity. This job asserts EMPIRICALLY, via the resolved
   # dependency graph, that:

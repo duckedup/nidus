@@ -79,7 +79,7 @@ pub use backend::{
     Appender, BackendLock, CasOutcome, LocalFs, LocalRam, MemoryTier, Persistence,
     open_memory_tier, open_persistence,
 };
-pub use config::{Config, Fsync, OpenMode};
+pub use config::{Config, Fsync, LeaseWait, OpenMode};
 pub use fts::Language;
 pub use model::{
     AnnConfig, AnnKind, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts, Predicate,

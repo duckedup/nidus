@@ -32,6 +32,8 @@ send `Authorization: Bearer <token>` — see [Authentication](/guides/http-serve
 | `POST /list` | metadata-only query (no vector) | `list` |
 | `POST /flush` | flush buffered writes to disk | `flush` |
 | `POST /compact` | reclaim dead rows and superseded log records | `compact` |
+| `POST /refresh` | adopt another instance's newer committed state | `refresh` |
+| `GET /ready` | whether this instance has a store open and can serve | — |
 
 ## Health & introspection
 
@@ -39,6 +41,25 @@ send `Authorization: Bearer <token>` — see [Authentication](/guides/http-serve
 
 Liveness probe. Returns `200` with the body `ok`. Always reachable without a
 token, so a load balancer or `docker healthcheck` needs no credential.
+
+Says nothing about the store — only that the process is up and answering. An instance
+waiting for the writer handle (see `/ready`) is alive, and killing it would be exactly
+wrong, so this keeps returning `200` throughout.
+
+### `GET /ready`
+
+Readiness probe. `200` with the body `ready` once the store is open; `503` before that.
+Also always reachable without a token — an orchestrator would read a `401` as "not ready"
+and never route to a healthy instance.
+
+Use this, not `/health`, to decide whether to send an instance traffic. The two differ
+whenever an instance is *waiting*: the server binds its port before opening the store, so
+`/health` answers immediately while `/ready` stays `503` until there is something to serve.
+That gap is the whole point for a standby writer, which may wait indefinitely for the
+active writer to release the handle.
+
+Data routes answer `503` during that window too, with an error explaining that the
+instance is waiting or still starting up.
 
 ### `GET /stats`
 
@@ -275,6 +296,22 @@ Rewrite the store to reclaim `dead_rows` and superseded log records. Returns
 ```bash
 curl -s -X POST localhost:7700/compact   # → {"ok": true}
 ```
+
+### `POST /refresh`
+
+Adopt newer state committed by another instance writing to the same shared store. A
+read-only instance loads a snapshot when it starts and keeps serving that snapshot, so
+this is how you advance it. `adopted` says whether there was anything new to take up,
+which lets a poller distinguish "no change" from "moved forward".
+
+```bash
+curl -s -X POST localhost:7700/refresh   # → {"adopted": true}
+```
+
+Reads are deliberately not made to refresh on their own: that would put a metadata fetch
+on every query, which is the opposite of what a read-heavy fan-out wants. Call this as
+often as your staleness tolerance requires. It is harmless anywhere else — an instance
+that does its own writing already has the freshest state, and answers `{"adopted": false}`.
 
 ## Errors
 
