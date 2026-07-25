@@ -4,6 +4,7 @@
 
 use anyhow::{Result, anyhow};
 
+use crate::cancel::{CHECK_EVERY, check};
 use crate::data::Segments;
 use crate::search::{TopK, dot_i8, euclidean_neg_sq_i8, hamming};
 
@@ -25,18 +26,25 @@ pub(super) fn score_chunk<'a>(
     score_fn: fn(&[f32], &[f32]) -> f32,
     top_k: usize,
     min_score: Option<f32>,
-) -> TopK<(&'a str, &'a str)> {
+) -> Result<TopK<(&'a str, &'a str)>> {
     let mut topk: TopK<(&'a str, &'a str)> = TopK::new(top_k);
-    for &(row, col_name, id) in chunk {
-        let score = score_fn(q, data.row(row));
-        if let Some(min) = min_score
-            && score < min
-        {
-            continue;
+    // Cooperative cancellation: the only thing that can stop this loop is this loop. The
+    // check is hoisted out of the per-row body by walking blocks — one atomic load per
+    // CHECK_EVERY rows and *nothing* per row, which matters because at small dimensions
+    // even a mask-and-branch is a measurable share of the scoring work.
+    for block in chunk.chunks(CHECK_EVERY) {
+        check()?;
+        for &(row, col_name, id) in block {
+            let score = score_fn(q, data.row(row));
+            if let Some(min) = min_score
+                && score < min
+            {
+                continue;
+            }
+            topk.offer(score, (col_name, id));
         }
-        topk.offer(score, (col_name, id));
     }
-    topk
+    Ok(topk)
 }
 
 /// Score a chunk against the **int8** matrix into a bounded top-k of `overscan`
@@ -53,23 +61,26 @@ pub(super) fn score_chunk_i8<'a>(
     q_i8: &[i8],
     is_euclidean: bool,
     overscan: usize,
-) -> TopK<(u64, &'a str, &'a str)> {
+) -> Result<TopK<(u64, &'a str, &'a str)>> {
     let mut topk: TopK<(u64, &'a str, &'a str)> = TopK::new(overscan);
-    for &(row, col_name, id) in chunk {
-        let base = row as usize * dim;
-        let end = base + dim;
-        if end > quant_vectors.len() {
-            continue;
+    for block in chunk.chunks(CHECK_EVERY) {
+        check()?;
+        for &(row, col_name, id) in block {
+            let base = row as usize * dim;
+            let end = base + dim;
+            if end > quant_vectors.len() {
+                continue;
+            }
+            let stored_i8 = &quant_vectors[base..end];
+            let approx_score = if is_euclidean {
+                euclidean_neg_sq_i8(q_i8, stored_i8) as f32
+            } else {
+                dot_i8(q_i8, stored_i8) as f32
+            };
+            topk.offer(approx_score, (row, col_name, id));
         }
-        let stored_i8 = &quant_vectors[base..end];
-        let approx_score = if is_euclidean {
-            euclidean_neg_sq_i8(q_i8, stored_i8) as f32
-        } else {
-            dot_i8(q_i8, stored_i8) as f32
-        };
-        topk.offer(approx_score, (row, col_name, id));
     }
-    topk
+    Ok(topk)
 }
 
 /// Score a chunk against the **binary** (sign-bit) matrix into a bounded top-k of
@@ -84,18 +95,21 @@ pub(super) fn score_chunk_bin<'a>(
     chunk: &[(u64, &'a str, &'a str)],
     q_words: &[u64],
     overscan: usize,
-) -> TopK<(u64, &'a str, &'a str)> {
+) -> Result<TopK<(u64, &'a str, &'a str)>> {
     let mut topk: TopK<(u64, &'a str, &'a str)> = TopK::new(overscan);
-    for &(row, col_name, id) in chunk {
-        let base = row as usize * words_per_row;
-        let end = base + words_per_row;
-        if end > words.len() {
-            continue;
+    for block in chunk.chunks(CHECK_EVERY) {
+        check()?;
+        for &(row, col_name, id) in block {
+            let base = row as usize * words_per_row;
+            let end = base + words_per_row;
+            if end > words.len() {
+                continue;
+            }
+            let approx_score = -(hamming(q_words, &words[base..end]) as f32);
+            topk.offer(approx_score, (row, col_name, id));
         }
-        let approx_score = -(hamming(q_words, &words[base..end]) as f32);
-        topk.offer(approx_score, (row, col_name, id));
     }
-    topk
+    Ok(topk)
 }
 
 /// Split `scan` across `workers` threads, score each chunk with `score_one` into its
@@ -116,17 +130,27 @@ pub(super) fn parallel_topk<'a, T, F>(
 ) -> Result<TopK<T>>
 where
     T: Send,
-    F: Fn(&[(u64, &'a str, &'a str)]) -> TopK<T> + Sync,
+    F: Fn(&[(u64, &'a str, &'a str)]) -> Result<TopK<T>> + Sync,
 {
     let chunk_len = scan.len().div_ceil(workers);
     let score_one = &score_one;
+    // Cancellation is ambient per-thread (see `crate::cancel`), and a freshly spawned
+    // worker inherits nothing — so capture the caller's token here and re-install it
+    // inside each worker. This is the one handoff the ambient model needs, which is
+    // exactly why it lives in the single shared fan-out rather than at each call site.
+    let token = crate::cancel::current();
     let locals = std::thread::scope(|s| -> Result<Vec<Vec<(f32, T)>>> {
         let handles: Vec<_> = scan
             .chunks_mut(chunk_len)
             .map(|chunk| {
+                let token = token.clone();
                 s.spawn(move || {
                     chunk.sort_unstable_by_key(|&(row, _, _)| row);
-                    score_one(chunk).into_sorted_desc()
+                    let score = || score_one(chunk).map(TopK::into_sorted_desc);
+                    match token {
+                        Some(token) => token.scope(score),
+                        None => score(),
+                    }
                 })
             })
             .collect();
@@ -134,7 +158,7 @@ where
         for h in handles {
             out.push(
                 h.join()
-                    .map_err(|_| anyhow!("search worker thread panicked"))?,
+                    .map_err(|_| anyhow!("search worker thread panicked"))??,
             );
         }
         Ok(out)

@@ -13,7 +13,7 @@ version: 0.5.0
 
 # The nidus image version this chart defaults to. `image.tag` falls back to this,
 # so bumping appVersion is how you roll the default image forward.
-appVersion: "0.26.0"
+appVersion: "0.35.0"
 
 home: https://nidus.duckedup.org
 sources:

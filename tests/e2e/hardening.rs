@@ -192,18 +192,22 @@ fn concurrent_load_beyond_the_limit_is_shed_not_queued() {
 /// **A client that withholds its request body must not pin a concurrency permit**
 /// (nidus-6c2).
 ///
-/// The permit is taken before the handler runs and the handler is what awaits the body, so
-/// a client that sends complete headers with a `Content-Length` and then goes silent used
-/// to hold a permit for the whole request deadline — or forever with `--read-timeout 0`.
-/// Against `--max-concurrent-requests 1` that is a one-connection denial of service.
+/// The store permit used to be taken before the handler ran, and the handler is what
+/// awaits the body — so a client that sent complete headers with a `Content-Length` and
+/// then went silent held a permit for the whole request deadline, or forever with
+/// `--read-timeout 0`. Against `--max-concurrent-requests 1` that was a one-connection
+/// denial of service.
 ///
-/// Driven over a raw socket rather than through an HTTP client, because no HTTP client will
-/// send headers promising a body and then refuse to send it — that is precisely the
-/// misbehaviour under test.
+/// The body is now received in its own phase, before any store permit is taken, so the
+/// assertion is the strong one: with a silent client parked on the connection, ordinary
+/// traffic keeps being served *throughout* — not "recovers eventually".
 ///
-/// `--read-timeout 0` is set deliberately: it removes the bound that used to be the only
-/// thing containing this, so the test fails unless `--body-idle-timeout` is doing the work
-/// on its own. Without the fix the final assertion never passes, however long it waits.
+/// Driven over a raw socket, because no HTTP client will send headers promising a body and
+/// then refuse to send it — that is precisely the misbehaviour under test.
+///
+/// `--read-timeout 0` and `--body-idle-timeout 0` are both set deliberately: they remove
+/// every deadline that could paper over the problem by eventually releasing the permit, so
+/// this passes only if the phase split is doing the work on its own.
 #[test]
 fn a_withheld_request_body_does_not_pin_a_permit() {
     let dir = tempfile::tempdir().unwrap();
@@ -214,9 +218,10 @@ fn a_withheld_request_body_does_not_pin_a_permit() {
             "--read-timeout",
             "0",
             "--body-idle-timeout",
-            "1",
+            "0",
         ])
         .start();
+    seed(&server, 200);
 
     let addr = server.base_url().trim_start_matches("http://").to_string();
     let mut silent = TcpStream::connect(&addr).expect("connect");
@@ -227,45 +232,24 @@ fn a_withheld_request_body_does_not_pin_a_permit() {
     )
     .expect("send headers");
     silent.flush().expect("flush headers");
+    // Give the server time to accept the connection and read the headers, so the request
+    // really is parked mid-flight rather than not yet noticed.
+    std::thread::sleep(Duration::from_millis(300));
 
-    // The permit is now pinned: a normal request is shed while the silent one holds it.
-    // Poll rather than sleep-then-assert — the point is only that the pin exists at all,
-    // and on a loaded runner the headers may take a moment to be read.
     let query = json!({ "query": vec![1.0f32; DIM], "top_k": 5 });
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut pinned = false;
-    while Instant::now() < deadline {
-        if server.post("/search", &query).0 == 503 {
-            pinned = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    for i in 0..10 {
+        let (status, body) = server.post("/search", &query);
+        assert_eq!(
+            status,
+            200,
+            "request {i} was refused while a silent client sat on the connection — \
+             the body wait is holding a store permit\n{body}\n--- server stderr ---\n{}",
+            server.stderr()
+        );
     }
-    assert!(
-        pinned,
-        "expected the silent client to hold the single permit\n--- server stderr ---\n{}",
-        server.stderr()
-    );
 
-    // …and it must be released once the body idles out, WITHOUT the silent client ever
-    // sending anything or the connection being closed. That release is the fix.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut recovered = None;
-    while Instant::now() < deadline {
-        let (status, _) = server.post("/search", &query);
-        if status == 200 {
-            recovered = Some(status);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert_eq!(
-        recovered,
-        Some(200),
-        "the permit was never released — a silent client can deny service indefinitely\n\
-         --- server stderr ---\n{}",
-        server.stderr()
-    );
+    // A bodyless route is equally unaffected.
+    assert_eq!(server.get("/stats").0, 200);
     drop(silent);
 }
 

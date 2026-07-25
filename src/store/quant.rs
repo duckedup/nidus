@@ -256,7 +256,7 @@ impl Store {
             })?
         } else {
             // `scan` arrives row-sorted from `with_sorted_scan` — score it in place.
-            score_chunk_i8(&s.vectors, dim, scan, &q_i8, is_euclidean, overscan)
+            score_chunk_i8(&s.vectors, dim, scan, &q_i8, is_euclidean, overscan)?
         };
 
         let candidates = topk_q.into_sorted_desc();
@@ -293,7 +293,7 @@ impl Store {
             })?
         } else {
             // `scan` arrives row-sorted from `with_sorted_scan` — score it in place.
-            score_chunk_bin(&s.words, wpr, scan, &q_words, overscan)
+            score_chunk_bin(&s.words, wpr, scan, &q_words, overscan)?
         };
 
         let candidates = topk_q.into_sorted_desc();

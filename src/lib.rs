@@ -25,6 +25,9 @@
 
 mod ann;
 pub mod backend;
+// Cooperative cancellation for long scans: a request deadline frees the client, only the
+// scan loop can free the CPU.
+mod cancel;
 mod config;
 mod data;
 // Levelled, logfmt diagnostics (`NIDUS_LOG`). Internal: what an embedding application
@@ -85,6 +88,7 @@ pub use backend::{
     Appender, BackendLock, CasOutcome, ClusterLease, LeaseLost, LeaseRenewer, LocalFs, LocalRam,
     MemoryTier, Persistence, is_lease_lost, open_memory_tier, open_persistence,
 };
+pub use cancel::Cancel;
 pub use config::{Config, Fsync, LeaseWait, OpenMode};
 pub use fts::Language;
 pub use model::{

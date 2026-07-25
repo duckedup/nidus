@@ -167,6 +167,7 @@ where
             cfg.read_timeout,
             cfg.write_timeout,
             cfg.body_idle_timeout,
+            cfg.max_body_bytes,
         )),
         #[cfg(feature = "memory")]
         embedder: cfg.embedder,
@@ -1056,13 +1057,20 @@ where
     F: FnOnce(&Nidus) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
+    // Picked up here, on the async side, because a task-local does not follow work onto a
+    // blocking thread — this is the handoff, and doing it in the two `run_*` helpers means
+    // every handler gets cancellation without knowing the concept exists.
+    let cancel = limits::current_cancel();
     tokio::task::spawn_blocking(move || {
         let db = st
             .db
             .read()
             .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
         let db = db.as_ref().ok_or_else(not_open)?;
-        f(db)
+        match cancel {
+            Some(cancel) => cancel.scope(|| f(db)),
+            None => f(db),
+        }
     })
     .await
     .map_err(|e| ApiError::internal(anyhow::anyhow!("task join error: {e}")))?
@@ -1075,13 +1083,17 @@ where
     F: FnOnce(&mut Nidus) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
+    let cancel = limits::current_cancel();
     tokio::task::spawn_blocking(move || {
         let mut db = st
             .db
             .write()
             .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
         let db = db.as_mut().ok_or_else(not_open)?;
-        f(db)
+        match cancel {
+            Some(cancel) => cancel.scope(|| f(db)),
+            None => f(db),
+        }
     })
     .await
     .map_err(|e| ApiError::internal(anyhow::anyhow!("task join error: {e}")))?
@@ -1194,7 +1206,13 @@ fn test_state(db: Option<Nidus>) -> AppState {
         token: None,
         // Generous by default so an ordinary test never trips admission control; the
         // backpressure tests build their own tight `Limits`.
-        limits: Arc::new(limits::Limits::new(1024, None, None, None)),
+        limits: Arc::new(limits::Limits::new(
+            1024,
+            None,
+            None,
+            None,
+            16 * 1024 * 1024,
+        )),
         #[cfg(feature = "memory")]
         embedder: None,
         #[cfg(all(feature = "memory", feature = "summarize"))]
@@ -1605,7 +1623,7 @@ mod tests {
     fn saturated_router() -> Router {
         let db = Nidus::open_in_memory(3).unwrap();
         let state = AppState {
-            limits: Arc::new(limits::Limits::new(0, None, None, None)),
+            limits: Arc::new(limits::Limits::new(0, None, None, None, 16 * 1024 * 1024)),
             ..test_state(Some(db))
         };
         router(state, 16 * 1024 * 1024)
@@ -1670,6 +1688,7 @@ mod tests {
                 Some(std::time::Duration::from_millis(50)),
                 None,
                 None,
+                16 * 1024 * 1024,
             )),
             ..test_state(Some(db))
         };

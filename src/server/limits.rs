@@ -32,21 +32,17 @@
 //!    as errors that `HandleErrorLayer` must downcast and re-dress. Same result, more
 //!    moving parts.
 //!
-//! ## What this does NOT do
+//! ## A deadline frees the CPU too, not just the client
 //!
-//! **A timeout frees the client, not the CPU.** When the deadline fires, the response
-//! future is dropped and the caller gets a `504` — but a search already running on a
-//! blocking task runs to completion regardless, because `spawn_blocking` work is not
-//! cancellable. Abandoned work still costs a full scan. Genuinely cancelling a running scan
-//! needs a cooperative check in the scan loop and is a separate, larger decision; it is
-//! recorded here so nobody reads "we have timeouts" as "we stop the work".
+//! Dropping the response future returns a `504` to the caller but cannot stop the work:
+//! the search is on a `spawn_blocking` task, and blocking tasks are not cancellable. So the
+//! deadline arm also **signals the scan to stop**, through the cooperative token in
+//! [`crate::cancel`] — the scan kernels check it every a few thousand rows and bail. Under
+//! load, finishing a scan nobody is waiting for is the worst possible use of a core.
 //!
-//! One consequence worth stating outright: the permit is released when the deadline fires,
-//! so during the tail of an abandoned request the admission count *understates* the work
-//! actually in flight. Holding the permit until the orphaned task finished would be no
-//! better — the server would then shed live traffic on behalf of work nobody is waiting
-//! for. Both are wrong; this is the less harmful wrong, and it is the right shape only once
-//! a scan can actually be cancelled.
+//! It is cooperative, so it is prompt rather than instant: work already inside a chunk
+//! finishes. That is the right trade — a per-row check would tax every query to help the
+//! rare abandoned one.
 //!
 //! **No per-IP rate limiting.** That belongs at the proxy that already terminates TLS in
 //! front of nidus (see the deployment guide); duplicating it here would be the wrong layer.
@@ -86,7 +82,26 @@ pub(super) struct Limits {
     /// How long a request body may go without delivering a frame before it is abandoned
     /// (nidus-6c2). See [`IdleTimeoutBody`].
     body_idle_timeout: Option<Duration>,
+    /// Permits for the **body-reception** phase, which happens before a store permit is
+    /// taken. See [`backpressure`] for why the two phases are separate.
+    ///
+    /// Sized [`BODY_SLOT_FACTOR`]× the store limit rather than given its own flag: it
+    /// bounds memory, not CPU, and the two are not independent in any way an operator
+    /// would want to tune separately. A derived number that is right is better than a
+    /// knob nobody knows how to set.
+    body_slots: Semaphore,
+    /// Largest body this server will receive, enforced here because the body is consumed
+    /// before the extractors (and therefore before `DefaultBodyLimit`) ever see it.
+    max_body_bytes: usize,
 }
+
+/// How many bodies may be arriving at once, as a multiple of the store-work limit.
+///
+/// Bigger than 1× on purpose: body reception is IO-bound and usually over in microseconds,
+/// so sizing it to the CPU-bound store limit would shed real traffic to protect against a
+/// phase that is not the bottleneck. Bounded at all because an unbounded count of
+/// concurrent bodies is the exact memory problem nidus-abx.2 exists to prevent.
+const BODY_SLOT_FACTOR: usize = 4;
 
 impl Limits {
     pub(super) fn new(
@@ -94,6 +109,7 @@ impl Limits {
         read_timeout: Option<Duration>,
         write_timeout: Option<Duration>,
         body_idle_timeout: Option<Duration>,
+        max_body_bytes: usize,
     ) -> Limits {
         Limits {
             permits: Semaphore::new(limit),
@@ -101,6 +117,8 @@ impl Limits {
             read_timeout,
             write_timeout,
             body_idle_timeout,
+            body_slots: Semaphore::new(limit.saturating_mul(BODY_SLOT_FACTOR)),
+            max_body_bytes,
         }
     }
 
@@ -145,15 +163,21 @@ pub(super) async fn backpressure(
     }
     let limits = &st.limits;
 
-    // Bound the body BEFORE anything waits on it (nidus-6c2). The permit below is taken
-    // ahead of the handler, and the handler is what awaits the body — so without this, a
-    // client that sends headers and then goes silent holds a permit for the whole request
-    // deadline, or forever if that deadline is disabled.
-    if let Some(idle) = limits.body_idle_timeout {
-        let (parts, body) = req.into_parts();
-        req = Request::from_parts(parts, Body::new(IdleTimeoutBody::new(body, idle)));
+    // ── Phase 1: receive the body, WITHOUT a store permit (nidus-6c2) ───────────────
+    //
+    // The store permit used to be taken first, and the handler is what awaits the body —
+    // so a client that sent headers and then went silent pinned a permit for the whole
+    // request deadline, denying service to work that was ready to run. Receiving the body
+    // first means a stalled client can no longer touch the store's admission pool at all.
+    //
+    // It is still bounded, by its own larger pool: an unbounded number of bodies arriving
+    // at once is the memory problem this epic exists to prevent, just relocated.
+    match receive_body(limits, req).await {
+        Ok(received) => req = received,
+        Err(response) => return response,
     }
 
+    // ── Phase 2: do the work, holding a store permit ────────────────────────────────
     let Ok(_permit) = limits.permits.try_acquire() else {
         super::metrics::http().shed.inc();
         crate::diag::diag!(
@@ -176,20 +200,44 @@ pub(super) async fn backpressure(
     };
 
     let path = req.uri().path().to_string();
-    match tokio::time::timeout(timeout, next.run(req)).await {
+    // The token this request's store work will run under. Dropping the response future
+    // frees the client but cannot stop a `spawn_blocking` scan, so the deadline arm below
+    // signals the scan itself to stop (`crate::cancel`).
+    let cancel = crate::Cancel::new();
+    let outcome = tokio::time::timeout(timeout, CANCEL.scope(cancel.clone(), next.run(req))).await;
+    match outcome {
         Ok(resp) => resp,
         Err(_) => {
+            cancel.cancel();
             super::metrics::http().timed_out.inc();
             crate::diag::diag!(
                 crate::diag::Level::Warn,
                 "http",
-                "request exceeded its deadline; the client is freed but the work continues",
+                "request exceeded its deadline; the client is freed and the scan is asked \
+                 to stop",
                 "timeout_secs" => timeout.as_secs(),
                 "path" => path,
             );
             timed_out(timeout)
         }
     }
+}
+
+tokio::task_local! {
+    /// The cancellation token for the request being handled on this task.
+    ///
+    /// A task-local rather than a request extension or a handler argument: `run_read` /
+    /// `run_write` are where the token has to be picked up, and they are called from every
+    /// handler but receive neither the `Request` nor an extractor. A task-local reaches
+    /// them without threading a parameter through a dozen signatures that have no other
+    /// reason to know about cancellation.
+    pub(super) static CANCEL: crate::Cancel;
+}
+
+/// The current request's cancellation token, or `None` outside a request (the in-process
+/// router tests, and the background lease/refresh tasks).
+pub(super) fn current_cancel() -> Option<crate::Cancel> {
+    CANCEL.try_with(Clone::clone).ok()
 }
 
 /// `503` with `Retry-After: 1`. A shed request is **retryable**: nothing was attempted, the
@@ -224,6 +272,78 @@ fn timed_out(after: Duration) -> Response {
                  so retry only after backing off",
                 after.as_secs()
             ),
+            "retryable": false,
+        })),
+    )
+        .into_response()
+}
+
+/// Read the request body to completion under the idle timeout and the size cap, holding a
+/// body slot rather than a store permit.
+///
+/// Buffering here rather than leaving it to the extractors is what moves the wait off the
+/// store's admission pool. It costs nothing extra in memory: every body was already
+/// buffered whole by the `Json` extractor a moment later — this only moves *where*.
+///
+/// Consuming the body means `DefaultBodyLimit` never sees it, so the size cap is enforced
+/// here too. `Content-Length` is checked first when the client sent one (every real client
+/// does), which rejects an oversized upload before a single byte of it is read.
+async fn receive_body(limits: &Limits, req: Request) -> Result<Request, Response> {
+    let declared = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|n| n > limits.max_body_bytes) {
+        return Err(too_large(limits.max_body_bytes));
+    }
+    // Nothing to receive: skip the slot entirely so a bodyless GET never queues behind
+    // uploads.
+    if declared == Some(0) {
+        return Ok(req);
+    }
+
+    let Ok(_slot) = limits.body_slots.try_acquire() else {
+        super::metrics::http().shed.inc();
+        crate::diag::diag!(
+            crate::diag::Level::Warn,
+            "http",
+            "shedding request: too many bodies already arriving",
+            "limit" => limits.body_slots.available_permits(),
+            "path" => req.uri().path(),
+        );
+        return Err(overloaded(limits.limit));
+    };
+
+    let (parts, body) = req.into_parts();
+    let body = match limits.body_idle_timeout {
+        Some(idle) => Body::new(IdleTimeoutBody::new(body, idle)),
+        None => body,
+    };
+    match axum::body::to_bytes(body, limits.max_body_bytes).await {
+        Ok(bytes) => Ok(Request::from_parts(parts, Body::from(bytes))),
+        // `to_bytes` reports "too large" and "the connection died" as the same error type.
+        // Reporting 413 is right for the case a client can act on, and for a dead
+        // connection the response goes nowhere anyway.
+        Err(e) => {
+            crate::diag::diag!(
+                crate::diag::Level::Debug,
+                "http",
+                "request body was not received",
+                "err" => e,
+            );
+            Err(too_large(limits.max_body_bytes))
+        }
+    }
+}
+
+/// `413`, matching what `DefaultBodyLimit` would have produced — kept in the same JSON
+/// shape as every other error so a client parses one thing.
+fn too_large(max: usize) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({
+            "error": format!("request body exceeds the {max}-byte limit (--max-body-bytes)"),
             "retryable": false,
         })),
     )
@@ -376,7 +496,7 @@ mod tests {
 
     #[test]
     fn in_flight_tracks_outstanding_permits() {
-        let l = Limits::new(2, None, None, None);
+        let l = Limits::new(2, None, None, None, 1024);
         assert_eq!(l.in_flight(), 0);
         let a = l.permits.try_acquire().unwrap();
         assert_eq!(l.in_flight(), 1);

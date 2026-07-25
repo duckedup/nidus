@@ -96,30 +96,30 @@ report the same.
 
 ## Securing a deployment
 
-**nidus serves plain HTTP, by design.** There is no `--tls` flag and no certificate
-configuration, and that is a decision rather than an omission: in every deployment
-where nidus is reachable off-box there is already an ingress, sidecar, or service
-mesh that terminates TLS — and it does that job better than a TLS stack compiled
-into a vector store would, with rotation, SNI, and modern cipher policy handled by
-infrastructure you are already operating.
+**Treat nidus like a database: it belongs on a private network, and none of its
+endpoints should be reachable from the public internet.** You would not put
+Postgres on a public IP and rely on its password prompt; the same reasoning applies
+here. Nothing in nidus assumes a hostile caller, and network placement — not
+`--token` — is what keeps it safe. That boundary is yours to enforce.
 
-What that means in practice, stated plainly so you can decide with it:
+Given that, the rest follows:
 
+- **nidus serves plain HTTP, by design.** There is no `--tls` flag, because
+  anywhere nidus is reachable off-box there is already an ingress, sidecar, or mesh
+  terminating TLS — with rotation, SNI, and cipher policy handled by infrastructure
+  you already operate, better than a TLS stack compiled into a vector store would.
 - **`--token` authenticates a caller. It does not confer confidentiality.** Over
-  plain HTTP the token itself crosses the network in cleartext on every request,
-  alongside every vector, document id, and metadata value. Anyone who can observe
-  the traffic has both the data and the credential.
-- **Terminate TLS in front of nidus.** Bind nidus to loopback or to a pod-local
-  address, and let the proxy be the only thing that accepts outside connections.
-- **The bind address is the real perimeter.** `--addr 0.0.0.0:7700` with no
-  `--token` is an unauthenticated, world-readable *and writable* vector store.
-  nidus warns at startup when it binds a non-loopback address — with a token
-  ("the credential crosses the network in cleartext") and without one ("this store
-  is open to anyone who can reach it"). It warns and starts; it never refuses,
-  because refusing would break the proxy-terminated architecture recommended here.
-- **Rate limiting belongs at the proxy.** nidus deliberately does not do per-IP
-  rate limiting — see [backpressure](#backpressure) for what it *does* bound, and
-  why the two are different layers.
+  plain HTTP the token crosses the network in cleartext on every request, alongside
+  every vector, document id, and metadata value. It is a guard against a
+  misconfigured neighbour on your own network, not a perimeter.
+- **The bind address is the real control.** `--addr 0.0.0.0:7700` with no `--token`
+  is an open, writable vector store for anyone who can route to it. nidus warns at
+  startup on a non-loopback bind — with a token, that the credential is in
+  cleartext; without one, that the store is open. It warns and starts; it never
+  refuses, because refusing would break the proxy-terminated architecture above.
+- **Rate limiting and slow-client protection belong at the proxy.** nidus bounds
+  total in-flight work (see [backpressure](#backpressure)) but does nothing
+  per-client, and deliberately so — that is a different layer.
 
 A minimal nginx sidecar, as a worked example:
 
@@ -153,9 +153,9 @@ One static shared secret, and nothing more. Specifically:
 - **No user model.** There is no identity attached to a request, so there is no
   per-caller audit trail beyond the access log's request id.
 
-That is a deliberate boundary for a store of this size, not an oversight — but it
-is a boundary. If you need scoped or rotatable credentials, issue them at the proxy
-and let it present the single nidus token upstream.
+That is a deliberate boundary for a store of this size, not an oversight. If you
+need scoped or rotatable credentials, issue them at the proxy and let it present the
+single nidus token upstream.
 
 ## Request size
 
@@ -191,15 +191,16 @@ distinction from `503` matters: a `504` means the work *was* admitted and may st
 be running, so an immediate retry piles a second copy onto an instance that is
 already behind.
 
-Two limits of the timeouts, stated because it would be easy to assume otherwise:
+**A deadline stops the work, not just the client.** When it fires, the caller gets
+its `504` *and* the running scan is asked to stop — the scan kernels check a
+cancellation flag every few thousand rows and bail out. Finishing a scan nobody is
+waiting for is the worst possible use of a core under load. Cancellation is
+cooperative, so it is prompt rather than instant: whatever chunk was in progress
+completes. A per-row check would tax every query to spare the rare abandoned one.
 
-- **A timeout frees the client, not the CPU.** When the deadline fires the caller
-  gets its `504`, but a scan already running finishes anyway — nidus has no
-  cooperative cancellation inside the scan loop. Abandoned work still costs a full
-  scan.
-- **Read and write deadlines differ by design.** A search is milliseconds; a large
-  upsert legitimately runs for minutes under one write lock. One bound tight enough
-  for the first would abort the second mid-batch.
+**Read and write deadlines differ by design.** A search is milliseconds; a large
+upsert legitimately runs for minutes under one write lock. One bound tight enough
+for the first would abort the second mid-batch.
 
 The probe endpoints (`/health`, `/ready`, `/metrics`) are **never** shed and never
 time out. They take no store lock, so they cost nothing to admit — and shedding a
@@ -208,23 +209,25 @@ the opposite of what you want when the server is saturated.
 
 ### Slow clients
 
-A request holds its concurrency permit while its body arrives, because that is what
-bounds how many bodies can be buffered at once against a store whose working set is
-in RAM. The consequence is that a client which sends headers and then goes quiet
-would occupy a permit for nothing.
+A request is handled in two phases: its body is **received first**, and only then
+does it take a concurrency permit to touch the store. That split is why a client
+which sends headers and then goes quiet cannot stall your search traffic — it never
+holds a store permit at all, however long it sits there.
 
-`--body-idle-timeout` closes that: a body that stops delivering data for that long
-is abandoned and the permit released. It is an **idle** bound, not a total one — the
-clock resets on every chunk, so a 256 MiB upsert over a slow link is never cut off
-however long it takes, while a silent client dies in seconds. (Same semantic as
-nginx's `client_body_timeout`.)
+Body reception has its own, larger pool (four times `--max-concurrent-requests`),
+so an unbounded number of bodies still cannot accumulate in RAM — that is the memory
+bound the concurrency cap exists for, kept in the phase that actually consumes the
+memory.
 
-Setting it to `0` removes the protection. Note that a stalled body surfaces as a
-`400`, not a `408` — the status is cosmetic; releasing the permit is the point.
+`--body-idle-timeout` then bounds how long a single stalled body may occupy one of
+those slots. It is an **idle** bound, not a total one — the clock resets on every
+chunk, so a 256 MiB upsert over a slow link is never cut off however long it takes,
+while a silent client dies in seconds. (Same semantic as nginx's
+`client_body_timeout`.) Setting it to `0` removes that bound.
 
-This shortens the window a slow client can occupy a permit; it does not eliminate
-it, and no setting here can. Genuine slow-client defence belongs at the same proxy
-that terminates TLS and rate-limits — see [Securing a deployment](#securing-a-deployment).
+An oversized body is rejected with `413` before it is read, when the client sends a
+`Content-Length`. A stalled one surfaces as `413` too, since the two are
+indistinguishable at that point.
 
 ## Concurrency & durability
 
@@ -267,8 +270,8 @@ would report the target as down). It reports:
 
 Route labels are **templates**: `/collections/{name}/upsert`, never the collection
 name. That bounds the label cardinality, and it means the scrape exposes traffic
-shape but not what is stored. It is still traffic shape, so put `/metrics` on a
-scrape-only path rather than the public ingress.
+shape but not what is stored. Like every other endpoint, it belongs on your private
+network — see [Securing a deployment](#securing-a-deployment).
 
 Reading it takes no store lock, so a scrape answers instantly even during a
 multi-minute upsert — the endpoints you consult during an incident must not be the

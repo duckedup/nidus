@@ -6,9 +6,12 @@ name: Helm chart
 on:
   push:
     branches: [main]
-    paths: ["charts/**", ".github/workflows/helm.yml"]
+    # Cargo.toml is in the trigger set so a crate version bump runs the appVersion
+    # check below — without it, the one change that can cause the drift would be the
+    # one change that never runs the guard.
+    paths: ["charts/**", "Cargo.toml", ".github/workflows/helm.yml"]
   pull_request:
-    paths: ["charts/**", ".github/workflows/helm.yml"]
+    paths: ["charts/**", "Cargo.toml", ".github/workflows/helm.yml"]
   workflow_dispatch:
 
 permissions:
@@ -24,6 +27,21 @@ jobs:
       - uses: azure/setup-helm@v4
         with:
           version: v3.16.3
+
+      # appVersion is the image tag a default `helm install` deploys, so when it lags
+      # the crate the chart quietly ships an old nidus (it sat at 0.26.0 while the crate
+      # reached 0.35.0 — nidus-yap). Asserted rather than auto-stamped: the coupling is
+      # then visible in the diff, and the fix is one obvious line.
+      - name: appVersion must match the crate version
+        run: |
+          crate=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          chart=$(grep '^appVersion' charts/nidus/Chart.yaml | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$crate" != "$chart" ]; then
+            echo "::error::Chart.yaml appVersion ($chart) != Cargo.toml version ($crate)." >&2
+            echo "Bump appVersion in charts/nidus/Chart.yaml, and the chart's own 'version' too." >&2
+            exit 1
+          fi
+          echo "ok: appVersion $chart matches the crate"
 
       - name: helm lint
         run: helm lint charts/nidus --values charts/nidus/ci/test-values.yaml

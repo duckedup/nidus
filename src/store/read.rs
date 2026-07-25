@@ -509,7 +509,7 @@ impl Store {
                 score_chunk(&self.data, chunk, q, score_fn, opts.top_k, opts.min_score)
             })?
         } else {
-            score_chunk(&self.data, scan, q, score_fn, opts.top_k, opts.min_score)
+            score_chunk(&self.data, scan, q, score_fn, opts.top_k, opts.min_score)?
         };
         Ok(self.hits_from_topk(topk))
     }
