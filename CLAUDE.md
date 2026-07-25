@@ -244,7 +244,14 @@ each.
   two cannot drift) and run `just test-e2e-cluster`. `.github/workflows/integration.yml`
   runs the whole target with `--include-ignored` on every PR, so anything added here
   is enforced. When a cluster test fails, read the panic first: the harness attaches
-  the offending process's own stderr.
+  the offending process's own stderr. `scale.rs` is the ranking-correctness lane: 10k
+  384-d vectors ingested over HTTP, top-k checked against cosine ground truth computed
+  in-test, so a scoring/normalisation/JSON-round-trip bug fails loudly where a
+  three-vector smoke test cannot see it. Its timing assertions are **order-of-magnitude
+  only** and must stay that way — it is a debug build on a shared runner, so a tight
+  bound flakes and proves nothing. Real performance work belongs in `benchmarks/`
+  (`just bench`, `--release`); note that harness drives the library **in-process**, so
+  the HTTP path's own cost is still unbenchmarked (nidus-8fn).
 
 ### Integrating into a host application
 

@@ -14,4 +14,5 @@
 mod harness;
 
 mod cluster;
+mod scale;
 mod server;
