@@ -101,10 +101,13 @@ pub async fn serve(db: Nidus, cfg: ServeConfig) -> anyhow::Result<()> {
     } else {
         ""
     };
-    eprintln!(
-        "nidus serving on http://{} (Ctrl-C / SIGTERM to stop){auth_note}",
-        cfg.addr
-    );
+    // Report the address actually bound, not the one requested: with a `:0` port the
+    // kernel picks it, so `cfg.addr` would print a useless `:0` and leave the caller
+    // (a test harness, or anyone avoiding a port collision) no way to learn the port.
+    let bound = listener
+        .local_addr()
+        .map_or_else(|_| cfg.addr.clone(), |a| a.to_string());
+    eprintln!("nidus serving on http://{bound} (Ctrl-C / SIGTERM to stop){auth_note}");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
