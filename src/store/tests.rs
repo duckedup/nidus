@@ -510,7 +510,7 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         .max_vector_bytes(Some(16));
     let mut store = Store {
         fenced: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        last_verified: std::time::Instant::now(),
+        last_verified: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         config,
         data: Segments::in_memory_with(2, Distance::Cosine),
         log: OpLog::in_memory(),

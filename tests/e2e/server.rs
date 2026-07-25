@@ -340,3 +340,60 @@ fn opt_in_flags_reach_the_running_store() {
     assert_eq!(status, 200);
     assert_eq!(hits[0]["id"], "a");
 }
+
+/// **A long write must not make the instance report NOT ready** (nidus-abx.3).
+///
+/// Readiness used to be answered through `cluster_status`, which needs the store lock: a
+/// large upsert holds the write guard for its whole duration, `try_read` returned
+/// `WouldBlock`, and the probe turned that into a `503`. Kubernetes would then pull the
+/// instance out of the Service in the middle of the very batch it existed to perform — and
+/// for a cluster writer there is no second instance to take the traffic.
+///
+/// The in-process test `a_busy_store_is_still_ready` proves the property deterministically by
+/// holding the guard directly; this one proves it survives the real binary, a real socket,
+/// and a genuinely long write.
+#[test]
+fn a_long_write_does_not_make_the_instance_report_unready() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 64).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+
+    // Big enough that the write guard is held across many probe intervals in a debug build,
+    // small enough not to dominate the fast lane's runtime.
+    let records: Vec<Value> = (0..10_000)
+        .map(|i| {
+            json!({
+                "id": format!("d{i}"),
+                "vector": (0..64).map(|d| ((i + d) % 17) as f64).collect::<Vec<_>>(),
+                "attrs": {},
+            })
+        })
+        .collect();
+    let body = json!({ "records": records });
+
+    let mut probes = 0usize;
+    let mut unready: Vec<usize> = Vec::new();
+    std::thread::scope(|s| {
+        let writing = s.spawn(|| server.post("/collections/docs/upsert", &body));
+        while !writing.is_finished() {
+            if !server.is_ready() {
+                unready.push(probes);
+            }
+            probes += 1;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(writing.join().expect("upsert thread").0, 200);
+    });
+
+    assert!(
+        unready.is_empty(),
+        "readiness dropped during a healthy write at probes {unready:?} of {probes} — busy is \
+         not unhealthy, and flapping here takes the writer out of rotation mid-batch"
+    );
+    // Guard against the test silently proving nothing: if the write finished before any
+    // probe overlapped it, the assertion above never actually observed a busy store.
+    assert!(
+        probes >= 5,
+        "the upsert completed too quickly to exercise the race (only {probes} probes overlapped)"
+    );
+}
