@@ -75,6 +75,32 @@ test-cli:
 test-e2e *FILTER:
     cargo test --features cli --test e2e {{ FILTER }}
 
+# Start the services the cluster e2e tests need (real S3 + real Redis-family tier).
+# Ports are deliberately non-default so this never fights a local minio/redis.
+e2e-services-up:
+    docker rm -f nidus-e2e-minio nidus-e2e-valkey 2>/dev/null || true
+    docker run -d --name nidus-e2e-minio -p 9100:9000 \
+        -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+        quay.io/minio/minio:latest server /data
+    docker run -d --name nidus-e2e-valkey -p 6479:6379 valkey/valkey:8-alpine
+    # minio starts with no buckets; under the filesystem backend a top-level
+    # directory IS a bucket, which avoids needing the `mc` client just for this.
+    until curl -sf http://127.0.0.1:9100/minio/health/live >/dev/null; do sleep 0.3; done
+    docker exec nidus-e2e-minio mkdir -p /data/nidus-test
+    @echo "minio :9100 (minioadmin/minioadmin, bucket nidus-test) + valkey :6479 ready"
+
+# Stop them again
+e2e-services-down:
+    docker rm -f nidus-e2e-minio nidus-e2e-valkey 2>/dev/null || true
+
+# Cluster e2e: several real `nidus serve` processes over a shared object store and
+# memory tier. #[ignore]d by default (they need the services above), so run them
+# explicitly. Bring the services up first: `just e2e-services-up`.
+# Override the endpoints with NIDUS_E2E_S3_ENDPOINT / NIDUS_E2E_S3_BUCKET /
+# NIDUS_E2E_S3_KEY / NIDUS_E2E_S3_SECRET / NIDUS_E2E_REDIS_URL.
+test-e2e-cluster *FILTER:
+    cargo test --features cli --test e2e cluster::{{ FILTER }} -- --ignored --test-threads=2
+
 # Release build of the `nidus` binary
 build-cli:
     cargo build --release --features cli

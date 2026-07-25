@@ -36,6 +36,7 @@ pub struct Server {
     dim: usize,
     args: Vec<String>,
     token: Option<String>,
+    env: Vec<(String, String)>,
 }
 
 /// A running `nidus serve` child process.
@@ -56,7 +57,16 @@ impl Server {
             dim,
             args: Vec::new(),
             token: None,
+            env: Vec::new(),
         }
+    }
+
+    /// Set an environment variable on the child — the cluster suite passes `AWS_*` this
+    /// way so a test states its own backend config instead of depending on whatever the
+    /// developer happens to have exported.
+    pub fn env(mut self, key: &str, value: &str) -> Self {
+        self.env.push((key.to_string(), value.to_string()));
+        self
     }
 
     /// Extra `nidus serve` flags (`--quantization int8`, `--cluster`, …).
@@ -96,7 +106,8 @@ impl Server {
             .stderr(Stdio::piped())
             // Inherited NIDUS_* vars would silently override the flags under test.
             .env_clear()
-            .envs(std::env::vars().filter(|(k, _)| !k.starts_with("NIDUS_")));
+            .envs(std::env::vars().filter(|(k, _)| !k.starts_with("NIDUS_")))
+            .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         if let Some(token) = &self.token {
             cmd.arg("--token").arg(token);
         }
@@ -198,13 +209,7 @@ impl RunningServer {
     /// shelling out to `kill` keeps the harness dependency-free.
     #[cfg(unix)]
     pub fn shutdown(mut self) -> bool {
-        let pid = self.child.id().to_string();
-        let signalled = Command::new("kill")
-            .args(["-TERM", &pid])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(signalled, "failed to SIGTERM pid {pid}");
+        self.signal("TERM");
         // `Drop` still runs when this returns, but its kill/wait on an already-reaped
         // child fail harmlessly (both errors are ignored) — no need to leak `self` to
         // suppress it.
@@ -216,6 +221,32 @@ impl RunningServer {
     pub fn kill(mut self) {
         self.child.kill().expect("kill server");
         self.child.wait().expect("reap killed server");
+    }
+
+    /// Freeze the process (SIGSTOP) and thaw it (SIGCONT). Together these simulate the
+    /// stall a lease cannot rule out — a long GC pause or a descheduled host — which is
+    /// how the cluster suite manufactures a writer that wakes up already superseded.
+    #[cfg(unix)]
+    pub fn pause(&self) {
+        self.signal("STOP");
+    }
+
+    #[cfg(unix)]
+    pub fn resume(&self) {
+        self.signal("CONT");
+    }
+
+    /// Shell out to `kill` — `std` exposes only SIGKILL, and a libc dependency for three
+    /// test signals is not worth it.
+    #[cfg(unix)]
+    fn signal(&self, sig: &str) {
+        let pid = self.child.id().to_string();
+        let ok = Command::new("kill")
+            .args([&format!("-{sig}"), &pid])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "failed to send SIG{sig} to pid {pid}");
     }
 
     fn url(&self, path: &str) -> String {

@@ -13,4 +13,5 @@
 
 mod harness;
 
+mod cluster;
 mod server;

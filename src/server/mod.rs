@@ -140,7 +140,8 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/hybrid-search", post(hybrid_search))
         .route("/list", post(list))
         .route("/flush", post(flush))
-        .route("/compact", post(compact));
+        .route("/compact", post(compact))
+        .route("/refresh", post(refresh));
 
     // Text-native memory routes: the SDKs send TEXT and the server embeds /
     // summarizes. Present only when the `memory` feature is compiled in (the
@@ -442,6 +443,22 @@ async fn flush(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> 
 async fn compact(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
     run_write(st, |db| db.compact()).await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// `POST /refresh` — adopt a writer's newer committed state (SPEC §14.6).
+///
+/// A read-only instance over a shared store loads a snapshot at open and would otherwise
+/// serve it forever; this is how a caller advances it. Explicit rather than automatic
+/// because the alternative — refreshing before every read — puts a manifest fetch on the
+/// hot path of exactly the read-heavy fan-out this mode exists for. Callers that want
+/// near-live reads can poll it; those that write through one instance need never call it.
+///
+/// `adopted` reports whether newer state was actually taken up, so a poller can tell "no
+/// change" from "advanced". Harmless in every other configuration: a writer already holds
+/// the only mutating handle and an in-memory store has no backend, so both answer `false`.
+async fn refresh(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
+    let adopted = run_write(st, |db| db.refresh()).await?;
+    Ok(Json(json!({ "adopted": adopted })))
 }
 
 // ── Memory handlers (the `memory` feature) ───────────────────────────────────
@@ -771,6 +788,22 @@ mod tests {
         assert_eq!(stats["ann"], JsonValue::Null); // exact search by default
         assert_eq!(stats["collections"], json!(["docs"]));
         assert_eq!(stats["footprint"]["doc_count"], 2);
+    }
+
+    /// `POST /refresh` is routed and answers `adopted: false` where there is nothing to
+    /// adopt — an in-memory store tracks no separate writer. Whether a cluster *reader*
+    /// actually takes up a writer's commits needs two processes and a shared backend, so
+    /// that lives in `tests/e2e/cluster.rs`.
+    #[tokio::test]
+    async fn refresh_is_a_no_op_without_a_shared_writer() {
+        let app = test_router(3);
+        let resp = app
+            .clone()
+            .oneshot(post("/refresh", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await["adopted"], false);
     }
 
     /// Full-text + hybrid search over HTTP: declare schema, upsert (incl. a text-only
