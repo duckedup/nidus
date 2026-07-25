@@ -69,6 +69,12 @@ lint-cli:
 test-cli:
     cargo test --features cli
 
+# End-to-end tests only: spawn the real `nidus serve` binary and drive it over HTTP.
+# Included in `test-cli` (they need no services and run in seconds); this recipe is
+# for iterating on them alone. Pass a filter, e.g. `just test-e2e token`.
+test-e2e *FILTER:
+    cargo test --features cli --test e2e {{ FILTER }}
+
 # Release build of the `nidus` binary
 build-cli:
     cargo build --release --features cli

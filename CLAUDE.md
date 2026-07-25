@@ -228,6 +228,16 @@ each.
 - **Branch workflow**: one branch per issue or bundled epic, push for PR review.
 - **Tests**: pure-logic unit tests live inline per module; file-backed behavior in
   `tests/` against temp dirs (and `#[cfg_attr(miri, ignore)]` where they fsync).
+  **End-to-end tests that drive the real binary** live in `tests/e2e/`
+  (`just test-e2e`, `cli`-gated): `harness.rs` spawns `nidus serve` via
+  `env!("CARGO_BIN_EXE_nidus")` on `--addr 127.0.0.1:0`, learns the port from the
+  startup line, polls `/health`, and kills + reaps the child on `Drop`; the suites
+  beside it (`server.rs`, …) hold only assertions. Deliberately **one** test binary
+  (`tests/e2e/main.rs` + sibling modules), because each `tests/*.rs` file is its own
+  crate — a second file would mean a second copy of the harness. Add a new suite as a
+  module here, not as a new `tests/*.rs`. These cover what the in-process
+  `tower::oneshot` server tests structurally cannot: the real bind, the CLI-flag →
+  `ServeConfig` wiring, socket framing, cross-process locking, and restart.
 
 ### Integrating into a host application
 
