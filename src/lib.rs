@@ -85,6 +85,7 @@ pub use model::{
     AnnConfig, AnnKind, ClusterStatus, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts,
     Predicate, QuantKind, Quantization, Record, Role, SearchOpts, Value,
 };
+pub use store::Readiness;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -163,6 +164,17 @@ impl Nidus {
     /// Reads only in-RAM state, so it is safe to call as often as a health check needs.
     pub fn cluster_status(&self) -> ClusterStatus {
         self.store.cluster_status()
+    }
+
+    /// A lock-free handle to the facts a readiness probe needs — role, whether this writer
+    /// has been fenced, and how stale a reader is. See [`Readiness`].
+    ///
+    /// Unlike [`cluster_status`](Self::cluster_status), reading through this handle takes no
+    /// lock at all, so a probe cannot be delayed — or answered wrongly — by a long write
+    /// holding the store guard. Take it once when the store opens and keep it: it shares the
+    /// store's atomics, so it never goes out of date.
+    pub fn readiness(&self) -> Readiness {
+        self.store.readiness()
     }
 
     /// A handle to this instance's cluster writer lease, for keeping it warm out of band.

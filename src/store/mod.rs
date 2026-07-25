@@ -83,6 +83,70 @@ fn oom(what: &str, count: usize) -> anyhow::Error {
     anyhow!("out of memory reserving capacity for {count} {what}")
 }
 
+/// Process-wide monotonic clock base for the lock-free staleness stamp.
+///
+/// `Instant` cannot live in an atomic, and staleness must be readable **without taking the
+/// store lock** (see [`Readiness`]), so the stamp is stored as milliseconds elapsed since
+/// this base. Deliberately not a `SystemTime` stamp: the wall clock can jump backwards, which
+/// would make a reader look *younger* than it is — the unsafe direction for a staleness bound.
+fn mono_base() -> Instant {
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *BASE.get_or_init(Instant::now)
+}
+
+/// Milliseconds on the [`mono_base`] clock — the value stored in a staleness stamp.
+fn mono_millis() -> u64 {
+    mono_base().elapsed().as_millis() as u64
+}
+
+/// The facts a **readiness probe** needs, readable with no lock at all.
+///
+/// Readiness used to be answered through `cluster_status`, which needs the store lock. That
+/// made a *busy* instance report **not ready**: a large upsert holds the write guard for
+/// seconds, `try_read` returned `WouldBlock`, and the probe turned that into a `503` — so the
+/// one writer left the load balancer in the middle of the very batch it existed to perform
+/// (nidus-abx.3). Busy is not unhealthy, so readiness must not be able to observe busy-ness.
+///
+/// Every field here is therefore an atomic or a value fixed at open, shared with the store
+/// rather than copied out of it — so the answer is always current *and* never blocks. The
+/// distinction is deliberate: liveness treats a **poisoned** lock as unhealthy
+/// (nidus-abx.1) while readiness ignores a merely **held** one.
+#[derive(Clone)]
+pub struct Readiness {
+    /// Fixed once the store is open: promotion happens *during* open, so an instance's role
+    /// never changes afterwards.
+    role: Role,
+    /// Shared with [`Store::fenced`] — latched by a failing write or a background lease
+    /// renewal (nidus-lp4.7), so readiness sees a fencing the moment it is detected.
+    fenced: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared staleness stamp, `None` for a writer or an in-memory store — neither can lag.
+    last_verified: Option<Arc<std::sync::atomic::AtomicU64>>,
+}
+
+impl Readiness {
+    /// What this instance is. Fixed at open.
+    pub fn role(&self) -> Role {
+        self.role
+    }
+
+    /// Whether this writer has been superseded and can never write again.
+    pub fn fenced(&self) -> bool {
+        self.fenced.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Seconds since this instance last verified itself current — `0` for a writer, whose
+    /// own state *is* the current state.
+    pub fn staleness_secs(&self) -> u64 {
+        match &self.last_verified {
+            None => 0,
+            Some(stamp) => {
+                let then = stamp.load(std::sync::atomic::Ordering::Acquire);
+                mono_millis().saturating_sub(then) / 1000
+            }
+        }
+    }
+}
+
 /// A pseudo-random duration in `0..=span`, for spreading standby retry polls.
 ///
 /// Deliberately not a PRNG: this only needs to decorrelate instances that would otherwise
@@ -211,7 +275,11 @@ pub struct Store {
     /// has still proven the reader current as of that moment, so resetting only on adoption
     /// would report a frequently-polling, perfectly up-to-date reader as increasingly
     /// stale. The basis of the staleness a reader reports (nidus-lp4.4).
-    last_verified: Instant,
+    ///
+    /// An `Arc<AtomicU64>` of [`mono_millis`] rather than an `Instant`, so a readiness probe
+    /// can read it through a [`Readiness`] handle **without the store lock** — a busy
+    /// instance must not report itself unready (nidus-abx.3).
+    last_verified: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Store {
@@ -419,7 +487,7 @@ impl Store {
             loaded_log_offset: watermark,
             manifest_cas,
             fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_verified: Instant::now(),
+            last_verified: Arc::new(std::sync::atomic::AtomicU64::new(mono_millis())),
         };
 
         // Whether the in-RAM index now differs from any tier snapshot — true if we built
@@ -520,7 +588,7 @@ impl Store {
             loaded_log_offset: 0,
             manifest_cas: None,
             fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_verified: Instant::now(),
+            last_verified: Arc::new(std::sync::atomic::AtomicU64::new(mono_millis())),
             config,
         };
         // Align `seg_indexes` to the (single, empty) segment so a later seal can update it
@@ -598,7 +666,8 @@ impl Store {
         if !changed {
             // Verified current: nothing new to adopt, which is just as much proof of
             // freshness as adopting would be. Reset the staleness clock.
-            self.last_verified = Instant::now();
+            self.last_verified
+                .store(mono_millis(), std::sync::atomic::Ordering::Release);
             return Ok(false);
         }
         // What *kind* of change: a restructure (seal/compaction altered the segment list) needs a
@@ -673,7 +742,8 @@ impl Store {
         self.build_segment_indexes();
         self.load_or_build_fts()?;
 
-        self.last_verified = Instant::now();
+        self.last_verified
+            .store(mono_millis(), std::sync::atomic::Ordering::Release);
         Ok(true)
     }
 
@@ -718,8 +788,28 @@ impl Store {
             staleness_secs: if writer {
                 0
             } else {
-                self.last_verified.elapsed().as_secs()
+                mono_millis().saturating_sub(
+                    self.last_verified
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ) / 1000
             },
+        }
+    }
+
+    /// A lock-free handle to the facts a readiness probe needs — see [`Readiness`].
+    ///
+    /// Taken once when the store opens and consulted per probe, so readiness never touches
+    /// the store lock and a long write cannot make a healthy instance report unready
+    /// (nidus-abx.3). The handle shares the store's atomics rather than snapshotting them,
+    /// so it stays current — a fencing latched mid-batch is visible to the very next probe.
+    pub fn readiness(&self) -> Readiness {
+        let writer = self.config.open_mode == OpenMode::ReadWrite;
+        Readiness {
+            role: self.cluster_status().role,
+            fenced: self.fenced.clone(),
+            // A writer is its own source of truth and an in-memory store has no peer to lag
+            // behind; only a reader over a durable backend can be stale.
+            last_verified: (!writer && !self.in_memory).then(|| self.last_verified.clone()),
         }
     }
 

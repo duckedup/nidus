@@ -15,7 +15,7 @@ send `Authorization: Bearer <token>` — see [Authentication](/guides/http-serve
 
 | Method & path | Operation | Library method |
 | --- | --- | --- |
-| `GET /health` | liveness check (always unauthenticated) | — |
+| `GET /health` | liveness check — `503` only when unrecoverably broken (always unauthenticated) | — |
 | `GET /stats` | dimension, distance, ann config, collections, footprint | `dimension` / `footprint` |
 | `GET /collections` | list collection names | `collections` |
 | `POST /collections/{name}` | create a collection | `create_collection` |
@@ -43,21 +43,46 @@ send `Authorization: Bearer <token>` — see [Authentication](/guides/http-serve
 Liveness probe. Returns `200` with the body `ok`. Always reachable without a
 token, so a load balancer or `docker healthcheck` needs no credential.
 
-Says nothing about the store — only that the process is up and answering. An instance
-waiting for the writer handle (see `/ready`) is alive, and killing it would be exactly
-wrong, so this keeps returning `200` throughout.
+Says almost nothing about the store — only that the process is up, answering, and not
+*unrecoverably* broken. An instance waiting for the writer handle (see `/ready`) is alive,
+and killing it would be exactly wrong, so this keeps returning `200` throughout. So does an
+instance that is merely **busy**: a large upsert holds the store's write guard for the length
+of the batch, which is normal work, not a fault.
+
+It returns `503` in exactly one case: the store's lock has been **poisoned** by a panic that
+unwound while the store was locked for writing. That leaves the in-RAM index possibly out of
+step with the durable bytes, and the condition never clears — every subsequent request would
+fail. The instance cannot recover on its own, so liveness fails and a supervisor restarts it;
+the durable data is intact and the fresh process rebuilds from it. In cluster mode that
+restart is also what releases the writer lease, letting a `--wait-for-lease` standby take over.
+
+```json
+{
+  "status": "unhealthy",
+  "error": "store lock poisoned: a panic left this instance's in-RAM state untrustworthy — it must be restarted"
+}
+```
 
 ### `GET /ready`
 
 Readiness probe. `200` once this instance can actually serve; `503` otherwise. It fails for
-three distinct reasons, each of which should take an instance out of rotation:
+four distinct reasons, each of which should take an instance out of rotation:
 
 - **no store yet** — still starting, or a standby waiting for the writer handle;
 - **fenced** — this writer was superseded, so every write would fail and it must be replaced.
   A writer notices this on its own lease-renewal timer, so it stops reporting ready even if no
   write arrives to discover it;
 - **stale** — a reader has gone longer than `--max-staleness` without verifying it is current
-  (only when that bound is set).
+  (only when that bound is set);
+- **poisoned** — a panic left this instance unrecoverable, so it leaves the load balancer as
+  well as failing `/health` (see above).
+
+What does **not** make an instance unready is being **busy**. A large upsert holds the store's
+write guard for the whole batch, and readiness is answered without ever taking that lock, so a
+writer stays in rotation while it works. This matters most where there is only one writer to
+route to: dropping out mid-batch would take writes offline during exactly the operation the
+instance exists to perform.
+
 Also always reachable without a token — an orchestrator would read a `401` as "not ready"
 and never route to a healthy instance.
 

@@ -98,6 +98,11 @@ struct AppState {
     /// with enough concurrent probes, stall executor threads themselves. A probe must
     /// answer in constant time no matter what the store is doing, so it reads an atomic.
     open: Arc<std::sync::atomic::AtomicBool>,
+    /// The lock-free readiness handle, published once the store opens (see
+    /// [`crate::Readiness`]). A `OnceLock` because a store opens exactly once per process,
+    /// so this needs publication but never mutation — and reading it costs an atomic load,
+    /// which is what keeps [`ready`] off the store lock entirely (nidus-abx.3).
+    readiness: Arc<std::sync::OnceLock<crate::Readiness>>,
     /// Readiness fails past this much reader staleness (`Config::max_staleness`), copied
     /// here so a probe never has to reach into the store's config behind the lock.
     max_staleness: Option<std::time::Duration>,
@@ -131,6 +136,7 @@ where
     let state = AppState {
         db: Arc::new(RwLock::new(None)),
         open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        readiness: Arc::new(std::sync::OnceLock::new()),
         max_staleness: cfg.max_staleness,
         token: cfg.token.map(Arc::from),
         #[cfg(feature = "memory")]
@@ -163,11 +169,15 @@ where
     let abort = Arc::new(tokio::sync::Notify::new());
     let slot = state.db.clone();
     let open_flag = state.open.clone();
+    let readiness_slot = state.readiness.clone();
     let failure_slot = open_failed.clone();
     let abort_tx = abort.clone();
     tokio::task::spawn_blocking(move || match open() {
         Ok(db) => {
             if let Ok(mut slot) = slot.write() {
+                // Take the lock-free readiness handle before publishing, so that whenever
+                // `open` reads true the handle is guaranteed to be there (nidus-abx.3).
+                let _ = readiness_slot.set(db.readiness());
                 *slot = Some(db);
                 // Publish only after the store is in place, so a probe never sees
                 // `ready` before a request could actually be served.
@@ -405,8 +415,38 @@ async fn shutdown_signal() {
 /// *alive* — killing it is precisely the wrong response, since waiting is its job — so this
 /// must keep answering while [`AppState::db`] is still empty. Whether the instance can
 /// actually serve traffic is [`ready`]'s question.
-async fn health() -> &'static str {
-    "ok"
+async fn health(State(st): State<AppState>) -> Response {
+    // A **poisoned** store lock is the one condition under which this process is broken
+    // beyond recovery, and it must be escalated rather than papered over (nidus-abx.1).
+    //
+    // std only poisons an `RwLock` when a panic unwinds while it is held for *writing* —
+    // verified, not assumed — so a poisoned store is by construction one whose in-RAM index
+    // was mid-mutation when the panic hit and may no longer match the durable bytes. Every
+    // request from here on fails, permanently, because poisoning never clears. Suppressing
+    // it (`clear_poison`, or catching the panic) would resume serving from that suspect
+    // index while discarding the only evidence — a loud correct failure traded for a quiet
+    // wrong one. So the poison flag is treated as the useful signal it is: report unhealthy,
+    // let liveness restart the process, and let a fresh instance rebuild from disk.
+    //
+    // In a cluster that restart is also what unblocks failover: a poisoned writer goes on
+    // renewing its lease from the background renewer (which deliberately holds no store
+    // lock), so no standby can be promoted until this process actually dies.
+    if st.db.is_poisoned() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "unhealthy",
+                "error": "store lock poisoned: a panic left this instance's in-RAM state \
+                          untrustworthy — it must be restarted",
+            })),
+        )
+            .into_response();
+    }
+    // Note what is deliberately NOT checked: whether the lock is currently *held*. A long
+    // write makes the store busy, not broken, and restarting an instance mid-batch would be
+    // far worse than the bug this guards. `is_poisoned` reads a flag and never acquires, so
+    // busy-ness is invisible here — the same distinction `ready` makes (nidus-abx.3).
+    "ok".into_response()
 }
 
 /// Readiness: this instance has a store open and can serve requests.
@@ -415,18 +455,41 @@ async fn health() -> &'static str {
 /// instead of sending requests that would all answer `503` anyway. Split from
 /// [`health`] because the two genuinely differ for a standby: live, but not ready.
 ///
-/// Note this currently reports only whether the store is *open*. A writer that has been
-/// **fenced**, or a reader that is arbitrarily **stale**, still reports ready — see
-/// `nidus-lp4.1`, which owns those.
+/// Beyond "is a store open", readiness asks whether this instance can serve *usefully*, so
+/// it also fails for a **fenced** writer (superseded — every write will fail) and for a
+/// reader past its `--max-staleness` bound.
+///
+/// **Answered entirely from atomics, with no store lock** (nidus-abx.3). This used to route
+/// through `cluster_status`, which needs the lock: `try_read` returned `WouldBlock` while a
+/// large upsert held the write guard, and the probe reported `503` — so the single writer
+/// dropped out of the load balancer in the middle of the very batch it existed to perform.
+/// Busy is not unhealthy. Reading through the lock-free [`crate::Readiness`] handle removes
+/// the `WouldBlock` case from this path altogether rather than merely tolerating it.
 async fn ready(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
     if !st.open.load(std::sync::atomic::Ordering::Acquire) {
         return Err(ApiError::from(not_open()));
     }
-    // Beyond "is a store open", readiness asks whether this instance can serve *usefully*.
-    // Both of these are cheap in-RAM reads (see `ClusterStatus`), so a probe every few
-    // seconds costs nothing and never touches the object store.
-    let status = read_status(&st)?;
-    if status.fenced {
+    // A poisoned lock means every data route now fails permanently (nidus-abx.1), so this
+    // instance must leave the Service as well as being restarted by liveness — waiting for
+    // the restart would keep traffic arriving at something that can only 500.
+    //
+    // Checked here rather than inherited from `read_status`, which this handler no longer
+    // calls: `is_poisoned` reads a flag and acquires nothing, so it keeps readiness entirely
+    // off the lock. Making readiness lock-free must not make it blind.
+    if st.db.is_poisoned() {
+        return Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            err: anyhow::anyhow!(
+                "store lock poisoned: a panic left this instance's in-RAM state \
+                 untrustworthy — it must be restarted"
+            ),
+        });
+    }
+    // Published before the `open` flag above, so this is always present once open is true.
+    let Some(status) = st.readiness.get() else {
+        return Err(ApiError::from(not_open()));
+    };
+    if status.fenced() {
         return Err(ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             err: anyhow::anyhow!(
@@ -435,23 +498,24 @@ async fn ready(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> 
             ),
         });
     }
+    let staleness_secs = status.staleness_secs();
     if let Some(max) = st.max_staleness
-        && status.staleness_secs > max.as_secs()
+        && staleness_secs > max.as_secs()
     {
         return Err(ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             err: anyhow::anyhow!(
                 "stale: last verified current {}s ago, beyond the {}s bound — this reader \
                  is not being refreshed",
-                status.staleness_secs,
+                staleness_secs,
                 max.as_secs()
             ),
         });
     }
     Ok(Json(json!({
         "ready": true,
-        "role": format!("{:?}", status.role),
-        "staleness_secs": status.staleness_secs,
+        "role": format!("{:?}", status.role()),
+        "staleness_secs": staleness_secs,
     })))
 }
 
@@ -1001,9 +1065,16 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 fn test_state(db: Option<Nidus>) -> AppState {
     let open = db.is_some();
+    // Publish the readiness handle exactly as `serve` does, so the tests exercise the same
+    // lock-free path a real probe takes rather than a special case.
+    let readiness = std::sync::OnceLock::new();
+    if let Some(db) = &db {
+        let _ = readiness.set(db.readiness());
+    }
     AppState {
         db: Arc::new(RwLock::new(db)),
         open: Arc::new(std::sync::atomic::AtomicBool::new(open)),
+        readiness: Arc::new(readiness),
         max_staleness: None,
         token: None,
         #[cfg(feature = "memory")]
@@ -1032,6 +1103,14 @@ mod tests {
     fn router_over(db: Option<Nidus>) -> Router {
         let state = test_state(db);
         router(state, 16 * 1024 * 1024)
+    }
+
+    /// Build a router **and keep the state**, for the tests that manipulate the store lock
+    /// itself — holding it to model a long write, or poisoning it to model a panic.
+    fn router_and_state(dim: usize) -> (Router, AppState) {
+        let db = Nidus::open_in_memory(dim).unwrap();
+        let state = test_state(Some(db));
+        (router(state.clone(), 16 * 1024 * 1024), state)
     }
 
     async fn json_body(resp: Response) -> JsonValue {
@@ -1129,6 +1208,131 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// **A busy store is still ready** (nidus-abx.3).
+    ///
+    /// Readiness used to be answered through `cluster_status`, which needs the store lock, so
+    /// a large upsert holding the write guard turned into `WouldBlock` and then a `503`. In a
+    /// cluster that pulled the single writer out of the load balancer in the middle of the
+    /// very batch it existed to perform. Busy is not unhealthy.
+    // Holding the guard across the awaits is the whole point: it models a write batch in
+    // flight while probes arrive. It cannot deadlock — the handlers under test are precisely
+    // the ones that must never take this lock, which is what the assertions verify. If a
+    // future change made `/ready` or `/health` acquire it, this test would hang rather than
+    // fail, which is itself a loud signal.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_busy_store_is_still_ready() {
+        let (app, state) = router_and_state(3);
+
+        // Hold the exclusive guard for the length of the test — exactly what a long upsert
+        // does. Nothing below may block on it.
+        let guard = state.db.write().unwrap();
+
+        let resp = app.clone().oneshot(get("/ready")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a write in flight must not make a healthy instance report NOT ready"
+        );
+
+        // Liveness likewise: the lock is held, not poisoned.
+        let resp = app.clone().oneshot(get("/health")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // By deliberate contrast, `/cluster` still answers 503 while it cannot read without
+        // blocking. Nothing routes on it, so "momentarily unable to answer" is the honest
+        // response there — the distinction is the point, not an oversight.
+        let resp = app.clone().oneshot(get("/cluster")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(guard);
+        let resp = app.clone().oneshot(get("/cluster")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "and it recovers once free");
+    }
+
+    /// **A poisoned store lock must report UNHEALTHY** so liveness restarts the process
+    /// (nidus-abx.1).
+    ///
+    /// `std` poisons an `RwLock` only when a panic unwinds while it is held for *writing*, so
+    /// a poisoned store is by construction one whose in-RAM index was mid-mutation and may no
+    /// longer match the durable bytes. Poisoning never clears, so every later request fails
+    /// forever — while `/health` used to return a hardcoded `"ok"`, meaning liveness never
+    /// fired and the pod was never recycled. In a cluster that is worse than a crash: the
+    /// background lease renewer holds no store lock, so the bricked writer keeps renewing its
+    /// lease and no standby can be promoted.
+    #[tokio::test]
+    async fn a_poisoned_store_lock_reports_unhealthy_so_liveness_restarts_it() {
+        let (app, state) = router_and_state(3);
+        let resp = app.clone().oneshot(get("/health")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "healthy to begin with");
+
+        // Poison it the way a panicking write handler would: unwind while holding the
+        // exclusive guard. The panic hook is silenced for the moment it takes, so a
+        // deliberate panic does not look like a failure in the test log. (Worst case a
+        // *concurrent* test's panic message is suppressed; that test still fails.)
+        let db = state.db.clone();
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::thread::spawn(move || {
+            let _guard = db.write().unwrap();
+            panic!("a handler panicked mid-write");
+        })
+        .join();
+        std::panic::set_hook(hook);
+        assert!(
+            state.db.is_poisoned(),
+            "a panic on the WRITE path must poison the lock"
+        );
+
+        let resp = app.clone().oneshot(get("/health")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a poisoned store is unrecoverable — liveness must fail so the process restarts"
+        );
+        let body = json_body(resp).await;
+        assert_eq!(body["status"], "unhealthy");
+
+        // Readiness must agree, so the instance leaves the Service as well as getting
+        // restarted — otherwise traffic keeps arriving at something that can only 500 for
+        // however long the liveness probe takes to fire. (This assertion caught exactly that
+        // gap: making readiness lock-free initially made it blind to the poison flag.)
+        let resp = app.clone().oneshot(get("/ready")).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::OK);
+    }
+
+    /// A panic on the **read** path must NOT brick the instance — it does not poison the
+    /// lock, so this whole failure mode is writer-only. Guards the reasoning in
+    /// `a_poisoned_store_lock_reports_unhealthy_so_liveness_restarts_it`: if std ever changed
+    /// here, the health check above would start firing on harmless search panics.
+    #[tokio::test]
+    async fn a_panic_on_the_read_path_leaves_the_instance_healthy() {
+        let (app, state) = router_and_state(3);
+
+        let db = state.db.clone();
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::thread::spawn(move || {
+            let _guard = db.read().unwrap();
+            panic!("a search panicked");
+        })
+        .join();
+        std::panic::set_hook(hook);
+
+        assert!(
+            !state.db.is_poisoned(),
+            "a read-path panic must not poison the lock"
+        );
+        let resp = app.clone().oneshot(get("/health")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "still healthy, still serving"
+        );
+        let resp = app.clone().oneshot(get("/ready")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// Once the store is open, readiness flips.

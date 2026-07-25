@@ -256,6 +256,13 @@ While waiting, a standby reports `200` on `/health` (it is alive — waiting is 
 at `/health` and your readiness probe at `/ready` and an orchestrator does the right thing
 on its own: keep the standby running, route around it, and route to it once promoted.
 
+The two probes answer different questions, and both are deliberately blind to an instance
+being merely **busy** — a large upsert holds the store's write guard for the whole batch, and
+neither probe takes that lock, so a working writer is never mistaken for a broken one.
+`/ready` additionally reports `503` for a fenced writer or a reader past `--max-staleness`;
+`/health` reports `503` only when a panic has left the process unrecoverable, which is the one
+case where restarting it is the right response.
+
 Pass a number of seconds (`--wait-for-lease 300`) to give up after that long instead of
 waiting indefinitely — useful in a script that should not hang.
 
