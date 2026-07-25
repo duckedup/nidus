@@ -4223,10 +4223,19 @@ mod object_backed {
 
 /// **A cancelled scan stops instead of running to completion.**
 ///
-/// A server request deadline drops the response future, which frees the client but not
-/// the CPU: the scan is on a blocking task and blocking tasks are not cancellable. The
-/// scan kernels therefore check an ambient token, and this is the proof it reaches
-/// them — otherwise the deadline is a promise to the caller and a lie to the machine.
+/// A server request deadline drops the response future, which frees the client but not the
+/// CPU: the scan is on a blocking task and blocking tasks are not cancellable. The scan
+/// kernels therefore check an ambient token, and this is the proof it reaches them through
+/// a real `search` — otherwise the deadline is a promise to the caller and a lie to the
+/// machine.
+///
+/// Deliberately tiny. The check fires at the head of every block, so cancellation is
+/// observable on the first one; more data would only slow the suite down — badly, under
+/// Miri — without testing anything further. The parallel fan-out's token handoff is the
+/// part that would need real volume to reach through `search`, so it is unit tested
+/// directly against `parallel_topk` in `super::scoring` instead. An earlier version of this
+/// file tried it here with 40k rows and quietly exercised the *serial* path, because that
+/// is still an order of magnitude under `PARALLEL_SCAN_WORK_FLOOR`.
 ///
 /// Asserted on the *outcome* (an error rather than results), never on elapsed time: a
 /// timing assertion here would flake on a shared runner and prove nothing.
@@ -4234,7 +4243,7 @@ mod object_backed {
 fn a_cancelled_search_stops_and_errors() {
     let mut store = Store::in_memory(8).unwrap();
     store.create_collection("col").unwrap();
-    let recs: Vec<Record> = (0..5_000)
+    let recs: Vec<Record> = (0..64)
         .map(|i| {
             let v: Vec<f32> = (0..8).map(|d| ((i * 7 + d) % 13) as f32).collect();
             Record::new(format!("d{i}"), v, Default::default())
@@ -4248,12 +4257,12 @@ fn a_cancelled_search_stops_and_errors() {
         ..Default::default()
     };
 
-    // Uncancelled: the ambient token is absent, so nothing changes for ordinary callers
-    // — the overwhelmingly common case, and the one a regression here would break.
+    // Uncancelled: the ambient token is absent, so nothing changes for ordinary callers —
+    // the overwhelmingly common case, and the one a regression here would break.
     assert_eq!(store.search(&["col"], &q, &opts).unwrap().len(), 10);
 
-    // Cancelled before the scan starts: it must refuse rather than return partial
-    // results, which would look like a legitimate (but wrong) ranking.
+    // Cancelled: it must refuse rather than return partial results, which would look like
+    // a legitimate (but wrong) ranking.
     let token = crate::Cancel::new();
     token.cancel();
     let err = token
@@ -4272,42 +4281,4 @@ fn a_cancelled_search_stops_and_errors() {
             .len(),
         10
     );
-}
-
-/// Cancellation must reach the **parallel** scan's worker threads too. A freshly
-/// spawned thread inherits no thread-local, so the fan-out has to hand the token over
-/// explicitly — the one place the ambient model needs help, and therefore the one most
-/// worth a test.
-#[test]
-fn cancellation_reaches_parallel_scan_workers() {
-    // Enough rows at this dimension to clear the parallel-scan work floor, so the
-    // query genuinely fans out rather than quietly staying serial.
-    let mut store = Store::in_memory_cfg(
-        Config::new("/dev/null/in-memory", 8)
-            .open_mode(OpenMode::ReadWrite)
-            .query_threads(4),
-    )
-    .unwrap();
-    store.create_collection("col").unwrap();
-    let recs: Vec<Record> = (0..40_000)
-        .map(|i| {
-            let v: Vec<f32> = (0..8).map(|d| ((i * 7 + d) % 13) as f32).collect();
-            Record::new(format!("d{i}"), v, Default::default())
-        })
-        .collect();
-    store.upsert("col", &recs).unwrap();
-
-    let q = vec![1.0f32; 8];
-    let opts = SearchOpts {
-        top_k: 10,
-        ..Default::default()
-    };
-    assert_eq!(store.search(&["col"], &q, &opts).unwrap().len(), 10);
-
-    let token = crate::Cancel::new();
-    token.cancel();
-    let err = token
-        .scope(|| store.search(&["col"], &q, &opts))
-        .expect_err("a cancelled parallel search must not return results");
-    assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
 }

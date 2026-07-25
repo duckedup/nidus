@@ -172,3 +172,71 @@ where
     }
     Ok(merged)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Cancel;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// **Cancellation must reach the parallel scan's worker threads.**
+    ///
+    /// The token is ambient per-thread (`crate::cancel`) and a freshly spawned thread
+    /// inherits nothing, so the fan-out has to hand it over explicitly. That handoff is the
+    /// one place the ambient model needs help, and therefore the one most worth a test.
+    ///
+    /// Driven through `parallel_topk` directly with a forced worker count, rather than
+    /// through `Store::search`: making a real search fan out requires clearing
+    /// `PARALLEL_SCAN_WORK_FLOOR`, i.e. upwards of a million floats, which is both far
+    /// slower than this needs to be and — as an earlier version of this test proved by
+    /// passing while silently running the *serial* path — easy to get wrong by a factor
+    /// that nothing checks.
+    #[test]
+    fn cancellation_reaches_every_parallel_worker() {
+        const WORKERS: usize = 4;
+        let mut scan: Vec<(u64, &str, &str)> = (0..64).map(|i| (i, "col", "id")).collect();
+
+        // Each worker records whether it observed the token. All four must.
+        let saw_token = AtomicUsize::new(0);
+        let ran = AtomicUsize::new(0);
+        let token = Cancel::new();
+        token.cancel();
+        let result: Result<TopK<(&str, &str)>> = token.scope(|| {
+            parallel_topk(&mut scan, WORKERS, 4, |_chunk| {
+                ran.fetch_add(1, Ordering::Relaxed);
+                if crate::cancel::cancelled() {
+                    saw_token.fetch_add(1, Ordering::Relaxed);
+                }
+                crate::cancel::check()?;
+                Ok(TopK::new(4))
+            })
+        });
+
+        assert_eq!(ran.load(Ordering::Relaxed), WORKERS, "every chunk ran");
+        assert_eq!(
+            saw_token.load(Ordering::Relaxed),
+            WORKERS,
+            "every worker must observe the caller's cancellation, not just the first"
+        );
+        assert!(
+            result.is_err(),
+            "a cancelled parallel scan must surface the error, not partial results"
+        );
+    }
+
+    /// Without a token installed, workers see no cancellation — the ordinary path, and the
+    /// one a bug in the handoff would most plausibly break.
+    #[test]
+    fn workers_see_no_cancellation_when_none_is_installed() {
+        let mut scan: Vec<(u64, &str, &str)> = (0..64).map(|i| (i, "col", "id")).collect();
+        let saw_token = AtomicUsize::new(0);
+        let result: Result<TopK<(&str, &str)>> = parallel_topk(&mut scan, 4, 4, |_chunk| {
+            if crate::cancel::cancelled() {
+                saw_token.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(TopK::new(4))
+        });
+        assert_eq!(saw_token.load(Ordering::Relaxed), 0);
+        assert!(result.is_ok());
+    }
+}
