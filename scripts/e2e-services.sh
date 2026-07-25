@@ -69,11 +69,113 @@ up() {
     echo "ready: minio :${MINIO_PORT} (minioadmin/minioadmin, bucket ${BUCKET}) + valkey :${VALKEY_PORT}"
 }
 
+# ── Valkey CLUSTER (slot routing / MOVED-ASK), a separate leg ────────────────
+#
+# A single-node valkey exercises no slot routing at all, so nidus's cluster-mode
+# tier client (redis-rs `cluster` feature) has never met a real slot map. This
+# brings up a 3-master cluster so the SAME e2e suite can run against it, driven
+# only by NIDUS_E2E_REDIS_URL — no second copy of the tests.
+#
+# LINUX ONLY, and deliberately loud about it rather than silently skipping.
+# Cluster nodes gossip with each other at the addresses they announce, so those
+# addresses must be reachable from BOTH the nodes and the test process. `--network
+# host` is the only arrangement where 127.0.0.1:<port> means the same thing to
+# everyone. On Docker Desktop (macOS/Windows) host networking does not bridge to
+# the host, so the ports stay unreachable and the cluster cannot be driven.
+CLUSTER_NODES=3
+CLUSTER_BASE_PORT=${CLUSTER_BASE_PORT:-7100}
+
+cluster_node_name() { echo "nidus-e2e-valkey-c$1"; }
+
+cluster_ports() {
+    for i in $(seq 0 $((CLUSTER_NODES - 1))); do
+        echo $((CLUSTER_BASE_PORT + i))
+    done
+}
+
+cluster_seeds() {
+    local seeds=""
+    for p in $(cluster_ports); do
+        seeds="${seeds:+$seeds,}127.0.0.1:$p"
+    done
+    echo "$seeds"
+}
+
+down_cluster() {
+    for i in $(seq 0 $((CLUSTER_NODES - 1))); do
+        docker rm -f "$(cluster_node_name "$i")" >/dev/null 2>&1 || true
+    done
+}
+
+up_cluster() {
+    if [ "$(uname -s)" != "Linux" ]; then
+        echo "valkey-cluster leg is Linux-only: it needs real host networking so the" >&2
+        echo "nodes' announced addresses are reachable from both the cluster and the" >&2
+        echo "tests. Docker Desktop's --network host does not bridge to the host, so" >&2
+        echo "the cluster would come up unreachable. Runs in CI (ubuntu-latest)." >&2
+        exit 1
+    fi
+    down_cluster
+
+    local i=0
+    for p in $(cluster_ports); do
+        docker run -d --name "$(cluster_node_name "$i")" --network host \
+            valkey/valkey:8-alpine \
+            valkey-server --port "$p" --cluster-enabled yes \
+            --cluster-config-file "nodes-$p.conf" --cluster-node-timeout 5000 \
+            --appendonly no --save '' >/dev/null
+        i=$((i + 1))
+    done
+
+    echo "waiting for ${CLUSTER_NODES} valkey nodes …"
+    for p in $(cluster_ports); do
+        for _ in $(seq 1 60); do
+            if docker exec "$(cluster_node_name 0)" \
+                valkey-cli -h 127.0.0.1 -p "$p" ping 2>/dev/null | grep -q PONG; then
+                break
+            fi
+            sleep 0.5
+        done
+    done
+
+    # `--cluster-replicas 0`: three masters is enough to exercise slot routing, and
+    # replicas would only slow startup.
+    docker exec "$(cluster_node_name 0)" sh -c \
+        "valkey-cli --cluster create $(cluster_ports | sed 's/^/127.0.0.1:/' | tr '\n' ' ') \
+         --cluster-replicas 0 --cluster-yes" >/dev/null
+
+    echo "waiting for cluster_state:ok …"
+    for _ in $(seq 1 60); do
+        if docker exec "$(cluster_node_name 0)" \
+            valkey-cli -h 127.0.0.1 -p "$CLUSTER_BASE_PORT" cluster info 2>/dev/null |
+            grep -q "cluster_state:ok"; then
+            break
+        fi
+        sleep 0.5
+    done
+    docker exec "$(cluster_node_name 0)" \
+        valkey-cli -h 127.0.0.1 -p "$CLUSTER_BASE_PORT" cluster info 2>/dev/null |
+        grep -q "cluster_state:ok" || {
+        echo "valkey cluster never reached cluster_state:ok; logs:" >&2
+        docker logs "$(cluster_node_name 0)" >&2 || true
+        exit 1
+    }
+
+    echo "ready: valkey cluster on $(cluster_seeds)"
+    echo "point the tests at it with:"
+    echo "  NIDUS_E2E_REDIS_URL='valkey://$(cluster_seeds)?cluster=true'"
+}
+
 case "${1:-}" in
     up) up ;;
     down) down ;;
+    up-cluster) up_cluster ;;
+    down-cluster) down_cluster ;;
+    # Print the URL the cluster leg should be driven with, so the justfile and the
+    # workflow never hand-write (and drift on) the seed list.
+    cluster-url) echo "valkey://$(cluster_seeds)?cluster=true" ;;
     *)
-        echo "usage: $0 {up|down}" >&2
+        echo "usage: $0 {up|down|up-cluster|down-cluster|cluster-url}" >&2
         exit 2
         ;;
 esac

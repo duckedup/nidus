@@ -86,6 +86,8 @@ fn parse_args() -> Result<Args> {
 fn compiled_engines() -> Vec<&'static str> {
     #[allow(unused_mut)]
     let mut v = vec!["nidus"];
+    #[cfg(feature = "server")]
+    v.push("nidus (server)");
     #[cfg(feature = "duckdb")]
     v.push("duckdb");
     #[cfg(feature = "lancedb")]
@@ -100,6 +102,14 @@ fn run_cell(cell: Cell, args: &Args) -> Result<Vec<EngineResult>> {
     let truth = nidus_bench::exact_ground_truth(&data, cell.top_k);
     #[allow(unused_mut)]
     let mut results = vec![run_engine::<NidusEngine>(cell, &data, &args.cfg, &truth)?];
+    // Immediately after the in-process row, so the table reads as a direct
+    // library-vs-server comparison over identical data.
+    #[cfg(feature = "server")]
+    results.push(
+        run_engine::<nidus_bench::engines::server::NidusServerEngine>(
+            cell, &data, &args.cfg, &truth,
+        )?,
+    );
     #[cfg(feature = "duckdb")]
     results.push(run_engine::<nidus_bench::engines::duckdb::DuckdbEngine>(
         cell, &data, &args.cfg, &truth,

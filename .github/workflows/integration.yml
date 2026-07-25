@@ -79,6 +79,19 @@ jobs:
       - name: Run end-to-end tests
         run: cargo test --features cli --test e2e -- --include-ignored --test-threads=2
 
+      # Second leg: the same cluster suite against a 3-master Valkey CLUSTER, which
+      # is the only way the tier client's slot routing and MOVED/ASK handling get
+      # exercised — a single-node valkey never issues a redirect. Same tests, driven
+      # purely by NIDUS_E2E_REDIS_URL, so there is no second copy to maintain.
+      # Linux-only (needs real host networking), which is exactly what this runner is.
+      - name: Start Valkey Cluster
+        run: ./scripts/e2e-services.sh up-cluster
+
+      - name: Run cluster tests against Valkey Cluster
+        run: |
+          NIDUS_E2E_REDIS_URL="$(./scripts/e2e-services.sh cluster-url)" \
+            cargo test --features cli --test e2e cluster:: -- --ignored --test-threads=2
+
       # A red run should be diagnosable from the log alone, without a rerun. The
       # harness already attaches each nidus process's stderr to its failure; these
       # are the backing services' side of the story.
@@ -91,10 +104,18 @@ jobs:
           echo "::group::valkey"
           docker logs nidus-e2e-valkey 2>&1 | tail -100 || true
           echo "::endgroup::"
+          echo "::group::valkey cluster"
+          for c in nidus-e2e-valkey-c0 nidus-e2e-valkey-c1 nidus-e2e-valkey-c2; do
+            echo "--- $c"; docker logs "$c" 2>&1 | tail -40 || true
+          done
+          docker exec nidus-e2e-valkey-c0 valkey-cli -p 7100 cluster info 2>&1 | head -20 || true
+          echo "::endgroup::"
           echo "::group::stray nidus processes"
           pgrep -af "nidus serve" || echo "none (harness cleaned up)"
           echo "::endgroup::"
 
-      - name: Stop minio + valkey
+      - name: Stop services
         if: always()
-        run: ./scripts/e2e-services.sh down
+        run: |
+          ./scripts/e2e-services.sh down
+          ./scripts/e2e-services.sh down-cluster
