@@ -509,6 +509,8 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         .auto_compact(None)
         .max_vector_bytes(Some(16));
     let mut store = Store {
+        fenced: std::sync::atomic::AtomicBool::new(false),
+        last_verified: std::time::Instant::now(),
         config,
         data: Segments::in_memory_with(2, Distance::Cosine),
         log: OpLog::in_memory(),
@@ -3802,6 +3804,10 @@ mod object_backed {
                 .get(key)
                 .map(|(b, g)| (b.clone(), Some(g.to_string()))))
         }
+        fn supports_cas(&self) -> bool {
+            true
+        }
+
         fn put_cas(&self, key: &str, bytes: &[u8], expected: Option<&str>) -> Result<CasOutcome> {
             // Atomic compare-and-swap under the map lock — the conditional-write primitive
             // S3/GCS give (If-Match / ifGenerationMatch, and If-None-Match:* / =0 when

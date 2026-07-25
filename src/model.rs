@@ -394,6 +394,51 @@ pub struct Footprint {
     pub doc_count: usize,
 }
 
+/// What an instance is within a store, for [`ClusterStatus`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// Sole writer of a single-node store — holds the plain writer lock.
+    Writer,
+    /// Read-only opener of a single-node store — holds no lock.
+    Reader,
+    /// Cluster writer — holds the renewable, fenced writer lease.
+    ClusterWriter,
+    /// Cluster reader — lock-free, advances via `refresh()`.
+    ClusterReader,
+    /// In-memory store: no durability, no lock, no peers.
+    InMemory,
+}
+
+/// Who this instance is and how current it is — the introspection an operator needs
+/// during an incident, and what a readiness probe consults (SPEC §14.6).
+///
+/// Cheap by construction: every field is already in RAM, so this performs **no** IO and
+/// takes no store lock. That matters because a readiness probe may run every few seconds
+/// per instance, and a probe that reached the object store would both cost money and stall
+/// behind whatever the store is doing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClusterStatus {
+    /// What this instance is.
+    pub role: Role,
+    /// Whether cluster mode is on (`Config::cluster`).
+    pub cluster: bool,
+    /// This instance believes it holds the writer handle.
+    pub holds_writer_handle: bool,
+    /// **This writer has been superseded.** Every subsequent write will fail; the instance
+    /// must be replaced. Latched once observed, because the condition is permanent — a
+    /// fenced writer never regains the lease, it has to reopen.
+    pub fenced: bool,
+    /// Our fencing token (owner id) while we hold a cluster lease.
+    pub lease_owner: Option<String>,
+    /// The manifest commit counter this instance is serving. A reader behind the writer
+    /// reports a lower number; comparing across instances shows replication lag.
+    pub commit_version: u64,
+    /// Seconds since this instance last took up newer state — `0` for a writer (its own
+    /// state is by definition current), and for a reader the age of its last successful
+    /// `refresh()` (or of its open, if it has not refreshed).
+    pub staleness_secs: u64,
+}
+
 /// A mutating operation recorded in the op log (the commit stream). `row` indexes
 /// into the data segment. The on-disk log is a sequence of framed, checksummed,
 /// bincode-encoded `Op`s (see `log` module + SPEC.md §5.2).

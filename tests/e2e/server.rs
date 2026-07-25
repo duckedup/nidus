@@ -209,6 +209,57 @@ fn second_server_on_the_same_dir_is_refused() {
     );
 }
 
+/// Cluster mode is refused on a backend without compare-and-swap (nidus-lp4.2).
+///
+/// A local-filesystem store trips the earlier "must be a shared object store" guard, so
+/// this asserts the guard chain as a user meets it: `--cluster` on a local store never
+/// starts, and the reason names what is missing rather than failing obscurely later.
+///
+/// The CAS requirement itself matters because cluster safety *is* the conditional write —
+/// without it the lease is advisory, two instances can both think they hold it, and the
+/// mid-batch fence does not exist at all.
+#[test]
+fn cluster_mode_is_refused_without_the_required_backends() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_nidus"))
+        .args(["serve", "--dir"])
+        .arg(dir.path())
+        .args(["--dim", "3", "--addr", "127.0.0.1:0", "--cluster"])
+        .output()
+        .expect("run cluster server");
+
+    assert!(
+        !output.status.success(),
+        "--cluster on a local store must not start"
+    );
+    let err = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(
+        err.contains("shared object-store") || err.contains("compare-and-swap"),
+        "the refusal should name the missing capability: {err}"
+    );
+}
+
+/// `/ready` and `/cluster` work on an ordinary single-node store too — the endpoints must
+/// not be cluster-only, or a non-cluster deployment could not use the probes at all.
+#[test]
+fn probes_work_on_a_single_node_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+
+    let (status, body) = server.get("/ready");
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = server.get("/cluster");
+    assert_eq!(status, 200);
+    assert_eq!(body["role"], "Writer", "single-node writer role: {body}");
+    assert_eq!(body["cluster"], false);
+    assert_eq!(body["fenced"], false);
+    assert_eq!(
+        body["holds_writer_handle"], true,
+        "a single-node writer holds the plain writer lock: {body}"
+    );
+}
+
 /// SIGTERM is the graceful path: it flushes and releases the writer lock, so a
 /// replacement server starts immediately over the same directory and sees the data.
 /// Covers `serve()`'s shutdown handler, which no in-process test reaches.

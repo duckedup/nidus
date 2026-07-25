@@ -5,14 +5,14 @@
 use std::io::Read;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
 use crate::server::dto::{AnnDto, FootprintDto, HitDto};
 use crate::{
-    AnnConfig, Config, Distance, Filter, Fsync, FtsQuery, HybridOpts, Language, Nidus, OpenMode,
-    Quantization, Record, Scope, SearchOpts,
+    AnnConfig, Config, Distance, Filter, Fsync, FtsQuery, HybridOpts, Language, LeaseWait, Nidus,
+    OpenMode, Quantization, Record, Scope, SearchOpts,
 };
 
 // AI-ingest (memory) wiring for `serve`: only under the `memory` feature (pulled
@@ -107,9 +107,9 @@ struct StoreArgs {
     memory: Option<String>,
     /// Run as one of several cooperating instances over a *shared* store (SPEC §14.6):
     /// requires an object-store `--persistence` **and** a Redis-family `--memory` tier.
-    /// One instance holds a renewing writer lease; the rest should open `--read-only`
-    /// and pick up each commit. Not a managed cluster — no coordinator, replication, or
-    /// rebalancing.
+    /// One instance holds a renewing writer lease; the others are either `--read-only`
+    /// readers that pick up each commit, or `--wait-for-lease` standbys waiting to be
+    /// promoted. Not a managed cluster — no coordinator, replication, or rebalancing.
     #[arg(long, env = "NIDUS_CLUSTER")]
     cluster: bool,
     /// Memory-map immutable segments instead of holding them in RAM — lets a store
@@ -154,6 +154,30 @@ struct StoreArgs {
     /// In `--cluster` mode this is also the writer-lease window.
     #[arg(long, value_name = "SECONDS", env = "NIDUS_LOCK_TTL")]
     lock_ttl: Option<u64>,
+    /// Wait for the writer handle instead of exiting when another instance holds it —
+    /// this instance becomes a **standby** and is promoted within roughly `--lock-ttl` of
+    /// the holder dying. Without this, a second writer exits immediately, so a supervisor
+    /// restarts it in a loop and failover takes as long as its backoff.
+    ///
+    /// Bare `--wait-for-lease` waits indefinitely (what a hot standby wants); give it a
+    /// number of seconds to give up after that long instead.
+    ///
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        num_args = 0..=1,
+        default_missing_value = "forever",
+        env = "NIDUS_WAIT_FOR_LEASE"
+    )]
+    wait_for_lease: Option<String>,
+    /// Fail the readiness probe once a `--read-only` instance has gone this many seconds
+    /// without verifying it is current. Omit for no bound (the default).
+    ///
+    /// A cluster reader only advances when something refreshes it, so without a bound a
+    /// reader whose refresher has died serves ever-older results while looking healthy.
+    /// Pair with `--refresh-interval`, or with an external `POST /refresh`.
+    #[arg(long, value_name = "SECONDS", env = "NIDUS_MAX_STALENESS")]
+    max_staleness: Option<u64>,
     /// Refuse to open a store whose vector matrix would exceed this many bytes — the
     /// overcommit guard (SPEC §6.6). Omit for no ceiling.
     #[arg(long, env = "NIDUS_MAX_VECTOR_BYTES")]
@@ -241,7 +265,27 @@ impl StoreArgs {
         if let Some(secs) = self.lock_ttl {
             cfg = cfg.lock_ttl(std::time::Duration::from_secs(secs));
         }
+        cfg = cfg.lease_wait(self.lease_wait()?);
+        cfg = cfg.max_staleness(self.max_staleness.map(std::time::Duration::from_secs));
         Ok(cfg)
+    }
+
+    /// Parse `--wait-for-lease` into a [`LeaseWait`]. Absent → `Fail` (unchanged
+    /// behaviour); bare flag → `Forever`; a number → that many seconds.
+    fn lease_wait(&self) -> Result<LeaseWait> {
+        let Some(raw) = self.wait_for_lease.as_deref() else {
+            return Ok(LeaseWait::Fail);
+        };
+        if raw.eq_ignore_ascii_case("forever") {
+            return Ok(LeaseWait::Forever);
+        }
+        let secs: u64 = raw.parse().with_context(|| {
+            format!(
+                "--wait-for-lease expects a number of seconds (or no value at all, \
+                     to wait indefinitely), got {raw:?}"
+            )
+        })?;
+        Ok(LeaseWait::Timeout(std::time::Duration::from_secs(secs)))
     }
 
     /// Build the `Option<Quantization>` from the `--quantization`/`--quant-rescore`
@@ -452,6 +496,16 @@ enum Command {
         /// Default 256 MiB.
         #[arg(long, default_value_t = 256 * 1024 * 1024, env = "NIDUS_MAX_BODY_BYTES")]
         max_body_bytes: usize,
+        /// Refresh this instance every N seconds so a `--read-only` reader stays current
+        /// without a sidecar or cron calling `POST /refresh`. Omit to leave refreshing
+        /// entirely to the caller (the default).
+        ///
+        /// A server-side interval, deliberately not a refresh on every read: that would put
+        /// a manifest fetch on the hot path of exactly the read-heavy fan-out cluster mode
+        /// exists for. Reads may be up to N seconds stale — pair with `--max-staleness` to
+        /// have readiness fail if refreshing stops working.
+        #[arg(long, value_name = "SECONDS", env = "NIDUS_REFRESH_INTERVAL")]
+        refresh_interval: Option<u64>,
         /// Refuse to start unless the store is backed by *shared, non-local* backends:
         /// object-store `--persistence` (`s3://…`/`gs://…`) **and** a Redis-family
         /// `--memory` tier (`redis://…`). This is the contract the published Docker
@@ -656,6 +710,7 @@ pub fn run(cli: Cli) -> Result<()> {
             addr,
             token,
             max_body_bytes,
+            refresh_interval,
             require_remote,
             #[cfg(feature = "memory")]
             ingest,
@@ -664,6 +719,7 @@ pub fn run(cli: Cli) -> Result<()> {
             addr,
             token,
             max_body_bytes,
+            refresh_interval,
             require_remote,
             #[cfg(feature = "memory")]
             ingest,
@@ -894,6 +950,7 @@ fn serve(
     addr: String,
     token: Option<String>,
     max_body_bytes: usize,
+    refresh_interval: Option<u64>,
     require_remote: bool,
     #[cfg(feature = "memory")] ingest: IngestArgs,
 ) -> Result<()> {
@@ -918,7 +975,10 @@ fn serve(
     } else {
         OpenMode::ReadWrite
     };
-    let db = Nidus::open(store.config(mode)?)?;
+    // Resolve the config here so a bad flag fails before anything binds, but defer the
+    // OPEN itself to the server: with `--wait-for-lease` it can block indefinitely, and
+    // the listener must already be answering liveness probes while a standby waits.
+    let open_config = store.config(mode)?;
     // An empty --token / NIDUS_TOKEN (clap reads the env var) means no auth.
     let token = token.filter(|t| !t.is_empty());
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -937,12 +997,17 @@ fn serve(
         addr,
         token,
         max_body_bytes,
+        max_staleness: open_config.max_staleness,
+        // A third of the lease TTL: frequent enough that a long batch cannot let the lease
+        // lapse, infrequent enough to be a rounding error in object-store cost.
+        lease_renew_interval: open_config.lock_ttl / 3,
+        refresh_interval: refresh_interval.map(std::time::Duration::from_secs),
         #[cfg(feature = "memory")]
         embedder,
         #[cfg(all(feature = "memory", feature = "summarize"))]
         summarizer,
     };
-    rt.block_on(crate::server::serve(db, cfg))
+    rt.block_on(crate::server::serve(move || Nidus::open(open_config), cfg))
 }
 
 /// Read JSON from `file`, or from stdin when absent.
@@ -1321,6 +1386,42 @@ mod tests {
         assert!(serve_store(&[]).quant_config().is_none());
     }
 
+    /// `--wait-for-lease` is what turns a losing writer into a standby, so the three
+    /// forms must map exactly: absent keeps the historical fail-fast behaviour, bare waits
+    /// forever, and a number bounds the wait.
+    #[test]
+    fn wait_for_lease_forms() {
+        assert_eq!(
+            serve_store(&[])
+                .config(OpenMode::ReadWrite)
+                .unwrap()
+                .lease_wait,
+            LeaseWait::Fail,
+            "absent must not change behaviour for existing users"
+        );
+        assert_eq!(
+            serve_store(&["--wait-for-lease"])
+                .config(OpenMode::ReadWrite)
+                .unwrap()
+                .lease_wait,
+            LeaseWait::Forever,
+        );
+        assert_eq!(
+            serve_store(&["--wait-for-lease", "45"])
+                .config(OpenMode::ReadWrite)
+                .unwrap()
+                .lease_wait,
+            LeaseWait::Timeout(std::time::Duration::from_secs(45)),
+        );
+
+        // A non-numeric value is a clear error, not a silent fall-back to waiting forever.
+        let err = serve_store(&["--wait-for-lease", "soon"])
+            .config(OpenMode::ReadWrite)
+            .expect_err("non-numeric value must be rejected")
+            .to_string();
+        assert!(err.contains("--wait-for-lease"), "unhelpful error: {err}");
+    }
+
     #[test]
     fn auto_compact_ratio_and_disable_conflict() {
         let cfg = serve_store(&["--auto-compact", "0.25"])
@@ -1385,6 +1486,7 @@ mod tests {
             "x".into(),
             None,
             1,
+            None,
             true,
             #[cfg(feature = "memory")]
             IngestArgs::default(),
@@ -1402,6 +1504,7 @@ mod tests {
             "x".into(),
             None,
             1,
+            None,
             true,
             #[cfg(feature = "memory")]
             IngestArgs::default(),

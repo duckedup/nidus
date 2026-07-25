@@ -33,6 +33,8 @@ send `Authorization: Bearer <token>` — see [Authentication](/guides/http-serve
 | `POST /flush` | flush buffered writes to disk | `flush` |
 | `POST /compact` | reclaim dead rows and superseded log records | `compact` |
 | `POST /refresh` | adopt another instance's newer committed state | `refresh` |
+| `GET /ready` | whether this instance can serve (store open, not fenced, not stale) | — |
+| `GET /cluster` | role, writer-handle state, fencing token, commit counter, staleness | `cluster_status` |
 
 ## Health & introspection
 
@@ -40,6 +42,59 @@ send `Authorization: Bearer <token>` — see [Authentication](/guides/http-serve
 
 Liveness probe. Returns `200` with the body `ok`. Always reachable without a
 token, so a load balancer or `docker healthcheck` needs no credential.
+
+Says nothing about the store — only that the process is up and answering. An instance
+waiting for the writer handle (see `/ready`) is alive, and killing it would be exactly
+wrong, so this keeps returning `200` throughout.
+
+### `GET /ready`
+
+Readiness probe. `200` once this instance can actually serve; `503` otherwise. It fails for
+three distinct reasons, each of which should take an instance out of rotation:
+
+- **no store yet** — still starting, or a standby waiting for the writer handle;
+- **fenced** — this writer was superseded, so every write would fail and it must be replaced;
+- **stale** — a reader has gone longer than `--max-staleness` without verifying it is current
+  (only when that bound is set).
+Also always reachable without a token — an orchestrator would read a `401` as "not ready"
+and never route to a healthy instance.
+
+Use this, not `/health`, to decide whether to send an instance traffic. The two differ
+whenever an instance is *waiting*: the server binds its port before opening the store, so
+`/health` answers immediately while `/ready` stays `503` until there is something to serve.
+That gap is the whole point for a standby writer, which may wait indefinitely for the
+active writer to release the handle.
+
+Data routes answer `503` during that window too, with an error explaining that the
+instance is waiting or still starting up.
+
+### `GET /cluster`
+
+Who this instance is and how current it is — the introspection to reach for during an
+incident. Always unauthenticated-safe to scrape? No: unlike the probes, this one **does**
+require the token when one is configured.
+
+```json
+{
+  "role": "ClusterWriter",
+  "cluster": true,
+  "holds_writer_handle": true,
+  "fenced": false,
+  "lease_owner": "4131-1784992862827886000",
+  "commit_version": 12,
+  "staleness_secs": 0,
+  "max_staleness_secs": null
+}
+```
+
+`role` is one of `Writer`, `Reader`, `ClusterWriter`, `ClusterReader`, `InMemory`.
+`lease_owner` is this instance's fencing token while it holds a cluster lease, and `null`
+otherwise — comparing it across instances answers "who is the writer right now".
+`commit_version` is the manifest commit counter being served, so a reader behind the writer
+reports a lower number; the gap is replication lag. `staleness_secs` is `0` for a writer (it
+*is* the current state) and, for a reader, the age of its last successful refresh.
+
+Every field is read from memory: no object-store round trip, so this is cheap to poll.
 
 ### `GET /stats`
 

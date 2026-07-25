@@ -63,6 +63,27 @@ spec:
             - name: NIDUS_MEMORY
               value: {{ .Values.nidus.memory | quote }}
             {{- end }}
+            {{- if .Values.nidus.cluster }}
+            - name: NIDUS_CLUSTER
+              value: "true"
+            {{- end }}
+            {{- if .Values.nidus.waitForLease }}
+            # Bare value = wait indefinitely: a standby's whole job is to wait.
+            - name: NIDUS_WAIT_FOR_LEASE
+              value: "forever"
+            {{- end }}
+            {{- if .Values.nidus.refreshInterval }}
+            - name: NIDUS_REFRESH_INTERVAL
+              value: {{ .Values.nidus.refreshInterval | quote }}
+            {{- end }}
+            {{- if .Values.nidus.maxStaleness }}
+            - name: NIDUS_MAX_STALENESS
+              value: {{ .Values.nidus.maxStaleness | quote }}
+            {{- end }}
+            {{- if .Values.nidus.lockTtl }}
+            - name: NIDUS_LOCK_TTL
+              value: {{ .Values.nidus.lockTtl | quote }}
+            {{- end }}
             {{- with .Values.nidus.distance }}
             - name: NIDUS_DISTANCE
               value: {{ . | quote }}

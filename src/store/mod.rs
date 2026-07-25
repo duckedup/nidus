@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 
@@ -24,12 +24,12 @@ use crate::backend::{
     BackendLock, ClusterLease, MemoryTier, Persistence, appender_for, locked_error,
     object_try_lock, open_memory_tier, open_persistence,
 };
-use crate::config::{Config, OpenMode};
+use crate::config::{Config, LeaseWait, OpenMode};
 use crate::data::Segments;
 use crate::fts::Fts;
 use crate::log::OpLog;
 use crate::manifest::{MANIFEST_KEY, Manifest};
-use crate::model::{AnnConfig, Distance, Op};
+use crate::model::{AnnConfig, ClusterStatus, Distance, Op, Role};
 
 mod memtier;
 mod quant;
@@ -81,6 +81,22 @@ impl Collection {
 /// reservation was for (units depend on the collection — vectors, rows, entries).
 fn oom(what: &str, count: usize) -> anyhow::Error {
     anyhow!("out of memory reserving capacity for {count} {what}")
+}
+
+/// A pseudo-random duration in `0..=span`, for spreading standby retry polls.
+///
+/// Deliberately not a PRNG: this only needs to decorrelate instances that would otherwise
+/// wake in lockstep when a lease TTL lapses, and the wall clock's nanoseconds already
+/// differ between processes. Nothing depends on the quality of this — a poor draw costs
+/// one redundant lock read.
+fn jitter(span: Duration) -> Duration {
+    if span.is_zero() {
+        return Duration::ZERO;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos() as u64);
+    Duration::from_nanos(nanos % (span.as_nanos().max(1) as u64))
 }
 
 // ── Store ─────────────────────────────────────────────────────────────────────
@@ -176,6 +192,22 @@ pub struct Store {
     /// making its stale segment set the truth. `None` outside cluster mode, for readers, and on
     /// a backend without CAS (the publish then degrades to a plain put, fenced only per-batch).
     manifest_cas: Option<String>,
+    /// This writer has been superseded and can never write again (SPEC §14.6). Latched the
+    /// first time a lease renewal reports the lease lost, because the condition is
+    /// permanent — the instance must reopen. Kept so the state is *observable*
+    /// ([`cluster_status`](Self::cluster_status)) rather than only surfacing as a
+    /// per-request error: a readiness probe has to be able to see it and pull the instance
+    /// out of rotation (nidus-lp4.1). Atomic because renewal happens behind `&self` — and
+    /// an atomic rather than a `Cell` so `Store` stays `Sync` without any `unsafe`.
+    fenced: std::sync::atomic::AtomicBool,
+    /// When this instance last **verified** it was current against the durable store — its
+    /// open, or its most recent successful [`refresh`](Self::refresh).
+    ///
+    /// Reset whether or not the refresh adopted anything: a refresh that finds nothing new
+    /// has still proven the reader current as of that moment, so resetting only on adoption
+    /// would report a frequently-polling, perfectly up-to-date reader as increasingly
+    /// stale. The basis of the staleness a reader reports (nidus-lp4.4).
+    last_verified: Instant,
 }
 
 impl Store {
@@ -234,22 +266,42 @@ impl Store {
                      process-local working set cannot be shared between instances"
                 );
             }
+            // Cluster safety IS the conditional write. Without compare-and-swap the lease
+            // degrades to advisory — two instances can both believe they hold it — and the
+            // mid-batch fence disappears entirely, so a stalled writer that wakes up
+            // superseded can clobber a peer's committed bytes. Refuse rather than run a
+            // cluster on a best-effort lock (nidus-lp4.2).
+            if !persistence.supports_cas() {
+                bail!(
+                    "cluster mode requires a persistence backend with compare-and-swap \
+                     (S3 If-Match / GCS ifGenerationMatch); this backend has none, so the \
+                     writer lease would be advisory only and a superseded writer could \
+                     overwrite committed data"
+                );
+            }
         }
 
         // 3. Acquire the writer handle (ReadWrite only). In cluster mode this is a heartbeated
         //    lease (renewed per write batch, fences a superseded writer); otherwise the plain
         //    writer lock — native `O_EXCL` on local files, or the object lock on a whole-object
         //    store. Readers take neither.
+        //    Under `Config::lease_wait` a losing claimant waits for promotion instead of
+        //    failing — see `await_writer_handle`.
         let (lock, lease) = if config.open_mode == OpenMode::ReadWrite {
             if config.cluster {
-                let lease = ClusterLease::acquire(&persistence, "lock", config.lock_ttl)?
-                    .ok_or_else(|| locked_error(location))?;
+                let lease = Self::await_writer_handle(location, &config, || {
+                    ClusterLease::acquire(&persistence, "lock", config.lock_ttl)
+                })?;
                 (None, Some(lease))
             } else {
-                (
-                    Some(Self::acquire_lock(&persistence, location, config.lock_ttl)?),
-                    None,
-                )
+                let lock = Self::await_writer_handle(location, &config, || {
+                    if persistence.has_native_lock() {
+                        persistence.try_lock("lock", config.lock_ttl)
+                    } else {
+                        object_try_lock(&persistence, "lock", config.lock_ttl)
+                    }
+                })?;
+                (Some(lock), None)
             }
         } else {
             (None, None)
@@ -362,6 +414,8 @@ impl Store {
             scan_order: std::sync::RwLock::new(None),
             loaded_log_offset: watermark,
             manifest_cas,
+            fenced: std::sync::atomic::AtomicBool::new(false),
+            last_verified: Instant::now(),
         };
 
         // Whether the in-RAM index now differs from any tier snapshot — true if we built
@@ -461,6 +515,8 @@ impl Store {
             scan_order: std::sync::RwLock::new(None),
             loaded_log_offset: 0,
             manifest_cas: None,
+            fenced: std::sync::atomic::AtomicBool::new(false),
+            last_verified: Instant::now(),
             config,
         };
         // Align `seg_indexes` to the (single, empty) segment so a later seal can update it
@@ -536,6 +592,9 @@ impl Store {
         let changed =
             manifest.version != self.data.version() || on_disk_log_len != self.loaded_log_offset;
         if !changed {
+            // Verified current: nothing new to adopt, which is just as much proof of
+            // freshness as adopting would be. Reset the staleness clock.
+            self.last_verified = Instant::now();
             return Ok(false);
         }
         // What *kind* of change: a restructure (seal/compaction altered the segment list) needs a
@@ -610,6 +669,7 @@ impl Store {
         self.build_segment_indexes();
         self.load_or_build_fts()?;
 
+        self.last_verified = Instant::now();
         Ok(true)
     }
 
@@ -625,21 +685,118 @@ impl Store {
         }
     }
 
-    /// Acquire the writer lock: the backend's native `O_EXCL` lock (local files) or, on a
-    /// whole-object store with no native lock, the object lock (race-free conditional-PUT
-    /// where the backend supports it, advisory otherwise). Contention is a clear "store is
-    /// locked" error in both cases.
-    fn acquire_lock(
-        persistence: &Arc<dyn Persistence>,
-        location: &str,
-        ttl: Duration,
-    ) -> Result<Box<dyn BackendLock>> {
-        let acquired = if persistence.has_native_lock() {
-            persistence.try_lock("lock", ttl)?
+    /// Who this instance is and how current it is (SPEC §14.6) — see [`ClusterStatus`].
+    ///
+    /// Reads only in-RAM state: no IO, no lock beyond the caller's own. A readiness probe
+    /// calls this every few seconds per instance, so it must not touch the object store.
+    pub fn cluster_status(&self) -> ClusterStatus {
+        let writer = self.config.open_mode == OpenMode::ReadWrite;
+        let role = if self.in_memory {
+            Role::InMemory
         } else {
-            object_try_lock(persistence, "lock", ttl)?
+            match (self.config.cluster, writer) {
+                (true, true) => Role::ClusterWriter,
+                (true, false) => Role::ClusterReader,
+                (false, true) => Role::Writer,
+                (false, false) => Role::Reader,
+            }
         };
-        acquired.ok_or_else(|| locked_error(location))
+        let fenced = self.fenced.load(std::sync::atomic::Ordering::Acquire);
+        ClusterStatus {
+            role,
+            cluster: self.config.cluster,
+            // A fenced writer no longer holds anything, whatever it once thought.
+            holds_writer_handle: (self.lease.is_some() || self.lock.is_some()) && !fenced,
+            fenced,
+            lease_owner: self.lease.as_ref().map(|l| l.owner().to_string()),
+            commit_version: self.data.version(),
+            // A writer IS the current state, so it is never stale. Only a reader lags.
+            staleness_secs: if writer {
+                0
+            } else {
+                self.last_verified.elapsed().as_secs()
+            },
+        }
+    }
+
+    /// A `Drop`-free renewal handle for this instance's cluster writer lease, if it holds one.
+    ///
+    /// Deliberately independent of the store lock. The lease must be renewable *while* a
+    /// long write is in flight — a large batch can hold the write guard for longer than
+    /// `lock_ttl`, and now that standbys exist (nidus-lp4.3) a peer would take over and
+    /// fence a writer that was merely slow, discarding the whole batch. A renewer with its
+    /// own handle keeps the lease warm without waiting on the guard.
+    ///
+    /// Returns a [`LeaseRenewer`], NOT a clone of the lease: `ClusterLease` is an owning
+    /// guard whose `Drop` deletes the lease object, so a cloned guard would release the
+    /// lease as soon as the copy dropped — briefly leaving the object absent, which is
+    /// exactly the window a peer's create-if-absent walks through. Renewal is idempotent
+    /// re-stamping, so racing the op-driven renewal in `guard_writable` is harmless.
+    pub fn lease_renewer(&self) -> Option<crate::backend::LeaseRenewer> {
+        self.lease.as_ref().map(|l| l.renewer())
+    }
+
+    /// Claim the writer handle, honouring [`Config::lease_wait`]. See [`jitter`].
+    ///
+    /// `claim` is one attempt: `Ok(Some(_))` when this instance now holds the handle,
+    /// `Ok(None)` when a live holder owns it (contention, not an error). Under
+    /// [`LeaseWait::Fail`] — the default — contention becomes the "store is locked" error
+    /// immediately, exactly as before. Otherwise this retries, so the process becomes a
+    /// standby that is promoted when the holder dies or releases.
+    ///
+    /// Correctness rests entirely on `claim` being atomic, which it already is: the object
+    /// store's conditional write makes exactly one of N racing claimants win, whether it
+    /// is a fresh acquire or the reclaim of a lease past its TTL. Retrying therefore adds
+    /// no new race — it only changes how a loser responds.
+    fn await_writer_handle<T>(
+        location: &str,
+        config: &Config,
+        claim: impl Fn() -> Result<Option<T>>,
+    ) -> Result<T> {
+        // A stale handle cannot be reclaimed until its TTL lapses, so polling much faster
+        // than that only spends object-store requests. Poll at an eighth of the TTL,
+        // clamped so a tiny TTL does not spin and a large one still notices a *clean*
+        // release (which can happen at any moment) reasonably promptly.
+        let base = (config.lock_ttl / 8).clamp(Duration::from_millis(250), Duration::from_secs(2));
+        let deadline = match config.lease_wait {
+            LeaseWait::Fail => {
+                return claim()?.ok_or_else(|| locked_error(location));
+            }
+            LeaseWait::Timeout(limit) => Some(Instant::now() + limit),
+            LeaseWait::Forever => None,
+        };
+
+        // Remembered so a wait that ends in repeated backend errors reports the real cause
+        // rather than a misleading "store is locked".
+        let mut last_error: Option<anyhow::Error> = None;
+        loop {
+            // A transient backend error must NOT end the wait. A standby may sit here for
+            // hours, and an object store will drop the occasional connection ("Peer
+            // disconnected") in that time; treating the first blip as fatal makes the
+            // process exit, which is precisely the crash-loop waiting exists to avoid.
+            // Only a *definitive* answer — acquired, or the deadline — ends the loop.
+            match claim() {
+                Ok(Some(handle)) => return Ok(handle),
+                Ok(None) => {}
+                Err(e) => {
+                    last_error = Some(e);
+                    eprintln!(
+                        "nidus: waiting for the writer handle — backend error, will retry: {}",
+                        last_error.as_ref().expect("just set")
+                    );
+                }
+            }
+            if let Some(deadline) = deadline
+                && Instant::now() >= deadline
+            {
+                // Surface the real cause when the wait ended in errors rather than
+                // contention — "store is locked" would be a misleading diagnosis.
+                return Err(last_error.unwrap_or_else(|| locked_error(location)));
+            }
+            // Jitter up to +25%: several standbys would otherwise wake together the
+            // instant a TTL lapses and stampede the same lock object.
+            std::thread::sleep(base + jitter(base / 4));
+        }
     }
 
     /// Replay the decoded log `ops` into the in-RAM index — the source of truth when no

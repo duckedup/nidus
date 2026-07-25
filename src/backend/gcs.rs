@@ -187,6 +187,10 @@ impl Persistence for Gcs {
         }
     }
 
+    fn supports_cas(&self) -> bool {
+        true
+    }
+
     fn put_cas(&self, key: &str, bytes: &[u8], expected: Option<&str>) -> Result<CasOutcome> {
         validate_key(key)?;
         let oid = self.object_id(key)?;

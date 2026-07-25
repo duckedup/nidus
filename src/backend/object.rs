@@ -278,7 +278,46 @@ pub struct ClusterLease {
     owner: String,
 }
 
+/// A **non-owning** handle that can renew a lease but never releases it.
+///
+/// Deliberately separate from [`ClusterLease`], which is an owning guard: its `Drop`
+/// deletes the lease object. Cloning the guard to hand a copy to a renewer would therefore
+/// release the lease the moment that copy was dropped — a self-inflicted split-brain, since
+/// a peer's create-if-absent then succeeds against the briefly-absent object. Renewal needs
+/// the key and owner token, not ownership, so it gets its own `Drop`-free type.
+#[derive(Clone)]
+pub struct LeaseRenewer {
+    persistence: Arc<dyn Persistence>,
+    key: String,
+    owner: String,
+}
+
+impl LeaseRenewer {
+    /// Re-stamp the lease, extending its TTL. Errors if this instance has been superseded
+    /// — the same fencing signal a write would hit.
+    pub fn renew(&self) -> Result<()> {
+        renew_lease_object(&self.persistence, &self.key, &self.owner)
+    }
+}
+
 impl ClusterLease {
+    /// A `Drop`-free handle for renewing this lease out of band — see [`LeaseRenewer`].
+    pub fn renewer(&self) -> LeaseRenewer {
+        LeaseRenewer {
+            persistence: self.persistence.clone(),
+            key: self.key.clone(),
+            owner: self.owner.clone(),
+        }
+    }
+
+    /// This instance's fencing token — the owner id written into the lease object.
+    /// Surfaced for operator introspection (`nidus-lp4.5`): during an incident the first
+    /// question is which instance holds the lease, and comparing this against the lease
+    /// object answers it.
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
     /// Acquire the lease for `key`, minting a fresh owner id. `Ok(Some)` when held,
     /// `Ok(None)` when a live writer already holds it (contention — not an error). Reclaims a
     /// stale lease (a crashed holder past `ttl`) race-free, exactly as [`object_try_lock`].
@@ -307,42 +346,47 @@ impl ClusterLease {
     /// argument: while we still own the lease no peer can have reclaimed it, so we just
     /// re-stamp; staleness only gates a *peer*'s takeover via [`try_claim`].)
     pub fn renew(&self) -> Result<()> {
-        match self.persistence.get(&self.key)? {
-            Some(bytes) => {
-                let owner = parse_owner(&bytes);
-                if owner.as_deref() != Some(self.owner.as_str()) {
-                    bail!(
-                        "writer lease lost: the store's lease is now held by another writer \
-                         (this instance was superseded while paused past the lease TTL) — \
-                         stop writing and reopen"
-                    );
-                }
-                // We still own it — re-stamp to extend the TTL.
-                self.persistence
-                    .put(&self.key, &lock_body(now_secs(), Some(&self.owner)))
-                    .context("renew writer lease")
-            }
-            None => {
-                // The lease object vanished (a peer found ours stale and deleted it, or it was
-                // never persisted). Re-claim atomically: if a peer beat us to it we are fenced.
-                let body = lock_body(now_secs(), Some(&self.owner));
-                match self.persistence.try_create_exclusive(&self.key, &body)? {
-                    Some(true) => Ok(()), // reclaimed cleanly
-                    Some(false) => bail!(
-                        "writer lease lost: another writer re-created the lease — stop writing \
-                         and reopen"
-                    ),
-                    None => self
-                        .persistence
-                        .put(&self.key, &body)
-                        .context("re-create writer lease (advisory backend)"),
-                }
-            }
-        }
+        renew_lease_object(&self.persistence, &self.key, &self.owner)
     }
 }
 
 impl BackendLock for ClusterLease {}
+
+/// Re-stamp lease object `key` for `owner`, the shared body of [`ClusterLease::renew`] and
+/// [`LeaseRenewer::renew`] — one implementation, so the owning guard and the out-of-band
+/// renewer can never drift on what "renew" means.
+fn renew_lease_object(persistence: &Arc<dyn Persistence>, key: &str, owner: &str) -> Result<()> {
+    match persistence.get(key)? {
+        Some(bytes) => {
+            if parse_owner(&bytes).as_deref() != Some(owner) {
+                bail!(
+                    "writer lease lost: the store's lease is now held by another writer \
+                     (this instance was superseded while paused past the lease TTL) — \
+                     stop writing and reopen"
+                );
+            }
+            // We still own it — re-stamp to extend the TTL.
+            persistence
+                .put(key, &lock_body(now_secs(), Some(owner)))
+                .context("renew writer lease")
+        }
+        None => {
+            // The lease object vanished (a peer found ours stale and deleted it, or it was
+            // never persisted). Re-claim atomically: if a peer beat us to it we are fenced.
+            let body = lock_body(now_secs(), Some(owner));
+            match persistence.try_create_exclusive(key, &body)? {
+                Some(true) => Ok(()), // reclaimed cleanly
+                Some(false) => bail!(
+                    "writer lease lost: another writer re-created the lease — stop writing \
+                     and reopen"
+                ),
+                None => persistence
+                    .put(key, &body)
+                    .context("re-create writer lease (advisory backend)"),
+            }
+        }
+    }
+}
 
 impl Drop for ClusterLease {
     fn drop(&mut self) {

@@ -43,7 +43,11 @@ mod tests;
 pub use gcs::Gcs;
 pub use local::{FileAppender, LocalFs};
 pub use object::ObjectAppender;
-pub(crate) use object::{ClusterLease, locked_error, object_try_lock};
+pub(crate) use object::{locked_error, object_try_lock};
+// Public: a cluster writer's lease handle is part of the API surface, so an async host
+// (`nidus serve`, or an embedding application) can keep the lease warm on a timer while a
+// long write holds the store lock — see `Nidus::lease_handle`.
+pub use object::{ClusterLease, LeaseRenewer};
 pub use ram::LocalRam;
 pub(crate) use ram::MemAppender;
 pub use redis::RedisTier;
@@ -142,6 +146,26 @@ pub trait Persistence: Send + Sync {
     /// advisory otherwise. Default `true`.
     fn has_native_lock(&self) -> bool {
         true
+    }
+
+    /// Whether this backend implements a real compare-and-swap
+    /// ([`put_cas`](Self::put_cas) / [`get_cas`](Self::get_cas)).
+    ///
+    /// **Cluster mode requires this** and refuses a backend without it (SPEC §14.6).
+    /// Without CAS the writer lease degrades to advisory: two instances can both believe
+    /// they hold it, and the mid-batch fence — which is a *conditional* write or nothing —
+    /// simply does not exist, so a stale writer can clobber a peer's committed bytes.
+    /// Tolerable for a single-node advisory lock; not for the mode whose entire safety
+    /// argument is the conditional write.
+    ///
+    /// Deliberately separate from [`has_native_lock`](Self::has_native_lock), which asks a
+    /// different question and would give the wrong answer here: GCS reports `false` there
+    /// (it has no `O_EXCL`) yet fully supports CAS via `ifGenerationMatch`, so gating on
+    /// the lock capability would reject a perfectly good cluster backend.
+    ///
+    /// Default `false` — a backend must opt in by implementing `put_cas`.
+    fn supports_cas(&self) -> bool {
+        false
     }
 }
 

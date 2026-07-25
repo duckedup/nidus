@@ -8,6 +8,31 @@ use anyhow::{Result, bail};
 
 use crate::model::{AnnConfig, Distance, Quantization};
 
+/// What a [`OpenMode::ReadWrite`] open does when another instance already holds the
+/// writer handle.
+///
+/// The default, [`Fail`](LeaseWait::Fail), is the historical behaviour: contention is
+/// immediately the "store is locked" error. That is right for a CLI command and for the
+/// single-writer case, but it makes a *hot standby* impossible — a second instance started
+/// while the incumbent is alive exits at once, so under a supervisor it crash-loops, and
+/// failover takes however long the supervisor's backoff has grown to.
+///
+/// Waiting instead turns that into a supported standby: the process stays up, retries
+/// acquisition, and takes over within roughly [`Config::lock_ttl`] of the holder dying.
+/// This needs no coordinator and no consensus — the object store's compare-and-swap is
+/// already the linearizable authority that makes exactly one claimant win (SPEC §14.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LeaseWait {
+    /// Fail immediately on contention. The default.
+    #[default]
+    Fail,
+    /// Retry until acquired, or until this long has elapsed and then fail. For a
+    /// script or one-shot command that should not hang forever.
+    Timeout(Duration),
+    /// Retry indefinitely — a standby whose whole job is to wait for promotion.
+    Forever,
+}
+
 /// How aggressively writes are flushed to disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fsync {
@@ -47,6 +72,20 @@ pub struct Config {
     pub auto_compact: Option<f32>,
     /// Stale writer-lock reclamation window. Default 60s.
     pub lock_ttl: Duration,
+    /// What to do when another instance holds the writer handle. Default
+    /// [`LeaseWait::Fail`] — see [`LeaseWait`] for why waiting is what a standby needs.
+    pub lease_wait: LeaseWait,
+    /// How stale a read-only instance may be before it should stop serving. `None` (the
+    /// default) means no bound — the historical behaviour, where a reader serves its
+    /// snapshot for as long as it likes.
+    ///
+    /// A cluster reader only advances when something calls `refresh()`, so without a bound
+    /// a reader whose refresher has died serves ever-older results indefinitely and looks
+    /// perfectly healthy doing it. With a bound set, [`ClusterStatus::staleness_secs`]
+    /// exceeding it is what `nidus serve`'s readiness probe fails on, so a load balancer
+    /// takes the instance out of rotation instead. Purely a *reporting* threshold: reads
+    /// are never rejected by the library itself.
+    pub max_staleness: Option<Duration>,
     /// Hard ceiling on the vector matrix (`rows * dimension * 4` bytes); `None`
     /// disables (the default — no behavior change). Enforced *before* allocating:
     /// `upsert` refuses a batch that would exceed it, and `open` refuses a data
@@ -146,6 +185,8 @@ impl Config {
             open_mode: OpenMode::ReadWrite,
             auto_compact: Some(0.5),
             lock_ttl: Duration::from_secs(60),
+            lease_wait: LeaseWait::default(),
+            max_staleness: None,
             max_vector_bytes: None,
             quantization: None,
             ann: None,
@@ -186,6 +227,21 @@ impl Config {
     /// Set the stale-lock reclamation window.
     pub fn lock_ttl(mut self, ttl: Duration) -> Self {
         self.lock_ttl = ttl;
+        self
+    }
+
+    /// Set how stale a read-only instance may be before its readiness probe should fail
+    /// (`None` = no bound, the default). See [`max_staleness`](Self::max_staleness).
+    pub fn max_staleness(mut self, max: Option<Duration>) -> Self {
+        self.max_staleness = max;
+        self
+    }
+
+    /// Set what a `ReadWrite` open does when another instance holds the writer handle
+    /// (default [`LeaseWait::Fail`]). [`LeaseWait::Forever`] makes this instance a
+    /// standby that waits for promotion instead of exiting.
+    pub fn lease_wait(mut self, wait: LeaseWait) -> Self {
+        self.lease_wait = wait;
         self
     }
 
