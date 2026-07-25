@@ -42,6 +42,42 @@ fn service(var: &str, default: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| default.to_string())
 }
 
+/// Fail fast, once per process, if the backing services are not reachable.
+///
+/// Without this the first symptom is a child process dying with `Connection refused`
+/// buried in its captured stderr — technically diagnosable, but it does not tell you the
+/// one thing you need to know, which is that you forgot to start the services.
+fn require_services() {
+    static CHECKED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    CHECKED.get_or_init(|| {
+        let endpoint = service("NIDUS_E2E_S3_ENDPOINT", "http://127.0.0.1:9100");
+        let redis = service("NIDUS_E2E_REDIS_URL", "redis://127.0.0.1:6479");
+        let hint = "start them with `just e2e-services-up` (or point the tests elsewhere \
+                    with NIDUS_E2E_S3_ENDPOINT / NIDUS_E2E_REDIS_URL)";
+
+        let health = format!("{}/minio/health/live", endpoint.trim_end_matches('/'));
+        assert!(
+            ureq::get(&health).call().is_ok(),
+            "S3 endpoint {endpoint} is not reachable — {hint}"
+        );
+
+        // No Redis round trip needed: a TCP connect distinguishes "nothing listening"
+        // (the mistake this guards) from a protocol-level problem, which the store's own
+        // error would explain better than we could here. Strip the scheme, then any
+        // `/db` or `?prefix=…` tail, so a fully-specified URL still yields host:port.
+        let addr = redis
+            .split_once("://")
+            .map_or(redis.as_str(), |(_, rest)| rest)
+            .split(['/', '?'])
+            .next()
+            .unwrap_or_default();
+        assert!(
+            std::net::TcpStream::connect(addr).is_ok(),
+            "memory tier {redis} is not reachable at {addr} — {hint}"
+        );
+    });
+}
+
 /// A store prefix unique to this process *and* this call, so tests neither collide with
 /// each other nor inherit objects left by an earlier run of the same test.
 fn unique_prefix(name: &str) -> String {
@@ -60,6 +96,7 @@ fn unique_prefix(name: &str) -> String {
 /// object store, but the flag is still required, so each instance gets its own scratch
 /// path exactly as separate machines would.
 fn instance(prefix: &str, read_only: bool, extra: &[&str]) -> (tempfile::TempDir, RunningServer) {
+    require_services();
     let dir = tempfile::tempdir().expect("temp dir");
     let bucket = service("NIDUS_E2E_S3_BUCKET", "nidus-test");
     let mut args = vec![

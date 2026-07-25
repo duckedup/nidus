@@ -238,6 +238,13 @@ each.
   module here, not as a new `tests/*.rs`. These cover what the in-process
   `tower::oneshot` server tests structurally cannot: the real bind, the CLI-flag →
   `ServeConfig` wiring, socket framing, cross-process locking, and restart.
+  `cluster.rs` goes further — several real instances over a **real** object store and
+  memory tier — and is therefore `#[ignore]`d: bring the services up with `just
+  e2e-services-up` (defined once in `scripts/e2e-services.sh`, shared with CI so the
+  two cannot drift) and run `just test-e2e-cluster`. `.github/workflows/integration.yml`
+  runs the whole target with `--include-ignored` on every PR, so anything added here
+  is enforced. When a cluster test fails, read the panic first: the harness attaches
+  the offending process's own stderr.
 
 ### Integrating into a host application
 

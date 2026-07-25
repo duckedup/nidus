@@ -1,0 +1,100 @@
+name: Integration
+
+# End-to-end tests against a REAL running system: the `nidus serve` binary driven
+# over a real socket, and several instances clustered over a real object store
+# (minio) and a real Redis-family memory tier (valkey).
+#
+# Its own workflow, not a lane in ci.yml, for two reasons: it is the only job that
+# needs Docker services, and keeping it separate means `ci.yml` stays a statement
+# about the pure library + feature lanes — fast, service-free, and unaffected by a
+# container hiccup.
+#
+# This is intended to be a REQUIRED status check on pull requests. Adding it here
+# only makes it *run*; marking it required is a branch-protection setting in the
+# repository configuration. Until that is flipped, a red run is advisory.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  e2e:
+    name: e2e (real server + cluster over minio/valkey)
+    runs-on: ubuntu-latest
+    # Generous next to the ~30s of real work, but bounded: a hung server or a
+    # service that never comes up must fail the check rather than burn an hour.
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Same cache shape as ci.yml's matrix jobs, with its own key so it neither
+      # evicts nor is evicted by them.
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-e2e-
+
+      # Build before starting anything, so a compile error reads as a compile
+      # error instead of a confusing "server never reported an address".
+      - name: Build the test binary and the nidus binary
+        run: cargo test --features cli --test e2e --no-run
+
+      # Started via the same script `just e2e-services-up` runs, so a developer
+      # reproducing a CI failure gets a byte-identical environment. Not GitHub
+      # `services:` containers: those cannot pass a command to the image, and
+      # minio needs `server /data`. The script waits for real readiness
+      # (minio /health/live, valkey PING) rather than sleeping.
+      - name: Start minio + valkey
+        run: ./scripts/e2e-services.sh up
+
+      # --include-ignored runs the cluster suite (#[ignore]d because it needs the
+      # services above) alongside the service-free server suite, so this job is a
+      # complete statement about e2e health on its own. The server suite also runs
+      # in ci.yml's test-cli lane; the few seconds of overlap are worth not having
+      # this check depend on another workflow.
+      #
+      # The tests' NIDUS_E2E_* defaults already match what the script starts, so
+      # there is nothing to configure here — one less pair of values to drift.
+      - name: Run end-to-end tests
+        run: cargo test --features cli --test e2e -- --include-ignored --test-threads=2
+
+      # A red run should be diagnosable from the log alone, without a rerun. The
+      # harness already attaches each nidus process's stderr to its failure; these
+      # are the backing services' side of the story.
+      - name: Service logs (on failure)
+        if: failure()
+        run: |
+          echo "::group::minio"
+          docker logs nidus-e2e-minio 2>&1 | tail -100 || true
+          echo "::endgroup::"
+          echo "::group::valkey"
+          docker logs nidus-e2e-valkey 2>&1 | tail -100 || true
+          echo "::endgroup::"
+          echo "::group::stray nidus processes"
+          pgrep -af "nidus serve" || echo "none (harness cleaned up)"
+          echo "::endgroup::"
+
+      - name: Stop minio + valkey
+        if: always()
+        run: ./scripts/e2e-services.sh down
