@@ -35,14 +35,27 @@ impl Store {
         if let Some(lease) = &self.lease
             && let Err(e) = lease.renew()
         {
-            // Latch it. Losing the lease is permanent — this instance can never write again
-            // and must be replaced — so record it rather than letting the fact exist only
-            // inside this one error. That is what lets a readiness probe see a fenced writer
-            // and pull it out of rotation instead of leaving it in the load balancer
-            // failing every write (nidus-lp4.1).
-            self.fenced
-                .store(true, std::sync::atomic::Ordering::Release);
-            eprintln!("nidus: writer lease LOST — this instance is fenced: {e:#}");
+            // Only a *definitive* loss latches the fence (nidus-lp4.7). Losing the lease is
+            // permanent — this instance can never write again and must be replaced — so
+            // record it rather than letting the fact exist only inside this one error. That is
+            // what lets a readiness probe see a fenced writer and pull it out of rotation
+            // instead of leaving it in the load balancer failing every write (nidus-lp4.1).
+            //
+            // A *transient* backend failure is a different thing entirely and must not latch:
+            // an object store drops the occasional connection, and treating that as "you have
+            // been superseded" would retire a perfectly healthy writer permanently, on a blip,
+            // with no way back but a restart. Fail this write — we could not prove we still
+            // hold the lease, so proceeding would be unsound — but stay in service.
+            if crate::backend::is_lease_lost(&e) {
+                self.fenced
+                    .store(true, std::sync::atomic::Ordering::Release);
+                eprintln!("nidus: writer lease LOST — this instance is fenced: {e:#}");
+            } else {
+                eprintln!(
+                    "nidus: writer lease renewal failed transiently — this write is refused, \
+                     but the lease is still ours: {e:#}"
+                );
+            }
             return Err(e);
         }
         Ok(())

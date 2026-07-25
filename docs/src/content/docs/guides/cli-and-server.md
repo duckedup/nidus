@@ -260,8 +260,15 @@ Pass a number of seconds (`--wait-for-lease 300`) to give up after that long ins
 waiting indefinitely — useful in a script that should not hang.
 
 `--lock-ttl` is the failover-latency knob: it bounds how long a dead writer's handle stays
-un-reclaimable, and so how long promotion takes. Lower is faster, but too low risks fencing
-a writer that is merely slow — a very large batch can outlast a short TTL.
+un-reclaimable, and so how long promotion takes (within a second either side — lease stamps
+have one-second granularity, and the reclaim rule errs towards leaving a live writer alone).
+Lower is faster. It does not need to be sized against your largest batch: the writer renews
+its lease on a timer at a third of the TTL, independently of any write, so a very large batch
+or a slow object-store `PUT` no longer risks having a healthy writer replaced mid-flight.
+
+A renewal that fails because the object store was briefly unreachable does not fence the
+writer either — only the store actually reporting a different lease owner does. A blip costs
+the write in flight, not the instance.
 
 ### Keeping readers current, and noticing when they are not
 

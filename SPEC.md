@@ -1180,9 +1180,30 @@ single-node payoff before any distribution work:
    `Config::cluster` (rejected unless persistence is a shared object store **and** a shared
    memory tier is set — local FS / process RAM are single-node). One `ReadWrite` writer holds
    a **lease** (the §6.3 object lock evolved: it carries an owner token and is **renewed on
-   every write batch** — op-driven, no background thread — so an active writer keeps it while
-   an idle one past the TTL can be taken over); the renewal **fences** a superseded writer at the
-   start of each batch. The narrower window the per-batch renew cannot cover — a writer that
+   every write batch** — op-driven, no background thread in the library — so an active writer
+   keeps it while an idle one past the TTL can be taken over); the renewal **fences** a
+   superseded writer at the start of each batch. `nidus serve` additionally renews on a timer at
+   `lock_ttl/3` through a `Drop`-free `LeaseRenewer` that does not take the store lock, so an
+   idle writer — or one inside a batch longer than the TTL — is not mistaken for a dead one now
+   that standbys wait to take over (`--wait-for-lease`).
+
+   Renewal is itself a **compare-and-swap** on the lease object, not a blind put (nidus-lp4.7).
+   Get-then-put was a read-modify-write race: a peer reclaiming the lease between the holder's
+   read and its write would be silently overwritten, leaving *two* instances each believing they
+   held the writer handle. The conditional write turns that into a detected loss — and a lost CAS
+   is re-read before concluding anything, so an instance racing *its own* other renewer (the
+   op-driven one against the timer) is not fenced by mistake. Relatedly, the staleness verdict
+   treats an age *equal* to the TTL as still-live: stamps are whole seconds, so a truncated age
+   can overstate the real elapsed time by nearly a second, and a strict comparison would declare
+   a live, renewing holder dead. Takeover therefore lands in `ttl..=ttl+1` seconds — availability
+   pays a bounded cost so mutual exclusion does not.
+
+   A renewal failure is classified, too: only the store naming a *different* owner is a lost
+   lease (permanent — the instance latches `fenced` and reports NOT ready). A transient backend
+   error fails the write in flight and nothing more, because permanently retiring a healthy
+   writer over a dropped connection trades an outage for a blip.
+
+   The narrower window the per-batch renew cannot cover — a writer that
    stalls past the lease TTL *mid-batch* while a replacement takes over — is closed by
    **compare-and-swap on every durable object write** (nidus-ahw): each cluster write of a
    segment/`log`/`manifest` object is conditional on the version the writer last saw (S3

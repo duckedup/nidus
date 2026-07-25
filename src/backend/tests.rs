@@ -138,6 +138,8 @@ struct MapBackend {
     state: Mutex<MapState>,
     cas: bool,
     inject_renew: Mutex<Option<Vec<u8>>>,
+    /// When set, reads fail with an IO-shaped error (see [`MapBackend::fail_reads`]).
+    fail_reads: Mutex<bool>,
 }
 
 impl MapBackend {
@@ -145,6 +147,12 @@ impl MapBackend {
         Self::arc_injecting(cas, None)
     }
     fn arc_injecting(cas: bool, renew_with: Option<Vec<u8>>) -> Arc<dyn Persistence> {
+        Self::concrete(cas, renew_with)
+    }
+    /// The same double as a **concrete** handle, so a test can keep calling inherent methods
+    /// ([`inject_next_read`](Self::inject_next_read)) after handing the trait object to the
+    /// code under test. Coerce with `let dyn_: Arc<dyn Persistence> = concrete.clone();`.
+    fn concrete(cas: bool, renew_with: Option<Vec<u8>>) -> Arc<MapBackend> {
         Arc::new(MapBackend {
             state: Mutex::new(MapState {
                 objects: HashMap::new(),
@@ -152,12 +160,29 @@ impl MapBackend {
             }),
             cas,
             inject_renew: Mutex::new(renew_with),
+            fail_reads: Mutex::new(false),
         })
+    }
+
+    /// Arrange for the **next** `get_cas` to write `body` after taking its snapshot —
+    /// simulating a peer that wrote the object in the read→write gap. Set after acquiring, so
+    /// the injected body can name an owner the test only learns at acquire time.
+    fn inject_next_read(&self, body: Vec<u8>) {
+        *self.inject_renew.lock().unwrap() = Some(body);
+    }
+
+    /// Make every read fail with an IO-shaped error — a dropped connection, not a verdict on
+    /// who holds the lease.
+    fn fail_reads(&self, fail: bool) {
+        *self.fail_reads.lock().unwrap() = fail;
     }
 }
 
 impl Persistence for MapBackend {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        if *self.fail_reads.lock().unwrap() {
+            anyhow::bail!("injected transient backend failure: Peer disconnected");
+        }
         Ok(self
             .state
             .lock()
@@ -181,6 +206,9 @@ impl Persistence for MapBackend {
         Ok(self.state.lock().unwrap().objects.keys().cloned().collect())
     }
     fn get_cas(&self, key: &str) -> Result<Option<(Vec<u8>, Option<String>)>> {
+        if *self.fail_reads.lock().unwrap() {
+            anyhow::bail!("injected transient backend failure: Peer disconnected");
+        }
         if !self.cas {
             return Ok(self.get(key)?.map(|b| (b, None)));
         }
@@ -346,6 +374,153 @@ fn cluster_lease_renew_reclaims_a_vanished_lease() {
             "lease re-created on renew"
         );
     }
+}
+
+/// **A live lease must never read as stale** just because stamps are truncated to whole
+/// seconds (nidus-lp4.7).
+///
+/// The staleness verdict compares two one-second-granularity stamps, so the age it computes
+/// can overstate the elapsed time by nearly a full second. Under a strict `age < ttl` that
+/// gap is a split brain: a holder renewing happily is declared dead and a peer reclaims its
+/// lease, after which both instances believe they hold the writer handle.
+#[test]
+fn a_lease_stays_live_for_its_whole_ttl_despite_truncated_stamps() {
+    use super::object::is_live;
+
+    let ttl = Duration::from_secs(2);
+    // Stamped at 1, read at 3 → age 2. As little as 1.02s may actually have elapsed
+    // (renewed at t=1.99, read at t=3.01), so this lease must still count as live.
+    assert!(
+        is_live(3, 1, ttl),
+        "age == ttl must stay live: truncation can inflate the age by nearly a second"
+    );
+    assert!(is_live(1, 1, ttl), "a just-stamped lease is live");
+    // Once the age is *certainly* past the TTL, it is reclaimable — failover still happens.
+    assert!(!is_live(4, 1, ttl), "age > ttl is reclaimable");
+    assert!(!is_live(9_999, 1, ttl), "an ancient stamp is reclaimable");
+}
+
+/// **A renewal must not steal back a lease a peer already reclaimed** (nidus-lp4.7).
+///
+/// This was a mutual-exclusion break, not merely a cosmetic one. Renewal used to be
+/// get-then-**unconditional**-put, a read-modify-write race: the holder reads the lease and
+/// sees itself, a peer reclaims it in the gap, and the holder's blind put then stamps its own
+/// ownership straight back over the peer's lease. Both instances then report
+/// `holds_writer_handle: true` with different owner tokens — exactly the reported symptom.
+/// The conditional write turns that into a detected loss.
+#[test]
+fn cluster_lease_renewal_cannot_steal_back_a_lease_a_peer_reclaimed() {
+    let backend = MapBackend::concrete(true, None);
+    let dyn_backend: Arc<dyn Persistence> = backend.clone();
+    let lease = ClusterLease::acquire(&dyn_backend, "lock", Duration::from_secs(60))
+        .unwrap()
+        .expect("first acquire wins");
+
+    // A peer reclaims the lease in the read→write gap of our renewal.
+    let peer = b"9999999999 peer-owner".to_vec();
+    backend.inject_next_read(peer.clone());
+
+    let err = lease
+        .renew()
+        .expect_err("a renewal that lost the CAS to a peer must fail, not overwrite it");
+    assert!(
+        is_lease_lost(&err),
+        "losing the lease is definitive, not transient: {err:#}"
+    );
+    assert_eq!(
+        backend.get("lock").unwrap().as_deref(),
+        Some(peer.as_slice()),
+        "the peer's lease must survive — the renewal must not have stamped ours back over it",
+    );
+}
+
+/// The flip side: an instance's **own** concurrent renewal must not fence it (nidus-lp4.7).
+///
+/// The op-driven pre-batch renewal and the server's background timer can fire at once, and
+/// re-stamping is idempotent, so one losing the CAS to the other is harmless. Treating every
+/// lost CAS as a takeover would make a healthy writer fence *itself* — a self-inflicted
+/// outage, and a strictly worse bug than the one being fixed.
+#[test]
+fn cluster_lease_renewal_tolerates_this_instances_own_concurrent_renewal() {
+    let backend = MapBackend::concrete(true, None);
+    let dyn_backend: Arc<dyn Persistence> = backend.clone();
+    let lease = ClusterLease::acquire(&dyn_backend, "lock", Duration::from_secs(60))
+        .unwrap()
+        .unwrap();
+
+    // Our other renewer re-stamps in the gap: same owner, fresh stamp.
+    backend.inject_next_read(format!("9999999999 {}", lease.owner()).into_bytes());
+
+    lease
+        .renew()
+        .expect("losing the CAS to our own renewal is not a lost lease");
+}
+
+/// **A transient backend error is not a lost lease** (nidus-lp4.7).
+///
+/// Object stores drop connections. Renewal used to report every failure the same way, and the
+/// write path latched `fenced` on any of them — so one blip retired a healthy writer
+/// permanently, recoverable only by a restart. The lease is only *lost* when the store says
+/// somebody else holds it.
+#[test]
+fn a_transient_backend_error_is_not_a_lost_lease() {
+    let backend = MapBackend::concrete(true, None);
+    let dyn_backend: Arc<dyn Persistence> = backend.clone();
+    let lease = ClusterLease::acquire(&dyn_backend, "lock", Duration::from_secs(60))
+        .unwrap()
+        .unwrap();
+
+    backend.fail_reads(true);
+    let err = lease
+        .renew()
+        .expect_err("the read failed, so renewal fails");
+    assert!(
+        !is_lease_lost(&err),
+        "a dropped connection says nothing about who holds the lease: {err:#}"
+    );
+
+    // And a renewer must not latch the store's fence on it.
+    let fenced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let renewer = lease.renewer(fenced.clone());
+    assert!(renewer.renew().is_err());
+    assert!(
+        !fenced.load(std::sync::atomic::Ordering::Acquire),
+        "a transient error must not fence a healthy writer"
+    );
+
+    // Recovering the backend recovers the writer — no restart needed.
+    backend.fail_reads(false);
+    renewer.renew().expect("still ours once the blip passes");
+    assert!(!fenced.load(std::sync::atomic::Ordering::Acquire));
+}
+
+/// **A lease lost on a *background* renewal must latch the shared fence** (nidus-lp4.7).
+///
+/// The background renewer runs every `lock_ttl/3`, so it is the first thing to learn the lease
+/// is gone — a write may not arrive for minutes. That discovery used to be printed to stderr
+/// and dropped: `fenced` was set only by a failing write, so a superseded writer kept
+/// answering `/ready` with 200 and reporting `holds_writer_handle: true`. Sharing the latch is
+/// what makes the readiness signal of nidus-lp4.1 honest.
+#[test]
+fn a_background_renewal_that_loses_the_lease_latches_the_shared_fence() {
+    let backend = MapBackend::arc(true);
+    let lease = ClusterLease::acquire(&backend, "lock", Duration::from_secs(60))
+        .unwrap()
+        .unwrap();
+    let fenced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let renewer = lease.renewer(fenced.clone());
+    renewer.renew().expect("ours to begin with");
+    assert!(!fenced.load(std::sync::atomic::Ordering::Acquire));
+
+    // A peer takes over.
+    backend.put("lock", b"9999999999 peer-owner").unwrap();
+
+    let err = renewer.renew().expect_err("superseded");
+    assert!(is_lease_lost(&err), "{err:#}");
+    assert!(
+        fenced.load(std::sync::atomic::Ordering::Acquire),
+        "the store's fence must be latched by the background renewer, not only by a write"
+    );
 }
 
 // ── LocalFs object ops (file-backed, Miri-ignored) ──────────────────────────────

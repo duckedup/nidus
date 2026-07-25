@@ -199,7 +199,11 @@ pub struct Store {
     /// per-request error: a readiness probe has to be able to see it and pull the instance
     /// out of rotation (nidus-lp4.1). Atomic because renewal happens behind `&self` — and
     /// an atomic rather than a `Cell` so `Store` stays `Sync` without any `unsafe`.
-    fenced: std::sync::atomic::AtomicBool,
+    /// `Arc` so an out-of-band [`LeaseRenewer`](crate::backend::LeaseRenewer) shares the same
+    /// latch: a lease lost on a background renewal must land here, where
+    /// [`cluster_status`](Self::cluster_status) and the readiness probe can see it, rather
+    /// than only in a log line (nidus-lp4.7).
+    fenced: Arc<std::sync::atomic::AtomicBool>,
     /// When this instance last **verified** it was current against the durable store — its
     /// open, or its most recent successful [`refresh`](Self::refresh).
     ///
@@ -414,7 +418,7 @@ impl Store {
             scan_order: std::sync::RwLock::new(None),
             loaded_log_offset: watermark,
             manifest_cas,
-            fenced: std::sync::atomic::AtomicBool::new(false),
+            fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_verified: Instant::now(),
         };
 
@@ -515,7 +519,7 @@ impl Store {
             scan_order: std::sync::RwLock::new(None),
             loaded_log_offset: 0,
             manifest_cas: None,
-            fenced: std::sync::atomic::AtomicBool::new(false),
+            fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_verified: Instant::now(),
             config,
         };
@@ -733,7 +737,10 @@ impl Store {
     /// exactly the window a peer's create-if-absent walks through. Renewal is idempotent
     /// re-stamping, so racing the op-driven renewal in `guard_writable` is harmless.
     pub fn lease_renewer(&self) -> Option<crate::backend::LeaseRenewer> {
-        self.lease.as_ref().map(|l| l.renewer())
+        // Hand over a clone of *this store's* fenced latch, so a lease lost on a background
+        // renewal is recorded where `cluster_status` — and therefore the readiness probe —
+        // will see it, instead of only reaching stderr (nidus-lp4.7).
+        self.lease.as_ref().map(|l| l.renewer(self.fenced.clone()))
     }
 
     /// Claim the writer handle, honouring [`Config::lease_wait`]. See [`jitter`].

@@ -76,8 +76,8 @@ pub use memory::{META_SOURCE, META_SUMMARY};
 
 pub use anyhow::Result;
 pub use backend::{
-    Appender, BackendLock, CasOutcome, ClusterLease, LeaseRenewer, LocalFs, LocalRam, MemoryTier,
-    Persistence, open_memory_tier, open_persistence,
+    Appender, BackendLock, CasOutcome, ClusterLease, LeaseLost, LeaseRenewer, LocalFs, LocalRam,
+    MemoryTier, Persistence, is_lease_lost, open_memory_tier, open_persistence,
 };
 pub use config::{Config, Fsync, LeaseWait, OpenMode};
 pub use fts::Language;

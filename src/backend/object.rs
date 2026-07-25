@@ -142,6 +142,10 @@ impl BackendLock for ObjectLock {}
 impl Drop for ObjectLock {
     fn drop(&mut self) {
         // Best-effort release; if it fails the TTL still reclaims the lock eventually.
+        lease_debug(format_args!(
+            "ObjectLock::drop key={:?} — DELETING the lock object",
+            self.key
+        ));
         let _ = self.persistence.delete(&self.key);
     }
 }
@@ -183,11 +187,21 @@ fn try_claim(
     body: &[u8],
 ) -> Result<Option<()>> {
     let now = now_secs();
+    lease_debug(format_args!(
+        "try_claim key={key:?} ttl={}s now={now} body={:?}",
+        ttl.as_secs(),
+        String::from_utf8_lossy(body)
+    ));
 
     // Fast path: atomic create-if-absent. A fresh acquire (no prior holder) is fully
     // race-free — exactly one of N racing writers gets `Some(true)`.
     match persistence.try_create_exclusive(key, body)? {
-        Some(true) => return Ok(Some(())),
+        Some(true) => {
+            lease_debug(format_args!(
+                "try_claim key={key:?} ACQUIRED via create-if-absent (object was ABSENT)"
+            ));
+            return Ok(Some(()));
+        }
         Some(false) => {} // a holder exists — fall through to the staleness check
         None => return advisory_claim(persistence, key, ttl, now, body), // no atomic primitive
     }
@@ -199,11 +213,25 @@ fn try_claim(
     // compare-and-swap gated on the token we read refuses in exactly that case.
     let Some((held, token)) = persistence.get_cas(key)? else {
         // Vanished since the create attempt above — race a fresh atomic create for it.
+        lease_debug(format_args!(
+            "try_claim key={key:?} VANISHED between create-probe and read — racing a create"
+        ));
         return reclaim_create(persistence, key, body);
     };
-    if now.saturating_sub(parse_stamp(&held)) < ttl.as_secs() {
+    lease_debug(format_args!(
+        "try_claim key={key:?} held={:?} stamp={} age={}s ttl={}s token={}",
+        String::from_utf8_lossy(&held),
+        parse_stamp(&held),
+        now.saturating_sub(parse_stamp(&held)),
+        ttl.as_secs(),
+        token.as_deref().unwrap_or("<none>")
+    ));
+    if is_live(now, parse_stamp(&held), ttl) {
         return Ok(None); // a live holder owns it
     }
+    lease_debug(format_args!(
+        "try_claim key={key:?} holder judged STALE — attempting reclaim"
+    ));
     match token {
         // CAS-capable backend (S3/GCS): reclaim with a compare-and-swap gated on the stale
         // object's token. A holder that renewed in the gap (its token moved) or a peer that
@@ -245,7 +273,7 @@ fn advisory_claim(
     body: &[u8],
 ) -> Result<Option<()>> {
     if let Some(existing) = persistence.get(key)?
-        && now.saturating_sub(parse_stamp(&existing)) < ttl.as_secs()
+        && is_live(now, parse_stamp(&existing), ttl)
     {
         return Ok(None); // a live holder owns it (else: stale — reclaim by overwriting below)
     }
@@ -290,23 +318,49 @@ pub struct LeaseRenewer {
     persistence: Arc<dyn Persistence>,
     key: String,
     owner: String,
+    /// Latched when a renewal proves the lease **definitively** lost. Shared with the owning
+    /// store's `fenced` flag, so an out-of-band renewal failure is *observable* rather than
+    /// only logged (nidus-lp4.7).
+    ///
+    /// A background renewer is the first thing to learn the lease is gone — it runs every
+    /// `lock_ttl/3` where a write may not come for minutes. Before this, that discovery was
+    /// printed to stderr and dropped on the floor: the store's `fenced` flag was set only by
+    /// a *failing write*, so a superseded writer kept answering `/ready` with 200 and
+    /// reporting `holds_writer_handle: true` until traffic happened to arrive. Sharing the
+    /// latch is what makes readiness honest the moment the lease is lost, which is the whole
+    /// point of nidus-lp4.1.
+    fenced: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LeaseRenewer {
     /// Re-stamp the lease, extending its TTL. Errors if this instance has been superseded
     /// — the same fencing signal a write would hit.
+    ///
+    /// A definitive loss ([`LeaseLost`]) latches the shared `fenced` flag; a transient
+    /// backend error does not, so a dropped connection fails this renewal and nothing more.
     pub fn renew(&self) -> Result<()> {
-        renew_lease_object(&self.persistence, &self.key, &self.owner)
+        match renew_lease_object(&self.persistence, &self.key, &self.owner) {
+            Err(e) if is_lease_lost(&e) => {
+                self.fenced
+                    .store(true, std::sync::atomic::Ordering::Release);
+                Err(e)
+            }
+            other => other,
+        }
     }
 }
 
 impl ClusterLease {
     /// A `Drop`-free handle for renewing this lease out of band — see [`LeaseRenewer`].
-    pub fn renewer(&self) -> LeaseRenewer {
+    ///
+    /// `fenced` is the owning store's latch, shared so that a lease lost on a background
+    /// renewal is recorded where readiness can see it.
+    pub fn renewer(&self, fenced: Arc<std::sync::atomic::AtomicBool>) -> LeaseRenewer {
         LeaseRenewer {
             persistence: self.persistence.clone(),
             key: self.key.clone(),
             owner: self.owner.clone(),
+            fenced,
         }
     }
 
@@ -356,30 +410,76 @@ impl BackendLock for ClusterLease {}
 /// [`LeaseRenewer::renew`] — one implementation, so the owning guard and the out-of-band
 /// renewer can never drift on what "renew" means.
 fn renew_lease_object(persistence: &Arc<dyn Persistence>, key: &str, owner: &str) -> Result<()> {
-    match persistence.get(key)? {
-        Some(bytes) => {
+    match persistence.get_cas(key)? {
+        Some((bytes, token)) => {
+            lease_debug(format_args!(
+                "renew key={key:?} owner={owner} saw={:?} token={}",
+                String::from_utf8_lossy(&bytes),
+                token.as_deref().unwrap_or("<none>")
+            ));
             if parse_owner(&bytes).as_deref() != Some(owner) {
-                bail!(
+                return Err(lease_lost(
                     "writer lease lost: the store's lease is now held by another writer \
                      (this instance was superseded while paused past the lease TTL) — \
-                     stop writing and reopen"
-                );
+                     stop writing and reopen",
+                ));
             }
-            // We still own it — re-stamp to extend the TTL.
-            persistence
-                .put(key, &lock_body(now_secs(), Some(owner)))
-                .context("renew writer lease")
+            // We still own it — re-stamp to extend the TTL. **Conditionally** on the token we
+            // just read (nidus-lp4.7): an unconditional put here is a read-modify-write race
+            // that breaks mutual exclusion. A peer that reclaims the lease between our read and
+            // our write would be silently overwritten — we would stamp our own owner back over
+            // its lease and carry on believing we hold it, while the peer equally believes it
+            // does. Two live writers, each reporting `holds_writer_handle`. The CAS turns that
+            // into a detected loss instead.
+            let body = lock_body(now_secs(), Some(owner));
+            match token {
+                Some(tok) => match persistence.put_cas(key, &body, Some(&tok))? {
+                    CasOutcome::Written(_) => Ok(()),
+                    CasOutcome::Stale => {
+                        // Someone wrote the lease object in the gap. That is either a peer
+                        // taking over — we are fenced — or *this* instance's other renewer:
+                        // the op-driven pre-batch renew and the server's background timer can
+                        // fire concurrently, and re-stamping is idempotent, so that race is
+                        // harmless and must NOT fence us. Re-read to tell them apart rather
+                        // than assuming the worst and fencing a healthy writer.
+                        match persistence.get(key)? {
+                            Some(now_held) if parse_owner(&now_held).as_deref() == Some(owner) => {
+                                lease_debug(format_args!(
+                                    "renew key={key:?} owner={owner} CAS lost to our own \
+                                     concurrent renewal — still ours, treating as renewed"
+                                ));
+                                Ok(())
+                            }
+                            _ => Err(lease_lost(
+                                "writer lease lost: another writer reclaimed the lease while \
+                                 this instance was renewing it — stop writing and reopen",
+                            )),
+                        }
+                    }
+                    // No conditional overwrite on this backend: fall back to the plain put.
+                    // Cluster mode refuses such a backend outright (nidus-lp4.2), so this is
+                    // only reachable for a single-node advisory lock, where it is the
+                    // documented limit rather than a hole.
+                    CasOutcome::Unsupported => {
+                        persistence.put(key, &body).context("renew writer lease")
+                    }
+                },
+                None => persistence.put(key, &body).context("renew writer lease"),
+            }
         }
         None => {
             // The lease object vanished (a peer found ours stale and deleted it, or it was
             // never persisted). Re-claim atomically: if a peer beat us to it we are fenced.
+            lease_debug(format_args!(
+                "renew key={key:?} owner={owner} — lease object ABSENT, re-creating"
+            ));
             let body = lock_body(now_secs(), Some(owner));
             match persistence.try_create_exclusive(key, &body)? {
                 Some(true) => Ok(()), // reclaimed cleanly
-                Some(false) => bail!(
+                Some(false) => Err(lease_lost(
                     "writer lease lost: another writer re-created the lease — stop writing \
-                     and reopen"
-                ),
+                     and reopen",
+                )),
                 None => persistence
                     .put(key, &body)
                     .context("re-create writer lease (advisory backend)"),
@@ -394,6 +494,10 @@ impl Drop for ClusterLease {
         if let Ok(Some(bytes)) = self.persistence.get(&self.key)
             && parse_owner(&bytes).as_deref() == Some(self.owner.as_str())
         {
+            lease_debug(format_args!(
+                "ClusterLease::drop key={:?} owner={} — DELETING the lease object",
+                self.key, self.owner
+            ));
             let _ = self.persistence.delete(&self.key);
         }
     }
@@ -427,6 +531,70 @@ fn parse_owner(bytes: &[u8]) -> Option<String> {
         .ok()
         .and_then(|s| s.split_whitespace().nth(1))
         .map(|o| o.to_string())
+}
+
+/// Env-gated lease tracing (`NIDUS_LEASE_DEBUG=1`), off by default.
+///
+/// Kept in-tree deliberately: what defeated the first pass at nidus-lp4.7 was not being able
+/// to tell which instance a log line came from, so every line carries the emitting process's
+/// pid, the key, and the TTL actually in force. A lease bug is a multi-process race that
+/// reproduces on a real object store and nowhere else — when it happens again, this is the
+/// difference between an afternoon and a week.
+fn lease_debug(args: std::fmt::Arguments<'_>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("NIDUS_LEASE_DEBUG").is_some()) {
+        eprintln!("nidus[lease pid={}] {args}", std::process::id());
+    }
+}
+
+/// The error a renewal returns when this instance has **definitively** lost the lease to
+/// another — as distinct from a transient backend failure (a dropped connection, a 5xx from
+/// the object store), which says nothing about who holds the lease.
+///
+/// The two demand opposite responses, which is why they need telling apart (nidus-lp4.7).
+/// Losing the lease is permanent: the instance can never write again and must latch `fenced`
+/// so a readiness probe pulls it out of rotation. A transient error must fail only the
+/// request in flight — latching on a network blip would take a perfectly healthy writer out
+/// of service for good, the same availability trap that once made standbys crash-loop.
+#[derive(Debug)]
+pub struct LeaseLost(String);
+
+impl std::fmt::Display for LeaseLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LeaseLost {}
+
+/// Whether `err` is the definitive [`LeaseLost`] signal rather than a transient backend
+/// failure. Searches the whole `anyhow` chain, so added context cannot hide it.
+pub fn is_lease_lost(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<LeaseLost>().is_some()
+}
+
+/// Build a [`LeaseLost`] error. Deliberately not `bail!`/`anyhow!`: the *type* is the signal
+/// callers classify on, and a plain string error would be indistinguishable from IO trouble.
+fn lease_lost(msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(LeaseLost(msg.into()))
+}
+
+/// Whether a lock/lease stamped at `stamp` is still **live** at `now` under `ttl`.
+///
+/// The comparison is `age <= ttl`, not `age < ttl`, and the extra second is not slack — it is
+/// what makes the test sound (nidus-lp4.7). Stamps have **one-second granularity**, so an age
+/// computed from two truncated stamps can read a full second higher than the time that
+/// actually elapsed: a lease renewed at `t=1.99` (stamped `1`) and read at `t=3.01` (now `3`)
+/// reads as `age=2` after only 1.02s. Under a strict `age < ttl` that lease is declared dead
+/// at `ttl=2` while its holder is alive and renewing — a peer then reclaims it and both
+/// instances believe they hold the writer handle.
+///
+/// So: reclaim only once the age is *certainly* past the TTL. Real elapsed time is greater
+/// than `age - 1`, hence `age >= ttl + 1` is the first safe moment. The cost is bounded and
+/// on the right side — a takeover happens within `ttl..=ttl+1` seconds rather than
+/// `ttl-1..=ttl` — and it is availability, not safety, that pays.
+pub(super) fn is_live(now: u64, stamp: u64, ttl: Duration) -> bool {
+    now.saturating_sub(stamp) <= ttl.as_secs()
 }
 
 /// Current unix time in seconds (a clock before the epoch reads as 0 — makes any lock

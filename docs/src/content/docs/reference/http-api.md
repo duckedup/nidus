@@ -53,7 +53,9 @@ Readiness probe. `200` once this instance can actually serve; `503` otherwise. I
 three distinct reasons, each of which should take an instance out of rotation:
 
 - **no store yet** — still starting, or a standby waiting for the writer handle;
-- **fenced** — this writer was superseded, so every write would fail and it must be replaced;
+- **fenced** — this writer was superseded, so every write would fail and it must be replaced.
+  A writer notices this on its own lease-renewal timer, so it stops reporting ready even if no
+  write arrives to discover it;
 - **stale** — a reader has gone longer than `--max-staleness` without verifying it is current
   (only when that bound is set).
 Also always reachable without a token — an orchestrator would read a `401` as "not ready"
