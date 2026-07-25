@@ -11,8 +11,8 @@ use serde::Serialize;
 
 use crate::server::dto::{AnnDto, FootprintDto, HitDto};
 use crate::{
-    AnnConfig, Config, Distance, Filter, FtsQuery, HybridOpts, Language, Nidus, OpenMode, Record,
-    Scope, SearchOpts,
+    AnnConfig, Config, Distance, Filter, Fsync, FtsQuery, HybridOpts, Language, Nidus, OpenMode,
+    Quantization, Record, Scope, SearchOpts,
 };
 
 // AI-ingest (memory) wiring for `serve`: only under the `memory` feature (pulled
@@ -46,7 +46,10 @@ pub struct Cli {
 /// Every flag also reads from a `NIDUS_*` environment variable (the flag still
 /// wins when both are given), so a container — e.g. the published Docker image —
 /// can be configured entirely through the environment with no command line.
-#[derive(Args, Debug)]
+/// `Default` (an empty `dir`, every flag absent) is exactly what clap produces when
+/// no store flag is given, so tests can name only the fields they care about — see
+/// [`IngestArgs`], which does the same.
+#[derive(Args, Debug, Default)]
 struct StoreArgs {
     /// Store directory (created on first write). Unused — but still required — when
     /// `--persistence` names an object store, where the durable bytes live remotely.
@@ -102,6 +105,59 @@ struct StoreArgs {
     /// process-local. The working set is published on flush and adopted on open.
     #[arg(long, env = "NIDUS_MEMORY")]
     memory: Option<String>,
+    /// Run as one of several cooperating instances over a *shared* store (SPEC §14.6):
+    /// requires an object-store `--persistence` **and** a Redis-family `--memory` tier.
+    /// One instance holds a renewing writer lease; the rest should open `--read-only`
+    /// and pick up each commit. Not a managed cluster — no coordinator, replication, or
+    /// rebalancing.
+    #[arg(long, env = "NIDUS_CLUSTER")]
+    cluster: bool,
+    /// Memory-map immutable segments instead of holding them in RAM — lets a store
+    /// exceed RAM on one node. Local filesystem + little-endian only; other segments
+    /// fall back to a RAM load.
+    #[arg(long, env = "NIDUS_MMAP")]
+    mmap: bool,
+    /// Quantize the search first pass for speed, then rerank the candidates in exact
+    /// f32: `int8` (4× less memory traffic) or `binary` (32×, cosine only). Omit for
+    /// exact-only search. Like `--ann`, not stored in the header — pass it on every open.
+    #[arg(long, env = "NIDUS_QUANTIZATION")]
+    quantization: Option<QuantArg>,
+    /// Candidate over-fetch multiple for the quantized first pass (`top_k * rescore`
+    /// reranked in f32). Defaults per kind: 4 for int8, 16 for binary. Ignored without
+    /// `--quantization`.
+    #[arg(long, env = "NIDUS_QUANT_RESCORE")]
+    quant_rescore: Option<usize>,
+    /// Worker threads for a single exact search (`1` = serial, the default). Splits one
+    /// query's scan across threads; unrelated to serving concurrent requests.
+    #[arg(long, env = "NIDUS_QUERY_THREADS")]
+    query_threads: Option<usize>,
+    /// Seal the active segment once it reaches this many rows (omit = never seal, one
+    /// growing segment). Sealed segments are immutable — the unit of mmap and per-segment
+    /// indexing.
+    #[arg(long, env = "NIDUS_SEGMENT_MAX_ROWS")]
+    segment_max_rows: Option<u64>,
+    /// Minimum rows for a sealed segment to get its own IVF index (omit = never index,
+    /// exact brute-force). Needs `--segment-max-rows` to have any effect.
+    #[arg(long, env = "NIDUS_SEGMENT_INDEX_MIN_ROWS")]
+    segment_index_min_rows: Option<u64>,
+    /// fsync policy: `per-batch` (durable per call, the default) or `on-flush` (faster,
+    /// weaker — a crash can lose acknowledged writes).
+    #[arg(long, env = "NIDUS_FSYNC")]
+    fsync: Option<FsyncArg>,
+    /// Rewrite the data matrix when this fraction of rows is dead (default `0.5`).
+    #[arg(long, env = "NIDUS_AUTO_COMPACT", conflicts_with = "no_auto_compact")]
+    auto_compact: Option<f32>,
+    /// Never auto-compact; reclaim dead rows only on an explicit `compact`.
+    #[arg(long, env = "NIDUS_NO_AUTO_COMPACT")]
+    no_auto_compact: bool,
+    /// Seconds before another process may reclaim a stale writer lock (default `60`).
+    /// In `--cluster` mode this is also the writer-lease window.
+    #[arg(long, value_name = "SECONDS", env = "NIDUS_LOCK_TTL")]
+    lock_ttl: Option<u64>,
+    /// Refuse to open a store whose vector matrix would exceed this many bytes — the
+    /// overcommit guard (SPEC §6.6). Omit for no ceiling.
+    #[arg(long, env = "NIDUS_MAX_VECTOR_BYTES")]
+    max_vector_bytes: Option<u64>,
 }
 
 impl StoreArgs {
@@ -157,12 +213,48 @@ impl StoreArgs {
     /// the read and serve paths can't drift.
     fn config(&self, mode: OpenMode) -> Result<Config> {
         let (dim, distance) = self.resolve()?;
-        Ok(Config::new(self.dir.clone(), dim)
+        let mut cfg = Config::new(self.dir.clone(), dim)
             .distance(distance)
             .ann(self.ann_config())
+            .quantization(self.quant_config())
             .persistence(self.persistence.clone().unwrap_or_default())
             .memory(self.memory.clone().unwrap_or_default())
-            .open_mode(mode))
+            .cluster(self.cluster)
+            .mmap(self.mmap)
+            .segment_max_rows(self.segment_max_rows)
+            .segment_index_min_rows(self.segment_index_min_rows)
+            .max_vector_bytes(self.max_vector_bytes)
+            .open_mode(mode);
+        // The remaining knobs have non-`Option` defaults in `Config`, so only an
+        // explicitly-supplied flag may overwrite them.
+        if let Some(n) = self.query_threads {
+            cfg = cfg.query_threads(n);
+        }
+        if let Some(f) = self.fsync {
+            cfg = cfg.fsync(f.into());
+        }
+        if self.no_auto_compact {
+            cfg = cfg.auto_compact(None);
+        } else if let Some(ratio) = self.auto_compact {
+            cfg = cfg.auto_compact(Some(ratio));
+        }
+        if let Some(secs) = self.lock_ttl {
+            cfg = cfg.lock_ttl(std::time::Duration::from_secs(secs));
+        }
+        Ok(cfg)
+    }
+
+    /// Build the `Option<Quantization>` from the `--quantization`/`--quant-rescore`
+    /// flags — `None` (no `--quantization`) keeps the exact-only search path.
+    fn quant_config(&self) -> Option<Quantization> {
+        let base = match self.quantization? {
+            QuantArg::Int8 => Quantization::int8(),
+            QuantArg::Binary => Quantization::binary(),
+        };
+        Some(match self.quant_rescore {
+            Some(n) => base.rescore(n),
+            None => base,
+        })
     }
 
     /// Build the `Option<AnnConfig>` from the `--ann*` flags. `None` (no `--ann`)
@@ -319,6 +411,27 @@ impl From<DistanceArg> for Distance {
 enum AnnKindArg {
     Hnsw,
     Ivf,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum QuantArg {
+    Int8,
+    Binary,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum FsyncArg {
+    PerBatch,
+    OnFlush,
+}
+
+impl From<FsyncArg> for Fsync {
+    fn from(f: FsyncArg) -> Self {
+        match f {
+            FsyncArg::PerBatch => Fsync::PerBatch,
+            FsyncArg::OnFlush => Fsync::OnFlush,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -853,7 +966,7 @@ fn print_json<T: Serialize>(v: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AnnKind;
+    use crate::{AnnKind, QuantKind};
 
     #[test]
     fn no_subcommand_errors() {
@@ -989,19 +1102,7 @@ mod tests {
         // No --dim / --distance: both come from the header.
         let args = StoreArgs {
             dir: dir.path().to_path_buf(),
-            dim: None,
-            distance: None,
-            read_only: false,
-            ann: None,
-            ann_m: None,
-            ann_ef_construction: None,
-            ann_ef_search: None,
-            ann_n_lists: None,
-            ann_n_probe: None,
-            ann_overscan: None,
-            ann_seed: None,
-            persistence: None,
-            memory: None,
+            ..Default::default()
         };
         assert_eq!(args.resolve().unwrap(), (5, Distance::Euclidean));
     }
@@ -1126,24 +1227,133 @@ mod tests {
         }
     }
 
+    /// Parse a `serve` command line and hand back the `StoreArgs` it produced.
+    fn serve_store(args: &[&str]) -> StoreArgs {
+        let mut argv = vec!["nidus", "serve", "--dir", "/tmp/s", "--dim", "3"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv).expect("parses").command {
+            Command::Serve { store, .. } => store,
+            _ => panic!("expected Serve"),
+        }
+    }
+
+    /// The whole point of nidus-1e6.1: every one of these `Config` knobs used to be
+    /// library-only, so `nidus serve` could ONLY run the default exact, all-RAM,
+    /// single-writer store. Assert each flag actually reaches `Config`.
+    #[test]
+    fn store_flags_reach_config() {
+        let cfg = serve_store(&[
+            "--cluster",
+            "--mmap",
+            "--query-threads",
+            "4",
+            "--segment-max-rows",
+            "100000",
+            "--segment-index-min-rows",
+            "50000",
+            "--fsync",
+            "on-flush",
+            "--no-auto-compact",
+            "--lock-ttl",
+            "15",
+            "--max-vector-bytes",
+            "4096",
+        ])
+        .config(OpenMode::ReadWrite)
+        .expect("config builds");
+
+        assert!(cfg.cluster);
+        assert!(cfg.mmap);
+        assert_eq!(cfg.query_threads, 4);
+        assert_eq!(cfg.segment_max_rows, Some(100_000));
+        assert_eq!(cfg.segment_index_min_rows, Some(50_000));
+        assert_eq!(cfg.fsync, Fsync::OnFlush);
+        assert_eq!(cfg.auto_compact, None);
+        assert_eq!(cfg.lock_ttl, std::time::Duration::from_secs(15));
+        assert_eq!(cfg.max_vector_bytes, Some(4096));
+    }
+
+    /// With none of the new flags passed, `Config`'s own defaults must survive — a
+    /// flag defaulting to `Some(..)` would silently change behaviour for everyone.
+    #[test]
+    fn store_flags_omitted_keep_config_defaults() {
+        let cfg = serve_store(&[])
+            .config(OpenMode::ReadWrite)
+            .expect("config");
+        let default = Config::new("/tmp/s", 3);
+
+        assert!(!cfg.cluster);
+        assert!(!cfg.mmap);
+        assert_eq!(cfg.quantization, None);
+        assert_eq!(cfg.query_threads, default.query_threads);
+        assert_eq!(cfg.segment_max_rows, default.segment_max_rows);
+        assert_eq!(cfg.segment_index_min_rows, default.segment_index_min_rows);
+        assert_eq!(cfg.fsync, default.fsync);
+        assert_eq!(cfg.auto_compact, default.auto_compact);
+        assert_eq!(cfg.lock_ttl, default.lock_ttl);
+        assert_eq!(cfg.max_vector_bytes, default.max_vector_bytes);
+    }
+
+    #[test]
+    fn quantization_kinds_and_rescore_override() {
+        // int8 with its default rescore.
+        let q = serve_store(&["--quantization", "int8"])
+            .quant_config()
+            .expect("quant enabled");
+        assert_eq!(q.kind, QuantKind::Int8);
+        assert_eq!(q.rescore, Quantization::int8().rescore);
+
+        // binary keeps its own (coarser → higher) default rescore, not int8's.
+        let q = serve_store(&["--quantization", "binary"])
+            .quant_config()
+            .expect("quant enabled");
+        assert_eq!(q.kind, QuantKind::Binary);
+        assert_eq!(q.rescore, Quantization::binary().rescore);
+
+        // --quant-rescore overrides the per-kind default.
+        let q = serve_store(&["--quantization", "binary", "--quant-rescore", "3"])
+            .quant_config()
+            .expect("quant enabled");
+        assert_eq!(q.kind, QuantKind::Binary);
+        assert_eq!(q.rescore, 3);
+
+        // No --quantization: exact-only search.
+        assert!(serve_store(&[]).quant_config().is_none());
+    }
+
+    #[test]
+    fn auto_compact_ratio_and_disable_conflict() {
+        let cfg = serve_store(&["--auto-compact", "0.25"])
+            .config(OpenMode::ReadWrite)
+            .expect("config");
+        assert_eq!(cfg.auto_compact, Some(0.25));
+
+        // Setting a ratio and disabling at once is contradictory, so clap refuses it.
+        assert!(
+            Cli::try_parse_from([
+                "nidus",
+                "serve",
+                "--dir",
+                "/tmp/s",
+                "--dim",
+                "3",
+                "--auto-compact",
+                "0.25",
+                "--no-auto-compact",
+            ])
+            .is_err()
+        );
+    }
+
     /// A `StoreArgs` with the given persistence/memory and everything else defaulted —
     /// keeps the backend-predicate tests below readable.
     fn store_args(persistence: Option<&str>, memory: Option<&str>) -> StoreArgs {
         StoreArgs {
             dir: PathBuf::from("/tmp/s"),
             dim: Some(8),
-            distance: None,
-            read_only: false,
-            ann: None,
-            ann_m: None,
-            ann_ef_construction: None,
-            ann_ef_search: None,
-            ann_n_lists: None,
-            ann_n_probe: None,
-            ann_overscan: None,
-            ann_seed: None,
             persistence: persistence.map(str::to_string),
             memory: memory.map(str::to_string),
+            ..Default::default()
         }
     }
 
@@ -1206,19 +1416,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let args = StoreArgs {
             dir: dir.path().join("does-not-exist-yet"),
-            dim: None,
-            distance: None,
-            read_only: false,
-            ann: None,
-            ann_m: None,
-            ann_ef_construction: None,
-            ann_ef_search: None,
-            ann_n_lists: None,
-            ann_n_probe: None,
-            ann_overscan: None,
-            ann_seed: None,
-            persistence: None,
-            memory: None,
+            ..Default::default()
         };
         let err = args.resolve().unwrap_err().to_string();
         assert!(err.contains("--dim"), "unexpected error: {err}");

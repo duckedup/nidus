@@ -180,6 +180,65 @@ A live object-store-backed store rewrites the whole `data`/`log` object on each 
 (`O(object)`, fine for low write rates) and takes an **advisory** writer lock — suited to a
 single writer; for many concurrent writers, prefer a local store and snapshot to the cloud.
 
+## Speed, memory & durability flags
+
+Defaults are exact, all-RAM, and durable per batch. These flags trade along each of those
+axes; like `--ann`, none is recorded in the header, so pass them on every command that
+should open the store that way (including `serve`):
+
+```bash
+# Quantize the search first pass, then rerank candidates in exact f32.
+# int8 = 4x less memory traffic; binary = 32x, cosine only.
+echo '[1,0,0]' | nidus search --dir ./store --quantization int8 docs -k 5
+echo '[1,0,0]' | nidus search --dir ./store --quantization binary --quant-rescore 24 docs
+
+# Split ONE query's scan across threads (unrelated to serving concurrent requests)
+nidus serve --dir ./store --dim 768 --query-threads 8
+
+# Seal the active segment every N rows, and memory-map the sealed ones so the
+# store can outgrow RAM on a single node (local filesystem only)
+nidus serve --dir ./store --dim 768 --segment-max-rows 250000 --mmap
+
+# Weaken durability for speed: fsync on explicit flush instead of every batch
+nidus upsert --dir ./store --fsync on-flush docs < recs.json
+```
+
+`--quantization` accepts `int8` or `binary` (`binary` is cosine-only — sign codes discard
+magnitude), with `--quant-rescore` tuning the over-fetch before the exact rerank. Candidate
+selection is approximate; the final ranking is always exact. `--segment-index-min-rows`
+gives each sufficiently large sealed segment its own IVF index. Housekeeping knobs:
+`--auto-compact <ratio>` (or `--no-auto-compact`) controls dead-row reclamation,
+`--lock-ttl <seconds>` how long before a stale writer lock may be reclaimed, and
+`--max-vector-bytes` refuses to open a store whose matrix would exceed a ceiling.
+
+Every flag also reads from a `NIDUS_*` environment variable (`NIDUS_QUANTIZATION`,
+`NIDUS_MMAP`, `NIDUS_QUERY_THREADS`, …), so a container can be configured entirely through
+the environment with no command line.
+
+## Running several instances over one shared store
+
+`--cluster` runs nidus as one of several cooperating instances over the *same* store. It
+requires both shared axes — an object-store `--persistence` **and** a Redis-family
+`--memory` tier — and is refused with a clear error otherwise, since a local directory or a
+process-local working set cannot be shared:
+
+```bash
+# The writer: holds a renewing lease; only one may hold it at a time
+nidus serve --dir ./meta --dim 768 --cluster \
+  --persistence s3://my-bucket/store --memory redis://cache:6379
+
+# Readers: no lease, and they pick up each of the writer's commits
+nidus serve --dir ./meta --dim 768 --cluster --read-only \
+  --persistence s3://my-bucket/store --memory redis://cache:6379
+```
+
+This is deliberately **not** a managed cluster: there is no coordinator, no replication, and
+no rebalancing. Writes are fenced (a superseded writer is refused rather than allowed to
+clobber committed data) and `--lock-ttl` sets the lease window. If you only want more
+capacity across a few machines, a simpler shape needs none of this: run one independent
+instance per box and fan queries out client-side, merging the top-k yourself — sound because
+every instance shares one embedding space.
+
 ## Backup & restore
 
 A store is just a directory, so you can always copy it by hand — but `nidus
