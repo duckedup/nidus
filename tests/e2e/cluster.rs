@@ -23,7 +23,7 @@
 //! `NIDUS_E2E_REDIS_URL`.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -172,6 +172,12 @@ fn build_instance(
             &service("NIDUS_E2E_S3_SECRET", "minioadmin"),
         )
         .env("AWS_REGION", &service("NIDUS_E2E_S3_REGION", "us-east-1"))
+        // Lease tracing on for every cluster instance. A lease bug is a multi-process race
+        // that reproduces here and essentially nowhere else, and the harness surfaces a
+        // child's stderr only when a test fails — so this costs nothing on a green run and is
+        // the whole diagnosis on a red one. nidus-lp4.7 took a second pass precisely because
+        // these lines (with their pids) were not there the first time.
+        .env("NIDUS_LEASE_DEBUG", "1")
         .start_unready();
     // The TempDir must outlive the server, so hand both back together.
     (dir, server)
@@ -494,24 +500,15 @@ fn standby_is_promoted_after_the_writer_dies() {
 /// `nidus serve` now renews out of band on a timer using a `LeaseRenewer` that does **not**
 /// need the store lock, so renewal continues even while a long write holds the guard.
 ///
-/// **This test currently FAILS and is retained as the reproduction for `nidus-lp4.6b`.** It
-/// found one real bug already (cloning the owning `ClusterLease` released the lease on drop,
-/// deleting the lock object — fixed), but a second defect remains: a `--wait-for-lease`
-/// standby still acquires the lease while the incumbent is alive and well within its TTL.
-/// Two instances then both report `holds_writer_handle`, which is a mutual-exclusion failure,
-/// not merely an availability one. Do not un-ignore this until that is understood — and do
-/// not weaken the assertions to make it pass.
+/// **This was the nidus-lp4.7 reproduction** — a standby acquiring the lease while the
+/// incumbent was alive and well within its TTL, leaving two instances both reporting
+/// `holds_writer_handle` (a mutual-exclusion failure, not merely an availability one). It
+/// found two real bugs and now passes, so it is part of the normal suite. Its assertions were
+/// never weakened to get there; see the git history of `backend/object.rs` for the fixes.
 #[cfg(unix)]
 #[test]
-#[ignore = "KNOWN FAILING repro for nidus-lp4.6b — set NIDUS_E2E_XFAIL=1 to run"]
+#[ignore = "needs minio + valkey (just test-e2e-cluster)"]
 fn idle_writer_keeps_its_lease_against_a_waiting_standby() {
-    // Gated by an env var, not only by `#[ignore]`: CI runs the suite with
-    // `--include-ignored`, which would turn this known failure into a red build. Keeping the
-    // reproduction in-tree is worth more than deleting it, so it opts in explicitly instead.
-    if std::env::var("NIDUS_E2E_XFAIL").is_err() {
-        eprintln!("skipped: set NIDUS_E2E_XFAIL=1 to run the nidus-lp4.6b reproduction");
-        return;
-    }
     // A longer TTL than the suite default ON PURPOSE: lease timestamps are second
     // granularity, so a 2s TTL cannot distinguish "renewed 700ms ago" from "expired".
     const TTL: u32 = 8;
@@ -530,16 +527,6 @@ fn idle_writer_keeps_its_lease_against_a_waiting_standby() {
     // path renews. Only the out-of-band renewer can keep the lease alive here.
     std::thread::sleep(Duration::from_secs(20));
 
-    eprintln!(
-        "WRITER stderr tail: {}",
-        writer
-            .stderr()
-            .lines()
-            .rev()
-            .take(3)
-            .collect::<Vec<_>>()
-            .join(" | ")
-    );
     assert!(
         !standby.is_ready(),
         "the standby must NOT have been promoted: an idle writer is still a live writer, \
@@ -552,10 +539,78 @@ fn idle_writer_keeps_its_lease_against_a_waiting_standby() {
         "an idle writer must not have been fenced"
     );
 
-    // And it can still write — proof it genuinely still holds the lease, not merely that
-    // the standby was slow to notice.
+    // The mutual-exclusion property stated directly: whatever the standby thinks its role is,
+    // it must not claim the writer handle. (While it waits it has no store open, so `/cluster`
+    // answers 503 — - that is itself proof it was not promoted. If it ever answers, the claim
+    // must still be false.)
+    let (status, body) = standby.get("/cluster");
+    if status == 200 {
+        assert_eq!(
+            body["holds_writer_handle"], false,
+            "two instances must never both hold the writer handle: {body}"
+        );
+    }
+
+    // And the writer can still write — proof it genuinely still holds the lease, not merely
+    // that the standby was slow to notice.
     assert_eq!(upsert(&writer, "b", [0, 1, 0]).0, 200);
     assert_eq!(ids(&writer), vec!["a", "b"]);
+}
+
+/// **A fenced writer reports unready without waiting for a write to find out** (nidus-lp4.7).
+///
+/// `fenced` used to be latched *only* by a failing write. The background renewer — which runs
+/// every `lock_ttl/3` and is therefore the first thing to learn the lease is gone — printed
+/// the loss to stderr and dropped it. So a superseded writer with no traffic kept answering
+/// `/ready` with 200 and reporting `holds_writer_handle: true` indefinitely, and an
+/// orchestrator had no way to see it until a write happened to arrive and fail. On a
+/// low-traffic store that could be a long time, and it is precisely the interval during which
+/// two instances both look like the writer.
+///
+/// Distinct from `fenced_writer_reports_unready`, which latches the state *via* a rejected
+/// write: this one asserts the discovery happens on its own, with no write attempted at all.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs minio + valkey (just test-e2e-cluster)"]
+fn a_superseded_writer_discovers_it_is_fenced_without_any_write() {
+    let prefix = unique_prefix("bg-fence");
+    let (_adir, writer_a) = instance(&prefix, false, &[]);
+    seed(&writer_a);
+    assert_eq!(upsert(&writer_a, "from-a", [1, 0, 0]).0, 200);
+    assert!(writer_a.is_ready(), "a healthy writer is ready");
+
+    // A stalls past its lease; B takes it over and commits.
+    writer_a.pause();
+    std::thread::sleep(past_the_lease());
+    let (_bdir, writer_b) = instance(&prefix, false, &[]);
+    assert_eq!(upsert(&writer_b, "from-b", [0, 1, 0]).0, 200);
+
+    // A wakes up. Nothing writes to it — the only thing that can notice the takeover is its
+    // own background renewal tick. Give it a few of those (`lock_ttl/3`) plus slack for a
+    // loaded debug build.
+    writer_a.resume();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while writer_a.is_ready() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    assert!(
+        !writer_a.is_ready(),
+        "a superseded writer must discover it is fenced on its own renewal timer, without \
+         needing a write to fail first: {}",
+        writer_a.stderr()
+    );
+    let (status, body) = writer_a.get("/cluster");
+    assert_eq!(status, 200);
+    assert_eq!(body["fenced"], true, "/cluster must report it: {body}");
+    assert_eq!(
+        body["holds_writer_handle"], false,
+        "and it must stop claiming the handle B now holds: {body}"
+    );
+
+    // B is unaffected — exactly one instance holds the handle.
+    assert!(writer_b.is_ready());
+    assert_eq!(writer_b.get("/cluster").1["holds_writer_handle"], true);
 }
 
 /// **A fenced writer must stop reporting ready** (nidus-lp4.1).

@@ -225,9 +225,22 @@ where
                 let lease = lease.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Err(e) = lease.renew() {
-                        // Losing the lease here is the same fencing signal a write would
-                        // hit; the write path latches it, and readiness reports it.
-                        eprintln!("nidus: background lease renewal failed: {e:#}");
+                        // A definitive loss latches the store's `fenced` flag through the
+                        // renewer's shared handle, so `/ready` starts failing and `/cluster`
+                        // reports it immediately — without waiting for a write to discover it
+                        // (nidus-lp4.7). A transient backend error latches nothing: this tick
+                        // simply failed, and the next one will try again.
+                        if crate::backend::is_lease_lost(&e) {
+                            eprintln!(
+                                "nidus: writer lease LOST on background renewal — this \
+                                 instance is fenced and now reports NOT ready: {e:#}"
+                            );
+                        } else {
+                            eprintln!(
+                                "nidus: background lease renewal failed transiently, will \
+                                 retry: {e:#}"
+                            );
+                        }
                     }
                 })
                 .await;

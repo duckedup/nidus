@@ -47,7 +47,7 @@ pub(crate) use object::{locked_error, object_try_lock};
 // Public: a cluster writer's lease handle is part of the API surface, so an async host
 // (`nidus serve`, or an embedding application) can keep the lease warm on a timer while a
 // long write holds the store lock — see `Nidus::lease_handle`.
-pub use object::{ClusterLease, LeaseRenewer};
+pub use object::{ClusterLease, LeaseLost, LeaseRenewer, is_lease_lost};
 pub use ram::LocalRam;
 pub(crate) use ram::MemAppender;
 pub use redis::RedisTier;
