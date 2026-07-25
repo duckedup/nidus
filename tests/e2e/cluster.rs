@@ -63,12 +63,20 @@ fn require_services() {
 
         // No Redis round trip needed: a TCP connect distinguishes "nothing listening"
         // (the mistake this guards) from a protocol-level problem, which the store's own
-        // error would explain better than we could here. Strip the scheme, then any
-        // `/db` or `?prefix=…` tail, so a fully-specified URL still yields host:port.
+        // error would explain better than we could here.
+        //
+        // Reduce the URL to one reachable `host:port`: drop the scheme, then any `/db` or
+        // `?cluster=true` tail, then take the FIRST of a comma-separated seed list — a
+        // Valkey Cluster URL carries every seed, and handing the whole list to
+        // `TcpStream::connect` fails on a perfectly healthy cluster. Reaching one seed is
+        // all this guard needs to prove.
         let addr = redis
             .split_once("://")
             .map_or(redis.as_str(), |(_, rest)| rest)
             .split(['/', '?'])
+            .next()
+            .unwrap_or_default()
+            .split(',')
             .next()
             .unwrap_or_default();
         assert!(
