@@ -15,6 +15,52 @@ pub(crate) struct Http {
     agent: Agent,
 }
 
+/// Whether a transport failure is worth one immediate retry.
+///
+/// The case this exists for is a **stale pooled connection**: the agent keeps connections
+/// alive, the server (or an intervening proxy) closes one after its own idle timeout, and
+/// the next request reuses the dead socket and fails with "Peer disconnected" / a reset
+/// before any bytes are served. There is nothing wrong with the request — a fresh
+/// connection succeeds — so failing the caller's operation on it is a self-inflicted error.
+///
+/// Observed for real: a `nidus serve` instance exited during a cluster e2e run because a
+/// lease claim hit exactly this, which is why it is handled here rather than left to every
+/// call site.
+///
+/// Only *connection-level* failures qualify. An HTTP status is never retried here (the
+/// client is built with `http_status_as_error(false)`, so statuses are not errors at all),
+/// and a timeout is not retried either — that would double the caller's worst case.
+fn worth_retrying(e: &ureq::Error) -> bool {
+    match e {
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected
+        ),
+        _ => false,
+    }
+}
+
+/// Run `attempt`, retrying once if the first failure looks like a dropped pooled
+/// connection. Requests reaching here are idempotent or compare-and-swap-guarded, so a
+/// single replay cannot double-apply anything: a CAS whose first attempt actually landed
+/// finds its token consumed on the replay and reports `Stale`, which the callers already
+/// handle.
+fn with_one_retry<T>(
+    mut attempt: impl FnMut() -> std::result::Result<T, ureq::Error>,
+) -> Result<T> {
+    match attempt() {
+        Ok(v) => Ok(v),
+        Err(first) if worth_retrying(&first) => attempt().map_err(|second| {
+            net_err(second).context(format!("after retrying a dropped connection ({first})"))
+        }),
+        Err(e) => Err(net_err(e)),
+    }
+}
+
 impl Http {
     pub(crate) fn new() -> Http {
         Http::new_with_timeout(None)
@@ -45,7 +91,7 @@ impl Http {
     /// `GET url`, also returning the response headers (the compare-and-swap paths read the
     /// object's version token from them — S3 `ETag`, GCS `x-goog-generation`).
     pub(crate) fn get_h(&self, url: &str) -> Result<(u16, Vec<u8>, HeaderMap)> {
-        finish(self.agent.get(url).call().map_err(net_err)?)
+        finish(with_one_retry(|| self.agent.get(url).call())?)
     }
 
     /// `PUT url` with `body` and any extra request `headers` (e.g. a signed
@@ -69,16 +115,18 @@ impl Http {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<(u16, Vec<u8>, HeaderMap)> {
-        let mut req = self.agent.put(url);
-        for (name, value) in headers {
-            req = req.header(*name, *value);
-        }
-        finish(req.send(body).map_err(net_err)?)
+        finish(with_one_retry(|| {
+            let mut req = self.agent.put(url);
+            for (name, value) in headers {
+                req = req.header(*name, *value);
+            }
+            req.send(body)
+        })?)
     }
 
     /// `DELETE url`.
     pub(crate) fn delete(&self, url: &str) -> Result<(u16, Vec<u8>)> {
-        let (status, body, _headers) = finish(self.agent.delete(url).call().map_err(net_err)?)?;
+        let (status, body, _headers) = finish(with_one_retry(|| self.agent.delete(url).call())?)?;
         Ok((status, body))
     }
 
@@ -92,7 +140,18 @@ impl Http {
     /// Like [`run`](Self::run) but also returns the response headers — GCS reads the object's
     /// generation (`x-goog-generation`, its CAS token) from a download response.
     pub(crate) fn run_h(&self, req: http::Request<Vec<u8>>) -> Result<(u16, Vec<u8>, HeaderMap)> {
-        finish(self.agent.run(req).map_err(net_err)?)
+        // Same dropped-pooled-connection retry as the S3 paths. `http::Request` is not
+        // `Clone`, so rebuild the one field the replay needs rather than cloning the request.
+        finish(with_one_retry(|| {
+            let mut replay = http::Request::builder().method(req.method()).uri(req.uri());
+            for (name, value) in req.headers() {
+                replay = replay.header(name, value);
+            }
+            let replay = replay
+                .body(req.body().clone())
+                .expect("rebuilding a request that already parsed");
+            self.agent.run(replay)
+        })?)
     }
 }
 
