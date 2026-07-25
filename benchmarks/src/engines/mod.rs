@@ -3,6 +3,10 @@
 
 pub mod nidus;
 
+/// The same nidus over HTTP — pair it with [`nidus`] to see what `serve` costs.
+#[cfg(feature = "server")]
+pub mod server;
+
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 

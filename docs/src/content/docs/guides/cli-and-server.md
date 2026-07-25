@@ -227,10 +227,16 @@ process-local working set cannot be shared:
 nidus serve --dir ./meta --dim 768 --cluster \
   --persistence s3://my-bucket/store --memory redis://cache:6379
 
-# Readers: no lease, and they pick up each of the writer's commits
+# Readers: no lease, so run as many as you like
 nidus serve --dir ./meta --dim 768 --cluster --read-only \
   --persistence s3://my-bucket/store --memory redis://cache:6379
 ```
+
+A reader loads the store's committed state when it starts and keeps serving that snapshot;
+`POST /refresh` advances it to whatever the writer has committed since, and answers
+`{"adopted": true}` when there was something new. Reads deliberately do not refresh on
+their own — that would add a metadata fetch to every query, which is the opposite of what
+a read-heavy fan-out wants — so poll it as often as your staleness tolerance requires.
 
 This is deliberately **not** a managed cluster: there is no coordinator, no replication, and
 no rebalancing. Writes are fenced (a superseded writer is refused rather than allowed to

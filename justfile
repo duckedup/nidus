@@ -69,6 +69,42 @@ lint-cli:
 test-cli:
     cargo test --features cli
 
+# End-to-end tests only: spawn the real `nidus serve` binary and drive it over HTTP.
+# Included in `test-cli` (they need no services and run in seconds); this recipe is
+# for iterating on them alone. Pass a filter, e.g. `just test-e2e token`.
+test-e2e *FILTER:
+    cargo test --features cli --test e2e {{ FILTER }}
+
+# Start the services the cluster e2e tests need (real S3 + real Redis-family tier).
+# The container definitions live in scripts/e2e-services.sh — one source of truth,
+# shared with .github/workflows/integration.yml so local and CI cannot drift.
+e2e-services-up:
+    ./scripts/e2e-services.sh up
+
+# Stop them again
+e2e-services-down:
+    ./scripts/e2e-services.sh down
+
+# Bring up a 3-master Valkey CLUSTER and run the same cluster suite against it, so
+# the tier client's slot routing / MOVED-ASK handling is exercised (a single-node
+# valkey exercises none of it). LINUX ONLY — needs real host networking, which
+# Docker Desktop does not provide; runs in CI. minio must already be up.
+test-e2e-valkey-cluster *FILTER:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ./scripts/e2e-services.sh up-cluster
+    trap './scripts/e2e-services.sh down-cluster' EXIT
+    NIDUS_E2E_REDIS_URL="$(./scripts/e2e-services.sh cluster-url)" \
+        cargo test --features cli --test e2e cluster::{{ FILTER }} -- --ignored --test-threads=2
+
+# Cluster e2e: several real `nidus serve` processes over a shared object store and
+# memory tier. #[ignore]d by default (they need the services above), so run them
+# explicitly. Bring the services up first: `just e2e-services-up`.
+# Override the endpoints with NIDUS_E2E_S3_ENDPOINT / NIDUS_E2E_S3_BUCKET /
+# NIDUS_E2E_S3_KEY / NIDUS_E2E_S3_SECRET / NIDUS_E2E_REDIS_URL.
+test-e2e-cluster *FILTER:
+    cargo test --features cli --test e2e cluster::{{ FILTER }} -- --ignored --test-threads=2
+
 # Release build of the `nidus` binary
 build-cli:
     cargo build --release --features cli
@@ -215,6 +251,19 @@ bench ENGINES="nidus" *ARGS:
       *)     feats="$(echo '{{ENGINES}}' | tr ' ' ',' | sed -E 's/(^|,)nidus(,|$)/\1/g; s/^,+|,+$//g; s/,,+/,/g')" ;;
     esac
     cargo run -p nidus-bench --release ${feats:+--features "$feats"} -- {{ARGS}}
+
+# Library-vs-server parity: the same dataset through `Nidus` in-process AND over HTTP,
+# so the gap between the two rows IS the server's overhead (JSON encoding, the
+# RwLock + spawn_blocking hop, socket framing). Builds the release binary first and
+# points the adapter at it — benchmarking a debug binary measures nothing useful.
+#   just bench-server                     defaults
+#   just bench-server n=100000 dim=768    pass-through args
+bench-server *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --features cli
+    NIDUS_BIN="$PWD/target/release/nidus" \
+        cargo run -p nidus-bench --release --features server -- {{ARGS}}
 
 # int8 quantization recall & speed sweep (nidus-only, no engine deps). Sweeps the
 # rescore factor and reports recall@k vs exact ground truth + query speedup.

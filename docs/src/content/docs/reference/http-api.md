@@ -32,6 +32,7 @@ send `Authorization: Bearer <token>` — see [Authentication](/guides/http-serve
 | `POST /list` | metadata-only query (no vector) | `list` |
 | `POST /flush` | flush buffered writes to disk | `flush` |
 | `POST /compact` | reclaim dead rows and superseded log records | `compact` |
+| `POST /refresh` | adopt another instance's newer committed state | `refresh` |
 
 ## Health & introspection
 
@@ -275,6 +276,22 @@ Rewrite the store to reclaim `dead_rows` and superseded log records. Returns
 ```bash
 curl -s -X POST localhost:7700/compact   # → {"ok": true}
 ```
+
+### `POST /refresh`
+
+Adopt newer state committed by another instance writing to the same shared store. A
+read-only instance loads a snapshot when it starts and keeps serving that snapshot, so
+this is how you advance it. `adopted` says whether there was anything new to take up,
+which lets a poller distinguish "no change" from "moved forward".
+
+```bash
+curl -s -X POST localhost:7700/refresh   # → {"adopted": true}
+```
+
+Reads are deliberately not made to refresh on their own: that would put a metadata fetch
+on every query, which is the opposite of what a read-heavy fan-out wants. Call this as
+often as your staleness tolerance requires. It is harmless anywhere else — an instance
+that does its own writing already has the freshest state, and answers `{"adopted": false}`.
 
 ## Errors
 

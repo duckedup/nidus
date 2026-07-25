@@ -102,7 +102,7 @@ fn build(data: &data::Dataset, quant: Option<Quantization>) -> Result<(Nidus, te
         .enumerate()
         .map(|(i, &id)| Record {
             id: id.to_string(),
-            vector: data.vectors[i * dim..(i + 1) * dim].to_vec(),
+            vector: Some(data.vectors[i * dim..(i + 1) * dim].to_vec()),
             attrs: BTreeMap::new(),
         })
         .collect();
