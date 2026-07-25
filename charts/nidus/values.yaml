@@ -71,6 +71,25 @@ nidus:
   # Max request/upsert body size in bytes. "" leaves the server default (256 MiB).
   maxBodyBytes: ""
 
+  # ── Backpressure ─────────────────────────────────────────────────────────────
+  # Cap on store-touching requests in flight; past it, requests are SHED with a
+  # retryable 503 + Retry-After rather than queued. "" leaves the server default,
+  # which is auto: 8x CPU cores, floored at 64. Set it explicitly when you have set
+  # a CPU limit, since `available_parallelism` sees the node's cores, not the pod's
+  # quota — auto will overshoot on a small `resources.limits.cpu`.
+  # /health, /ready and /metrics are never shed.
+  maxConcurrentRequests: ""
+  # Per-request deadlines in seconds ("" = server default; "0" = no deadline).
+  # A read is milliseconds, a large upsert legitimately runs for minutes, which is
+  # why they are separate knobs. Note a timeout frees the CLIENT, not the CPU: a
+  # scan already running finishes anyway.
+  readTimeout: ""    # default 30
+  writeTimeout: ""   # default 600
+  # Log level: error | warn | info (default) | debug | trace | off. Logs are one
+  # key=value line per event on stderr, with a per-request id. `error` silences the
+  # per-request access log; `debug` turns on writer-lease tracing.
+  logLevel: ""
+
   # Approximate-nearest-neighbour index: "" (exact brute force) | hnsw | ivf.
   ann: ""
   # Optional ANN tuning — each non-empty key becomes a NIDUS_ANN_* env var.
@@ -79,7 +98,32 @@ nidus:
 
 # ── Bearer-token auth ───────────────────────────────────────────────────────────
 # Strongly recommended whenever the Service is reachable beyond localhost. When
-# enabled, every request except GET /health needs `Authorization: Bearer <token>`.
+# enabled, every request except the probes (GET /health, /ready, /metrics) needs
+# `Authorization: Bearer <token>`.
+#
+# READ THIS BEFORE EXPOSING THE SERVICE. nidus speaks PLAIN HTTP by design — there
+# is no in-process TLS, and that is a decision, not a gap: TLS belongs at the
+# ingress/sidecar/mesh you are already running. Consequences:
+#
+#   * `auth.token` authenticates a caller; it does NOT confer confidentiality. Over
+#     plain HTTP the token, every vector, every id, and every metadata value cross
+#     the network in cleartext on every request.
+#   * The chart's ClusterIP Service is in-cluster only, so pod-to-pod traffic is as
+#     private as your CNI makes it. The moment you expose it — `ingress.enabled`, a
+#     LoadBalancer Service, or a mesh gateway — terminate TLS there. Set
+#     `ingress.tls` (below) with a cert-manager or hand-managed Secret; a mesh with
+#     strict mTLS covers the in-cluster leg too.
+#   * Rate limiting belongs on the ingress, not in nidus. nidus bounds total
+#     in-flight work (see nidus.maxConcurrentRequests) but does nothing per-client.
+#   * The token model is one static shared secret: no rotation without a restart,
+#     no per-collection scoping, no user identity. Issue scoped or rotatable
+#     credentials at the proxy if you need them.
+#
+# nidus logs a warning at startup when it binds a non-loopback address (which the
+# container always does) — with a token, that the credential is in cleartext;
+# without one, that the store is open to anyone who can reach it. It warns and
+# starts; it never refuses, because refusing would break the proxy-terminated
+# architecture recommended here.
 auth:
   enabled: false
   # Provide the token inline (stored in a chart-managed Secret)…
@@ -218,15 +262,35 @@ service:
   annotations: {}
 
 # ── Ingress ───────────────────────────────────────────────────────────────────
+# This is where TLS terminates. nidus serves plain HTTP (see the auth section
+# above), so an Ingress with an empty `tls:` publishes the bearer token and every
+# vector in cleartext to anything on the path. Populate `tls` whenever `enabled`.
+#
+# Two more things worth setting here rather than in nidus:
+#   * A proxy body-size limit matching nidus.maxBodyBytes — most ingress controllers
+#     default to 1 MiB and will reject an upsert long before nidus sees it
+#     (nginx: nginx.ingress.kubernetes.io/proxy-body-size).
+#   * A proxy read timeout at least as long as nidus.writeTimeout, or the proxy will
+#     cut off a legitimate large upsert mid-batch
+#     (nginx: nginx.ingress.kubernetes.io/proxy-read-timeout).
+#
+# Keep /metrics off any public host: it exposes traffic shape (never collection
+# names or data), and it is deliberately unauthenticated so a scraper is not
+# reported as down.
 ingress:
   enabled: false
   className: ""
   annotations: {}
+    # nginx.ingress.kubernetes.io/proxy-body-size: "256m"
+    # nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
   hosts:
     - host: nidus.local
       paths:
         - path: /
           pathType: Prefix
+  # e.g.
+  #   - hosts: [nidus.local]
+  #     secretName: nidus-tls    # cert-manager, or a Secret you manage
   tls: []
 
 # ── ServiceAccount ──────────────────────────────────────────────────────────────

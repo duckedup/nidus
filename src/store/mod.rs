@@ -876,11 +876,14 @@ impl Store {
                 Ok(Some(handle)) => return Ok(handle),
                 Ok(None) => {}
                 Err(e) => {
-                    last_error = Some(e);
-                    eprintln!(
-                        "nidus: waiting for the writer handle — backend error, will retry: {}",
-                        last_error.as_ref().expect("just set")
+                    crate::metrics::metrics().lease_wait_errors.inc();
+                    crate::diag::diag!(
+                        crate::diag::Level::Warn,
+                        "lease",
+                        "waiting for the writer handle — backend error, will retry",
+                        "err" => format!("{e:#}"),
                     );
+                    last_error = Some(e);
                 }
             }
             if let Some(deadline) = deadline

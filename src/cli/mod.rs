@@ -496,6 +496,41 @@ enum Command {
         /// Default 256 MiB.
         #[arg(long, default_value_t = 256 * 1024 * 1024, env = "NIDUS_MAX_BODY_BYTES")]
         max_body_bytes: usize,
+        /// Cap on store-touching requests in flight. Past it, requests are **shed** with a
+        /// retryable `503` + `Retry-After` rather than queued — the store's working set is
+        /// in RAM, so an unbounded queue of in-flight bodies competes with the data itself.
+        ///
+        /// `0` (the default) means auto: 8× CPU cores, floored at 64. Search is CPU-bound
+        /// brute force, so admitting far more concurrent scans than cores buys no
+        /// throughput and costs memory. `/health`, `/ready` and `/metrics` are never shed.
+        #[arg(long, default_value_t = 0, env = "NIDUS_MAX_CONCURRENT_REQUESTS")]
+        max_concurrent_requests: usize,
+        /// Deadline in seconds for a read request (search, list, stats). Default 30.
+        /// `0` disables it.
+        ///
+        /// Frees the *client*; it does not stop the work. A scan already running on a
+        /// blocking task runs to completion regardless — cancelling it would need a
+        /// cooperative check in the scan loop, which nidus does not have.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            default_value_t = 30,
+            env = "NIDUS_READ_TIMEOUT"
+        )]
+        read_timeout: u64,
+        /// Deadline in seconds for a mutating request (upsert, delete, compact, flush).
+        /// Default 600. `0` disables it.
+        ///
+        /// Deliberately far longer than `--read-timeout`: a large upsert legitimately runs
+        /// for minutes under one write lock, and a bound tight enough for a search would
+        /// abort it mid-batch.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            default_value_t = 600,
+            env = "NIDUS_WRITE_TIMEOUT"
+        )]
+        write_timeout: u64,
         /// Refresh this instance every N seconds so a `--read-only` reader stays current
         /// without a sidecar or cron calling `POST /refresh`. Omit to leave refreshing
         /// entirely to the caller (the default).
@@ -710,17 +745,25 @@ pub fn run(cli: Cli) -> Result<()> {
             addr,
             token,
             max_body_bytes,
+            max_concurrent_requests,
+            read_timeout,
+            write_timeout,
             refresh_interval,
             require_remote,
             #[cfg(feature = "memory")]
             ingest,
         } => serve(
+            ServeArgs {
+                addr,
+                token,
+                max_body_bytes,
+                max_concurrent_requests,
+                read_timeout,
+                write_timeout,
+                refresh_interval,
+                require_remote,
+            },
             store,
-            addr,
-            token,
-            max_body_bytes,
-            refresh_interval,
-            require_remote,
             #[cfg(feature = "memory")]
             ingest,
         ),
@@ -945,15 +988,44 @@ fn open(store: &StoreArgs, mutating: bool) -> Result<Nidus> {
     Nidus::open(store.config(mode)?)
 }
 
-fn serve(
-    store: StoreArgs,
+/// The `serve` flags, as one struct.
+///
+/// A plain argument list had reached eight positional parameters of mostly-`u64`, which is
+/// exactly the shape where a transposed pair compiles cleanly and misconfigures the server.
+struct ServeArgs {
     addr: String,
     token: Option<String>,
     max_body_bytes: usize,
+    max_concurrent_requests: usize,
+    read_timeout: u64,
+    write_timeout: u64,
     refresh_interval: Option<u64>,
     require_remote: bool,
+}
+
+/// Seconds from a flag to a deadline, where `0` means "no deadline".
+///
+/// `0` rather than a separate `--no-read-timeout` flag: it reads naturally, it is what an
+/// operator reaches for first, and it keeps the escape hatch on the same knob as the value.
+fn timeout_secs(secs: u64) -> Option<std::time::Duration> {
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+fn serve(
+    args: ServeArgs,
+    store: StoreArgs,
     #[cfg(feature = "memory")] ingest: IngestArgs,
 ) -> Result<()> {
+    let ServeArgs {
+        addr,
+        token,
+        max_body_bytes,
+        max_concurrent_requests,
+        read_timeout,
+        write_timeout,
+        refresh_interval,
+        require_remote,
+    } = args;
     // The container contract: no durable local disk, so refuse anything that would
     // keep its state process-local (a local-file store or process-RAM working set).
     if require_remote {
@@ -997,6 +1069,9 @@ fn serve(
         addr,
         token,
         max_body_bytes,
+        max_concurrent_requests,
+        read_timeout: timeout_secs(read_timeout),
+        write_timeout: timeout_secs(write_timeout),
         max_staleness: open_config.max_staleness,
         // A third of the lease TTL: frequent enough that a long batch cannot let the lease
         // lapse, infrequent enough to be a rounding error in object-store cost.
@@ -1478,16 +1553,27 @@ mod tests {
         assert!(!store_args(None, None).is_shared_memory());
     }
 
+    /// `--require-remote` args that never get as far as binding: the check under test
+    /// fails first. Everything but `require_remote` is therefore a placeholder.
+    fn require_remote_args() -> ServeArgs {
+        ServeArgs {
+            addr: "x".into(),
+            token: None,
+            max_body_bytes: 1,
+            max_concurrent_requests: 0,
+            read_timeout: 30,
+            write_timeout: 600,
+            refresh_interval: None,
+            require_remote: true,
+        }
+    }
+
     #[test]
     fn serve_require_remote_rejects_local_backends() {
         // Local-file persistence (the default) is refused under --require-remote.
         let err = serve(
+            require_remote_args(),
             store_args(None, Some("redis://c")),
-            "x".into(),
-            None,
-            1,
-            None,
-            true,
             #[cfg(feature = "memory")]
             IngestArgs::default(),
         )
@@ -1500,18 +1586,21 @@ mod tests {
 
         // Object store but process-RAM memory is refused too.
         let err = serve(
+            require_remote_args(),
             store_args(Some("s3://b/s"), None),
-            "x".into(),
-            None,
-            1,
-            None,
-            true,
             #[cfg(feature = "memory")]
             IngestArgs::default(),
         )
         .unwrap_err()
         .to_string();
         assert!(err.contains("--memory must be a shared"), "{err}");
+    }
+
+    /// `0` is the documented "no deadline" escape hatch on both timeout flags.
+    #[test]
+    fn zero_means_no_deadline() {
+        assert_eq!(timeout_secs(0), None);
+        assert_eq!(timeout_secs(30), Some(std::time::Duration::from_secs(30)));
     }
 
     #[test]

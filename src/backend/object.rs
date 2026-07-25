@@ -341,12 +341,24 @@ impl LeaseRenewer {
     pub fn renew(&self) -> Result<()> {
         match renew_lease_object(&self.persistence, &self.key, &self.owner) {
             Err(e) if is_lease_lost(&e) => {
-                self.fenced
-                    .store(true, std::sync::atomic::Ordering::Release);
+                latch_fenced(&self.fenced);
                 Err(e)
             }
             other => other,
         }
+    }
+}
+
+/// Latch a store's `fenced` flag, counting the transition exactly once.
+///
+/// Both the out-of-band renewer above and the op-driven pre-batch renew in
+/// `store::write` discover a definitive loss and must latch. `swap` rather than `store`
+/// so `nidus_lease_fenced_total` counts the *transition*: fencing is permanent, so a
+/// counter that ticked on every subsequent failed write would report an escalating
+/// problem where there is one, unchanging fact.
+pub(crate) fn latch_fenced(fenced: &std::sync::atomic::AtomicBool) {
+    if !fenced.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        crate::metrics::metrics().lease_fenced.inc();
     }
 }
 
@@ -410,6 +422,26 @@ impl BackendLock for ClusterLease {}
 /// [`LeaseRenewer::renew`] — one implementation, so the owning guard and the out-of-band
 /// renewer can never drift on what "renew" means.
 fn renew_lease_object(persistence: &Arc<dyn Persistence>, key: &str, owner: &str) -> Result<()> {
+    // Counted here rather than at the two call sites: this is the one function both the
+    // owning guard and the background renewer route through, so the attempt/outcome split
+    // — the thing that would have shown an object store misbehaving long before anything
+    // broke (nidus-abx.4) — cannot drift between them.
+    let m = crate::metrics::metrics();
+    m.lease_renew_attempts.inc();
+    let outcome = renew_lease_object_inner(persistence, key, owner);
+    match &outcome {
+        Ok(()) => m.lease_renew_ok.inc(),
+        Err(e) if is_lease_lost(e) => m.lease_renew_lost.inc(),
+        Err(_) => m.lease_renew_transient_failures.inc(),
+    }
+    outcome
+}
+
+fn renew_lease_object_inner(
+    persistence: &Arc<dyn Persistence>,
+    key: &str,
+    owner: &str,
+) -> Result<()> {
     match persistence.get_cas(key)? {
         Some((bytes, token)) => {
             lease_debug(format_args!(
@@ -533,18 +565,25 @@ fn parse_owner(bytes: &[u8]) -> Option<String> {
         .map(|o| o.to_string())
 }
 
-/// Env-gated lease tracing (`NIDUS_LEASE_DEBUG=1`), off by default.
+/// Lease tracing at `debug` level (`NIDUS_LOG=debug`, or the legacy `NIDUS_LEASE_DEBUG=1`).
 ///
 /// Kept in-tree deliberately: what defeated the first pass at nidus-lp4.7 was not being able
 /// to tell which instance a log line came from, so every line carries the emitting process's
 /// pid, the key, and the TTL actually in force. A lease bug is a multi-process race that
 /// reproduces on a real object store and nowhere else — when it happens again, this is the
 /// difference between an afternoon and a week.
+///
+/// It now routes through the general levelled logger (nidus-abx.4) rather than its own
+/// env-var switch, so lease tracing turns up and down with everything else instead of being
+/// a one-subsystem special case — but `NIDUS_LEASE_DEBUG` still works, because runbooks and
+/// CI jobs set it.
 fn lease_debug(args: std::fmt::Arguments<'_>) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("NIDUS_LEASE_DEBUG").is_some()) {
-        eprintln!("nidus[lease pid={}] {args}", std::process::id());
-    }
+    crate::diag::diag!(
+        crate::diag::Level::Debug,
+        "lease",
+        args,
+        "pid" => std::process::id(),
+    );
 }
 
 /// The error a renewal returns when this instance has **definitively** lost the lease to

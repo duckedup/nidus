@@ -9,9 +9,12 @@ server, set a bind address, and configure auth, see the
 [HTTP server guide](/guides/http-server/).
 
 **Base URL** is wherever the server is bound (the examples use `localhost:7700`).
-**Auth:** when the server is started with a token, every request except `GET /health` must
-send `Authorization: Bearer <token>` — see [Authentication](/guides/http-server/#authentication).
+**Auth:** when the server is started with a token, every request except the probe endpoints
+(`GET /health`, `GET /ready`, `GET /metrics`) must send `Authorization: Bearer <token>` — see
+[Authentication](/guides/http-server/#authentication).
 **Errors** return `{"error": "<message>"}` with a status code; see [Errors](#errors).
+**Correlation:** every response carries `X-Request-Id`. Send your own and nidus echoes it,
+so the same id appears in your logs and the server's.
 
 | Method & path | Operation | Library method |
 | --- | --- | --- |
@@ -35,6 +38,7 @@ send `Authorization: Bearer <token>` — see [Authentication](/guides/http-serve
 | `POST /refresh` | adopt another instance's newer committed state | `refresh` |
 | `GET /ready` | whether this instance can serve (store open, not fenced, not stale) | — |
 | `GET /cluster` | role, writer-handle state, fencing token, commit counter, staleness | `cluster_status` |
+| `GET /metrics` | Prometheus scrape — traffic, search path, lease counters (always unauthenticated) | — |
 
 ## Health & introspection
 
@@ -122,6 +126,30 @@ reports a lower number; the gap is replication lag. `staleness_secs` is `0` for 
 *is* the current state) and, for a reader, the age of its last successful refresh.
 
 Every field is read from memory: no object-store round trip, so this is cheap to poll.
+
+### `GET /metrics`
+
+Prometheus text exposition (`text/plain; version=0.0.4`). Always reachable without a
+token — a scraper that got a `401` would report the target as down.
+
+```bash
+curl -s localhost:7700/metrics
+```
+
+```text
+# HELP nidus_search_queries_total Vector searches served
+# TYPE nidus_search_queries_total counter
+nidus_search_queries_total 1483
+# TYPE nidus_http_requests_total counter
+nidus_http_requests_total{route="/search",status="2xx"} 1483
+nidus_http_request_duration_seconds_bucket{route="/search",le="0.01"} 1402
+…
+```
+
+Route labels are **templates** (`/collections/{name}/upsert`), never the collection name:
+the scrape exposes traffic shape, not what is stored. The full metric list is in the
+[server guide](/guides/http-server/#get-metrics). Reading it takes no store lock, so a
+scrape answers instantly even during a long write.
 
 ### `GET /stats`
 
@@ -387,5 +415,16 @@ mistake from a server fault:
 | `403 Forbidden` | a write against a `--read-only` server |
 | `409 Conflict` | the store's writer lock is held by another process |
 | `413 Payload Too Large` | request body exceeds `--max-body-bytes` |
+| `503 Service Unavailable` | the store is not open yet (a standby waiting for promotion), **or** the request was [shed](/guides/http-server/#backpressure) at `--max-concurrent-requests` |
+| `504 Gateway Timeout` | the request exceeded `--read-timeout` / `--write-timeout` |
 | `507 Insufficient Storage` | an allocation guard (`max_vector_bytes`) or OOM tripped |
 | `500 Internal Server Error` | anything else (an IO fault, a bug) |
+
+### Retrying
+
+A shed `503` carries `Retry-After: 1` and `{"retryable": true}` in the body. Nothing was
+attempted and the store is untouched, so retrying after a brief backoff is correct.
+
+A `504` carries `{"retryable": false}`. The request *was* admitted and the work may still
+be running — a timeout frees the client, not the CPU — so an immediate retry piles a second
+copy onto an instance that is already behind. Back off substantially, or don't retry.

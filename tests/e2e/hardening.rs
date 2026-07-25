@@ -1,0 +1,324 @@
+//! Serving-edge hardening against a real process (epic nidus-abx).
+//!
+//! What the in-process `tower::oneshot` suites structurally cannot reach: a *shared*
+//! permit pool under genuinely concurrent connections (a `oneshot` router serves one
+//! request at a time, so admission control there can only be tested by pre-exhausting it),
+//! the CLI-flag → `ServeConfig` wiring for the new knobs, `NIDUS_LOG` filtering in the
+//! process that reads it, and `/metrics` served over a real socket.
+
+use serde_json::json;
+use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
+use std::time::{Duration, Instant};
+
+use crate::harness::Server;
+
+/// Vectors seeded before the load test, so a search does enough work to overlap with its
+/// neighbours rather than completing before the next connection is even accepted.
+const SEED_DOCS: usize = 2_000;
+const DIM: usize = 64;
+
+fn seed(server: &crate::harness::RunningServer, n: usize) {
+    let records: Vec<_> = (0..n)
+        .map(|i| {
+            // A cheap deterministic spread; the ranking is irrelevant here, only the cost.
+            let v: Vec<f32> = (0..DIM)
+                .map(|d| ((i * 31 + d * 17) % 97) as f32 / 97.0)
+                .collect();
+            json!({ "id": format!("d{i}"), "vector": v, "attrs": {} })
+        })
+        .collect();
+    let (status, body) = server.post("/collections/load/upsert", &json!({ "records": records }));
+    assert_eq!(status, 200, "seeding failed: {body}");
+}
+
+/// **Beyond the concurrency limit, requests are shed with `503` — not queued** (nidus-abx.2).
+///
+/// Sixteen client threads issue `REQUESTS_PER_CLIENT` searches each against
+/// `--max-concurrent-requests 1`. With sixteen requests in flight and one permit, shedding
+/// is a structural certainty rather than a race the test hopes to win.
+///
+/// The requests are **paced**, not fired in a tight loop. An unthrottled loop saturates the
+/// *client* first — thousands of connections in a couple of seconds exhausts the local
+/// ephemeral-port range and ureq starts returning `EINVAL`, which fails the test for a
+/// reason that has nothing to do with the server. The pacing costs nothing here because
+/// shedding happens on the first overlapping request, not after a warm-up.
+///
+/// Assertions are on *kind* (some 503s, no other status, every 503 marked retryable), never
+/// on a latency threshold: this is a debug build on a shared runner, so a tight timing bound
+/// would flake and prove nothing (CLAUDE.md). The one timing assertion is
+/// order-of-magnitude — the run must finish in the time paced requests should take, which is
+/// what distinguishes shedding from the unbounded queueing this replaced.
+#[test]
+fn concurrent_load_beyond_the_limit_is_shed_not_queued() {
+    const CLIENTS: usize = 16;
+    const REQUESTS_PER_CLIENT: usize = 25;
+    const PACE: Duration = Duration::from_millis(5);
+
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), DIM)
+        .args(["--max-concurrent-requests", "1"])
+        .start();
+    seed(&server, SEED_DOCS);
+
+    let ok = Arc::new(AtomicUsize::new(0));
+    let shed = Arc::new(AtomicUsize::new(0));
+    let other = Arc::new(AtomicUsize::new(0));
+    let not_marked_retryable = Arc::new(AtomicUsize::new(0));
+
+    let started = Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..CLIENTS {
+            let (ok, shed, other, not_marked_retryable) = (
+                Arc::clone(&ok),
+                Arc::clone(&shed),
+                Arc::clone(&other),
+                Arc::clone(&not_marked_retryable),
+            );
+            let server = &server;
+            s.spawn(move || {
+                let query: Vec<f32> = (0..DIM).map(|d| (d % 7) as f32).collect();
+                let body = json!({ "query": query, "top_k": 20 });
+                for _ in 0..REQUESTS_PER_CLIENT {
+                    let (status, payload) = server.post("/search", &body);
+                    match status {
+                        200 => {
+                            ok.fetch_add(1, Ordering::Relaxed);
+                        }
+                        503 => {
+                            shed.fetch_add(1, Ordering::Relaxed);
+                            if payload["retryable"] != json!(true) {
+                                not_marked_retryable.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        _ => {
+                            other.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    std::thread::sleep(PACE);
+                }
+            });
+        }
+    });
+    let elapsed = started.elapsed();
+
+    let (ok, shed, other) = (
+        ok.load(Ordering::Relaxed),
+        shed.load(Ordering::Relaxed),
+        other.load(Ordering::Relaxed),
+    );
+    assert_eq!(
+        other, 0,
+        "unexpected statuses beyond 200/503 ({ok} ok, {shed} shed)"
+    );
+    assert!(ok > 0, "the server should still be serving under load");
+    assert!(
+        shed > 0,
+        "{CLIENTS} concurrent clients against a limit of 1 must shed something; \
+         got {ok} ok, 0 shed"
+    );
+    assert_eq!(
+        not_marked_retryable.load(Ordering::Relaxed),
+        0,
+        "every shed response must say it is retryable"
+    );
+    // Order-of-magnitude: paced requests should take about `REQUESTS_PER_CLIENT × PACE`,
+    // and 10× that is still nowhere near what unbounded queueing behind one lock would cost.
+    let paced = PACE * REQUESTS_PER_CLIENT as u32;
+    assert!(
+        elapsed < paced * 10,
+        "load ran {elapsed:?} against a paced {paced:?} — requests were queueing, not shedding"
+    );
+
+    // The server's own counters agree with what the clients saw. This is also the proof
+    // that the metrics path stays answerable under saturation: the scrape happens while
+    // the instance has just been shedding, and it takes no store lock.
+    let scrape = scrape(&server);
+    let counted = metric(&scrape, "nidus_http_requests_shed_total")
+        .unwrap_or_else(|| panic!("shed counter missing:\n{scrape}"));
+    assert!(
+        counted >= shed as f64,
+        "server counted {counted} shed, clients saw {shed}"
+    );
+}
+
+/// Both timeout flags and the concurrency flag reach `ServeConfig` — the wiring the
+/// in-process suites cannot see, because they construct `AppState` directly.
+///
+/// `--read-timeout 1` with `--max-concurrent-requests` left at auto: an ordinary search is
+/// milliseconds, so the deadline must NOT fire. A flag that silently aborted healthy
+/// traffic would be worse than no flag.
+#[test]
+fn timeout_flags_are_wired_and_do_not_fire_on_healthy_traffic() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), DIM)
+        .args(["--read-timeout", "5", "--write-timeout", "30"])
+        .start();
+    seed(&server, 200);
+
+    let query: Vec<f32> = (0..DIM).map(|d| (d % 5) as f32).collect();
+    let (status, body) = server.post("/search", &json!({ "query": query, "top_k": 5 }));
+    assert_eq!(status, 200, "{body}");
+    assert!(body.as_array().is_some_and(|a| !a.is_empty()));
+}
+
+/// `--max-concurrent-requests 0` is the documented "auto" value, not "admit nothing".
+///
+/// Worth its own test because the failure mode is total: reading `0` as a literal cap would
+/// make every configured-to-default server shed every request, while still passing every
+/// unit test that constructs `Limits` directly.
+#[test]
+fn zero_concurrency_means_auto_not_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), DIM)
+        .args(["--max-concurrent-requests", "0"])
+        .start();
+    let (status, _) = server.get("/stats");
+    assert_eq!(status, 200, "auto must not shed ordinary traffic");
+
+    let scrape = scrape(&server);
+    let limit = metric(&scrape, "nidus_http_concurrency_limit").expect("limit gauge");
+    assert!(limit >= 64.0, "auto floors at 64, got {limit}");
+}
+
+/// `/metrics` is reachable **without** a credential on a token-protected server (a scraper
+/// that got a `401` would report the target as down), and never names a collection
+/// (nidus-abx.4).
+#[test]
+fn metrics_is_scrapeable_without_a_token_and_names_no_collections() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), DIM).token("s3cret").start();
+
+    let (status, body) = server.post(
+        "/collections/very-secret-project/upsert",
+        &json!({"records": [{"id": "a", "vector": vec![0.5f32; DIM], "attrs": {}}]}),
+    );
+    assert_eq!(status, 200, "{body}");
+
+    // A bare client with no Authorization header at all.
+    let raw = ureq::get(format!("{}/metrics", server.base_url()))
+        .call()
+        .expect("scrape /metrics unauthenticated");
+    assert_eq!(raw.status().as_u16(), 200);
+    let text = raw.into_body().read_to_string().expect("metrics body");
+
+    assert!(
+        !text.contains("very-secret-project"),
+        "a collection name reached a metric label:\n{text}"
+    );
+    assert!(text.contains("nidus_http_requests_total{route=\"/collections/{name}/upsert\""));
+    assert!(text.contains("nidus_lease_renew_attempts_total"));
+
+    // And a data route still demands the token — opening /metrics must not have opened
+    // anything else.
+    let denied = ureq::get(format!("{}/stats", server.base_url()))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()
+        .expect("call /stats");
+    assert_eq!(denied.status().as_u16(), 401);
+}
+
+/// A correlation id survives a real round trip, and the access log carries it — the point
+/// of the id is that the same string appears in the client's record and the server's.
+#[test]
+fn request_ids_round_trip_into_the_access_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), DIM).start();
+
+    let resp = ureq::get(format!("{}/stats", server.base_url()))
+        .header("x-request-id", "e2e-correlation-1")
+        .call()
+        .expect("GET /stats");
+    assert_eq!(
+        resp.headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("e2e-correlation-1")
+    );
+
+    // The access line is emitted after the response is produced, so give the child a
+    // moment to flush it before reading its stderr.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !server.stderr().contains("e2e-correlation-1") {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let log = server.stderr();
+    assert!(
+        log.contains("id=e2e-correlation-1"),
+        "the access log should carry the caller's id:\n{log}"
+    );
+    assert!(
+        log.contains("route=/stats") && log.contains("status=200"),
+        "the access line should be structured key=value:\n{log}"
+    );
+}
+
+/// `NIDUS_LOG` turns detail down, in the process that reads it.
+///
+/// At `error`, the per-request access lines must disappear while the startup banner (a
+/// plain `println`, not a log record) stays — that split is what lets a test suite or a
+/// noisy production deployment silence traffic logging without losing the line that
+/// reports the bound port.
+#[test]
+fn nidus_log_filters_the_access_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), DIM)
+        .env("NIDUS_LOG", "error")
+        .start();
+
+    for _ in 0..3 {
+        let (status, _) = server.get("/stats");
+        assert_eq!(status, 200);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let log = server.stderr();
+    assert!(
+        !log.contains("target=http"),
+        "NIDUS_LOG=error must suppress the access log:\n{log}"
+    );
+    assert!(
+        log.contains("nidus serving on http://"),
+        "the startup banner must survive any log level:\n{log}"
+    );
+}
+
+/// A loopback bind must NOT print an exposure warning (nidus-abx.6).
+///
+/// The complementary case — that a non-loopback bind *does* warn — is
+/// `server::tests::exposure_is_classified_by_reachability_then_auth`, unit-tested on the
+/// classification rather than here: binding `0.0.0.0` from a test would open a real
+/// off-box socket on whatever machine runs it, which is not a thing a test suite should do.
+#[test]
+fn a_loopback_bind_prints_no_security_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), DIM).start();
+    let (status, _) = server.get("/stats");
+    assert_eq!(status, 200);
+
+    let log = server.stderr();
+    assert!(
+        !log.contains("off-loopback"),
+        "a localhost server must not cry wolf:\n{log}"
+    );
+}
+
+/// Scrape `/metrics` as text.
+fn scrape(server: &crate::harness::RunningServer) -> String {
+    ureq::get(format!("{}/metrics", server.base_url()))
+        .call()
+        .expect("scrape /metrics")
+        .into_body()
+        .read_to_string()
+        .expect("metrics body")
+}
+
+/// Pull a single unlabelled sample out of a Prometheus text exposition.
+fn metric(scrape: &str, name: &str) -> Option<f64> {
+    scrape.lines().find_map(|l| {
+        l.strip_prefix(name)
+            .filter(|rest| rest.starts_with(' '))
+            .and_then(|rest| rest.trim().parse().ok())
+    })
+}

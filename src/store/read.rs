@@ -314,6 +314,12 @@ impl Store {
         query: &[f32],
         opts: &SearchOpts,
     ) -> Result<Vec<Hit>> {
+        // Which path served a query is the difference between "queries are slow" and
+        // "queries are slow BECAUSE the index is not being used" (nidus-abx.4). One relaxed
+        // atomic add per query, off the per-vector inner loop entirely.
+        let m = crate::metrics::metrics();
+        m.search_queries.inc();
+
         let mut q = query.to_vec();
         if self.config.distance == Distance::Cosine {
             normalize(&mut q);
@@ -330,6 +336,7 @@ impl Store {
         // `search_ann` first falls back to an exact prefilter when the survivor set is
         // small enough to score directly (nidus-0ou). Skips the linear scan otherwise.
         if self.ann.is_some() {
+            m.search_ann.inc();
             return self.search_ann(collections, &q, opts, score_fn);
         }
 
@@ -338,6 +345,7 @@ impl Store {
         // into one ranking (SPEC §14.3). Engaged only when at least one segment is indexed
         // — i.e. `segment_index_min_rows` is set and a sealed segment has crossed it.
         if self.seg_indexes.iter().any(Option::is_some) {
+            m.search_segmented.inc();
             return self.search_segmented(collections, &q, opts, score_fn);
         }
 
@@ -346,6 +354,11 @@ impl Store {
         // hands back an already row-sorted scan, reusing the cached whole-store order
         // where it can so the sort is not redone every query (nidus-dxt).
         self.with_sorted_scan(collections, &opts.filter, |scan| {
+            // Only the brute-force paths reach here, which is exactly why the counter lives
+            // here: "rows scanned" is a meaningful cost on a linear scan and meaningless on
+            // an ANN walk, so counting it in one place keeps the metric honest.
+            m.search_vectors_scanned.add(scan.len() as u64);
+
             // Decide once whether this query splits across workers (configured threads +
             // enough scan work to amortize spawn cost).
             let workers = self.parallel_workers(scan.len());
@@ -353,8 +366,10 @@ impl Store {
             // Two-pass quantized search if enabled and the quantized matrix is populated;
             // otherwise the standard exact f32 brute-force path.
             if let Some(res) = self.search_quantized(&q, scan, opts, score_fn, workers) {
+                m.search_quantized.inc();
                 return res;
             }
+            m.search_exact.inc();
             self.rank_scan(&q, scan, score_fn, opts)
         })
     }
