@@ -981,6 +981,25 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// The single place tests build [`AppState`], so adding a field updates one site instead of
+/// every helper. Lives at module level, not inside `mod tests`, so the `memory`-gated
+/// `memory_tests` module sees it too via `use super::*` — those helpers compile only on the
+/// `serve` lane, which is exactly how they drifted out of sync unnoticed.
+#[cfg(test)]
+fn test_state(db: Option<Nidus>) -> AppState {
+    let open = db.is_some();
+    AppState {
+        db: Arc::new(RwLock::new(db)),
+        open: Arc::new(std::sync::atomic::AtomicBool::new(open)),
+        max_staleness: None,
+        token: None,
+        #[cfg(feature = "memory")]
+        embedder: None,
+        #[cfg(all(feature = "memory", feature = "summarize"))]
+        summarizer: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -998,17 +1017,7 @@ mod tests {
     /// Build a router over an optional store — `None` models an instance whose store is
     /// not open yet (a standby waiting for promotion).
     fn router_over(db: Option<Nidus>) -> Router {
-        let open = db.is_some();
-        let state = AppState {
-            db: Arc::new(RwLock::new(db)),
-            open: Arc::new(std::sync::atomic::AtomicBool::new(open)),
-            max_staleness: None,
-            token: None,
-            #[cfg(feature = "memory")]
-            embedder: None,
-            #[cfg(all(feature = "memory", feature = "summarize"))]
-            summarizer: None,
-        };
+        let state = test_state(db);
         router(state, 16 * 1024 * 1024)
     }
 
@@ -1137,15 +1146,9 @@ mod tests {
     async fn staleness_bound_does_not_fail_a_writer() {
         let db = Nidus::open_in_memory(3).unwrap();
         let state = AppState {
-            db: Arc::new(RwLock::new(Some(db))),
-            open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             // Zero tolerance: anything with nonzero staleness would fail.
             max_staleness: Some(std::time::Duration::ZERO),
-            token: None,
-            #[cfg(feature = "memory")]
-            embedder: None,
-            #[cfg(all(feature = "memory", feature = "summarize"))]
-            summarizer: None,
+            ..test_state(Some(db))
         };
         let app = router(state, 16 * 1024 * 1024);
         let resp = app.oneshot(get("/ready")).await.unwrap();
@@ -1162,14 +1165,8 @@ mod tests {
     async fn probes_are_exempt_from_auth() {
         let db = Nidus::open_in_memory(3).unwrap();
         let state = AppState {
-            db: Arc::new(RwLock::new(Some(db))),
-            open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            max_staleness: None,
             token: Some(Arc::from("s3cret")),
-            #[cfg(feature = "memory")]
-            embedder: None,
-            #[cfg(all(feature = "memory", feature = "summarize"))]
-            summarizer: None,
+            ..test_state(Some(db))
         };
         let app = router(state, 16 * 1024 * 1024);
 
@@ -1399,25 +1396,15 @@ mod memory_tests {
         .expect("build mock embedder");
         let db = Nidus::open_in_memory(DIM).unwrap();
         let state = AppState {
-            db: Arc::new(RwLock::new(db)),
-            token: None,
             embedder: Some(Arc::new(embedder)),
-            #[cfg(all(feature = "memory", feature = "summarize"))]
-            summarizer: None,
+            ..test_state(Some(db))
         };
         router(state, 16 * 1024 * 1024)
     }
 
     /// A router with NO embedder configured — memory routes must answer `400`.
     fn router_without_embedder() -> Router {
-        let db = Nidus::open_in_memory(DIM).unwrap();
-        let state = AppState {
-            db: Arc::new(RwLock::new(db)),
-            token: None,
-            embedder: None,
-            #[cfg(all(feature = "memory", feature = "summarize"))]
-            summarizer: None,
-        };
+        let state = test_state(Some(Nidus::open_in_memory(DIM).unwrap()));
         router(state, 16 * 1024 * 1024)
     }
 

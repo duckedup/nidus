@@ -766,14 +766,32 @@ impl Store {
             LeaseWait::Forever => None,
         };
 
+        // Remembered so a wait that ends in repeated backend errors reports the real cause
+        // rather than a misleading "store is locked".
+        let mut last_error: Option<anyhow::Error> = None;
         loop {
-            if let Some(handle) = claim()? {
-                return Ok(handle);
+            // A transient backend error must NOT end the wait. A standby may sit here for
+            // hours, and an object store will drop the occasional connection ("Peer
+            // disconnected") in that time; treating the first blip as fatal makes the
+            // process exit, which is precisely the crash-loop waiting exists to avoid.
+            // Only a *definitive* answer — acquired, or the deadline — ends the loop.
+            match claim() {
+                Ok(Some(handle)) => return Ok(handle),
+                Ok(None) => {}
+                Err(e) => {
+                    last_error = Some(e);
+                    eprintln!(
+                        "nidus: waiting for the writer handle — backend error, will retry: {}",
+                        last_error.as_ref().expect("just set")
+                    );
+                }
             }
             if let Some(deadline) = deadline
                 && Instant::now() >= deadline
             {
-                return Err(locked_error(location));
+                // Surface the real cause when the wait ended in errors rather than
+                // contention — "store is locked" would be a misleading diagnosis.
+                return Err(last_error.unwrap_or_else(|| locked_error(location)));
             }
             // Jitter up to +25%: several standbys would otherwise wake together the
             // instant a TTL lapses and stampede the same lock object.
