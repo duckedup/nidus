@@ -161,6 +161,7 @@ struct StoreArgs {
     ///
     /// Bare `--wait-for-lease` waits indefinitely (what a hot standby wants); give it a
     /// number of seconds to give up after that long instead.
+    ///
     #[arg(
         long,
         value_name = "SECONDS",
@@ -169,6 +170,14 @@ struct StoreArgs {
         env = "NIDUS_WAIT_FOR_LEASE"
     )]
     wait_for_lease: Option<String>,
+    /// Fail the readiness probe once a `--read-only` instance has gone this many seconds
+    /// without verifying it is current. Omit for no bound (the default).
+    ///
+    /// A cluster reader only advances when something refreshes it, so without a bound a
+    /// reader whose refresher has died serves ever-older results while looking healthy.
+    /// Pair with `--refresh-interval`, or with an external `POST /refresh`.
+    #[arg(long, value_name = "SECONDS", env = "NIDUS_MAX_STALENESS")]
+    max_staleness: Option<u64>,
     /// Refuse to open a store whose vector matrix would exceed this many bytes — the
     /// overcommit guard (SPEC §6.6). Omit for no ceiling.
     #[arg(long, env = "NIDUS_MAX_VECTOR_BYTES")]
@@ -257,6 +266,7 @@ impl StoreArgs {
             cfg = cfg.lock_ttl(std::time::Duration::from_secs(secs));
         }
         cfg = cfg.lease_wait(self.lease_wait()?);
+        cfg = cfg.max_staleness(self.max_staleness.map(std::time::Duration::from_secs));
         Ok(cfg)
     }
 
@@ -486,6 +496,16 @@ enum Command {
         /// Default 256 MiB.
         #[arg(long, default_value_t = 256 * 1024 * 1024, env = "NIDUS_MAX_BODY_BYTES")]
         max_body_bytes: usize,
+        /// Refresh this instance every N seconds so a `--read-only` reader stays current
+        /// without a sidecar or cron calling `POST /refresh`. Omit to leave refreshing
+        /// entirely to the caller (the default).
+        ///
+        /// A server-side interval, deliberately not a refresh on every read: that would put
+        /// a manifest fetch on the hot path of exactly the read-heavy fan-out cluster mode
+        /// exists for. Reads may be up to N seconds stale — pair with `--max-staleness` to
+        /// have readiness fail if refreshing stops working.
+        #[arg(long, value_name = "SECONDS", env = "NIDUS_REFRESH_INTERVAL")]
+        refresh_interval: Option<u64>,
         /// Refuse to start unless the store is backed by *shared, non-local* backends:
         /// object-store `--persistence` (`s3://…`/`gs://…`) **and** a Redis-family
         /// `--memory` tier (`redis://…`). This is the contract the published Docker
@@ -690,6 +710,7 @@ pub fn run(cli: Cli) -> Result<()> {
             addr,
             token,
             max_body_bytes,
+            refresh_interval,
             require_remote,
             #[cfg(feature = "memory")]
             ingest,
@@ -698,6 +719,7 @@ pub fn run(cli: Cli) -> Result<()> {
             addr,
             token,
             max_body_bytes,
+            refresh_interval,
             require_remote,
             #[cfg(feature = "memory")]
             ingest,
@@ -928,6 +950,7 @@ fn serve(
     addr: String,
     token: Option<String>,
     max_body_bytes: usize,
+    refresh_interval: Option<u64>,
     require_remote: bool,
     #[cfg(feature = "memory")] ingest: IngestArgs,
 ) -> Result<()> {
@@ -974,6 +997,11 @@ fn serve(
         addr,
         token,
         max_body_bytes,
+        max_staleness: open_config.max_staleness,
+        // A third of the lease TTL: frequent enough that a long batch cannot let the lease
+        // lapse, infrequent enough to be a rounding error in object-store cost.
+        lease_renew_interval: open_config.lock_ttl / 3,
+        refresh_interval: refresh_interval.map(std::time::Duration::from_secs),
         #[cfg(feature = "memory")]
         embedder,
         #[cfg(all(feature = "memory", feature = "summarize"))]
@@ -1458,6 +1486,7 @@ mod tests {
             "x".into(),
             None,
             1,
+            None,
             true,
             #[cfg(feature = "memory")]
             IngestArgs::default(),
@@ -1475,6 +1504,7 @@ mod tests {
             "x".into(),
             None,
             1,
+            None,
             true,
             #[cfg(feature = "memory")]
             IngestArgs::default(),

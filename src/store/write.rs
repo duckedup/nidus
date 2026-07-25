@@ -32,8 +32,18 @@ impl Store {
     /// Renew (and fence) the cluster writer lease — op-driven, no background thread. A no-op
     /// outside cluster mode (no lease held); errors if this writer was superseded.
     fn renew_lease(&self) -> Result<()> {
-        if let Some(lease) = &self.lease {
-            lease.renew()?;
+        if let Some(lease) = &self.lease
+            && let Err(e) = lease.renew()
+        {
+            // Latch it. Losing the lease is permanent — this instance can never write again
+            // and must be replaced — so record it rather than letting the fact exist only
+            // inside this one error. That is what lets a readiness probe see a fenced writer
+            // and pull it out of rotation instead of leaving it in the load balancer
+            // failing every write (nidus-lp4.1).
+            self.fenced
+                .store(true, std::sync::atomic::Ordering::Release);
+            eprintln!("nidus: writer lease LOST — this instance is fenced: {e:#}");
+            return Err(e);
         }
         Ok(())
     }

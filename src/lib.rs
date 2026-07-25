@@ -76,14 +76,14 @@ pub use memory::{META_SOURCE, META_SUMMARY};
 
 pub use anyhow::Result;
 pub use backend::{
-    Appender, BackendLock, CasOutcome, LocalFs, LocalRam, MemoryTier, Persistence,
-    open_memory_tier, open_persistence,
+    Appender, BackendLock, CasOutcome, ClusterLease, LeaseRenewer, LocalFs, LocalRam, MemoryTier,
+    Persistence, open_memory_tier, open_persistence,
 };
 pub use config::{Config, Fsync, LeaseWait, OpenMode};
 pub use fts::Language;
 pub use model::{
-    AnnConfig, AnnKind, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts, Predicate,
-    QuantKind, Quantization, Record, SearchOpts, Value,
+    AnnConfig, AnnKind, ClusterStatus, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts,
+    Predicate, QuantKind, Quantization, Record, Role, SearchOpts, Value,
 };
 
 use std::collections::BTreeMap;
@@ -154,6 +154,33 @@ impl Nidus {
     /// fits before a memory ceiling (pairs with [`Config::max_vector_bytes`]).
     pub fn footprint(&self) -> Footprint {
         self.store.footprint()
+    }
+
+    /// Who this instance is within the store, and how current it is — role, whether it
+    /// holds the writer handle, whether it has been **fenced**, and how stale a reader is
+    /// (SPEC §14.6). See [`ClusterStatus`].
+    ///
+    /// Reads only in-RAM state, so it is safe to call as often as a health check needs.
+    pub fn cluster_status(&self) -> ClusterStatus {
+        self.store.cluster_status()
+    }
+
+    /// A handle to this instance's cluster writer lease, for keeping it warm out of band.
+    ///
+    /// The lease is renewed at the start of every write batch, which is enough when batches
+    /// are short. A batch that takes longer than [`Config::lock_ttl`] — a very large upsert,
+    /// or a slow object-store PUT — would otherwise let a standby conclude the writer died
+    /// and take over, fencing a writer that was perfectly healthy and throwing away its
+    /// work. Renewing on a timer from this handle closes that window, and because the handle
+    /// is independent of the store lock it keeps working *during* the long write.
+    ///
+    /// This hands back a [`LeaseRenewer`] — a `Drop`-free handle — rather than the lease
+    /// itself, because the lease is an owning guard that releases on drop.
+    ///
+    /// `None` outside cluster mode, and for readers. `nidus serve` drives this itself; a
+    /// library caller embedding nidus in an async host can do the same.
+    pub fn lease_renewer(&self) -> Option<LeaseRenewer> {
+        self.store.lease_renewer()
     }
 
     // ── Collections ──────────────────────────────────────────────────────

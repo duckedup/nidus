@@ -192,6 +192,10 @@ impl Persistence for MapBackend {
         }
         Ok(snap.map(|(b, g)| (b, Some(g.to_string()))))
     }
+    fn supports_cas(&self) -> bool {
+        true
+    }
+
     fn put_cas(&self, key: &str, bytes: &[u8], expected: Option<&str>) -> Result<CasOutcome> {
         if !self.cas {
             return Ok(CasOutcome::Unsupported); // forces the advisory fallback

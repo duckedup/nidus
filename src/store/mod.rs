@@ -29,7 +29,7 @@ use crate::data::Segments;
 use crate::fts::Fts;
 use crate::log::OpLog;
 use crate::manifest::{MANIFEST_KEY, Manifest};
-use crate::model::{AnnConfig, Distance, Op};
+use crate::model::{AnnConfig, ClusterStatus, Distance, Op, Role};
 
 mod memtier;
 mod quant;
@@ -192,6 +192,22 @@ pub struct Store {
     /// making its stale segment set the truth. `None` outside cluster mode, for readers, and on
     /// a backend without CAS (the publish then degrades to a plain put, fenced only per-batch).
     manifest_cas: Option<String>,
+    /// This writer has been superseded and can never write again (SPEC §14.6). Latched the
+    /// first time a lease renewal reports the lease lost, because the condition is
+    /// permanent — the instance must reopen. Kept so the state is *observable*
+    /// ([`cluster_status`](Self::cluster_status)) rather than only surfacing as a
+    /// per-request error: a readiness probe has to be able to see it and pull the instance
+    /// out of rotation (nidus-lp4.1). Atomic because renewal happens behind `&self` — and
+    /// an atomic rather than a `Cell` so `Store` stays `Sync` without any `unsafe`.
+    fenced: std::sync::atomic::AtomicBool,
+    /// When this instance last **verified** it was current against the durable store — its
+    /// open, or its most recent successful [`refresh`](Self::refresh).
+    ///
+    /// Reset whether or not the refresh adopted anything: a refresh that finds nothing new
+    /// has still proven the reader current as of that moment, so resetting only on adoption
+    /// would report a frequently-polling, perfectly up-to-date reader as increasingly
+    /// stale. The basis of the staleness a reader reports (nidus-lp4.4).
+    last_verified: Instant,
 }
 
 impl Store {
@@ -248,6 +264,19 @@ impl Store {
                 bail!(
                     "cluster mode requires a shared memory tier (e.g. redis://…); the \
                      process-local working set cannot be shared between instances"
+                );
+            }
+            // Cluster safety IS the conditional write. Without compare-and-swap the lease
+            // degrades to advisory — two instances can both believe they hold it — and the
+            // mid-batch fence disappears entirely, so a stalled writer that wakes up
+            // superseded can clobber a peer's committed bytes. Refuse rather than run a
+            // cluster on a best-effort lock (nidus-lp4.2).
+            if !persistence.supports_cas() {
+                bail!(
+                    "cluster mode requires a persistence backend with compare-and-swap \
+                     (S3 If-Match / GCS ifGenerationMatch); this backend has none, so the \
+                     writer lease would be advisory only and a superseded writer could \
+                     overwrite committed data"
                 );
             }
         }
@@ -385,6 +414,8 @@ impl Store {
             scan_order: std::sync::RwLock::new(None),
             loaded_log_offset: watermark,
             manifest_cas,
+            fenced: std::sync::atomic::AtomicBool::new(false),
+            last_verified: Instant::now(),
         };
 
         // Whether the in-RAM index now differs from any tier snapshot — true if we built
@@ -484,6 +515,8 @@ impl Store {
             scan_order: std::sync::RwLock::new(None),
             loaded_log_offset: 0,
             manifest_cas: None,
+            fenced: std::sync::atomic::AtomicBool::new(false),
+            last_verified: Instant::now(),
             config,
         };
         // Align `seg_indexes` to the (single, empty) segment so a later seal can update it
@@ -559,6 +592,9 @@ impl Store {
         let changed =
             manifest.version != self.data.version() || on_disk_log_len != self.loaded_log_offset;
         if !changed {
+            // Verified current: nothing new to adopt, which is just as much proof of
+            // freshness as adopting would be. Reset the staleness clock.
+            self.last_verified = Instant::now();
             return Ok(false);
         }
         // What *kind* of change: a restructure (seal/compaction altered the segment list) needs a
@@ -633,6 +669,7 @@ impl Store {
         self.build_segment_indexes();
         self.load_or_build_fts()?;
 
+        self.last_verified = Instant::now();
         Ok(true)
     }
 
@@ -646,6 +683,57 @@ impl Store {
             "" | "local" | "ram" => Ok(None),
             loc => Ok(Some(open_memory_tier(loc)?)),
         }
+    }
+
+    /// Who this instance is and how current it is (SPEC §14.6) — see [`ClusterStatus`].
+    ///
+    /// Reads only in-RAM state: no IO, no lock beyond the caller's own. A readiness probe
+    /// calls this every few seconds per instance, so it must not touch the object store.
+    pub fn cluster_status(&self) -> ClusterStatus {
+        let writer = self.config.open_mode == OpenMode::ReadWrite;
+        let role = if self.in_memory {
+            Role::InMemory
+        } else {
+            match (self.config.cluster, writer) {
+                (true, true) => Role::ClusterWriter,
+                (true, false) => Role::ClusterReader,
+                (false, true) => Role::Writer,
+                (false, false) => Role::Reader,
+            }
+        };
+        let fenced = self.fenced.load(std::sync::atomic::Ordering::Acquire);
+        ClusterStatus {
+            role,
+            cluster: self.config.cluster,
+            // A fenced writer no longer holds anything, whatever it once thought.
+            holds_writer_handle: (self.lease.is_some() || self.lock.is_some()) && !fenced,
+            fenced,
+            lease_owner: self.lease.as_ref().map(|l| l.owner().to_string()),
+            commit_version: self.data.version(),
+            // A writer IS the current state, so it is never stale. Only a reader lags.
+            staleness_secs: if writer {
+                0
+            } else {
+                self.last_verified.elapsed().as_secs()
+            },
+        }
+    }
+
+    /// A `Drop`-free renewal handle for this instance's cluster writer lease, if it holds one.
+    ///
+    /// Deliberately independent of the store lock. The lease must be renewable *while* a
+    /// long write is in flight — a large batch can hold the write guard for longer than
+    /// `lock_ttl`, and now that standbys exist (nidus-lp4.3) a peer would take over and
+    /// fence a writer that was merely slow, discarding the whole batch. A renewer with its
+    /// own handle keeps the lease warm without waiting on the guard.
+    ///
+    /// Returns a [`LeaseRenewer`], NOT a clone of the lease: `ClusterLease` is an owning
+    /// guard whose `Drop` deletes the lease object, so a cloned guard would release the
+    /// lease as soon as the copy dropped — briefly leaving the object absent, which is
+    /// exactly the window a peer's create-if-absent walks through. Renewal is idempotent
+    /// re-stamping, so racing the op-driven renewal in `guard_writable` is harmless.
+    pub fn lease_renewer(&self) -> Option<crate::backend::LeaseRenewer> {
+        self.lease.as_ref().map(|l| l.renewer())
     }
 
     /// Claim the writer handle, honouring [`Config::lease_wait`]. See [`jitter`].

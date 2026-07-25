@@ -263,6 +263,28 @@ waiting indefinitely — useful in a script that should not hang.
 un-reclaimable, and so how long promotion takes. Lower is faster, but too low risks fencing
 a writer that is merely slow — a very large batch can outlast a short TTL.
 
+### Keeping readers current, and noticing when they are not
+
+A reader adopts state at open and advances only when refreshed. Two flags make that
+operable rather than something you have to build around:
+
+```bash
+# Refresh itself every 5s, and report NOT ready if it ever falls 30s behind
+nidus serve --dir ./meta --dim 768 --cluster --read-only \
+  --refresh-interval 5 --max-staleness 30 \
+  --persistence s3://my-bucket/store --memory redis://cache:6379
+```
+
+`--refresh-interval` removes the need for a sidecar or cron calling `POST /refresh`.
+`--max-staleness` is the safety net: if refreshing stops working, readiness fails and the
+instance leaves the load balancer rather than quietly serving ever-older results. Reads
+themselves are never rejected — the bound governs *routing*, not correctness.
+
+`GET /cluster` reports each instance's role, whether it holds the writer handle, whether it
+has been fenced, the commit counter it is serving, and its staleness. That is what to check
+first during an incident: comparing `commit_version` across instances shows replication lag,
+and `lease_owner` answers who the writer is.
+
 There is no election and no coordinator, and none is needed: the object store's conditional
 writes (`If-Match` on S3, `ifGenerationMatch` on GCS) are a linearizable compare-and-swap,
 so exactly one claimant can win the handle even when several try at the same instant. That

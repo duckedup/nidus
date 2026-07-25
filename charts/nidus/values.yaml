@@ -57,6 +57,13 @@ nidus:
   # lower means faster takeover, but too low risks fencing a writer that is merely slow.
   lockTtl: 0
 
+  # Read-only instances: refresh every N seconds so they stay current without a sidecar
+  # calling POST /refresh (0 = never, the default), and fail readiness if they ever fall
+  # more than maxStaleness seconds behind (0 = no bound). Set both on reader replicas:
+  # the interval keeps them fresh, the bound takes them out of the Service if it stops.
+  refreshInterval: 0
+  maxStaleness: 0
+
   # Distance metric: "" (cosine, the default) | cosine | euclidean | dot.
   # Only honored when the store is first created.
   distance: ""

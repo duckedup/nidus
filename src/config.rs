@@ -75,6 +75,17 @@ pub struct Config {
     /// What to do when another instance holds the writer handle. Default
     /// [`LeaseWait::Fail`] — see [`LeaseWait`] for why waiting is what a standby needs.
     pub lease_wait: LeaseWait,
+    /// How stale a read-only instance may be before it should stop serving. `None` (the
+    /// default) means no bound — the historical behaviour, where a reader serves its
+    /// snapshot for as long as it likes.
+    ///
+    /// A cluster reader only advances when something calls `refresh()`, so without a bound
+    /// a reader whose refresher has died serves ever-older results indefinitely and looks
+    /// perfectly healthy doing it. With a bound set, [`ClusterStatus::staleness_secs`]
+    /// exceeding it is what `nidus serve`'s readiness probe fails on, so a load balancer
+    /// takes the instance out of rotation instead. Purely a *reporting* threshold: reads
+    /// are never rejected by the library itself.
+    pub max_staleness: Option<Duration>,
     /// Hard ceiling on the vector matrix (`rows * dimension * 4` bytes); `None`
     /// disables (the default — no behavior change). Enforced *before* allocating:
     /// `upsert` refuses a batch that would exceed it, and `open` refuses a data
@@ -175,6 +186,7 @@ impl Config {
             auto_compact: Some(0.5),
             lock_ttl: Duration::from_secs(60),
             lease_wait: LeaseWait::default(),
+            max_staleness: None,
             max_vector_bytes: None,
             quantization: None,
             ann: None,
@@ -215,6 +227,13 @@ impl Config {
     /// Set the stale-lock reclamation window.
     pub fn lock_ttl(mut self, ttl: Duration) -> Self {
         self.lock_ttl = ttl;
+        self
+    }
+
+    /// Set how stale a read-only instance may be before its readiness probe should fail
+    /// (`None` = no bound, the default). See [`max_staleness`](Self::max_staleness).
+    pub fn max_staleness(mut self, max: Option<Duration>) -> Self {
+        self.max_staleness = max;
         self
     }
 

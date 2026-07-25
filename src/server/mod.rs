@@ -51,6 +51,22 @@ pub struct ServeConfig {
     /// Maximum request body size in bytes. The store buffers each body in memory,
     /// so this is also the largest single upsert payload.
     pub max_body_bytes: usize,
+    /// Fail readiness once a read-only instance is staler than this (mirrors
+    /// [`Config::max_staleness`](crate::Config::max_staleness)). `None` = no bound.
+    pub max_staleness: Option<std::time::Duration>,
+    /// Refresh a read-only instance on this interval so it stays current without a sidecar
+    /// or cron calling `POST /refresh`. `None` (the default) leaves refreshing entirely to
+    /// the caller.
+    ///
+    /// A server-side tokio task, deliberately NOT a library background thread — "no
+    /// background threads" is a property of the sync core, and the server is already async.
+    /// Also deliberately not a refresh-per-read: that would put a manifest fetch on the hot
+    /// path of exactly the read-heavy fan-out cluster mode exists for.
+    pub refresh_interval: Option<std::time::Duration>,
+    /// How often to renew the cluster writer lease out of band. Should be well under
+    /// `Config::lock_ttl` — a third of it is a reasonable default — so a long write cannot
+    /// let the lease lapse. Ignored unless this instance is a cluster writer.
+    pub lease_renew_interval: std::time::Duration,
     /// Embedder that backs the text-native `/remember` and `/recall` routes. When
     /// `None`, those routes answer `400` (the server was started without an
     /// embedder). Built by the CLI from `--embed-provider …`.
@@ -82,6 +98,9 @@ struct AppState {
     /// with enough concurrent probes, stall executor threads themselves. A probe must
     /// answer in constant time no matter what the store is doing, so it reads an atomic.
     open: Arc<std::sync::atomic::AtomicBool>,
+    /// Readiness fails past this much reader staleness (`Config::max_staleness`), copied
+    /// here so a probe never has to reach into the store's config behind the lock.
+    max_staleness: Option<std::time::Duration>,
     token: Option<Arc<str>>,
     /// Shared embedder for the `memory` routes; `None` disables them (→ `400`).
     #[cfg(feature = "memory")]
@@ -112,12 +131,14 @@ where
     let state = AppState {
         db: Arc::new(RwLock::new(None)),
         open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        max_staleness: cfg.max_staleness,
         token: cfg.token.map(Arc::from),
         #[cfg(feature = "memory")]
         embedder: cfg.embedder,
         #[cfg(all(feature = "memory", feature = "summarize"))]
         summarizer: cfg.summarizer,
     };
+    let renew_every = cfg.lease_renew_interval;
     let app = router(state.clone(), cfg.max_body_bytes);
 
     let listener = TcpListener::bind(&cfg.addr)
@@ -162,6 +183,88 @@ where
         }
     });
 
+    // Keep the writer lease warm on a timer.
+    //
+    // The lease is otherwise renewed only at the START of each write batch, which is fine
+    // while batches are short. A batch longer than `lock_ttl` — a very large upsert, or a
+    // slow object-store PUT — would let a standby (nidus-lp4.3) conclude the writer died and
+    // take over, fencing a writer that was perfectly healthy and discarding its work. That
+    // became a live risk the moment standbys shipped.
+    //
+    // Renewing needs its own lease handle, NOT the store lock: a long write holds the write
+    // guard for its whole duration, so a renewer that waited on the lock would be blocked
+    // exactly when it matters. `Nidus::lease_handle` exists for this.
+    {
+        let db = state.db.clone();
+        let ttl = renew_every;
+        tokio::spawn(async move {
+            // Wait for the store to open (a standby may take a long time), then grab the
+            // lease handle once. `None` means this instance is not a cluster writer.
+            let lease = loop {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let handle = db
+                    .try_read()
+                    .ok()
+                    .and_then(|g| g.as_ref().and_then(|db| db.lease_renewer()));
+                if let Some(handle) = handle {
+                    break handle;
+                }
+                // Opened but holds no lease → not a cluster writer, nothing to renew.
+                if db
+                    .try_read()
+                    .ok()
+                    .is_some_and(|g| g.as_ref().is_some_and(|db| db.lease_renewer().is_none()))
+                {
+                    return;
+                }
+            };
+            let mut ticker = tokio::time::interval(ttl);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let lease = lease.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = lease.renew() {
+                        // Losing the lease here is the same fencing signal a write would
+                        // hit; the write path latches it, and readiness reports it.
+                        eprintln!("nidus: background lease renewal failed: {e:#}");
+                    }
+                })
+                .await;
+            }
+        });
+    }
+
+    // Optional self-refresh, so a read-only instance stays current without a sidecar
+    // calling POST /refresh. A tokio task rather than a library background thread: "no
+    // background threads" is a property of the sync core, and the server is already async.
+    // `refresh()` is a no-op on a writer, so this is harmless whatever the role.
+    if let Some(interval) = cfg.refresh_interval {
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // Skip missed ticks rather than firing a burst to catch up — a backlog of
+            // manifest fetches is the opposite of what an interval refresher is for.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let db = db.clone();
+                // On a blocking task: refresh does object-store IO.
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(mut guard) = db.write()
+                        && let Some(db) = guard.as_mut()
+                        && let Err(e) = db.refresh()
+                    {
+                        // Not fatal: the staleness clock keeps running, so readiness
+                        // (with --max-staleness) is what escalates a persistent failure.
+                        eprintln!("nidus: scheduled refresh failed: {e:#}");
+                    }
+                })
+                .await;
+            }
+        });
+    }
+
     let shutdown = async move {
         tokio::select! {
             _ = shutdown_signal() => {}
@@ -191,6 +294,7 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
     let router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/cluster", get(cluster))
         .route("/stats", get(stats))
         .route("/collections", get(list_collections))
         .route(
@@ -301,11 +405,81 @@ async fn health() -> &'static str {
 /// Note this currently reports only whether the store is *open*. A writer that has been
 /// **fenced**, or a reader that is arbitrarily **stale**, still reports ready — see
 /// `nidus-lp4.1`, which owns those.
-async fn ready(State(st): State<AppState>) -> Result<&'static str, ApiError> {
-    if st.open.load(std::sync::atomic::Ordering::Acquire) {
-        Ok("ready")
-    } else {
-        Err(ApiError::from(not_open()))
+async fn ready(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
+    if !st.open.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(ApiError::from(not_open()));
+    }
+    // Beyond "is a store open", readiness asks whether this instance can serve *usefully*.
+    // Both of these are cheap in-RAM reads (see `ClusterStatus`), so a probe every few
+    // seconds costs nothing and never touches the object store.
+    let status = read_status(&st)?;
+    if status.fenced {
+        return Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            err: anyhow::anyhow!(
+                "writer fenced: this instance was superseded and every write will fail — \
+                 it must be replaced"
+            ),
+        });
+    }
+    if let Some(max) = st.max_staleness
+        && status.staleness_secs > max.as_secs()
+    {
+        return Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            err: anyhow::anyhow!(
+                "stale: last verified current {}s ago, beyond the {}s bound — this reader \
+                 is not being refreshed",
+                status.staleness_secs,
+                max.as_secs()
+            ),
+        });
+    }
+    Ok(Json(json!({
+        "ready": true,
+        "role": format!("{:?}", status.role),
+        "staleness_secs": status.staleness_secs,
+    })))
+}
+
+/// `GET /cluster` — role, writer-handle state, fencing token, commit counter, staleness.
+///
+/// The introspection an operator needs mid-incident: which instance holds the writer
+/// handle, whether this one has been fenced, and how far behind a reader is. Reads only
+/// in-RAM state, so it is safe to scrape.
+async fn cluster(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
+    let s = read_status(&st)?;
+    Ok(Json(json!({
+        "role": format!("{:?}", s.role),
+        "cluster": s.cluster,
+        "holds_writer_handle": s.holds_writer_handle,
+        "fenced": s.fenced,
+        "lease_owner": s.lease_owner,
+        "commit_version": s.commit_version,
+        "staleness_secs": s.staleness_secs,
+        "max_staleness_secs": st.max_staleness.map(|d| d.as_secs()),
+    })))
+}
+
+/// Read [`ClusterStatus`] without blocking the async executor.
+///
+/// `try_read` rather than `read`: a probe must answer in constant time, and a blocking
+/// acquisition would queue behind a long write (a large upsert holds the guard for
+/// seconds). Contention is reported as `503` — momentarily unable to answer is the honest
+/// response, and far better than stalling executor threads under a probe storm.
+fn read_status(st: &AppState) -> Result<crate::ClusterStatus, ApiError> {
+    match st.db.try_read() {
+        Ok(guard) => match guard.as_ref() {
+            Some(db) => Ok(db.cluster_status()),
+            None => Err(ApiError::from(not_open())),
+        },
+        Err(std::sync::TryLockError::WouldBlock) => Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            err: anyhow::anyhow!("store busy: could not read status without blocking"),
+        }),
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            Err(ApiError::internal(anyhow::anyhow!("store lock poisoned")))
+        }
     }
 }
 
@@ -828,6 +1002,7 @@ mod tests {
         let state = AppState {
             db: Arc::new(RwLock::new(db)),
             open: Arc::new(std::sync::atomic::AtomicBool::new(open)),
+            max_staleness: None,
             token: None,
             #[cfg(feature = "memory")]
             embedder: None,
@@ -941,6 +1116,46 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// `/cluster` reports the instance's role and handle state. An in-memory store is the
+    /// degenerate case — no cluster, no lease — and must say so rather than erroring.
+    #[tokio::test]
+    async fn cluster_endpoint_reports_role() {
+        let resp = test_router(3).oneshot(get("/cluster")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["role"], "InMemory");
+        assert_eq!(body["cluster"], false);
+        assert_eq!(body["fenced"], false);
+        assert_eq!(body["lease_owner"], JsonValue::Null);
+        assert_eq!(body["staleness_secs"], 0);
+    }
+
+    /// A staleness bound only ever fails a *reader*: a writer is the current state by
+    /// definition and reports zero staleness, so an aggressive bound must not take the
+    /// writer out of rotation.
+    #[tokio::test]
+    async fn staleness_bound_does_not_fail_a_writer() {
+        let db = Nidus::open_in_memory(3).unwrap();
+        let state = AppState {
+            db: Arc::new(RwLock::new(Some(db))),
+            open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            // Zero tolerance: anything with nonzero staleness would fail.
+            max_staleness: Some(std::time::Duration::ZERO),
+            token: None,
+            #[cfg(feature = "memory")]
+            embedder: None,
+            #[cfg(all(feature = "memory", feature = "summarize"))]
+            summarizer: None,
+        };
+        let app = router(state, 16 * 1024 * 1024);
+        let resp = app.oneshot(get("/ready")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a writer reports 0 staleness and must stay ready"
+        );
+    }
+
     /// Both probe endpoints stay reachable without a token: an orchestrator would read a
     /// `401` as "not ready" and never route to a healthy instance.
     #[tokio::test]
@@ -949,6 +1164,7 @@ mod tests {
         let state = AppState {
             db: Arc::new(RwLock::new(Some(db))),
             open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            max_staleness: None,
             token: Some(Arc::from("s3cret")),
             #[cfg(feature = "memory")]
             embedder: None,

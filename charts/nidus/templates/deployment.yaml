@@ -72,6 +72,14 @@ spec:
             - name: NIDUS_WAIT_FOR_LEASE
               value: "forever"
             {{- end }}
+            {{- if .Values.nidus.refreshInterval }}
+            - name: NIDUS_REFRESH_INTERVAL
+              value: {{ .Values.nidus.refreshInterval | quote }}
+            {{- end }}
+            {{- if .Values.nidus.maxStaleness }}
+            - name: NIDUS_MAX_STALENESS
+              value: {{ .Values.nidus.maxStaleness | quote }}
+            {{- end }}
             {{- if .Values.nidus.lockTtl }}
             - name: NIDUS_LOCK_TTL
               value: {{ .Values.nidus.lockTtl | quote }}
