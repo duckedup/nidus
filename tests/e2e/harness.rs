@@ -86,12 +86,27 @@ impl Server {
         self
     }
 
-    /// Spawn the server and wait until it answers `/health`.
+    /// Spawn the server and return as soon as it has *bound*, without waiting for the
+    /// store to open.
     ///
-    /// Panics — rather than returning an error — because every caller is a test for
-    /// which a server that won't start is a failure, and the panic carries the child's
-    /// stderr.
+    /// For a standby writer, which by design never becomes ready while the incumbent
+    /// holds the lease — [`start`](Self::start) would wait forever. The caller then drives
+    /// readiness itself with [`RunningServer::ready_within`].
+    pub fn start_unready(self) -> RunningServer {
+        self.spawn()
+    }
+
+    /// Spawn the server and wait until its store is open.
+    ///
+    /// Panics — rather than returning an error — because every caller is a test for which
+    /// a server that won't start is a failure, and the panic carries the child's stderr.
     pub fn start(self) -> RunningServer {
+        let server = self.spawn();
+        server.await_ready();
+        server
+    }
+
+    fn spawn(self) -> RunningServer {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_nidus"));
         cmd.arg("serve")
             .arg("--dir")
@@ -135,12 +150,12 @@ impl Server {
             Err(msg) => panic!("{msg}"),
         };
 
-        let server = RunningServer {
+        RunningServer {
             child,
             base,
             token: self.token,
-            // 4xx/5xx must arrive as responses, not errors — the suites assert on 401
-            // and 413 (mirrors `backend::cloud::Http`).
+            // 4xx/5xx must arrive as responses, not errors — the suites assert on 401,
+            // 413 and 503 (mirrors `backend::cloud::Http`).
             agent: Agent::new_with_config(
                 ureq::config::Config::builder()
                     .http_status_as_error(false)
@@ -148,13 +163,47 @@ impl Server {
                     .build(),
             ),
             stderr,
-        };
-        server.await_health();
-        server
+        }
     }
 }
 
 impl RunningServer {
+    /// Whether this instance reports its store open (`/ready`).
+    pub fn is_ready(&self) -> bool {
+        self.agent
+            .get(self.url("/ready"))
+            .call()
+            .map(|r| r.status().as_u16() == 200)
+            .unwrap_or(false)
+    }
+
+    /// Whether the process is answering at all (`/health`) — true for a standby that is
+    /// alive but deliberately not ready.
+    pub fn is_live(&self) -> bool {
+        self.agent
+            .get(self.url("/health"))
+            .call()
+            .map(|r| r.status().as_u16() == 200)
+            .unwrap_or(false)
+    }
+
+    /// Wait for the store to open, panicking with the child's stderr if it never does —
+    /// the assertion form for instances that are *expected* to be ready promptly.
+    pub fn await_ready_or_panic(&self) {
+        self.await_ready();
+    }
+
+    /// Poll until the store opens, or give up after `limit`. Returns how long it took.
+    pub fn ready_within(&self, limit: Duration) -> Option<Duration> {
+        let started = Instant::now();
+        while started.elapsed() < limit {
+            if self.is_ready() {
+                return Some(started.elapsed());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
     /// `http://127.0.0.1:<port>` — the base for a raw client.
     pub fn base_url(&self) -> &str {
         &self.base
@@ -260,11 +309,15 @@ impl RunningServer {
         }
     }
 
-    /// Poll `/health` until it answers or [`STARTUP_TIMEOUT`] elapses. The bound port
-    /// proves the listener exists; this proves the store opened and the router is live.
-    fn await_health(&self) {
+    /// Poll `/ready` until it answers or [`STARTUP_TIMEOUT`] elapses.
+    ///
+    /// `/ready`, not `/health`: the server binds *before* opening the store (so a standby
+    /// waiting for promotion still answers liveness probes), which means `/health` returns
+    /// `200` while there is no store yet and every data route would `503`. `/ready` is the
+    /// signal that the store is actually open — the condition these suites need.
+    fn await_ready(&self) {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
-        let url = self.url("/health");
+        let url = self.url("/ready");
         loop {
             if let Ok(res) = self.agent.get(&url).call()
                 && res.status().as_u16() == 200
@@ -273,7 +326,7 @@ impl RunningServer {
             }
             assert!(
                 Instant::now() < deadline,
-                "server bound {} but /health never answered\n--- server stderr ---\n{}",
+                "server bound {} but /ready never answered\n--- server stderr ---\n{}",
                 self.base,
                 self.stderr()
             );

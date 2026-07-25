@@ -70,7 +70,18 @@ pub struct ServeConfig {
 /// use multiple cores is the whole point at this scale.
 #[derive(Clone)]
 struct AppState {
-    db: Arc<RwLock<Nidus>>,
+    /// `None` until the store finishes opening — a standby writer waiting for promotion
+    /// sits here indefinitely by design. Data routes answer `503` while it is empty; see
+    /// [`serve`] for why the listener comes up first.
+    db: Arc<RwLock<Option<Nidus>>>,
+    /// Mirrors `db.is_some()` for [`ready`] to read.
+    ///
+    /// Not just `db.read().is_some()`: that takes a **blocking** lock, and `ready` runs on
+    /// the async executor rather than a blocking task. A long write (a large upsert holds
+    /// the write guard for seconds) would then stall every readiness probe behind it — and
+    /// with enough concurrent probes, stall executor threads themselves. A probe must
+    /// answer in constant time no matter what the store is doing, so it reads an atomic.
+    open: Arc<std::sync::atomic::AtomicBool>,
     token: Option<Arc<str>>,
     /// Shared embedder for the `memory` routes; `None` disables them (→ `400`).
     #[cfg(feature = "memory")]
@@ -80,11 +91,27 @@ struct AppState {
     summarizer: Option<Arc<AnySummarizer>>,
 }
 
-/// Open the store, bind the address, and serve until a shutdown signal (Ctrl-C /
-/// SIGTERM); flush and release the writer lock on shutdown.
-pub async fn serve(db: Nidus, cfg: ServeConfig) -> anyhow::Result<()> {
+/// Bind the address, open the store, and serve until a shutdown signal (Ctrl-C /
+/// SIGTERM); flush and release the writer handle on shutdown.
+///
+/// `open` is a closure rather than an already-open [`Nidus`] because **binding happens
+/// first**. Opening can block for a long time by design: a standby writer
+/// ([`LeaseWait::Forever`](crate::LeaseWait)) waits for the incumbent to die before it
+/// gets a handle. If nothing were listening during that wait, a supervisor's liveness
+/// probe would fail and kill the very standby that is meant to be waiting — turning the
+/// feature into the crash-loop it exists to remove.
+///
+/// So the listener comes up immediately and the store is opened on a blocking task.
+/// Until it succeeds, `/health` answers (the process is alive) while `/ready` and every
+/// data route answer `503` (there is no store yet). An open *failure* — as opposed to
+/// waiting — shuts the server down and is returned from here.
+pub async fn serve<F>(open: F, cfg: ServeConfig) -> anyhow::Result<()>
+where
+    F: FnOnce() -> anyhow::Result<Nidus> + Send + 'static,
+{
     let state = AppState {
-        db: Arc::new(RwLock::new(db)),
+        db: Arc::new(RwLock::new(None)),
+        open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         token: cfg.token.map(Arc::from),
         #[cfg(feature = "memory")]
         embedder: cfg.embedder,
@@ -109,21 +136,61 @@ pub async fn serve(db: Nidus, cfg: ServeConfig) -> anyhow::Result<()> {
         .map_or_else(|_| cfg.addr.clone(), |a| a.to_string());
     eprintln!("nidus serving on http://{bound} (Ctrl-C / SIGTERM to stop){auth_note}");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error")?;
+    // Open on a blocking task; a failure (not a wait) asks the server to stop, and is
+    // re-raised after `axum::serve` returns so the process exits non-zero.
+    let open_failed = Arc::new(RwLock::new(None::<anyhow::Error>));
+    let abort = Arc::new(tokio::sync::Notify::new());
+    let slot = state.db.clone();
+    let open_flag = state.open.clone();
+    let failure_slot = open_failed.clone();
+    let abort_tx = abort.clone();
+    tokio::task::spawn_blocking(move || match open() {
+        Ok(db) => {
+            if let Ok(mut slot) = slot.write() {
+                *slot = Some(db);
+                // Publish only after the store is in place, so a probe never sees
+                // `ready` before a request could actually be served.
+                open_flag.store(true, std::sync::atomic::Ordering::Release);
+                eprintln!("nidus store open — serving requests");
+            }
+        }
+        Err(e) => {
+            if let Ok(mut failure) = failure_slot.write() {
+                *failure = Some(e);
+            }
+            abort_tx.notify_one();
+        }
+    });
 
-    // Best-effort durability flush on a clean shutdown.
-    if let Ok(mut db) = state.db.write() {
+    let shutdown = async move {
+        tokio::select! {
+            _ = shutdown_signal() => {}
+            _ = abort.notified() => {}
+        }
+    };
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .context("server error");
+
+    // Best-effort durability flush on a clean shutdown (no-op if never opened).
+    if let Ok(mut db) = state.db.write()
+        && let Some(db) = db.as_mut()
+    {
         let _ = db.flush();
     }
-    Ok(())
+
+    // A failed open outranks the serve result: it is the actual cause.
+    if let Some(e) = open_failed.write().ok().and_then(|mut f| f.take()) {
+        return Err(e);
+    }
+    served
 }
 
 fn router(state: AppState, max_body_bytes: usize) -> Router {
     let router = Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/stats", get(stats))
         .route("/collections", get(list_collections))
         .route(
@@ -158,11 +225,13 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
 }
 
 /// Reject any request lacking a valid `Authorization: Bearer <token>` when a
-/// token is configured. `/health` is always open so liveness checks need no
-/// credential. A no-op when the server is unauthenticated.
+/// token is configured. The probe endpoints are always open so liveness and readiness
+/// checks need no credential — an orchestrator would otherwise read `401` as "not ready"
+/// and never route to a perfectly healthy instance. A no-op when the server is
+/// unauthenticated.
 async fn auth(State(st): State<AppState>, req: Request, next: Next) -> Response {
     if let Some(expected) = &st.token
-        && req.uri().path() != "/health"
+        && !matches!(req.uri().path(), "/health" | "/ready")
     {
         let presented = req
             .headers()
@@ -213,8 +282,31 @@ async fn shutdown_signal() {
 
 // ── Handlers ──────────────────────────────────────────────────────────────
 
+/// Liveness: the process is up and the HTTP stack is answering.
+///
+/// Deliberately says nothing about the store. A standby writer waiting for promotion is
+/// *alive* — killing it is precisely the wrong response, since waiting is its job — so this
+/// must keep answering while [`AppState::db`] is still empty. Whether the instance can
+/// actually serve traffic is [`ready`]'s question.
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Readiness: this instance has a store open and can serve requests.
+///
+/// `503` while a standby waits for the writer handle, so a load balancer routes around it
+/// instead of sending requests that would all answer `503` anyway. Split from
+/// [`health`] because the two genuinely differ for a standby: live, but not ready.
+///
+/// Note this currently reports only whether the store is *open*. A writer that has been
+/// **fenced**, or a reader that is arbitrarily **stale**, still reports ready — see
+/// `nidus-lp4.1`, which owns those.
+async fn ready(State(st): State<AppState>) -> Result<&'static str, ApiError> {
+    if st.open.load(std::sync::atomic::Ordering::Acquire) {
+        Ok("ready")
+    } else {
+        Err(ApiError::from(not_open()))
+    }
 }
 
 /// Store-wide introspection: pinned dimension, distance metric, the collection
@@ -603,7 +695,8 @@ where
             .db
             .read()
             .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
-        f(&db)
+        let db = db.as_ref().ok_or_else(not_open)?;
+        f(db)
     })
     .await
     .map_err(|e| ApiError::internal(anyhow::anyhow!("task join error: {e}")))?
@@ -621,7 +714,8 @@ where
             .db
             .write()
             .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
-        f(&mut db)
+        let db = db.as_mut().ok_or_else(not_open)?;
+        f(db)
     })
     .await
     .map_err(|e| ApiError::internal(anyhow::anyhow!("task join error: {e}")))?
@@ -661,9 +755,23 @@ impl ApiError {
 
 /// Map a store error to an HTTP status. Defaults to `500`; recognises the
 /// store's client-fault messages and the writer-lock conflict.
+/// The error every data route returns before the store is open — a standby writer still
+/// waiting for promotion, or the brief window during a normal open.
+///
+/// `503` with `Retry-After` semantics is the honest answer: the request is valid and the
+/// process is healthy, it simply has no store to serve yet.
+fn not_open() -> anyhow::Error {
+    anyhow::anyhow!(
+        "store is not open yet: this instance is waiting for the writer handle \
+         (standby) or still starting up"
+    )
+}
+
 fn classify(err: &anyhow::Error) -> StatusCode {
     let msg = format!("{err:#}").to_lowercase();
-    if msg.contains("does not match store dimension") {
+    if msg.contains("store is not open yet") {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if msg.contains("does not match store dimension") {
         StatusCode::BAD_REQUEST
     } else if msg.contains("read-only store") {
         StatusCode::FORBIDDEN
@@ -710,8 +818,16 @@ mod tests {
     /// Build a router over a fresh in-memory store of the given dimension.
     fn test_router(dim: usize) -> Router {
         let db = Nidus::open_in_memory(dim).unwrap();
+        router_over(Some(db))
+    }
+
+    /// Build a router over an optional store — `None` models an instance whose store is
+    /// not open yet (a standby waiting for promotion).
+    fn router_over(db: Option<Nidus>) -> Router {
+        let open = db.is_some();
         let state = AppState {
             db: Arc::new(RwLock::new(db)),
+            open: Arc::new(std::sync::atomic::AtomicBool::new(open)),
             token: None,
             #[cfg(feature = "memory")]
             embedder: None,
@@ -788,6 +904,66 @@ mod tests {
         assert_eq!(stats["ann"], JsonValue::Null); // exact search by default
         assert_eq!(stats["collections"], json!(["docs"]));
         assert_eq!(stats["footprint"]["doc_count"], 2);
+    }
+
+    /// Before the store is open — a standby waiting for promotion — liveness must still
+    /// answer while readiness and every data route say `503`. Getting this backwards is
+    /// what makes a standby unusable: a failing liveness probe has a supervisor kill the
+    /// very instance that is meant to be waiting, and a passing readiness probe has a load
+    /// balancer send it traffic it cannot serve.
+    #[tokio::test]
+    async fn not_open_is_live_but_not_ready() {
+        let app = router_over(None);
+
+        // Liveness: the process is up.
+        let resp = app.clone().oneshot(get("/health")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Readiness: no store, so explicitly not ready.
+        let resp = app.clone().oneshot(get("/ready")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Data routes: 503, not 500 — the request is fine, the instance just has no store.
+        let resp = app.clone().oneshot(get("/stats")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let resp = app
+            .clone()
+            .oneshot(post("/search", json!({"query": [1, 0, 0], "top_k": 1})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Once the store is open, readiness flips.
+    #[tokio::test]
+    async fn open_store_is_ready() {
+        let resp = test_router(3).oneshot(get("/ready")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Both probe endpoints stay reachable without a token: an orchestrator would read a
+    /// `401` as "not ready" and never route to a healthy instance.
+    #[tokio::test]
+    async fn probes_are_exempt_from_auth() {
+        let db = Nidus::open_in_memory(3).unwrap();
+        let state = AppState {
+            db: Arc::new(RwLock::new(Some(db))),
+            open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            token: Some(Arc::from("s3cret")),
+            #[cfg(feature = "memory")]
+            embedder: None,
+            #[cfg(all(feature = "memory", feature = "summarize"))]
+            summarizer: None,
+        };
+        let app = router(state, 16 * 1024 * 1024);
+
+        for path in ["/health", "/ready"] {
+            let resp = app.clone().oneshot(get(path)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path} should skip auth");
+        }
+        // A real route still requires the token.
+        let resp = app.clone().oneshot(get("/stats")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// `POST /refresh` is routed and answers `adopted: false` where there is nothing to

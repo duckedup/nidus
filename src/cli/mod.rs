@@ -5,14 +5,14 @@
 use std::io::Read;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
 use crate::server::dto::{AnnDto, FootprintDto, HitDto};
 use crate::{
-    AnnConfig, Config, Distance, Filter, Fsync, FtsQuery, HybridOpts, Language, Nidus, OpenMode,
-    Quantization, Record, Scope, SearchOpts,
+    AnnConfig, Config, Distance, Filter, Fsync, FtsQuery, HybridOpts, Language, LeaseWait, Nidus,
+    OpenMode, Quantization, Record, Scope, SearchOpts,
 };
 
 // AI-ingest (memory) wiring for `serve`: only under the `memory` feature (pulled
@@ -107,9 +107,9 @@ struct StoreArgs {
     memory: Option<String>,
     /// Run as one of several cooperating instances over a *shared* store (SPEC §14.6):
     /// requires an object-store `--persistence` **and** a Redis-family `--memory` tier.
-    /// One instance holds a renewing writer lease; the rest should open `--read-only`
-    /// and pick up each commit. Not a managed cluster — no coordinator, replication, or
-    /// rebalancing.
+    /// One instance holds a renewing writer lease; the others are either `--read-only`
+    /// readers that pick up each commit, or `--wait-for-lease` standbys waiting to be
+    /// promoted. Not a managed cluster — no coordinator, replication, or rebalancing.
     #[arg(long, env = "NIDUS_CLUSTER")]
     cluster: bool,
     /// Memory-map immutable segments instead of holding them in RAM — lets a store
@@ -154,6 +154,21 @@ struct StoreArgs {
     /// In `--cluster` mode this is also the writer-lease window.
     #[arg(long, value_name = "SECONDS", env = "NIDUS_LOCK_TTL")]
     lock_ttl: Option<u64>,
+    /// Wait for the writer handle instead of exiting when another instance holds it —
+    /// this instance becomes a **standby** and is promoted within roughly `--lock-ttl` of
+    /// the holder dying. Without this, a second writer exits immediately, so a supervisor
+    /// restarts it in a loop and failover takes as long as its backoff.
+    ///
+    /// Bare `--wait-for-lease` waits indefinitely (what a hot standby wants); give it a
+    /// number of seconds to give up after that long instead.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        num_args = 0..=1,
+        default_missing_value = "forever",
+        env = "NIDUS_WAIT_FOR_LEASE"
+    )]
+    wait_for_lease: Option<String>,
     /// Refuse to open a store whose vector matrix would exceed this many bytes — the
     /// overcommit guard (SPEC §6.6). Omit for no ceiling.
     #[arg(long, env = "NIDUS_MAX_VECTOR_BYTES")]
@@ -241,7 +256,26 @@ impl StoreArgs {
         if let Some(secs) = self.lock_ttl {
             cfg = cfg.lock_ttl(std::time::Duration::from_secs(secs));
         }
+        cfg = cfg.lease_wait(self.lease_wait()?);
         Ok(cfg)
+    }
+
+    /// Parse `--wait-for-lease` into a [`LeaseWait`]. Absent → `Fail` (unchanged
+    /// behaviour); bare flag → `Forever`; a number → that many seconds.
+    fn lease_wait(&self) -> Result<LeaseWait> {
+        let Some(raw) = self.wait_for_lease.as_deref() else {
+            return Ok(LeaseWait::Fail);
+        };
+        if raw.eq_ignore_ascii_case("forever") {
+            return Ok(LeaseWait::Forever);
+        }
+        let secs: u64 = raw.parse().with_context(|| {
+            format!(
+                "--wait-for-lease expects a number of seconds (or no value at all, \
+                     to wait indefinitely), got {raw:?}"
+            )
+        })?;
+        Ok(LeaseWait::Timeout(std::time::Duration::from_secs(secs)))
     }
 
     /// Build the `Option<Quantization>` from the `--quantization`/`--quant-rescore`
@@ -918,7 +952,10 @@ fn serve(
     } else {
         OpenMode::ReadWrite
     };
-    let db = Nidus::open(store.config(mode)?)?;
+    // Resolve the config here so a bad flag fails before anything binds, but defer the
+    // OPEN itself to the server: with `--wait-for-lease` it can block indefinitely, and
+    // the listener must already be answering liveness probes while a standby waits.
+    let open_config = store.config(mode)?;
     // An empty --token / NIDUS_TOKEN (clap reads the env var) means no auth.
     let token = token.filter(|t| !t.is_empty());
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -942,7 +979,7 @@ fn serve(
         #[cfg(all(feature = "memory", feature = "summarize"))]
         summarizer,
     };
-    rt.block_on(crate::server::serve(db, cfg))
+    rt.block_on(crate::server::serve(move || Nidus::open(open_config), cfg))
 }
 
 /// Read JSON from `file`, or from stdin when absent.
@@ -1319,6 +1356,42 @@ mod tests {
 
         // No --quantization: exact-only search.
         assert!(serve_store(&[]).quant_config().is_none());
+    }
+
+    /// `--wait-for-lease` is what turns a losing writer into a standby, so the three
+    /// forms must map exactly: absent keeps the historical fail-fast behaviour, bare waits
+    /// forever, and a number bounds the wait.
+    #[test]
+    fn wait_for_lease_forms() {
+        assert_eq!(
+            serve_store(&[])
+                .config(OpenMode::ReadWrite)
+                .unwrap()
+                .lease_wait,
+            LeaseWait::Fail,
+            "absent must not change behaviour for existing users"
+        );
+        assert_eq!(
+            serve_store(&["--wait-for-lease"])
+                .config(OpenMode::ReadWrite)
+                .unwrap()
+                .lease_wait,
+            LeaseWait::Forever,
+        );
+        assert_eq!(
+            serve_store(&["--wait-for-lease", "45"])
+                .config(OpenMode::ReadWrite)
+                .unwrap()
+                .lease_wait,
+            LeaseWait::Timeout(std::time::Duration::from_secs(45)),
+        );
+
+        // A non-numeric value is a clear error, not a silent fall-back to waiting forever.
+        let err = serve_store(&["--wait-for-lease", "soon"])
+            .config(OpenMode::ReadWrite)
+            .expect_err("non-numeric value must be rejected")
+            .to_string();
+        assert!(err.contains("--wait-for-lease"), "unhelpful error: {err}");
     }
 
     #[test]

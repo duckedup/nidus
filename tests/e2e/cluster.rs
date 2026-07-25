@@ -104,6 +104,22 @@ fn unique_prefix(name: &str) -> String {
 /// object store, but the flag is still required, so each instance gets its own scratch
 /// path exactly as separate machines would.
 fn instance(prefix: &str, read_only: bool, extra: &[&str]) -> (tempfile::TempDir, RunningServer) {
+    let (dir, server) = build_instance(prefix, read_only, extra);
+    server.await_ready_or_panic();
+    (dir, server)
+}
+
+/// Like [`instance`] but does **not** wait for the store to open — for a standby writer,
+/// which stays unready on purpose until the incumbent's lease lapses.
+fn instance_unready(prefix: &str, extra: &[&str]) -> (tempfile::TempDir, RunningServer) {
+    build_instance(prefix, false, extra)
+}
+
+fn build_instance(
+    prefix: &str,
+    read_only: bool,
+    extra: &[&str],
+) -> (tempfile::TempDir, RunningServer) {
     require_services();
     let dir = tempfile::tempdir().expect("temp dir");
     let bucket = service("NIDUS_E2E_S3_BUCKET", "nidus-test");
@@ -136,7 +152,7 @@ fn instance(prefix: &str, read_only: bool, extra: &[&str]) -> (tempfile::TempDir
             &service("NIDUS_E2E_S3_SECRET", "minioadmin"),
         )
         .env("AWS_REGION", &service("NIDUS_E2E_S3_REGION", "us-east-1"))
-        .start();
+        .start_unready();
     // The TempDir must outlive the server, so hand both back together.
     (dir, server)
 }
@@ -385,6 +401,66 @@ fn stalled_writer_is_fenced_and_cannot_clobber() {
     // memory.
     let (_rdir, reader) = instance(&prefix, true, &[]);
     assert_eq!(ids(&reader), vec!["from-a", "from-b"]);
+}
+
+/// **Automatic promotion — the availability property, with no external restart.**
+///
+/// Before `--wait-for-lease`, a second writer exited the instant it found the lease held
+/// (asserted above), so a "hot standby" could only be approximated by a supervisor
+/// restarting a crash-looping pod: failover took lease TTL *plus* whatever backoff the
+/// supervisor had reached, and `CrashLoopBackOff` is an alert rather than a design.
+///
+/// Here the standby stays up and is promoted on its own. Note what it asserts along the
+/// way, because each part was a separate way to get this wrong:
+///
+/// * while waiting, the standby is **live but not ready** — a failing liveness probe would
+///   have a supervisor kill the very instance meant to be waiting, and a passing readiness
+///   probe would have a load balancer send it traffic it cannot serve;
+/// * its data routes answer `503`, not `500` — nothing is broken, there is just no store;
+/// * promotion happens within roughly the lease TTL of the incumbent dying, **without any
+///   external restart** — the assertion that was impossible to write before;
+/// * and the promoted instance can write, and sees everything its predecessor committed.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs minio + valkey (just test-e2e-cluster)"]
+fn standby_is_promoted_after_the_writer_dies() {
+    let prefix = unique_prefix("promote");
+    let (_wdir, writer) = instance(&prefix, false, &[]);
+    seed(&writer);
+    assert_eq!(upsert(&writer, "before", [1, 0, 0]).0, 200);
+
+    // The standby: a cluster writer that waits instead of exiting.
+    let (_sdir, standby) = instance_unready(&prefix, &["--wait-for-lease"]);
+
+    // Waiting, not broken: alive, deliberately unready, and honest about why.
+    assert!(standby.is_live(), "a waiting standby must answer liveness");
+    assert!(
+        !standby.is_ready(),
+        "a standby must not report ready while the incumbent holds the lease"
+    );
+    let (status, body) = standby.get("/stats");
+    assert_eq!(
+        status, 503,
+        "an unpromoted standby should answer 503, got {status} {body}"
+    );
+
+    // The incumbent dies outright — no clean release, no lease handback.
+    writer.kill();
+
+    // Promotion is the standby's own doing. Allow generous slack over the TTL for a loaded
+    // CI runner; the point is that it happens at all, unattended.
+    let promoted = standby
+        .ready_within(past_the_lease() + Duration::from_secs(10))
+        .expect("standby must be promoted after the writer dies, with no external restart");
+    println!("standby promoted {promoted:.2?} after the writer was killed");
+
+    // A promoted standby is a full writer: it can write, and it inherited the state.
+    assert_eq!(upsert(&standby, "after", [0, 1, 0]).0, 200);
+    assert_eq!(
+        ids(&standby),
+        vec!["after", "before"],
+        "the promoted standby must see its predecessor's committed data"
+    );
 }
 
 /// A reader restarted from scratch reconstructs the same state, so the shared backend and

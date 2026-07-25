@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 
@@ -24,7 +24,7 @@ use crate::backend::{
     BackendLock, ClusterLease, MemoryTier, Persistence, appender_for, locked_error,
     object_try_lock, open_memory_tier, open_persistence,
 };
-use crate::config::{Config, OpenMode};
+use crate::config::{Config, LeaseWait, OpenMode};
 use crate::data::Segments;
 use crate::fts::Fts;
 use crate::log::OpLog;
@@ -81,6 +81,22 @@ impl Collection {
 /// reservation was for (units depend on the collection — vectors, rows, entries).
 fn oom(what: &str, count: usize) -> anyhow::Error {
     anyhow!("out of memory reserving capacity for {count} {what}")
+}
+
+/// A pseudo-random duration in `0..=span`, for spreading standby retry polls.
+///
+/// Deliberately not a PRNG: this only needs to decorrelate instances that would otherwise
+/// wake in lockstep when a lease TTL lapses, and the wall clock's nanoseconds already
+/// differ between processes. Nothing depends on the quality of this — a poor draw costs
+/// one redundant lock read.
+fn jitter(span: Duration) -> Duration {
+    if span.is_zero() {
+        return Duration::ZERO;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos() as u64);
+    Duration::from_nanos(nanos % (span.as_nanos().max(1) as u64))
 }
 
 // ── Store ─────────────────────────────────────────────────────────────────────
@@ -240,16 +256,23 @@ impl Store {
         //    lease (renewed per write batch, fences a superseded writer); otherwise the plain
         //    writer lock — native `O_EXCL` on local files, or the object lock on a whole-object
         //    store. Readers take neither.
+        //    Under `Config::lease_wait` a losing claimant waits for promotion instead of
+        //    failing — see `await_writer_handle`.
         let (lock, lease) = if config.open_mode == OpenMode::ReadWrite {
             if config.cluster {
-                let lease = ClusterLease::acquire(&persistence, "lock", config.lock_ttl)?
-                    .ok_or_else(|| locked_error(location))?;
+                let lease = Self::await_writer_handle(location, &config, || {
+                    ClusterLease::acquire(&persistence, "lock", config.lock_ttl)
+                })?;
                 (None, Some(lease))
             } else {
-                (
-                    Some(Self::acquire_lock(&persistence, location, config.lock_ttl)?),
-                    None,
-                )
+                let lock = Self::await_writer_handle(location, &config, || {
+                    if persistence.has_native_lock() {
+                        persistence.try_lock("lock", config.lock_ttl)
+                    } else {
+                        object_try_lock(&persistence, "lock", config.lock_ttl)
+                    }
+                })?;
+                (Some(lock), None)
             }
         } else {
             (None, None)
@@ -625,21 +648,49 @@ impl Store {
         }
     }
 
-    /// Acquire the writer lock: the backend's native `O_EXCL` lock (local files) or, on a
-    /// whole-object store with no native lock, the object lock (race-free conditional-PUT
-    /// where the backend supports it, advisory otherwise). Contention is a clear "store is
-    /// locked" error in both cases.
-    fn acquire_lock(
-        persistence: &Arc<dyn Persistence>,
+    /// Claim the writer handle, honouring [`Config::lease_wait`]. See [`jitter`].
+    ///
+    /// `claim` is one attempt: `Ok(Some(_))` when this instance now holds the handle,
+    /// `Ok(None)` when a live holder owns it (contention, not an error). Under
+    /// [`LeaseWait::Fail`] — the default — contention becomes the "store is locked" error
+    /// immediately, exactly as before. Otherwise this retries, so the process becomes a
+    /// standby that is promoted when the holder dies or releases.
+    ///
+    /// Correctness rests entirely on `claim` being atomic, which it already is: the object
+    /// store's conditional write makes exactly one of N racing claimants win, whether it
+    /// is a fresh acquire or the reclaim of a lease past its TTL. Retrying therefore adds
+    /// no new race — it only changes how a loser responds.
+    fn await_writer_handle<T>(
         location: &str,
-        ttl: Duration,
-    ) -> Result<Box<dyn BackendLock>> {
-        let acquired = if persistence.has_native_lock() {
-            persistence.try_lock("lock", ttl)?
-        } else {
-            object_try_lock(persistence, "lock", ttl)?
+        config: &Config,
+        claim: impl Fn() -> Result<Option<T>>,
+    ) -> Result<T> {
+        // A stale handle cannot be reclaimed until its TTL lapses, so polling much faster
+        // than that only spends object-store requests. Poll at an eighth of the TTL,
+        // clamped so a tiny TTL does not spin and a large one still notices a *clean*
+        // release (which can happen at any moment) reasonably promptly.
+        let base = (config.lock_ttl / 8).clamp(Duration::from_millis(250), Duration::from_secs(2));
+        let deadline = match config.lease_wait {
+            LeaseWait::Fail => {
+                return claim()?.ok_or_else(|| locked_error(location));
+            }
+            LeaseWait::Timeout(limit) => Some(Instant::now() + limit),
+            LeaseWait::Forever => None,
         };
-        acquired.ok_or_else(|| locked_error(location))
+
+        loop {
+            if let Some(handle) = claim()? {
+                return Ok(handle);
+            }
+            if let Some(deadline) = deadline
+                && Instant::now() >= deadline
+            {
+                return Err(locked_error(location));
+            }
+            // Jitter up to +25%: several standbys would otherwise wake together the
+            // instant a TTL lapses and stampede the same lock object.
+            std::thread::sleep(base + jitter(base / 4));
+        }
     }
 
     /// Replay the decoded log `ops` into the in-RAM index — the source of truth when no
