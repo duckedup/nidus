@@ -24,6 +24,31 @@
 //! allocation, and above all no lock. The store is already serialised behind one `RwLock`;
 //! an observability layer that contended with it would become the problem it exists to
 //! diagnose.
+//!
+//! ## The two in-flight gauges measure different things, on purpose (nidus-bcg)
+//!
+//! * `nidus_http_requests_in_flight` — handler futures alive, probes included. Counted by
+//!   the [`InFlight`] guard, so a client that disconnects mid-request decrements it.
+//! * `nidus_http_admitted_in_flight` — **concurrency permits held**, read straight off the
+//!   semaphore in [`super::limits`]. This is the one to correlate with
+//!   `nidus_http_requests_shed_total`: shedding happens exactly when it reaches
+//!   `nidus_http_concurrency_limit`.
+//!
+//! The permit gauge is named after the admission decision, and it reports that decision
+//! exactly. It is therefore **not** a count of work executing: when a request hits its
+//! deadline the permit is released immediately — holding it would shed live traffic on
+//! behalf of work nobody is waiting for — while the blocking task keeps running until it
+//! observes the cancellation token. For that window the gauge is low.
+//!
+//! The window is bounded by cooperative cancellation: the scan kernels check the token
+//! every few thousand rows, so it is milliseconds, not a whole scan. It is entered exactly
+//! `nidus_http_requests_timed_out_total` times — if that counter is flat, the discrepancy
+//! has never occurred on this instance, which is the measurement to make before wanting a
+//! second gauge for it.
+//!
+//! Folding orphaned work into the permit gauge was considered and rejected: the gauge
+//! would then no longer correspond to the admission decision it is named after, which is
+//! the only reason to graph it against the shed count.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -405,7 +430,8 @@ fn render(out: &mut String, st: &AppState) {
         ),
         (
             "nidus_http_requests_timed_out_total",
-            "Requests abandoned with 504 at their deadline",
+            "Requests abandoned with 504 at their deadline: clients freed and the scan \
+             signalled to stop",
             HTTP.timed_out.get(),
         ),
         (
@@ -422,12 +448,13 @@ fn render(out: &mut String, st: &AppState) {
     for (name, help, value) in [
         (
             "nidus_http_requests_in_flight",
-            "Requests currently being handled",
+            "Requests currently being handled, probes included",
             HTTP.in_flight.get(),
         ),
         (
             "nidus_http_admitted_in_flight",
-            "Store-touching requests currently holding a concurrency permit",
+            "Concurrency permits held: store-touching requests admitted and not yet \
+             released, excluding work whose deadline already fired",
             st.limits.in_flight() as u64,
         ),
         (

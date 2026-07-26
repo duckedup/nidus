@@ -70,6 +70,27 @@ harness's independent exact ground truth plus query latency and speedup vs the
 exact path. It's nidus-only (no engine deps) and is how the default `rescore` and
 the documented recall/speed expectations were chosen.
 
+## Single-writer ingest decomposition
+
+```bash
+just bench-write                              # n=50k, dim=384/768, batch=1..1000
+just bench-write n=100000 dim=768 batch=1000  # extra key=value args pass through
+```
+
+`bench-write` answers *which layer a single writer saturates on*, by timing each stage a
+vector passes through on its way into the store — client JSON encode, server JSON decode,
+`Nidus::upsert` without fsync, the fsync itself, and the real HTTP round trip. Everything
+the round trip costs beyond the sum of the others is reported as a **residual**
+("transport+runtime": sockets, the tokio hop, the middleware stack, the `RwLock`) rather
+than measured directly, so nothing can hide in it.
+
+Two sweeps come with it. **Batch size** separates per-request costs (one fsync, one round
+trip), which amortise, from per-vector costs (JSON), which do not. **Concurrent writers**
+shows whether one server process still has headroom above the store's exclusive lock.
+
+This is the measurement epic `nidus-xb9` asked for before deciding whether nidus needs
+more than one writer; the recorded findings live on that issue.
+
 ## nidus regression tracking (criterion)
 
 ```bash

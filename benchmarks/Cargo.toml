@@ -30,6 +30,13 @@ path = "src/quant.rs"
 name = "nidus-bench-ann"
 path = "src/ann.rs"
 
+# Single-writer ingest decomposition (nidus-xb9): which stage of the write path
+# actually saturates. The in-process half needs no engine deps; the HTTP half is
+# behind the same `server` feature the engine adapter uses.
+[[bin]]
+name = "nidus-bench-write"
+path = "src/write.rs"
+
 [dependencies]
 nidus = { path = ".." }
 anyhow = "1"
