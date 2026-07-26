@@ -1,17 +1,16 @@
 name: Helm chart
 
-# Lint/render the chart on every change, and publish it as an OCI artifact to
-# ghcr.io when a new chart version lands on main. Users then install with:
+# Lint and render the chart on every change. PUBLISHING lives in helm-publish.yml,
+# which release.yml calls once a release is actually cut — see that file for why the
+# chart's versions are stamped from the crate rather than hand-edited (nidus-yap).
+# Users install with:
 #   helm install nidus oci://ghcr.io/duckedup/charts/nidus --version <x.y.z>
 on:
   push:
     branches: [main]
-    # Cargo.toml is in the trigger set so a crate version bump runs the appVersion
-    # check below — without it, the one change that can cause the drift would be the
-    # one change that never runs the guard.
-    paths: ["charts/**", "Cargo.toml", ".github/workflows/helm.yml"]
+    paths: ["charts/**", ".github/workflows/helm.yml"]
   pull_request:
-    paths: ["charts/**", "Cargo.toml", ".github/workflows/helm.yml"]
+    paths: ["charts/**", ".github/workflows/helm.yml"]
   workflow_dispatch:
 
 permissions:
@@ -28,21 +27,13 @@ jobs:
         with:
           version: v3.16.3
 
-      # appVersion is the image tag a default `helm install` deploys, so when it lags
-      # the crate the chart quietly ships an old nidus (it sat at 0.26.0 while the crate
-      # reached 0.35.0 — nidus-yap). Asserted rather than auto-stamped: the coupling is
-      # then visible in the diff, and the fix is one obvious line.
-      - name: appVersion must match the crate version
-        run: |
-          crate=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          chart=$(grep '^appVersion' charts/nidus/Chart.yaml | sed 's/.*"\(.*\)".*/\1/')
-          if [ "$crate" != "$chart" ]; then
-            echo "::error::Chart.yaml appVersion ($chart) != Cargo.toml version ($crate)." >&2
-            echo "Bump appVersion in charts/nidus/Chart.yaml, and the chart's own 'version' too." >&2
-            exit 1
-          fi
-          echo "ok: appVersion $chart matches the crate"
-
+      # No appVersion-vs-crate assertion here any more. It used to live at this step and
+      # it worked — but since every PR bumps `Cargo.toml`, it fired on essentially every
+      # PR, and it fired late, in CI after a push. helm-publish.yml now derives both chart
+      # versions from the crate at release time, so the drift it guarded against is
+      # unrepresentable rather than merely detected. `Cargo.toml` has left this workflow's
+      # trigger paths for the same reason: a crate bump alone no longer changes anything
+      # here.
       - name: helm lint
         run: helm lint charts/nidus --values charts/nidus/ci/test-values.yaml
 
@@ -61,33 +52,3 @@ jobs:
             exit 1
           fi
           echo "ok: chart rejects an incomplete config"
-
-  publish:
-    name: Publish OCI chart
-    needs: lint
-    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.repository == 'duckedup/nidus' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: azure/setup-helm@v4
-        with:
-          version: v3.16.3
-
-      - name: Publish if the chart version is new
-        env:
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          VERSION=$(helm show chart charts/nidus | awk '/^version:/ {print $2}')
-          REPO="oci://ghcr.io/${GITHUB_REPOSITORY_OWNER}/charts"
-          echo "$GHCR_TOKEN" | helm registry login ghcr.io -u "$GHCR_USER" --password-stdin
-          if helm pull "$REPO/nidus" --version "$VERSION" >/dev/null 2>&1; then
-            echo "nidus chart $VERSION already published — skipping (bump charts/nidus/Chart.yaml version to release)"
-            exit 0
-          fi
-          helm package charts/nidus --destination /tmp
-          helm push "/tmp/nidus-${VERSION}.tgz" "$REPO"
