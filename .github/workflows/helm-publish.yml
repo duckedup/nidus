@@ -1,0 +1,119 @@
+name: Publish Helm chart
+
+# Stamps the chart's versions from the crate version, then publishes the OCI chart.
+#
+# NOT triggered by `push`: like the Docker workflow (nidus-cwo), the release workflow
+# pushes its tag with the default GITHUB_TOKEN, which by GitHub's anti-recursion rule
+# cannot start another workflow. release.yml therefore calls this directly
+# (workflow_call) once it has actually cut a release. It can also be run by hand
+# (workflow_dispatch) to (re)publish a specific version.
+#
+# ## Why the versions are stamped here rather than hand-edited (nidus-yap)
+#
+# `appVersion` is the image tag a default `helm install` deploys, so it has to track the
+# crate or the chart quietly ships an old nidus. That used to be a hand-edit guarded by a
+# CI assertion — but since every PR bumps `Cargo.toml` (see CLAUDE.md), the guard fired on
+# essentially every PR, and it fired *late*, in CI after a push. Deriving both versions
+# from the one source of truth removes the chore and makes the drift unrepresentable.
+#
+# The chart's own `version` is stamped to the crate version too, not just `appVersion`.
+# That is forced, not stylistic: an OCI registry keys a chart solely by its `version`, so
+# a new `appVersion` cannot reach users unless the chart version moves with it. Tying them
+# together is what makes "the published chart deploys the current nidus" true by
+# construction. (One-time discontinuity: the chart jumped 0.5.1 -> the crate's version. It
+# still increases monotonically, which is all the registry requires.)
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Crate version to stamp and publish (no leading v)
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Crate version to stamp and publish (no leading v)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Stamp and publish OCI chart
+    if: github.repository == 'duckedup/nidus'
+    runs-on: ubuntu-latest
+    permissions:
+      # `write` so the stamp can be committed back — see "Persist the stamp" below.
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The branch, not the triggering SHA: this job commits the stamp back, which
+          # needs a branch to push to.
+          ref: main
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Stamp chart version and appVersion from the crate
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::refusing to stamp a non-semver version: '$VERSION'" >&2; exit 1 ;;
+          esac
+          sed -i -E "s/^version: .*/version: ${VERSION}/" charts/nidus/Chart.yaml
+          sed -i -E "s/^appVersion: .*/appVersion: \"${VERSION}\"/" charts/nidus/Chart.yaml
+          echo "stamped charts/nidus/Chart.yaml to $VERSION"
+          grep -E '^(version|appVersion):' charts/nidus/Chart.yaml
+
+      # Re-lint AFTER stamping: the thing being published is the stamped chart, so that is
+      # what has to be valid. Linting the pre-stamp file would verify the wrong artifact.
+      - name: helm lint (stamped)
+        run: helm lint charts/nidus --values charts/nidus/ci/test-values.yaml
+
+      - name: Publish if this chart version is new
+        env:
+          VERSION: ${{ inputs.version }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="oci://ghcr.io/${GITHUB_REPOSITORY_OWNER}/charts"
+          echo "$GHCR_TOKEN" | helm registry login ghcr.io -u "$GHCR_USER" --password-stdin
+          if helm pull "$REPO/nidus" --version "$VERSION" >/dev/null 2>&1; then
+            echo "nidus chart $VERSION is already published — nothing to do"
+            exit 0
+          fi
+          helm package charts/nidus --destination /tmp
+          helm push "/tmp/nidus-${VERSION}.tgz" "$REPO"
+
+      # Keep the checked-in chart honest. Without this the repo would permanently disagree
+      # with what was published, and `helm install ./charts/nidus` from a clone would
+      # deploy a stale image tag — the exact failure this issue was filed about, merely
+      # relocated. Pushed with GITHUB_TOKEN, which cannot trigger another workflow, so
+      # there is no loop.
+      #
+      # Best-effort on purpose: the chart is already published by this point, and a race
+      # with a concurrent push to main must not fail a release that actually succeeded.
+      - name: Persist the stamp back to main
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- charts/nidus/Chart.yaml; then
+            echo "chart already at the released version — nothing to commit"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add charts/nidus/Chart.yaml
+          git commit -m "🪺 chart: stamp version ${{ inputs.version }} [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main

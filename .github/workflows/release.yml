@@ -227,3 +227,17 @@ jobs:
     with:
       version: ${{ needs.check-version.outputs.version }}
     secrets: inherit
+
+  # Same reasoning as publish-docker, plus one of its own: the chart's `appVersion` is
+  # the image tag a default `helm install` deploys, so it must not be stamped until the
+  # image it names actually exists. Hence `needs: publish-docker` — a chart pointing at
+  # an unpublished tag would render fine and fail at pull time, which is the worst place
+  # to find out (nidus-yap).
+  publish-helm:
+    name: Publish Helm chart
+    needs: [check-version, publish-docker]
+    if: "!failure() && !cancelled() && needs.check-version.outputs.should_release == 'true'"
+    uses: ./.github/workflows/helm-publish.yml
+    with:
+      version: ${{ needs.check-version.outputs.version }}
+    secrets: inherit

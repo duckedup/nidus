@@ -91,16 +91,47 @@ shows whether one server process still has headroom above the store's exclusive 
 This is the measurement epic `nidus-xb9` asked for before deciding whether nidus needs
 more than one writer; the recorded findings live on that issue.
 
+### Baselines
+
+```bash
+just bench-write json=benchmarks/baselines/write-<version>.json   # record
+```
+
+A printed table is for reading; a baseline is for **diffing**. `benchmarks/baselines/`
+holds committed runs so a change can be argued against a number rather than a memory —
+`write-0.36.0.json` is the reference for `nidus-xb9.1` (group commit), captured right
+after `nidus-4h2` removed the stray per-call fsync.
+
+The file records the *inputs* (`n`, `dim`, `batch`, `clients`, `max_requests`, `seed`)
+next to the results, because a baseline compared against a run with different knobs is
+not a comparison and there would otherwise be nothing to catch it. These are wall-clock
+numbers from one developer machine: compare runs **on the same box**, and treat a
+cross-machine diff as meaningless.
+
 ## nidus regression tracking (criterion)
 
 ```bash
-just bench-crit                        # all groups: search, parallel_search, ingest
+just bench-crit                        # all groups
 just bench-crit parallel_search        # just the query_threads scaling group
+just bench-crit write_path             # just the file-backed write path
 just bench-crit --save-baseline main   # record a baseline; later runs report the delta
 ```
 
 `bench-crit` benchmarks nidus through its public API with criterion's statistical
 sampling and baseline comparison — the "did we regress?" signal. It covers single-threaded
 `search`, the `parallel_search` sweep across `query_threads` (1/2/4/8 — the reproducible
-parallel-scan measurement), and `ingest`. criterion is a dev-dependency of *this* crate
-only and never touches nidus's build.
+parallel-scan measurement), `ingest`, and `write_path`. criterion is a dev-dependency of
+*this* crate only and never touches nidus's build.
+
+`write_path` is the file-backed write lane, swept across fsync policy and batch size. It
+exists because `ingest` **cannot** catch a write regression: `ingest` uses
+`open_in_memory` and a single 10k-record call, so it touches no filesystem, takes no disk
+barrier, and has no batch-size axis — every quantity `nidus-xb9.1` is meant to move is
+invisible to it. `write_path` runs at `sample_size(10)` over only 200 records because a
+`PerBatch` call costs a real disk barrier (~3.8ms where `sync_all` is `F_FULLFSYNC`);
+criterion's defaults would make the `b1` row alone several minutes. Expect the group to
+take roughly a minute and a half.
+
+The shape to watch: `on_flush` is flat across batch size (no per-call barrier since
+`nidus-4h2`), while `per_batch` scales with the number of calls. Group commit should pull
+`per_batch` toward `on_flush`.

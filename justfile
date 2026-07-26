@@ -287,10 +287,14 @@ bench-ann *ARGS:
 # Builds the release binary first — the HTTP half drives a real `nidus serve`.
 #   just bench-write                              defaults (n=50k, dim=384/768)
 #   just bench-write n=100000 dim=768 batch=1000  pass-through args
+#   just bench-write json=benchmarks/baselines/write-<version>.json   record a baseline
 bench-write *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --release --features cli
+    # Passed through so a recorded baseline names the nidus it measured — the bench
+    # crate's own CARGO_PKG_VERSION would say 0.1.0, which is the wrong crate.
+    NIDUS_VERSION="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')" \
     NIDUS_BIN="$PWD/target/release/nidus" \
         cargo run -p nidus-bench --release --features server \
         --bin nidus-bench-write -- {{ARGS}}
