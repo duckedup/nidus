@@ -304,6 +304,22 @@ docs (`docs/src/content/docs/getting-started.md`) and `README.md` to match (e.g.
 `major.minor` (a patch bump like `0.12.1 → 0.12.2` leaves `nidus = "0.12"` correct).
 Those `[dependencies]` examples must not lag the released crate.
 
+**The client SDKs ship at the crate's version — and you do NOT hand-edit theirs
+either.** Every SDK under `sdks/` is released at `Cargo.toml`'s `version`, so "which
+nidus does this client speak to" is answerable from the version alone. `release.yml`
+invokes each SDK's release workflow (`sdk-js-release.yml`, `sdk-go-release.yml`,
+`sdk-py-release.yml`) via `workflow_call` after it cuts a release — same mechanism, and
+same two reasons, as `publish-docker`/`publish-helm`: a tag pushed with `GITHUB_TOKEN`
+cannot trigger another workflow, and calling directly means an SDK can only publish a
+version the crate actually released. Any version string in an SDK manifest
+(`sdks/js/package.json`, `sdks/python/src/nidus/_version.py`) is **stamped from
+`Cargo.toml` at release time and committed back to `main`**, exactly like the chart
+below; the Go SDK has no version file at all, since a Go module's version *is* its tag.
+So an SDK-only fix still ships by bumping `Cargo.toml` — there is no separate SDK bump
+to remember, and no CI assertion to trip over. Tag namespaces are distinct from the
+crate's `v*`: `js-v*`, `py-v*`, and `sdks/go/v*` (that last form is forced — Go resolves
+a module in a repo subdirectory only via a `<subdir>/v<semver>` tag).
+
 **Do NOT hand-edit `charts/nidus/Chart.yaml` versions.** Both `version` and
 `appVersion` are stamped from `Cargo.toml` by `.github/workflows/helm-publish.yml` at
 release time, and the release job commits the stamp back (nidus-yap). A PR that bumps

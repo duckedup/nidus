@@ -186,7 +186,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${{ needs.check-version.outputs.tag }}$" | head -1)
+          # `--list 'v*'` restricts this to the crate's own tags. The SDKs tag in their
+          # own namespaces (js-v*, py-v*, sdks/go/v*), and an unfiltered listing would
+          # let one of those become PREV_TAG and silently truncate the crate changelog.
+          PREV_TAG=$(git tag --sort=-v:refname --list 'v*' | grep -v "^${{ needs.check-version.outputs.tag }}$" | head -1)
           if [ -z "$PREV_TAG" ]; then
             NOTES=$(git log --pretty=format:"- %s" HEAD)
           else
@@ -238,6 +241,24 @@ jobs:
     needs: [check-version, publish-docker]
     if: "!failure() && !cancelled() && needs.check-version.outputs.should_release == 'true'"
     uses: ./.github/workflows/helm-publish.yml
+    with:
+      version: ${{ needs.check-version.outputs.version }}
+    secrets: inherit
+
+  # Every client SDK ships at the crate's version, so "which nidus does this client
+  # speak to" is answerable from the version alone. Called from here for the same two
+  # reasons as publish-docker/publish-helm: the tag above is pushed with GITHUB_TOKEN
+  # and so cannot trigger a workflow of its own, and invoking directly makes it
+  # structurally impossible for an SDK to publish a version the crate never released.
+  #
+  # `needs: github-release` (not just check-version) so an SDK is never published for a
+  # release that failed to cut. The SDKs are independent of each other and run in
+  # parallel; one registry being down must not block the others.
+  publish-sdk-js:
+    name: Publish JS SDK
+    needs: [check-version, github-release]
+    if: "!failure() && !cancelled() && needs.check-version.outputs.should_release == 'true'"
+    uses: ./.github/workflows/sdk-js-release.yml
     with:
       version: ${{ needs.check-version.outputs.version }}
     secrets: inherit

@@ -1,62 +1,61 @@
 name: Release JS SDK
 
-# Publishes @duckedup/nidus to npm whenever sdks/js/package.json's version bumps
-# on main. Mirrors the crate's release.yml "bump-to-ship" gate, but keyed to the
-# SDK's own version and a distinct tag namespace (js-v*) so it never collides with
-# the crate's v* release tags.
+# Publishes @duckedup/nidus to npm at the CRATE's version.
+#
+# ## Why the version is the crate's, and why it is stamped rather than hand-edited
+#
+# Every nidus SDK ships at the version of the server it was written against, so
+# "which nidus does this client speak to" is answerable from the version alone. That
+# makes `Cargo.toml`'s `version` the single source of truth, and `package.json`'s
+# version a *derived* value — stamped here from the `version` input and committed back
+# to main, exactly as `helm-publish.yml` does for the chart (nidus-yap). CLAUDE.md
+# records why the alternative was abandoned: a CI assertion that the two agree fires on
+# essentially every PR, because every PR bumps the crate. Deriving it makes the drift
+# unrepresentable instead of merely detected.
+#
+# ## Why workflow_call rather than `on: push`
+#
+# The crate's release tag is pushed with GITHUB_TOKEN, which by GitHub's anti-recursion
+# rule cannot start another workflow — the same reason docker.yml and helm-publish.yml
+# are called directly by release.yml. Being invoked by release.yml also means this can
+# only ever publish a version the crate actually released, which a `paths:`-filtered
+# push trigger could not guarantee.
+#
+# Tag namespace `js-v*`, distinct from the crate's `v*`.
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "sdks/js/**"
+  workflow_call:
+    inputs:
+      version:
+        description: Crate version to stamp and publish (no leading v)
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Crate version to stamp and publish (no leading v)
+        required: true
+        type: string
 
 permissions:
-  contents: write
-  id-token: write # required for npm provenance
+  contents: read
 
 jobs:
-  check-version:
-    name: Check for version bump
+  publish:
+    name: Stamp and publish to npm
+    if: github.repository == 'duckedup/nidus'
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      tag: ${{ steps.version.outputs.tag }}
-      should_release: ${{ steps.check.outputs.should_release }}
+    permissions:
+      # `write` so the stamp can be committed back — see "Persist the stamp" below.
+      contents: write
+      id-token: write # required for npm provenance / trusted publishing
     steps:
       - uses: actions/checkout@v6
         with:
+          # The branch, not the triggering SHA: this job commits the stamp back, which
+          # needs a branch to push to.
+          ref: main
           fetch-depth: 0
-
-      - name: Get version from package.json
-        id: version
-        run: |
-          VERSION=$(node -p "require('./sdks/js/package.json').version")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=js-v$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Check if tag exists
-        id: check
-        run: |
-          TAG="js-v$(node -p "require('./sdks/js/package.json').version")"
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-            echo "Tag $TAG already exists, skipping release"
-          else
-            echo "should_release=true" >> "$GITHUB_OUTPUT"
-            echo "Tag $TAG does not exist, will release"
-          fi
-
-  publish:
-    name: Publish to npm
-    needs: check-version
-    if: needs.check-version.outputs.should_release == 'true'
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: sdks/js
-    steps:
-      - uses: actions/checkout@v6
 
       - name: Setup Node
         uses: actions/setup-node@v5
@@ -68,59 +67,108 @@ jobs:
       - name: Upgrade npm
         run: npm install -g npm@latest
 
+      - name: Stamp package.json version from the crate
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::refusing to stamp a non-semver version: '$VERSION'" >&2; exit 1 ;;
+          esac
+          cd sdks/js
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          echo "stamped sdks/js/package.json to $(node -p 'require("./package.json").version')"
+
       - name: Install
+        working-directory: sdks/js
         run: npm ci || npm install
 
+      # Verify AFTER stamping: the tree being published is the stamped one, so that is
+      # what has to be valid (same reasoning as helm-publish re-linting post-stamp).
       - name: Typecheck
+        working-directory: sdks/js
         run: npm run typecheck
 
       - name: Unit tests
+        working-directory: sdks/js
         run: npm run test:unit
 
       - name: Build
+        working-directory: sdks/js
         run: npm run build
 
-      # No NODE_AUTH_TOKEN: authentication is via OIDC trusted publishing.
-      # Configure the trusted publisher at npmjs.com → @duckedup/nidus →
-      # Settings → Trusted Publishing (org: duckedup, repo: nidus,
-      # workflow: sdk-js-release.yml). Provenance is emitted automatically.
+      # Idempotent: a version already on the registry is a no-op success, not a failed
+      # release — the crate's own publish step takes the same stance.
+      #
+      # No NODE_AUTH_TOKEN: authentication is via OIDC trusted publishing, configured at
+      # npmjs.com → @duckedup/nidus → Settings → Trusted Publishing (org: duckedup,
+      # repo: nidus, workflow: sdk-js-release.yml). Provenance is emitted automatically.
+      # Keep this filename stable — the trusted publisher is keyed to it.
       - name: Publish
-        run: npm publish
-
-  github-release:
-    name: Create GitHub Release
-    needs: [check-version, publish]
-    if: "!failure() && !cancelled() && needs.check-version.outputs.should_release == 'true'"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Create tag
+        working-directory: sdks/js
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          git tag ${{ needs.check-version.outputs.tag }}
-          git push origin ${{ needs.check-version.outputs.tag }}
+          set -euo pipefail
+          if npm view "@duckedup/nidus@${VERSION}" version >/dev/null 2>&1; then
+            echo "@duckedup/nidus ${VERSION} is already published — nothing to do"
+            exit 0
+          fi
+          npm publish
 
-      - name: Create GitHub Release
+      - name: Create tag and GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
         run: |
-          PREV_TAG=$(git tag --sort=-v:refname --list 'js-v*' | grep -v "^${{ needs.check-version.outputs.tag }}$" | head -1)
+          set -euo pipefail
+          TAG="js-v${VERSION}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already exists — nothing to do"
+            exit 0
+          fi
+          PREV_TAG=$(git tag --sort=-v:refname --list 'js-v*' | head -1)
           if [ -z "$PREV_TAG" ]; then
             NOTES=$(git log --pretty=format:"- %s" -- sdks/js | head -50)
           else
             NOTES=$(git log --pretty=format:"- %s" "$PREV_TAG"..HEAD -- sdks/js)
           fi
+          git tag "$TAG"
+          git push origin "$TAG"
 
-          gh release create "${{ needs.check-version.outputs.tag }}" \
-            --title "JS SDK ${{ needs.check-version.outputs.version }}" \
-            --notes "## @duckedup/nidus ${{ needs.check-version.outputs.version }}
+          # --latest=false so an SDK release never displaces the crate's as the
+          # repository's "latest" release.
+          gh release create "$TAG" \
+            --title "JS SDK ${VERSION}" \
+            --latest=false \
+            --notes "## @duckedup/nidus ${VERSION}
 
           \`\`\`sh
-          npm install @duckedup/nidus@${{ needs.check-version.outputs.version }}
+          npm install @duckedup/nidus@${VERSION}
           \`\`\`
 
           ### Changes
 
-          $NOTES"
+          ${NOTES}"
+
+      # Keep the checked-in manifest honest: without this the repo would permanently
+      # disagree with what was published, and a clone would report a stale version.
+      # Pushed with GITHUB_TOKEN, which cannot trigger another workflow, so no loop.
+      #
+      # Best-effort on purpose: the package is already published by this point, and a
+      # race with a concurrent push to main must not fail a release that succeeded.
+      - name: Persist the stamp back to main
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- sdks/js/package.json sdks/js/package-lock.json; then
+            echo "manifest already at the released version — nothing to commit"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sdks/js/package.json sdks/js/package-lock.json
+          git commit -m "🪺 sdk-js: stamp version ${{ inputs.version }} [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main
