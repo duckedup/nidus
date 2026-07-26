@@ -2063,6 +2063,13 @@ mod tests {
                 "vector length 4 does not match store dimension 8",
                 StatusCode::BAD_REQUEST,
             ),
+            // The read-path counterpart (nidus-c5v). Same substring on purpose, so the
+            // search guard needed no new mapping here — which is also why it must keep
+            // that wording: rephrase it and the status silently falls back to 500.
+            (
+                "query length 2 does not match store dimension 3",
+                StatusCode::BAD_REQUEST,
+            ),
             (
                 "read-only store: mutations are not allowed",
                 StatusCode::FORBIDDEN,
@@ -2089,6 +2096,64 @@ mod tests {
         for (msg, want) in cases {
             assert_eq!(classify(&anyhow!("{msg}")), want, "message: {msg}");
         }
+    }
+
+    /// A wrong-dimension query is a `400` with a message that names both lengths, on every
+    /// route that takes a query vector (nidus-c5v).
+    ///
+    /// This is the regression that matters most to a caller: before the guard, these
+    /// answered `200` with an empty (or prefix-scored) ranking, so the overwhelmingly
+    /// common cause — swapping embedding models without re-indexing — surfaced as "search
+    /// stopped working" rather than an error naming the actual problem.
+    #[tokio::test]
+    async fn wrong_dimension_query_is_a_400_on_every_vector_route() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [{"id": "a", "vector": [1, 0, 0], "attrs": {}}]}),
+            ))
+            .await
+            .unwrap();
+
+        // Too short, too long, and empty — over `/search` and the `/hybrid-search`
+        // vector leg. `/list` and `/text-search` take no vector and are unaffected.
+        let cases = [
+            ("/search", json!({"query": [1, 0], "top_k": 5})),
+            ("/search", json!({"query": [1, 0, 0, 9], "top_k": 5})),
+            ("/search", json!({"query": [], "top_k": 5})),
+            (
+                "/hybrid-search",
+                json!({"vector": [1, 0], "field": "body", "text": "x", "top_k": 5}),
+            ),
+            // top_k 0 short-circuits the fusion, but the verdict must not depend on it.
+            (
+                "/hybrid-search",
+                json!({"vector": [1, 0], "field": "body", "text": "x", "top_k": 0}),
+            ),
+        ];
+        for (path, body) in cases {
+            let resp = app.clone().oneshot(post(path, body.clone())).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{path} with {body} should be refused, not answered"
+            );
+            let msg = json_body(resp).await["error"].as_str().unwrap().to_string();
+            assert!(
+                msg.contains("does not match store dimension"),
+                "the error should say what is wrong: {msg}"
+            );
+        }
+
+        // The right length is still served — the guard must not have broken the happy path.
+        let resp = app
+            .clone()
+            .oneshot(post("/search", json!({"query": [1, 0, 0], "top_k": 5})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await.as_array().unwrap().len(), 1);
     }
 
     #[test]

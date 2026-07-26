@@ -205,7 +205,13 @@ jobs:
           # `--list 'v*'` restricts this to the crate's own tags. The SDKs tag in their
           # own namespaces (js-v*, py-v*, sdks/go/v*), and an unfiltered listing would
           # let one of those become PREV_TAG and silently truncate the crate changelog.
-          PREV_TAG=$(git tag --sort=-v:refname --list 'v*' | grep -v "^${{ needs.check-version.outputs.tag }}$" | head -1)
+          # `|| true` because `grep -v` exits 1 when it filters everything out. This
+          # step does not run under `set -e`, so today that only yields an empty
+          # PREV_TAG — which the branch below already handles. Hardened anyway: the
+          # identical line in sdk-go-release.yml *does* run under `set -euo pipefail`
+          # and silently killed v0.40.0's Go SDK release, and a line that is only
+          # accidentally safe is a poor thing to copy from.
+          PREV_TAG=$(git tag --sort=-v:refname --list 'v*' | grep -v "^${{ needs.check-version.outputs.tag }}$" | head -1 || true)
           if [ -z "$PREV_TAG" ]; then
             NOTES=$(git log --pretty=format:"- %s" HEAD)
           else

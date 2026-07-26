@@ -172,7 +172,16 @@ jobs:
           # `--list 'sdks/go/v*'` so only this SDK's own history is walked; an
           # unfiltered listing would let the crate's or another SDK's tag become
           # PREV_TAG and truncate the notes.
-          PREV_TAG=$(git tag --sort=-v:refname --list 'sdks/go/v*' | grep -v "^${TAG}$" | head -1)
+          #
+          # `|| true` is load-bearing, not defensive habit. `grep -v` exits 1 when it
+          # filters everything out, which is exactly what happens on the FIRST release —
+          # the tag just pushed above is the only one matching the glob. Under
+          # `set -euo pipefail` that killed the step with no output at all, which is how
+          # v0.40.0's Go SDK release failed *after* successfully tagging and warming the
+          # proxy: the module was published and usable, but the GitHub release never got
+          # created and the job went red. `head -1` alone is not enough — pipefail
+          # propagates grep's status through it.
+          PREV_TAG=$(git tag --sort=-v:refname --list 'sdks/go/v*' | grep -v "^${TAG}$" | head -1 || true)
           if [ -z "$PREV_TAG" ]; then
             NOTES=$(git log --pretty=format:"- %s" -- sdks/go | head -50)
           else

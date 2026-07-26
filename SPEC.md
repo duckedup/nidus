@@ -129,7 +129,10 @@ pub enum Value {
   pinned dimension.
 - **Dimension** is fixed for the life of the store, recorded in the `data` header.
   Reopening with a different dimension is a hard error. One store = one embedding
-  model = one comparable vector space.
+  model = one comparable vector space. A **query** vector of the wrong length is a
+  hard error too, symmetrically with `upsert` — never a silent empty result. The
+  usual cause is swapping embedding models without re-indexing, and reporting that as
+  "no matches" would be indistinguishable from an empty store (nidus-c5v).
 - `Value` is rich enough to hold any scalar/metadata a caller attaches. The
   `Null`-vs-absent distinction is meaningful and preserved across disk round-trips:
   it lets a caller tell apart "this field was not computed/indexed" (absent) from
