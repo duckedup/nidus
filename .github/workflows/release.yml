@@ -4,8 +4,24 @@ on:
   push:
     branches: [main]
 
+# The UNION of everything this workflow and every workflow it calls needs. A called
+# workflow's job cannot hold more permission than the caller's token grants, and GitHub
+# does not degrade gracefully when it asks for more — it refuses to start the entire run
+# with a `startup_failure`, before any job or log exists. That is silent in the worst way:
+# no failed job, no annotation, and `git tag` simply never happens, so a release looks
+# like it was skipped rather than broken.
+#
+# It bit twice. `packages: write` (publish-helm, pushing the OCI chart to ghcr.io) landed
+# without this widening and took out v0.37.0; `id-token: write` (publish-sdk-js, npm OIDC
+# trusted publishing) then did the same to v0.38.0 and v0.39.0.
+#
+# So: adding a `uses:` job here means checking what permissions that workflow's jobs
+# declare and adding them below. `docker.yml` needs nothing extra only because its job
+# inherits rather than declaring its own.
 permissions:
-  contents: write
+  contents: write # tag + GitHub release; the SDK stamp commits
+  packages: write # publish-helm -> ghcr.io OCI chart
+  id-token: write # publish-sdk-js -> npm OIDC trusted publishing
 
 env:
   CARGO_TERM_COLOR: always
@@ -254,8 +270,10 @@ jobs:
   # `needs: github-release` (not just check-version) so an SDK is never published for a
   # release that failed to cut — and, for Go, because its module tag is cut from the
   # crate's release tag. The SDKs are independent of each other and run in parallel; one
-  # registry being down must not block the others. Each owns its release workflow, since
-  # "publish" means something different per ecosystem (npm upload vs. a bare module tag).
+  # registry being down must not block the others — hence the deliberately identical
+  # `needs:`/`if:` on each of them rather than a chain. Each owns its release workflow,
+  # since "publish" means something different per ecosystem (an npm/PyPI upload vs. a
+  # bare module tag).
   publish-sdk-js:
     name: Publish JS SDK
     needs: [check-version, github-release]
@@ -270,6 +288,15 @@ jobs:
     needs: [check-version, github-release]
     if: "!failure() && !cancelled() && needs.check-version.outputs.should_release == 'true'"
     uses: ./.github/workflows/sdk-go-release.yml
+    with:
+      version: ${{ needs.check-version.outputs.version }}
+    secrets: inherit
+
+  publish-sdk-py:
+    name: Publish Python SDK
+    needs: [check-version, github-release]
+    if: "!failure() && !cancelled() && needs.check-version.outputs.should_release == 'true'"
+    uses: ./.github/workflows/sdk-py-release.yml
     with:
       version: ${{ needs.check-version.outputs.version }}
     secrets: inherit

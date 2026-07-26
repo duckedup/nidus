@@ -1,0 +1,142 @@
+# Packaging + tooling for the nidus Python SDK.
+#
+# The one property worth protecting here is that `pip install nidus` pulls NOTHING:
+# the sync client is standard-library only (`urllib.request`), mirroring the JS SDK's
+# zero-runtime-dependency posture. `httpx` is needed only by the async client, so it
+# lives behind the `async` extra and never in `[project] dependencies`. Dev tooling
+# lives in the `dev` extra for the same reason — it must never reach an installer.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nidus"
+description = "Python client for nidus — a small, fast vector store. Connects to a local or remote `nidus serve` over HTTP."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "duckedup" }]
+# The version is read from src/nidus/_version.py, which the release workflow stamps
+# from Cargo.toml — the crate's version is the single source of truth for all SDKs.
+dynamic = ["version"]
+keywords = [
+  "nidus",
+  "vector",
+  "vector-store",
+  "vector-database",
+  "embeddings",
+  "semantic-search",
+  "similarity-search",
+  "client",
+  "sdk",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Database",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# The async client is the only thing that needs a third-party HTTP stack.
+async = ["httpx>=0.27"]
+dev = [
+  "ruff>=0.8",
+  "mypy>=1.13",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+  "httpx>=0.27",
+  "build>=1.2",
+  "twine>=5.1",
+]
+
+[project.urls]
+Homepage = "https://nidus.duckedup.org"
+Documentation = "https://nidus.duckedup.org/sdks/python/"
+Repository = "https://github.com/duckedup/nidus"
+Source = "https://github.com/duckedup/nidus/tree/main/sdks/python"
+Issues = "https://github.com/duckedup/nidus/issues"
+
+[tool.hatch.version]
+path = "src/nidus/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nidus"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/nidus", "tests", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.ruff]
+# 3.9 is the floor, so ruff must not rewrite code into 3.10+ syntax.
+target-version = "py39"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.format]
+# Only Python is formatted. ruff 0.16 formats fenced Python blocks inside Markdown by
+# default, and the README's snippets are hand-laid-out prose — aligned trailing comments,
+# `db.flush(); db.compact()` on one line to keep a survey of the API scannable — which the
+# formatter would explode into a column of statements. `ruff check`/`format` still walk
+# every real source file; this only keeps documentation out of the code formatter's hands.
+exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["A", "ANN", "B", "C4", "E", "F", "I", "N", "RUF", "SIM", "UP", "W"]
+# JSON payloads are genuinely `Any` at the wire edge; annotating them as anything
+# narrower would be a lie the decoders have to cast their way out of.
+ignore = ["ANN401"]
+
+[tool.ruff.lint.pyupgrade]
+# Keep `Optional[X]` instead of letting UP045/UP007 rewrite it to `X | None`.
+#
+# `from __future__ import annotations` defers an annotation but does not make it
+# *evaluable*: on 3.9 — this package's declared floor — `typing.get_type_hints()` still
+# has to run `int | None` and raises `TypeError: unsupported operand type(s) for |`. Any
+# consumer that resolves hints at runtime (a pydantic/cattrs adapter, a dataclass-to-JSON
+# helper, a FastAPI response model, Sphinx autodoc with typehints) would crash on its own
+# import. mypy is perfectly happy with PEP 604 under the future import, so nothing else in
+# CI catches it; `test_typing.py` pins the property and this setting stops the linter from
+# undoing the fix.
+keep-runtime-typing = true
+
+[tool.ruff.lint.per-file-ignores]
+# `v.str`/`v.int`/`v.list` and `f.in_`/`f.and_` are name-for-name with the JS SDK's
+# `v.*`/`f.*` constructors so the three SDKs read alike side by side. Shadowing the
+# builtins as *attribute* names (A003), and naming the namespace classes `v`/`f` in
+# lowercase (N801), are the price of that parity, and it is worth paying: renaming would
+# buy a clean lint run and cost the cross-SDK symmetry reviewers rely on.
+"src/nidus/values.py" = ["A003", "N801"]
+"src/nidus/filter.py" = ["A003", "N801"]
+
+[tool.mypy]
+python_version = "3.9"
+files = ["src/nidus"]
+strict = true
+warn_unreachable = true
+# The SDK ships `py.typed`, so its own annotations are the contract callers see.
+disallow_any_generics = true
+
+[[tool.mypy.overrides]]
+# `httpx` is optional; without the `async` extra installed mypy would otherwise fail
+# on the import rather than on anything we wrote.
+module = "httpx.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# `auto` so async tests need no per-test marker; the async suite skips itself when
+# httpx is absent, and the integration suite skips when the nidus binary is absent.
+asyncio_mode = "auto"

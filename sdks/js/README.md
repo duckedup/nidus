@@ -12,8 +12,9 @@ browser.
 npm install @duckedup/nidus
 ```
 
-This package is versioned in lockstep with nidus itself, so `@duckedup/nidus@0.38.x`
-is the client for nidus `0.38.x`. Match the two and the wire contract lines up.
+This package is versioned in lockstep with nidus itself: a given `@duckedup/nidus`
+version is the client for the identically-numbered nidus release. Match the two and the
+wire contract lines up.
 
 ## Connecting
 

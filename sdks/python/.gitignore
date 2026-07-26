@@ -1,0 +1,10 @@
+# virtualenv
+.venv/
+# build output
+dist/
+*.egg-info/
+# caches
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
