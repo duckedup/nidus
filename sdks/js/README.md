@@ -12,6 +12,9 @@ browser.
 npm install @duckedup/nidus
 ```
 
+This package is versioned in lockstep with nidus itself, so `@duckedup/nidus@0.38.x`
+is the client for nidus `0.38.x`. Match the two and the wire contract lines up.
+
 ## Connecting
 
 "Local vs remote" is just the base URL — point the client at a local `nidus serve`
