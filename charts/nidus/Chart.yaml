@@ -7,12 +7,16 @@ description: |
   since it has no durable local disk.
 type: application
 
-# Chart version (SemVer) — bump on every change to the chart. Independent of the
-# nidus release line.
+# BOTH versions below are STAMPED BY CI from the crate version at release time
+# (.github/workflows/helm-publish.yml, nidus-yap) — do not hand-edit them, and do not
+# expect a PR that bumps Cargo.toml to touch this file. They are checked in only so a
+# clone renders, and the release job commits the stamp back to keep them honest.
+#
+# They are equal on purpose. An OCI registry keys a chart solely by `version`, so a new
+# `appVersion` (the image tag a default install deploys) cannot reach anyone unless the
+# chart version moves with it — tying them together is what makes "the published chart
+# deploys the current nidus" true by construction rather than by remembering.
 version: 0.5.1
-
-# The nidus image version this chart defaults to. `image.tag` falls back to this,
-# so bumping appVersion is how you roll the default image forward.
 appVersion: "0.36.0"
 
 home: https://nidus.duckedup.org
