@@ -92,6 +92,26 @@ spec:
             - name: NIDUS_MAX_BODY_BYTES
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.nidus.maxConcurrentRequests }}
+            - name: NIDUS_MAX_CONCURRENT_REQUESTS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.nidus.readTimeout }}
+            - name: NIDUS_READ_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.nidus.writeTimeout }}
+            - name: NIDUS_WRITE_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.nidus.bodyIdleTimeout }}
+            - name: NIDUS_BODY_IDLE_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.nidus.logLevel }}
+            - name: NIDUS_LOG
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.nidus.ann }}
             - name: NIDUS_ANN
               value: {{ . | quote }}

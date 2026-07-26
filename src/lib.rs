@@ -25,8 +25,14 @@
 
 mod ann;
 pub mod backend;
+// Cooperative cancellation for long scans: a request deadline frees the client, only the
+// scan loop can free the CPU.
+mod cancel;
 mod config;
 mod data;
+// Levelled, logfmt diagnostics (`NIDUS_LOG`). Internal: what an embedding application
+// wants from us is a `Result`, not our log stream, so the macro stays `pub(crate)`.
+mod diag;
 mod filter;
 mod fts;
 mod glob;
@@ -34,6 +40,9 @@ mod index_cache;
 mod lock;
 mod log;
 mod manifest;
+// Process-wide counters, rendered as Prometheus text by `GET /metrics` and readable
+// in-process by an embedding application (nidus-abx.4).
+pub mod metrics;
 mod model;
 mod search;
 mod store;
@@ -79,6 +88,7 @@ pub use backend::{
     Appender, BackendLock, CasOutcome, ClusterLease, LeaseLost, LeaseRenewer, LocalFs, LocalRam,
     MemoryTier, Persistence, is_lease_lost, open_memory_tier, open_persistence,
 };
+pub use cancel::Cancel;
 pub use config::{Config, Fsync, LeaseWait, OpenMode};
 pub use fts::Language;
 pub use model::{

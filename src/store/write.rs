@@ -47,13 +47,20 @@ impl Store {
             // with no way back but a restart. Fail this write — we could not prove we still
             // hold the lease, so proceeding would be unsound — but stay in service.
             if crate::backend::is_lease_lost(&e) {
-                self.fenced
-                    .store(true, std::sync::atomic::Ordering::Release);
-                eprintln!("nidus: writer lease LOST — this instance is fenced: {e:#}");
+                crate::backend::latch_fenced(&self.fenced);
+                crate::diag::diag!(
+                    crate::diag::Level::Error,
+                    "lease",
+                    "writer lease LOST — this instance is fenced and must be replaced",
+                    "err" => format!("{e:#}"),
+                );
             } else {
-                eprintln!(
-                    "nidus: writer lease renewal failed transiently — this write is refused, \
-                     but the lease is still ours: {e:#}"
+                crate::diag::diag!(
+                    crate::diag::Level::Warn,
+                    "lease",
+                    "writer lease renewal failed transiently — this write is refused, but the \
+                     lease is still ours",
+                    "err" => format!("{e:#}"),
                 );
             }
             return Err(e);

@@ -43,7 +43,7 @@ mod tests;
 pub use gcs::Gcs;
 pub use local::{FileAppender, LocalFs};
 pub use object::ObjectAppender;
-pub(crate) use object::{locked_error, object_try_lock};
+pub(crate) use object::{latch_fenced, locked_error, object_try_lock};
 // Public: a cluster writer's lease handle is part of the API surface, so an async host
 // (`nidus serve`, or an embedding application) can keep the lease warm on a timer while a
 // long write holds the store lock — see `Nidus::lease_handle`.

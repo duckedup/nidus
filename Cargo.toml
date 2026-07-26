@@ -9,7 +9,7 @@ default-members = ["."]
 
 [package]
 name = "nidus"
-version = "0.34.0"
+version = "0.35.0"
 edition = "2024"
 rust-version = "1.96"
 description = "A small, pure-Rust embeddable vector store: brute-force or ANN cosine search over a single append-only directory, with pluggable persistence (local files, S3, GCS). No SQL, no query engine; builds in seconds."
@@ -44,7 +44,7 @@ required-features = ["memory", "embed-all", "summarize-all"]
 # and `cargo tree -p nidus` (`just deps`) pull NOTHING beyond the four core
 # crates below, and the core build/test/Miri path stays pure and seconds-long.
 # Turning it on adds the binary-only deps (all pure Rust, zero FFI).
-cli = ["dep:clap", "dep:tokio", "dep:axum", "dep:tower", "dep:serde_json", "dep:tar", "dep:flate2"]
+cli = ["dep:clap", "dep:tokio", "dep:axum", "dep:tower", "dep:http-body", "dep:serde_json", "dep:tar", "dep:flate2"]
 
 # ── AI ingest layer (SPEC §9 / epic nidus-54l) — all OFF by default ──────────
 # nidus widens from a tight vector store to an all-in-one "memory": text in,
@@ -158,6 +158,11 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "signal", "time"], optional = true }
 axum = { version = "0.8", optional = true }
 tower = { version = "0.5", optional = true }
+# The `http_body::Body` trait, so the server can wrap a request body in a per-frame
+# idle timeout (nidus-6c2). NOT a new dependency in any sense that costs anything:
+# axum 0.8 already depends on this exact version, so it is compiled either way — this
+# line only makes the trait nameable. `cli`-gated like the rest of the binary's deps.
+http-body = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
 # Backup/restore archiving. Both pure Rust, zero FFI: `tar` is std-only, and
 # `flate2` is pinned to its `rust_backend` (miniz_oxide) — never a `*-sys`/C

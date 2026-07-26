@@ -256,7 +256,7 @@ impl Store {
             })?
         } else {
             // `scan` arrives row-sorted from `with_sorted_scan` — score it in place.
-            score_chunk_i8(&s.vectors, dim, scan, &q_i8, is_euclidean, overscan)
+            score_chunk_i8(&s.vectors, dim, scan, &q_i8, is_euclidean, overscan)?
         };
 
         let candidates = topk_q.into_sorted_desc();
@@ -293,7 +293,7 @@ impl Store {
             })?
         } else {
             // `scan` arrives row-sorted from `with_sorted_scan` — score it in place.
-            score_chunk_bin(&s.words, wpr, scan, &q_words, overscan)
+            score_chunk_bin(&s.words, wpr, scan, &q_words, overscan)?
         };
 
         let candidates = topk_q.into_sorted_desc();
@@ -310,6 +310,13 @@ impl Store {
         score_fn: fn(&[f32], &[f32]) -> f32,
         opts: &SearchOpts,
     ) -> Vec<Hit> {
+        // The second pass's real cost, and the knob (`rescore`) that sets it: overscan too
+        // little and recall suffers, too much and the quantized first pass has bought
+        // nothing. Counted once per query, not per candidate.
+        crate::metrics::metrics()
+            .search_reranked
+            .add(candidates.len() as u64);
+
         let mut topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
         for (_, (row, col_name, id)) in candidates {
             let score = score_fn(q, self.data.row(*row));

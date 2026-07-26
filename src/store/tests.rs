@@ -4218,3 +4218,67 @@ mod object_backed {
         assert_eq!(r.get_all("col").len(), 5);
     }
 }
+
+// ── Cooperative cancellation ────────────────────────────────────────────────
+
+/// **A cancelled scan stops instead of running to completion.**
+///
+/// A server request deadline drops the response future, which frees the client but not the
+/// CPU: the scan is on a blocking task and blocking tasks are not cancellable. The scan
+/// kernels therefore check an ambient token, and this is the proof it reaches them through
+/// a real `search` — otherwise the deadline is a promise to the caller and a lie to the
+/// machine.
+///
+/// Deliberately tiny. The check fires at the head of every block, so cancellation is
+/// observable on the first one; more data would only slow the suite down — badly, under
+/// Miri — without testing anything further. The parallel fan-out's token handoff is the
+/// part that would need real volume to reach through `search`, so it is unit tested
+/// directly against `parallel_topk` in `super::scoring` instead. An earlier version of this
+/// file tried it here with 40k rows and quietly exercised the *serial* path, because that
+/// is still an order of magnitude under `PARALLEL_SCAN_WORK_FLOOR`.
+///
+/// Asserted on the *outcome* (an error rather than results), never on elapsed time: a
+/// timing assertion here would flake on a shared runner and prove nothing.
+#[test]
+fn a_cancelled_search_stops_and_errors() {
+    let mut store = Store::in_memory(8).unwrap();
+    store.create_collection("col").unwrap();
+    let recs: Vec<Record> = (0..64)
+        .map(|i| {
+            let v: Vec<f32> = (0..8).map(|d| ((i * 7 + d) % 13) as f32).collect();
+            Record::new(format!("d{i}"), v, Default::default())
+        })
+        .collect();
+    store.upsert("col", &recs).unwrap();
+
+    let q = vec![1.0f32; 8];
+    let opts = SearchOpts {
+        top_k: 10,
+        ..Default::default()
+    };
+
+    // Uncancelled: the ambient token is absent, so nothing changes for ordinary callers —
+    // the overwhelmingly common case, and the one a regression here would break.
+    assert_eq!(store.search(&["col"], &q, &opts).unwrap().len(), 10);
+
+    // Cancelled: it must refuse rather than return partial results, which would look like
+    // a legitimate (but wrong) ranking.
+    let token = crate::Cancel::new();
+    token.cancel();
+    let err = token
+        .scope(|| store.search(&["col"], &q, &opts))
+        .expect_err("a cancelled search must not return results");
+    assert!(
+        format!("{err:#}").contains("cancelled"),
+        "the error should say why: {err:#}"
+    );
+
+    // An installed but un-cancelled token is not cancellation.
+    let live = crate::Cancel::new();
+    assert_eq!(
+        live.scope(|| store.search(&["col"], &q, &opts))
+            .unwrap()
+            .len(),
+        10
+    );
+}

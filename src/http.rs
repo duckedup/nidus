@@ -100,10 +100,18 @@ where
             Ok(resp) => {
                 if (policy.retryable)(resp.status().as_u16()) && attempt < policy.max_retries {
                     let delay = backoff(policy, attempt);
-                    eprintln!(
-                        "warning: {label} returned {} (attempt {}), retrying in {delay:?}",
-                        resp.status(),
-                        attempt + 1
+                    // Counted as well as logged: a backend that has been retrying all
+                    // morning is invisible in a log nobody is tailing, and looks like
+                    // nothing at all until it fails outright (nidus-abx.4).
+                    crate::metrics::metrics().backend_retries.inc();
+                    crate::diag::diag!(
+                        crate::diag::Level::Warn,
+                        "backend",
+                        "request returned a retryable status, retrying",
+                        "label" => label,
+                        "status" => resp.status(),
+                        "attempt" => attempt + 1,
+                        "delay_ms" => delay.as_millis(),
                     );
                     tokio::time::sleep(delay).await;
                     attempt += 1;
@@ -114,9 +122,15 @@ where
             Err(e) => {
                 if attempt < policy.max_retries {
                     let delay = backoff(policy, attempt);
-                    eprintln!(
-                        "warning: {label} request failed (attempt {}): {e}, retrying in {delay:?}",
-                        attempt + 1
+                    crate::metrics::metrics().backend_retries.inc();
+                    crate::diag::diag!(
+                        crate::diag::Level::Warn,
+                        "backend",
+                        "request failed at the transport, retrying",
+                        "label" => label,
+                        "err" => e,
+                        "attempt" => attempt + 1,
+                        "delay_ms" => delay.as_millis(),
                     );
                     tokio::time::sleep(delay).await;
                     attempt += 1;

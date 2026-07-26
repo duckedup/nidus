@@ -9,16 +9,19 @@
 //! executor, drop the lock — never held across an `.await`. Endpoints map 1:1 to
 //! the public API.
 
+mod auth;
 pub mod dto;
+mod limits;
+mod metrics;
 
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Request, State},
-    http::{StatusCode, header::AUTHORIZATION},
-    middleware::{self, Next},
+    extract::{DefaultBodyLimit, Path, State},
+    http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -51,6 +54,21 @@ pub struct ServeConfig {
     /// Maximum request body size in bytes. The store buffers each body in memory,
     /// so this is also the largest single upsert payload.
     pub max_body_bytes: usize,
+    /// Cap on store-touching requests in flight; beyond it, requests are **shed** with
+    /// `503` rather than queued (nidus-abx.2). `0` resolves to `8 ×` CPU cores, floored at
+    /// 64 — see [`limits::resolve_concurrency`]. Probe endpoints are never shed.
+    pub max_concurrent_requests: usize,
+    /// Wall-clock deadline for a read request. `None` disables it.
+    pub read_timeout: Option<std::time::Duration>,
+    /// Wall-clock deadline for a mutating request — separate from `read_timeout` because a
+    /// large upsert legitimately runs for minutes while a search is milliseconds. `None`
+    /// disables it.
+    pub write_timeout: Option<std::time::Duration>,
+    /// How long a request body may go without delivering a frame before it is abandoned
+    /// (nidus-6c2). An **idle** bound, not a total one: a body that keeps arriving is never
+    /// cut off however large it is. `None` disables it, which also removes the only thing
+    /// stopping a silent client from pinning a concurrency permit.
+    pub body_idle_timeout: Option<std::time::Duration>,
     /// Fail readiness once a read-only instance is staler than this (mirrors
     /// [`Config::max_staleness`](crate::Config::max_staleness)). `None` = no bound.
     pub max_staleness: Option<std::time::Duration>,
@@ -106,7 +124,11 @@ struct AppState {
     /// Readiness fails past this much reader staleness (`Config::max_staleness`), copied
     /// here so a probe never has to reach into the store's config behind the lock.
     max_staleness: Option<std::time::Duration>,
-    token: Option<Arc<str>>,
+    token: Option<auth::Token>,
+    /// Admission control: the concurrency permits and the per-request deadlines
+    /// (nidus-abx.2). `Arc` because `AppState` is cloned per request and the permit pool
+    /// must be the *same* pool for all of them — a per-clone semaphore would cap nothing.
+    limits: Arc<limits::Limits>,
     /// Shared embedder for the `memory` routes; `None` disables them (→ `400`).
     #[cfg(feature = "memory")]
     embedder: Option<Arc<AnyEmbedder>>,
@@ -133,12 +155,20 @@ pub async fn serve<F>(open: F, cfg: ServeConfig) -> anyhow::Result<()>
 where
     F: FnOnce() -> anyhow::Result<Nidus> + Send + 'static,
 {
+    let concurrency = limits::resolve_concurrency(cfg.max_concurrent_requests);
     let state = AppState {
         db: Arc::new(RwLock::new(None)),
         open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         readiness: Arc::new(std::sync::OnceLock::new()),
         max_staleness: cfg.max_staleness,
-        token: cfg.token.map(Arc::from),
+        token: cfg.token.map(auth::Token::new),
+        limits: Arc::new(limits::Limits::new(
+            concurrency,
+            cfg.read_timeout,
+            cfg.write_timeout,
+            cfg.body_idle_timeout,
+            cfg.max_body_bytes,
+        )),
         #[cfg(feature = "memory")]
         embedder: cfg.embedder,
         #[cfg(all(feature = "memory", feature = "summarize"))]
@@ -161,7 +191,10 @@ where
     let bound = listener
         .local_addr()
         .map_or_else(|_| cfg.addr.clone(), |a| a.to_string());
+    // Kept as a plain line rather than a `diag!` event: this is the startup banner a human
+    // reads (and the e2e harness parses to learn the bound port), not a log record.
     eprintln!("nidus serving on http://{bound} (Ctrl-C / SIGTERM to stop){auth_note}");
+    warn_on_exposure(listener.local_addr().ok(), state.token.is_some());
 
     // Open on a blocking task; a failure (not a wait) asks the server to stop, and is
     // re-raised after `axum::serve` returns so the process exits non-zero.
@@ -182,7 +215,11 @@ where
                 // Publish only after the store is in place, so a probe never sees
                 // `ready` before a request could actually be served.
                 open_flag.store(true, std::sync::atomic::Ordering::Release);
-                eprintln!("nidus store open — serving requests");
+                crate::diag::diag!(
+                    crate::diag::Level::Info,
+                    "server",
+                    "store open — serving requests"
+                );
             }
         }
         Err(e) => {
@@ -241,14 +278,19 @@ where
                         // (nidus-lp4.7). A transient backend error latches nothing: this tick
                         // simply failed, and the next one will try again.
                         if crate::backend::is_lease_lost(&e) {
-                            eprintln!(
-                                "nidus: writer lease LOST on background renewal — this \
-                                 instance is fenced and now reports NOT ready: {e:#}"
+                            crate::diag::diag!(
+                                crate::diag::Level::Error,
+                                "lease",
+                                "writer lease LOST on background renewal — this instance is \
+                                 fenced and now reports NOT ready",
+                                "err" => format!("{e:#}"),
                             );
                         } else {
-                            eprintln!(
-                                "nidus: background lease renewal failed transiently, will \
-                                 retry: {e:#}"
+                            crate::diag::diag!(
+                                crate::diag::Level::Warn,
+                                "lease",
+                                "background lease renewal failed transiently, will retry",
+                                "err" => format!("{e:#}"),
                             );
                         }
                     }
@@ -280,7 +322,13 @@ where
                     {
                         // Not fatal: the staleness clock keeps running, so readiness
                         // (with --max-staleness) is what escalates a persistent failure.
-                        eprintln!("nidus: scheduled refresh failed: {e:#}");
+                        crate::metrics::metrics().refresh_failures.inc();
+                        crate::diag::diag!(
+                            crate::diag::Level::Warn,
+                            "refresh",
+                            "scheduled refresh failed",
+                            "err" => format!("{e:#}"),
+                        );
                     }
                 })
                 .await;
@@ -313,10 +361,74 @@ where
     served
 }
 
+/// Warn at startup when the bind address makes the security posture worse than the
+/// configuration suggests (nidus-abx.6).
+///
+/// nidus serves **plain HTTP by design** — TLS is expected to be terminated in front of it
+/// by an ingress, sidecar, or mesh, which does that job better than a TLS stack compiled
+/// into the store would. The defect this closes is not the absence of TLS but the silence
+/// about it: a reader who follows the deployment guide, sets `--token`, and binds
+/// `0.0.0.0` has no indication that the credential they just configured crosses the network
+/// in cleartext on every request, alongside every vector and metadata value.
+///
+/// **Warn, never refuse.** Refusing a non-loopback bind would break every legitimate
+/// deployment that terminates TLS at a proxy — which is precisely the architecture being
+/// recommended — so this has to stay advisory. It is emitted at `warn`, which is on by
+/// default, and it names the concrete consequence rather than gesturing at "security".
+fn warn_on_exposure(bound: Option<std::net::SocketAddr>, has_token: bool) {
+    let Some(addr) = bound else { return };
+    match exposure(addr, has_token) {
+        Exposure::Contained => {}
+        Exposure::CleartextCredential => crate::diag::diag!(
+            crate::diag::Level::Warn,
+            "server",
+            "bound off-loopback over plain HTTP: --token authenticates callers but confers \
+             NO confidentiality, so the token and every vector, id, and metadata value \
+             cross the network in cleartext — terminate TLS in front of nidus (ingress, \
+             sidecar, or mesh)",
+            "addr" => addr,
+        ),
+        Exposure::Unauthenticated => crate::diag::diag!(
+            crate::diag::Level::Warn,
+            "server",
+            "bound off-loopback with NO --token: this store is readable and writable by \
+             anyone who can reach the address — pass --token and terminate TLS in front \
+             of nidus",
+            "addr" => addr,
+        ),
+    }
+}
+
+/// What a bind address plus the auth setting says about exposure.
+///
+/// Split from the warning itself so the *decision* can be tested exactly, without a test
+/// having to scrape stderr or bind a public socket on a developer's machine.
+#[derive(Debug, PartialEq, Eq)]
+enum Exposure {
+    /// Loopback: nothing leaves the box, so there is nothing to warn about.
+    Contained,
+    /// Off-box with a token — authenticated, but the credential and the data are in
+    /// cleartext on the wire.
+    CleartextCredential,
+    /// Off-box with no token — an open, writable vector store.
+    Unauthenticated,
+}
+
+fn exposure(addr: std::net::SocketAddr, has_token: bool) -> Exposure {
+    if addr.ip().is_loopback() {
+        Exposure::Contained
+    } else if has_token {
+        Exposure::CleartextCredential
+    } else {
+        Exposure::Unauthenticated
+    }
+}
+
 fn router(state: AppState, max_body_bytes: usize) -> Router {
     let router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/metrics", get(metrics::metrics_endpoint))
         .route("/cluster", get(cluster))
         .route("/stats", get(stats))
         .route("/collections", get(list_collections))
@@ -345,35 +457,24 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/collections/{name}/remember", post(remember))
         .route("/collections/{name}/recall", post(recall));
 
+    // Layer order matters, and `.layer()` applies **outermost last**. Reading inside-out:
+    //
+    //   body limit  ← per-extractor, closest to the handler
+    //   backpressure ← admit or shed; holds a permit for the handler's whole lifetime
+    //   auth         ← outside backpressure so an unauthenticated request is rejected
+    //                  without ever consuming a permit
+    //   observe      ← outermost, so a 401 and a shed 503 are both counted and logged;
+    //                  an error rate that excludes the errors clients actually see is
+    //                  worse than no error rate at all
     router
         .layer(DefaultBodyLimit::max(max_body_bytes))
-        .layer(middleware::from_fn_with_state(state.clone(), auth))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            limits::backpressure,
+        ))
+        .layer(middleware::from_fn_with_state(state.clone(), auth::auth))
+        .layer(middleware::from_fn(metrics::observe))
         .with_state(state)
-}
-
-/// Reject any request lacking a valid `Authorization: Bearer <token>` when a
-/// token is configured. The probe endpoints are always open so liveness and readiness
-/// checks need no credential — an orchestrator would otherwise read `401` as "not ready"
-/// and never route to a perfectly healthy instance. A no-op when the server is
-/// unauthenticated.
-async fn auth(State(st): State<AppState>, req: Request, next: Next) -> Response {
-    if let Some(expected) = &st.token
-        && !matches!(req.uri().path(), "/health" | "/ready")
-    {
-        let presented = req
-            .headers()
-            .get(AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        if presented != Some(expected.as_ref()) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "missing or invalid bearer token" })),
-            )
-                .into_response();
-        }
-    }
-    next.run(req).await
 }
 
 /// Resolve on the first shutdown signal: Ctrl-C (SIGINT) everywhere, plus SIGTERM on
@@ -466,6 +567,25 @@ async fn health(State(st): State<AppState>) -> Response {
 /// Busy is not unhealthy. Reading through the lock-free [`crate::Readiness`] handle removes
 /// the `WouldBlock` case from this path altogether rather than merely tolerating it.
 async fn ready(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
+    let (role, staleness_secs) = readiness_check(&st)?;
+    Ok(Json(json!({
+        "ready": true,
+        "role": role,
+        "staleness_secs": staleness_secs,
+    })))
+}
+
+/// The readiness decision, in one place.
+///
+/// `GET /ready` answers with it and `/metrics` exports it as `nidus_ready`. Factored
+/// because they had already drifted once in draft — the gauge omitted the staleness bound,
+/// so a reader that had stopped refreshing would report `nidus_ready 1` on the dashboard
+/// while `/ready` was `503`ing it out of the load balancer. Two answers to "is this
+/// instance serving" is worse than either one alone.
+///
+/// Returns `(role, staleness_secs)` when ready. Every check reads an atomic and acquires
+/// nothing (nidus-abx.3), so both callers stay off the store lock.
+fn readiness_check(st: &AppState) -> Result<(String, u64), ApiError> {
     if !st.open.load(std::sync::atomic::Ordering::Acquire) {
         return Err(ApiError::from(not_open()));
     }
@@ -512,11 +632,7 @@ async fn ready(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> 
             ),
         });
     }
-    Ok(Json(json!({
-        "ready": true,
-        "role": format!("{:?}", status.role()),
-        "staleness_secs": staleness_secs,
-    })))
+    Ok((format!("{:?}", status.role()), staleness_secs))
 }
 
 /// `GET /cluster` — role, writer-handle state, fencing token, commit counter, staleness.
@@ -941,13 +1057,20 @@ where
     F: FnOnce(&Nidus) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
+    // Picked up here, on the async side, because a task-local does not follow work onto a
+    // blocking thread — this is the handoff, and doing it in the two `run_*` helpers means
+    // every handler gets cancellation without knowing the concept exists.
+    let cancel = limits::current_cancel();
     tokio::task::spawn_blocking(move || {
         let db = st
             .db
             .read()
             .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
         let db = db.as_ref().ok_or_else(not_open)?;
-        f(db)
+        match cancel {
+            Some(cancel) => cancel.scope(|| f(db)),
+            None => f(db),
+        }
     })
     .await
     .map_err(|e| ApiError::internal(anyhow::anyhow!("task join error: {e}")))?
@@ -960,13 +1083,17 @@ where
     F: FnOnce(&mut Nidus) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
+    let cancel = limits::current_cancel();
     tokio::task::spawn_blocking(move || {
         let mut db = st
             .db
             .write()
             .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
         let db = db.as_mut().ok_or_else(not_open)?;
-        f(db)
+        match cancel {
+            Some(cancel) => cancel.scope(|| f(db)),
+            None => f(db),
+        }
     })
     .await
     .map_err(|e| ApiError::internal(anyhow::anyhow!("task join error: {e}")))?
@@ -1077,6 +1204,15 @@ fn test_state(db: Option<Nidus>) -> AppState {
         readiness: Arc::new(readiness),
         max_staleness: None,
         token: None,
+        // Generous by default so an ordinary test never trips admission control; the
+        // backpressure tests build their own tight `Limits`.
+        limits: Arc::new(limits::Limits::new(
+            1024,
+            None,
+            None,
+            None,
+            16 * 1024 * 1024,
+        )),
         #[cfg(feature = "memory")]
         embedder: None,
         #[cfg(all(feature = "memory", feature = "summarize"))]
@@ -1089,7 +1225,7 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use axum::body::{Body, to_bytes};
-    use axum::http::Request;
+    use axum::http::{Request, header::AUTHORIZATION};
     use tower::ServiceExt; // for `oneshot`
 
     /// Build a router over a fresh in-memory store of the given dimension.
@@ -1382,7 +1518,7 @@ mod tests {
     async fn probes_are_exempt_from_auth() {
         let db = Nidus::open_in_memory(3).unwrap();
         let state = AppState {
-            token: Some(Arc::from("s3cret")),
+            token: Some(auth::Token::new("s3cret")),
             ..test_state(Some(db))
         };
         let app = router(state, 16 * 1024 * 1024);
@@ -1475,6 +1611,291 @@ mod tests {
             .map(|h| h["id"].as_str().unwrap().to_string())
             .collect();
         assert!(ids.contains(&"a".to_string()) && ids.contains(&"b".to_string()));
+    }
+
+    // ── Backpressure (nidus-abx.2) ──────────────────────────────────────────
+
+    /// A router whose admission control is already exhausted. `Limits::new(0, …)` hands out
+    /// no permits at all, so **every** non-exempt request sheds — a deterministic stand-in
+    /// for saturation that needs no concurrency and cannot flake. (Not reachable through
+    /// configuration: `resolve_concurrency` reads `0` as "auto".) That the permit pool
+    /// itself fills and drains correctly is `limits::tests::in_flight_tracks_outstanding_permits`.
+    fn saturated_router() -> Router {
+        let db = Nidus::open_in_memory(3).unwrap();
+        let state = AppState {
+            limits: Arc::new(limits::Limits::new(0, None, None, None, 16 * 1024 * 1024)),
+            ..test_state(Some(db))
+        };
+        router(state, 16 * 1024 * 1024)
+    }
+
+    /// Past the cap, a request is **shed** with a retryable `503` + `Retry-After` — not
+    /// queued behind a lock with no bound on how long it waits, which is what the server
+    /// did before.
+    #[tokio::test]
+    async fn requests_past_the_concurrency_limit_are_shed() {
+        let app = saturated_router();
+
+        let resp = app
+            .clone()
+            .oneshot(post("/search", json!({"query": [1, 0, 0], "top_k": 1})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get("retry-after").unwrap(),
+            "1",
+            "a shed request must tell the client to come back"
+        );
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["retryable"], true,
+            "nothing was attempted, so retrying is safe — say so in the body, not just \
+             the status"
+        );
+        assert!(body["error"].as_str().unwrap().contains("overloaded"));
+    }
+
+    /// **Probes are never shed.** They take no store lock, so they cost nothing to admit —
+    /// and shedding them under load would fail liveness and get a busy-but-healthy instance
+    /// restarted, which is exactly the availability trap nidus-abx.1/.3 closed one layer
+    /// down. `/metrics` too: an incident is when someone is looking.
+    #[tokio::test]
+    async fn probes_and_metrics_survive_saturation() {
+        let app = saturated_router();
+        for path in ["/health", "/ready", "/metrics"] {
+            let resp = app.clone().oneshot(get(path)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{path} must answer while the server is shedding"
+            );
+        }
+    }
+
+    /// A request cannot occupy a connection indefinitely. The deadline answers `504` —
+    /// **not** `503`: this request *was* admitted and its work is still running, so an
+    /// immediate retry would pile a second copy onto an instance already behind.
+    // Holding the guard across awaits is the point: it is a write batch in flight that the
+    // read below can never get past, so the deadline is the only thing that can end it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_request_that_outlives_its_deadline_gets_504() {
+        let db = Nidus::open_in_memory(3).unwrap();
+        let state = AppState {
+            limits: Arc::new(limits::Limits::new(
+                8,
+                Some(std::time::Duration::from_millis(50)),
+                None,
+                None,
+                16 * 1024 * 1024,
+            )),
+            ..test_state(Some(db))
+        };
+        let app = router(state.clone(), 16 * 1024 * 1024);
+
+        let guard = state.db.write().unwrap();
+        let resp = app.clone().oneshot(get("/stats")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["retryable"], false,
+            "the work may still be running; an immediate retry doubles it"
+        );
+
+        // Releasing the guard lets the abandoned blocking task finish, and the next request
+        // succeeds — the deadline freed the client without breaking the instance.
+        drop(guard);
+        let resp = app.oneshot(get("/stats")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── Observability (nidus-abx.4) ─────────────────────────────────────────
+
+    /// `/metrics` renders Prometheus text, needs no token, and — the property that makes
+    /// leaving it unauthenticated defensible — never names a collection.
+    #[tokio::test]
+    async fn metrics_scrape_is_open_and_leaks_no_collection_names() {
+        let db = Nidus::open_in_memory(3).unwrap();
+        let state = AppState {
+            token: Some(auth::Token::new("s3cret")),
+            ..test_state(Some(db))
+        };
+        let app = router(state, 16 * 1024 * 1024);
+
+        // Drive traffic through a collection whose name would be unmistakable in a label.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/collections/very-secret-project/upsert")
+                    .header("content-type", "application/json")
+                    .header(AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::from(
+                        json!({"records": [{"id": "a", "vector": [1, 0, 0], "attrs": {}}]})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // No credential — a scraper that got a 401 would report the target as down.
+        let resp = app.clone().oneshot(get("/metrics")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            !text.contains("very-secret-project"),
+            "a collection name reached a metric label:\n{text}"
+        );
+        assert!(
+            text.contains("nidus_http_requests_total{route=\"/collections/{name}/upsert\""),
+            "the upsert should be counted under its template:\n{text}"
+        );
+        // Library counters and the histogram both render.
+        assert!(text.contains("nidus_search_queries_total"));
+        assert!(text.contains("nidus_http_request_duration_seconds_bucket"));
+        assert!(text.contains("nidus_http_concurrency_limit"));
+        // Every series must be preceded by its TYPE line, or Prometheus rejects the scrape.
+        assert!(text.contains("# TYPE nidus_http_requests_total counter"));
+    }
+
+    /// Search-path counters move, so a scrape can distinguish "queries are slow" from
+    /// "queries are slow because the index is not being used".
+    #[tokio::test]
+    async fn a_search_advances_the_search_counters() {
+        let app = test_router(3);
+        let before = crate::metrics::metrics().search_queries.get();
+        let resp = app
+            .oneshot(post("/search", json!({"query": [1, 0, 0], "top_k": 1})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            crate::metrics::metrics().search_queries.get() > before,
+            "a served search must be counted"
+        );
+    }
+
+    /// `nidus_ready` must always agree with `GET /ready` — they share one decision
+    /// (`readiness_check`), and this is the regression guard on that.
+    ///
+    /// A dashboard that disagrees with the load balancer about whether an instance is
+    /// serving is worse than no dashboard: the poisoned case below is exactly when someone
+    /// is looking at both.
+    #[tokio::test]
+    async fn the_ready_gauge_agrees_with_the_ready_probe() {
+        async fn ready_pair(app: &Router) -> (bool, bool) {
+            let probe =
+                app.clone().oneshot(get("/ready")).await.unwrap().status() == StatusCode::OK;
+            let scrape = app.clone().oneshot(get("/metrics")).await.unwrap();
+            assert_eq!(
+                scrape.status(),
+                StatusCode::OK,
+                "/metrics must answer in every state — it is what you read during one"
+            );
+            let bytes = to_bytes(scrape.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            let gauge = text
+                .lines()
+                .find_map(|l| l.strip_prefix("nidus_ready "))
+                .expect("nidus_ready gauge")
+                == "1";
+            (probe, gauge)
+        }
+
+        // No store yet (a standby waiting for promotion): neither says ready.
+        let (probe, gauge) = ready_pair(&router_over(None)).await;
+        assert!(!probe && !gauge, "not open: probe={probe} gauge={gauge}");
+
+        // Open and healthy: both say ready.
+        let (app, state) = router_and_state(3);
+        let (probe, gauge) = ready_pair(&app).await;
+        assert!(probe && gauge, "open: probe={probe} gauge={gauge}");
+
+        // Poisoned by a panic on the write path: both must flip.
+        let db = state.db.clone();
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::thread::spawn(move || {
+            let _guard = db.write().unwrap();
+            panic!("a handler panicked mid-write");
+        })
+        .join();
+        std::panic::set_hook(hook);
+
+        let (probe, gauge) = ready_pair(&app).await;
+        assert!(!probe && !gauge, "poisoned: probe={probe} gauge={gauge}");
+    }
+
+    /// A caller's correlation id is echoed back, so a client can quote it in a bug report
+    /// and an operator can grep for the same string in the access log.
+    #[tokio::test]
+    async fn request_ids_are_echoed_and_minted() {
+        let app = test_router(3);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("x-request-id", "trace-42")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.headers().get("x-request-id").unwrap(), "trace-42");
+
+        // Absent one, the server mints its own rather than leaving the response unlabelled.
+        let resp = app.oneshot(get("/health")).await.unwrap();
+        assert!(resp.headers().get("x-request-id").is_some());
+    }
+
+    // ── Exposure warnings (nidus-abx.6) ─────────────────────────────────────
+
+    /// The startup warning is **advisory** — it must never refuse. Refusing a non-loopback
+    /// bind would break every deployment that terminates TLS at a proxy, which is the
+    /// architecture the docs recommend. This asserts the function is total: no panic, no
+    /// error, on every combination including an unknown address.
+    #[test]
+    fn exposure_warnings_never_refuse() {
+        let loopback: std::net::SocketAddr = "127.0.0.1:7700".parse().unwrap();
+        let public: std::net::SocketAddr = "0.0.0.0:7700".parse().unwrap();
+        for addr in [None, Some(loopback), Some(public)] {
+            for has_token in [false, true] {
+                warn_on_exposure(addr, has_token);
+            }
+        }
+    }
+
+    /// The two configurations that earn a warning, and the one that does not.
+    ///
+    /// A loopback bind must stay silent: `nidus serve` on a laptop is the frictionless
+    /// default the docs lead with, and a security warning printed on every ordinary run is
+    /// one an operator learns to scroll past — which costs exactly the case it exists for.
+    #[test]
+    fn exposure_is_classified_by_reachability_then_auth() {
+        let cases = [
+            ("127.0.0.1:7700", true, Exposure::Contained),
+            ("127.0.0.1:7700", false, Exposure::Contained),
+            ("[::1]:7700", false, Exposure::Contained),
+            ("0.0.0.0:7700", true, Exposure::CleartextCredential),
+            ("0.0.0.0:7700", false, Exposure::Unauthenticated),
+            ("10.1.2.3:7700", true, Exposure::CleartextCredential),
+            ("10.1.2.3:7700", false, Exposure::Unauthenticated),
+        ];
+        for (addr, has_token, want) in cases {
+            assert_eq!(
+                exposure(addr.parse().unwrap(), has_token),
+                want,
+                "{addr} (token: {has_token})"
+            );
+        }
     }
 
     #[test]
