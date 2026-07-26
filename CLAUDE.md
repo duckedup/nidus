@@ -226,6 +226,19 @@ each.
 - **Commit style**: emoji prefix + short description (e.g. `🪺 op-log codec`).
 - **Issue tracking**: `bd` (beads) — run `bd ready` for available work.
 - **Branch workflow**: one branch per issue or bundled epic, push for PR review.
+- **CLOSE THE TICKET IN THE PR THAT SHIPS IT.** `bd close <id>` belongs in the same
+  PR as the work, not a later cleanup pass. Never park a finished issue in
+  `in_progress` "pending PR review" — that phrasing has produced a standing pile of
+  stale tickets more than once. If the PR ships the fix, close it in that PR; if
+  review later changes the outcome, reopen it. **Why this bites harder than it
+  looks:** `bd ready` and `bd list --status open` both *hide* `in_progress`, so a
+  forgotten ticket is invisible to every routine check — it does not nag, it just
+  quietly misrepresents the backlog. A sweep in PR #63 found ten such tickets,
+  three of them P1 bugs that had actually been fixed weeks earlier, alongside two
+  marked in-progress whose work had never landed at all. Both directions of lie
+  come from the same habit. When auditing, check `bd list --status in_progress`
+  explicitly, and verify each claim against the tree rather than trusting the note
+  on the issue.
 - **Tests**: pure-logic unit tests live inline per module; file-backed behavior in
   `tests/` against temp dirs (and `#[cfg_attr(miri, ignore)]` where they fsync).
   **End-to-end tests that drive the real binary** live in `tests/e2e/`

@@ -17,6 +17,11 @@ pub mod engines;
 pub mod metrics;
 pub mod report;
 
+/// A live `nidus serve` child — shared by the HTTP engine adapter and the write-path
+/// decomposition bench.
+#[cfg(feature = "server")]
+pub mod serve;
+
 use data::Dataset;
 use metrics::Timings;
 

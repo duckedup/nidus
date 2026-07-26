@@ -242,6 +242,33 @@ identical to the library — the server adds nothing and hides nothing.
 You can take a hot [backup](/guides/cli-and-server/#backup--restore) of a store
 while `nidus serve` is running: `nidus backup` does not take the writer lock.
 
+### Getting write throughput
+
+Two client-side choices dominate ingest speed, and both are free:
+
+**Batch your upserts.** Each `/collections/{name}/upsert` call pays a fixed cost —
+a round trip and an fsync — no matter how many records it carries. Sending one
+record per request is roughly *two hundred times* slower per vector than sending a
+thousand:
+
+| records per request | vectors/s (one client, 384-d) |
+| --- | --- |
+| 1 | ~130 |
+| 10 | ~1k |
+| 100 | ~9k |
+| 1000 | ~33k |
+
+**Use more than one connection.** A single client posting batches back-to-back
+spends most of its time waiting: encode, send, decode, store, reply, all in series.
+Several concurrent writers keep those stages overlapped, and one `nidus serve`
+absorbs them — throughput roughly doubles at two clients and plateaus around
+2.5–3.5× by four to eight, at which point the store's exclusive write lock is the
+limit and more clients add nothing.
+
+Both figures come from `just bench-write` on a development machine; treat them as
+orders of magnitude, not promises. The shape is what matters — batch size first,
+concurrency second.
+
 ## Metrics and logs
 
 ### `GET /metrics`
@@ -255,6 +282,7 @@ would report the target as down). It reports:
   `nidus_http_requests_cancelled_total` (clients that disconnected before a
   response — invisible in a status breakdown, which only ever sees requests that
   finished), `nidus_http_requests_in_flight`, and `nidus_http_concurrency_limit`.
+  See [the two in-flight gauges](#the-two-in-flight-gauges) for which is which.
 - **Search path** — `nidus_search_queries_total` split by how each query was served
   (`nidus_search_ann_total`, `nidus_search_segmented_total`,
   `nidus_search_quantized_total`, `nidus_search_exact_total`), plus
@@ -276,6 +304,29 @@ network — see [Securing a deployment](#securing-a-deployment).
 Reading it takes no store lock, so a scrape answers instantly even during a
 multi-minute upsert — the endpoints you consult during an incident must not be the
 ones the incident blocks.
+
+### The two in-flight gauges
+
+They count different things, and mixing them up will mislead you during an incident:
+
+| Metric | Counts |
+| --- | --- |
+| `nidus_http_requests_in_flight` | Requests being handled right now, **probes included**. Drops when a client disconnects mid-request. |
+| `nidus_http_admitted_in_flight` | **Concurrency permits held** — store-touching requests that passed admission control. |
+
+Graph the second one against `nidus_http_concurrency_limit`: requests are shed with
+a `503` exactly when it reaches the limit, so the two together explain every entry
+in `nidus_http_requests_shed_total`. The first is the one to watch for clients
+hanging up, alongside `nidus_http_requests_cancelled_total`.
+
+`nidus_http_admitted_in_flight` reports the admission decision, not a headcount of
+running work. When a request hits its `--read-timeout` / `--write-timeout` the
+permit is released at once — continuing to hold it would shed live traffic on
+behalf of a response nobody is waiting for — while the scan itself keeps going
+until it notices the cancellation signal. During that window the gauge reads low.
+The scan kernels check every few thousand rows, so the window is milliseconds, and
+it is entered exactly `nidus_http_requests_timed_out_total` times: if that counter
+is flat, it has never happened on your instance.
 
 ### Logs
 

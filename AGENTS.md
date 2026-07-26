@@ -47,6 +47,20 @@ cp -rf source dest          # NOT: cp -r source dest
 - `apt-get` - use `-y` flag
 - `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
+## Close the ticket in the PR that ships it
+
+`bd close <id>` belongs in the same PR as the work — never a later cleanup pass, and
+never parked in `in_progress` "pending PR review". If the PR ships the fix, close it
+there; reopen if review changes the outcome.
+
+This matters more than it sounds: `bd ready` and `bd list --status open` both **hide**
+`in_progress`, so a forgotten ticket is invisible to every routine check. It does not
+nag — it silently misrepresents the backlog, in both directions. When auditing, run
+`bd list --status in_progress` explicitly and verify each claim against the tree rather
+than trusting the note on the issue.
+
+(Full rationale, with the incident that prompted it, is in `CLAUDE.md` §Conventions.)
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 

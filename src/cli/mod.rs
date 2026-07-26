@@ -508,9 +508,9 @@ enum Command {
         /// Deadline in seconds for a read request (search, list, stats). Default 30.
         /// `0` disables it.
         ///
-        /// Frees the *client*; it does not stop the work. A scan already running on a
-        /// blocking task runs to completion regardless — cancelling it would need a
-        /// cooperative check in the scan loop, which nidus does not have.
+        /// Frees the client *and* asks the work to stop. A scan on a blocking task cannot
+        /// be cancelled outright, so the deadline signals it cooperatively: the kernels
+        /// check every few thousand rows and bail, which is prompt rather than instant.
         #[arg(
             long,
             value_name = "SECONDS",

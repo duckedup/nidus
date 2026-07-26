@@ -280,6 +280,21 @@ bench-quant *ARGS:
 bench-ann *ARGS:
     cargo run -p nidus-bench --release --bin nidus-bench-ann -- {{ARGS}}
 
+# Single-writer ingest decomposition (nidus-xb9): splits the write path into JSON
+# encode / decode / store append / fsync / transport, then sweeps batch size and
+# concurrent writers. Answers which layer a single writer actually saturates on,
+# which is the prerequisite for deciding whether writes need scaling out at all.
+# Builds the release binary first — the HTTP half drives a real `nidus serve`.
+#   just bench-write                              defaults (n=50k, dim=384/768)
+#   just bench-write n=100000 dim=768 batch=1000  pass-through args
+bench-write *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --features cli
+    NIDUS_BIN="$PWD/target/release/nidus" \
+        cargo run -p nidus-bench --release --features server \
+        --bin nidus-bench-write -- {{ARGS}}
+
 # nidus-internal regression benchmarks (criterion); compares against saved baselines.
 # Targets the criterion bench directly so harness args reach it (the lib's libtest
 # harness would otherwise reject them).

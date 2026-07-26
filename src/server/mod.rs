@@ -1764,6 +1764,47 @@ mod tests {
         assert!(text.contains("# TYPE nidus_http_requests_total counter"));
     }
 
+    /// The two in-flight gauges are separate series with separate meanings, and the
+    /// permit gauge says out loud that it excludes work whose deadline already fired
+    /// (nidus-bcg).
+    ///
+    /// Asserted rather than left to the docs because the discrepancy is invisible in a
+    /// scrape: the gauge reads plausibly low, and an operator correlating it with the shed
+    /// count has no way to tell "nothing is running" from "the permit was handed back
+    /// while the scan finishes noticing". The HELP text is the only place that distinction
+    /// is delivered to the person reading it.
+    #[tokio::test]
+    async fn the_two_in_flight_gauges_are_distinct_and_self_describing() {
+        let app = test_router(3);
+        let resp = app.oneshot(get("/metrics")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        for name in [
+            "nidus_http_requests_in_flight",
+            "nidus_http_admitted_in_flight",
+        ] {
+            assert!(
+                text.contains(&format!("# HELP {name} ")),
+                "{name} has no HELP line:\n{text}"
+            );
+            assert!(
+                text.contains(&format!("# TYPE {name} gauge")),
+                "{name} has no TYPE line:\n{text}"
+            );
+        }
+
+        let help = text
+            .lines()
+            .find(|l| l.starts_with("# HELP nidus_http_admitted_in_flight "))
+            .expect("checked above");
+        assert!(
+            help.contains("permits") && help.contains("deadline"),
+            "the permit gauge must name what it counts and what it excludes, got: {help}"
+        );
+    }
+
     /// Search-path counters move, so a scrape can distinguish "queries are slow" from
     /// "queries are slow because the index is not being used".
     #[tokio::test]
