@@ -81,14 +81,79 @@ impl Store {
         self.persist_manifest()
     }
 
+    /// Whether *this* mutation issues its own durable barrier.
+    ///
+    /// [`Fsync::PerBatch`] says yes — unless the host has taken the barrier over for a group
+    /// of mutations ([`Nidus::deferred`](crate::Nidus::deferred), nidus-xb9.1), in which case
+    /// the bytes are appended now and one [`commit`](Self::commit) covers the whole group.
+    /// Under [`Fsync::OnFlush`] the answer is no either way: `flush()` is the barrier.
+    fn barrier_now(&self) -> bool {
+        self.config.fsync == Fsync::PerBatch && !self.defer_barrier
+    }
+
     /// Apply the fsync policy after a mutation: sync data then log under PerBatch, then (in
-    /// cluster mode) advance the published commit counter so peers see the batch.
+    /// cluster mode) advance the published commit counter so peers see the batch. When the
+    /// barrier is not ours to take, record that one is owed instead (see `pending_barrier`).
     fn maybe_sync(&mut self) -> Result<()> {
-        if self.config.fsync == Fsync::PerBatch {
-            self.data.sync()?;
-            self.log.sync()?;
-            self.note_cluster_commit()?;
+        crate::metrics::metrics().write_batches.inc();
+        if !self.barrier_now() {
+            self.pending_barrier = true;
+            return Ok(());
         }
+        self.data.sync()?;
+        self.log.sync()?;
+        crate::metrics::metrics().durability_barriers.inc();
+        self.note_cluster_commit()
+    }
+
+    /// Enter a deferred-barrier scope (**group commit**, nidus-xb9.1), returning the previous
+    /// setting for [`end_deferred`](Self::end_deferred) to restore. Returning the old value
+    /// rather than just clearing makes nesting safe.
+    ///
+    /// The safe wrapper is [`Nidus::deferred`](crate::Nidus::deferred); the primitive lives
+    /// here as a pair because the closure that wrapper takes needs `&mut Nidus`, and handing
+    /// out a `&mut Store` from inside it is not possible.
+    pub(crate) fn begin_deferred(&mut self) -> bool {
+        std::mem::replace(&mut self.defer_barrier, true)
+    }
+
+    /// Leave a deferred-barrier scope, restoring what [`begin_deferred`](Self::begin_deferred)
+    /// found. Does **not** take the barrier — [`commit`](Self::commit) does, and keeping them
+    /// separate is what lets the caller decide when the group is closed.
+    pub(crate) fn end_deferred(&mut self, prev: bool) {
+        self.defer_barrier = prev;
+    }
+
+    /// The group barrier: make everything appended since the last barrier durable.
+    ///
+    /// This is the fsync that the mutations inside [`deferred`](Self::deferred) skipped — one
+    /// for the whole group instead of one each, which is the entire saving. Syncs `data` then
+    /// `log` (the §6.2 order) and, in cluster mode, publishes the commit counter once for the
+    /// group rather than once per batch.
+    ///
+    /// Deliberately narrower than [`flush`](Self::flush): it takes the barrier and nothing
+    /// else. No segment seal, no working-set publish — those are periodic housekeeping, and
+    /// doing them per group would put a whole-working-set serialize-and-PUT on the write path
+    /// of every batch, trading one saved fsync for something far more expensive.
+    ///
+    /// **A no-op when nothing is owed**, at the cost of one branch: a caller that already
+    /// synced (the ordinary `PerBatch` path, one client at a time) pays nothing here. That is
+    /// what keeps group commit from making the uncontended single-writer path slower.
+    ///
+    /// Under [`Fsync::OnFlush`] it is also a no-op — that policy's whole point is that the
+    /// write path takes no barrier and `flush()` is the durability point — so a host that
+    /// always calls `commit` still gets exactly the policy its config asked for.
+    pub fn commit(&mut self) -> Result<()> {
+        if !self.pending_barrier || self.config.fsync == Fsync::OnFlush {
+            return Ok(());
+        }
+        self.data.sync()?;
+        self.log.sync()?;
+        crate::metrics::metrics().durability_barriers.inc();
+        self.note_cluster_commit()?;
+        // Last: a failure above must leave the barrier still owed, so the next `commit` (or
+        // `flush`) retries it rather than reporting durability nobody achieved.
+        self.pending_barrier = false;
         Ok(())
     }
 
@@ -372,6 +437,11 @@ impl Store {
             staged.push((rec.id.clone(), row, rec.attrs.clone()));
         }
 
+        // Whether this batch takes its own barrier, decided once so phases 2 and 4 cannot
+        // disagree (they must sync as a pair or not at all).
+        let barrier_now = self.barrier_now();
+        crate::metrics::metrics().write_batches.inc();
+
         // Phase 2: fsync data before writing log records — under `PerBatch` only.
         //
         // Gated to match phase 4 below (nidus-4h2). It used to be unconditional, which
@@ -389,9 +459,11 @@ impl Store {
         // ignores any `Upsert` whose row is beyond the data file (§6.2). The tail is
         // dropped, never torn — which is the durability contract `OnFlush` advertises
         // ("a crash can lose acknowledged writes").
-        if self.config.fsync == Fsync::PerBatch
-            && let Err(e) = self.data.sync()
-        {
+        //
+        // Group commit (nidus-xb9.1) skips it for the same reason and with the same
+        // reasoning — but there the caller has promised to call `commit()` before it
+        // acknowledges anything, so no write is *reported* durable ahead of its bytes.
+        if barrier_now && let Err(e) = self.data.sync() {
             self.data
                 .truncate_to(data_mark)
                 .context("rollback data after failed sync")?;
@@ -425,12 +497,16 @@ impl Store {
             }
         }
 
-        // Phase 4: fsync log (or defer to flush()).
-        if self.config.fsync == Fsync::PerBatch
-            && let Err(e) = self.log.sync()
-        {
-            self.rollback(data_mark, log_mark)?;
-            return Err(e);
+        // Phase 4: fsync log (or defer to commit()/flush()).
+        if barrier_now {
+            if let Err(e) = self.log.sync() {
+                self.rollback(data_mark, log_mark)?;
+                return Err(e);
+            }
+            crate::metrics::metrics().durability_barriers.inc();
+        } else {
+            // Appended, not yet durable — `commit()`/`flush()` owes this batch a barrier.
+            self.pending_barrier = true;
         }
 
         // Phase 5: commit to the in-RAM index — infallible. Both files are durable,
@@ -474,8 +550,10 @@ impl Store {
         self.invalidate_scan_order();
         // Cluster: announce this committed batch via the manifest commit counter so reader
         // instances detect it (this path commits durably itself, bypassing `maybe_sync`).
-        // Deferred to `flush()` under OnFlush; a no-op outside cluster mode.
-        if self.config.fsync == Fsync::PerBatch {
+        // Deferred to `commit()`/`flush()` under OnFlush and under group commit — where one
+        // manifest publish then covers the whole group, so the coalescing saves an
+        // object-store round trip as well as an fsync. A no-op outside cluster mode.
+        if barrier_now {
             self.note_cluster_commit()?;
         }
         Ok(count)
@@ -558,12 +636,15 @@ impl Store {
         self.check_writable()?;
         self.data.sync()?;
         self.log.sync()?;
-        // Under OnFlush the per-batch path deferred the cluster commit-counter bump to here
-        // (PerBatch already bumped it in `maybe_sync`); advance it now that the batch is
-        // durable so peers see it. No-op outside cluster mode.
-        if self.config.fsync == Fsync::OnFlush {
+        crate::metrics::metrics().durability_barriers.inc();
+        // Under OnFlush — or when a group-commit scope left a barrier owed — the per-batch
+        // path deferred the cluster commit-counter bump to here (PerBatch already bumped it
+        // in `maybe_sync`); advance it now that the batch is durable so peers see it. No-op
+        // outside cluster mode.
+        if self.config.fsync == Fsync::OnFlush || self.pending_barrier {
             self.note_cluster_commit()?;
         }
+        self.pending_barrier = false;
         // Seal a large active-segment tail into an immutable segment (SPEC §14.4). No-op
         // unless `segment_max_rows` is set and the tail is over it.
         self.maybe_seal()?;

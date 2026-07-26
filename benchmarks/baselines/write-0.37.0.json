@@ -1,0 +1,160 @@
+{
+  "bench": "nidus-bench-write",
+  "cells": [
+    {
+      "batch": 1000,
+      "by_batch": [
+        {
+          "append_per_s": 46640.65548404092,
+          "batch": 1,
+          "durable_per_s": 131.26192839492742,
+          "http_per_s": 127.22359273936452,
+          "vectors": 500
+        },
+        {
+          "append_per_s": 104006.42526733759,
+          "batch": 10,
+          "durable_per_s": 1283.9571465579402,
+          "http_per_s": 1177.3085549126142,
+          "vectors": 5000
+        },
+        {
+          "append_per_s": 218644.0071247511,
+          "batch": 100,
+          "durable_per_s": 11277.717340640918,
+          "http_per_s": 8863.507676060539,
+          "vectors": 50000
+        },
+        {
+          "append_per_s": 241942.3636191461,
+          "batch": 1000,
+          "durable_per_s": 77399.40500724429,
+          "http_per_s": 32175.74908964751,
+          "vectors": 50000
+        }
+      ],
+      "by_clients": [
+        {
+          "clients": 1,
+          "per_s": 31805.90847904032,
+          "writes_per_barrier": 1.0
+        },
+        {
+          "clients": 2,
+          "per_s": 61709.88529591145,
+          "writes_per_barrier": 1.0
+        },
+        {
+          "clients": 4,
+          "per_s": 94524.56226611008,
+          "writes_per_barrier": 1.3421052631578947
+        },
+        {
+          "clients": 8,
+          "per_s": 134396.8908343729,
+          "writes_per_barrier": 3.0
+        }
+      ],
+      "dim": 384,
+      "stages_us_per_vector": {
+        "append": 4.0527633000000005,
+        "decode": 5.75236316,
+        "durable": 12.537593300000001,
+        "encode": 10.120365039999998,
+        "fsync": 8.48483,
+        "http": 31.76368,
+        "residual": 13.47372354
+      },
+      "vectors": 50000
+    },
+    {
+      "batch": 1000,
+      "by_batch": [
+        {
+          "append_per_s": 46929.30306981466,
+          "batch": 1,
+          "durable_per_s": 130.65571855434524,
+          "http_per_s": 127.91057720383449,
+          "vectors": 500
+        },
+        {
+          "append_per_s": 89682.3054551343,
+          "batch": 10,
+          "durable_per_s": 1267.9625357899067,
+          "http_per_s": 1113.5661327059079,
+          "vectors": 5000
+        },
+        {
+          "append_per_s": 180115.21213636472,
+          "batch": 100,
+          "durable_per_s": 11187.601768690745,
+          "http_per_s": 7667.836970284256,
+          "vectors": 50000
+        },
+        {
+          "append_per_s": 189601.34746795706,
+          "batch": 1000,
+          "durable_per_s": 70991.63102237217,
+          "http_per_s": 19690.742770465422,
+          "vectors": 50000
+        }
+      ],
+      "by_clients": [
+        {
+          "clients": 1,
+          "per_s": 19614.454038995864,
+          "writes_per_barrier": 1.0
+        },
+        {
+          "clients": 2,
+          "per_s": 37846.494124797675,
+          "writes_per_barrier": 1.0
+        },
+        {
+          "clients": 4,
+          "per_s": 64445.84838149801,
+          "writes_per_barrier": 1.1590909090909092
+        },
+        {
+          "clients": 8,
+          "per_s": 84743.33890873884,
+          "writes_per_barrier": 2.3181818181818183
+        }
+      ],
+      "dim": 768,
+      "stages_us_per_vector": {
+        "append": 5.06932418,
+        "decode": 11.1128508,
+        "durable": 13.72087822,
+        "encode": 19.74833994,
+        "fsync": 8.65155404,
+        "http": 51.48045166,
+        "residual": 26.64672264
+      },
+      "vectors": 50000
+    }
+  ],
+  "inputs": {
+    "batch": [
+      1,
+      10,
+      100,
+      1000
+    ],
+    "clients": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "dim": [
+      384,
+      768
+    ],
+    "max_requests": 500,
+    "n": 50000,
+    "seed": 42
+  },
+  "nidus_version": "0.37.0",
+  "server_feature": true
+}

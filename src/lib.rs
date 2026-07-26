@@ -346,6 +346,60 @@ impl Nidus {
         self.store.hybrid_search(&refs, vector, text, opts)
     }
 
+    // ── Group commit (nidus-xb9.1) ───────────────────────────────────────
+
+    /// Run `f` with the per-batch durable barrier **deferred**, so several mutations can
+    /// share one fsync instead of taking one each — the group-commit primitive.
+    ///
+    /// Inside `f`, [`upsert`](Self::upsert)/[`delete`](Self::delete)/… append their bytes and
+    /// update the in-RAM index exactly as they always do, but issue no fsync. Afterwards
+    /// [`commit`](Self::commit) takes **one** barrier covering all of them. Nothing about the
+    /// durable write order changes: each batch is still appended data-before-log, and `commit`
+    /// still syncs `data` before `log`.
+    ///
+    /// # The contract you take on
+    ///
+    /// **Do not report any of `f`'s results as successful until [`commit`](Self::commit)
+    /// returns `Ok`.** Until then the bytes are appended but not durable — precisely the state
+    /// the lock-free reader rule drops from the tail on replay (SPEC §6.2). Acknowledging
+    /// before the barrier would turn this from "fewer fsyncs" into "silently weaker
+    /// durability", which is not a trade worth offering.
+    ///
+    /// This is what `nidus serve` does with concurrent writes: the request that reaches the
+    /// store first applies every other queued write too, one barrier covers the group, and
+    /// only then does each request get its `200`. That is where the per-call `~7.6ms` disk
+    /// barrier stops being paid once per request.
+    ///
+    /// # Notes
+    ///
+    /// * Nesting is safe — the previous setting is restored, including when `f` errors.
+    /// * A **panic** out of `f` skips the restore, leaving the store in the deferred state; a
+    ///   panic while holding a store this way should be treated as fatal to the store (in
+    ///   `nidus serve` it poisons the lock, which takes the instance out of service).
+    /// * Under [`Fsync::OnFlush`] this changes nothing: that policy already defers every
+    ///   barrier to `flush()`.
+    pub fn deferred<T>(&mut self, f: impl FnOnce(&mut Nidus) -> Result<T>) -> Result<T> {
+        let prev = self.store.begin_deferred();
+        let out = f(self);
+        self.store.end_deferred(prev);
+        out
+    }
+
+    /// Take the barrier that [`deferred`](Self::deferred) mutations skipped: fsync `data` then
+    /// `log`, and in cluster mode publish the commit counter once for the whole group.
+    ///
+    /// A **no-op when no barrier is owed** — a caller on the ordinary per-batch path that
+    /// already synced pays a branch and nothing more, which is what keeps the uncontended
+    /// single-writer path exactly as fast as it was. Also a no-op under
+    /// [`Fsync::OnFlush`], where `flush()` is by definition the durability point.
+    ///
+    /// Narrower than [`flush`](Self::flush) on purpose: it takes the barrier and skips the
+    /// housekeeping (segment seal, shared working-set publish), which would otherwise put a
+    /// whole-working-set write on the hot path of every group.
+    pub fn commit(&mut self) -> Result<()> {
+        self.store.commit()
+    }
+
     // ── Maintenance ──────────────────────────────────────────────────────
 
     /// fsync both files.

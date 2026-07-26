@@ -295,6 +295,9 @@ would report the target as down). It reports:
   misbehaving, visible long before anything actually breaks.
 - **Backend health** — `nidus_backend_retries_total`, `nidus_refresh_failures_total`.
 - **Instance state** — `nidus_ready`, `nidus_writer_fenced`, `nidus_staleness_seconds`.
+- **Write path** — `nidus_write_batches_total` (batches that needed a durable barrier) against
+  `nidus_durability_barriers_total` (barriers actually taken). See
+  [group commit](#group-commit) below.
 
 Route labels are **templates**: `/collections/{name}/upsert`, never the collection
 name. That bounds the label cardinality, and it means the scrape exposes traffic
@@ -304,6 +307,28 @@ network — see [Securing a deployment](#securing-a-deployment).
 Reading it takes no store lock, so a scrape answers instantly even during a
 multi-minute upsert — the endpoints you consult during an incident must not be the
 ones the incident blocks.
+
+### Group commit
+
+Concurrent writes share one disk barrier instead of each taking its own: the first request to
+reach the store applies every write queued alongside it under one lock, one fsync covers them
+all, and each request is answered only after that fsync succeeds. A `200` still means the
+bytes are on disk. See [how it works](/guides/how-it-works/#group-commit) for the mechanism.
+
+| Metric | Counts |
+| --- | --- |
+| `nidus_write_groups_total` | Groups committed — one shared barrier each. |
+| `nidus_write_group_members_total` | Writes applied inside those groups. |
+| `nidus_write_queue_depth` | Writes submitted and not yet applied — the current write backlog. |
+
+Divide the second by the first for the **coalescing factor**: the average number of writes
+that shared a barrier. `1.0` is not a fault — it means writes on this instance never overlap,
+so there was never a group to form. Nothing waits for one, so a single writer is exactly as
+fast as it would be without any of this.
+
+The factor rises with write concurrency, which is where it matters: measured on one
+developer machine, eight concurrent HTTP writers at 384 dimensions went from 85k to 134k
+vectors/s at 3.0 writes per barrier.
 
 ### The two in-flight gauges
 

@@ -210,6 +210,10 @@ This is deliberately small: there is no coordinator, no replication, and no reba
 object store plus the versioned manifest *are* the coordination — the same architecture as a
 single node, just with more readers.
 
+Cluster mode scales *readers* over one dataset. If what you need is **capacity** — a corpus
+larger than one machine — that is a different shape and needs none of this: see
+[running across a few boxes](/guides/multi-box/).
+
 ## Writing your own backend
 
 The backends above are implementations of one small, synchronous Rust trait,

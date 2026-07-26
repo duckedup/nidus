@@ -66,6 +66,34 @@ it is an unreferenced row, reclaimed by [compaction](/guides/storage/#compaction
 Upsert is **all-or-nothing**: any failure mid-batch rolls `data` and `log` back
 to the entry marks, so a caught `ENOSPC` leaves the store exactly as it was.
 
+### Group commit
+
+Steps 2 and 4 are one disk barrier, and a barrier costs the same whether the batch
+carries one record or a thousand. That is fine for an indexer writing big batches
+occasionally; it is the ceiling for a server taking many small writes at once, where every
+concurrent write used to pay its own.
+
+So the barrier can be **shared**. `deferred` runs a group of mutations without syncing;
+`commit` then takes one barrier for all of them, still `data` before `log`:
+
+```rust
+db.deferred(|db| {
+    db.upsert("docs", &first)?;
+    db.upsert("docs", &second)?;
+    Ok(())
+})?;
+db.commit()?; // one fsync pair for both batches
+```
+
+The rule that keeps this honest: **do not tell anyone a write succeeded until `commit`
+returns `Ok`.** Before that its bytes are appended but not durable — the same tail state a
+crash leaves behind, which the next open discards. Deferring the barrier is a way to pay for
+durability once instead of N times, never a way to skip it.
+
+[`nidus serve`](/guides/http-server/) does this for you: concurrent writes are applied
+together under one lock, share one barrier, and each request is answered only after it
+succeeds. Nothing waits for a group to form, so a lone write is exactly as fast as before.
+
 ## Search
 
 Search scores (cosine, dot, or Euclidean) over a

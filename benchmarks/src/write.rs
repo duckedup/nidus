@@ -43,13 +43,15 @@
 //! the in-process decomposition still runs and says so.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use nidus::{Config, Fsync, Nidus, Record};
 use nidus_bench::data::{self, Dataset};
 use nidus_bench::report::fmt_count;
+use serde_json::{Value, json};
 
 const COLLECTION: &str = "bench";
 
@@ -63,6 +65,13 @@ struct Args {
     /// Ceiling on upsert calls per pass — see [`Plan::new`] for why one exists.
     max_requests: usize,
     seed: u64,
+    /// Where to write the machine-readable run, if anywhere.
+    ///
+    /// A printed table is for reading; a baseline is for *diffing*. nidus-xb9.1 (group
+    /// commit) has to beat a specific number, and re-deriving that number by eyeballing
+    /// two terminal dumps is how a 10% regression goes unnoticed. Mirrors the parity
+    /// harness, which already emits `target/bench-results/<stamp>.json`.
+    json: Option<PathBuf>,
 }
 
 impl Default for Args {
@@ -74,6 +83,7 @@ impl Default for Args {
             clients: vec![1, 2, 4, 8],
             max_requests: 500,
             seed: 42,
+            json: None,
         }
     }
 }
@@ -89,7 +99,7 @@ fn parse_args() -> Result<Args> {
     for tok in std::env::args().skip(1) {
         if tok == "help" || tok == "--help" || tok == "-h" {
             println!("nidus-bench-write — single-writer ingest decomposition (nidus-xb9)");
-            println!("args: n=, dim=, batch=, clients=, max_requests=, seed=");
+            println!("args: n=, dim=, batch=, clients=, max_requests=, seed=, json=<path>");
             std::process::exit(0);
         }
         let Some((key, val)) = tok.split_once('=') else {
@@ -102,6 +112,7 @@ fn parse_args() -> Result<Args> {
             "clients" => a.clients = parse_list(val)?,
             "max_requests" => a.max_requests = val.parse()?,
             "seed" => a.seed = val.parse()?,
+            "json" => a.json = Some(PathBuf::from(val)),
             _ => bail!("unknown arg `{key}` (try `help`)"),
         }
     }
@@ -227,6 +238,10 @@ struct HttpPass {
     wall: Duration,
     /// Summed client-side JSON encoding, excluded from `wall`'s attribution below.
     encode: Duration,
+    /// Writes per durable barrier over the pass — the group-commit coalescing factor
+    /// (nidus-xb9.1), read from the server's own counters. `1.0` means every write took its
+    /// own fsync, which is what this pass looked like before group commit.
+    coalescing: f64,
 }
 
 /// Ingest the plan over HTTP with `clients` concurrent writers.
@@ -299,9 +314,14 @@ fn http_pass(dataset: &Dataset, plan: &Plan, fsync: Fsync, clients: usize) -> Re
         proc.post("/flush", &json!({}))?;
     }
 
+    // Scraped after the clock is read, so the extra request never lands inside the timing.
+    let groups = proc.metric("nidus_write_groups_total")?;
+    let members = proc.metric("nidus_write_group_members_total")?;
+
     Ok(HttpPass {
         wall,
         encode: Duration::from_nanos(encode_nanos.load(Ordering::Relaxed)),
+        coalescing: if groups > 0.0 { members / groups } else { 0.0 },
     })
 }
 
@@ -334,6 +354,41 @@ fn stage_row(name: &str, d: Duration, n: usize, total: Duration) {
     );
 }
 
+/// Write the run as JSON for diffing against a later one.
+///
+/// Records the knobs alongside the numbers: a baseline compared against a run with a
+/// different `n`, `seed` or `max_requests` is not a comparison, and without the inputs
+/// in the file there is nothing to catch that.
+fn write_json(path: &Path, args: &Args, cells: &[Value]) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let doc = json!({
+        "bench": "nidus-bench-write",
+        // The version of NIDUS, not of this bench crate. `env!("CARGO_PKG_VERSION")` here
+        // would report nidus-bench's own 0.1.0 — which is worse than nothing on a
+        // baseline, since it looks authoritative while naming the wrong crate. nidus does
+        // not expose its version, so `just bench-write` passes it in; a direct `cargo run`
+        // gets "unknown" rather than a confident lie.
+        "nidus_version": std::env::var("NIDUS_VERSION").unwrap_or_else(|_| "unknown".into()),
+        "server_feature": cfg!(feature = "server"),
+        "inputs": {
+            "n": args.n,
+            "dim": args.dim,
+            "batch": args.batch,
+            "clients": args.clients,
+            "max_requests": args.max_requests,
+            "seed": args.seed,
+        },
+        "cells": cells,
+    });
+    std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&doc)?))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    println!("\nwrote {}", path.display());
+    Ok(())
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -347,6 +402,7 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let args = parse_args()?;
     let n = args.n;
+    let mut doc_cells: Vec<Value> = Vec::new();
 
     #[cfg(not(feature = "server"))]
     eprintln!(
@@ -392,6 +448,16 @@ fn run() -> Result<()> {
         stage_row("fsync (per batch)", fsync, v, total);
         stage_row("= in-process durable write", durable, v, total);
 
+        // `mut` only under the `server` feature, which adds the http/residual keys.
+        #[allow(unused_mut)]
+        let mut stages = json!({
+            "encode": per_vec_us(encode, v),
+            "decode": per_vec_us(decode, v),
+            "append": per_vec_us(append, v),
+            "fsync": per_vec_us(fsync, v),
+            "durable": per_vec_us(durable, v),
+        });
+
         #[cfg(feature = "server")]
         {
             stage_row("HTTP round trip (measured)", http.wall, v, total);
@@ -401,6 +467,8 @@ fn run() -> Result<()> {
                 "  (client-side encode ran concurrently and cost {:.2} us/vector)",
                 per_vec_us(http.encode, v)
             );
+            stages["http"] = json!(per_vec_us(http.wall, v));
+            stages["residual"] = json!(per_vec_us(residual, v));
         }
 
         // ── batch-size sweep ────────────────────────────────────────────────
@@ -420,11 +488,19 @@ fn run() -> Result<()> {
             "batch", "n", "append", "durable"
         );
 
+        let mut by_batch: Vec<Value> = Vec::new();
         for &b in &args.batch {
             let plan = Plan::new(n, b, args.max_requests);
             let v = plan.vectors;
             let append = store_pass(&dataset, &plan, Fsync::OnFlush)?;
             let durable = store_pass(&dataset, &plan, Fsync::PerBatch)?;
+            #[allow(unused_mut)] // `http_per_s` is added only under the `server` feature
+            let mut row = json!({
+                "batch": b,
+                "vectors": v,
+                "append_per_s": per_s(append, v),
+                "durable_per_s": per_s(durable, v),
+            });
             #[cfg(feature = "server")]
             {
                 let http = http_pass(&dataset, &plan, Fsync::PerBatch, 1)?;
@@ -436,6 +512,7 @@ fn run() -> Result<()> {
                     fmt_count(per_s(durable, v)),
                     fmt_count(per_s(http.wall, v))
                 );
+                row["http_per_s"] = json!(per_s(http.wall, v));
             }
             #[cfg(not(feature = "server"))]
             println!(
@@ -445,15 +522,22 @@ fn run() -> Result<()> {
                 fmt_count(per_s(append, v)),
                 fmt_count(per_s(durable, v))
             );
+            by_batch.push(row);
         }
 
         // ── concurrent-writer sweep ─────────────────────────────────────────
+        #[allow(unused_mut)]
+        let mut by_clients: Vec<Value> = Vec::new();
         #[cfg(feature = "server")]
         {
             println!("\n── concurrent writers  n={v} dim={dim} batch={batch}  ────────────────");
+            // `writes/barrier` is the group-commit coalescing factor read off the server's
+            // own counters (nidus-xb9.1) — without it a rising throughput curve cannot be
+            // told apart from the machine simply having more cores to spend, and a *flat*
+            // one cannot be told apart from group commit having silently stopped working.
             println!(
-                "{:<10} {:>14} {:>12}",
-                "clients", "vectors/s", "vs 1 client"
+                "{:<10} {:>14} {:>12} {:>16}",
+                "clients", "vectors/s", "vs 1 client", "writes/barrier"
             );
             let mut baseline = 0.0;
             for (i, &c) in args.clients.iter().enumerate() {
@@ -463,13 +547,32 @@ fn run() -> Result<()> {
                     baseline = rate;
                 }
                 println!(
-                    "{:<10} {:>14} {:>11.2}x",
+                    "{:<10} {:>14} {:>11.2}x {:>15.2}",
                     c,
                     fmt_count(rate),
-                    if baseline > 0.0 { rate / baseline } else { 0.0 }
+                    if baseline > 0.0 { rate / baseline } else { 0.0 },
+                    http.coalescing
                 );
+                by_clients.push(json!({
+                    "clients": c,
+                    "per_s": rate,
+                    "writes_per_barrier": http.coalescing,
+                }));
             }
         }
+
+        doc_cells.push(json!({
+            "dim": dim,
+            "batch": batch,
+            "vectors": v,
+            "stages_us_per_vector": stages,
+            "by_batch": by_batch,
+            "by_clients": by_clients,
+        }));
+    }
+
+    if let Some(path) = &args.json {
+        write_json(path, &args, &doc_cells)?;
     }
 
     Ok(())

@@ -445,6 +445,31 @@ fn render(out: &mut String, st: &AppState) {
         let _ = writeln!(out, "{name} {value}");
     }
 
+    // ── Group commit (nidus-xb9.1) ──────────────────────────────────────────
+    //
+    // `writes / groups` is the average number of requests that shared one disk barrier. Read
+    // it against `nidus_write_batches_total` / `nidus_durability_barriers_total` above: those
+    // count the store's barriers whoever asked for them, these attribute the coalescing to
+    // concurrent HTTP writes.
+    let (groups, writes) = st.commit.stats();
+    for (name, help, value) in [
+        (
+            "nidus_write_groups_total",
+            "Write groups committed: one shared disk barrier each",
+            groups,
+        ),
+        (
+            "nidus_write_group_members_total",
+            "Writes applied inside those groups (divide by the groups for the coalescing \
+             factor)",
+            writes,
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} counter");
+        let _ = writeln!(out, "{name} {value}");
+    }
+
     for (name, help, value) in [
         (
             "nidus_http_requests_in_flight",
@@ -461,6 +486,11 @@ fn render(out: &mut String, st: &AppState) {
             "nidus_http_concurrency_limit",
             "Configured --max-concurrent-requests",
             st.limits.limit() as u64,
+        ),
+        (
+            "nidus_write_queue_depth",
+            "Writes submitted to the group committer and not yet applied",
+            st.commit.depth(),
         ),
     ] {
         let _ = writeln!(out, "# HELP {name} {help}");

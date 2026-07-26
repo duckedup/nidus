@@ -74,6 +74,7 @@ export default defineConfig({
             { label: "Embedding in a host app", link: "/guides/integrating/" },
             { label: "Command line", link: "/guides/cli-and-server/" },
             { label: "HTTP server", link: "/guides/http-server/" },
+            { label: "Running across a few boxes", link: "/guides/multi-box/" },
             { label: "Kubernetes (Helm)", link: "/guides/kubernetes/" },
           ],
         },

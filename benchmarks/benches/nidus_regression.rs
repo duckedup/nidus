@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use nidus::{Config, Distance, Nidus, QuantKind, Quantization, Record, SearchOpts};
+use nidus::{Config, Distance, Fsync, Nidus, QuantKind, Quantization, Record, SearchOpts};
 use nidus_bench::data;
 use std::hint::black_box;
 
@@ -156,5 +156,77 @@ fn bench_ingest(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_search, bench_parallel_search, bench_ingest);
+/// The **file-backed** write path, across fsync policy and batch size — the regression
+/// lane for nidus-xb9.1 (group commit).
+///
+/// [`bench_ingest`] above cannot serve as that baseline: it uses `open_in_memory` and one
+/// 10k-record call, so it touches no filesystem, takes no disk barrier, and has no
+/// batch-size axis. Every quantity group commit is meant to move is invisible to it. This
+/// group opens a real store in a temp dir and varies the two things that actually decide
+/// write throughput.
+///
+/// This group is deliberately *small and few-sampled*, unlike every other one here. A
+/// `PerBatch` call costs a real disk barrier (~3.8ms on APFS, where `sync_all` is
+/// `F_FULLFSYNC`), so cost is driven by call count, and criterion's defaults would turn
+/// the `b1` row alone into several minutes on every `just bench-crit`. `n = 200` with
+/// `sample_size(10)` keeps the whole group to roughly twenty seconds while still
+/// resolving the thing being watched — the per-call barrier — to well inside a percent.
+fn bench_write_path(c: &mut Criterion) {
+    let mut group = c.benchmark_group("write_path");
+    // The floor criterion allows. These are IO benchmarks whose variance comes from the
+    // filesystem, not from sampling noise, so more samples mostly buys wall time.
+    group.sample_size(10);
+    let dim = 384;
+    // Deliberately modest: this measures per-CALL cost, which is constant in store size
+    // (verified while fixing nidus-4h2), so a bigger corpus buys noise, not signal.
+    let n = 200;
+    let recs = records(n, dim);
+
+    for (label, fsync) in [("per_batch", Fsync::PerBatch), ("on_flush", Fsync::OnFlush)] {
+        for batch in [1usize, 10, 100] {
+            group.throughput(Throughput::Elements(n as u64));
+            group.bench_with_input(
+                BenchmarkId::new(label, format!("b{batch}")),
+                &(batch, fsync),
+                |b, &(batch, fsync)| {
+                    b.iter_batched(
+                        // Setup is untimed: a fresh store per iteration, so no run
+                        // inherits the previous one's rows or dirty pages.
+                        || {
+                            let tmp = tempfile::Builder::new()
+                                .prefix("nidus-crit-write-")
+                                .tempdir()
+                                .expect("tempdir");
+                            let db = Nidus::open(Config::new(tmp.path(), dim).fsync(fsync))
+                                .expect("open store");
+                            (tmp, db)
+                        },
+                        |(tmp, mut db)| {
+                            for chunk in recs.chunks(batch) {
+                                db.upsert("bench", black_box(chunk)).expect("upsert");
+                            }
+                            // Included, not incidental: under OnFlush this is where
+                            // durability is actually paid for, and omitting it would
+                            // flatter that policy by exactly the cost being measured.
+                            db.flush().expect("flush");
+                            black_box(&db);
+                            drop(db);
+                            drop(tmp);
+                        },
+                        criterion::BatchSize::PerIteration,
+                    )
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_search,
+    bench_parallel_search,
+    bench_ingest,
+    bench_write_path
+);
 criterion_main!(benches);

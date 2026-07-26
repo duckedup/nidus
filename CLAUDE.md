@@ -303,3 +303,10 @@ docs (`docs/src/content/docs/getting-started.md`) and `README.md` to match (e.g.
 `nidus = "0.3"`) — but only when the `major.minor` changes, since the snippets pin
 `major.minor` (a patch bump like `0.12.1 → 0.12.2` leaves `nidus = "0.12"` correct).
 Those `[dependencies]` examples must not lag the released crate.
+
+**Do NOT hand-edit `charts/nidus/Chart.yaml` versions.** Both `version` and
+`appVersion` are stamped from `Cargo.toml` by `.github/workflows/helm-publish.yml` at
+release time, and the release job commits the stamp back (nidus-yap). A PR that bumps
+the crate should leave the chart alone — editing it just creates a conflict with the
+bot commit. This used to be a hand-edit enforced by a CI assertion; that fired on
+essentially every PR, which is why it is derived now.

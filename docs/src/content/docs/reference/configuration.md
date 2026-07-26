@@ -68,8 +68,12 @@ write (and thus takes the writer lock).
 
 ### `lock_ttl`
 
-`Duration` — default 60s. The window after which a stale writer lock (left by a
-crashed process) may be reclaimed.
+`Duration` — default 60s. The window after which a writer handle whose owner has gone
+silent may be reclaimed — a stale lock file left by a crashed single-node process, or, in
+[cluster mode](/guides/storage-backends/#cooperating-instances-cluster), an unrenewed lease.
+
+In a cluster it is the **failover-latency knob**, and there is a tuning guide for it:
+[choosing `--lock-ttl`](/guides/cli-and-server/#choosing---lock-ttl).
 
 ### `max_vector_bytes`
 
