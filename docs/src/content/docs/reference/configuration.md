@@ -202,7 +202,8 @@ pub enum Fsync {
 ```
 
 `PerBatch` loses at most the in-flight batch on a crash. `OnFlush` trades that
-guarantee for speed — useful for bulk loads you can afford to redo. See
+guarantee for speed — useful for bulk loads you can afford to redo — and takes
+*no* disk barrier per call, so the win is largest on small batches. See
 [the durability contract](/guides/storage/#the-durability-contract).
 
 ## `OpenMode`

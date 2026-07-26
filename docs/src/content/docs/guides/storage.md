@@ -41,10 +41,21 @@ committing `log` records, then fsyncs `log`. **A crash loses at most the
 in-flight batch** — everything fsynced before it is intact, and the in-RAM index
 is fully reproducible from the files.
 
-`Fsync::OnFlush` defers the fsync to an explicit
-[`flush()`](/reference/api/#flush) or close. This is faster but weaker: an
-unflushed batch can be lost on a crash. Use it when you are bulk-loading and can
-afford to redo the load on failure.
+`Fsync::OnFlush` defers **both** fsyncs to an explicit
+[`flush()`](/reference/api/#flush) or close, which re-establishes the same
+data-then-log ordering in one go. This is much faster but weaker: an unflushed
+batch can be lost on a crash. Use it when you are bulk-loading and can afford to
+redo the load on failure.
+
+How much faster depends entirely on how big your batches are, because what
+`OnFlush` removes is a fixed per-call cost. Ingesting one record per `upsert`
+call, it is a couple of hundred times quicker; at a thousand records per call
+the barrier is already amortised and the gap is closer to 2×.
+
+A crash under `OnFlush` can leave the `log` durable while the rows it references
+are not. That is not a torn store: replay ignores any record pointing past the
+end of `data`, so recovery drops the tail and opens cleanly on the prefix — the
+same rule that lets readers work lock-free.
 
 ## Graceful failure
 

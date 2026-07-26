@@ -372,8 +372,26 @@ impl Store {
             staged.push((rec.id.clone(), row, rec.attrs.clone()));
         }
 
-        // Phase 2: fsync data before writing log records.
-        if let Err(e) = self.data.sync() {
+        // Phase 2: fsync data before writing log records — under `PerBatch` only.
+        //
+        // Gated to match phase 4 below (nidus-4h2). It used to be unconditional, which
+        // made `Fsync::OnFlush` — documented as "fsync only on explicit flush(), faster,
+        // weaker durability" — still pay a full disk barrier per `upsert` CALL. Measured
+        // at ~3.8ms on APFS (where `sync_all` is `F_FULLFSYNC`), constant regardless of
+        // store size, so the "fast" policy delivered roughly half the speedup it promised
+        // and small batches were dominated by a barrier the caller had opted out of.
+        //
+        // Dropping it under `OnFlush` cannot corrupt the store. The ordering this sync
+        // enforces — data durable before the log records naming its rows — is re-created
+        // by `flush()`, which syncs data then log in exactly this order. In between, a
+        // crash can leave the log durable while the rows it references are not, and that
+        // is precisely the state the lock-free reader rule already handles: `replay_ops`
+        // ignores any `Upsert` whose row is beyond the data file (§6.2). The tail is
+        // dropped, never torn — which is the durability contract `OnFlush` advertises
+        // ("a crash can lose acknowledged writes").
+        if self.config.fsync == Fsync::PerBatch
+            && let Err(e) = self.data.sync()
+        {
             self.data
                 .truncate_to(data_mark)
                 .context("rollback data after failed sync")?;

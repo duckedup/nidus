@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use super::quant::{BinState, Int8State, Quant};
 use super::scoring::PARALLEL_SCAN_WORK_FLOOR;
 use super::*;
+use crate::Fsync;
 use crate::model::{Filter, Predicate, Quantization, Record, SearchOpts, Value};
 use crate::search::normalize;
 
@@ -602,6 +603,92 @@ fn upsert_rollback_survives_reopen() {
     let recs = store.get_all("col");
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].id, "a");
+}
+
+// ── Fsync::OnFlush durability (nidus-4h2) ─────────────────────────────────
+
+/// Everything written under `OnFlush` is present after `flush()` + reopen.
+///
+/// The happy-path guard for gating the phase-2 `data` sync: that sync is what used to
+/// order data ahead of the log on every call, and `flush()` is now solely responsible for
+/// establishing it. If the gate ever dropped writes, this fails first.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn on_flush_persists_every_batch_once_flushed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let mut store = Store::open(Config::new(&path, 2).fsync(Fsync::OnFlush)).unwrap();
+        // Several separate calls: under `OnFlush` none of them syncs on its own, so this
+        // is the case where a lost ordering guarantee would show up.
+        for i in 0..8 {
+            store
+                .upsert("col", &[rec(&format!("d{i}"), vec![i as f32, 1.0])])
+                .unwrap();
+        }
+        store.flush().unwrap();
+    }
+
+    let store = Store::open(Config::new(&path, 2).open_mode(OpenMode::ReadOnly)).unwrap();
+    assert_eq!(store.get_all("col").len(), 8);
+}
+
+/// A crash that leaves the log durable while the rows it names are not must drop the
+/// dangling tail and reopen cleanly — never fail, never surface a phantom record.
+///
+/// This is the exact state gating the phase-2 sync makes reachable under `OnFlush`, so it
+/// is the test that licenses the gate. Simulated by truncating `data` behind an intact
+/// log, which is what a machine crash between the two files looks like on restart. The
+/// surviving prefix must still be readable and searchable — a store that recovered into
+/// an unusable state would be no better than a torn one.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_log_ahead_of_data_tail_is_dropped_on_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let mut store = Store::open(Config::new(&path, 2).fsync(Fsync::OnFlush)).unwrap();
+        for i in 0..6 {
+            store
+                .upsert("col", &[rec(&format!("d{i}"), vec![i as f32, 1.0])])
+                .unwrap();
+        }
+        store.flush().unwrap();
+    }
+
+    // Lose the last two rows of `data` while the log still names all six — rows are a
+    // fixed `dim * 4` stride after the header, so dropping bytes off the end drops whole
+    // rows and leaves the header and the prefix intact.
+    let data_path = path.join("data");
+    let len = std::fs::metadata(&data_path).unwrap().len();
+    let stride = 2 * std::mem::size_of::<f32>() as u64;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&data_path)
+        .unwrap()
+        .set_len(len - 2 * stride)
+        .unwrap();
+
+    let store = Store::open(Config::new(&path, 2).open_mode(OpenMode::ReadOnly)).unwrap();
+    let recs = store.get_all("col");
+    assert_eq!(recs.len(), 4, "the two rowless records must be ignored");
+    let mut ids: Vec<&str> = recs.iter().map(|r| r.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["d0", "d1", "d2", "d3"]);
+
+    // The recovered prefix is a working store, not just a readable one.
+    let hits = store
+        .search(
+            &["col"],
+            &[0.0, 1.0],
+            &SearchOpts {
+                top_k: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(!hits.is_empty(), "recovered store must still serve search");
+    assert!(hits.iter().all(|h| h.id != "d4" && h.id != "d5"));
 }
 
 #[cfg_attr(miri, ignore)]
