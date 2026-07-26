@@ -98,9 +98,18 @@ just bench-write json=benchmarks/baselines/write-<version>.json   # record
 ```
 
 A printed table is for reading; a baseline is for **diffing**. `benchmarks/baselines/`
-holds committed runs so a change can be argued against a number rather than a memory —
-`write-0.36.0.json` is the reference for `nidus-xb9.1` (group commit), captured right
-after `nidus-4h2` removed the stray per-call fsync.
+holds committed runs so a change can be argued against a number rather than a memory:
+
+| baseline | what it is |
+| --- | --- |
+| `write-0.36.0.json` | before group commit, right after `nidus-4h2` removed the stray per-call fsync — every write pays its own barrier |
+| `write-0.37.0.json` | after group commit (`nidus-xb9.1`) |
+
+The concurrent-writer sweep is where the two differ, and the `writes/barrier` column says
+why: on the same box, 8 clients at 384-d went **85k → 134k vectors/s** at 3.0 writes per
+barrier, and at 768-d **70k → 85k** at 2.3. At 1 and 2 clients the column reads `1.00` —
+group commit forms no group when nothing is waiting, so the uncontended path is untouched,
+which is the property to check first if that number ever drifts above 1 at one client.
 
 The file records the *inputs* (`n`, `dim`, `batch`, `clients`, `max_requests`, `seed`)
 next to the results, because a baseline compared against a run with different knobs is

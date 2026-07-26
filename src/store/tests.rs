@@ -532,6 +532,8 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         scan_order: std::sync::RwLock::new(None),
         loaded_log_offset: 0,
         manifest_cas: None,
+        defer_barrier: false,
+        pending_barrier: false,
     };
     store.create_collection("col").unwrap();
     store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
@@ -3829,6 +3831,11 @@ mod object_backed {
         /// Per-key read count (`get` + `get_cas`), so a test can assert which objects a
         /// refresh fetched — e.g. that an incremental refresh skips immutable segments.
         gets: Mutex<HashMap<String, u64>>,
+        /// Per-key **durable write** count (`put` + `put_cas`). On a whole-object backend a
+        /// segment's `sync()` *is* a `put`, so this counts barriers the way an fsync counter
+        /// would on local files — which is what makes group-commit coalescing directly
+        /// measurable rather than inferred (nidus-xb9.1).
+        puts: Mutex<HashMap<String, u64>>,
     }
 
     impl InMemObjectStore {
@@ -3853,6 +3860,23 @@ mod object_backed {
         fn reset_gets(&self) {
             self.gets.lock().unwrap().clear();
         }
+        /// Record a durable write of `key`.
+        fn note_put(&self, key: &str) {
+            *self
+                .puts
+                .lock()
+                .unwrap()
+                .entry(key.to_string())
+                .or_insert(0) += 1;
+        }
+        /// How many times `key` has been durably written.
+        fn put_count(&self, key: &str) -> u64 {
+            self.puts.lock().unwrap().get(key).copied().unwrap_or(0)
+        }
+        /// Forget all write counts (call before the action under test).
+        fn reset_puts(&self) {
+            self.puts.lock().unwrap().clear();
+        }
     }
 
     impl Persistence for InMemObjectStore {
@@ -3866,6 +3890,7 @@ mod object_backed {
                 .map(|(b, _)| b.clone()))
         }
         fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+            self.note_put(key);
             let g = self.bump();
             self.objects
                 .lock()
@@ -3909,6 +3934,7 @@ mod object_backed {
             if !matches {
                 return Ok(CasOutcome::Stale);
             }
+            self.note_put(key);
             let g = self.next_gen.fetch_add(1, Ordering::Relaxed) + 1;
             objs.insert(key.to_string(), (bytes.to_vec(), g));
             Ok(CasOutcome::Written(Some(g.to_string())))
@@ -4303,6 +4329,162 @@ mod object_backed {
             "a restructure (seal) re-opens every segment, including the immutable base"
         );
         assert_eq!(r.get_all("col").len(), 5);
+    }
+
+    /// **Group commit issues fewer barriers than there are batches — counted, not inferred.**
+    ///
+    /// On a whole-object backend a segment's `sync()` *is* a `put`, so `put_count` is a direct
+    /// barrier counter: the same measurement an fsync counter makes on local files, but
+    /// deterministic and Miri-clean. The assertion the ticket asks for (nidus-xb9.1) is the
+    /// comparison between the two halves — same four batches, same bytes, four barriers versus
+    /// one.
+    #[test]
+    fn group_commit_coalesces_the_barrier_across_batches() {
+        let raw = Arc::new(InMemObjectStore::default());
+        let backend: Arc<dyn Persistence> = raw.clone();
+        let mut store = Store::open_with(cfg(), "s3://bucket/store", backend, None).unwrap();
+        store.create_collection("col").unwrap();
+
+        // Baseline: four separate batches, each taking its own barrier.
+        raw.reset_puts();
+        for i in 0..4u32 {
+            store
+                .upsert("col", &[rec(&format!("solo-{i}"), vec![1.0, 0.0, 0.0])])
+                .unwrap();
+        }
+        let (solo_data, solo_log) = (raw.put_count("data"), raw.put_count("log"));
+        assert_eq!(
+            (solo_data, solo_log),
+            (4, 4),
+            "without group commit every batch pays its own data+log barrier"
+        );
+
+        // The same four batches inside one deferred scope, closed by one `commit`.
+        raw.reset_puts();
+        let prev = store.begin_deferred();
+        for i in 0..4u32 {
+            store
+                .upsert("col", &[rec(&format!("group-{i}"), vec![0.0, 1.0, 0.0])])
+                .unwrap();
+        }
+        store.end_deferred(prev);
+        assert_eq!(
+            (raw.put_count("data"), raw.put_count("log")),
+            (0, 0),
+            "a deferred batch appends without taking a barrier"
+        );
+        store.commit().unwrap();
+        assert_eq!(
+            (raw.put_count("data"), raw.put_count("log")),
+            (1, 1),
+            "one barrier covers the whole group"
+        );
+
+        // And the data is all there — coalescing barriers must not lose batches.
+        assert_eq!(store.get_all("col").len(), 8);
+
+        // A second `commit` with nothing owed is free: no barrier, so the uncontended
+        // single-writer path is not taxed by a redundant fsync.
+        raw.reset_puts();
+        store.commit().unwrap();
+        assert_eq!((raw.put_count("data"), raw.put_count("log")), (0, 0));
+    }
+
+    /// **In cluster mode the coalesced group publishes the commit counter once, not per batch.**
+    ///
+    /// The manifest publish is a CAS round trip to the object store on every durable batch, so
+    /// on a cluster writer it is a second per-call cost sitting beside the fsync. Group commit
+    /// has to fold that one too, and — the part worth asserting — the commit counter must still
+    /// end up advanced, or peers would never see the group at all.
+    #[test]
+    fn group_commit_publishes_one_cluster_commit_for_the_group() {
+        let raw = Arc::new(InMemObjectStore::default());
+        let backend: Arc<dyn Persistence> = raw.clone();
+        let tier = Arc::new(LocalRam::new());
+        let mem: Box<dyn MemoryTier> = Box::new(tier.clone());
+        let mut w = Store::open_with(
+            cluster_cfg(),
+            "s3://bucket/store",
+            backend.clone(),
+            Some(mem),
+        )
+        .unwrap();
+        w.create_collection("col").unwrap();
+
+        let before = Manifest::load(backend.as_ref()).unwrap().unwrap().version;
+        raw.reset_puts();
+        let prev = w.begin_deferred();
+        for i in 0..3u32 {
+            w.upsert("col", &[rec(&format!("g-{i}"), vec![1.0, 0.0, 0.0])])
+                .unwrap();
+        }
+        w.end_deferred(prev);
+        w.commit().unwrap();
+        assert_eq!(
+            raw.put_count("manifest"),
+            1,
+            "three batches, one manifest publish"
+        );
+
+        let after = Manifest::load(backend.as_ref()).unwrap().unwrap().version;
+        assert!(
+            after > before,
+            "the commit counter must still advance, or a reader never sees the group \
+             ({before} → {after})"
+        );
+        let mut r = cluster_reader(&backend, &tier);
+        assert_eq!(
+            r.get_all("col").len(),
+            3,
+            "and a peer picks the whole group up on one refresh"
+        );
+        assert!(!r.refresh().unwrap(), "which leaves it current");
+    }
+
+    /// **A failed barrier fails every write in its group.**
+    ///
+    /// The one way group commit could become a lie: N writes applied, the shared barrier
+    /// fails, and some of them are reported successful anyway. Here the writer is superseded
+    /// mid-group (a peer commits a manifest under it), so the CAS at the commit point refuses
+    /// — and `commit` must surface that rather than swallowing it, because the caller is
+    /// waiting on it to decide whether to answer `200`.
+    #[test]
+    fn a_failed_group_barrier_is_reported_not_swallowed() {
+        let raw = Arc::new(InMemObjectStore::default());
+        let backend: Arc<dyn Persistence> = raw.clone();
+        let tier = Arc::new(LocalRam::new());
+        let mem: Box<dyn MemoryTier> = Box::new(tier.clone());
+        let mut w = Store::open_with(
+            cluster_cfg(),
+            "s3://bucket/store",
+            backend.clone(),
+            Some(mem),
+        )
+        .unwrap();
+        w.create_collection("col").unwrap();
+
+        let prev = w.begin_deferred();
+        for i in 0..3u32 {
+            w.upsert("col", &[rec(&format!("g-{i}"), vec![1.0, 0.0, 0.0])])
+                .unwrap();
+        }
+        w.end_deferred(prev);
+
+        // Someone else advances the manifest: this writer's CAS token is now stale.
+        let m = backend.get("manifest").unwrap().unwrap();
+        backend.put("manifest", &m).unwrap();
+
+        let err = w
+            .commit()
+            .expect_err("a superseded writer's group barrier must fail");
+        assert!(err.to_string().contains("lease lost"), "{err}");
+
+        // Still owed: a failed barrier must not clear the debt, or the next `commit` would
+        // report durability that never happened.
+        let err = w
+            .commit()
+            .expect_err("the barrier is still owed and retried");
+        assert!(err.to_string().contains("lease lost"), "{err}");
     }
 }
 

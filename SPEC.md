@@ -400,6 +400,29 @@ large (e.g. hundreds of docs) and infrequent during indexing, so the cost is
 negligible and durability is real. `flush()` exists for callers that want an
 explicit barrier.
 
+That assumption — batches large and infrequent — holds for an indexer and breaks for a
+*served* store, where the barrier is a per-call cost measured at ~7.6ms regardless of
+payload, and several writes are genuinely in flight at once. **Group commit** (nidus-xb9.1)
+is the answer, and it is a change to *who calls the barrier*, not to the policy:
+
+- `Nidus::deferred(f)` runs `f`'s mutations with their barrier deferred — appended, indexed,
+  not synced.
+- `Nidus::commit()` then takes **one** barrier for all of them, in the §6.2 order (`data`,
+  then `log`), plus one commit-counter publish in cluster mode instead of one per batch.
+
+The obligation this shifts onto the caller is explicit and is the whole of the correctness
+argument: **nothing may be reported successful until `commit()` returns `Ok`.** Until then
+the bytes are appended but not durable, which is exactly the tail state §6.2's reader rule
+already drops on replay — so a crash in that window loses the un-acknowledged batch and
+nothing else. A failed barrier fails every member of its group.
+
+`nidus serve` is the host that does this: concurrent writes queue, the first to reach the
+store applies the whole queue under one exclusive guard, one barrier covers them, and only
+then does each request get its `200`. There is no timed window — a lone write forms a group
+of one and pays exactly what it always did — so the uncontended path is untouched while the
+contended one stops paying N barriers for N writes. `nidus_write_groups_total` /
+`nidus_write_group_members_total` report the resulting coalescing factor.
+
 ### 6.5 Concurrency & speed
 The hot path (`search`) is pure CPU over in-RAM data — there is no IO to await — so
 the core API is **synchronous on purpose**. An `async` core would add executor

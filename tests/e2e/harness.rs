@@ -382,6 +382,29 @@ fn await_addr(
     }
 }
 
+/// Scrape `/metrics` as text.
+///
+/// Deliberately not [`RunningServer::get`]: the exposition is `text/plain`, so the JSON
+/// decode there would flatten every sample to `Value::Null`. Lives here rather than in one
+/// suite because more than one of them reads the scrape.
+pub fn scrape(server: &RunningServer) -> String {
+    ureq::get(format!("{}/metrics", server.base_url()))
+        .call()
+        .expect("scrape /metrics")
+        .into_body()
+        .read_to_string()
+        .expect("metrics body")
+}
+
+/// Pull a single unlabelled sample out of a Prometheus text exposition.
+pub fn metric(scrape: &str, name: &str) -> Option<f64> {
+    scrape.lines().find_map(|l| {
+        l.strip_prefix(name)
+            .filter(|rest| rest.starts_with(' '))
+            .and_then(|rest| rest.trim().parse().ok())
+    })
+}
+
 /// Read a response into `(status, json)`, tolerating a non-JSON body.
 fn read(res: ureq::http::Response<ureq::Body>, path: &str, stderr: &str) -> (u16, Value) {
     let status = res.status().as_u16();

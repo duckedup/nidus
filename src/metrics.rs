@@ -96,6 +96,17 @@ pub struct Metrics {
     /// Backend errors seen while a standby waited for the writer handle.
     pub lease_wait_errors: Counter,
 
+    // ── Write path / durability (nidus-xb9.1) ────────────────────────────────
+    /// Mutating batches that needed a durable barrier (upserts, deletes, …).
+    pub write_batches: Counter,
+    /// Durable barriers actually issued — one fsync of `data` then `log`.
+    ///
+    /// The pair above is the whole point: without group commit these two counters move
+    /// together, and every batch pays its own disk barrier. With it, `write_batches`
+    /// outruns `durability_barriers` by the average group size, which is exactly the
+    /// coalescing factor and the only honest way to see it from outside.
+    pub durability_barriers: Counter,
+
     // ── Object store / memory tier ───────────────────────────────────────────
     /// HTTP requests to a backend that were retried (per retry, not per request).
     pub backend_retries: Counter,
@@ -129,6 +140,8 @@ impl Metrics {
             lease_renew_lost: Counter::new(),
             lease_fenced: Counter::new(),
             lease_wait_errors: Counter::new(),
+            write_batches: Counter::new(),
+            durability_barriers: Counter::new(),
             backend_retries: Counter::new(),
             refresh_failures: Counter::new(),
             search_queries: Counter::new(),
@@ -156,6 +169,8 @@ impl Metrics {
             lease_renew_lost,
             lease_fenced,
             lease_wait_errors,
+            write_batches,
+            durability_barriers,
             backend_retries,
             refresh_failures,
             search_queries,
@@ -196,6 +211,16 @@ impl Metrics {
                 "nidus_lease_wait_errors_total",
                 "Backend errors while waiting for the writer handle",
                 lease_wait_errors.get(),
+            ),
+            (
+                "nidus_write_batches_total",
+                "Mutating batches that needed a durable barrier",
+                write_batches.get(),
+            ),
+            (
+                "nidus_durability_barriers_total",
+                "Durable barriers issued (one fsync of data then log)",
+                durability_barriers.get(),
             ),
             (
                 "nidus_backend_retries_total",

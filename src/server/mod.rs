@@ -10,6 +10,7 @@
 //! the public API.
 
 mod auth;
+mod commit;
 pub mod dto;
 mod limits;
 mod metrics;
@@ -129,6 +130,10 @@ struct AppState {
     /// (nidus-abx.2). `Arc` because `AppState` is cloned per request and the permit pool
     /// must be the *same* pool for all of them — a per-clone semaphore would cap nothing.
     limits: Arc<limits::Limits>,
+    /// Group commit for the write path (nidus-xb9.1): concurrent writes are applied together
+    /// under one store guard and share one disk barrier instead of taking one each. `Arc` for
+    /// the same reason as `limits` — a per-clone queue would coalesce nothing.
+    commit: Arc<commit::Committer>,
     /// Shared embedder for the `memory` routes; `None` disables them (→ `400`).
     #[cfg(feature = "memory")]
     embedder: Option<Arc<AnyEmbedder>>,
@@ -169,6 +174,7 @@ where
             cfg.body_idle_timeout,
             cfg.max_body_bytes,
         )),
+        commit: commit::Committer::new(),
         #[cfg(feature = "memory")]
         embedder: cfg.embedder,
         #[cfg(all(feature = "memory", feature = "summarize"))]
@@ -1077,27 +1083,32 @@ where
     .map_err(ApiError::from)
 }
 
-/// Run a **write** operation on a blocking task under the exclusive lock.
+/// Run a **write** operation under the exclusive lock, **group-committed**: it is applied
+/// together with whatever other writes are queued at that moment, and the group shares one
+/// disk barrier (see [`commit`], nidus-xb9.1).
+///
+/// The result is returned only after that barrier succeeds, so this is exactly as durable as
+/// the fsync-per-call path it replaced — a `200` from here still means the bytes are on disk.
+/// A single writer with nothing queued beside it forms a group of one and pays the same
+/// append-then-barrier it always did.
 async fn run_write<F, T>(st: AppState, f: F) -> Result<T, ApiError>
 where
     F: FnOnce(&mut Nidus) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
+    // Refuse before queueing when there is no store to write to, so the honest `503` comes
+    // from here rather than from the committer's cannot-answer fallback. Reads an atomic, not
+    // the store lock — a queue of writes must not be able to delay this.
+    if !st.open.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(ApiError::from(not_open()));
+    }
+    // Picked up on the async side for the same reason as in `run_read`: a task-local does not
+    // follow work onto the blocking thread that ends up applying it.
     let cancel = limits::current_cancel();
-    tokio::task::spawn_blocking(move || {
-        let mut db = st
-            .db
-            .write()
-            .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
-        let db = db.as_mut().ok_or_else(not_open)?;
-        match cancel {
-            Some(cancel) => cancel.scope(|| f(db)),
-            None => f(db),
-        }
-    })
-    .await
-    .map_err(|e| ApiError::internal(anyhow::anyhow!("task join error: {e}")))?
-    .map_err(ApiError::from)
+    st.commit
+        .submit(st.db.clone(), cancel, f)
+        .await
+        .map_err(ApiError::from)
 }
 
 // ── Error response ──────────────────────────────────────────────────────────
@@ -1213,6 +1224,7 @@ fn test_state(db: Option<Nidus>) -> AppState {
             None,
             16 * 1024 * 1024,
         )),
+        commit: commit::Committer::new(),
         #[cfg(feature = "memory")]
         embedder: None,
         #[cfg(all(feature = "memory", feature = "summarize"))]
@@ -1386,6 +1398,111 @@ mod tests {
         drop(guard);
         let resp = app.clone().oneshot(get("/cluster")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "and it recovers once free");
+    }
+
+    /// **Concurrent writes are applied as one group sharing one barrier** (nidus-xb9.1).
+    ///
+    /// The measured ceiling this exists to move is the per-call disk barrier: `~7.6ms` paid
+    /// once per `upsert` *call*, so eight concurrent clients used to take eight barriers to
+    /// commit eight batches. What has to be true afterwards is that the group actually forms —
+    /// `writes > groups` — and that every request in it still gets its `200`.
+    ///
+    /// Forming a group deterministically needs the writes to genuinely overlap, so the store
+    /// guard is held while they queue. That is not a contrivance: it is exactly the state a
+    /// server is in whenever a write is already running when the next arrives, which the
+    /// concurrency sweep showed is most of the time under load.
+    // The guard is held across awaits on purpose (see `a_busy_store_is_still_ready`): it is
+    // what puts several writes in the queue at once. The tasks below are spawned, not awaited,
+    // so nothing here waits on the lock it holds.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_share_one_barrier_and_all_still_get_their_200() {
+        let (app, state) = router_and_state(3);
+
+        const N: usize = 8;
+        let guard = state.db.write().unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let app = app.clone();
+            tasks.spawn(async move {
+                app.oneshot(post(
+                    "/collections/docs/upsert",
+                    json!({"records": [{"id": format!("d{i}"), "vector": [1, 0, 0], "attrs": {}}]}),
+                ))
+                .await
+                .unwrap()
+                .status()
+            });
+        }
+        // Wait until every write has reached the queue. The leader is parked on the guard held
+        // below, so none of them can complete — but it may already have *drained* them, which
+        // is why this waits on the monotonic submitted count rather than the queue's length:
+        // the length is 0 in exactly the case where the coalescing worked best.
+        //
+        // `sleep`, not `yield_now`: this thread has to genuinely stand aside, and the test
+        // binary runs hundreds of tests at once, so a spin loop just keeps the CPU it is
+        // waiting for the workers to have.
+        for _ in 0..2_000 {
+            if state.commit.submitted() >= N as u64 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            state.commit.submitted(),
+            N as u64,
+            "not every write reached the queue, so this test would not be measuring group commit"
+        );
+        drop(guard);
+
+        while let Some(status) = tasks.join_next().await {
+            assert_eq!(
+                status.unwrap(),
+                StatusCode::OK,
+                "sharing a barrier must not cost any request its acknowledgement"
+            );
+        }
+
+        let (groups, writes) = state.commit.stats();
+        assert_eq!(writes, N as u64, "every write was applied exactly once");
+        assert!(
+            groups < writes,
+            "the point of group commit: {writes} writes committed in {groups} groups"
+        );
+
+        // And all of it is in the store — coalescing barriers must not lose writes.
+        let resp = app
+            .oneshot(post("/list", json!({"limit": 100})))
+            .await
+            .unwrap();
+        assert_eq!(json_body(resp).await.as_array().unwrap().len(), N);
+    }
+
+    /// **A single write forms a group of one and is never made to wait for company.**
+    ///
+    /// The classic way to get group commit wrong is a timed window: throughput rises under load
+    /// and every uncontended write pays a delay it gains nothing from. There is no window here,
+    /// and this is the guard against one appearing — with nothing else queued, one request must
+    /// produce exactly one group.
+    #[tokio::test]
+    async fn a_lone_write_commits_immediately_as_a_group_of_one() {
+        let (app, state) = router_and_state(3);
+        for i in 0..3 {
+            let resp = app
+                .clone()
+                .oneshot(post(
+                    "/collections/docs/upsert",
+                    json!({"records": [{"id": format!("d{i}"), "vector": [1, 0, 0], "attrs": {}}]}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            state.commit.stats(),
+            (3, 3),
+            "three sequential writes must be three groups of one, with no waiting"
+        );
     }
 
     /// **A poisoned store lock must report UNHEALTHY** so liveness restarts the process

@@ -12,7 +12,7 @@ use std::net::TcpStream;
 use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
 use std::time::{Duration, Instant};
 
-use crate::harness::Server;
+use crate::harness::{Server, metric, scrape};
 
 /// Vectors seeded before the load test, so a search does enough work to overlap with its
 /// neighbours rather than completing before the next connection is even accepted.
@@ -414,23 +414,4 @@ fn a_loopback_bind_prints_no_security_warning() {
         !log.contains("off-loopback"),
         "a localhost server must not cry wolf:\n{log}"
     );
-}
-
-/// Scrape `/metrics` as text.
-fn scrape(server: &crate::harness::RunningServer) -> String {
-    ureq::get(format!("{}/metrics", server.base_url()))
-        .call()
-        .expect("scrape /metrics")
-        .into_body()
-        .read_to_string()
-        .expect("metrics body")
-}
-
-/// Pull a single unlabelled sample out of a Prometheus text exposition.
-fn metric(scrape: &str, name: &str) -> Option<f64> {
-    scrape.lines().find_map(|l| {
-        l.strip_prefix(name)
-            .filter(|rest| rest.starts_with(' '))
-            .and_then(|rest| rest.trim().parse().ok())
-    })
 }

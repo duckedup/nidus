@@ -397,3 +397,95 @@ fn a_long_write_does_not_make_the_instance_report_unready() {
         "the upsert completed too quickly to exercise the race (only {probes} probes overlapped)"
     );
 }
+
+/// **Group commit does not weaken durability: every acknowledged concurrent write survives
+/// SIGKILL** (nidus-xb9.1).
+///
+/// This is the assertion the ticket asks for, and the only one that can be trusted. Group
+/// commit is a promise that N writes share one disk barrier *without* any of them being
+/// acknowledged early — and a throughput number cannot tell the difference between keeping
+/// that promise and quietly dropping the barrier. Only a crash can.
+///
+/// So: hammer one server with concurrent writers, keep the id of every write that came back
+/// `200`, `SIGKILL` the process (nothing flushes, no destructor runs, no graceful shutdown),
+/// restart over the same directory, and demand that every single acknowledged id is there. A
+/// bug that acknowledged before the barrier — or that let one group's barrier cover a write
+/// appended after it — shows up here as a missing record, and nowhere else.
+///
+/// The concurrency is what makes it a group-commit test rather than a restatement of
+/// `killed_server_leaves_data_intact_and_lock_reclaimable`: with a single client every group
+/// has one member and the shared barrier is never exercised at all.
+#[test]
+fn every_acknowledged_concurrent_write_survives_sigkill() {
+    let dir = tempfile::tempdir().unwrap();
+    // A short TTL so the abandoned lock from the kill is reclaimable without a long wait.
+    let server = Server::new(dir.path(), 3).args(["--lock-ttl", "1"]).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+
+    const WRITERS: usize = 8;
+    const PER_WRITER: usize = 12;
+
+    // Only ids the server actually answered `200` for. An id whose request failed, or whose
+    // response never arrived, proves nothing either way and must not be asserted on.
+    let acked: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let server = &server;
+                scope.spawn(move || {
+                    let mut ok = Vec::new();
+                    for r in 0..PER_WRITER {
+                        let id = format!("w{w}-{r}");
+                        let body = json!({"records": [
+                            {"id": id, "vector": [1, 0, 0], "attrs": {}}
+                        ]});
+                        let (status, resp) = server.post("/collections/docs/upsert", &body);
+                        assert_eq!(status, 200, "upsert {id} failed: {resp}");
+                        ok.push(id);
+                    }
+                    ok
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("no writer thread panicked"))
+            .collect()
+    });
+    assert_eq!(acked.len(), WRITERS * PER_WRITER);
+
+    // Before the crash, confirm the writes really did share barriers — otherwise this test
+    // would pass just as well with group commit removed, and would be measuring nothing.
+    let text = crate::harness::scrape(&server);
+    let groups = crate::harness::metric(&text, "nidus_write_groups_total").expect("groups");
+    let members =
+        crate::harness::metric(&text, "nidus_write_group_members_total").expect("group members");
+    assert!(
+        members > groups,
+        "the writes never overlapped ({members} writes in {groups} groups), so this run did \
+         not exercise a shared barrier"
+    );
+
+    // The crash. Not a shutdown: `kill` is SIGKILL, so nothing flushes and nothing runs on
+    // the way out. Whatever is on disk now is whatever the barriers put there.
+    server.kill();
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let restarted = Server::new(dir.path(), 3).args(["--lock-ttl", "1"]).start();
+    let (status, records) = restarted.post("/list", &json!({"limit": 10_000}));
+    assert_eq!(status, 200);
+    let survivors: std::collections::HashSet<String> = records
+        .as_array()
+        .expect("a list response")
+        .iter()
+        .map(|r| r["id"].as_str().expect("an id").to_string())
+        .collect();
+
+    let lost: Vec<&String> = acked.iter().filter(|id| !survivors.contains(*id)).collect();
+    assert!(
+        lost.is_empty(),
+        "{} of {} acknowledged writes did not survive the crash: {lost:?} — a 200 was returned \
+         before its bytes were durable",
+        lost.len(),
+        acked.len()
+    );
+}

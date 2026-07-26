@@ -153,6 +153,29 @@ impl ServeProcess {
     pub fn post_bytes(&self, path: &str, bytes: &[u8]) -> Result<Value> {
         post_on(&self.agent, &self.base, path, bytes)
     }
+
+    /// One unlabelled sample from `GET /metrics`.
+    ///
+    /// A benchmark that reports only wall clock can say a change made things faster; it
+    /// cannot say *why*. Reading the server's own counters lets a run attribute the number
+    /// to the mechanism — e.g. how many writes actually shared a barrier (nidus-xb9.1)
+    /// rather than inferring it from the shape of the curve.
+    pub fn metric(&self, name: &str) -> Result<f64> {
+        let text = self
+            .agent
+            .get(format!("{}/metrics", self.base))
+            .call()
+            .context("scrape /metrics")?
+            .into_body()
+            .read_to_string()?;
+        text.lines()
+            .find_map(|l| {
+                l.strip_prefix(name)
+                    .filter(|rest| rest.starts_with(' '))
+                    .and_then(|rest| rest.trim().parse().ok())
+            })
+            .with_context(|| format!("no sample named {name} in the scrape"))
+    }
 }
 
 /// [`ServeProcess::post_bytes`] against a borrowed agent, for worker threads that hold a

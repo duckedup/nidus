@@ -280,6 +280,23 @@ pub struct Store {
     /// can read it through a [`Readiness`] handle **without the store lock** — a busy
     /// instance must not report itself unready (nidus-abx.3).
     last_verified: Arc<std::sync::atomic::AtomicU64>,
+    /// The host has taken over responsibility for the durable barrier — **group commit**
+    /// (nidus-xb9.1). Set only for the duration of [`Nidus::deferred`](crate::Nidus::deferred):
+    /// mutations inside that scope append and update RAM as usual but issue no fsync, so N of
+    /// them can share the one barrier [`commit`](Store::commit) issues afterwards.
+    ///
+    /// A plain `bool` rather than a config knob because it is not a durability *policy* — the
+    /// policy is still [`Config::fsync`](crate::Config::fsync) — it is a statement about who
+    /// calls the barrier, and it must be scoped to the call that made the promise.
+    defer_barrier: bool,
+    /// Bytes are appended that no barrier has covered yet, so [`commit`](Store::commit) /
+    /// [`flush`](Store::flush) owes them an fsync (and, in cluster mode, a commit-counter
+    /// bump). Set by every mutation that did not sync itself — whether because the host
+    /// deferred it (`defer_barrier`) or because the configured policy is
+    /// [`Fsync::OnFlush`](crate::Fsync::OnFlush) — and cleared by the barrier that covers
+    /// them. It is what lets `commit` be a genuine no-op when nothing is owed, which is what
+    /// keeps the single-writer path exactly as fast as it was.
+    pending_barrier: bool,
 }
 
 impl Store {
@@ -488,6 +505,8 @@ impl Store {
             manifest_cas,
             fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_verified: Arc::new(std::sync::atomic::AtomicU64::new(mono_millis())),
+            defer_barrier: false,
+            pending_barrier: false,
         };
 
         // Whether the in-RAM index now differs from any tier snapshot — true if we built
@@ -589,6 +608,8 @@ impl Store {
             manifest_cas: None,
             fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_verified: Arc::new(std::sync::atomic::AtomicU64::new(mono_millis())),
+            defer_barrier: false,
+            pending_barrier: false,
             config,
         };
         // Align `seg_indexes` to the (single, empty) segment so a later seal can update it

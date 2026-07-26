@@ -238,6 +238,10 @@ struct HttpPass {
     wall: Duration,
     /// Summed client-side JSON encoding, excluded from `wall`'s attribution below.
     encode: Duration,
+    /// Writes per durable barrier over the pass — the group-commit coalescing factor
+    /// (nidus-xb9.1), read from the server's own counters. `1.0` means every write took its
+    /// own fsync, which is what this pass looked like before group commit.
+    coalescing: f64,
 }
 
 /// Ingest the plan over HTTP with `clients` concurrent writers.
@@ -310,9 +314,14 @@ fn http_pass(dataset: &Dataset, plan: &Plan, fsync: Fsync, clients: usize) -> Re
         proc.post("/flush", &json!({}))?;
     }
 
+    // Scraped after the clock is read, so the extra request never lands inside the timing.
+    let groups = proc.metric("nidus_write_groups_total")?;
+    let members = proc.metric("nidus_write_group_members_total")?;
+
     Ok(HttpPass {
         wall,
         encode: Duration::from_nanos(encode_nanos.load(Ordering::Relaxed)),
+        coalescing: if groups > 0.0 { members / groups } else { 0.0 },
     })
 }
 
@@ -522,9 +531,13 @@ fn run() -> Result<()> {
         #[cfg(feature = "server")]
         {
             println!("\n── concurrent writers  n={v} dim={dim} batch={batch}  ────────────────");
+            // `writes/barrier` is the group-commit coalescing factor read off the server's
+            // own counters (nidus-xb9.1) — without it a rising throughput curve cannot be
+            // told apart from the machine simply having more cores to spend, and a *flat*
+            // one cannot be told apart from group commit having silently stopped working.
             println!(
-                "{:<10} {:>14} {:>12}",
-                "clients", "vectors/s", "vs 1 client"
+                "{:<10} {:>14} {:>12} {:>16}",
+                "clients", "vectors/s", "vs 1 client", "writes/barrier"
             );
             let mut baseline = 0.0;
             for (i, &c) in args.clients.iter().enumerate() {
@@ -534,12 +547,17 @@ fn run() -> Result<()> {
                     baseline = rate;
                 }
                 println!(
-                    "{:<10} {:>14} {:>11.2}x",
+                    "{:<10} {:>14} {:>11.2}x {:>15.2}",
                     c,
                     fmt_count(rate),
-                    if baseline > 0.0 { rate / baseline } else { 0.0 }
+                    if baseline > 0.0 { rate / baseline } else { 0.0 },
+                    http.coalescing
                 );
-                by_clients.push(json!({ "clients": c, "per_s": rate }));
+                by_clients.push(json!({
+                    "clients": c,
+                    "per_s": rate,
+                    "writes_per_barrier": http.coalescing,
+                }));
             }
         }
 

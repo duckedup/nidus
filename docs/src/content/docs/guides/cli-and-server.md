@@ -266,16 +266,41 @@ case where restarting it is the right response.
 Pass a number of seconds (`--wait-for-lease 300`) to give up after that long instead of
 waiting indefinitely — useful in a script that should not hang.
 
-`--lock-ttl` is the failover-latency knob: it bounds how long a dead writer's handle stays
-un-reclaimable, and so how long promotion takes (within a second either side — lease stamps
-have one-second granularity, and the reclaim rule errs towards leaving a live writer alone).
-Lower is faster. It does not need to be sized against your largest batch: the writer renews
-its lease on a timer at a third of the TTL, independently of any write, so a very large batch
-or a slow object-store `PUT` no longer risks having a healthy writer replaced mid-flight.
+### Choosing `--lock-ttl`
 
-A renewal that fails because the object store was briefly unreachable does not fence the
-writer either — only the store actually reporting a different lease owner does. A blip costs
-the write in flight, not the instance.
+`--lock-ttl` bounds how long a dead writer's handle stays un-reclaimable, and therefore how
+long promotion takes (within a second either side — lease stamps have one-second granularity,
+and the reclaim rule errs towards leaving a live writer alone). Lower is faster failover.
+The default is 60s; 10–30s is a reasonable cluster setting.
+
+**It is failover latency, not a write budget.** The writer renews its lease on a timer at a
+third of the TTL, out of band and without the store lock, so renewal continues *during* a
+long write. You do not need to size the TTL against your largest batch, and a slow
+object-store `PUT` no longer risks a healthy writer being replaced mid-flight. An idle writer
+is kept alive by the same timer — issuing no writes for hours does not put its lease at risk.
+
+What the two directions actually cost:
+
+| | Too low | Too high |
+| --- | --- | --- |
+| Cost | A run of failed renewals — an object store having a bad minute — can expire a lease that a healthy writer still believes it holds | A crashed writer's slice of the store is read-only for that long before a standby takes over |
+| Floor | Renewal is `TTL/3`, so anything under a few seconds gives the renewer no room to retry through a blip | — |
+
+That first case is *safe*, just disruptive: the superseded writer is
+[fenced](/guides/storage-backends/#cooperating-instances-cluster), not allowed to clobber —
+every durable write is compare-and-swapped against the version it last saw, so its next batch
+is refused rather than applied. You lose the writer, never the data. It reports `503` from
+`/ready` immediately (the background renewer latches the state; nobody has to wait for a
+write to discover it), and an orchestrator recycles it. Set the TTL so that does not happen
+on an ordinary hiccup.
+
+A renewal that fails because the object store was briefly unreachable does **not** fence the
+writer — only the store actually reporting a different lease owner does. That distinction is
+why a blip costs the write in flight rather than the instance.
+
+If failover latency matters more than the TTL can give you, run a standby with
+`--wait-for-lease`: it is already up, already warm, and takes over the moment the handle
+becomes claimable, so promotion is the TTL and not the TTL plus a cold start.
 
 ### Keeping readers current, and noticing when they are not
 
@@ -311,7 +336,8 @@ no rebalancing. Writes are fenced (a superseded writer is refused rather than al
 clobber committed data) and `--lock-ttl` sets the lease window. If you only want more
 capacity across a few machines, a simpler shape needs none of this: run one independent
 instance per box and fan queries out client-side, merging the top-k yourself — sound because
-every instance shares one embedding space.
+every instance shares one embedding space. See
+[running across a few boxes](/guides/multi-box/) for the recipe.
 
 ## Backup & restore
 
