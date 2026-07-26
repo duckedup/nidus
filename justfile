@@ -218,6 +218,24 @@ sdk-js-test-all: build-cli
 sdk-js-build:
     cd sdks/js && npm install && npm run build
 
+# Go SDK: unit tests (httptest.Server — no server binary needed)
+sdk-go-test:
+    cd sdks/go && go test ./...
+
+# `gofmt -l` exits 0 even when it names files, so its output is tested for
+# emptiness — the same guard the CI job uses.
+# Go SDK: format check + vet
+sdk-go-lint:
+    cd sdks/go && test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+    cd sdks/go && go vet ./...
+
+# Go SDK: full test incl. integration against a real `nidus serve`.
+# Builds the binary first and points the suite at it via NIDUS_BIN. The integration
+# tests are behind a build tag, so they are invisible to `sdk-go-test` above.
+sdk-go-test-all: build-cli
+    cd sdks/go && NIDUS_BIN={{justfile_directory()}}/target/release/nidus \
+      go test -tags integration ./...
+
 # ── Build ──────────────────────────────────────────────────────────────────
 
 # Debug build for the current host

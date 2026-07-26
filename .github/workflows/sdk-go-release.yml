@@ -1,0 +1,195 @@
+name: Release Go SDK
+
+# Releases github.com/duckedup/nidus/sdks/go at the CRATE's version.
+#
+# ## Why the tag is `sdks/go/v*` and not `go-v*`
+#
+# Go has no registry upload: a module is published *by its tag*, and for a module that
+# lives in a repo subdirectory the tag must be `<subdir>/v<semver>` — the module path's
+# directory prefix is load-bearing, not cosmetic. `go get github.com/duckedup/nidus/
+# sdks/go@v0.39.0` resolves only if the tag is literally `sdks/go/v0.39.0`. A `go-v*`
+# tag in the style of `js-v*`/`py-v*` would not be a cosmetic difference; `go get`
+# would fail outright with "unknown revision". So the Go SDK's tag namespace is dictated
+# by the toolchain rather than chosen, and it still cannot collide with the crate's `v*`.
+#
+# ## Why there is no stamp / commit-back step
+#
+# Every other SDK release workflow stamps a version into a manifest (`package.json`,
+# `pyproject.toml`) and commits it back to main, because those manifests carry a version
+# string that would otherwise drift from `Cargo.toml`. Go has no such file — `go.mod`
+# records the module path and language version, never the module's own version, which
+# comes from the tag alone. There is nothing to stamp, so there is deliberately nothing
+# to commit back. This workflow being shorter than its siblings is expected, not an
+# oversight.
+#
+# ## Why the whole test suite runs before tagging
+#
+# A Go tag is effectively immutable: once proxy.golang.org has fetched
+# `sdks/go/v<version>` it caches the module zip and checksum permanently, and
+# sum.golang.org records the hash. Re-pushing a moved tag does not reach users — it
+# produces a checksum mismatch, which is worse than the original bug. So there is no
+# "unpublish" and no "fix the tag": verification has to happen *before* the tag exists.
+# Hence gofmt + vet + test as a gate, not as a post-publish sanity check.
+#
+# ## Why workflow_call rather than `on: push`
+#
+# The crate's release tag is pushed with GITHUB_TOKEN, which by GitHub's anti-recursion
+# rule cannot start another workflow — the same reason docker.yml, helm-publish.yml and
+# sdk-js-release.yml are called directly by release.yml. Being invoked by release.yml
+# also means this can only ever tag a version the crate actually released.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Crate version to tag and publish (no leading v)
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Crate version to tag and publish (no leading v)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Verify and tag the Go module
+    if: github.repository == 'duckedup/nidus'
+    runs-on: ubuntu-latest
+    permissions:
+      # `write` to push the module tag and create the release. Nothing is committed
+      # back — see the header.
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The crate's release tag, not `main`. Unlike the JS/Helm jobs this one has no
+          # stamp to commit, so it needs no branch — and it *does* need the exact tree
+          # that was released, because the tag it pushes is what the module proxy will
+          # serve forever. Main may already have advanced; `v<version>` cannot.
+          ref: v${{ inputs.version }}
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: sdks/go/go.mod
+
+      # Same guard as helm-publish: refuse to tag something that is not a version.
+      # A malformed tag here would be permanent (see the header), so fail early and loud.
+      - name: Check the version is semver
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::refusing to tag a non-semver version: '$VERSION'" >&2; exit 1 ;;
+          esac
+          echo "will tag sdks/go/v$VERSION"
+
+      # `gofmt -l` lists offending files and still exits 0, so a bare invocation is a
+      # silent pass. Compare its output against empty instead.
+      - name: gofmt
+        working-directory: sdks/go
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "gofmt clean"
+
+      - name: go vet
+        working-directory: sdks/go
+        run: go vet ./...
+
+      # Unit tier only: the integration tests are behind `-tags integration` and need a
+      # `nidus` binary, which this job has no Rust toolchain to build. CI's `sdk-go` job
+      # draws the same line.
+      - name: go test
+        working-directory: sdks/go
+        run: go test ./...
+
+      # Idempotent: an existing tag is a no-op success, matching the stance the crate and
+      # chart publishes take. Re-running a release must not fail on work already done.
+      - name: Tag the module
+        id: tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="sdks/go/v${VERSION}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already exists — nothing to tag"
+            exit 0
+          fi
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "pushed $TAG"
+
+      # Warming the proxy *is* the publish step's only remaining half: the tag makes the
+      # version resolvable, this makes the first `go get` fast instead of paying for a
+      # cold fetch of the whole repo. The proxy needs a moment to notice a fresh tag, so
+      # retry — and never fail the release over it, because the module is already
+      # published by this point. A cold proxy is a latency wart, not a broken release.
+      - name: Warm proxy.golang.org
+        continue-on-error: true
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -uo pipefail
+          URL="https://proxy.golang.org/github.com/duckedup/nidus/sdks/go/@v/v${VERSION}.info"
+          for attempt in 1 2 3 4 5; do
+            if curl -fsS "$URL"; then
+              echo
+              echo "proxy has v${VERSION}"
+              exit 0
+            fi
+            echo "attempt ${attempt}: proxy does not see v${VERSION} yet, waiting"
+            sleep 20
+          done
+          echo "::warning::proxy.golang.org has not picked up v${VERSION}; the first \`go get\` will populate it"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="sdks/go/v${VERSION}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists — nothing to do"
+            exit 0
+          fi
+          # `--list 'sdks/go/v*'` so only this SDK's own history is walked; an
+          # unfiltered listing would let the crate's or another SDK's tag become
+          # PREV_TAG and truncate the notes.
+          PREV_TAG=$(git tag --sort=-v:refname --list 'sdks/go/v*' | grep -v "^${TAG}$" | head -1)
+          if [ -z "$PREV_TAG" ]; then
+            NOTES=$(git log --pretty=format:"- %s" -- sdks/go | head -50)
+          else
+            NOTES=$(git log --pretty=format:"- %s" "$PREV_TAG"..HEAD -- sdks/go)
+          fi
+
+          # --latest=false so an SDK release never displaces the crate's as the
+          # repository's "latest" release.
+          gh release create "$TAG" \
+            --title "Go SDK ${VERSION}" \
+            --latest=false \
+            --notes "## github.com/duckedup/nidus/sdks/go ${VERSION}
+
+          \`\`\`sh
+          go get github.com/duckedup/nidus/sdks/go@v${VERSION}
+          \`\`\`
+
+          ### Changes
+
+          ${NOTES}"

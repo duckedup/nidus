@@ -1,0 +1,173 @@
+// Predicate and Filter — metadata predicates and the bare-array wire shape.
+//
+// A Filter is AND-combined predicates. On the wire the crate's Filter is a newtype
+// over Vec<Predicate> (src/model.rs), so it serializes as a plain JSON array — never
+// an object wrapping one. An empty array matches everything.
+//
+// Each Predicate is a positive assertion about a *present* attribute: an absent key
+// matches nothing, including the negative predicates (Ne, NotIn) and the ranges.
+// Comparisons are same-type only — Int↔Int numerically, Str↔Str lexically,
+// Bool↔Bool — which is why the builders normalize through [ValueOf] rather than
+// coercing types to make a comparison "work".
+//
+// One asymmetry to keep straight, because it is the wire format and not a choice:
+// Glob's second tuple element is a bare string (the pattern), while every other
+// predicate's is a tagged Value, and In/NotIn's is an array of them.
+
+package nidus
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+// The externally-tagged variant names, exactly as serde spells them.
+const (
+	opEq    = "Eq"
+	opNe    = "Ne"
+	opGlob  = "Glob"
+	opIn    = "In"
+	opNotIn = "NotIn"
+	opLt    = "Lt"
+	opLe    = "Le"
+	opGt    = "Gt"
+	opGe    = "Ge"
+)
+
+// A Predicate is one attribute condition. Build it with [Eq], [Ne], [Glob], [In],
+// [NotIn], [Lt], [Le], [Gt], or [Ge]; the fields are unexported so a predicate the
+// server cannot parse cannot be constructed.
+type Predicate struct {
+	op   string
+	key  string
+	val  Value   // Eq, Ne, Lt, Le, Gt, Ge
+	vals []Value // In, NotIn
+	pat  string  // Glob
+	err  error   // a normalization failure, surfaced from MarshalJSON
+}
+
+// A Filter is a conjunction (AND) of predicates. The zero value — a nil Filter —
+// matches everything, same as an empty one.
+type Filter []Predicate
+
+// The builders take `any` so that nidus.Eq("year", 2024) reads the way a caller
+// expects, which means normalization can fail inside a function with no error to
+// return. The three ways out are: panic (hostile in a library), swallow the error and
+// send a wrong-but-valid body (silent data bugs), or carry the error. We carry it:
+// the Predicate remembers the failure and returns it from MarshalJSON, so it lands
+// as an ordinary error from the Search call that used the filter, at a call site the
+// caller is already checking. Use [Predicate.Err] or [Filter.Err] to check earlier.
+
+// Eq matches records where attrs[key] equals v.
+func Eq(key string, v any) Predicate { return unary(opEq, key, v) }
+
+// Ne matches records where attrs[key] is present and does not equal v.
+func Ne(key string, v any) Predicate { return unary(opNe, key, v) }
+
+// Glob matches records where attrs[key] is a string matching the pattern (*, ?,
+// [..]). The pattern travels as a bare string, not a Value — Glob is the one
+// asymmetric variant on the wire.
+func Glob(key, pattern string) Predicate {
+	return Predicate{op: opGlob, key: key, pat: pattern}
+}
+
+// In matches records where attrs[key] equals one of vals.
+func In(key string, vals ...any) Predicate { return set(opIn, key, vals) }
+
+// NotIn matches records where attrs[key] is present and equals none of vals.
+func NotIn(key string, vals ...any) Predicate { return set(opNotIn, key, vals) }
+
+// Lt matches records where attrs[key] < v (same-type, orderable).
+func Lt(key string, v any) Predicate { return unary(opLt, key, v) }
+
+// Le matches records where attrs[key] <= v (same-type, orderable).
+func Le(key string, v any) Predicate { return unary(opLe, key, v) }
+
+// Gt matches records where attrs[key] > v (same-type, orderable).
+func Gt(key string, v any) Predicate { return unary(opGt, key, v) }
+
+// Ge matches records where attrs[key] >= v (same-type, orderable).
+func Ge(key string, v any) Predicate { return unary(opGe, key, v) }
+
+// And collects predicates into a [Filter]. It is sugar — predicates already AND —
+// but it reads better at a call site than a slice literal.
+func And(preds ...Predicate) Filter { return Filter(preds) }
+
+func unary(op, key string, v any) Predicate {
+	val, err := ValueOf(v)
+	if err != nil {
+		return Predicate{op: op, key: key, err: fmt.Errorf("nidus: %s(%q): %w", op, key, err)}
+	}
+	return Predicate{op: op, key: key, val: val}
+}
+
+func set(op, key string, raw []any) Predicate {
+	vals := make([]Value, len(raw))
+	for i, r := range raw {
+		v, err := ValueOf(r)
+		if err != nil {
+			return Predicate{
+				op:  op,
+				key: key,
+				err: fmt.Errorf("nidus: %s(%q) value %d: %w", op, key, i, err),
+			}
+		}
+		vals[i] = v
+	}
+	return Predicate{op: op, key: key, vals: vals}
+}
+
+// Err reports a value that could not be normalized when the predicate was built
+// (for example a float, which is not an attribute type). It is nil for a usable
+// predicate. Checking it is optional: the same error comes back from the request
+// that carries the filter.
+func (p Predicate) Err() error { return p.err }
+
+// Err returns the first predicate error in the filter, or nil.
+func (f Filter) Err() error {
+	for _, p := range f {
+		if err := p.err; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// MarshalJSON writes the externally-tagged 2-tuple form, e.g.
+// {"Eq":["lang",{"Str":"rust"}]} or {"Glob":["path","src/*"]}.
+func (p Predicate) MarshalJSON() ([]byte, error) {
+	if p.err != nil {
+		return nil, p.err
+	}
+	if p.op == "" {
+		return nil, fmt.Errorf(
+			"nidus: zero-value Predicate; build one with Eq, Ne, Glob, In, NotIn, Lt, Le, Gt or Ge",
+		)
+	}
+	var second any
+	switch p.op {
+	case opGlob:
+		second = p.pat
+	case opIn, opNotIn:
+		// A nil set must still be `[]`: the server's is a Vec, and `null` would fail
+		// to deserialize rather than mean "an empty set, matching nothing".
+		vals := p.vals
+		if vals == nil {
+			vals = []Value{}
+		}
+		second = vals
+	default:
+		second = p.val
+	}
+	return json.Marshal(map[string][]any{p.op: {p.key, second}})
+}
+
+// MarshalJSON writes the bare array. A nil Filter is `[]` rather than `null`,
+// because the server deserializes this field into a Vec and `null` is an error
+// there, not an empty filter.
+func (f Filter) MarshalJSON() ([]byte, error) {
+	if f == nil {
+		return []byte("[]"), nil
+	}
+	return json.Marshal([]Predicate(f))
+}

@@ -205,6 +205,38 @@ jobs:
       - run: npm run build
         working-directory: sdks/js
 
+  # The Go SDK (sdks/go) is its own module and, like the JS one, independent of the Rust
+  # build: format check, vet, and the unit tests (httptest.Server — no server binary
+  # needed). The `-tags integration` suite drives a real `nidus serve` and runs locally
+  # via `just sdk-go-test-all`, so it stays out of here — CI has no release binary to
+  # point it at. There is no build step to mirror: `go test` compiles the package, and a
+  # library has nothing to bundle.
+  sdk-go:
+    name: Go SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          # go.mod, not go.sum: the SDK is standard-library only, so no go.sum exists.
+          cache-dependency-path: sdks/go/go.mod
+      # `gofmt -l` lists offending files but still exits 0, so a bare invocation would
+      # pass silently. Test its output for emptiness instead.
+      - name: gofmt
+        working-directory: sdks/go
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - run: go vet ./...
+        working-directory: sdks/go
+      - run: go test ./...
+        working-directory: sdks/go
+
   miri:
     name: Miri
     runs-on: ubuntu-latest

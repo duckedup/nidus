@@ -88,6 +88,7 @@ export default defineConfig({
           label: "SDKs",
           items: [
             { label: "JavaScript / TypeScript", link: "/sdks/javascript/" },
+            { label: "Go", link: "/sdks/go/" },
           ],
         },
         {

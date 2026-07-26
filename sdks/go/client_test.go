@@ -1,0 +1,1519 @@
+// Tests for the client and its single request path, against net/http/httptest.
+//
+// No network, no binary: every test here drives a real HTTP round trip over a
+// loopback listener, which is enough to exercise the parts of transport.go that a
+// hand-rolled fake would paper over — URL escaping as the http package actually
+// serializes it, header precedence, status handling, body draining.
+//
+// The assertions on request bodies are on *bytes* rather than on a re-decoded struct,
+// deliberately. The bug this SDK is most exposed to is an omit-vs-zero mistake: the
+// server fills unset fields from #[serde(default)] (top_k = 10, limit = 100), so
+// sending "top_k": 0 is a request for zero results. A test that decodes the body back
+// into a struct cannot see the difference between an absent field and a zero one —
+// which is the only thing that matters — so it has to read the JSON.
+package nidus
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// ── Harness ─────────────────────────────────────────────────────────────────
+
+// capture is a fake nidus server: it records what it received and replies with a
+// canned status and body. One instance serves one test.
+type capture struct {
+	mu     sync.Mutex
+	calls  int
+	method string
+	path   string // EscapedPath, so a percent-escaped collection name stays visible
+	body   []byte
+	header http.Header
+
+	status int    // 0 means 200
+	reply  string // "" means an empty body
+}
+
+func (c *capture) handler(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	c.mu.Lock()
+	c.calls++
+	c.method, c.path = r.Method, r.URL.EscapedPath()
+	c.body, c.header = body, r.Header.Clone()
+	status, reply := c.status, c.reply
+	c.mu.Unlock()
+
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if reply != "" {
+		_, _ = io.WriteString(w, reply)
+	}
+}
+
+// serve starts the fake server and returns a client pointed at it. The listener and
+// the client are torn down by t.Cleanup, so no test has to remember to.
+func serve(t *testing.T, c *capture, opts ...Option) *Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(c.handler))
+	t.Cleanup(srv.Close)
+	db, err := NewClient(srv.URL, opts...)
+	if err != nil {
+		t.Fatalf("NewClient(%q) failed: %v", srv.URL, err)
+	}
+	return db
+}
+
+// recorded is a copy of what the fake saw — the one way a test reads those fields.
+//
+// A copy rather than a locked read at each assertion, and a separate type rather than
+// a copy of capture, because capture holds the mutex and `go vet`'s copylocks check is
+// right to refuse copying that. Every field below is written under c.mu by the handler
+// while the test goroutine reads, so an unlocked read is a data race even where
+// net/http happens to supply a happens-before edge today; one accessor means no test
+// can quietly opt out of the lock.
+type recorded struct {
+	calls  int
+	method string
+	path   string
+	body   []byte
+	header http.Header
+}
+
+func (c *capture) snapshot() recorded {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return recorded{
+		calls:  c.calls,
+		method: c.method,
+		path:   c.path,
+		body:   c.body,
+		header: c.header,
+	}
+}
+
+// sentBody returns the request body the fake server saw, as a string, failing the
+// test if nothing was sent at all.
+func (c *capture) sentBody(t *testing.T) string {
+	t.Helper()
+	got := c.snapshot()
+	if got.calls == 0 {
+		t.Fatal("no request reached the server")
+	}
+	return string(got.body)
+}
+
+// f32 and iptr make the pointers the request structs take for the knobs whose zero the
+// server treats as a real value.
+func f32(v float32) *float32 { return &v }
+func iptr(v int) *int        { return &v }
+
+// ── Routing ─────────────────────────────────────────────────────────────────
+
+// TestClientMethodsHitTheRightRoute drives every public method against the fake
+// server and checks the HTTP method and path. A wrong path is the kind of mistake
+// that only shows up as a 404 from a real server — which reads as "collection not
+// found" and sends a caller looking in the wrong place entirely.
+//
+// The paths here are transcribed from the router in src/server/mod.rs; the reply
+// column is whatever shape that endpoint's response decoder expects.
+func TestClientMethodsHitTheRightRoute(t *testing.T) {
+	ctx := context.Background()
+
+	cases := []struct {
+		method     string // the Client method this row covers
+		reply      string
+		wantMethod string
+		wantPath   string
+		call       func(*Client) error
+	}{
+		{"Health", `{}`, http.MethodGet, "/health", func(c *Client) error {
+			if !c.Health(ctx) {
+				return errors.New("Health reported down against a 200")
+			}
+			return nil
+		}},
+		{"Ping", `{}`, http.MethodGet, "/health", func(c *Client) error {
+			return c.Ping(ctx)
+		}},
+		{"Stats", `{"dimension":3}`, http.MethodGet, "/stats", func(c *Client) error {
+			_, err := c.Stats(ctx)
+			return err
+		}},
+		{"Collections", `["docs"]`, http.MethodGet, "/collections", func(c *Client) error {
+			_, err := c.Collections(ctx)
+			return err
+		}},
+		{"CreateCollection", `{"ok":true}`, http.MethodPost, "/collections/docs", func(c *Client) error {
+			return c.CreateCollection(ctx, "docs")
+		}},
+		{"DropCollection", `{"ok":true}`, http.MethodDelete, "/collections/docs", func(c *Client) error {
+			return c.DropCollection(ctx, "docs")
+		}},
+		{"GetMeta", `{"k":"v"}`, http.MethodGet, "/collections/docs/meta", func(c *Client) error {
+			_, err := c.GetMeta(ctx, "docs")
+			return err
+		}},
+		{"SetMeta", `{"ok":true}`, http.MethodPut, "/collections/docs/meta", func(c *Client) error {
+			return c.SetMeta(ctx, "docs", map[string]string{"k": "v"})
+		}},
+		{"Upsert", `{"upserted":1}`, http.MethodPost, "/collections/docs/upsert", func(c *Client) error {
+			_, err := c.Upsert(ctx, "docs", []Record{{ID: "a"}})
+			return err
+		}},
+		{"Delete", `{"deleted":1}`, http.MethodPost, "/collections/docs/delete", func(c *Client) error {
+			_, err := c.Delete(ctx, "docs", []string{"a"})
+			return err
+		}},
+		{"DeleteWhere", `{"deleted":1}`, http.MethodPost, "/collections/docs/delete", func(c *Client) error {
+			_, err := c.DeleteWhere(ctx, "docs", And(Eq("lang", "rust")))
+			return err
+		}},
+		{"Records", `[]`, http.MethodGet, "/collections/docs/records", func(c *Client) error {
+			_, err := c.Records(ctx, "docs")
+			return err
+		}},
+		{"SetFtsSchema", `{"ok":true}`, http.MethodPost, "/collections/docs/fts-schema", func(c *Client) error {
+			return c.SetFtsSchema(ctx, "docs", []string{"body"})
+		}},
+		{"Search", `[]`, http.MethodPost, "/search", func(c *Client) error {
+			_, err := c.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}})
+			return err
+		}},
+		{"TextSearch", `[]`, http.MethodPost, "/text-search", func(c *Client) error {
+			_, err := c.TextSearch(ctx, TextSearchRequest{Field: "body", Query: "fox"})
+			return err
+		}},
+		{"HybridSearch", `[]`, http.MethodPost, "/hybrid-search", func(c *Client) error {
+			_, err := c.HybridSearch(ctx, HybridSearchRequest{
+				Vector: []float32{1, 0, 0}, Field: "body", Text: "fox",
+			})
+			return err
+		}},
+		{"List", `[]`, http.MethodPost, "/list", func(c *Client) error {
+			_, err := c.List(ctx, ListRequest{Scope: []string{"docs"}})
+			return err
+		}},
+		{"Remember", `{"ok":true}`, http.MethodPost, "/collections/docs/remember", func(c *Client) error {
+			return c.Remember(ctx, "docs", "a", "some text", RememberOptions{})
+		}},
+		{"Recall", `[]`, http.MethodPost, "/collections/docs/recall", func(c *Client) error {
+			_, err := c.Recall(ctx, "docs", "some text", RecallOptions{})
+			return err
+		}},
+		{"Flush", `{"ok":true}`, http.MethodPost, "/flush", func(c *Client) error {
+			return c.Flush(ctx)
+		}},
+		{"Compact", `{"ok":true}`, http.MethodPost, "/compact", func(c *Client) error {
+			return c.Compact(ctx)
+		}},
+	}
+
+	covered := make(map[string]bool, len(cases))
+	for _, tc := range cases {
+		covered[tc.method] = true
+		t.Run(tc.method, func(t *testing.T) {
+			fake := &capture{reply: tc.reply}
+			db := serve(t, fake)
+			if err := tc.call(db); err != nil {
+				t.Fatalf("%s failed: %v", tc.method, err)
+			}
+			got := fake.snapshot()
+			if got.calls != 1 {
+				t.Fatalf("server saw %d requests, want exactly 1", got.calls)
+			}
+			if got.method != tc.wantMethod {
+				t.Errorf("HTTP method = %s, want %s", got.method, tc.wantMethod)
+			}
+			if got.path != tc.wantPath {
+				t.Errorf("path = %s, want %s", got.path, tc.wantPath)
+			}
+		})
+	}
+
+	// A new endpoint should not be able to ship without a row above. reflect on
+	// *Client reports exactly its exported methods, so the two lists must agree.
+	clientType := reflect.TypeOf((*Client)(nil))
+	for i := range clientType.NumMethod() {
+		name := clientType.Method(i).Name
+		if !covered[name] {
+			t.Errorf("Client.%s has no row in this table — add one so its route is pinned", name)
+		}
+	}
+}
+
+// TestCollectionNameIsPathEscaped — a collection name is an opaque string that may
+// hold a slash ("notes/2024") or a space. Unescaped, a slash silently addresses a
+// different route: /collections/notes/2024/upsert is not a route the server has, so
+// the request 404s and the caller reads it as "no such collection".
+func TestCollectionNameIsPathEscaped(t *testing.T) {
+	cases := []struct {
+		name     string
+		wantPath string
+	}{
+		{"docs", "/collections/docs/upsert"},
+		{"notes/2024", "/collections/notes%2F2024/upsert"},
+		{"my notes", "/collections/my%20notes/upsert"},
+		{"notes/2024 archive", "/collections/notes%2F2024%20archive/upsert"},
+		{"a?b#c", "/collections/a%3Fb%23c/upsert"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &capture{reply: `{"upserted":0}`}
+			db := serve(t, fake)
+			if _, err := db.Upsert(context.Background(), tc.name, nil); err != nil {
+				t.Fatalf("Upsert failed: %v", err)
+			}
+			if got := fake.snapshot().path; got != tc.wantPath {
+				t.Errorf("path = %s, want %s", got, tc.wantPath)
+			}
+		})
+	}
+}
+
+// TestBaseURLTrailingSlashIsNormalized — a base URL pasted from a browser ends in a
+// slash, and "http://host//health" is a different path to a strict router.
+func TestBaseURLTrailingSlashIsNormalized(t *testing.T) {
+	for _, suffix := range []string{"", "/", "//", "///"} {
+		fake := &capture{reply: `{}`}
+		srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+		t.Cleanup(srv.Close)
+
+		db, err := NewClient(srv.URL + suffix)
+		if err != nil {
+			t.Fatalf("NewClient(%q) failed: %v", srv.URL+suffix, err)
+		}
+		if err := db.Ping(context.Background()); err != nil {
+			t.Fatalf("Ping failed for base URL %q: %v", srv.URL+suffix, err)
+		}
+		if got := fake.snapshot().path; got != "/health" {
+			t.Errorf("base URL %q produced path %s, want /health", srv.URL+suffix, got)
+		}
+	}
+}
+
+// TestNewClientRejectsABadBaseURL — failing at construction puts the error where the
+// mistake was made, rather than on the first call from somewhere else entirely. The
+// bare host:port case is the common one: it parses, but with "127.0.0.1" as the
+// scheme.
+//
+// The query and fragment cases are the subtle ones, and the reason they are here rather
+// than left to the first request: the base URL is concatenated with each endpoint path,
+// so "http://h/?x=1" + "/health" parses as path "/" with query "x=1/health", and
+// "http://h#frag" + "/health" has no path at all. Every call then misroutes for the
+// client's whole lifetime, and the 404 reads at the call site as "no such collection".
+func TestNewClientRejectsABadBaseURL(t *testing.T) {
+	bad := []string{
+		"", "   ", "/", "///", "127.0.0.1:7700", "http://", "localhost",
+		"http://127.0.0.1:7700/?x=1",
+		"http://127.0.0.1:7700?x=1",
+		"http://127.0.0.1:7700/#frag",
+		"http://127.0.0.1:7700#frag",
+		"http://127.0.0.1:7700/api?tenant=acme#top",
+	}
+	for _, bad := range bad {
+		if db, err := NewClient(bad); err == nil {
+			t.Errorf("NewClient(%q) succeeded (baseURL %q), want an error", bad, db.baseURL)
+		}
+	}
+	for _, good := range []string{"http://127.0.0.1:7700", "https://nidus.example.com/api"} {
+		if _, err := NewClient(good); err != nil {
+			t.Errorf("NewClient(%q) failed: %v", good, err)
+		}
+	}
+}
+
+// ── Request bodies: the omit-vs-zero contract ───────────────────────────────
+
+// TestSearchOmitsZeroTopK is the omit-vs-zero trap, asserted on the marshalled bytes.
+// The server's default top_k is 10; sending "top_k": 0 asks for zero results, which
+// is a silent empty-result bug rather than a visible failure.
+func TestSearchOmitsZeroTopK(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	body := fake.sentBody(t)
+	if body != `{"query":[1,0,0]}` {
+		t.Errorf("body = %s, want only the query field", body)
+	}
+	if strings.Contains(body, "top_k") {
+		t.Errorf("body = %s, must not mention top_k when TopK is 0", body)
+	}
+
+	// A set TopK travels, so omitting zero is not the same as never sending it.
+	if _, err := db.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}, TopK: 5}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"query":[1,0,0],"top_k":5}` {
+		t.Errorf("body = %s, want top_k:5", body)
+	}
+}
+
+// TestListOmitsZeroLimit — same trap on /list, where the server's default limit is
+// 100. Offset's default is 0 so omitting a zero offset is harmless, but it is
+// asserted here too so the whole body is pinned rather than half of it.
+func TestListOmitsZeroLimit(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.List(ctx, ListRequest{}); err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	body := fake.sentBody(t)
+	if body != `{}` {
+		t.Errorf("body = %s, want {} — every field defaults on the server", body)
+	}
+	for _, field := range []string{"limit", "offset", "scope", "filter"} {
+		if strings.Contains(body, field) {
+			t.Errorf("body = %s, must not mention %s when it is unset", body, field)
+		}
+	}
+
+	if _, err := db.List(ctx, ListRequest{Scope: []string{"docs"}, Offset: 10, Limit: 25}); err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	want := `{"scope":["docs"],"offset":10,"limit":25}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+}
+
+// TestZeroValuedRequestFieldsAreOmitted sweeps the rest of the defaulted fields —
+// hybrid search's rrf_k and candidates, text search's top_k — so no request type is
+// left with an unasserted zero.
+func TestZeroValuedRequestFieldsAreOmitted(t *testing.T) {
+	cases := []struct {
+		name string
+		want string
+		call func(context.Context, *Client) error
+	}{
+		{
+			"TextSearch", `{"field":"body","query":"fox"}`,
+			func(ctx context.Context, c *Client) error {
+				_, err := c.TextSearch(ctx, TextSearchRequest{Field: "body", Query: "fox"})
+				return err
+			},
+		},
+		{
+			"HybridSearch", `{"vector":[1,0,0],"field":"body","text":"fox"}`,
+			func(ctx context.Context, c *Client) error {
+				_, err := c.HybridSearch(ctx, HybridSearchRequest{
+					Vector: []float32{1, 0, 0}, Field: "body", Text: "fox",
+				})
+				return err
+			},
+		},
+		{
+			"HybridSearch with tuning", `{"vector":[1,0,0],"field":"body","text":"fox","top_k":5,"rrf_k":40,"candidates":200}`,
+			func(ctx context.Context, c *Client) error {
+				_, err := c.HybridSearch(ctx, HybridSearchRequest{
+					Vector: []float32{1, 0, 0}, Field: "body", Text: "fox",
+					TopK: 5, RRFK: f32(40), Candidates: iptr(200),
+				})
+				return err
+			},
+		},
+		{
+			"Recall", `{"query":"some text"}`,
+			func(ctx context.Context, c *Client) error {
+				_, err := c.Recall(ctx, "docs", "some text", RecallOptions{})
+				return err
+			},
+		},
+		{
+			// Mode is absent for the default "raw" ingest, and attrs is absent rather
+			// than {} — the server defaults both.
+			"Remember", `{"id":"a","text":"some text"}`,
+			func(ctx context.Context, c *Client) error {
+				return c.Remember(ctx, "docs", "a", "some text", RememberOptions{})
+			},
+		},
+		{
+			"Remember summarizing", `{"id":"a","text":"some text","mode":"summarize","attrs":{"src":{"Str":"x"}}}`,
+			func(ctx context.Context, c *Client) error {
+				return c.Remember(ctx, "docs", "a", "some text", RememberOptions{
+					Mode:  "summarize",
+					Attrs: Attrs{"src": Str("x")},
+				})
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &capture{reply: `[]`}
+			db := serve(t, fake)
+			if err := tc.call(context.Background(), db); err != nil {
+				t.Fatalf("call failed: %v", err)
+			}
+			if body := fake.sentBody(t); body != tc.want {
+				t.Errorf("body = %s, want %s", body, tc.want)
+			}
+		})
+	}
+}
+
+// TestMinScoreNilIsOmittedAndZeroIsSent — the case a plain float32 could not express.
+// nil means "no floor"; &0.0 means "a floor of exactly zero", which for cosine drops
+// everything orthogonal or worse and is a real thing to ask for.
+func TestMinScoreNilIsOmittedAndZeroIsSent(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.Search(ctx, SearchRequest{Query: []float32{1}}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); strings.Contains(body, "min_score") {
+		t.Errorf("body = %s, must omit min_score when MinScore is nil", body)
+	}
+
+	for _, floor := range []float32{0, 0.5, -1} {
+		if _, err := db.Search(ctx, SearchRequest{Query: []float32{1}, MinScore: f32(floor)}); err != nil {
+			t.Fatalf("Search failed: %v", err)
+		}
+		want := fmt.Sprintf(`{"query":[1],"min_score":%v}`, floor)
+		if body := fake.sentBody(t); body != want {
+			t.Errorf("body = %s, want %s", body, want)
+		}
+	}
+
+	// The pointer fields on the other request types behave the same way.
+	if _, err := db.TextSearch(ctx, TextSearchRequest{
+		Field: "body", Query: "fox", MinScore: f32(0),
+	}); err != nil {
+		t.Fatalf("TextSearch failed: %v", err)
+	}
+	if body := fake.sentBody(t); !strings.Contains(body, `"min_score":0`) {
+		t.Errorf("body = %s, want min_score:0", body)
+	}
+	if _, err := db.Recall(ctx, "docs", "q", RecallOptions{MinScore: f32(0)}); err != nil {
+		t.Fatalf("Recall failed: %v", err)
+	}
+	if body := fake.sentBody(t); !strings.Contains(body, `"min_score":0`) {
+		t.Errorf("body = %s, want min_score:0", body)
+	}
+}
+
+// TestHybridZeroKnobsAreSentNotOmitted — the other half of the omit-vs-zero rule, and
+// the half a plain float32/int gets wrong. Zero is a real request for both of these:
+// the server fuses with 1/(rrf_k + rank + 1), so rrf_k = 0 is the maximally top-heavy
+// weighting (verified against a running server: 2.0 / 1.0 / 0.333 for three docs,
+// versus 0.0328 / 0.0323 / 0.0159 at the default 60), and candidates = 0 is clamped up
+// to top_k — "fuse exactly top_k deep". Value fields with `omitempty` would silently
+// substitute 60 and 100, which is also where the JS SDK's prune() and this SDK would
+// have disagreed: `rrfK: 0` travels there.
+func TestHybridZeroKnobsAreSentNotOmitted(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	req := HybridSearchRequest{
+		Vector: []float32{1, 0, 0}, Field: "body", Text: "fox",
+		RRFK: f32(0), Candidates: iptr(0),
+	}
+	if _, err := db.HybridSearch(ctx, req); err != nil {
+		t.Fatalf("HybridSearch failed: %v", err)
+	}
+	want := `{"vector":[1,0,0],"field":"body","text":"fox","rrf_k":0,"candidates":0}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s — an explicit zero must travel", body, want)
+	}
+
+	// nil is how the server's default is requested, so those keys must be absent.
+	if _, err := db.HybridSearch(ctx, HybridSearchRequest{
+		Vector: []float32{1, 0, 0}, Field: "body", Text: "fox",
+	}); err != nil {
+		t.Fatalf("HybridSearch failed: %v", err)
+	}
+	body := fake.sentBody(t)
+	for _, field := range []string{"rrf_k", "candidates"} {
+		if strings.Contains(body, field) {
+			t.Errorf("body = %s, must omit %s when it is nil", body, field)
+		}
+	}
+}
+
+// TestEmptyFilterIsOmittedFromASearchBody — an unset Filter must be absent, so the
+// server's #[serde(default)] applies, rather than sent as [] (which means the same
+// thing but restates a default the SDK should not own).
+func TestEmptyFilterIsOmittedFromASearchBody(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.Search(ctx, SearchRequest{Query: []float32{1}}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); strings.Contains(body, "filter") {
+		t.Errorf("body = %s, must omit an empty filter", body)
+	}
+
+	if _, err := db.Search(ctx, SearchRequest{
+		Query:  []float32{1},
+		Filter: And(Glob("path", "src/*")),
+	}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	want := `{"query":[1],"filter":[{"Glob":["path","src/*"]}]}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+}
+
+// TestNilSlicesAndMapsBecomeEmptyCollections — `records: null`, `ids: null` and a
+// `null` metadata map are deserialization errors on the server, not empty ones. The
+// SDK sends the lawful empty shape so a no-op call is a no-op rather than a 400.
+func TestNilSlicesAndMapsBecomeEmptyCollections(t *testing.T) {
+	cases := []struct {
+		name string
+		want string
+		call func(context.Context, *Client) error
+	}{
+		{"Upsert", `{"records":[]}`, func(ctx context.Context, c *Client) error {
+			_, err := c.Upsert(ctx, "docs", nil)
+			return err
+		}},
+		{"Delete", `{"ids":[]}`, func(ctx context.Context, c *Client) error {
+			_, err := c.Delete(ctx, "docs", nil)
+			return err
+		}},
+		{"DeleteWhere", `{"filter":[]}`, func(ctx context.Context, c *Client) error {
+			_, err := c.DeleteWhere(ctx, "docs", nil)
+			return err
+		}},
+		{"SetMeta", `{}`, func(ctx context.Context, c *Client) error {
+			return c.SetMeta(ctx, "docs", nil)
+		}},
+		{"SetFtsSchema", `{"fields":[]}`, func(ctx context.Context, c *Client) error {
+			return c.SetFtsSchema(ctx, "docs", nil)
+		}},
+		// A bodyless POST still sends {}, so the request is well-formed JSON all the
+		// way through whatever sits between the client and the server.
+		{"CreateCollection", `{}`, func(ctx context.Context, c *Client) error {
+			return c.CreateCollection(ctx, "docs")
+		}},
+		{"Flush", `{}`, func(ctx context.Context, c *Client) error {
+			return c.Flush(ctx)
+		}},
+		{"Compact", `{}`, func(ctx context.Context, c *Client) error {
+			return c.Compact(ctx)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &capture{reply: `{"upserted":0,"deleted":0}`}
+			db := serve(t, fake)
+			if err := tc.call(context.Background(), db); err != nil {
+				t.Fatalf("call failed: %v", err)
+			}
+			if body := fake.sentBody(t); body != tc.want {
+				t.Errorf("body = %s, want %s", body, tc.want)
+			}
+		})
+	}
+}
+
+// TestUpsertBodyShape — attrs is `{}` and not `null` for a record built without any
+// (the server's attrs field has no serde default), and the vector is omitted for a
+// text-only doc so "no embedding" stays distinguishable from "an empty one".
+func TestUpsertBodyShape(t *testing.T) {
+	fake := &capture{reply: `{"upserted":2}`}
+	db := serve(t, fake)
+
+	n, err := db.Upsert(context.Background(), "docs", []Record{
+		{ID: "a", Vector: []float32{1, 0, 0}, Attrs: Attrs{"lang": Str("rust")}},
+		{ID: "b"},
+	})
+	if err != nil {
+		t.Fatalf("Upsert failed: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("Upsert returned %d, want 2 (the server's count)", n)
+	}
+	want := `{"records":[` +
+		`{"id":"a","vector":[1,0,0],"attrs":{"lang":{"Str":"rust"}}},` +
+		`{"id":"b","attrs":{}}` +
+		`]}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+}
+
+// TestUpsertRefusesAnEmptyVector — the case `omitempty` cannot encode. A non-nil
+// zero-length Vector marshals byte-identically to an absent one, so sending it would
+// turn a vector-bearing upsert into a text-only document that no vector search can ever
+// see — silently, with no error anywhere in the stack. The realistic source is an
+// embedder that returned an empty slice, so the SDK refuses it at the call site instead
+// of encoding an ambiguity, and nothing is sent.
+func TestUpsertRefusesAnEmptyVector(t *testing.T) {
+	cases := []struct {
+		name    string
+		records []Record
+		wantErr bool
+	}{
+		{"nil vector is a text-only doc", []Record{{ID: "a"}}, false},
+		{"empty vector", []Record{{ID: "a", Vector: []float32{}}}, true},
+		{
+			"empty vector among good ones",
+			[]Record{
+				{ID: "a", Vector: []float32{1, 0, 0}},
+				{ID: "b", Vector: []float32{}},
+			},
+			true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &capture{reply: `{"upserted":0}`}
+			db := serve(t, fake)
+
+			_, err := db.Upsert(context.Background(), "docs", tc.records)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("Upsert error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if !tc.wantErr {
+				return
+			}
+			// All-or-nothing: a batch holding an unencodable record is not partially sent.
+			if got := fake.snapshot(); got.calls != 0 {
+				t.Errorf("the server saw %d requests, body = %s; nothing should have been sent",
+					got.calls, got.body)
+			}
+			if !strings.Contains(err.Error(), "empty vector") {
+				t.Errorf("error = %q, want it to name the empty vector", err)
+			}
+			// A caller mistake, not a server or transport failure, so not an *Error.
+			var nerr *Error
+			if errors.As(err, &nerr) {
+				t.Errorf("error is an *Error with status %d", nerr.Status)
+			}
+		})
+	}
+}
+
+// TestDeleteAndDeleteWhereAreTheSameEndpoint — id-delete and filter-delete differ
+// only in the body, and the server takes the filter branch whenever that field is
+// present. Two methods rather than one struct with both fields is what keeps a caller
+// from accidentally sending both and getting whichever the server prefers.
+func TestDeleteAndDeleteWhereAreTheSameEndpoint(t *testing.T) {
+	fake := &capture{reply: `{"deleted":3}`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	n, err := db.Delete(ctx, "docs", []string{"a", "b"})
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("Delete returned %d, want 3", n)
+	}
+	if body := fake.sentBody(t); body != `{"ids":["a","b"]}` {
+		t.Errorf("Delete body = %s, want only ids", body)
+	}
+	if strings.Contains(fake.sentBody(t), "filter") {
+		t.Error("Delete sent a filter field; the server would take the filter branch")
+	}
+
+	if _, err := db.DeleteWhere(ctx, "docs", And(Eq("lang", "go"))); err != nil {
+		t.Fatalf("DeleteWhere failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"filter":[{"Eq":["lang",{"Str":"go"}]}]}` {
+		t.Errorf("DeleteWhere body = %s, want only a filter", body)
+	}
+	if strings.Contains(fake.sentBody(t), `"ids"`) {
+		t.Error("DeleteWhere sent an ids field")
+	}
+}
+
+// TestUnencodableFilterFailsBeforeSending — a predicate built from a value the store
+// has no attribute type for must surface as an ordinary error from the call, with no
+// request made. Not a panic, and above all not a request with a mangled body: a
+// filter that silently lost a predicate would delete or return the wrong records.
+func TestUnencodableFilterFailsBeforeSending(t *testing.T) {
+	cases := []struct {
+		name string
+		call func(context.Context, *Client) error
+	}{
+		{"Search", func(ctx context.Context, c *Client) error {
+			_, err := c.Search(ctx, SearchRequest{
+				Query:  []float32{1, 0, 0},
+				Filter: And(Eq("lang", "rust"), Ge("score", 0.5)),
+			})
+			return err
+		}},
+		{"List", func(ctx context.Context, c *Client) error {
+			_, err := c.List(ctx, ListRequest{Filter: And(Eq("score", 1.5))})
+			return err
+		}},
+		{"DeleteWhere", func(ctx context.Context, c *Client) error {
+			_, err := c.DeleteWhere(ctx, "docs", And(Eq("score", 1.5)))
+			return err
+		}},
+		{"TextSearch", func(ctx context.Context, c *Client) error {
+			_, err := c.TextSearch(ctx, TextSearchRequest{
+				Field: "body", Query: "fox", Filter: And(Eq("score", 1.5)),
+			})
+			return err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &capture{reply: `[]`}
+			db := serve(t, fake)
+
+			err := tc.call(context.Background(), db)
+			if err == nil {
+				t.Fatal("call succeeded; a filter holding a float must not be sent")
+			}
+			if got := fake.snapshot(); got.calls != 0 {
+				t.Errorf("the server saw %d requests; nothing should have been sent, and "+
+					"body = %s", got.calls, got.body)
+			}
+			if !strings.Contains(err.Error(), "float") {
+				t.Errorf("error = %q, want it to name the float that could not be encoded", err)
+			}
+			// Not an *Error: nothing was sent, so there is no status, and Status 0
+			// ("never got an answer") would misattribute a caller mistake to the network.
+			var nerr *Error
+			if errors.As(err, &nerr) {
+				t.Errorf("error is an *Error with status %d; an encode failure is not a "+
+					"transport or server failure", nerr.Status)
+			}
+		})
+	}
+}
+
+// ── Responses ───────────────────────────────────────────────────────────────
+
+// TestStatsAnnNullDecodesToNil — the server sends "ann": null for a store doing exact
+// brute-force search, which is the default rather than a fault.
+func TestStatsAnnNullDecodesToNil(t *testing.T) {
+	fake := &capture{reply: `{
+		"dimension": 384,
+		"distance": "Cosine",
+		"ann": null,
+		"collections": ["docs", "notes"],
+		"footprint": {
+			"rows": 12, "dead_rows": 2, "dimension": 384,
+			"vector_bytes": 18432, "doc_count": 10
+		}
+	}`}
+	db := serve(t, fake)
+
+	stats, err := db.Stats(context.Background())
+	if err != nil {
+		t.Fatalf("Stats failed: %v", err)
+	}
+	if stats.Ann != nil {
+		t.Errorf("Ann = %+v, want nil for an exact-search store", stats.Ann)
+	}
+	if stats.Dimension != 384 || stats.Distance != "Cosine" {
+		t.Errorf("dimension/distance = %d/%q", stats.Dimension, stats.Distance)
+	}
+	if !reflect.DeepEqual(stats.Collections, []string{"docs", "notes"}) {
+		t.Errorf("collections = %v", stats.Collections)
+	}
+	want := Footprint{Rows: 12, DeadRows: 2, Dimension: 384, VectorBytes: 18432, DocCount: 10}
+	if stats.Footprint != want {
+		t.Errorf("footprint = %+v, want %+v", stats.Footprint, want)
+	}
+}
+
+// TestStatsHnswAnnDecodesOnlyTheHnswKnobs — the server omits the knobs that do not
+// apply to the active index (AnnDto's skip_serializing_if), so the IVF fields must
+// come back nil rather than as a plausible zero. A plain int could not tell "this
+// knob does not apply" from "n_probe is 0".
+func TestStatsHnswAnnDecodesOnlyTheHnswKnobs(t *testing.T) {
+	fake := &capture{reply: `{
+		"dimension": 3,
+		"distance": "Cosine",
+		"ann": {
+			"kind": "Hnsw", "overscan": 2, "seed": 42,
+			"m": 16, "ef_construction": 200, "ef_search": 64
+		},
+		"collections": [],
+		"footprint": {"rows":0,"dead_rows":0,"dimension":3,"vector_bytes":0,"doc_count":0}
+	}`}
+	db := serve(t, fake)
+
+	stats, err := db.Stats(context.Background())
+	if err != nil {
+		t.Fatalf("Stats failed: %v", err)
+	}
+	ann := stats.Ann
+	if ann == nil {
+		t.Fatal("Ann = nil, want the HNSW configuration")
+	}
+	if ann.Kind != "Hnsw" || ann.Overscan != 2 || ann.Seed != 42 {
+		t.Errorf("kind/overscan/seed = %q/%d/%d", ann.Kind, ann.Overscan, ann.Seed)
+	}
+	if ann.M == nil || *ann.M != 16 {
+		t.Errorf("m = %v, want 16", ann.M)
+	}
+	if ann.EfConstruction == nil || *ann.EfConstruction != 200 {
+		t.Errorf("ef_construction = %v, want 200", ann.EfConstruction)
+	}
+	if ann.EfSearch == nil || *ann.EfSearch != 64 {
+		t.Errorf("ef_search = %v, want 64", ann.EfSearch)
+	}
+	if ann.NLists != nil || ann.NProbe != nil {
+		t.Errorf("IVF knobs decoded as %v/%v, want nil for an HNSW index", ann.NLists, ann.NProbe)
+	}
+}
+
+// TestStatsIvfAnnDecodesOnlyTheIvfKnobs — the mirror image, so neither direction can
+// regress unnoticed.
+func TestStatsIvfAnnDecodesOnlyTheIvfKnobs(t *testing.T) {
+	fake := &capture{reply: `{"dimension":3,"ann":{"kind":"Ivf","overscan":2,"seed":1,` +
+		`"n_lists":64,"n_probe":8},"collections":[],` +
+		`"footprint":{"rows":0,"dead_rows":0,"dimension":3,"vector_bytes":0,"doc_count":0}}`}
+	db := serve(t, fake)
+
+	stats, err := db.Stats(context.Background())
+	if err != nil {
+		t.Fatalf("Stats failed: %v", err)
+	}
+	ann := stats.Ann
+	if ann == nil {
+		t.Fatal("Ann = nil, want the IVF configuration")
+	}
+	if ann.NLists == nil || *ann.NLists != 64 || ann.NProbe == nil || *ann.NProbe != 8 {
+		t.Errorf("n_lists/n_probe = %v/%v, want 64/8", ann.NLists, ann.NProbe)
+	}
+	if ann.M != nil || ann.EfConstruction != nil || ann.EfSearch != nil {
+		t.Error("HNSW knobs decoded non-nil for an IVF index")
+	}
+}
+
+// TestRecordWithoutAVectorStaysAbsent — a text-only doc has no "vector" key, and it
+// must survive a decode → encode round trip without acquiring an empty one. `null` or
+// `[]` there would be a dimension mismatch on the way back in, and worse, would turn
+// a text-only document into a vector-bearing one.
+func TestRecordWithoutAVectorStaysAbsent(t *testing.T) {
+	const wire = `[{"id":"a","attrs":{"body":{"Str":"text only"}}},` +
+		`{"id":"b","vector":[1,0,0],"attrs":{}}]`
+	fake := &capture{reply: wire}
+	db := serve(t, fake)
+
+	recs, err := db.Records(context.Background(), "notes")
+	if err != nil {
+		t.Fatalf("Records failed: %v", err)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("decoded %d records, want 2", len(recs))
+	}
+	if recs[0].Vector != nil {
+		t.Errorf("text-only record decoded with Vector = %v, want nil", recs[0].Vector)
+	}
+	if !reflect.DeepEqual(recs[1].Vector, []float32{1, 0, 0}) {
+		t.Errorf("vector = %v, want [1 0 0]", recs[1].Vector)
+	}
+
+	encoded, err := json.Marshal(recs)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	if string(encoded) != wire {
+		t.Errorf("round trip produced %s, want the original %s", encoded, wire)
+	}
+	if strings.Contains(string(encoded), `"vector":null`) {
+		t.Error("a text-only record re-encoded with a null vector")
+	}
+}
+
+// TestHitAttrsDecodeToTypedValues — hits keep [Value]s rather than a loose map (see
+// the note on Attrs), and the i64 precision guard has to survive the whole response
+// path, not just a direct Value decode.
+func TestHitAttrsDecodeToTypedValues(t *testing.T) {
+	fake := &capture{reply: `[{"collection":"docs","id":"a","score":0.98,` +
+		`"attrs":{"lang":{"Str":"rust"},"id":{"Int":9007199254740993},"none":"Null"}}]`}
+	db := serve(t, fake)
+
+	hits, err := db.Search(context.Background(), SearchRequest{Query: []float32{1, 0, 0}, TopK: 1})
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("decoded %d hits, want 1", len(hits))
+	}
+	hit := hits[0]
+	if hit.Collection != "docs" || hit.ID != "a" || hit.Score != 0.98 {
+		t.Errorf("hit = %+v", hit)
+	}
+	if lang, ok := hit.Attrs["lang"].Str(); !ok || lang != "rust" {
+		t.Errorf("lang = (%q, %v)", lang, ok)
+	}
+	if id, ok := hit.Attrs["id"].Int(); !ok || id != 9007199254740993 {
+		t.Errorf("id = (%d, %v), want the exact i64 through the response path", id, ok)
+	}
+	if hit.Attrs["none"].Kind() != KindNull {
+		t.Errorf("none kind = %v, want KindNull", hit.Attrs["none"].Kind())
+	}
+}
+
+// TestSuccessWithAnEmptyBodyIsNotAnError — a 200 with no body and a decoder waiting
+// for one is a lawful answer (some proxies strip bodies, and 204 is legal), so it must
+// not turn into a decode error.
+func TestSuccessWithAnEmptyBodyIsNotAnError(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusNoContent} {
+		fake := &capture{status: status}
+		db := serve(t, fake)
+		got, err := db.Collections(context.Background())
+		if err != nil {
+			t.Errorf("Collections against a %d with no body failed: %v", status, err)
+		}
+		if got != nil {
+			t.Errorf("Collections = %v, want nil", got)
+		}
+	}
+}
+
+// TestMalformedSuccessBodyIsNotAnAPIError — a 2xx whose body will not decode is a
+// contract problem, not a server error, so it must not masquerade as an *Error with a
+// status a caller might retry on.
+func TestMalformedSuccessBodyIsNotAnAPIError(t *testing.T) {
+	fake := &capture{reply: `{"dimension": "three"}`}
+	db := serve(t, fake)
+
+	_, err := db.Stats(context.Background())
+	if err == nil {
+		t.Fatal("Stats succeeded against a malformed body")
+	}
+	var nerr *Error
+	if errors.As(err, &nerr) {
+		t.Errorf("error is an *Error with status %d, want a plain decode error", nerr.Status)
+	}
+	if !strings.Contains(err.Error(), "/stats") {
+		t.Errorf("error = %q, want it to name the endpoint", err)
+	}
+}
+
+// ── Errors ──────────────────────────────────────────────────────────────────
+
+// TestErrorMessageExtraction — the thing on the other end of the socket is not always
+// the server. A reverse proxy returns HTML, axum's body-limit rejection is plain text,
+// and a dropped upstream returns nothing at all; the caller needs the most useful
+// message available in each case rather than an error-path failure.
+func TestErrorMessageExtraction(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		reply   string
+		wantMsg string
+	}{
+		{
+			"the server's JSON envelope", http.StatusBadRequest,
+			`{"error":"dimension mismatch: expected 3, got 4"}`,
+			"dimension mismatch: expected 3, got 4",
+		},
+		{
+			// A proxy's HTML, or axum's plain-text body-limit rejection: not JSON, so
+			// the raw body is the best message there is.
+			"a non-JSON body", http.StatusBadGateway,
+			"<html><body>502 Bad Gateway</body></html>",
+			"<html><body>502 Bad Gateway</body></html>",
+		},
+		{
+			"plain text", http.StatusRequestEntityTooLarge,
+			"length limit exceeded",
+			"length limit exceeded",
+		},
+		{
+			// Nothing to go on, so the status is the message. Anything else would be
+			// invented.
+			"an empty body", http.StatusServiceUnavailable, "", "HTTP 503",
+		},
+		{
+			"whitespace only", http.StatusInternalServerError, "   \n  ", "HTTP 500",
+		},
+		{
+			// Valid JSON with no error key — the envelope is absent, so fall back to the
+			// body rather than reporting an empty message.
+			"JSON without an error key", http.StatusBadRequest,
+			`{"detail":"something else"}`, `{"detail":"something else"}`,
+		},
+		{
+			"an empty error string", http.StatusBadRequest, `{"error":""}`, `{"error":""}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &capture{status: tc.status, reply: tc.reply}
+			db := serve(t, fake)
+
+			err := db.Flush(context.Background())
+			if err == nil {
+				t.Fatalf("Flush succeeded against a %d", tc.status)
+			}
+			var nerr *Error
+			if !errors.As(err, &nerr) {
+				t.Fatalf("error is %T, want *nidus.Error", err)
+			}
+			if nerr.Status != tc.status {
+				t.Errorf("Status = %d, want %d", nerr.Status, tc.status)
+			}
+			if nerr.Message != tc.wantMsg {
+				t.Errorf("Message = %q, want %q", nerr.Message, tc.wantMsg)
+			}
+			// Error() carries both parts, since that is what lands in a log line.
+			if !strings.Contains(err.Error(), tc.wantMsg) ||
+				!strings.Contains(err.Error(), fmt.Sprint(tc.status)) {
+				t.Errorf("Error() = %q, want the message and the status", err)
+			}
+		})
+	}
+}
+
+// TestErrorClassifiers — the status is the part a caller acts on (409 and 503 are
+// worth retrying, 400 and 422 never are), so the helpers must map to the statuses the
+// server actually chooses.
+//
+// 422 is the row that matters most, because it is the one a reader of the HTTP contract
+// does not expect: axum's Json extractor answers 422, not 400, for a body it cannot
+// deserialize (a negative top_k, a wrong-shaped Value), and 400 only for a JSON syntax
+// error. A retry loop written as `if !nerr.IsBadRequest() { retry() }` would otherwise
+// spin forever on a request that can never succeed.
+func TestErrorClassifiers(t *testing.T) {
+	cases := []struct {
+		status int
+		checks map[string]bool // the classifier that must report true; the rest false
+	}{
+		{0, map[string]bool{"transport": true}},
+		{400, map[string]bool{"bad request": true}},
+		{401, map[string]bool{"unauthorized": true}},
+		{403, map[string]bool{"read only": true}},
+		{409, map[string]bool{"locked": true}},
+		{422, map[string]bool{"bad request": true}},
+		{503, map[string]bool{"unavailable": true}},
+		{507, map[string]bool{"out of capacity": true}},
+		// A 500 is none of them: a caller has no specific recovery for it.
+		{500, nil},
+		// Nor is a 404, which is what a memory route answers on a build without the
+		// `memory` feature. Nothing about the request is malformed.
+		{404, nil},
+	}
+	for _, tc := range cases {
+		e := &Error{Message: "boom", Status: tc.status}
+		got := map[string]bool{
+			"transport":       e.IsTransport(),
+			"bad request":     e.IsBadRequest(),
+			"unauthorized":    e.IsUnauthorized(),
+			"read only":       e.IsReadOnly(),
+			"locked":          e.IsLocked(),
+			"unavailable":     e.IsUnavailable(),
+			"out of capacity": e.IsOutOfCapacity(),
+		}
+		for name, val := range got {
+			want := tc.checks[name]
+			if val != want {
+				t.Errorf("status %d: Is%s = %v, want %v", tc.status, name, val, want)
+			}
+		}
+	}
+
+	// Status 0 renders without a status suffix, because "(HTTP 0)" is noise.
+	if got := (&Error{Message: "unreachable"}).Error(); got != "nidus: unreachable" {
+		t.Errorf("Error() = %q, want no HTTP suffix for status 0", got)
+	}
+	if got := (&Error{Message: "nope", Status: 400}).Error(); got != "nidus: nope (HTTP 400)" {
+		t.Errorf("Error() = %q", got)
+	}
+}
+
+// TestTransportFailureIsStatusZero — a request that never got an answer is an *Error
+// with Status 0, so a caller has one error type to check and can still tell "nidus
+// said no" from "nidus was not reachable".
+func TestTransportFailureIsStatusZero(t *testing.T) {
+	// Take a real port and then close the listener, so the address is well-formed and
+	// nothing is listening — connection refused rather than a DNS or routing timeout.
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	addr := srv.URL
+	srv.Close()
+
+	db, err := NewClient(addr)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	_, err = db.Stats(context.Background())
+	if err == nil {
+		t.Fatal("Stats succeeded against a closed port")
+	}
+	var nerr *Error
+	if !errors.As(err, &nerr) {
+		t.Fatalf("error is %T, want *nidus.Error", err)
+	}
+	if nerr.Status != 0 {
+		t.Errorf("Status = %d, want 0 for a request that never got an answer", nerr.Status)
+	}
+	if !nerr.IsTransport() {
+		t.Error("IsTransport() = false")
+	}
+	if !strings.Contains(nerr.Message, "/stats") {
+		t.Errorf("Message = %q, want it to name the endpoint", nerr.Message)
+	}
+
+	// Health collapses every failure to false — "is it up" has one answer here — while
+	// Ping keeps the diagnosis that got the answer.
+	if db.Health(context.Background()) {
+		t.Error("Health reported up against a closed port")
+	}
+	perr := db.Ping(context.Background())
+	if perr == nil {
+		t.Fatal("Ping reported no error against a closed port")
+	}
+	if !errors.As(perr, &nerr) || nerr.Status != 0 {
+		t.Errorf("Ping error = %v (%T), want an *Error with status 0", perr, perr)
+	}
+	if !strings.Contains(perr.Error(), "/health") {
+		t.Errorf("Ping error = %q, want it to name the endpoint it could not reach", perr)
+	}
+}
+
+// TestErrorBodyIsBounded — the error path reads a bounded prefix, because the body only
+// ever becomes a short message and the thing on the other end of the socket is not
+// necessarily nidus. A gateway streaming a huge error document must not decide how much
+// memory this client allocates; the success path is deliberately still unbounded, since
+// Records returns a whole collection.
+func TestErrorBodyIsBounded(t *testing.T) {
+	const bodySize = 4 * errorBodyLimit
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		// Not JSON, so extractError falls back to the raw body — which is exactly the
+		// case where an unbounded read would have kept all of it.
+		_, _ = w.Write(bytes.Repeat([]byte("x"), bodySize))
+	}))
+	t.Cleanup(srv.Close)
+
+	db, err := NewClient(srv.URL)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	err = db.Flush(context.Background())
+	if err == nil {
+		t.Fatal("Flush succeeded against a 502")
+	}
+	var nerr *Error
+	if !errors.As(err, &nerr) {
+		t.Fatalf("error is %T, want *nidus.Error", err)
+	}
+	if nerr.Status != http.StatusBadGateway {
+		t.Errorf("Status = %d, want 502", nerr.Status)
+	}
+	if len(nerr.Message) > errorBodyLimit {
+		t.Errorf("Message is %d bytes from a %d-byte body, want at most %d",
+			len(nerr.Message), bodySize, errorBodyLimit)
+	}
+	if len(nerr.Message) == 0 {
+		t.Error("Message is empty; the prefix that was read is still the best message there is")
+	}
+
+	// The client is still usable afterwards, which is what the bounded drain is for.
+	if err := db.Flush(context.Background()); err == nil {
+		t.Error("the second Flush succeeded against a 502")
+	}
+}
+
+// TestCancelledContextIsATransportError — a cancelled or expired context is reported
+// as Status 0 too, and the message says which, because a caller chasing a phantom
+// network problem is a real cost.
+func TestCancelledContextIsATransportError(t *testing.T) {
+	fake := &capture{reply: `{}`}
+	db := serve(t, fake)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := db.Flush(ctx)
+	if err == nil {
+		t.Fatal("Flush succeeded with a cancelled context")
+	}
+	var nerr *Error
+	if !errors.As(err, &nerr) || nerr.Status != 0 {
+		t.Fatalf("error = %v (%T), want an *Error with status 0", err, err)
+	}
+	if !strings.Contains(nerr.Message, "cancelled") {
+		t.Errorf("Message = %q, want it to say the request was cancelled", nerr.Message)
+	}
+}
+
+// TestWithTimeoutBoundsARequestAndSaysSo — the SDK timeout is applied as a context
+// deadline so it composes with the caller's, and it is named in the message only when
+// it was the deadline that could fire first.
+func TestWithTimeoutBoundsARequestAndSaysSo(t *testing.T) {
+	slow := func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(2 * time.Second):
+		case <-r.Context().Done():
+		}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(slow))
+	t.Cleanup(srv.Close)
+
+	db, err := NewClient(srv.URL, WithTimeout(30*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	start := time.Now()
+	err = db.Flush(context.Background())
+	if err == nil {
+		t.Fatal("Flush succeeded against a hanging server")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("the request took %s; the timeout did not fire", elapsed)
+	}
+	var nerr *Error
+	if !errors.As(err, &nerr) || nerr.Status != 0 {
+		t.Fatalf("error = %v (%T), want an *Error with status 0", err, err)
+	}
+	if !strings.Contains(nerr.Message, "timed out after 30ms") {
+		t.Errorf("Message = %q, want it to name the configured timeout", nerr.Message)
+	}
+
+	// When the caller's own deadline is the earlier one, the message must not blame
+	// the SDK's timeout — that would send them looking in the wrong place.
+	loose, err := NewClient(srv.URL, WithTimeout(10*time.Second))
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	err = loose.Flush(ctx)
+	if err == nil {
+		t.Fatal("Flush succeeded against a hanging server")
+	}
+	if strings.Contains(err.Error(), "10s") {
+		t.Errorf("error = %q, must not blame the SDK timeout for the caller's deadline", err)
+	}
+}
+
+// ── Options and headers ─────────────────────────────────────────────────────
+
+// TestWithTokenSendsABearerHeader — and no Authorization header at all when there is
+// no token, since an empty bearer is the sort of thing an intermediary rejects while
+// `nidus serve` without --token would have accepted anything.
+func TestWithTokenSendsABearerHeader(t *testing.T) {
+	fake := &capture{reply: `{}`}
+	db := serve(t, fake, WithToken("s3cret"))
+	if err := db.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+	if got := fake.snapshot().header.Get("Authorization"); got != "Bearer s3cret" {
+		t.Errorf("Authorization = %q, want %q", got, "Bearer s3cret")
+	}
+
+	plain := &capture{reply: `{}`}
+	db = serve(t, plain)
+	if err := db.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+	header := plain.snapshot().header
+	if _, present := header["Authorization"]; present {
+		t.Errorf("Authorization = %q with no token configured, want the header absent",
+			header.Get("Authorization"))
+	}
+}
+
+// TestWithHeaderCannotDisplaceTheSDKsOwn — a caller's extra headers travel, but the
+// SDK sets Authorization and Content-Type last so its contract with the server
+// survives a typo in a WithHeader call.
+func TestWithHeaderCannotDisplaceTheSDKsOwn(t *testing.T) {
+	fake := &capture{reply: `{}`}
+	db := serve(t, fake,
+		WithToken("real"),
+		WithHeader("X-Trace-Id", "abc123"),
+		WithHeader("X-Tenant", "acme"),
+		WithHeader("Authorization", "Bearer forged"),
+		WithHeader("Content-Type", "text/plain"),
+	)
+	if err := db.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+	header := fake.snapshot().header
+	if got := header.Get("X-Trace-Id"); got != "abc123" {
+		t.Errorf("X-Trace-Id = %q, want abc123", got)
+	}
+	if got := header.Get("X-Tenant"); got != "acme" {
+		t.Errorf("X-Tenant = %q, want acme", got)
+	}
+	if got := header.Get("Authorization"); got != "Bearer real" {
+		t.Errorf("Authorization = %q; the configured token must win", got)
+	}
+	if got := header.Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q; the SDK's must win", got)
+	}
+}
+
+// TestContentTypeOnlyAccompaniesABody — a bodyless request that claims
+// application/json is a lie, and some proxies act on it.
+func TestContentTypeOnlyAccompaniesABody(t *testing.T) {
+	cases := []struct {
+		name     string
+		wantType string
+		call     func(context.Context, *Client) error
+	}{
+		{"GET has no body", "", func(ctx context.Context, c *Client) error {
+			_, err := c.Collections(ctx)
+			return err
+		}},
+		{"DELETE has no body", "", func(ctx context.Context, c *Client) error {
+			return c.DropCollection(ctx, "docs")
+		}},
+		{"POST with a body", "application/json", func(ctx context.Context, c *Client) error {
+			return c.Flush(ctx)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &capture{reply: `[]`}
+			db := serve(t, fake)
+			if err := tc.call(context.Background(), db); err != nil {
+				t.Fatalf("call failed: %v", err)
+			}
+			got := fake.snapshot()
+			if ct := got.header.Get("Content-Type"); ct != tc.wantType {
+				t.Errorf("Content-Type = %q, want %q", ct, tc.wantType)
+			}
+			if tc.wantType == "" && len(got.body) != 0 {
+				t.Errorf("sent a body (%s) on a request that should have none", got.body)
+			}
+		})
+	}
+}
+
+// TestWithHTTPClientIsUsedAndNilIsIgnored — a caller's transport is honoured, and a
+// nil one is dropped rather than stored, since a nil client can serve no request and
+// the resulting panic would point at the wrong line.
+func TestWithHTTPClientIsUsedAndNilIsIgnored(t *testing.T) {
+	fake := &capture{reply: `{}`}
+
+	var seen int
+	custom := &http.Client{Transport: countingTransport{&seen, http.DefaultTransport}}
+	db := serve(t, fake, WithHTTPClient(custom))
+	if err := db.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+	if seen != 1 {
+		t.Errorf("the supplied http.Client served %d requests, want 1", seen)
+	}
+
+	nilled := serve(t, &capture{reply: `{}`}, WithHTTPClient(nil))
+	if nilled.hc == nil {
+		t.Fatal("WithHTTPClient(nil) stored a nil client")
+	}
+	if err := nilled.Flush(context.Background()); err != nil {
+		t.Errorf("Flush failed after WithHTTPClient(nil): %v", err)
+	}
+}
+
+// countingTransport counts round trips so a test can prove which client was used.
+type countingTransport struct {
+	n    *int
+	next http.RoundTripper
+}
+
+func (t countingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	*t.n++
+	return t.next.RoundTrip(r)
+}
+
+// TestNewClientDoesNotTouchTheDefaultClient — a library that sets a Timeout on
+// http.DefaultClient changes the behaviour of every other package in the binary, from
+// a place nobody thinks to look.
+func TestNewClientDoesNotTouchTheDefaultClient(t *testing.T) {
+	db, err := NewClient("http://127.0.0.1:7700", WithTimeout(time.Second))
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	if db.hc == http.DefaultClient {
+		t.Error("the client is http.DefaultClient; SDK policy would leak process-wide")
+	}
+	if http.DefaultClient.Timeout != 0 {
+		t.Errorf("http.DefaultClient.Timeout = %s, want it untouched", http.DefaultClient.Timeout)
+	}
+	// The timeout is a per-request context deadline, not client policy, so it composes
+	// with a caller's own context instead of overriding it.
+	if db.hc.Timeout != 0 {
+		t.Errorf("hc.Timeout = %s, want 0 (the deadline is applied per request)", db.hc.Timeout)
+	}
+}
+
+// TestHealthCollapsesEveryFailureToFalse — "is it up" has one answer, and /health
+// needs no token, so a false is never merely an auth problem.
+func TestHealthCollapsesEveryFailureToFalse(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		want   bool
+	}{
+		{"200", http.StatusOK, true},
+		{"401", http.StatusUnauthorized, false},
+		{"503 store not open", http.StatusServiceUnavailable, false},
+		{"500", http.StatusInternalServerError, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &capture{status: tc.status, reply: `{"status":"ok"}`}
+			db := serve(t, fake)
+			if got := db.Health(context.Background()); got != tc.want {
+				t.Errorf("Health() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestConcurrentUseIsSafe — one Client per server, shared, is the intended shape;
+// this is the assertion that says so, and `go test -race` is what enforces it.
+func TestConcurrentUseIsSafe(t *testing.T) {
+	// A handler of its own here rather than the shared capture, whose recorded fields
+	// are last-write-wins by design.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	t.Cleanup(srv.Close)
+
+	db, err := NewClient(srv.URL, WithToken("t"), WithHeader("X-Trace-Id", "abc"))
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 32)
+	for i := range 32 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := db.Search(context.Background(), SearchRequest{
+				Query: []float32{1, 0, 0},
+				TopK:  i + 1,
+			})
+			if err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent Search failed: %v", err)
+	}
+}
