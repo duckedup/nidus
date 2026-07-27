@@ -252,13 +252,24 @@ jobs:
   # structurally impossible for an SDK to publish a version the crate never released.
   #
   # `needs: github-release` (not just check-version) so an SDK is never published for a
-  # release that failed to cut. The SDKs are independent of each other and run in
-  # parallel; one registry being down must not block the others.
+  # release that failed to cut — and, for Go, because its module tag is cut from the
+  # crate's release tag. The SDKs are independent of each other and run in parallel; one
+  # registry being down must not block the others. Each owns its release workflow, since
+  # "publish" means something different per ecosystem (npm upload vs. a bare module tag).
   publish-sdk-js:
     name: Publish JS SDK
     needs: [check-version, github-release]
     if: "!failure() && !cancelled() && needs.check-version.outputs.should_release == 'true'"
     uses: ./.github/workflows/sdk-js-release.yml
+    with:
+      version: ${{ needs.check-version.outputs.version }}
+    secrets: inherit
+
+  publish-sdk-go:
+    name: Publish Go SDK
+    needs: [check-version, github-release]
+    if: "!failure() && !cancelled() && needs.check-version.outputs.should_release == 'true'"
+    uses: ./.github/workflows/sdk-go-release.yml
     with:
       version: ${{ needs.check-version.outputs.version }}
     secrets: inherit

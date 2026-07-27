@@ -1,0 +1,268 @@
+// Tests for the predicate and filter wire shapes.
+//
+// These assert on marshalled bytes throughout. A filter that encodes to the wrong
+// shape does not fail loudly — the server answers 400 with a serde message about a
+// tuple variant, which tells a caller nothing about which builder was wrong — so the
+// shape is worth pinning exactly. Two shapes in particular have no symmetry to fall
+// back on: Glob's second element is a bare string where every other predicate's is a
+// tagged Value, and a Filter is a bare array rather than an object wrapping one.
+package nidus
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+// TestPredicateWireShapes pins every variant's encoding. The key is always the first
+// tuple element and the operand the second, matching serde's externally-tagged
+// 2-tuple form for the crate's Predicate enum.
+func TestPredicateWireShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		pred Predicate
+		want string
+	}{
+		{"Eq string", Eq("lang", "rust"), `{"Eq":["lang",{"Str":"rust"}]}`},
+		{"Eq int", Eq("year", 2024), `{"Eq":["year",{"Int":2024}]}`},
+		{"Eq bool", Eq("draft", false), `{"Eq":["draft",{"Bool":false}]}`},
+		{"Eq null", Eq("summary", nil), `{"Eq":["summary","Null"]}`},
+		{"Eq list", Eq("tags", []string{"a", "b"}), `{"Eq":["tags",{"List":["a","b"]}]}`},
+		{"Ne", Ne("lang", "go"), `{"Ne":["lang",{"Str":"go"}]}`},
+		{"Lt", Lt("year", 2024), `{"Lt":["year",{"Int":2024}]}`},
+		{"Le", Le("year", 2024), `{"Le":["year",{"Int":2024}]}`},
+		{"Gt", Gt("year", 2024), `{"Gt":["year",{"Int":2024}]}`},
+		{"Ge", Ge("year", 2024), `{"Ge":["year",{"Int":2024}]}`},
+		{"In", In("lang", "rust", "go"), `{"In":["lang",[{"Str":"rust"},{"Str":"go"}]]}`},
+		{"In mixed types", In("k", "a", 1), `{"In":["k",[{"Str":"a"},{"Int":1}]]}`},
+		{"NotIn", NotIn("lang", "js"), `{"NotIn":["lang",[{"Str":"js"}]]}`},
+		// A nil set must still be `[]`: the server's is a Vec, and `null` would be a
+		// deserialization error rather than "an empty set, matching nothing".
+		{"In with no values", In("lang"), `{"In":["lang",[]]}`},
+		{"NotIn with no values", NotIn("lang"), `{"NotIn":["lang",[]]}`},
+		{"Glob", Glob("path", "src/*.rs"), `{"Glob":["path","src/*.rs"]}`},
+		// A key with JSON-significant characters must be escaped as a string, not
+		// interpolated — the key is caller data.
+		{"quoted key", Eq(`a"b`, "v"), `{"Eq":["a\"b",{"Str":"v"}]}`},
+		// A Value passed straight through, rather than a plain Go value to normalize.
+		{"pre-built Value", Eq("n", Int(9007199254740993)), `{"Eq":["n",{"Int":9007199254740993}]}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.pred.Err(); err != nil {
+				t.Fatalf("Err() = %v, want nil", err)
+			}
+			got, err := json.Marshal(tc.pred)
+			if err != nil {
+				t.Fatalf("Marshal failed: %v", err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("Marshal = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGlobSecondElementIsABareString states the asymmetry on its own, because it is
+// the wire format and not a choice — a Glob pattern wrapped in {"Str":…} is rejected
+// by the server, and it is the mistake a reader of the other predicates would make.
+func TestGlobSecondElementIsABareString(t *testing.T) {
+	encoded, err := json.Marshal(Glob("path", "src/*"))
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	if want := `{"Glob":["path","src/*"]}`; string(encoded) != want {
+		t.Fatalf("Marshal = %s, want %s", encoded, want)
+	}
+
+	// Decode it back generically and check the second element really is a JSON string
+	// and not an object, so this cannot pass by coincidence of formatting.
+	var tuple map[string][]json.RawMessage
+	if err := json.Unmarshal(encoded, &tuple); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	second := string(tuple["Glob"][1])
+	if !strings.HasPrefix(second, `"`) {
+		t.Errorf("Glob's pattern encoded as %s, want a bare JSON string", second)
+	}
+
+	// Every other predicate's second element IS a tagged object — the contrast is the
+	// point of this test.
+	other, err := json.Marshal(Eq("path", "src/*"))
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	if err := json.Unmarshal(other, &tuple); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	if second := string(tuple["Eq"][1]); !strings.HasPrefix(second, "{") {
+		t.Errorf("Eq's operand encoded as %s, want a tagged Value object", second)
+	}
+}
+
+// TestFilterMarshalsAsBareArray — the crate's Filter is a newtype over
+// Vec<Predicate>, so it serializes as a plain array. An object wrapping one would be
+// rejected.
+func TestFilterMarshalsAsBareArray(t *testing.T) {
+	f := And(Eq("lang", "rust"), Ge("year", 2020), Glob("path", "src/*"))
+	got, err := json.Marshal(f)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	want := `[{"Eq":["lang",{"Str":"rust"}]},{"Ge":["year",{"Int":2020}]},{"Glob":["path","src/*"]}]`
+	if string(got) != want {
+		t.Errorf("Marshal = %s, want %s", got, want)
+	}
+	// Predicate order is preserved. It does not change the result (they AND), but a
+	// reordering would mean the encoder is round-tripping through a map somewhere.
+	if got[1] != '{' || !strings.Contains(string(got), `"Eq"`) {
+		t.Errorf("unexpected array shape: %s", got)
+	}
+}
+
+// TestEmptyFilterMarshalsAsEmptyArray — both a nil Filter and a zero-length one. The
+// nil case is the one that matters: `null` is a deserialization error on the server,
+// not an empty filter, so a caller who left the field alone would get a 400.
+func TestEmptyFilterMarshalsAsEmptyArray(t *testing.T) {
+	var nilFilter Filter
+	got, err := json.Marshal(nilFilter)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	if string(got) != "[]" {
+		t.Errorf("nil Filter marshalled as %s, want []", got)
+	}
+
+	got, err = json.Marshal(Filter{})
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	if string(got) != "[]" {
+		t.Errorf("empty Filter marshalled as %s, want []", got)
+	}
+
+	// And() with no arguments is the same thing, since callers reach for it first.
+	got, err = json.Marshal(And())
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	if string(got) != "[]" {
+		t.Errorf("And() marshalled as %s, want []", got)
+	}
+}
+
+// TestAndCollectsPredicates — And is sugar over a slice literal, so it must not
+// reorder, drop, or wrap.
+func TestAndCollectsPredicates(t *testing.T) {
+	f := And(Eq("a", 1), Eq("b", 2))
+	if len(f) != 2 {
+		t.Fatalf("And produced %d predicates, want 2", len(f))
+	}
+	if f[0].key != "a" || f[1].key != "b" {
+		t.Errorf("And reordered: %q then %q", f[0].key, f[1].key)
+	}
+	// A Filter is a slice, so a literal is equivalent — the sugar must not diverge.
+	direct, _ := json.Marshal(Filter{Eq("a", 1), Eq("b", 2)})
+	viaAnd, _ := json.Marshal(f)
+	if string(direct) != string(viaAnd) {
+		t.Errorf("And() = %s but the slice literal = %s", viaAnd, direct)
+	}
+}
+
+// TestPredicateCarriesANormalizationError — the builders take `any` so that
+// nidus.Eq("year", 2024) reads naturally, which means a bad value has no error to
+// return at the call site. The failure is carried on the Predicate and surfaced from
+// MarshalJSON rather than panicking or silently sending a wrong-but-valid body.
+func TestPredicateCarriesANormalizationError(t *testing.T) {
+	cases := []struct {
+		name string
+		pred Predicate
+		want string // a substring the error must contain
+	}{
+		{"Eq float", Eq("score", 1.5), `Eq("score")`},
+		{"Ne float", Ne("score", 1.5), `Ne("score")`},
+		{"Lt float", Lt("score", 1.5), `Lt("score")`},
+		{"Le float", Le("score", 1.5), `Le("score")`},
+		{"Gt float", Gt("score", 1.5), `Gt("score")`},
+		{"Ge float", Ge("score", 1.5), `Ge("score")`},
+		{"In float", In("score", "ok", 1.5), `In("score") value 1`},
+		{"NotIn float", NotIn("score", 1.5), `NotIn("score") value 0`},
+		{"Eq unsupported type", Eq("k", []int{1}), `Eq("k")`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.pred.Err()
+			if err == nil {
+				t.Fatal("Err() = nil, want the normalization failure")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Err() = %q, want it to name %s", err, tc.want)
+			}
+			// The same error must come back from the encoder, because that is the path a
+			// caller who never checks Err() takes.
+			if _, err := json.Marshal(tc.pred); err == nil {
+				t.Error("Marshal succeeded; a broken predicate must not encode")
+			}
+		})
+	}
+}
+
+// TestFilterErrReportsTheFirstFailure — checking a whole filter at once, for callers
+// who want the error before they make the request.
+func TestFilterErrReportsTheFirstFailure(t *testing.T) {
+	if err := And(Eq("a", 1), Ge("b", "x")).Err(); err != nil {
+		t.Errorf("a valid filter reported %v", err)
+	}
+	var nilFilter Filter
+	if err := nilFilter.Err(); err != nil {
+		t.Errorf("nil Filter reported %v", err)
+	}
+
+	f := And(Eq("ok", 1), Eq("first", 1.5), Eq("second", 2.5))
+	err := f.Err()
+	if err == nil {
+		t.Fatal("Err() = nil, want the first failure")
+	}
+	if !strings.Contains(err.Error(), "first") {
+		t.Errorf("Err() = %q, want the first failing predicate", err)
+	}
+	// A filter holding a broken predicate must not encode at all — a partial body
+	// would be worse than an error, since the server would happily run the wrong query.
+	if _, err := json.Marshal(f); err == nil {
+		t.Error("Marshal succeeded on a filter with a broken predicate")
+	}
+}
+
+// TestZeroPredicateIsAnEncodeError — Predicate{} names no operation, so it cannot be
+// encoded. The message points at the builders, since a zero predicate almost always
+// means a struct literal was used where a builder was meant.
+func TestZeroPredicateIsAnEncodeError(t *testing.T) {
+	_, err := json.Marshal(Predicate{})
+	if err == nil {
+		t.Fatal("Marshal(Predicate{}) succeeded, want an error")
+	}
+	if !strings.Contains(err.Error(), "Eq") {
+		t.Errorf("error = %q, want it to point at the builders", err)
+	}
+	if _, err := json.Marshal(Filter{Predicate{}}); err == nil {
+		t.Error("a Filter holding a zero Predicate encoded successfully")
+	}
+}
+
+// TestGlobNeedsNoNormalization — Glob takes a typed string, so it can never carry a
+// normalization error, and an empty pattern is a legitimate (if useless) request
+// rather than something to reject client-side.
+func TestGlobNeedsNoNormalization(t *testing.T) {
+	p := Glob("path", "")
+	if err := p.Err(); err != nil {
+		t.Fatalf("Err() = %v, want nil", err)
+	}
+	got, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	if want := `{"Glob":["path",""]}`; string(got) != want {
+		t.Errorf("Marshal = %s, want %s", got, want)
+	}
+}
