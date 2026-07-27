@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use super::scoring::{PARALLEL_SCAN_WORK_FLOOR, parallel_topk, score_chunk};
 use super::{ScanOrder, Store, oom};
@@ -300,6 +300,36 @@ impl Store {
 
     // ── Search ──────────────────────────────────────────────────────────────────
 
+    /// Reject a query vector whose length is not the store's pinned dimension (nidus-c5v).
+    ///
+    /// Dimension is fixed in the `data` header at creation, so a mismatched query is
+    /// never a question the store can answer — but it *is* one it can silently appear to
+    /// answer. Without this guard the query is scored against rows of a different width:
+    /// `dot` zips the two slices, so it stops at the shorter one and happily returns a
+    /// score computed over a prefix. The caller gets `200` and a plausible-looking
+    /// (or empty) ranking rather than an error.
+    ///
+    /// That matters more than a normal input-validation miss because of *how* callers
+    /// reach it: the overwhelmingly common way to send a wrong-length query is to change
+    /// embedding models without re-indexing. The symptom is then "my search got worse"
+    /// or "no results" — indistinguishable from a genuinely empty store, and the one
+    /// failure mode a vector store cannot afford to express as a quiet wrong answer.
+    ///
+    /// `upsert` has always rejected a mismatched vector (`store/write.rs`); this makes the
+    /// read path agree. The wording deliberately keeps the substring the server's
+    /// `classify` already matches to return `400`, so no new mapping is needed.
+    fn check_query_dim(&self, query: &[f32]) -> Result<()> {
+        let dim = self.data.dimension();
+        if query.len() != dim {
+            bail!(
+                "query length {} does not match store dimension {}",
+                query.len(),
+                dim
+            );
+        }
+        Ok(())
+    }
+
     /// Brute-force search over the union of `collections`, merged into one ranking
     /// (one bounded top-k heap fed by every in-scope collection). The scoring function
     /// is determined by the store's [`Distance`] metric.
@@ -308,12 +338,22 @@ impl Store {
     /// is configured, then to the quantized two-pass path
     /// ([`search_quantized`](Self::search_quantized)) when quantization is on, and
     /// otherwise scores the row-sorted scan exactly via [`rank_scan`](Self::rank_scan).
+    ///
+    /// Errors when `query.len()` is not the store's dimension — see
+    /// [`check_query_dim`](Self::check_query_dim).
     pub fn search(
         &self,
         collections: &[&str],
         query: &[f32],
         opts: &SearchOpts,
     ) -> Result<Vec<Hit>> {
+        // Before the metric: a request the store refuses is not a query it served, so
+        // counting it would overstate `search_queries` and skew every ratio built on it.
+        // This is also the single funnel for *every* vector path — exact, quantized, ANN,
+        // and per-segment all dispatch below it, and `hybrid_search`'s vector leg calls
+        // straight into here — so one check covers them all.
+        self.check_query_dim(query)?;
+
         // Which path served a query is the difference between "queries are slow" and
         // "queries are slow BECAUSE the index is not being used" (nidus-abx.4). One relaxed
         // atomic add per query, off the per-vector inner loop entirely.
@@ -446,6 +486,12 @@ impl Store {
         text: &FtsQuery,
         opts: &HybridOpts,
     ) -> Result<Vec<Hit>> {
+        // Ahead of the `top_k == 0` shortcut, not after it: the vector leg calls `search`,
+        // which validates, but that shortcut returns before the leg ever runs. Validating
+        // here too means one bad query does not change verdict — accepted or rejected —
+        // based on `top_k`, which would be a confusing thing to debug.
+        self.check_query_dim(vector)?;
+
         if opts.top_k == 0 {
             return Ok(Vec::new());
         }

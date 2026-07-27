@@ -4551,3 +4551,128 @@ fn a_cancelled_search_stops_and_errors() {
         10
     );
 }
+
+// ── Query-dimension validation (nidus-c5v) ───────────────────────────────────
+//
+// Dimension is pinned in the `data` header at creation, so a query of the wrong length
+// is unanswerable. It used to be answered anyway: `dot` zips two slices and stops at the
+// shorter, so a mismatched query was scored over a prefix and came back as `Ok` — a
+// plausible-looking or empty ranking rather than an error. These are pure in-memory
+// tests (Miri-clean) because that is exactly where the arithmetic lives.
+
+/// The wording matters beyond readability: the server's `classify` maps this substring to
+/// `400`, so a reworded message would silently downgrade the HTTP status to `500`.
+fn assert_dim_error(err: anyhow::Error, want_len: usize, want_dim: usize) {
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("does not match store dimension"),
+        "message must keep the substring `classify` matches for 400, got: {msg}"
+    );
+    assert!(
+        msg.contains(&want_len.to_string()) && msg.contains(&want_dim.to_string()),
+        "message should name both lengths ({want_len} vs {want_dim}), got: {msg}"
+    );
+}
+
+#[test]
+fn search_rejects_a_query_of_the_wrong_dimension() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert("col", &[rec("a", vec![1.0, 0.0, 0.0])])
+        .unwrap();
+
+    // Short, long, and empty. The short case is the dangerous one: it used to score
+    // against a prefix and return `Ok`, so "too few dimensions" was indistinguishable
+    // from a real answer.
+    for bad in [vec![1.0, 0.0], vec![1.0, 0.0, 0.0, 9.0], vec![]] {
+        let n = bad.len();
+        let err = match store.search(&["col"], &bad, &default_opts(5)) {
+            Ok(hits) => panic!(
+                "a {n}-dim query against a dim-3 store must be refused, got {} hit(s)",
+                hits.len()
+            ),
+            Err(e) => e,
+        };
+        assert_dim_error(err, n, 3);
+    }
+
+    // The correct length still works — the guard must not have broken the happy path.
+    assert_eq!(
+        store
+            .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(5))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn search_rejects_a_bad_dimension_even_on_an_empty_store() {
+    // No rows, so a scan would find nothing and return `Ok(vec![])` regardless. That is
+    // the whole point: "wrong shape" must not be reported as "nothing matched", because a
+    // caller cannot tell those apart and the wrong-shape case is a bug in their code.
+    let store = Store::in_memory(8).unwrap();
+    let err = store
+        .search(&["col"], &[1.0, 2.0], &default_opts(5))
+        .expect_err("dimension is pinned at creation, not inferred from the rows present");
+    assert_dim_error(err, 2, 8);
+}
+
+#[test]
+fn search_rejects_a_bad_dimension_on_the_ann_path_too() {
+    // `search` validates before dispatching, so every path inherits the guard. Asserted
+    // rather than assumed: the ANN walk is a separate code path that never touches
+    // `rank_scan`, and it is the path a production store is most likely to be running.
+    let vectors: Vec<Vec<f32>> = (0..32)
+        .map(|i| {
+            let x = i as f32;
+            vec![x, 1.0 - x, x * 0.5, 2.0 - x]
+        })
+        .collect();
+    let store = ann_store(4, AnnConfig::hnsw(), &vectors);
+    let err = store
+        .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(5))
+        .expect_err("the ANN path must refuse a mismatched query too");
+    assert_dim_error(err, 3, 4);
+}
+
+#[test]
+fn hybrid_search_rejects_a_bad_dimension_regardless_of_top_k() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .unwrap();
+    store
+        .upsert("docs", &[doc("c", "quantum physics")])
+        .unwrap();
+
+    let query = FtsQuery::new("body", "quantum");
+    for top_k in [10, 0] {
+        let opts = HybridOpts {
+            top_k,
+            ..Default::default()
+        };
+        // `top_k: 0` short-circuits before the vector leg runs, so without an explicit
+        // guard in `hybrid_search` the same bad query would be accepted at `top_k: 0` and
+        // refused at `top_k: 10`. A verdict that depends on `top_k` is a miserable thing
+        // to debug.
+        let err = store
+            .hybrid_search(&["docs"], &[1.0, 0.0], &query, &opts)
+            .expect_err("hybrid must refuse a mismatched vector at any top_k");
+        assert_dim_error(err, 2, 3);
+    }
+}
+
+#[test]
+fn a_refused_query_is_not_counted_as_a_served_one() {
+    // `search_queries` underpins every ratio built on it (ANN-vs-exact share, mean rows
+    // scanned). Counting a request the store refused would overstate the denominator.
+    let store = Store::in_memory(3).unwrap();
+    let before = crate::metrics::metrics().search_queries.get();
+    assert!(store.search(&["col"], &[1.0], &default_opts(5)).is_err());
+    assert_eq!(
+        crate::metrics::metrics().search_queries.get(),
+        before,
+        "a rejected query must not move the served-query counter"
+    );
+}
