@@ -236,6 +236,37 @@ sdk-go-test-all: build-cli
     cd sdks/go && NIDUS_BIN={{justfile_directory()}}/target/release/nidus \
       go test -tags integration ./...
 
+# Python SDK: the venv every sdk-py-* recipe runs in. Created on demand so the recipes
+# work from a clean clone with nothing but `python3` on PATH — the dev tools (ruff, mypy,
+# pytest) live in the package's `dev` extra, never in a global install and never as
+# runtime deps. `sdks/python/.venv/` is gitignored.
+[private]
+sdk-py-venv:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd sdks/python
+    [ -d .venv ] || python3 -m venv .venv
+    ./.venv/bin/python -m pip install --quiet --upgrade pip
+    ./.venv/bin/python -m pip install --quiet -e '.[dev]'
+
+# Python SDK: lint + format check + strict typecheck (what CI's sdk-python job runs)
+sdk-py-lint: sdk-py-venv
+    cd sdks/python && ./.venv/bin/ruff check && ./.venv/bin/ruff format --check && \
+      ./.venv/bin/mypy src
+
+# Python SDK: typecheck + unit tests (stub transport — no server needed). The
+# integration suite skips itself when the binary is absent, but exclude it explicitly:
+# a silent skip is indistinguishable from a pass, and `sdk-py-test-all` is where it runs.
+sdk-py-test: sdk-py-venv
+    cd sdks/python && ./.venv/bin/mypy src && \
+      ./.venv/bin/pytest --ignore=tests/test_integration.py
+
+# Python SDK: full test incl. integration against a real `nidus serve`.
+# Builds the binary first and points the suite at it via NIDUS_BIN.
+sdk-py-test-all: build-cli sdk-py-venv
+    cd sdks/python && ./.venv/bin/mypy src && \
+      NIDUS_BIN={{justfile_directory()}}/target/release/nidus ./.venv/bin/pytest
+
 # ── Build ──────────────────────────────────────────────────────────────────
 
 # Debug build for the current host

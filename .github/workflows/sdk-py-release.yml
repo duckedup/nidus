@@ -1,0 +1,192 @@
+name: Release Python SDK
+
+# Publishes `nidus` to PyPI at the CRATE's version.
+#
+# ## Why the version is the crate's, and why it is stamped rather than hand-edited
+#
+# Every nidus SDK ships at the version of the server it was written against, so
+# "which nidus does this client speak to" is answerable from the version alone. That
+# makes `Cargo.toml`'s `version` the single source of truth and the package's version a
+# *derived* value — stamped here from the `version` input and committed back to main,
+# exactly as `helm-publish.yml` does for the chart (nidus-yap) and `sdk-js-release.yml`
+# for npm. CLAUDE.md records why the alternative was abandoned: a CI assertion that the
+# two agree fires on essentially every PR, because every PR bumps the crate.
+#
+# There is exactly ONE string to stamp: `sdks/python/src/nidus/_version.py`.
+# `pyproject.toml` declares `dynamic = ["version"]` and reads that file via
+# `[tool.hatch.version] path`, so the manifest and `nidus.__version__` cannot disagree.
+#
+# ## Why workflow_call rather than `on: push`
+#
+# The crate's release tag is pushed with GITHUB_TOKEN, which by GitHub's anti-recursion
+# rule cannot start another workflow — the same reason docker.yml, helm-publish.yml and
+# sdk-js-release.yml are called directly by release.yml. Being invoked by release.yml
+# also means this can only ever publish a version the crate actually released, which a
+# `paths:`-filtered push trigger could not guarantee.
+#
+# Tag namespace `py-v*`, distinct from the crate's `v*` and the JS SDK's `js-v*`.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Crate version to stamp and publish (no leading v)
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Crate version to stamp and publish (no leading v)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Stamp and publish to PyPI
+    if: github.repository == 'duckedup/nidus'
+    runs-on: ubuntu-latest
+    permissions:
+      # `write` so the stamp can be committed back — see "Persist the stamp" below.
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The branch, not the triggering SHA: this job commits the stamp back, which
+          # needs a branch to push to.
+          ref: main
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          # Build/publish on a current interpreter even though the SDK's floor is 3.9 —
+          # the wheel is pure-Python and `py3-none-any`, so the building interpreter
+          # does not narrow who can install it. CI's sdk-python job is what proves the
+          # code itself still type-checks and passes on the supported range.
+          python-version: "3.12"
+
+      - name: Stamp _version.py from the crate
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::refusing to stamp a non-semver version: '$VERSION'" >&2; exit 1 ;;
+          esac
+          sed -i -E "s/^__version__ = .*/__version__ = \"${VERSION}\"/" sdks/python/src/nidus/_version.py
+          echo "stamped sdks/python/src/nidus/_version.py to $VERSION"
+          grep -E '^__version__' sdks/python/src/nidus/_version.py
+
+      - name: Install
+        working-directory: sdks/python
+        run: pip install -e '.[dev]'
+
+      # Verify AFTER stamping: the tree being published is the stamped one, so that is
+      # what has to be valid (same reasoning as helm-publish re-linting post-stamp).
+      # `_version.py` is a real source file that ruff and mypy read, so a botched stamp
+      # is caught here rather than by whoever installs the release.
+      - name: Lint (stamped)
+        working-directory: sdks/python
+        run: |
+          ruff check
+          ruff format --check
+
+      - name: Typecheck (stamped)
+        working-directory: sdks/python
+        run: mypy src
+
+      # Unit tier only: the integration suite needs a real `nidus serve` binary, which
+      # is a Rust build this job has no reason to carry. It runs locally via
+      # `just sdk-py-test-all` and in the integration workflow.
+      - name: Unit tests (stamped)
+        working-directory: sdks/python
+        run: pytest --ignore=tests/test_integration.py
+
+      - name: Build sdist + wheel
+        working-directory: sdks/python
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          python -m build
+          ls -l dist
+
+      # `twine check` catches the failure mode that is otherwise only visible after
+      # upload: a README PyPI refuses to render, which cannot be fixed in place.
+      - name: Check distributions
+        working-directory: sdks/python
+        run: twine check dist/*
+
+      # Idempotent: `--skip-existing` turns "this version is already on PyPI" into a
+      # no-op success instead of a hard failure, so re-running a release (or a
+      # workflow_dispatch of a version already out) is safe. The crate's own publish
+      # step takes the same stance by grepping for "already exists".
+      #
+      # PIPY_TOKEN is spelled that way ON PURPOSE — it is the secret that exists in this
+      # repository. Do NOT "correct" it to PYPI_TOKEN: the name would resolve to empty
+      # and every release would fail authentication at the last step.
+      - name: Publish
+        working-directory: sdks/python
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PIPY_TOKEN }}
+        run: twine upload --skip-existing dist/*
+
+      - name: Create tag and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="py-v${VERSION}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already exists — nothing to do"
+            exit 0
+          fi
+          PREV_TAG=$(git tag --sort=-v:refname --list 'py-v*' | head -1)
+          if [ -z "$PREV_TAG" ]; then
+            NOTES=$(git log --pretty=format:"- %s" -- sdks/python | head -50)
+          else
+            NOTES=$(git log --pretty=format:"- %s" "$PREV_TAG"..HEAD -- sdks/python)
+          fi
+          git tag "$TAG"
+          git push origin "$TAG"
+
+          # --latest=false so an SDK release never displaces the crate's as the
+          # repository's "latest" release.
+          gh release create "$TAG" \
+            --title "Python SDK ${VERSION}" \
+            --latest=false \
+            --notes "## nidus ${VERSION} (Python SDK)
+
+          \`\`\`sh
+          pip install nidus==${VERSION}
+          \`\`\`
+
+          ### Changes
+
+          ${NOTES}"
+
+      # Keep the checked-in version honest: without this a clone's `nidus.__version__`
+      # would permanently disagree with what is on PyPI. Pushed with GITHUB_TOKEN, which
+      # cannot trigger another workflow, so no loop.
+      #
+      # Best-effort on purpose: the package is already published by this point, and a
+      # race with a concurrent push to main must not fail a release that succeeded.
+      - name: Persist the stamp back to main
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- sdks/python/src/nidus/_version.py; then
+            echo "version already at the released version — nothing to commit"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sdks/python/src/nidus/_version.py
+          git commit -m "🪺 sdk-py: stamp version ${{ inputs.version }} [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main

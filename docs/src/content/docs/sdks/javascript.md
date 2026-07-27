@@ -14,8 +14,9 @@ runs unchanged on Node 18+, Deno, Bun, Cloudflare Workers, and in the browser.
 npm install @duckedup/nidus
 ```
 
-The SDK is versioned in lockstep with nidus, so `@duckedup/nidus@0.38.x` is the client
-for nidus `0.38.x`. Match the two and the wire contract lines up.
+The SDK is versioned in lockstep with nidus: a given `@duckedup/nidus` version is the
+client for the identically-numbered nidus release. Match the two and the wire contract
+lines up.
 
 ## Connecting
 
