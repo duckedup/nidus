@@ -281,6 +281,8 @@ of `examples/memory.rs`.
 
 ## Where to next
 
+- [MCP (agent memory)](/guides/mcp/) — expose this layer to an agent over the
+  Model Context Protocol.
 - [Search & filters](/guides/search/) — what `recall` runs underneath.
 - [Embedding in a host app](/guides/integrating/) — mapping your document type
   onto a `Record`.

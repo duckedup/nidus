@@ -58,7 +58,7 @@ jobs:
       # Build before starting anything, so a compile error reads as a compile
       # error instead of a confusing "server never reported an address".
       - name: Build the test binary and the nidus binary
-        run: cargo test --features cli --test e2e --no-run
+        run: cargo test --features cli,mcp --test e2e --no-run
 
       # Started via the same script `just e2e-services-up` runs, so a developer
       # reproducing a CI failure gets a byte-identical environment. Not GitHub
@@ -77,7 +77,7 @@ jobs:
       # The tests' NIDUS_E2E_* defaults already match what the script starts, so
       # there is nothing to configure here — one less pair of values to drift.
       - name: Run end-to-end tests
-        run: cargo test --features cli --test e2e -- --include-ignored --test-threads=2
+        run: cargo test --features cli,mcp --test e2e -- --include-ignored --test-threads=2
 
       # Second leg: the same cluster suite against a 3-master Valkey CLUSTER, which
       # is the only way the tier client's slot routing and MOVED/ASK handling get
@@ -90,7 +90,7 @@ jobs:
       - name: Run cluster tests against Valkey Cluster
         run: |
           NIDUS_E2E_REDIS_URL="$(./scripts/e2e-services.sh cluster-url)" \
-            cargo test --features cli --test e2e cluster:: -- --ignored --test-threads=2
+            cargo test --features cli,mcp --test e2e cluster:: -- --ignored --test-threads=2
 
       # A red run should be diagnosable from the log alone, without a rerun. The
       # harness already attaches each nidus process's stderr to its failure; these

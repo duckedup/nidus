@@ -250,6 +250,40 @@ impl RunningServer {
         read(res, path, &self.stderr())
     }
 
+    /// `POST path` with a JSON body plus caller-supplied headers.
+    ///
+    /// Exists for the MCP suite, whose protocol lives partly *in the headers*:
+    /// `2026-07-28` requires `Mcp-Method`/`Mcp-Name` on every Streamable HTTP POST so
+    /// gateways can route without parsing the body, and it needs an `Accept` naming both
+    /// `application/json` and `text/event-stream`. Testing that surface through
+    /// [`post`](Self::post) would be testing a different protocol.
+    ///
+    /// A later header of the same name overrides an earlier one, so a caller can pass a
+    /// deliberately wrong `Mcp-Name` after a right one to exercise header/body mismatch.
+    ///
+    /// Gated on `mcp` because that suite is its only caller and a plain `cli` build compiles
+    /// this file with the suite cfg'd out — where an ungated helper is dead code, and
+    /// `lint-cli` runs with `-D warnings`.
+    #[cfg(feature = "mcp")]
+    pub fn post_with_headers(
+        &self,
+        path: &str,
+        body: &Value,
+        headers: &[(&str, &str)],
+    ) -> (u16, Value) {
+        let bytes = serde_json::to_vec(body).expect("serialise request body");
+        let mut req = self
+            .auth(self.agent.post(self.url(path)))
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let res = req.send(&bytes).unwrap_or_else(|e| {
+            panic!("POST {path}: {e}\n--- server stderr ---\n{}", self.stderr())
+        });
+        read(res, path, &self.stderr())
+    }
+
     /// Ask the server to shut down the way a supervisor would (SIGTERM), and wait for it
     /// to exit — the path that flushes and releases the writer lock. Returns whether it
     /// exited successfully.
