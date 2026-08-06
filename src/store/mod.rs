@@ -1,17 +1,6 @@
-//! The integrator: in-RAM index + write/read glue + compaction. Composes
-//! [`Segments`](crate::data::Segments) (the live segment set as one global row space),
-//! [`OpLog`](crate::log::OpLog), the [`Manifest`](crate::manifest::Manifest), and an
-//! optional [`WriteLock`](crate::lock::WriteLock). Contract: see the root `SPEC.md`
-//! §3, §5–§8, §14.
-//!
-//! This module holds the [`Store`] type, its constructors (`open`/`in_memory*`), and
-//! the ANN index lifecycle glue. The behaviour splits across child modules — each can
-//! see `Store`'s private fields because they descend from this one:
-//!
-//! - [`scoring`] — the scan kernels and the parallel-scan engine.
-//! - [`quant`]   — int8/binary state + the quantized two-pass search.
-//! - [`read`]    — accessors, scan plumbing, exact + ANN search.
-//! - [`write`]   — `upsert`/`delete`, `flush`, `compact`, collection lifecycle.
+//! The integrator: in-RAM index + write/read glue + compaction, composing `Segments`,
+//! `OpLog`, `Manifest`, and an optional `WriteLock`. Holds [`Store`] and its constructors;
+//! behaviour splits across the child modules below. Contract: `SPEC.md` §3, §5–§8, §14.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -48,12 +37,9 @@ use quant::Quant;
 /// sorted by `row` (see [`Store::scan_order`]).
 type ScanOrder = Vec<(u64, String, String)>;
 
-/// One document's entry within a collection. `row` is `None` for a text-only doc (no
-/// embedding, so no row in the data matrix); such docs are full-text/metadata only and
-/// never enter the vector scan or ANN index.
-///
-/// Serializable so the whole index can be published to / loaded from a shared
-/// [`MemoryTier`](crate::backend::MemoryTier) (the working-set snapshot, see [`memtier`]).
+/// One document's entry within a collection. `row` is `None` for a text-only doc, which stays
+/// out of the vector scan and ANN index. Serializable so the index can be published to a
+/// shared [`MemoryTier`](crate::backend::MemoryTier).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DocEntry {
     row: Option<u64>,
@@ -83,12 +69,9 @@ fn oom(what: &str, count: usize) -> anyhow::Error {
     anyhow!("out of memory reserving capacity for {count} {what}")
 }
 
-/// Process-wide monotonic clock base for the lock-free staleness stamp.
-///
-/// `Instant` cannot live in an atomic, and staleness must be readable **without taking the
-/// store lock** (see [`Readiness`]), so the stamp is stored as milliseconds elapsed since
-/// this base. Deliberately not a `SystemTime` stamp: the wall clock can jump backwards, which
-/// would make a reader look *younger* than it is — the unsafe direction for a staleness bound.
+/// Monotonic clock base for the lock-free staleness stamp: `Instant` cannot live in an atomic,
+/// and staleness must read without the store lock. NOT `SystemTime` — the wall clock can jump
+/// backwards, making a reader look *younger* than it is.
 fn mono_base() -> Instant {
     static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     *BASE.get_or_init(Instant::now)
@@ -99,18 +82,9 @@ fn mono_millis() -> u64 {
     mono_base().elapsed().as_millis() as u64
 }
 
-/// The facts a **readiness probe** needs, readable with no lock at all.
-///
-/// Readiness used to be answered through `cluster_status`, which needs the store lock. That
-/// made a *busy* instance report **not ready**: a large upsert holds the write guard for
-/// seconds, `try_read` returned `WouldBlock`, and the probe turned that into a `503` — so the
-/// one writer left the load balancer in the middle of the very batch it existed to perform
-/// (nidus-abx.3). Busy is not unhealthy, so readiness must not be able to observe busy-ness.
-///
-/// Every field here is therefore an atomic or a value fixed at open, shared with the store
-/// rather than copied out of it — so the answer is always current *and* never blocks. The
-/// distinction is deliberate: liveness treats a **poisoned** lock as unhealthy
-/// (nidus-abx.1) while readiness ignores a merely **held** one.
+/// The facts a readiness probe needs, readable with no lock — every field is an atomic or
+/// fixed at open. Busy is not unhealthy, so readiness must not observe busy-ness
+/// (nidus-abx.3); liveness treats a *poisoned* lock as unhealthy, readiness a held one as fine.
 #[derive(Clone)]
 pub struct Readiness {
     /// Fixed once the store is open: promotion happens *during* open, so an instance's role
@@ -147,12 +121,9 @@ impl Readiness {
     }
 }
 
-/// A pseudo-random duration in `0..=span`, for spreading standby retry polls.
-///
-/// Deliberately not a PRNG: this only needs to decorrelate instances that would otherwise
-/// wake in lockstep when a lease TTL lapses, and the wall clock's nanoseconds already
-/// differ between processes. Nothing depends on the quality of this — a poor draw costs
-/// one redundant lock read.
+/// A pseudo-random duration in `0..=span`, spreading standby retry polls. Not a PRNG: it only
+/// decorrelates instances that would wake in lockstep, and a poor draw costs one redundant
+/// lock read.
 fn jitter(span: Duration) -> Duration {
     if span.is_zero() {
         return Duration::ZERO;
@@ -172,26 +143,21 @@ pub struct Store {
     config: Config,
     data: Segments,
     log: OpLog,
-    /// The persistence backend the store's objects (`data`/`log`/`ann`/`fts`/`lock`)
-    /// live on — a [`LocalFs`](crate::backend::LocalFs) for a file-backed store, or an
-    /// object store ([`S3`](crate::backend::S3)/[`Gcs`](crate::backend::Gcs)) for a live
-    /// object-backed store. `None` for an in-memory store (no durable backing; the
-    /// cache/lock paths short-circuit). Held as an `Arc` so an [`ObjectAppender`] can
-    /// share the same backend handle to rewrite `data`/`log` whole-objects on sync.
+    /// Where the store's objects live: `LocalFs`, or `S3`/`Gcs` for an object-backed store.
+    /// `None` in memory (the cache/lock paths short-circuit). `Arc` so an [`ObjectAppender`]
+    /// shares the handle to rewrite whole objects on sync.
     persistence: Option<Arc<dyn Persistence>>,
-    /// The shared memory tier (SPEC §13.3), when a non-local one is configured. `None`
-    /// means the working set is the process heap only (the default). When `Some`, the
-    /// serialized working set is published on `flush` and adopted on `open` (skipping
-    /// the log replay + index rebuild). A rebuildable cache: tier errors are never fatal.
+    /// The shared memory tier (SPEC §13.3); `None` = process heap only. When set, the working
+    /// set is published on `flush` and adopted on `open`, skipping replay + rebuild. A
+    /// rebuildable cache, so tier errors are never fatal.
     memory: Option<Box<dyn MemoryTier>>,
     /// Held for its `Drop` effect (releases the writer lock on close). `ReadOnly` stores
     /// and in-memory stores hold `None`.
     #[allow(dead_code)]
     lock: Option<Box<dyn BackendLock>>,
-    /// The cluster writer **lease** (SPEC §14.6 phase 5), held in place of `lock` by a
-    /// cluster-mode [`ReadWrite`](crate::OpenMode::ReadWrite) writer. Renewed before every
-    /// write batch (op-driven, no background thread) and fences a superseded writer; released
-    /// on drop. `None` outside cluster mode and for readers / in-memory stores.
+    /// The cluster writer **lease** (SPEC §14.6 phase 5), held in place of `lock`. Renewed per
+    /// write batch (op-driven, no background thread), fences a superseded writer, released on
+    /// drop. `None` outside cluster mode and for readers.
     lease: Option<ClusterLease>,
     collections: HashMap<String, Collection>,
     /// Rows no longer referenced (deleted or overwritten), for compaction tracking.
@@ -202,14 +168,9 @@ pub struct Store {
     /// May coexist with `quant`: the index walk then scores `quant`'s codes and the
     /// f32 rerank in `search_ann` restores accuracy (nidus-ndu).
     ann: Option<Ann>,
-    /// Per-segment IVF indexes, aligned by position with `data`'s segment set
-    /// (`seg_indexes[i]` indexes segment `i`'s global row range). `None` = that segment is
-    /// brute-forced — always the active (last) segment, plus any immutable segment below
-    /// [`Config::segment_index_min_rows`](crate::Config::segment_index_min_rows). Empty
-    /// when per-segment indexing is off (the default) or a global `ann` index is configured
-    /// (which already covers every row). This is the "brute-force tail / indexed cold
-    /// segments" split (SPEC §14.3): the index walk picks candidates from the cold segments,
-    /// the exhaustive scan covers the fresh tail, and both feed one merged top-k.
+    /// Per-segment IVF indexes, position-aligned with `data`'s segments. `None` = that segment
+    /// is brute-forced (always the active one). Empty when per-segment indexing is off or a
+    /// global `ann` covers every row. The brute-force-tail / indexed-cold split, SPEC §14.3.
     seg_indexes: Vec<Option<IvfIndex>>,
     /// The in-RAM ANN index has unpersisted changes (rows inserted since the last
     /// `persist_index`/load). Lets `persist_index` skip a redundant write and tracks
@@ -225,90 +186,48 @@ pub struct Store {
     /// True for in-memory stores (no backing directory) — they never persist the ANN
     /// cache. `open`ed (file-backed) stores set this false.
     in_memory: bool,
-    /// Reverse map physical-row → `(collection, id)`, maintained only when ANN is on,
-    /// so an ANN candidate row resolves to its owning doc in O(1) for the post-filter
-    /// and `Hit` build. It is a *hint*: every lookup is re-verified against the
-    /// authoritative index (`docs[id].row == row`), so deletions and overwrites need no
-    /// special invalidation — a stale entry simply fails the check and is skipped.
-    /// Dense + append-only (rebuilt wholesale on `compact`, which renumbers rows).
+    /// Reverse map row → `(collection, id)`, ANN-only, so a candidate resolves to its doc in
+    /// O(1). A *hint*: every lookup is re-verified against `docs[id].row`, so deletes and
+    /// overwrites need no invalidation. Rebuilt wholesale on `compact`.
     row_to_doc: Vec<Option<(String, String)>>,
-    /// Row-sorted scan order over *all* live docs — `(row, collection, id)` sorted by
-    /// `row` — so a whole-store scan reaches the data matrix in storage order without
-    /// re-sorting on every query (nidus-dxt). Built lazily on the first whole-store
-    /// `search`/`list` after a write and reused until the next write invalidates it
-    /// (`None` = stale). Subset-only workloads never build it, so they pay nothing.
-    /// Behind a `RwLock` because searches take `&self` and may run concurrently
-    /// (the store is shared as `Arc<RwLock<Nidus>>`); writers hold `&mut self` and
-    /// invalidate via `get_mut` (no lock contention). The duplicated id/collection
-    /// strings cost ~one extra copy of the key set in RAM while the cache is live.
+    /// Row-sorted scan order over all live docs, so a whole-store scan reads the matrix in
+    /// storage order without re-sorting per query (nidus-dxt). Built lazily, `None` = stale.
+    /// `RwLock` because searches take `&self` and run concurrently.
     scan_order: std::sync::RwLock<Option<ScanOrder>>,
-    /// The committed `log` byte-length the in-RAM index currently reflects — the
-    /// reader-refresh watermark (SPEC §14.6 phase 4). [`refresh`](Self::refresh) compares it
-    /// (together with the manifest version) against the on-disk state to tell, cheaply,
-    /// whether a separate writer has committed anything since this reader last loaded.
-    /// Set after each replay; only a [`ReadOnly`](crate::OpenMode::ReadOnly) reader reads it
-    /// back (a writer is itself the source of truth and never refreshes).
+    /// The committed `log` length the in-RAM index reflects — the reader-refresh watermark
+    /// (SPEC §14.6 phase 4). [`refresh`](Self::refresh) compares it plus the manifest version
+    /// to detect a separate writer's commits cheaply. Only a `ReadOnly` reader reads it back.
     loaded_log_offset: u64,
-    /// The CAS token (S3 `ETag` / GCS generation) of the `manifest` object as this writer last
-    /// wrote or read it — the compare-and-swap fence for the **commit point** (SPEC §14.6,
-    /// nidus-ahw). A cluster writer publishes each manifest conditionally on this token, so a
-    /// writer superseded mid-batch finds the token changed and fails its commit rather than
-    /// making its stale segment set the truth. `None` outside cluster mode, for readers, and on
-    /// a backend without CAS (the publish then degrades to a plain put, fenced only per-batch).
+    /// CAS token (S3 `ETag` / GCS generation) of the `manifest` as last written — the fence for
+    /// the commit point (SPEC §14.6, nidus-ahw). A writer superseded mid-batch finds it changed
+    /// and fails its commit rather than making a stale segment set the truth.
     manifest_cas: Option<String>,
-    /// This writer has been superseded and can never write again (SPEC §14.6). Latched the
-    /// first time a lease renewal reports the lease lost, because the condition is
-    /// permanent — the instance must reopen. Kept so the state is *observable*
-    /// ([`cluster_status`](Self::cluster_status)) rather than only surfacing as a
-    /// per-request error: a readiness probe has to be able to see it and pull the instance
-    /// out of rotation (nidus-lp4.1). Atomic because renewal happens behind `&self` — and
-    /// an atomic rather than a `Cell` so `Store` stays `Sync` without any `unsafe`.
-    /// `Arc` so an out-of-band [`LeaseRenewer`](crate::backend::LeaseRenewer) shares the same
-    /// latch: a lease lost on a background renewal must land here, where
-    /// [`cluster_status`](Self::cluster_status) and the readiness probe can see it, rather
-    /// than only in a log line (nidus-lp4.7).
+    /// Superseded and can never write again (SPEC §14.6) — latched, since it is permanent.
+    /// Observable via `cluster_status` so a probe can pull the instance from rotation
+    /// (nidus-lp4.1); `Arc<Atomic>` so a background `LeaseRenewer` shares it (nidus-lp4.7).
     fenced: Arc<std::sync::atomic::AtomicBool>,
-    /// When this instance last **verified** it was current against the durable store — its
-    /// open, or its most recent successful [`refresh`](Self::refresh).
-    ///
-    /// Reset whether or not the refresh adopted anything: a refresh that finds nothing new
-    /// has still proven the reader current as of that moment, so resetting only on adoption
-    /// would report a frequently-polling, perfectly up-to-date reader as increasingly
-    /// stale. The basis of the staleness a reader reports (nidus-lp4.4).
-    ///
-    /// An `Arc<AtomicU64>` of [`mono_millis`] rather than an `Instant`, so a readiness probe
-    /// can read it through a [`Readiness`] handle **without the store lock** — a busy
-    /// instance must not report itself unready (nidus-abx.3).
+    /// When this instance last *verified* it was current — open, or the last successful
+    /// [`refresh`](Self::refresh), reset even when nothing was adopted (nidus-lp4.4). Millis not
+    /// `Instant`, so a probe reads it without the store lock (nidus-abx.3).
     last_verified: Arc<std::sync::atomic::AtomicU64>,
-    /// The host has taken over responsibility for the durable barrier — **group commit**
-    /// (nidus-xb9.1). Set only for the duration of [`Nidus::deferred`](crate::Nidus::deferred):
-    /// mutations inside that scope append and update RAM as usual but issue no fsync, so N of
-    /// them can share the one barrier [`commit`](Store::commit) issues afterwards.
-    ///
-    /// A plain `bool` rather than a config knob because it is not a durability *policy* — the
-    /// policy is still [`Config::fsync`](crate::Config::fsync) — it is a statement about who
-    /// calls the barrier, and it must be scoped to the call that made the promise.
+    /// The host owns the durable barrier — group commit (nidus-xb9.1). Set only inside
+    /// [`Nidus::deferred`](crate::Nidus::deferred), where mutations append without fsync so N
+    /// share one barrier. It says who calls the barrier, not what the durability policy is.
     defer_barrier: bool,
-    /// Bytes are appended that no barrier has covered yet, so [`commit`](Store::commit) /
-    /// [`flush`](Store::flush) owes them an fsync (and, in cluster mode, a commit-counter
-    /// bump). Set by every mutation that did not sync itself — whether because the host
-    /// deferred it (`defer_barrier`) or because the configured policy is
-    /// [`Fsync::OnFlush`](crate::Fsync::OnFlush) — and cleared by the barrier that covers
-    /// them. It is what lets `commit` be a genuine no-op when nothing is owed, which is what
-    /// keeps the single-writer path exactly as fast as it was.
+    /// Appended bytes no barrier has covered, so `commit`/`flush` owes them an fsync (plus a
+    /// commit-counter bump in cluster mode). Set by any mutation that did not sync itself and
+    /// cleared by the covering barrier, which is what lets `commit` no-op when nothing is owed.
     pending_barrier: bool,
 }
 
 impl Store {
-    /// Open per `config`: acquire the writer lock (unless `ReadOnly`), open the
-    /// data + log files, replay the log into the in-RAM index (ignoring `Upsert`s
-    /// that reference rows beyond the data file — the lock-free reader rule, §6.2),
-    /// and auto-compact if the dead-row ratio exceeds `config.auto_compact`.
+    /// Open per `config`: take the writer lock unless `ReadOnly`, open data + log, replay the
+    /// log into the in-RAM index (ignoring `Upsert`s past the data file — the lock-free reader
+    /// rule, §6.2), and auto-compact past `config.auto_compact`.
     pub fn open(config: Config) -> Result<Store> {
-        // 1. Open the persistence backend (SPEC §13.2). Empty location → local files
-        //    under `config.path` (created if absent); `s3://…`/`gs://…` → a live
-        //    object-store-backed store. Held as `Arc` so the object-store appenders below
-        //    can share the same handle to rewrite whole objects on sync.
+        // 1. Open the persistence backend (SPEC §13.2): empty location → local files under
+        //    `config.path`, `s3://…`/`gs://…` → object store. `Arc` so the appenders below
+        //    share the handle to rewrite whole objects on sync.
         let location = if config.persistence.is_empty() {
             config.path.to_string_lossy().into_owned()
         } else {
@@ -324,10 +243,9 @@ impl Store {
         Self::open_with(config, &location, persistence, memory)
     }
 
-    /// Open over already-resolved backends — the body shared by [`open`](Self::open) and
-    /// the backend-injection tests. `location` is only used in the "store is locked"
-    /// message. The persistence backend may be local (native append + `O_EXCL` lock) or a
-    /// whole-object store (an [`ObjectAppender`] per segment + the advisory object lock).
+    /// Open over already-resolved backends — shared by [`open`](Self::open) and the
+    /// backend-injection tests. `location` only feeds the "store is locked" message. The backend
+    /// may be local or a whole-object store.
     pub(crate) fn open_with(
         config: Config,
         location: &str,
@@ -338,10 +256,9 @@ impl Store {
         //     per-segment indexing) — reject before any IO so a bad config fails fast.
         config.validate()?;
 
-        // 2b. Cluster mode (SPEC §14.6 phase 5) needs a *shared* backend: every cooperating
-        //     instance must reach the same durable objects and the same working set. Local
-        //     files / process RAM are single-node by definition, so reject them here — for
-        //     readers and writers alike (all instances must agree on the mode).
+        // 2b. Cluster mode (SPEC §14.6 phase 5) needs a *shared* backend, so local files and
+        //     process RAM are rejected here — for readers and writers alike, since all
+        //     instances must agree on the mode.
         if config.cluster {
             if persistence.has_native_lock() {
                 bail!(
@@ -355,11 +272,9 @@ impl Store {
                      process-local working set cannot be shared between instances"
                 );
             }
-            // Cluster safety IS the conditional write. Without compare-and-swap the lease
-            // degrades to advisory — two instances can both believe they hold it — and the
-            // mid-batch fence disappears entirely, so a stalled writer that wakes up
-            // superseded can clobber a peer's committed bytes. Refuse rather than run a
-            // cluster on a best-effort lock (nidus-lp4.2).
+            // Cluster safety IS the conditional write: without CAS the lease is advisory, two
+            // instances can both believe they hold it, and a stalled writer waking up
+            // superseded can clobber a peer's committed bytes (nidus-lp4.2).
             if !persistence.supports_cas() {
                 bail!(
                     "cluster mode requires a persistence backend with compare-and-swap \
@@ -370,12 +285,9 @@ impl Store {
             }
         }
 
-        // 3. Acquire the writer handle (ReadWrite only). In cluster mode this is a heartbeated
-        //    lease (renewed per write batch, fences a superseded writer); otherwise the plain
-        //    writer lock — native `O_EXCL` on local files, or the object lock on a whole-object
-        //    store. Readers take neither.
-        //    Under `Config::lease_wait` a losing claimant waits for promotion instead of
-        //    failing — see `await_writer_handle`.
+        // 3. Acquire the writer handle (ReadWrite only): a heartbeated lease in cluster mode,
+        //    else the plain writer lock (`O_EXCL` locally, the object lock otherwise). Under
+        //    `Config::lease_wait` a loser waits for promotion — see `await_writer_handle`.
         let (lock, lease) = if config.open_mode == OpenMode::ReadWrite {
             if config.cluster {
                 let lease = Self::await_writer_handle(location, &config, || {
@@ -396,10 +308,9 @@ impl Store {
             (None, None)
         };
 
-        // 4. Read the manifest naming the live segments (SPEC §14.2). Absent → this is a
-        //    fresh store or a legacy `data`+`log` store that predates the manifest; both
-        //    synthesize a single-segment manifest over the base `data` object (transparent
-        //    migration). The synthesized manifest is persisted below (ReadWrite only).
+        // 4. Read the manifest naming the live segments (SPEC §14.2). Absent → a fresh store or
+        //    a legacy `data`+`log` one; both synthesize a single-segment manifest over the base
+        //    `data` object, persisted below (ReadWrite only).
         let on_disk = Manifest::load(persistence.as_ref())?;
         let manifest = match &on_disk {
             Some(m) => {
@@ -422,10 +333,9 @@ impl Store {
             None => Manifest::fresh(config.dimension, config.distance),
         };
 
-        // Compare-and-swap fencing applies to a cluster **writer**'s object writes (manifest,
-        // segments, log): each durable rewrite is conditional on the version it last saw, so a
-        // writer superseded mid-batch is fenced instead of clobbering a peer (SPEC §14.6,
-        // nidus-ahw). Readers never write, so they take the plain path.
+        // CAS fencing applies to a cluster *writer*'s object writes: each rewrite is conditional
+        // on the version it last saw, so one superseded mid-batch is fenced rather than clobbering
+        // a peer (SPEC §14.6, nidus-ahw). Readers never write.
         let cas = config.cluster && config.open_mode == OpenMode::ReadWrite;
 
         // 5. Open every segment the manifest names into one global row space. The cap is
@@ -438,10 +348,8 @@ impl Store {
             cas,
         )?;
 
-        // A store with no manifest on disk gets one written now — initializing a fresh
-        // store and migrating a legacy one in the same step. ReadOnly stores never write
-        // (lock-free readers stay strictly read-only); they read through the synthesized
-        // manifest in RAM.
+        // No manifest on disk → write one now, initializing a fresh store and migrating a legacy
+        // one in the same step. ReadOnly never writes; it reads the synthesized manifest in RAM.
         if on_disk.is_none() && config.open_mode == OpenMode::ReadWrite {
             data.manifest().store(persistence.as_ref())?;
         }
@@ -537,12 +445,9 @@ impl Store {
         //    A no-op when no collection declares FTS.
         store.load_or_build_fts()?;
 
-        // 10. Auto-compact for FTS tombstone pressure too. Text-only docs occupy no data
-        //     rows, so their deletes/overwrites never raise `dead_rows` and the step-6
-        //     check can't see them — a churning text-only collection would otherwise let
-        //     dead postings grow without bound. `compact` rebuilds the index (dropping
-        //     tombstones). Checked after the index is built, so the ratio is meaningful;
-        //     if step 6 already compacted, the ratio is ~0 and this is a no-op.
+        // 10. Auto-compact for FTS tombstone pressure too: text-only docs occupy no data rows, so
+        //     step 6 cannot see their churn and dead postings would grow without bound. Checked
+        //     after the index is built so the ratio is meaningful.
         if let Some(threshold) = store.config.auto_compact
             && store.fts.tombstone_ratio() > threshold
         {
@@ -550,10 +455,9 @@ impl Store {
             tier_stale = true;
         }
 
-        // 11. Warm the shared memory tier for peers: if we built the index from the log
-        //     (didn't adopt a tier snapshot) or a compaction above rewrote the store,
-        //     publish the fresh working set so peers can adopt the current state instead
-        //     of replaying. Best-effort — the tier is a rebuildable cache.
+        // 11. Warm the shared memory tier: if the index came from the log, or a compaction above
+        //     rewrote the store, publish the working set so peers adopt it instead of replaying.
+        //     Best-effort — the tier is a rebuildable cache.
         if tier_stale {
             store.publish_working_set();
         }
@@ -618,25 +522,9 @@ impl Store {
         Ok(store)
     }
 
-    /// Adopt a separate writer's newer committed state into this lock-free
-    /// [`ReadOnly`](crate::OpenMode::ReadOnly) reader **without a full reopen** (SPEC §14.6
-    /// phase 4). Re-reads the `manifest` and, when it names a newer version or the `log` has
-    /// grown, re-opens the segment set and replays the log into a fresh in-RAM index at a
-    /// single consistent point — the §6.2 lock-free reader rule, advanced in place.
-    ///
-    /// Returns `Ok(true)` when newer state was adopted, `Ok(false)` when the reader was
-    /// already current (the cheap common case — one small manifest read plus a `log` stat,
-    /// no segment or index work) or the handle cannot refresh: a writer (already the source
-    /// of truth, its in-RAM state never trailing the disk) or an in-memory store (no backend
-    /// to track).
-    ///
-    /// **Atomic against a concurrent compaction.** The new segment set and replayed index are
-    /// built into locals first, and every step a concurrent seal/compaction can break —
-    /// re-opening the segments (one it may have already deleted) and re-reading the log — runs
-    /// *before* any field of `self` is touched. So that class of failure leaves the reader
-    /// serving its prior consistent snapshot, never a torn mix. The derived-index rebuilds run
-    /// after the swap over already-consistent data (a cache miss there rebuilds in RAM rather
-    /// than failing).
+    /// Adopt a writer's newer committed state into this lock-free reader without a full reopen
+    /// (SPEC §14.6 phase 4). `Ok(false)` when already current or unable to refresh. Atomic against
+    /// compaction: built into locals first, so a failure leaves the prior snapshot intact.
     pub fn refresh(&mut self) -> Result<bool> {
         // Only a lock-free ReadOnly reader over a durable backend tracks a separate writer.
         // A writer holds the only mutating handle (the §6.3 lock excludes other writers), so
@@ -674,13 +562,9 @@ impl Store {
             None => Manifest::fresh(self.config.dimension, self.config.distance),
         };
 
-        // Cheap currency check. The manifest version advances on every seal/compaction (the
-        // structural commits); every other write (upsert/delete/meta) appends to the `log`.
-        // So the reader is current exactly when both are unchanged. `self.log.offset()` stats
-        // the reader's existing log handle — live for plain appends (the writer extends the
-        // same object). A compaction replaces the log object, which can leave that cached
-        // length stale, but it also bumps the version, so we reload via the version check
-        // regardless.
+        // Cheap currency check: the version advances on every seal/compaction, every other write
+        // appends to the `log`, so the reader is current exactly when both are unchanged. A
+        // compaction can stale the cached log length, but it bumps the version too.
         let on_disk_log_len = self.log.offset()?;
         let changed =
             manifest.version != self.data.version() || on_disk_log_len != self.loaded_log_offset;
@@ -691,22 +575,14 @@ impl Store {
                 .store(mono_millis(), std::sync::atomic::Ordering::Release);
             return Ok(false);
         }
-        // What *kind* of change: a restructure (seal/compaction altered the segment list) needs a
-        // full re-open; an unchanged list means only the active segment grew (the incremental fast
-        // path). Keyed on the segment list, not the version — in cluster mode the version is the
-        // commit counter and advances on every batch (nidus-bdg).
+        // What kind of change: a restructured segment list needs a full re-open, an unchanged one
+        // means only the active segment grew. Keyed on the list, not the version — in cluster mode
+        // the version is the commit counter and advances every batch (nidus-bdg).
         let restructured = !self.data.segment_names_match(&manifest.segments);
 
-        // Re-read the segment objects. The **incremental** fast path (nidus-bdg) handles the
-        // common case — only the active segment grew (plain appends, manifest version unchanged)
-        // — by re-reading just the active segment object and reusing every immutable segment
-        // (they never change), which avoids re-fetching the whole set (the dominant cost on an
-        // object store). A version change means a seal/compaction restructured the set, so re-open
-        // it whole. Both build into locals first so a failure leaves the live snapshot untouched;
-        // `replaced` carries the whole new set on the version-change path, else `None`.
-        // Exactly one of these is populated: the whole new set (restructure) or the staged
-        // active segment (incremental). Both are locals — `self.data` is not touched until the
-        // final swap, so a failure above leaves the reader on its prior consistent snapshot.
+        // Re-read the segments. The incremental path (nidus-bdg) re-reads only the active one and
+        // reuses the immutable ones, avoiding the whole-set fetch that dominates object-store cost.
+        // `self.data` is untouched until the final swap.
         let mut replaced: Option<Segments> = None;
         let mut pending = None;
         let row_count = if restructured {
@@ -728,11 +604,9 @@ impl Store {
             rows
         };
 
-        // Re-read the log (a fresh handle — the cached object may have been replaced by a
-        // compaction) and rebuild the in-RAM index, bounded by the freshly-sized segments
-        // (§6.2: ignore any `Upsert` past the row count we just observed). Prefer the shared
-        // memory tier's snapshot when it is exactly current — adopting it skips the log replay
-        // entirely (tier-aware refresh, mirroring the open path), else replay the ops.
+        // Re-read the log on a fresh handle (a compaction may have replaced the object) and
+        // rebuild the index bounded by the freshly-sized segments (§6.2). Prefer the memory tier's
+        // snapshot when exactly current, which skips the replay entirely.
         let (log, ops) = OpLog::open_with(appender_for(&persistence, "log", false)?)?;
         let watermark = log.offset()?;
         let key = memtier::working_set_key(&self.config);
@@ -780,10 +654,9 @@ impl Store {
         }
     }
 
-    /// Who this instance is and how current it is (SPEC §14.6) — see [`ClusterStatus`].
-    ///
-    /// Reads only in-RAM state: no IO, no lock beyond the caller's own. A readiness probe
-    /// calls this every few seconds per instance, so it must not touch the object store.
+    /// Who this instance is and how current it is (SPEC §14.6) — see [`ClusterStatus`]. In-RAM
+    /// only, no IO: a readiness probe calls this every few seconds and must not touch the object
+    /// store.
     pub fn cluster_status(&self) -> ClusterStatus {
         let writer = self.config.open_mode == OpenMode::ReadWrite;
         let role = if self.in_memory {
@@ -817,12 +690,9 @@ impl Store {
         }
     }
 
-    /// A lock-free handle to the facts a readiness probe needs — see [`Readiness`].
-    ///
-    /// Taken once when the store opens and consulted per probe, so readiness never touches
-    /// the store lock and a long write cannot make a healthy instance report unready
-    /// (nidus-abx.3). The handle shares the store's atomics rather than snapshotting them,
-    /// so it stays current — a fencing latched mid-batch is visible to the very next probe.
+    /// A lock-free handle to the facts a readiness probe needs — see [`Readiness`]. Taken once at
+    /// open so a long write cannot make a healthy instance report unready (nidus-abx.3); it shares
+    /// the store's atomics rather than snapshotting, so a mid-batch fencing shows on the next probe.
     pub fn readiness(&self) -> Readiness {
         let writer = self.config.open_mode == OpenMode::ReadWrite;
         Readiness {
@@ -834,19 +704,9 @@ impl Store {
         }
     }
 
-    /// A `Drop`-free renewal handle for this instance's cluster writer lease, if it holds one.
-    ///
-    /// Deliberately independent of the store lock. The lease must be renewable *while* a
-    /// long write is in flight — a large batch can hold the write guard for longer than
-    /// `lock_ttl`, and now that standbys exist (nidus-lp4.3) a peer would take over and
-    /// fence a writer that was merely slow, discarding the whole batch. A renewer with its
-    /// own handle keeps the lease warm without waiting on the guard.
-    ///
-    /// Returns a [`LeaseRenewer`], NOT a clone of the lease: `ClusterLease` is an owning
-    /// guard whose `Drop` deletes the lease object, so a cloned guard would release the
-    /// lease as soon as the copy dropped — briefly leaving the object absent, which is
-    /// exactly the window a peer's create-if-absent walks through. Renewal is idempotent
-    /// re-stamping, so racing the op-driven renewal in `guard_writable` is harmless.
+    /// A `Drop`-free renewal handle for the writer lease, independent of the store lock so a batch
+    /// longer than `lock_ttl` cannot let a peer fence a merely-slow writer (nidus-lp4.3). NOT a
+    /// lease clone: a cloned owning guard would delete the lease object on drop.
     pub fn lease_renewer(&self) -> Option<crate::backend::LeaseRenewer> {
         // Hand over a clone of *this store's* fenced latch, so a lease lost on a background
         // renewal is recorded where `cluster_status` — and therefore the readiness probe —
@@ -854,27 +714,17 @@ impl Store {
         self.lease.as_ref().map(|l| l.renewer(self.fenced.clone()))
     }
 
-    /// Claim the writer handle, honouring [`Config::lease_wait`]. See [`jitter`].
-    ///
-    /// `claim` is one attempt: `Ok(Some(_))` when this instance now holds the handle,
-    /// `Ok(None)` when a live holder owns it (contention, not an error). Under
-    /// [`LeaseWait::Fail`] — the default — contention becomes the "store is locked" error
-    /// immediately, exactly as before. Otherwise this retries, so the process becomes a
-    /// standby that is promoted when the holder dies or releases.
-    ///
-    /// Correctness rests entirely on `claim` being atomic, which it already is: the object
-    /// store's conditional write makes exactly one of N racing claimants win, whether it
-    /// is a fresh acquire or the reclaim of a lease past its TTL. Retrying therefore adds
-    /// no new race — it only changes how a loser responds.
+    /// Claim the writer handle, honouring [`Config::lease_wait`]. `Ok(None)` = a live holder owns
+    /// it: an error under the default [`LeaseWait::Fail`], else retried so the process becomes a
+    /// standby. Safe because `claim` is atomic, so retrying changes only how a loser responds.
     fn await_writer_handle<T>(
         location: &str,
         config: &Config,
         claim: impl Fn() -> Result<Option<T>>,
     ) -> Result<T> {
-        // A stale handle cannot be reclaimed until its TTL lapses, so polling much faster
-        // than that only spends object-store requests. Poll at an eighth of the TTL,
-        // clamped so a tiny TTL does not spin and a large one still notices a *clean*
-        // release (which can happen at any moment) reasonably promptly.
+        // A stale handle cannot be reclaimed before its TTL lapses, so faster polling only spends
+        // requests. An eighth of the TTL, clamped so a tiny one does not spin and a large one still
+        // notices a clean release promptly.
         let base = (config.lock_ttl / 8).clamp(Duration::from_millis(250), Duration::from_secs(2));
         let deadline = match config.lease_wait {
             LeaseWait::Fail => {
@@ -888,11 +738,9 @@ impl Store {
         // rather than a misleading "store is locked".
         let mut last_error: Option<anyhow::Error> = None;
         loop {
-            // A transient backend error must NOT end the wait. A standby may sit here for
-            // hours, and an object store will drop the occasional connection ("Peer
-            // disconnected") in that time; treating the first blip as fatal makes the
-            // process exit, which is precisely the crash-loop waiting exists to avoid.
-            // Only a *definitive* answer — acquired, or the deadline — ends the loop.
+            // A transient backend error must NOT end the wait: a standby may sit here for hours,
+            // and treating the first dropped connection as fatal causes exactly the crash-loop
+            // waiting exists to avoid. Only acquisition or the deadline ends the loop.
             match claim() {
                 Ok(Some(handle)) => return Ok(handle),
                 Ok(None) => {}
@@ -920,11 +768,9 @@ impl Store {
         }
     }
 
-    /// Replay the decoded log `ops` into the in-RAM index — the source of truth when no
-    /// shared working-set snapshot is adopted. Returns the collections, the dead-row
-    /// count, and the FTS index with its declared schemas restored (postings are rebuilt
-    /// later by [`load_or_build_fts`](Self::load_or_build_fts)). `Upsert`s referencing a
-    /// row beyond the data file are ignored (the lock-free reader rule, §6.2).
+    /// Replay the decoded log `ops` into the in-RAM index — the source of truth when no shared
+    /// snapshot is adopted. Returns collections, dead-row count, and the FTS index with schemas
+    /// restored. `Upsert`s past the data file are ignored (the lock-free reader rule, §6.2).
     fn replay_ops(ops: Vec<Op>, row_count: u64) -> (HashMap<String, Collection>, usize, Fts) {
         let mut collections: HashMap<String, Collection> = HashMap::new();
         let mut dead_rows: usize = 0;
@@ -1049,10 +895,9 @@ impl Store {
         self.ann_dirty = true;
     }
 
-    /// On `open`: load the ANN index from its `ann` cache if one is present and valid
-    /// for this store's config, then incrementally insert any rows added since the
-    /// cache was written (so a stale/partial cache still makes open cheap). With no
-    /// valid cache, fall back to a full `rebuild_ann`. No-op when ANN is off.
+    /// On `open`: load the ANN index from its `ann` cache when valid for this config, then insert
+    /// rows added since — so even a stale cache keeps open cheap. Falls back to a full
+    /// `rebuild_ann`; no-op when ANN is off.
     fn load_or_build_ann(&mut self) -> Result<()> {
         let Some(cfg) = self.config.ann else {
             return Ok(());
@@ -1099,11 +944,9 @@ impl Store {
         Ok(())
     }
 
-    /// Write the ANN index to its `ann` cache file so the next `open` skips the
-    /// rebuild. Out-of-band by design — call it explicitly (e.g. before shutdown) or
-    /// let `compact` trigger it; it is *never* on the `upsert`/`flush` write path. A
-    /// no-op when ANN is off, the store is in-memory or read-only, or nothing changed
-    /// since the last persist.
+    /// Write the ANN index to its `ann` cache so the next `open` skips the rebuild. Out-of-band by
+    /// design — called explicitly or by `compact`, *never* on the `upsert`/`flush` path. No-op when
+    /// ANN is off, the store is in-memory or read-only, or nothing changed.
     pub fn persist_index(&mut self) -> Result<()> {
         // The on-disk caches are never written for an in-memory or read-only store.
         if self.in_memory || self.config.open_mode == OpenMode::ReadOnly {
@@ -1141,11 +984,9 @@ impl Store {
         Ok(())
     }
 
-    /// Persist the FTS index to the `fts` cache if dirty. The validity key is the
-    /// declared schema + analyzer/BM25 params; the watermark is the current log offset,
-    /// so on open the cache is adopted only when nothing has been written since (any
-    /// later write → the offset differs → rebuild). Reuses the shared
-    /// [`crate::index_cache`] codec.
+    /// Persist the FTS index to the `fts` cache if dirty. Keyed on the declared schema plus
+    /// analyzer/BM25 params, watermarked by the log offset, so open adopts it only when nothing has
+    /// been written since. Reuses the [`crate::index_cache`] codec.
     fn persist_fts(&mut self) -> Result<()> {
         if !self.fts.is_active() || !self.fts_dirty {
             return Ok(());
@@ -1159,10 +1000,9 @@ impl Store {
         Ok(())
     }
 
-    /// On `open`: adopt the `fts` cache when it is valid for the current schema **and**
-    /// its watermark equals the current log offset (i.e. nothing was written after it
-    /// was persisted — the clean-reopen fast path). Otherwise rebuild from the replayed
-    /// docs. No-op when FTS is inactive.
+    /// On `open`: adopt the `fts` cache when valid for the current schema *and* its watermark
+    /// matches the log offset — the clean-reopen fast path. Otherwise rebuild from the replayed
+    /// docs; no-op when FTS is inactive.
     fn load_or_build_fts(&mut self) -> Result<()> {
         if !self.fts.is_active() {
             return Ok(());
@@ -1213,10 +1053,9 @@ impl Store {
 
     // ── Per-segment index lifecycle (SPEC §14.3) ─────────────────────────────────
 
-    /// Per-segment IVF indexing is active when [`Config::segment_index_min_rows`] is set
-    /// **and** no global `ann` index is configured. A global index already covers every
-    /// row, so the per-segment split would be redundant — that path takes precedence and
-    /// per-segment indexing stays off.
+    /// Per-segment IVF indexing is active when [`Config::segment_index_min_rows`] is set *and* no
+    /// global `ann` is configured — a global index already covers every row, so it takes precedence
+    /// and the per-segment split stays off.
     fn seg_indexing_on(&self) -> bool {
         self.ann.is_none() && self.config.segment_index_min_rows.is_some()
     }
@@ -1227,13 +1066,9 @@ impl Store {
         AnnConfig::ivf()
     }
 
-    /// (Re)build the per-segment IVF indexes from scratch over the current segment set:
-    /// an [`IvfIndex`] over each **immutable** segment holding at least
-    /// `segment_index_min_rows` rows, `None` for the active segment and any smaller one.
-    /// Refreshes the reverse map first so walked candidates resolve to docs. O(indexed
-    /// rows) — runs on `open` and after `compact`; the cheaper incremental
-    /// [`index_just_sealed`](Self::index_just_sealed) handles a single seal. No-op unless
-    /// per-segment indexing is on.
+    /// Rebuild the per-segment IVF indexes over the current segment set: one per immutable segment
+    /// at or above `segment_index_min_rows`, `None` for the active and smaller ones. O(indexed
+    /// rows), for `open` and `compact`; a single seal takes the cheaper `index_just_sealed`.
     fn build_segment_indexes(&mut self) {
         self.seg_indexes = Vec::new();
         if !self.seg_indexing_on() {
@@ -1264,12 +1099,9 @@ impl Store {
         self.seg_indexes = indexes;
     }
 
-    /// After a successful seal, index the just-sealed segment (now immutable, the
-    /// second-to-last) if it meets the threshold and append a `None` slot for the fresh
-    /// active segment — keeping `seg_indexes` aligned with the segment set without
-    /// re-running k-means on the already-built segments. Falls back to a full
-    /// [`build_segment_indexes`](Self::build_segment_indexes) if the alignment is somehow
-    /// off. No-op unless per-segment indexing is on.
+    /// After a seal, index the just-sealed segment if it meets the threshold and append a `None`
+    /// slot for the fresh active one — keeping `seg_indexes` aligned without re-running k-means on
+    /// segments already built. Falls back to `build_segment_indexes` if alignment is off.
     fn index_just_sealed(&mut self) {
         if !self.seg_indexing_on() {
             return;
@@ -1304,11 +1136,9 @@ impl Store {
 
     // ── FTS index lifecycle ───────────────────────────────────────────────────────
 
-    /// Rebuild the full-text index from all live docs (used on `open` after replay and
-    /// after `compact` renumbers). Clears the field indexes (keeping the declared
-    /// schema), then re-indexes every doc of every FTS collection in a deterministic
-    /// order (sorted collection, then sorted id) so docnums are reproducible. No-op when
-    /// FTS is inactive.
+    /// Rebuild the full-text index from all live docs — on `open` after replay, and after
+    /// `compact` renumbers. Re-indexes in a deterministic order (sorted collection, then id) so
+    /// docnums are reproducible. No-op when FTS is inactive.
     fn rebuild_fts(&mut self) {
         if !self.fts.is_active() {
             return;
