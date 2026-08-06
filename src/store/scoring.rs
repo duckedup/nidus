@@ -8,12 +8,9 @@ use crate::cancel::{CHECK_EVERY, check};
 use crate::data::Segments;
 use crate::search::{TopK, dot_i8, euclidean_neg_sq_i8, hamming};
 
-/// Minimum total scan *work* — candidate rows × dimension — before a parallel search
-/// splits across worker threads. Below this, thread spawn/join overhead outweighs the
-/// scan, so we stay serial even when `Config::query_threads > 1`. The floor is on work
-/// rather than a flat row count because per-row scan cost scales with dimension: a fixed
-/// row floor over-parallelizes narrow vectors and under-parallelizes wide ones. ~1.05M
-/// units ≈ 4096 rows at dim 256, or ~1365 rows at dim 768.
+/// Minimum scan work — rows × dimension — before a parallel search splits across threads; below it
+/// spawn/join outweighs the scan. On work rather than a row count because per-row cost scales with
+/// dimension. ~1.05M units ≈ 4096 rows at dim 256, or ~1365 at dim 768.
 pub(super) const PARALLEL_SCAN_WORK_FLOOR: usize = 1 << 20;
 
 /// Score a slice of candidate rows into a fresh bounded top-k heap. The unit of
@@ -28,10 +25,9 @@ pub(super) fn score_chunk<'a>(
     min_score: Option<f32>,
 ) -> Result<TopK<(&'a str, &'a str)>> {
     let mut topk: TopK<(&'a str, &'a str)> = TopK::new(top_k);
-    // Cooperative cancellation: the only thing that can stop this loop is this loop. The
-    // check is hoisted out of the per-row body by walking blocks — one atomic load per
-    // CHECK_EVERY rows and *nothing* per row, which matters because at small dimensions
-    // even a mask-and-branch is a measurable share of the scoring work.
+    // Cooperative cancellation: the only thing that can stop this loop is this loop. Hoisted out of
+    // the per-row body by walking blocks — one atomic load per CHECK_EVERY rows and nothing per row,
+    // since at small dimensions even a mask-and-branch is a measurable share of the work.
     for block in chunk.chunks(CHECK_EVERY) {
         check()?;
         for &(row, col_name, id) in block {
@@ -47,13 +43,9 @@ pub(super) fn score_chunk<'a>(
     Ok(topk)
 }
 
-/// Score a chunk against the **int8** matrix into a bounded top-k of `overscan`
-/// candidates — the quantized first-pass unit of parallel work, mirroring
-/// [`score_chunk`] for the f32 path. The int8 score is monotonic with the f32 score
-/// (shared symmetric scale), so it picks the right candidate set; exact scores come
-/// from the caller's f32 rerank. Carries `row` in the item so the rerank can re-read
-/// the f32 vector. `min_score` is *not* applied here — the int8 score is only an
-/// ordering proxy, so the floor is enforced on the exact f32 score during rerank.
+/// Score a chunk against the int8 matrix into a bounded top-k of `overscan` candidates — the
+/// quantized first-pass unit of parallel work, mirroring [`score_chunk`]. Monotonic with f32, so it
+/// picks the right set; carries `row` for the rerank, which is where `min_score` is enforced.
 pub(super) fn score_chunk_i8<'a>(
     quant_vectors: &[i8],
     dim: usize,
@@ -83,12 +75,9 @@ pub(super) fn score_chunk_i8<'a>(
     Ok(topk)
 }
 
-/// Score a chunk against the **binary** (sign-bit) matrix into a bounded top-k of
-/// `overscan` candidates — the binary first-pass unit of parallel work, mirroring
-/// [`score_chunk_i8`]. Score is `-(hamming)` (higher = better), monotone with cosine
-/// rank for unit vectors, so it picks the right candidate set; exact scores come from
-/// the caller's f32 rerank. Carries `row` so the rerank can re-read the f32 vector.
-/// `min_score` is *not* applied here — Hamming is only an ordering proxy.
+/// Score a chunk against the binary (sign-bit) matrix into a bounded top-k of `overscan`
+/// candidates, mirroring [`score_chunk_i8`]. Score is `-(hamming)`, monotone with cosine rank for
+/// unit vectors, and carries `row` for the rerank. `min_score` is applied there, not here.
 pub(super) fn score_chunk_bin<'a>(
     words: &[u64],
     words_per_row: usize,
@@ -127,10 +116,9 @@ where
 {
     let chunk_len = scan.len().div_ceil(workers);
     let score_one = &score_one;
-    // Cancellation is ambient per-thread (see `crate::cancel`), and a freshly spawned
-    // worker inherits nothing — so capture the caller's token here and re-install it
-    // inside each worker. This is the one handoff the ambient model needs, which is
-    // exactly why it lives in the single shared fan-out rather than at each call site.
+    // Cancellation is ambient per-thread (`crate::cancel`) and a fresh worker inherits nothing, so
+    // capture the caller's token here and re-install it in each worker. The one handoff the ambient
+    // model needs, which is why it lives in the shared fan-out rather than each call site.
     let token = crate::cancel::current();
     let locals = std::thread::scope(|s| -> Result<Vec<Vec<(f32, T)>>> {
         let handles: Vec<_> = scan

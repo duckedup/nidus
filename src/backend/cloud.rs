@@ -24,11 +24,9 @@ fn worth_retrying(e: &ureq::Error) -> bool {
     }
 }
 
-/// Run `attempt`, retrying once if the first failure looks like a dropped pooled
-/// connection. Requests reaching here are idempotent or compare-and-swap-guarded, so a
-/// single replay cannot double-apply anything: a CAS whose first attempt actually landed
-/// finds its token consumed on the replay and reports `Stale`, which the callers already
-/// handle.
+/// Run `attempt`, retrying once if the first failure looks like a dropped pooled connection.
+/// Everything reaching here is idempotent or CAS-guarded, so a replay cannot double-apply: a CAS
+/// whose first attempt landed finds its token consumed and reports `Stale`, which callers handle.
 fn with_one_retry<T>(
     mut attempt: impl FnMut() -> std::result::Result<T, ureq::Error>,
 ) -> Result<T> {
@@ -46,10 +44,9 @@ impl Http {
         Http::new_with_timeout(None)
     }
 
-    /// Like [`new`](Self::new) but with an overall per-request timeout. Used for the
-    /// credential-metadata calls (STS / ECS / EC2 IMDS): off-cloud the link-local IMDS
-    /// address is unroutable, so a short timeout turns a multi-second hang into a quick,
-    /// clear "no credentials" error.
+    /// Like [`new`](Self::new) but with an overall per-request timeout, for the credential-metadata
+    /// calls (STS/ECS/EC2 IMDS): off-cloud the link-local IMDS address is unroutable, so a short
+    /// timeout turns a multi-second hang into a quick, clear "no credentials" error.
     pub(crate) fn new_with_timeout(timeout: Option<std::time::Duration>) -> Http {
         // `http_status_as_error(false)`: a 4xx/5xx comes back as a normal response so a
         // backend can distinguish 404 (absent → `None`) from a transport failure.

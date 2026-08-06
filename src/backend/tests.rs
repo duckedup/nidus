@@ -126,14 +126,9 @@ struct MapState {
     next_gen: u64,
 }
 
-/// A whole-object [`Persistence`] backed by an in-RAM map. `cas == true` models a real
-/// compare-and-swap object store (S3/GCS): every write mints a fresh generation, and
-/// [`get_cas`](Persistence::get_cas)/[`put_cas`](Persistence::put_cas) are honoured (so
-/// [`try_create_exclusive`](Persistence::try_create_exclusive) works for free through its
-/// default delegation, exactly as the live backends do). `cas == false` models a backend with
-/// no atomic primitive at all — the advisory get-then-put fallback. `inject_renew` is a test
-/// hook: when set, the next `get_cas` performs one "concurrent peer write" right after reading,
-/// so a reclaimer's token goes stale in the read→write gap (the TOCTOU the CAS reclaim fences).
+/// A whole-object [`Persistence`] over an in-RAM map. `cas == true` models a real CAS object store,
+/// `false` one with no atomic primitive (the advisory fallback). `inject_renew` makes the next
+/// `get_cas` do a concurrent peer write, staling a reclaimer's token in the read→write gap.
 struct MapBackend {
     state: Mutex<MapState>,
     cas: bool,

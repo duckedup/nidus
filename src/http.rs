@@ -1,11 +1,8 @@
 //! Generic HTTP retry infrastructure shared by every reqwest-based adapter.
 
-// Every item here is shared retry infra whose ONLY consumers are the per-provider
-// adapters in `embed/` and `summarize/`. A feature set that enables a base
-// (`embed`/`summarize`/`memory`) but no provider adapter — or a single adapter
-// that happens not to use a given helper — compiles this module with some items
-// unreferenced, which is expected, not dead. Allow it module-wide rather than
-// dusting per-item attributes across the file.
+// Shared retry infra whose only consumers are the per-provider adapters. A feature set enabling a
+// base but no adapter — or an adapter not using a given helper — leaves items unreferenced here,
+// which is expected rather than dead, so this is allowed module-wide.
 #![allow(dead_code)]
 
 use std::time::Duration;

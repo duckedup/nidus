@@ -155,11 +155,9 @@ impl OpLog {
         Self::open_with(Box::new(appender))
     }
 
-    /// Open the log over an already-opened persistence [`Appender`]: **replay** all
-    /// committed records into a `Vec<Op>` (in order) and return the write handle
-    /// alongside them. A torn or CRC-failing *tail* record (crash mid-append) is
-    /// recovered by truncating to the last good record — not an error. A bad record in
-    /// the *middle* is corruption (error).
+    /// Open the log over an already-opened [`Appender`]: replay every committed record into a
+    /// `Vec<Op>` in order and return the write handle alongside them. A torn or CRC-failing *tail*
+    /// record is recovered by truncating to the last good one; a bad record mid-log is corruption.
     pub fn open_with(mut appender: Box<dyn Appender>) -> Result<(OpLog, Vec<Op>)> {
         // Read the entire log (the `read_to_end` default reserves fallibly, so a huge
         // log fails with an error instead of aborting the process on allocation).

@@ -24,10 +24,9 @@ pub(crate) fn analyze(text: &str, lang: Language) -> Vec<String> {
     }
 }
 
-/// Split `text` into lowercased tokens on runs of Unicode alphanumerics. Everything
-/// else (punctuation, whitespace, symbols) is a separator. Lowercasing uses
-/// `char::to_lowercase` (std, no FFI), which handles the Latin script we target; a
-/// pragmatic stand-in for full UAX #29 segmentation that stays pure and dependency-free.
+/// Split `text` into lowercased tokens on runs of Unicode alphanumerics, everything else being a
+/// separator. Lowercasing is std's `char::to_lowercase`, which covers the Latin script we target —
+/// a pragmatic stand-in for full UAX #29 segmentation that stays dependency-free.
 fn tokenize(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();

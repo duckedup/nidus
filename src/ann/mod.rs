@@ -48,11 +48,9 @@ pub(crate) enum AnnSnapshot {
     },
 }
 
-/// Scoring function shared with the brute-force path: **higher = nearer**. Cosine and
-/// dot-product use the raw dot product (vectors are unit-normalized on insert for
-/// cosine); Euclidean uses negative squared distance. Picking the candidate set and
-/// the final rerank both use this, so the index orders candidates exactly as the
-/// exact path would.
+/// Scoring shared with the brute-force path: higher = nearer. Cosine and dot use the raw dot
+/// product (unit-normalized on insert), Euclidean the negative squared distance. Both candidate
+/// selection and the rerank use this, so the index orders exactly as the exact path would.
 pub(crate) type ScoreFn = fn(&[f32], &[f32]) -> f32;
 
 /// The score function for a metric (mirrors the dispatch in [`crate::store`]).
@@ -63,10 +61,9 @@ pub(crate) fn score_fn_for(distance: Distance) -> ScoreFn {
     }
 }
 
-/// The metric the [`Walk`] scores in. `None` is exact f32 (the default, unchanged); the
-/// quantized variants score the store's int8/binary codes for a cheaper walk. The codes
-/// are borrowed from the store's quantization state by *physical row* — the same layout
-/// the brute-force two-pass search uses — so this adds no new state or persistence.
+/// The metric the [`Walk`] scores in. `None` is exact f32; the quantized variants score the store's
+/// int8/binary codes for a cheaper walk. Codes are borrowed by physical row, the same layout the
+/// two-pass search uses, so this adds no new state or persistence.
 enum WalkQuant<'a> {
     /// Exact f32: rows are scored straight from the `data` matrix.
     None,
@@ -282,11 +279,9 @@ impl Ann {
         }
     }
 
-    /// Full (re)build from `live_rows` (physical row indices into `data`). Used on
-    /// `open` and after `compact` renumbers rows. `workers` (from
-    /// `Config::query_threads`) caps build concurrency; `1` builds serially and
-    /// deterministically. The [`Walk`] decides whether the build scores exact f32 or
-    /// quantized codes (nidus-ndu).
+    /// Full rebuild from `live_rows` (physical row indices), for `open` and after `compact`
+    /// renumbers. `workers` caps build concurrency, and `1` builds serially and deterministically.
+    /// The [`Walk`] decides whether the build scores exact f32 or quantized codes (nidus-ndu).
     pub(crate) fn build(&mut self, walk: &Walk, live_rows: &[u64], workers: usize) {
         match self {
             Ann::Hnsw(g) => g.build(walk, live_rows, workers),
@@ -333,10 +328,9 @@ impl Ann {
         }
     }
 
-    /// Walk the index for up to `n_candidates` rows, best-first as `(row, score)`. The
-    /// caller post-filters and reranks; recall rises with `n_candidates`. Scores are
-    /// quantized-approximate when the [`Walk`] carries a codebook (the store reranks the
-    /// rows exactly), exact f32 otherwise.
+    /// Walk the index for up to `n_candidates` rows, best-first as `(row, score)`; the caller
+    /// post-filters and reranks, and recall rises with `n_candidates`. Scores are
+    /// quantized-approximate when the [`Walk`] carries a codebook, exact f32 otherwise.
     pub(crate) fn search(
         &self,
         walk: &Walk,

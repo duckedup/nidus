@@ -21,11 +21,9 @@ impl MappedSegment {
     pub fn open(path: &Path) -> Result<MappedSegment> {
         let file = File::open(path)
             .with_context(|| format!("failed to open segment for mmap at {}", path.display()))?;
-        // SAFETY: this is the crate's only `unsafe`. `Mmap::map` is `unsafe` because the mapped
-        // bytes must not be mutated underneath the mapping. nidus maps **only immutable
-        // segments** — a sealed segment is never appended to, truncated, or rewritten in place
-        // (the manifest's commit discipline, SPEC §14.2; compaction renames a fresh object over
-        // the name and drops this map first). So the bytes are stable for the map's lifetime.
+        // SAFETY: the crate's only `unsafe`. `Mmap::map` requires the mapped bytes not be mutated
+        // underneath it, and nidus maps only immutable segments — never appended to, truncated, or
+        // rewritten in place (SPEC §14.2), with compaction dropping this map first.
         #[allow(unsafe_code)]
         let map = unsafe {
             Mmap::map(&file)

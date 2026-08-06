@@ -163,10 +163,9 @@ impl Segments {
         self.version = version;
     }
 
-    /// Whether `names` matches this set's segment list exactly — the structural change signal for
-    /// refresh: unchanged means only the active segment grew (incremental path), changed means a
-    /// seal/compaction restructured it. Used instead of the version, which in cluster mode advances
-    /// on every commit.
+    /// Whether `names` matches this set's segment list exactly — refresh's structural change signal:
+    /// unchanged means only the active segment grew, changed means a seal/compaction restructured it.
+    /// Used instead of the version, which in cluster mode advances on every commit.
     pub fn segment_names_match(&self, names: &[String]) -> bool {
         self.segs.len() == names.len() && self.segs.iter().zip(names).all(|(s, n)| &s.name == n)
     }

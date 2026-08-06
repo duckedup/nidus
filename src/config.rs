@@ -72,20 +72,17 @@ pub struct Config {
     /// Enforced *before* allocating, so it is the only exhaustion guard that holds under memory
     /// overcommit, where the kernel SIGKILLs before `try_reserve` ever fires.
     pub max_vector_bytes: Option<u64>,
-    /// Vector quantization for faster search; `None` disables. Maintains an in-memory quantized
-    /// matrix and a two-pass search: a cheap first pass selects candidates, an f32 rerank restores
-    /// exact scores. [`Quantization::int8`] (4×, any metric) or [`binary`](Quantization::binary)
-    /// (32×, cosine only).
+    /// Vector quantization for faster search; `None` disables. Keeps an in-memory quantized matrix
+    /// and a two-pass search: a cheap first pass selects, an f32 rerank restores exact scores.
+    /// [`int8`](Quantization::int8) is 4× and any metric, [`binary`](Quantization::binary) 32× and cosine only.
     pub quantization: Option<Quantization>,
-    /// Approximate-nearest-neighbour index; `None` disables, leaving exact brute force. When set,
-    /// `search` walks an in-RAM HNSW or IVF index for an over-fetched candidate set, then applies
-    /// scope/filter/`min_score` and an exact f32 rerank — recall traded for speed. Composes with
-    /// [`Config::quantization`], which makes the walk itself cheaper.
+    /// Approximate-nearest-neighbour index; `None` leaves exact brute force. When set, `search` walks
+    /// an in-RAM HNSW or IVF index for an over-fetched candidate set, then applies scope/filter and an
+    /// exact f32 rerank. Composes with [`Config::quantization`], which makes the walk cheaper.
     pub ann: Option<AnnConfig>,
-    /// Worker threads for a single search; default `1`. Above that, a large scan splits across
-    /// scoped workers each with its own bounded heap. The f32 scan is bandwidth-bound (sublinear
-    /// gain), the int8 first pass compute-bound and better-scaling. Leave at `1` when you already
-    /// have query-level concurrency.
+    /// Worker threads for a single search; default `1`. Above that, a large scan splits across scoped
+    /// workers each with its own bounded heap. The f32 scan is bandwidth-bound and the int8 first pass
+    /// compute-bound; leave at `1` when you already have query-level concurrency.
     pub query_threads: usize,
     /// Where the durable bytes live (SPEC §13.2): empty or `file://`/bare path → local files under
     /// [`path`](Self::path); `s3://…`/`gs://…` → a live object-backed store, rewriting whole
@@ -96,15 +93,12 @@ pub struct Config {
     /// store stays a single segment and behaves exactly as the pre-segment monolith did.
     pub segment_max_rows: Option<u64>,
     /// IVF-index each immutable segment holding at least this many rows (SPEC §14.3); `None`
-    /// brute-forces everything. Fresh data stays exact while the cold bulk is indexed, so
-    /// exact-vs-approximate follows segment size. Needs
-    /// [`segment_max_rows`](Self::segment_max_rows), is ignored under a global
-    /// [`ann`](Self::ann), and is rejected with [`quantization`](Self::quantization).
+    /// brute-forces everything, so exact-vs-approximate follows segment size. Needs
+    /// [`segment_max_rows`], ignored under [`ann`](Self::ann), rejected with [`quantization`](Self::quantization).
     pub segment_index_min_rows: Option<u64>,
-    /// Memory-map sealed segments instead of loading them into RAM (SPEC §9 / §14.6 phase 3, the
-    /// one conscious mmap opt-in), which is what lets a store outgrow one node's RAM. The active
-    /// segment stays in RAM. Local-FS only, and needs
-    /// [`segment_max_rows`](Self::segment_max_rows); results are identical either way.
+    /// Memory-map sealed segments rather than loading them into RAM (SPEC §9 / §14.6 phase 3) — what
+    /// lets a store outgrow one node's RAM. The active segment stays in RAM. Local-FS only, needs
+    /// [`segment_max_rows`](Self::segment_max_rows), and results are identical either way.
     pub mmap: bool,
     /// Where the in-RAM working set is shared (SPEC §13.3). Empty/`local`/`ram` → the process heap
     /// only; a `redis://…` URL publishes the working set on `flush` and loads it on `open`, so other

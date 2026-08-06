@@ -146,10 +146,9 @@ pub fn object_try_lock(
     Ok(try_claim(persistence, key, ttl, &body)?.map(|()| guard(persistence, key)))
 }
 
-/// The shared acquire core for [`object_try_lock`] and [`ClusterLease`]: `Some(())` = we hold the
-/// lock (created it, or reclaimed a stale holder), `None` = a live holder owns it. On a CAS-capable
-/// backend both paths are race-free, so a holder renewing in the read→write gap is not robbed;
-/// without CAS this degrades to a best-effort get-then-put (advisory).
+/// The shared acquire core for [`object_try_lock`] and [`ClusterLease`]: `Some(())` = we hold it
+/// (created, or reclaimed from a stale holder), `None` = a live holder owns it. Race-free on a
+/// CAS-capable backend; without CAS it degrades to a best-effort, advisory get-then-put.
 fn try_claim(
     persistence: &Arc<dyn Persistence>,
     key: &str,

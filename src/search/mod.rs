@@ -200,10 +200,9 @@ pub fn pack_signs(v: &[f32]) -> Vec<u64> {
     out
 }
 
-/// Pack the sign bits of `v` into the pre-sized word slice `out` (length
-/// `v.len().div_ceil(64)`), zeroing it first. The store's row-major matrix packer
-/// writes each row's code into its slice of one big `Vec<u64>` with this — no per-row
-/// allocation. See [`pack_signs`] for the sign rule and padding contract.
+/// Pack the sign bits of `v` into the pre-sized word slice `out`, zeroing it first. The store's
+/// row-major packer writes each row's code into its slice of one big `Vec<u64>` this way, with no
+/// per-row allocation. See [`pack_signs`] for the sign rule and padding contract.
 pub fn pack_signs_into(v: &[f32], out: &mut [u64]) {
     out.iter_mut().for_each(|w| *w = 0);
     for (i, &x) in v.iter().enumerate() {
@@ -213,9 +212,8 @@ pub fn pack_signs_into(v: &[f32], out: &mut [u64]) {
     }
 }
 
-/// Hamming distance between two equal-length packed bit vectors: the number of
-/// differing bits, `Σ (aᵢ ^ bᵢ).count_ones()`. Pure integer (a `POPCNT` reduction),
-/// so it runs under Miri and needs no FFI. Kept in [`DOT_LANES`] independent lanes for
+/// Hamming distance between two equal-length packed bit vectors: `Σ (aᵢ ^ bᵢ).count_ones()`. Pure
+/// integer, so it runs under Miri and needs no FFI, and kept in [`DOT_LANES`] independent lanes for
 /// the same instruction-level-parallelism reason as [`dot`].
 pub fn hamming(a: &[u64], b: &[u64]) -> u32 {
     debug_assert_eq!(a.len(), b.len(), "hamming: word lengths must be equal");
@@ -238,11 +236,8 @@ pub fn hamming(a: &[u64], b: &[u64]) -> u32 {
 }
 
 // ── Internal total-order wrapper for f32 scores ──────────────────────────────
-//
-// `BinaryHeap` requires `Ord`. Since `f32` is not `Ord` (NaN), we wrap the
-// score with a newtype that uses `f32::total_cmp`, which places NaN below all
-// finite values (at the bottom of the total order). This means NaN scores are
-// the lowest possible and will be evicted before any real result.
+// `BinaryHeap` needs `Ord`, and `f32` is not (NaN), so this newtype uses `f32::total_cmp`, which
+// puts NaN below every finite value — so a NaN score is evicted before any real result.
 
 #[derive(Clone, Copy, PartialEq)]
 struct OrdF32(f32);
@@ -272,9 +267,8 @@ impl Ord for OrdF32 {
 }
 
 // ── Entry stored in the min-heap ──────────────────────────────────────────────
-//
-// The heap is a max-heap by default; to get a min-heap we reverse the ordering
-// so the smallest score sits at the top and is the first candidate for eviction.
+// `BinaryHeap` is a max-heap, so the ordering is reversed here: the smallest score sits at the top
+// and is the first candidate for eviction.
 
 struct Entry<T> {
     score: OrdF32,

@@ -175,10 +175,9 @@ impl Persistence for Gcs {
     fn put_cas(&self, key: &str, bytes: &[u8], expected: Option<&str>) -> Result<CasOutcome> {
         validate_key(key)?;
         let oid = self.object_id(key)?;
-        // `ifGenerationMatch=<gen>` makes the insert a compare-and-swap; `=0` makes it a
-        // create-if-absent (`expected: None`). It is a signed query param baked into the URI
-        // (no extra header on the wire). A non-numeric `expected` can never match a real
-        // generation, so it maps to a value (-1) that fails the precondition cleanly.
+        // `ifGenerationMatch=<gen>` makes the insert a compare-and-swap, `=0` a create-if-absent —
+        // a signed query param baked into the URI, not a header. A non-numeric `expected` can never
+        // match a real generation, so it maps to -1 and fails the precondition cleanly.
         let want_gen = match expected {
             Some(t) => t.parse::<i64>().unwrap_or(-1),
             None => 0,

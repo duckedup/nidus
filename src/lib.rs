@@ -350,9 +350,8 @@ impl Nidus {
     }
 
     /// Write the ANN index ([`Config::ann`]) to its on-disk cache so the next [`open`](Self::open)
-    /// loads it instead of rebuilding the graph. Explicit and out-of-band — never triggered by
-    /// `upsert`/`flush` — so call it before shutting down a long-lived handle. `compact()` also
-    /// refreshes the cache.
+    /// loads it instead of rebuilding the graph. Explicit and out-of-band, never triggered by
+    /// `upsert`/`flush`, so call it before shutting down a long-lived handle; `compact()` also does.
     pub fn persist_index(&mut self) -> Result<()> {
         self.store.persist_index()
     }

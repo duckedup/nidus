@@ -96,14 +96,8 @@ pub(super) async fn backpressure(
     let limits = &st.limits;
 
     // ── Phase 1: receive the body, WITHOUT a store permit (nidus-6c2) ───────────────
-    //
-    // The store permit used to be taken first, and the handler is what awaits the body —
-    // so a client that sent headers and then went silent pinned a permit for the whole
-    // request deadline, denying service to work that was ready to run. Receiving the body
-    // first means a stalled client can no longer touch the store's admission pool at all.
-    //
-    // It is still bounded, by its own larger pool: an unbounded number of bodies arriving
-    // at once is the memory problem this epic exists to prevent, just relocated.
+    // The permit used to come first, and the handler awaits the body, so a silent client pinned one
+    // for the whole deadline. Body-first keeps a stalled client off the store's pool; still bounded.
     match receive_body(limits, req).await {
         Ok(received) => req = received,
         Err(response) => return response,

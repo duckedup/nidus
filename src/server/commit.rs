@@ -28,11 +28,9 @@ pub(super) struct Committer {
     /// Groups committed, and writes applied across them.
     groups: AtomicU64,
     writes: AtomicU64,
-    /// Writes submitted, ever. `submitted - writes` is the current backlog — reported as a
-    /// gauge, and the reason this is a monotonic counter rather than the queue's length: an
-    /// atomic can be read by a scrape without taking the queue's mutex, and it does not
-    /// evaporate the instant a leader drains the queue, which makes it something a test can
-    /// synchronise on.
+    /// Writes submitted, ever; `submitted - writes` is the current backlog. Monotonic rather than
+    /// the queue's length because an atomic reads without taking the queue's mutex, and it does not
+    /// evaporate the instant a leader drains — which makes it something a test can synchronise on.
     submitted: AtomicU64,
 }
 
@@ -154,10 +152,9 @@ impl Committer {
 
     /// Lead: commit group after group until the queue is empty, then stand down.
     fn drive(&self, db: &Db) {
-        // Backstop for an unwind out of `commit_group` — a panicking write must not leave the
-        // queue leaderless, which would hang every write that came after it. Disarmed on the
-        // orderly exit below, where standing down happens under the same lock as the emptiness
-        // check it is based on.
+        // Backstop for an unwind out of `commit_group`: a panicking write must not leave the queue
+        // leaderless, which would hang every write behind it. Disarmed on the orderly exit below,
+        // where standing down happens under the same lock as the emptiness check behind it.
         let mut standdown = StandDown { c: Some(self) };
         loop {
             let group: Vec<Apply> = {

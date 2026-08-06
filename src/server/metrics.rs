@@ -47,10 +47,9 @@ const BUCKETS: &[f64] = &[
 
 /// Per-route request counts, split by status class, plus a latency histogram.
 struct RouteStats {
-    /// Index 0..=4 → 1xx..5xx. A class rather than the exact code: it answers "what is the
-    /// error rate" without multiplying the label set by every status the server can return,
-    /// and the two statuses an operator actually needs to tell apart under load — a shed
-    /// `503` and a deadline `504` — have their own counters below.
+    /// Index 0..=4 → 1xx..5xx. A class, not the exact code: it answers "what is the error rate"
+    /// without multiplying the label set by every status, and the two an operator must tell apart
+    /// under load — a shed `503` and a deadline `504` — have their own counters below.
     by_class: [AtomicU64; 5],
     /// Cumulative bucket counts (`le`), Prometheus-style: each is "requests at or under
     /// this bound", filled in at render time from the per-bucket tallies here.
@@ -94,10 +93,9 @@ pub(super) struct HttpMetrics {
     routes: [RouteStats; ROUTES.len()],
     /// Requests currently being handled, probes included.
     in_flight: crate::metrics::Gauge,
-    /// Requests whose client vanished before a response was produced — axum drops the
-    /// handler future when the connection closes, so these never reach a status. Worth its
-    /// own counter: a rising count is clients giving up, which looks like nothing at all in
-    /// a request/status breakdown that only ever sees completed requests.
+    /// Requests whose client vanished before a response — axum drops the handler future when the
+    /// connection closes, so these never reach a status. Worth its own counter: a rising count is
+    /// clients giving up, invisible in a breakdown that only sees completed requests.
     cancelled: crate::metrics::Counter,
     /// Requests refused with `503` because the concurrency cap was reached (nidus-abx.2).
     pub(super) shed: crate::metrics::Counter,
@@ -358,11 +356,8 @@ fn render(out: &mut String, st: &AppState) {
     }
 
     // ── Group commit (nidus-xb9.1) ──────────────────────────────────────────
-    //
-    // `writes / groups` is the average number of requests that shared one disk barrier. Read
-    // it against `nidus_write_batches_total` / `nidus_durability_barriers_total` above: those
-    // count the store's barriers whoever asked for them, these attribute the coalescing to
-    // concurrent HTTP writes.
+    // `writes / groups` is the average number of requests sharing one disk barrier. The store's own
+    // barrier counters above count them whoever asked; these attribute coalescing to HTTP writes.
     let (groups, writes) = st.commit.stats();
     for (name, help, value) in [
         (
@@ -411,11 +406,8 @@ fn render(out: &mut String, st: &AppState) {
     }
 
     // ── Instance state ──────────────────────────────────────────────────────
-    //
-    // The *same* decision `GET /ready` answers with, not a re-derivation of it — a
-    // dashboard that disagreed with the load balancer about whether an instance is serving
-    // would be worse than no dashboard. Lock-free like the probe, so a scrape during a long
-    // write answers instantly.
+    // The *same* decision `GET /ready` answers with, not a re-derivation: a dashboard disagreeing
+    // with the load balancer would be worse than none. Lock-free, so a scrape answers instantly.
     let _ = writeln!(
         out,
         "# HELP nidus_ready Whether this instance reports ready (1) or not (0)"

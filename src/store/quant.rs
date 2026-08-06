@@ -12,9 +12,8 @@ use crate::model::{Distance, Hit, QuantKind, SearchOpts};
 use crate::search::{QuantParams, TopK, pack_signs, pack_signs_into};
 
 /// Build the ANN [`Walk`] for the current quantization state (nidus-ndu): a quantized walk when a
-/// populated matrix is present, since the graph was built in that space, else the exact f32 walk. A
-/// free function so callers can build it from the disjoint `quant`/`data` fields while holding
-/// `&mut self.ann`.
+/// populated matrix is present, since the graph was built in that space, else exact f32. A free
+/// function so callers can build it from the disjoint `quant`/`data` fields while holding `&mut ann`.
 pub(super) fn ann_walk_for<'a>(
     quant: Option<&'a Quant>,
     data: &'a Segments,
@@ -136,10 +135,9 @@ impl Store {
         }
     }
 
-    /// Extend the quantized matrix after `upsert` appended rows — O(batch), not O(N). int8 reuses
-    /// the existing scale, falling back to a full rebuild with no scale yet or past
-    /// [`REFIT_GROWTH`]× the fit set, so a drifting distribution cannot saturate a stale scale.
-    /// Binary is scale-free and never refits.
+    /// Extend the quantized matrix after `upsert` appended rows — O(batch), not O(N). int8 reuses the
+    /// existing scale, rebuilding fully with no scale yet or past [`REFIT_GROWTH`]× the fit set, so a
+    /// drifting distribution cannot saturate a stale scale. Binary is scale-free and never refits.
     pub(super) fn extend_quant(&mut self, prev_rows: u64) {
         let total = self.data.row_count();
         let dim = self.data.dimension();

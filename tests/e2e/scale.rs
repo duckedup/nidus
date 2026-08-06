@@ -249,10 +249,9 @@ fn filtered_search_at_scale_matches_ground_truth() {
     }
 }
 
-/// The quantized first pass is a *speed/recall trade*, so the contract is recall, not an
-/// exact match. This pins that the trade is actually being made well end-to-end: int8
-/// codes select candidates, an exact f32 rerank orders them, and what comes back over
-/// HTTP still contains nearly all of the true top-k.
+/// The quantized first pass is a speed/recall trade, so the contract is recall, not an exact match.
+/// This pins that the trade is made well end-to-end: int8 codes select, an exact f32 rerank orders,
+/// and what comes back over HTTP still contains nearly all of the true top-k.
 #[test]
 fn quantized_search_at_scale_keeps_high_recall() {
     let corpus = Corpus::generate(0x00A17_u64, N, DIM, 3);

@@ -4498,8 +4498,7 @@ fn a_cancelled_search_stops_and_errors() {
 
 // ── Query-dimension validation (nidus-c5v) ───────────────────────────────────
 // Dimension is pinned in the `data` header, so a wrong-length query is unanswerable. It used to be
-// answered anyway: `dot` zips and stops at the shorter, so a mismatched query scored over a prefix
-// and returned `Ok` — a plausible-looking ranking rather than an error.
+// answered anyway: `dot` zips and stops at the shorter, returning a plausible-looking prefix score.
 
 /// The wording matters beyond readability: the server's `classify` maps this substring to
 /// `400`, so a reworded message would silently downgrade the HTTP status to `500`.

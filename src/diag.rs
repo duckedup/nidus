@@ -46,10 +46,9 @@ impl Level {
 pub(crate) fn level() -> Level {
     static LEVEL: OnceLock<Level> = OnceLock::new();
     *LEVEL.get_or_init(|| {
-        // `NIDUS_LEASE_DEBUG` predates this and is still honoured: it used to be the only
-        // way to see lease tracing, and a runbook or a CI job may still set it. It now
-        // simply means "debug", so the crude hook becomes a special case of the general
-        // mechanism instead of sitting beside it.
+        // `NIDUS_LEASE_DEBUG` predates this and is still honoured, since a runbook or CI job may
+        // set it. It now simply means "debug", making the crude hook a special case of the general
+        // mechanism rather than something sitting beside it.
         if std::env::var_os("NIDUS_LEASE_DEBUG").is_some()
             && std::env::var_os("NIDUS_LOG").is_none()
         {

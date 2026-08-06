@@ -298,10 +298,9 @@ fn killed_server_leaves_data_intact_and_lock_reclaimable() {
     );
 }
 
-/// The flags phase 0 added must actually change how the *server* opens the store, not
-/// just how `Config` parses. `/stats` echoes the ANN config, so it can prove the flag
-/// reached the running store; quantization is asserted behaviourally (search still
-/// ranks correctly through the quantized first pass + exact rerank).
+/// The flags phase 0 added must change how the *server* opens the store, not just how `Config`
+/// parses. `/stats` echoes the ANN config, proving the flag reached the running store; quantization
+/// is asserted behaviourally, since search still ranks correctly through the two-pass path.
 #[test]
 fn opt_in_flags_reach_the_running_store() {
     let dir = tempfile::tempdir().unwrap();

@@ -45,16 +45,13 @@ use nidus::{Config, Memory, Nidus, RecallOpts, Record, RememberMode, SearchOpts,
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // ── 1. The escape hatch — raw vectors, no network, no async ──────────────
-    // `Memory` is a strictly additive convenience layer. If you already have
-    // your own embeddings (or want a model nidus ships no adapter for), keep
-    // using `Nidus` directly: it takes a caller-supplied `Vec<f32>` and is
-    // completely untouched by the AI layer. This part always runs.
+    // `Memory` is strictly additive. With your own embeddings, or a model nidus ships no adapter
+    // for, keep using `Nidus` directly — it is untouched by the AI layer. This part always runs.
     byo_vector_demo()?;
 
     // ── 2. Build an embedder from the environment (or bail out cleanly) ──────
-    // Every provider is selected at runtime through the closed `AnyEmbedder`
-    // enum — no `Box<dyn>`. The model is optional: leaving it empty uses the
-    // provider's default (e.g. `text-embedding-3-small` for OpenAI).
+    // Providers are selected at runtime through the closed `AnyEmbedder` enum — no `Box<dyn>`. The
+    // model is optional; leaving it empty uses the provider's default.
     let embedder = match build_embedder().await {
         Ok(embedder) => embedder,
         Err(msg) => {
@@ -76,9 +73,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ── 3. Open a store whose dimension matches the embedder ─────────────────
-    // The embedding dimension is pinned into the store at creation. Asking the
-    // embedder for its dimension and opening the store to match keeps the two
-    // in lockstep (a mismatch is a hard error on the first `remember`).
+    // The dimension is pinned into the store at creation, so asking the embedder for its dimension
+    // keeps the two in lockstep — a mismatch is a hard error on the first `remember`.
     let dir = std::env::temp_dir().join("nidus-memory-example");
     let _ = std::fs::remove_dir_all(&dir); // start clean
     let dim = embedder.dimension();
@@ -99,10 +95,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── 5. remember() — text in ──────────────────────────────────────────────
-    // Raw mode embeds the text as-is. The first write into a collection pins
-    // the embedder's "provider/model" identity + dimension into the collection
-    // metadata; a later write with a *different* embedder is refused, so you
-    // can't accidentally mix incomparable vector spaces in one collection.
+    // Raw mode embeds the text as-is. The first write pins the embedder's provider/model identity, so
+    // a later write with a different one is refused rather than mixing incomparable vector spaces.
     let notes = [
         (
             "login",

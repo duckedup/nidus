@@ -295,11 +295,9 @@ fn write_json(path: &Path, args: &Args, cells: &[Value]) -> Result<()> {
     }
     let doc = json!({
         "bench": "nidus-bench-write",
-        // The version of NIDUS, not of this bench crate. `env!("CARGO_PKG_VERSION")` here
-        // would report nidus-bench's own 0.1.0 — which is worse than nothing on a
-        // baseline, since it looks authoritative while naming the wrong crate. nidus does
-        // not expose its version, so `just bench-write` passes it in; a direct `cargo run`
-        // gets "unknown" rather than a confident lie.
+        // The version of NIDUS, not of this bench crate: `env!("CARGO_PKG_VERSION")` would report
+        // nidus-bench's own, which looks authoritative while naming the wrong crate. `just
+        // bench-write` passes it in; a direct `cargo run` gets "unknown" rather than a confident lie.
         "nidus_version": std::env::var("NIDUS_VERSION").unwrap_or_else(|_| "unknown".into()),
         "server_feature": cfg!(feature = "server"),
         "inputs": {
@@ -344,10 +342,8 @@ fn run() -> Result<()> {
         let dataset = data::generate(args.seed, n, dim, 0);
 
         // ── the decomposition, at the largest batch size ────────────────────
-        //
-        // Largest, because per-request costs are amortised there and what remains is the
-        // per-vector floor — the thing that cannot be batched away and therefore the thing
-        // that decides whether a single writer has a ceiling worth scaling out past.
+        // Largest, because per-request costs amortise there and what remains is the per-vector floor
+        // — what cannot be batched away, and so what decides whether one writer has a real ceiling.
         let batch = *args.batch.iter().max().expect("non-empty");
         let plan = Plan::new(n, batch, args.max_requests);
         let v = plan.vectors;
@@ -401,10 +397,8 @@ fn run() -> Result<()> {
         }
 
         // ── batch-size sweep ────────────────────────────────────────────────
-        //
-        // `n` varies down the column: small batches are capped at `--max-requests` calls,
-        // so the row reports the vectors it actually ingested rather than implying it
-        // covered the same corpus as the row below it.
+        // `n` varies down the column: small batches are capped at `--max-requests` calls, so each row
+        // reports the vectors it actually ingested rather than implying a shared corpus size.
         println!("\n── batch-size sweep  dim={dim}  (vectors/s) ──────────────────────────");
         #[cfg(feature = "server")]
         println!(
@@ -460,10 +454,9 @@ fn run() -> Result<()> {
         #[cfg(feature = "server")]
         {
             println!("\n── concurrent writers  n={v} dim={dim} batch={batch}  ────────────────");
-            // `writes/barrier` is the group-commit coalescing factor read off the server's
-            // own counters (nidus-xb9.1) — without it a rising throughput curve cannot be
-            // told apart from the machine simply having more cores to spend, and a *flat*
-            // one cannot be told apart from group commit having silently stopped working.
+            // `writes/barrier` is the coalescing factor read off the server's own counters
+            // (nidus-xb9.1). Without it a rising curve is indistinguishable from more cores, and a
+            // flat one from group commit having silently stopped working.
             println!(
                 "{:<10} {:>14} {:>12} {:>16}",
                 "clients", "vectors/s", "vs 1 client", "writes/barrier"

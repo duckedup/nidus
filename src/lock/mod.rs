@@ -17,13 +17,9 @@ pub struct WriteLock {
 }
 
 impl WriteLock {
-    /// Acquire `<dir>/lock` by atomic create (`create_new`). Writes the PID + a
-    /// timestamp inside for diagnostics. If the file already exists and is older
-    /// than `ttl` (stale — a crashed writer), reclaim it; otherwise return an error
-    /// (`anyhow`, surfaced as a clear "store is locked" message). The store goes
-    /// through [`Persistence::try_lock`](crate::backend::Persistence::try_lock) (which
-    /// shares [`try_acquire_path`](Self::try_acquire_path)); this dir-based form backs
-    /// the lock's own tests.
+    /// Acquire `<dir>/lock` by atomic create, writing the PID and a timestamp for diagnostics. A file
+    /// older than `ttl` (a crashed writer) is reclaimed; otherwise this errors as "store is locked".
+    /// The store goes through `Persistence::try_lock`; this dir-based form backs the lock's own tests.
     #[cfg(test)]
     pub fn acquire(dir: &Path, ttl: Duration) -> Result<WriteLock> {
         let path = dir.join("lock");
@@ -38,12 +34,9 @@ impl WriteLock {
         }
     }
 
-    /// The reusable O_EXCL primitive behind [`acquire`](Self::acquire): try to take
-    /// the lock file at `path`, reclaiming it if it is older than `ttl` (a crashed
-    /// writer). Returns `Ok(None)` — **not** an error — when the lock is genuinely
-    /// held by a live writer, so a caller honouring the `Persistence::try_lock`
-    /// contract (lock-or-`None`, never a hard error on contention) can map it
-    /// directly. A real IO failure is still an `Err`.
+    /// The reusable O_EXCL primitive behind [`acquire`](Self::acquire): take the lock file at `path`,
+    /// reclaiming it if older than `ttl`. `Ok(None)` — not an error — when a live writer holds it, so
+    /// a caller honouring the lock-or-`None` contract maps it directly. Real IO failures are `Err`.
     pub fn try_acquire_path(path: &Path, ttl: Duration) -> Result<Option<WriteLock>> {
         match try_create_lock(path) {
             Ok(lock) => Ok(Some(lock)),

@@ -425,11 +425,8 @@ mod tests {
 
     #[test]
     fn empty_class_not_matchable() {
-        // `[]` — immediately closing bracket; in many glob implementations `]`
-        // is treated as first char of class. But our spec says unterminated if no `]`
-        // after content. `[]` means class with just `]`? Let's test that `[]` followed
-        // by `]` closes on the first `]` making an empty set... actually `[]` sees `]`
-        // immediately and since found_close=true with 0 members, matches nothing.
+        // `[]` closes immediately: many glob implementations treat a leading `]` as a class member,
+        // but here the first `]` closes the class, giving zero members — so it matches nothing.
         assert!(!glob_match("[]", "a"));
         assert!(!glob_match("[]", "]"));
     }

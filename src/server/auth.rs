@@ -28,10 +28,9 @@ impl Token {
         if expected.len() != presented.len() {
             return false;
         }
-        // Fold every byte pair into one accumulator and test it once at the end, so the
-        // work done — and every branch taken — is the same whether the first byte differs
-        // or none of them do. `black_box` keeps a future optimiser from noticing that the
-        // accumulator can be abandoned as soon as it is nonzero.
+        // Fold every byte pair into one accumulator and test it once at the end, so the work and
+        // every branch taken are identical whether the first byte differs or none do. `black_box`
+        // stops a future optimiser abandoning the accumulator as soon as it is nonzero.
         let mut diff: u8 = 0;
         for (a, b) in expected.iter().zip(presented) {
             diff |= a ^ b;

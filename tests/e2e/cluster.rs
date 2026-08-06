@@ -137,11 +137,9 @@ fn build_instance(
             &service("NIDUS_E2E_S3_SECRET", "minioadmin"),
         )
         .env("AWS_REGION", &service("NIDUS_E2E_S3_REGION", "us-east-1"))
-        // Lease tracing on for every cluster instance. A lease bug is a multi-process race
-        // that reproduces here and essentially nowhere else, and the harness surfaces a
-        // child's stderr only when a test fails — so this costs nothing on a green run and is
-        // the whole diagnosis on a red one. nidus-lp4.7 took a second pass precisely because
-        // these lines (with their pids) were not there the first time.
+        // Lease tracing on for every cluster instance: a lease bug is a multi-process race that
+        // reproduces here and essentially nowhere else, and the harness shows a child's stderr only
+        // on failure. Free on a green run, the whole diagnosis on a red one (nidus-lp4.7).
         .env("NIDUS_LEASE_DEBUG", "1")
         .start_unready();
     // The TempDir must outlive the server, so hand both back together.
@@ -454,10 +452,9 @@ fn idle_writer_keeps_its_lease_against_a_waiting_standby() {
         "an idle writer must not have been fenced"
     );
 
-    // The mutual-exclusion property stated directly: whatever the standby thinks its role is,
-    // it must not claim the writer handle. (While it waits it has no store open, so `/cluster`
-    // answers 503 — - that is itself proof it was not promoted. If it ever answers, the claim
-    // must still be false.)
+    // Mutual exclusion stated directly: whatever the standby thinks its role is, it must not claim
+    // the writer handle. While waiting it has no store open, so `/cluster` answers 503 — itself proof
+    // it was not promoted — and if it ever answers, the claim must still be false.
     let (status, body) = standby.get("/cluster");
     if status == 200 {
         assert_eq!(

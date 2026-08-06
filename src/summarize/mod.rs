@@ -294,11 +294,9 @@ impl Summarizer for AnySummarizer {
 
 // ── Shared adapter plumbing ─────────────────────────────────────────────────────
 
-/// Send a prepared request with retry, then classify the response: transport
-/// failure past the retry budget → [`SummarizeError::Backend`], a non-2xx
-/// status → [`SummarizeError::Api`], success → the [`reqwest::Response`] for the
-/// caller to parse. Shared by every provider adapter (the dedupe rule — one
-/// source, two callers) so status/error handling lives in exactly one place.
+/// Send a prepared request with retry, then classify: transport failure past the budget →
+/// [`SummarizeError::Backend`], non-2xx → [`SummarizeError::Api`], success → the response to parse.
+/// Shared by every provider adapter so status handling lives in exactly one place.
 #[cfg(any(feature = "summarize-anthropic", feature = "summarize-openai"))]
 async fn send_checked(
     policy: &crate::http::RetryPolicy,

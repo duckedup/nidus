@@ -16,11 +16,9 @@ use crate::backend::cloud::Http;
 /// the window between signing and the (immediate) execution.
 const PRESIGN_TTL: Duration = Duration::from_secs(300);
 
-/// The `If-None-Match: *` precondition that makes a PUT a create-if-absent (it succeeds
-/// only when no object matches — i.e. none exists). The header name is **lowercase**:
-/// SigV4 signs canonical (lowercased) header names, and rusty-s3 signs the name as given,
-/// so it must already be lowercase here to match what AWS recomputes. HTTP header names
-/// are case-insensitive on the wire, so sending it lowercase is equally fine.
+/// The `If-None-Match: *` precondition making a PUT a create-if-absent. The name must be lowercase
+/// here: SigV4 signs canonical lowercased names and rusty-s3 signs the name as given, so anything
+/// else fails what AWS recomputes. Header names are case-insensitive on the wire regardless.
 const IF_NONE_MATCH_HEADER: &str = "if-none-match";
 const IF_NONE_MATCH_ANY: &str = "*";
 
@@ -148,10 +146,9 @@ impl Persistence for S3 {
     fn put_cas(&self, key: &str, bytes: &[u8], expected: Option<&str>) -> Result<CasOutcome> {
         validate_key(key)?;
         let path = self.path(key);
-        // `If-Match: <etag>` makes the PUT a compare-and-swap; `If-None-Match: *` makes it a
-        // create-if-absent (`expected: None`). Either header is *signed* (added before signing)
-        // so it must be sent verbatim on the wire. A 412 means the precondition failed — a peer
-        // changed the object since `expected` (or it already exists), i.e. we are fenced.
+        // `If-Match: <etag>` makes the PUT a compare-and-swap, `If-None-Match: *` a
+        // create-if-absent. Either header is signed, so it must go on the wire verbatim. A 412 means
+        // the precondition failed — a peer changed the object, or it already exists: we are fenced.
         let (name, value) = match expected {
             Some(etag) => (IF_MATCH_HEADER, etag),
             None => (IF_NONE_MATCH_HEADER, IF_NONE_MATCH_ANY),

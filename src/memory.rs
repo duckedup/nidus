@@ -217,12 +217,9 @@ async fn embed_and_store<E: Embedder>(
     Ok(())
 }
 
-/// Recall-side identity guard: refuse a recall whose embedder differs from the
-/// one `collection` was written with. Symmetric with the write-side pin —
-/// recalling with a different (even same-dimension) embedder than the collection
-/// was written with would silently return meaningless cross-space rankings, so
-/// refuse it up front. A collection with no pinned embedder (never written
-/// through `Memory`) imposes no constraint.
+/// Recall-side identity guard: refuse a recall whose embedder differs from the one `collection` was
+/// written with, since even a same-dimension mismatch returns meaningless cross-space rankings. A
+/// collection with no pinned embedder — never written through `Memory` — imposes no constraint.
 pub(crate) fn guard_recall_identity<E: Embedder>(
     db: &Nidus,
     embedder: &E,

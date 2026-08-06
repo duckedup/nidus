@@ -63,10 +63,9 @@ pub(super) fn working_set_key(config: &Config) -> Vec<u8> {
     format!("ws-v1:{}:{:?}", config.dimension, config.distance).into_bytes()
 }
 
-/// Try to adopt the shared working set: `Ok(Some(index))` only when the tier holds a
-/// snapshot whose validity key, log watermark, and data row count all match the
-/// just-opened store. Any miss — no tier, absent/stale/evicted blob, or an unreachable
-/// tier — is `Ok(None)`, and the caller replays the log. Never fatal.
+/// Try to adopt the shared working set: `Some(index)` only when the tier holds a snapshot whose
+/// validity key, log watermark, and row count all match the just-opened store. Any miss — no tier,
+/// a stale or evicted blob, an unreachable tier — is `None`, and the caller replays. Never fatal.
 pub(super) fn try_adopt(
     memory: Option<&dyn MemoryTier>,
     key: &[u8],
@@ -90,10 +89,9 @@ pub(super) fn try_adopt(
 }
 
 impl Store {
-    /// Publish the current in-RAM working set to the shared memory tier so peers can
-    /// adopt it on open (skipping their own log replay). Best-effort and a no-op when no
-    /// external tier is configured: the tier is a rebuildable cache, so a serialization
-    /// or transport failure is swallowed, never surfaced as a write/flush error.
+    /// Publish the in-RAM working set to the shared memory tier so peers adopt it on open, skipping
+    /// their own replay. Best-effort, and a no-op with no external tier: the tier is a rebuildable
+    /// cache, so a serialization or transport failure is swallowed rather than failing the flush.
     pub(super) fn publish_working_set(&self) {
         let Some(mem) = self.memory.as_deref() else {
             return;

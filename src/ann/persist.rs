@@ -36,10 +36,9 @@ fn quant_to_byte(quant: Option<QuantKind>) -> u8 {
     }
 }
 
-/// The validity key for the shared cache codec: a cache is valid only for this exact
-/// `(kind, distance, quant, dim, m, ef_construction, n_lists, seed)`. Any mismatch on
-/// load means "rebuild". (`ef_search`, `n_probe`, `overscan` are query-time tunables
-/// that don't change the built structure, so they are deliberately excluded.)
+/// The validity key for the shared cache codec: valid only for this exact `(kind, distance, quant,
+/// dim, m, ef_construction, n_lists, seed)`, and any mismatch means rebuild. `ef_search`/`n_probe`/
+/// `overscan` are query-time tunables that do not change the built structure, so they are excluded.
 fn validity_key(
     dim: usize,
     distance: Distance,
@@ -74,10 +73,9 @@ pub(crate) fn save(
     index_cache::save(p, ANN_OBJECT, &key, covered_rows, &ann.snapshot_ref())
 }
 
-/// Load the index from `p` if present and valid for the current `(dim, distance, cfg,
-/// quant)`. Returns `Ok(None)` — never an error — when the cache is absent, stale, or
-/// corrupt; the caller rebuilds. On success returns the index and the row count it
-/// covers (the caller incrementally catches up any rows added since).
+/// Load the index from `p` if present and valid for the current `(dim, distance, cfg, quant)`.
+/// `Ok(None)` — never an error — when absent, stale, or corrupt, and the caller rebuilds. On success
+/// returns the index and the row count it covers, so the caller can catch up any rows added since.
 pub(crate) fn load(
     p: &dyn Persistence,
     dim: usize,

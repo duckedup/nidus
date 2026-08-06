@@ -1,9 +1,8 @@
 //! Build-thesis guard for the AI ingest layer (epic nidus-54l).
 
-// Every assertion in this file is a DELIBERATE compile-time `cfg!` guard — its
-// operand is a constant on purpose (that is the whole point: pin the feature
-// graph at build time). `clippy::assertions_on_constants` would flag each one,
-// so it is allowed crate-wide for this guard file.
+// Every assertion here is a deliberate compile-time `cfg!` guard, so its operand is a constant on
+// purpose — pinning the feature graph at build time. `clippy::assertions_on_constants` would flag
+// each one, hence the crate-wide allow in this guard file.
 #![allow(clippy::assertions_on_constants)]
 
 /// DEFAULT build: none of the AI-ingest features are enabled, so the async edge
@@ -43,10 +42,8 @@ fn default_build_is_pure() {
 }
 
 // ── Ingest lane: the feature-implication graph that wires the async edge. ──────
-//
-// Each `assert!` is compiled ONLY when its provider feature is active, so on the
-// pure lane none of these exist; on the ingest lane they pin that a provider can
-// never be enabled without the base feature that pulls reqwest + tokio.
+// Each `assert!` compiles only when its provider feature is active, so none exist on the pure lane;
+// on the ingest lane they pin that a provider cannot be enabled without its reqwest+tokio base.
 
 /// A provider/umbrella feature must always drag in its base `embed` feature —
 /// that base is what enables `dep:reqwest` + `dep:tokio`. If any embedder is on

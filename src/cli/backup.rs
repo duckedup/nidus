@@ -1,9 +1,6 @@
-//! `nidus backup` / `nidus restore`: snapshot a store into a single pure-Rust
-//! `.tar.gz` **object**, and extract one back. The archive's destination/source is a
-//! [`Persistence`](crate::backend::Persistence) location, so a snapshot is just one
-//! named object on any backend — a local file (`./snap.tar.gz`, `file:///b/snap.tar.gz`)
-//! today, an object store (`s3://…`) once one lands (SPEC §13.7). It is *exactly*
-//! object-granular, which is why every backend does it trivially.
+//! `nidus backup` / `nidus restore`: snapshot a store into one pure-Rust `.tar.gz` object, and
+//! extract it back. The archive's source/destination is a `Persistence` location, so a snapshot is
+//! one named object on any backend (SPEC §13.7) — exactly object-granular, hence trivial everywhere.
 
 use std::io::Read;
 use std::path::Path;
@@ -59,10 +56,9 @@ struct Manifest {
     log_bytes: u64,
 }
 
-/// Snapshot the store at the persistence location `source` into a gzip-compressed tar
-/// **object** at `out_location`. Both are [`open_persistence`](crate::open_persistence)
-/// locations — a local path/`file://`, or an `s3://`/`gs://` object store — so a store
-/// living on any backend can be snapshotted to any backend.
+/// Snapshot the store at `source` into a gzip-compressed tar object at `out_location`. Both are
+/// [`open_persistence`](crate::open_persistence) locations, so a store on any backend can be
+/// snapshotted to any backend.
 pub fn backup(source: &str, out_location: &str) -> Result<BackupReport> {
     // Read the source store's durable objects through its backend — `data` first, then
     // `log`, for the consistent lock-free snapshot (see the module docs).
