@@ -1,63 +1,6 @@
-//! Group commit for the write path (nidus-xb9.1).
-//!
-//! ## The measurement this exists to move
-//!
-//! `just bench-write` put a number on the write ceiling: **~7.6ms of fixed cost per upsert
-//! call**, paid whether that call carries one record or a thousand — a disk barrier
-//! (`fsync` of `data`, then `log`) plus, in cluster mode, a manifest publish. It is why
-//! `batch=1` gets 125 vec/s over HTTP while `batch=1000` gets 33k from the same code path.
-//!
-//! A single `nidus serve` already has 2–8 upserts genuinely in flight at once, and the
-//! concurrency sweep plateaus at ~85k vec/s (384-d) because **every one of them pays its own
-//! barrier**. The plateau sits exactly on the in-process durable rate, so the exclusive write
-//! section is the asymptote, and merging the barriers is how that asymptote moves.
-//!
-//! ## The shape
-//!
-//! Classic WAL group commit. Writes are submitted to a queue instead of racing for the store
-//! lock. Whichever request finds no leader becomes one: it takes the store's exclusive guard
-//! **once**, applies every write queued at that moment with the barrier deferred
-//! ([`Nidus::deferred`]), then takes **one** barrier for the whole group
-//! ([`Nidus::commit`]) and only then answers all of them.
-//!
-//! ```text
-//!   without group commit          with group commit
-//!   ────────────────────          ─────────────────
-//!   append ─ fsync ─ 200          append ┐
-//!            append ─ fsync ─ 200 append ├─ fsync ─ 200 ×N
-//!                     append ─ …  append ┘
-//! ```
-//!
-//! Every existing invariant holds. The durable write order is untouched (each batch appends
-//! data before log; the barrier syncs data before log). No request is answered before its own
-//! bytes are durable — that is the entire point of splitting apply from acknowledge, and the
-//! reason [`Nidus::deferred`] documents the obligation rather than hiding it. A failed barrier
-//! fails *every* member of its group, because none of them can honestly be called durable.
-//!
-//! ## Why no window, no timer, no wait
-//!
-//! The classic mistake in a group-commit implementation is to *wait* for a group to form —
-//! which buys throughput under load by taxing every single-client write with a delay it
-//! gains nothing from. There is no timer here. The leader drains whatever is **already**
-//! queued and goes; with one client that is always a group of one, and the path is the same
-//! append-then-barrier it was before, minus a queue push. Batching only ever happens because
-//! work was genuinely waiting.
-//!
-//! ## Leadership, and why it is a flag rather than a thread
-//!
-//! A dedicated commit thread was the alternative. This is less machinery for the same
-//! behaviour: no lifecycle to own, nothing to shut down, and no thread sitting idle in a
-//! read-only instance. The election is one `bool` under the queue's mutex, and it is
-//! *elected together with the enqueue* — a write either finds a leader that is guaranteed to
-//! come back for it, or becomes the leader itself. There is no third outcome, which is what
-//! rules out the lost-wakeup this design would otherwise be prone to.
-//!
-//! One incidental win: under write load the blocking pool now holds roughly one task per
-//! *group* instead of one per request.
-//!
-//! The queue is unbounded because it is already bounded — the concurrency semaphore in
-//! [`super::limits`] caps store-touching requests in flight, and nothing can be queued here
-//! without holding one of those permits.
+//! Group commit for the write path (nidus-xb9.1): concurrent writes queue, the first to
+//! reach the store applies the whole queue under one exclusive guard, and one barrier covers
+//! them all. No timed window, so a lone write still pays exactly what it did. SPEC §6.4.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};

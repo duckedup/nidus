@@ -426,6 +426,15 @@ of one and pays exactly what it always did — so the uncontended path is untouc
 contended one stops paying N barriers for N writes. `nidus_write_groups_total` /
 `nidus_write_group_members_total` report the resulting coalescing factor.
 
+Leadership is a `bool` under the queue's mutex rather than a dedicated commit thread: less
+machinery for the same behaviour, with no lifecycle to own and no thread idling in a
+read-only instance. The election happens *together with the enqueue*, so a write either
+finds a leader guaranteed to come back for it or becomes the leader — there is no third
+outcome, which is what rules out a lost wakeup. The queue is unbounded because it is
+already bounded: the §6.5 concurrency semaphore caps store-touching requests in flight, and
+nothing reaches the queue without holding a permit. Under write load the blocking pool then
+holds roughly one task per *group* rather than one per request.
+
 ### 6.5 Concurrency & speed
 The hot path (`search`) is pure CPU over in-RAM data — there is no IO to await — so
 the core API is **synchronous on purpose**. An `async` core would add executor

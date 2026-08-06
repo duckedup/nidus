@@ -1,32 +1,6 @@
-//! Levelled, machine-parseable diagnostic logging (nidus-abx.4).
-//!
-//! Before this, every diagnostic in the crate was a bare `eprintln!`: no level, so there
-//! was no way to turn detail up in production or down in a test; no structure, so a log
-//! aggregator could not query any of it; and no correlation id, so a slow request could
-//! not be tied to the lease renewal that overlapped it. `NIDUS_LEASE_DEBUG=1` was a
-//! deliberately crude on/off for one subsystem and showed what the general mechanism
-//! should be — this is that mechanism, and it subsumes it.
-//!
-//! **Why not `tracing`.** `tracing` + `tracing-subscriber` is the idiomatic answer and
-//! would be a fine choice for a bigger service, but it is a real dependency-tree decision
-//! rather than an implementation detail (CLAUDE.md), and it would land in the *library*
-//! tree — every `cargo add nidus` consumer would pay for it. What the crate actually needs
-//! is levels, key=value structure, and a request id. That is this file: no dependency, and
-//! it holds the same shape a `tracing` migration would keep if one is ever wanted.
-//!
-//! **Format** — logfmt, one event per line on stderr:
-//!
-//! ```text
-//! ts=2026-07-25T18:04:11.482Z level=warn target=lease msg="renewal failed" pid=4711 attempt=3
-//! ```
-//!
-//! `ts`/`level`/`target`/`msg` always lead, in that order, followed by the caller's own
-//! key=value pairs. Values containing a space, a quote, or an `=` are quoted and escaped,
-//! so a naive `key=value` splitter never mis-parses a message.
-//!
-//! **Level** comes from `NIDUS_LOG` (`error|warn|info|debug|trace`, default `info`), read
-//! once into a `OnceLock` — so a suppressed `trace!` in a hot path costs one relaxed atomic
-//! load and no formatting at all.
+//! Levelled diagnostics (nidus-abx.4): logfmt on stderr, `ts`/`level`/`target`/`msg` leading.
+//! Level from `NIDUS_LOG`, read once into a `OnceLock`, so a suppressed event costs one relaxed
+//! load. Hand-rolled to keep `tracing` out of the library dependency tree.
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;

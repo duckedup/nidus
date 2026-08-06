@@ -1,23 +1,15 @@
-//! Shared on-disk codec for **derived index caches** (the ANN graph/lists, the FTS
-//! inverted index, …). A cache is never the source of truth — both indexes are fully
-//! reconstructable from the `data`/`log` files — so this codec exists only to let
-//! `open` *load* an index instead of rebuilding it. Every load is therefore
-//! best-effort: a missing, stale (validity key changed), or CRC-failed file returns
-//! `Ok(None)` and the caller rebuilds. It is never fatal.
-//!
-//! One framing for every index (so ANN and FTS don't each hand-roll it):
+//! Shared on-disk codec for derived index caches (ANN graph/lists, FTS postings). Never the
+//! source of truth — both rebuild from `data`/`log` — so every load is best-effort: missing,
+//! stale, or CRC-failed returns `Ok(None)` and the caller rebuilds. One framing for both:
 //!
 //! ```text
 //! MAGIC(6) "NIDUS\0" | VERSION(2 LE) | watermark(8 LE) | key_len(2 LE) | key(key_len)
 //!   | bincode(payload) | crc32(payload) (4 LE)
 //! ```
 //!
-//! The **key** is opaque validity bytes the caller composes (ANN: dim/metric/params;
-//! FTS: schema hash/language) — any change to it invalidates the cache. The
-//! **watermark** is *data*, not part of the key: it records how much the cache covers
-//! (rows / docs) so the caller can incrementally catch up the rest. The bytes live as
-//! one named object on the [`Persistence`] backend, so the atomic-write guarantee
-//! (local: temp + fsync + rename) is the backend's `put`, not hand-rolled here.
+//! The **key** is opaque validity bytes the caller composes; any change invalidates the cache.
+//! The **watermark** is data, not key: it records how much the cache covers so the caller can
+//! catch up the rest. Atomic write is the backend's `put`, not hand-rolled here.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
