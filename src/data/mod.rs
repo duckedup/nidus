@@ -103,10 +103,9 @@ fn decode_header(buf: &[u8; HEADER_LEN]) -> Result<(usize, Distance)> {
     Ok((dim, distance))
 }
 
-/// Peek the pinned `(dimension, distance)` from an existing store's `data`
-/// header without loading any vectors. Returns `Ok(None)` when there is no store
-/// yet (the file is absent or holds no header), so a caller can require an
-/// explicit dimension only at creation time. Reads just the 64-byte header.
+/// Peek the pinned `(dimension, distance)` from an existing store's `data` header without loading
+/// vectors — just the 64-byte header. `Ok(None)` when there is no store yet, so a caller can require
+/// an explicit dimension only at creation time.
 #[cfg(feature = "cli")]
 pub(crate) fn peek_header(path: &std::path::Path) -> Result<Option<(usize, Distance)>> {
     use std::fs::File;
@@ -144,10 +143,9 @@ pub(crate) fn peek_header(path: &std::path::Path) -> Result<Option<(usize, Dista
     Ok(Some(header))
 }
 
-/// Decode the pinned `(dimension, distance)` from the leading bytes of a `data`
-/// object (the first [`HEADER_LEN`] bytes) — the in-memory counterpart to
-/// [`peek_header`] for callers that already hold the object (e.g. snapshot/backup
-/// reading `data` via the persistence backend).
+/// Decode the pinned `(dimension, distance)` from the leading bytes of a `data` object (the first
+/// [`HEADER_LEN`] bytes) — the in-memory counterpart to [`peek_header`] for callers that already
+/// hold the object (e.g. snapshot/backup reading `data` via the persistence backend).
 #[cfg(feature = "cli")]
 pub(crate) fn header_from_bytes(bytes: &[u8]) -> Result<(usize, Distance)> {
     if bytes.len() < HEADER_LEN {
@@ -194,10 +192,9 @@ fn bytes_to_floats(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
 }
 
 impl DataSegment {
-    /// Open or create the `data` file at `path` (convenience over
-    /// [`open_with`](Self::open_with): wraps a local `FileAppender`). The store path
-    /// goes through the persistence backend's appender via `open_with`; this direct
-    /// path-based form backs the segment's own file tests.
+    /// Open or create the `data` file at `path` (convenience over [`open_with`](Self::open_with):
+    /// wraps a local `FileAppender`). The store path goes through the persistence backend's
+    /// appender via `open_with`; this direct path-based form backs the segment's own file tests.
     #[cfg(test)]
     pub fn open(
         path: &std::path::Path,
@@ -209,10 +206,9 @@ impl DataSegment {
         Self::open_with(Box::new(appender), dimension, distance)
     }
 
-    /// Open the segment over an already-opened persistence [`Appender`]. Verifies/writes
-    /// the 64-byte header (magic + version + dimension + distance), then reads every
-    /// fully-written row into RAM. Errors on magic mismatch, truncated header, or a
-    /// dimension/distance that differs from the requested values.
+    /// Open the segment over an already-opened [`Appender`]: verify or write the 64-byte header,
+    /// then read every fully-written row into RAM. Errors on magic mismatch, truncated header, or a
+    /// dimension/distance differing from the requested values.
     pub fn open_with(
         mut appender: Box<dyn Appender>,
         dimension: usize,
@@ -268,12 +264,9 @@ impl DataSegment {
             };
             let whole_data_bytes = row_count * row_stride as u64;
 
-            // Read exactly the whole rows. Stream into a single pre-reserved
-            // `Vec<f32>`, converting LE bytes in bounded chunks — this both makes
-            // the load fallible (try_reserve → Err instead of an allocator abort)
-            // and avoids a raw-bytes + decoded-floats double allocation (~2×
-            // transient peak at open time). `read_exact_at` keeps this streaming over
-            // any backend, never materializing the whole object.
+            // Stream whole rows into one pre-reserved `Vec<f32>`, converting LE bytes in bounded
+            // chunks: this makes the load fallible (`try_reserve` rather than an allocator abort) and
+            // avoids the ~2× transient peak of a raw-bytes plus decoded-floats double allocation.
             let total_floats = (row_count as usize) * dimension;
             vectors = if total_floats == 0 {
                 Vec::new()
@@ -323,11 +316,9 @@ impl DataSegment {
         })
     }
 
-    /// Open an **immutable** segment as a read-only memory-map at `path` (SPEC §9 / §14.6
-    /// phase 3). Verifies the 64-byte header against `(dimension, distance)` and computes the
-    /// whole-row count from the mapped length — but never reads the rows into RAM; they are
-    /// served zero-copy from the map by [`row`](Self::row). The caller guarantees the segment
-    /// is immutable (a sealed segment, never the active one), which is what makes the map sound.
+    /// Open an immutable segment as a read-only memory-map (SPEC §9 / §14.6 phase 3): verify the
+    /// header, compute the row count from the mapped length, and never read rows into RAM — they are
+    /// served zero-copy. The caller guarantees immutability, which is what makes the map sound.
     pub fn open_mmap(
         path: &std::path::Path,
         dimension: usize,
@@ -392,10 +383,9 @@ impl DataSegment {
         }
     }
 
-    /// A writable RAM-backed segment over `appender` **without** loading any existing rows —
-    /// valid only as the immediate target of a [`rewrite`](Self::rewrite) (compaction), which
-    /// atomically replaces the whole object. Lets `Segments::rewrite` collapse onto a base
-    /// segment that may currently be memory-mapped, without first paging it into RAM.
+    /// A writable RAM-backed segment over `appender` without loading existing rows — valid only as
+    /// the immediate target of a [`rewrite`](Self::rewrite), which replaces the whole object. Lets
+    /// compaction collapse onto a mapped base segment without paging it into RAM.
     pub(crate) fn rewrite_target(
         appender: Box<dyn Appender>,
         dimension: usize,
@@ -498,10 +488,9 @@ impl DataSegment {
         Ok(row_index)
     }
 
-    /// Roll the segment back to exactly `rows` rows, discarding everything after
-    /// (RAM + the file tail). The batch-rollback primitive: a writer captures
-    /// `row_count()` before a batch and calls this to undo a failed one. `rows`
-    /// must not exceed the current row count.
+    /// Roll the segment back to exactly `rows` rows, discarding everything after (RAM + the file
+    /// tail). The batch-rollback primitive: a writer captures `row_count()` before a batch and
+    /// calls this to undo a failed one. `rows` must not exceed the current row count.
     pub fn truncate_to(&mut self, rows: u64) -> Result<()> {
         let dim = self.dimension;
         let cur_rows = self.row_count();
@@ -537,10 +526,9 @@ impl DataSegment {
         Ok(())
     }
 
-    /// Atomically rewrite the backing segment to contain exactly `rows` (compaction),
-    /// then swap in-RAM state. `rows.len()` must be a multiple of `dimension`. The
-    /// appender's `rewrite` handles the atomic temp + fsync + rename (or, in-memory,
-    /// the buffer swap).
+    /// Atomically rewrite the backing segment to contain exactly `rows` (compaction), then swap
+    /// in-RAM state. `rows.len()` must be a multiple of `dimension`. The appender's `rewrite`
+    /// handles the atomic temp + fsync + rename (or, in-memory, the buffer swap).
     pub fn rewrite(&mut self, rows: &[f32]) -> Result<()> {
         let dim = self.dimension;
         if dim > 0 && !rows.len().is_multiple_of(dim) {
@@ -567,11 +555,9 @@ impl DataSegment {
     }
 }
 
-/// Reinterpret a memory-mapped segment's row bytes as `&[f32]` (zero-copy). On the on-disk
-/// layout this cast always succeeds: `mmap` returns a page-aligned base and the header is a
-/// fixed 64 bytes, so the row region starts 4-byte-aligned, and its length (`rows × dim × 4`)
-/// is a multiple of 4. The cast is **little-endian only** — callers gate the mmap path on a
-/// little-endian target (SPEC §5.1), so `bytemuck`'s byte reinterpret matches the f32 layout.
+/// Reinterpret a mapped segment's row bytes as `&[f32]`, zero-copy. The cast always succeeds on the
+/// on-disk layout: a page-aligned base plus a fixed 64-byte header leaves the row region 4-byte
+/// aligned with a length that is a multiple of 4. Little-endian only, which callers gate on (§5.1).
 fn mmap_rows(map: &MappedSegment, rows: u64, dimension: usize) -> &[f32] {
     let end = HEADER_LEN + rows as usize * dimension * 4;
     bytemuck::cast_slice(&map.bytes()[HEADER_LEN..end])

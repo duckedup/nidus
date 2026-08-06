@@ -166,10 +166,9 @@ pub(super) fn current_cancel() -> Option<crate::Cancel> {
     CANCEL.try_with(Clone::clone).ok()
 }
 
-/// `503` with `Retry-After: 1`. A shed request is **retryable**: nothing was attempted, the
-/// store is untouched, and the same request a moment later will very likely succeed. That
-/// is exactly the contract `503` carries, and it composes with the readiness signal an
-/// orchestrator already reads.
+/// `503` with `Retry-After: 1`. A shed request is **retryable**: nothing was attempted, the store
+/// is untouched, and the same request a moment later will very likely succeed. That is exactly the
+/// contract `503` carries, and it composes with the readiness signal an orchestrator already reads.
 fn overloaded(limit: usize) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,

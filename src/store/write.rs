@@ -1,7 +1,6 @@
-//! Mutations: collection lifecycle, `upsert`/`delete`, `flush`, and `compact`. Every
-//! method here funnels through [`check_writable`](Store::check_writable) and the §6.2
-//! durable write order; `upsert` is all-or-nothing (rolls `data`+`log` back to their
-//! entry marks on any failure). Read/search lives in [`super::read`].
+//! Mutations: collection lifecycle, `upsert`/`delete`, `flush`, `compact`. Everything here
+//! funnels through [`check_writable`](Store::check_writable) and the §6.2 durable write order;
+//! `upsert` is all-or-nothing. Read/search lives in [`super::read`].
 
 use std::collections::BTreeMap;
 
@@ -17,10 +16,9 @@ use crate::model::{Distance, Filter, Op, Record, Value};
 use crate::search::normalize;
 
 impl Store {
-    /// Reject mutations when in ReadOnly mode, and — in cluster mode — renew/fence the writer
-    /// lease before any durable write (SPEC §14.6 phase 5). Every mutating op calls this
-    /// first, so this is the single point where a superseded cluster writer is stopped before
-    /// it can clobber the shared store.
+    /// Reject mutations in ReadOnly mode and, in cluster mode, renew/fence the writer lease
+    /// before any durable write (SPEC §14.6 phase 5). Every mutating op calls this first, so it is
+    /// the single point where a superseded writer is stopped before it can clobber the store.
     fn check_writable(&self) -> Result<()> {
         if self.config.open_mode == OpenMode::ReadOnly {
             bail!("read-only store: mutations are not allowed");
@@ -35,17 +33,9 @@ impl Store {
         if let Some(lease) = &self.lease
             && let Err(e) = lease.renew()
         {
-            // Only a *definitive* loss latches the fence (nidus-lp4.7). Losing the lease is
-            // permanent — this instance can never write again and must be replaced — so
-            // record it rather than letting the fact exist only inside this one error. That is
-            // what lets a readiness probe see a fenced writer and pull it out of rotation
-            // instead of leaving it in the load balancer failing every write (nidus-lp4.1).
-            //
-            // A *transient* backend failure is a different thing entirely and must not latch:
-            // an object store drops the occasional connection, and treating that as "you have
-            // been superseded" would retire a perfectly healthy writer permanently, on a blip,
-            // with no way back but a restart. Fail this write — we could not prove we still
-            // hold the lease, so proceeding would be unsound — but stay in service.
+            // Only a *definitive* loss latches the fence (nidus-lp4.7), so a readiness probe can
+            // see it and pull the instance from rotation (nidus-lp4.1). A transient backend blip
+            // must not: that would retire a healthy writer permanently. Fail the write, stay up.
             if crate::backend::is_lease_lost(&e) {
                 crate::backend::latch_fenced(&self.fenced);
                 crate::diag::diag!(
@@ -68,11 +58,9 @@ impl Store {
         Ok(())
     }
 
-    /// In cluster mode, advance the manifest version and republish it as the universal
-    /// **commit counter** (SPEC §14.6 phase 5): every durable batch bumps it, so a reader
-    /// instance detects this commit with a single manifest read in
-    /// [`refresh`](crate::Nidus::refresh). A no-op outside cluster mode (single-node refresh
-    /// relies on the live log length instead) and for in-memory / read-only stores.
+    /// In cluster mode, advance the manifest version and republish it as the universal commit
+    /// counter (SPEC §14.6 phase 5), so a reader detects the commit with one manifest read. No-op
+    /// outside cluster mode, where refresh uses the live log length instead.
     fn note_cluster_commit(&mut self) -> Result<()> {
         if !self.config.cluster {
             return Ok(());
@@ -130,12 +118,9 @@ impl Store {
         Ok(())
     }
 
-    /// Seal the active segment into an immutable one and publish the new manifest when it
-    /// has grown past [`Config::segment_max_rows`] (SPEC §14.4 — "WAL→segment"). A no-op
-    /// when the threshold is unset (the default — single-segment store) or the active
-    /// segment is still under it. Called *before* a batch appends, so a seal failure leaves
-    /// the store byte-identical (the active segment is still valid and named by the manifest;
-    /// the fresh segment is durable and only becomes live once the manifest commits).
+    /// Seal the active segment and publish the new manifest once it passes
+    /// [`Config::segment_max_rows`] (SPEC §14.4). Called *before* a batch appends, so a seal
+    /// failure leaves the store byte-identical — the fresh segment goes live only on commit.
     fn maybe_seal(&mut self) -> Result<()> {
         let Some(max) = self.config.segment_max_rows else {
             return Ok(());
@@ -216,11 +201,9 @@ impl Store {
         Ok(())
     }
 
-    /// Declare `collection`'s full-text-indexed fields (the per-collection FTS schema),
-    /// then build the field indexes from its existing live docs. Settable any time;
-    /// `create_collection_with_fts` is the up-front path that shares this code so a
-    /// fresh collection indexes incrementally from its first upsert with no build pass.
-    /// Redeclaring discards and rebuilds the affected field indexes.
+    /// Declare `collection`'s full-text-indexed fields, then build the field indexes from its
+    /// live docs. Settable any time; `create_collection_with_fts` shares this code so a fresh
+    /// collection indexes from its first upsert. Redeclaring rebuilds the affected indexes.
     pub fn set_fts_schema(
         &mut self,
         collection: &str,
@@ -277,12 +260,9 @@ impl Store {
         Ok(())
     }
 
-    /// Upsert a batch. **All-or-nothing:** every fallible step (vector append,
-    /// data fsync, log append, log fsync) rolls `data` and `log` back to the marks
-    /// captured at entry on failure, then returns the original error — a failed
-    /// batch (e.g. ENOSPC mid-write) leaves the store byte-identical to its
-    /// pre-call state and never corrupts it. The in-RAM index is mutated only in
-    /// the final, infallible commit phase, after both files are durable.
+    /// Upsert a batch, all-or-nothing: every fallible step rolls `data` and `log` back to their
+    /// entry marks and returns the original error, so a failed batch (ENOSPC mid-write) leaves the
+    /// store byte-identical. The in-RAM index changes only in the final infallible phase.
     pub fn upsert(&mut self, collection: &str, records: &[Record]) -> Result<usize> {
         self.check_writable()?;
 
@@ -322,11 +302,9 @@ impl Store {
         // below, so a seal failure leaves the store unchanged.
         self.maybe_seal()?;
 
-        // Capacity gate: refuse — before any append — a batch that would grow the
-        // vector matrix past the cap. Clean refusal, no rollback, store stays fully
-        // usable for reads/search. (Counts physical rows incl. dead ones; compact()
-        // reclaims headroom.)
-        // Only vector-bearing records grow the matrix; text-only ones cost no rows.
+        // Capacity gate: refuse, before any append, a batch that would grow the matrix past the
+        // cap — clean refusal, no rollback. Counts physical rows including dead ones, so
+        // `compact` reclaims headroom; text-only records cost no rows.
         let vector_count = records.iter().filter(|r| r.vector.is_some()).count() as u64;
         if let Some(cap) = self.config.max_vector_bytes {
             let projected =
@@ -575,10 +553,9 @@ impl Store {
         self.data.sync()?;
         self.log.sync()?;
         crate::metrics::metrics().durability_barriers.inc();
-        // Under OnFlush — or when a group-commit scope left a barrier owed — the per-batch
-        // path deferred the cluster commit-counter bump to here (PerBatch already bumped it
-        // in `maybe_sync`); advance it now that the batch is durable so peers see it. No-op
-        // outside cluster mode.
+        // Under OnFlush — or when a group-commit scope left a barrier owed — the commit-counter
+        // bump was deferred to here (PerBatch already did it in `maybe_sync`). Advance it now the
+        // batch is durable so peers see it.
         if self.config.fsync == Fsync::OnFlush || self.pending_barrier {
             self.note_cluster_commit()?;
         }
@@ -687,10 +664,9 @@ impl Store {
             }
         }
 
-        // 2. Rewrite data and log atomically (delegated to their modules). Compaction
-        //    collapses every segment into one fresh base segment; `rewrite` returns the
-        //    names that are no longer referenced so their objects can be reclaimed, and
-        //    the new manifest is published as the commit point (SPEC §14.2).
+        // 2. Rewrite data and log atomically. Compaction collapses every segment into one fresh
+        //    base; `rewrite` returns the now-unreferenced names so their objects can be reclaimed,
+        //    and the new manifest is the commit point (SPEC §14.2).
         let dropped = self.data.rewrite(&new_rows)?;
         self.log.rewrite(&log_ops)?;
         self.persist_manifest()?;
@@ -723,10 +699,9 @@ impl Store {
         //     failure must not fail the compaction.
         self.rebuild_ann();
 
-        // 5b-ii. Rebuild the per-segment IVF indexes. Compaction collapsed every segment
-        //     into one fresh active segment, so this leaves the store fully exact until it
-        //     seals again (the next over-threshold write re-seals + re-indexes). No-op
-        //     unless per-segment indexing is on.
+        // 5b-ii. Rebuild the per-segment IVF indexes. Compaction left one fresh active segment, so
+        //     the store is fully exact until it seals again and the next over-threshold write
+        //     re-indexes. No-op unless per-segment indexing is on.
         self.build_segment_indexes();
 
         // 5c. Rebuild the FTS index from the live docs (drops tombstones, renumbers

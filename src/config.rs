@@ -68,82 +68,51 @@ pub struct Config {
     /// default) means no bound — the historical behaviour, where a reader serves its
     /// snapshot for as long as it likes.
     pub max_staleness: Option<Duration>,
-    /// Hard ceiling on the vector matrix (`rows * dimension * 4` bytes); `None`
-    /// disables (the default — no behavior change). Enforced *before* allocating:
-    /// `upsert` refuses a batch that would exceed it, and `open` refuses a data
-    /// file already over it. This is the only exhaustion guard that holds under
-    /// memory overcommit, where the kernel SIGKILLs before an allocation fails and
-    /// `try_reserve` never fires. Counts physical rows incl. not-yet-compacted dead
-    /// rows, so `compact` can reclaim headroom.
+    /// Hard ceiling on the vector matrix (`rows * dimension * 4` bytes); `None` disables.
+    /// Enforced *before* allocating, so it is the only exhaustion guard that holds under memory
+    /// overcommit, where the kernel SIGKILLs before `try_reserve` ever fires.
     pub max_vector_bytes: Option<u64>,
-    /// Vector quantization for faster search. `None` disables (the default). When
-    /// enabled, the store maintains an in-memory quantized matrix and uses a two-pass
-    /// search: a cheap first pass selects candidates, then an f32 rerank restores exact
-    /// scores. [`Quantization::int8`] (4× smaller, any metric) or
-    /// [`Quantization::binary`] (32× smaller, Hamming first pass, **cosine only**).
+    /// Vector quantization for faster search; `None` disables. Maintains an in-memory quantized
+    /// matrix and a two-pass search: a cheap first pass selects candidates, an f32 rerank restores
+    /// exact scores. [`Quantization::int8`] (4×, any metric) or [`binary`](Quantization::binary)
+    /// (32×, cosine only).
     pub quantization: Option<Quantization>,
-    /// Approximate-nearest-neighbour index. `None` disables (the default — exact
-    /// brute-force search, unchanged). When set, the store builds an in-RAM ANN index
-    /// ([`crate::AnnConfig::hnsw`] or [`crate::AnnConfig::ivf`]) and `search` walks it
-    /// for an over-fetched candidate set, then applies the scope/filter/`min_score`
-    /// and an exact f32 rerank. Approximate: trades recall for speed past brute-force's
-    /// comfort zone. May be combined with [`Config::quantization`]: the index walk then
-    /// scores quantized codes for cheaper candidate selection and the exact f32 rerank
-    /// restores accuracy (a quantized walk + exact rerank).
+    /// Approximate-nearest-neighbour index; `None` disables, leaving exact brute force. When set,
+    /// `search` walks an in-RAM HNSW or IVF index for an over-fetched candidate set, then applies
+    /// scope/filter/`min_score` and an exact f32 rerank — recall traded for speed. Composes with
+    /// [`Config::quantization`], which makes the walk itself cheaper.
     pub ann: Option<AnnConfig>,
-    /// Worker threads for a single search. Default `1` (single-threaded, no behavior
-    /// change). When `> 1`, a large scan is split across this many `std::thread::scope`
-    /// workers, each with its own bounded heap, merged at the end — both the exact f32
-    /// scan and (when quantization is on) the int8 first pass. The f32 scan is
-    /// bandwidth-bound (sublinear gain); the int8 first pass is compute-bound and scales
-    /// better. Parallelizes *one* query across cores — leave it at `1` when you already
-    /// have query-level concurrency (many readers under `Arc<RwLock<Nidus>>`).
+    /// Worker threads for a single search; default `1`. Above that, a large scan splits across
+    /// scoped workers each with its own bounded heap. The f32 scan is bandwidth-bound (sublinear
+    /// gain), the int8 first pass compute-bound and better-scaling. Leave at `1` when you already
+    /// have query-level concurrency.
     pub query_threads: usize,
-    /// Where the durable bytes live (SPEC §13.2): a [`crate::open_persistence`] location
-    /// — empty (default) or `file://`/bare path → local files under [`path`](Self::path);
-    /// `s3://…` / `gs://…` → a live object-store-backed store (whole-object rewrite on
-    /// flush). Empty defaults to `path`, so existing callers are unchanged.
+    /// Where the durable bytes live (SPEC §13.2): empty or `file://`/bare path → local files under
+    /// [`path`](Self::path); `s3://…`/`gs://…` → a live object-backed store, rewriting whole
+    /// objects on flush. Empty defaults to `path`.
     pub persistence: String,
     /// Roll the active segment into an immutable one once it reaches this many rows
     /// (SPEC §14.2/§14.4 — "WAL→segment"). `None` (the default) never auto-seals, so a
     /// store stays a single segment and behaves exactly as the pre-segment monolith did.
     pub segment_max_rows: Option<u64>,
-    /// Build a per-segment IVF index over each **immutable** segment that holds at least
-    /// this many rows (SPEC §14.3 — "brute-force is the tail, not the engine"). `None`
-    /// (the default) never indexes a segment, so every row is brute-forced — exact, 100%
-    /// recall, the zero-config local default. When set, a sealed segment with `≥ rows`
-    /// vectors carries an IVF index (built once at seal/compaction); the **active**
-    /// segment (the recent WAL tail) and any smaller sealed segment stay exhaustive. So
-    /// "exact vs approximate" becomes a per-segment property that follows size: the fresh
-    /// data is always exact, the cold bulk is indexed. Has no effect without
-    /// [`segment_max_rows`](Self::segment_max_rows) (a store only seals — and thus only
-    /// gets immutable segments to index — when sealing is enabled), and is ignored when a
-    /// global [`ann`](Self::ann) index is configured (that index already covers every row).
-    /// Cannot be combined with [`quantization`](Self::quantization) (rejected at open): a
-    /// per-segment search never consults the quantized matrix, so the two do not compose.
+    /// IVF-index each immutable segment holding at least this many rows (SPEC §14.3); `None`
+    /// brute-forces everything. Fresh data stays exact while the cold bulk is indexed, so
+    /// exact-vs-approximate follows segment size. Needs
+    /// [`segment_max_rows`](Self::segment_max_rows), is ignored under a global
+    /// [`ann`](Self::ann), and is rejected with [`quantization`](Self::quantization).
     pub segment_index_min_rows: Option<u64>,
-    /// Memory-map immutable segments from disk instead of loading them into RAM (SPEC §9 /
-    /// §14.6 phase 3 — the one conscious FFI/mmap opt-in). `false` (the default) holds every
-    /// segment in RAM, exactly as before. When `true`, each **sealed** segment is mapped
-    /// read-only (the OS pages it in on touch), while the **active** segment — which still
-    /// takes appends — stays in RAM; this is what lets a store grow past one node's RAM.
-    /// Effective only for a **local-FS** store with sealed segments: it needs
-    /// [`segment_max_rows`](Self::segment_max_rows) to produce immutable segments, and a
-    /// mappable local file (an object-store / in-memory store silently keeps everything in
-    /// RAM). Search reads map through the same row accessor, so results are identical.
+    /// Memory-map sealed segments instead of loading them into RAM (SPEC §9 / §14.6 phase 3, the
+    /// one conscious mmap opt-in), which is what lets a store outgrow one node's RAM. The active
+    /// segment stays in RAM. Local-FS only, and needs
+    /// [`segment_max_rows`](Self::segment_max_rows); results are identical either way.
     pub mmap: bool,
-    /// Where the in-RAM working set is *shared* (SPEC §13.3): a
-    /// [`crate::open_memory_tier`] location. Empty / `local` / `ram` (default) → the
-    /// process heap only (nothing shared). A `redis://…` (or `valkey://…`, …) URL
-    /// publishes the serialized working set on `flush` and loads it on `open`, so other
-    /// workers skip the log replay + index rebuild. A rebuildable cache — an unreachable
-    /// or evicted tier is never fatal.
+    /// Where the in-RAM working set is shared (SPEC §13.3). Empty/`local`/`ram` → the process heap
+    /// only; a `redis://…` URL publishes the working set on `flush` and loads it on `open`, so other
+    /// workers skip replay and rebuild. A rebuildable cache, never fatal.
     pub memory: String,
-    /// Cooperating instances over one **shared** backend (SPEC §14.6 phase 5): several nidus
-    /// processes open the *same* store — one [`ReadWrite`](OpenMode::ReadWrite) writer that
-    /// holds a heartbeated **lease** and advances the manifest on every commit, and any number
-    /// of [`ReadOnly`](OpenMode::ReadOnly) readers that pick up its writes via
-    /// [`refresh`](crate::Nidus::refresh). Default `false` (single-node).
+    /// Cooperating instances over one shared backend (SPEC §14.6 phase 5): one `ReadWrite` writer
+    /// holding a heartbeated lease and advancing the manifest per commit, plus any number of
+    /// `ReadOnly` readers picking its writes up via `refresh`. Default `false`.
     pub cluster: bool,
 }
 
@@ -291,13 +260,9 @@ impl Config {
     /// store constructor before any IO. (Backend-specific checks, e.g. cluster mode needing a
     /// shared store, live in `Store::open_with`, which has the resolved backend in hand.)
     pub(crate) fn validate(&self) -> Result<()> {
-        // Quantization and per-segment indexing do not yet compose. Once a sealed segment is
-        // IVF-indexed, `search` fans out per-segment (the cold IVF legs plus an exact f32 tail)
-        // and never consults the quantized matrix — so quantization would be built and
-        // maintained at full memory/CPU cost yet have no effect. Reject the combination so the
-        // trade-off is an explicit choice rather than a silent no-op (nidus-tku). Sealing
-        // *without* indexing (`segment_max_rows` alone) keeps quantization fully in effect — the
-        // quantized matrix spans every segment — so that pairing stays allowed.
+        // Quantization and per-segment indexing do not compose: a per-segment fan-out never
+        // consults the quantized matrix, so quantization would cost full memory/CPU for no effect.
+        // Rejected so the trade-off is explicit rather than a silent no-op (nidus-tku).
         if self.quantization.is_some()
             && self.segment_max_rows.is_some()
             && self.segment_index_min_rows.is_some()

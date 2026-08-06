@@ -38,10 +38,9 @@ pub struct Cli {
     command: Command,
 }
 
-/// Store location, shared by every subcommand. For an existing store both the
-/// dimension and distance metric are read from the on-disk header, so `--dim`
-/// and `--distance` are only needed when creating a store (or to override and
-/// double-check an existing one — a mismatch is then a hard error).
+/// Store location, shared by every subcommand. For an existing store the dimension and distance
+/// are read from the on-disk header, so `--dim`/`--distance` are only needed when creating one, or
+/// to double-check an existing one — a mismatch is then a hard error.
 #[derive(Args, Debug, Default)]
 struct StoreArgs {
     /// Store directory (created on first write). Unused — but still required — when
@@ -58,10 +57,9 @@ struct StoreArgs {
     /// Open without taking the writer lock (rejects mutations).
     #[arg(long, env = "NIDUS_READ_ONLY")]
     read_only: bool,
-    /// Opt into an approximate-nearest-neighbour index: `hnsw` or `ivf`. Omit for
-    /// exact brute-force search (the default). Unlike `--dim`/`--distance`, the ANN
-    /// choice is *not* stored in the header — pass it on every open (including
-    /// `serve`) where you want the index built/consulted.
+    /// Opt into an approximate-nearest-neighbour index: `hnsw` or `ivf`. Omit for exact brute-force
+    /// search (the default). Unlike `--dim`/`--distance`, the ANN choice is *not* stored in the
+    /// header — pass it on every open (including `serve`) where you want the index built/consulted.
     #[arg(long, env = "NIDUS_ANN")]
     ann: Option<AnnKindArg>,
     /// HNSW: max neighbours per node above layer 0. Ignored without `--ann hnsw`.
@@ -86,11 +84,9 @@ struct StoreArgs {
     /// Build PRNG seed (deterministic index). Applies to both ANN kinds. Ignored without `--ann`.
     #[arg(long, env = "NIDUS_ANN_SEED")]
     ann_seed: Option<u64>,
-    /// Where the durable bytes live (SPEC §13.2). Omit (or a path / `file://…`) for local
-    /// files under `--dir`; `s3://<bucket>[/<prefix>]` or `gs://<bucket>[/<prefix>]` for a
-    /// live object-store-backed store (whole-object rewrite on flush). With an object
-    /// store pass `--dim` — the remote header is not peeked. Credentials come from the
-    /// standard environment (AWS_*/GOOGLE_APPLICATION_CREDENTIALS).
+    /// Where the durable bytes live (SPEC §13.2). Omit for local files under `--dir`; `s3://…` or
+    /// `gs://…` for a live object-backed store. Pass `--dim` with an object store, since the remote
+    /// header is not peeked; credentials come from the standard environment.
     #[arg(long, env = "NIDUS_PERSISTENCE")]
     persistence: Option<String>,
     /// Share the in-RAM working set across processes (SPEC §13.3): a `redis://…` (or
@@ -144,10 +140,9 @@ struct StoreArgs {
     /// In `--cluster` mode this is also the writer-lease window.
     #[arg(long, value_name = "SECONDS", env = "NIDUS_LOCK_TTL")]
     lock_ttl: Option<u64>,
-    /// Wait for the writer handle instead of exiting when another instance holds it —
-    /// this instance becomes a **standby** and is promoted within roughly `--lock-ttl` of
-    /// the holder dying. Without this, a second writer exits immediately, so a supervisor
-    /// restarts it in a loop and failover takes as long as its backoff.
+    /// Wait for the writer handle instead of exiting when another instance holds it: this becomes a
+    /// standby, promoted within roughly `--lock-ttl` of the holder dying. Without it a second writer
+    /// exits immediately and failover takes as long as the supervisor's backoff.
     #[arg(
         long,
         value_name = "SECONDS",
@@ -167,10 +162,9 @@ struct StoreArgs {
 }
 
 impl StoreArgs {
-    /// Resolve the `(dimension, distance)` to open with. An explicit flag always
-    /// wins (and is then verified against the header on open); otherwise the
-    /// value is read from an existing store's header. When neither is available
-    /// — no store yet and no `--dim` — creation cannot proceed, so we ask for it.
+    /// Resolve the `(dimension, distance)` to open with. An explicit flag wins and is verified
+    /// against the header on open; otherwise the value comes from an existing store's header. With
+    /// neither — no store and no `--dim` — creation cannot proceed.
     fn resolve(&self) -> Result<(usize, Distance)> {
         // The local-file header peek only applies to a local store; an object-store
         // location (`s3://`/`gs://`) has no peekable local `data`, so `--dim` is required.
@@ -283,10 +277,9 @@ impl StoreArgs {
         })
     }
 
-    /// Build the `Option<AnnConfig>` from the `--ann*` flags. `None` (no `--ann`)
-    /// keeps exact brute-force search; otherwise start from the kind's defaults and
-    /// override only the params the caller supplied. Param flags for the *other*
-    /// kind are accepted but inert (matching `AnnConfig`'s own ignore semantics).
+    /// Build the `Option<AnnConfig>` from the `--ann*` flags. No `--ann` keeps exact brute force;
+    /// otherwise start from the kind's defaults and override only what was supplied. Param flags for
+    /// the other kind are accepted but inert, matching `AnnConfig`'s own semantics.
     fn ann_config(&self) -> Option<AnnConfig> {
         let base = match self.ann? {
             AnnKindArg::Hnsw => AnnConfig::hnsw(),
@@ -318,11 +311,9 @@ impl StoreArgs {
     }
 }
 
-/// Embedder / summarizer configuration for the text-native memory routes
-/// (`/remember`, `/recall`) of `nidus serve`. Flattened into the `Serve`
-/// subcommand only when the `memory` feature is compiled in (the `serve`
-/// umbrella). With no `--embed-provider`, the server still starts — it just
-/// serves the raw vector endpoints, and the memory routes answer `400`.
+/// Embedder/summarizer configuration for `nidus serve`'s text-native memory routes, flattened into
+/// the `Serve` subcommand only under the `memory` feature. With no `--embed-provider` the server
+/// still starts, serving the raw vector endpoints while the memory routes answer `400`.
 #[cfg(feature = "memory")]
 #[derive(Args, Debug, Default)]
 struct IngestArgs {
@@ -512,11 +503,9 @@ enum Command {
         /// entirely to the caller (the default).
         #[arg(long, value_name = "SECONDS", env = "NIDUS_REFRESH_INTERVAL")]
         refresh_interval: Option<u64>,
-        /// Refuse to start unless the store is backed by *shared, non-local* backends:
-        /// object-store `--persistence` (`s3://…`/`gs://…`) **and** a Redis-family
-        /// `--memory` tier (`redis://…`). This is the contract the published Docker
-        /// image runs under — a container has no durable local disk, so a local-file or
-        /// process-RAM store would silently lose data on restart.
+        /// Refuse to start unless the store is on shared, non-local backends: an object-store
+        /// `--persistence` *and* a Redis-family `--memory` tier. The contract the published Docker
+        /// image runs under, since a container has no durable disk and would lose data on restart.
         #[arg(long, env = "NIDUS_REQUIRE_REMOTE")]
         require_remote: bool,
         /// Embedder / summarizer flags for the text-native `/remember` + `/recall`

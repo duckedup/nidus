@@ -181,10 +181,9 @@ impl FieldIndex {
     }
 }
 
-/// All FTS state for a store: the per-`(collection, field)` indexes plus the declared
-/// schema (`collection → [(field, language)]`). The schema is the source of truth for
-/// which attrs are full-text indexed; it is persisted via the op-log and replayed on
-/// open.
+/// All FTS state for a store: the per-`(collection, field)` indexes plus the declared schema
+/// (`collection → [(field, language)]`). The schema is the source of truth for which attrs are
+/// full-text indexed; it is persisted via the op-log and replayed on open.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Fts {
     fields: HashMap<(String, String), FieldIndex>,
@@ -262,10 +261,9 @@ impl Fts {
         self.schema.insert(collection.to_string(), fields.to_vec());
     }
 
-    /// Index document `id`'s text into every declared field of `collection`. A field
-    /// with no text (absent / non-string attr) tombstones any prior value for that id,
-    /// so a doc only lives in a field's index while it has text there. No-op if the
-    /// collection has no FTS schema.
+    /// Index document `id`'s text into every declared field of `collection`. A field with no text
+    /// (absent / non-string attr) tombstones any prior value for that id, so a doc only lives in a
+    /// field's index while it has text there. No-op if the collection has no FTS schema.
     pub(crate) fn index_doc(
         &mut self,
         collection: &str,
@@ -318,10 +316,9 @@ impl Fts {
         }
     }
 
-    /// BM25-score already-analyzed `query_terms` against `collection`.`field`, as
-    /// `(id, score)` for live matches. Empty when the field isn't indexed or nothing
-    /// matches. The caller analyzes the query once (per [`field_language`]) and reuses
-    /// the term list across collections.
+    /// BM25-score already-analyzed `query_terms` against `collection`.`field`, as `(id, score)` for
+    /// live matches. Empty when the field isn't indexed or nothing matches. The caller analyzes the
+    /// query once (per [`field_language`]) and reuses the term list across collections.
     pub(crate) fn score(
         &self,
         collection: &str,

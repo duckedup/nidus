@@ -19,10 +19,9 @@ they are the bridge between the source's vocabulary and a searcher's query.\n\
 pub const DEFAULT_INSTRUCTION: &str =
     "Summarize the following text into dense, retrieval-friendly prose:";
 
-/// Assemble the user message from the source `text` and optional caller
-/// `instructions`. When `instructions` is present (and non-blank) it becomes
-/// the lead-in; otherwise [`DEFAULT_INSTRUCTION`] is used. The text follows,
-/// separated by a blank line.
+/// Assemble the user message from the source `text` and optional caller `instructions`. When
+/// `instructions` is present (and non-blank) it becomes the lead-in; otherwise
+/// [`DEFAULT_INSTRUCTION`] is used. The text follows, separated by a blank line.
 pub fn user_message(text: &str, instructions: Option<&str>) -> String {
     let lead = instructions
         .map(str::trim)

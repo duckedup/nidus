@@ -86,18 +86,15 @@ pub enum AnnKind {
     /// Hierarchical Navigable Small World graph. Native incremental insert (matches
     /// nidus's append-only upsert), high recall, no training pass. The default.
     Hnsw,
-    /// Inverted-file index: k-means centroids partition the space into lists; a query
-    /// probes the nearest few lists. Lower edge memory than HNSW, but its centroids
-    /// are fit from the data present at build time, so heavy incremental growth drifts
-    /// until the next [`crate::Nidus::compact`] rebuild.
+    /// Inverted-file index: k-means centroids partition the space into lists and a query probes the
+    /// nearest few. Lower edge memory than HNSW, but centroids are fit at build time, so heavy
+    /// incremental growth drifts until the next [`crate::Nidus::compact`].
     Ivf,
 }
 
-/// Configuration for approximate-nearest-neighbour search. When set on
-/// [`crate::Config::ann`] the store maintains an in-RAM ANN index and `search`
-/// consults it — walking the index for an over-fetched candidate set, then applying
-/// the scope/filter/`min_score` and an exact f32 rerank. Approximate: recall is
-/// traded for speed past brute-force's comfort zone (≫ a few million vectors).
+/// Configuration for approximate-nearest-neighbour search. Set on [`crate::Config::ann`], the store
+/// maintains an in-RAM index and `search` walks it for an over-fetched candidate set, then applies
+/// scope/filter/`min_score` and an exact f32 rerank — recall traded for speed past brute force.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnnConfig {
     /// Which index drives the candidate walk.
@@ -118,10 +115,9 @@ pub struct AnnConfig {
     /// IVF: how many of the nearest lists a query scans. Higher = better recall,
     /// slower queries. Ignored for HNSW.
     pub n_probe: usize,
-    /// Over-fetch multiple: the walk collects `top_k * overscan` candidates before the
-    /// scope/filter/`min_score` post-filter and f32 rerank, so a metadata filter or a
-    /// collection-subset scope still has survivors to rank. Higher = better recall
-    /// under selective filters, slower queries.
+    /// Over-fetch multiple: the walk collects `top_k * overscan` candidates before the post-filter
+    /// and rerank, so a metadata filter or subset scope still has survivors to rank. Higher means
+    /// better recall under selective filters and slower queries.
     pub overscan: usize,
     /// Seed for the index's PRNG (HNSW level assignment, IVF centroid init), so a
     /// build is deterministic and tests are reproducible.
@@ -274,10 +270,9 @@ pub enum Predicate {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Filter(pub Vec<Predicate>);
 
-/// A full-text query: the indexed `field` to search and the raw query `text`. The text
-/// is analyzed (lowercase → tokenize → stopword → stem) with the field's configured
-/// language at query time, exactly as documents were at index time, so a query term
-/// matches a stored term when they share a stem.
+/// A full-text query: the indexed `field` and the raw query `text`. The text is analyzed
+/// (lowercase → tokenize → stopword → stem) with the field's language at query time, exactly as
+/// documents were at index time, so a query term matches a stored term sharing its stem.
 #[derive(Clone, Debug)]
 pub struct FtsQuery {
     /// The full-text-indexed attribute field to search (declared in the FTS schema).
@@ -342,10 +337,9 @@ pub struct Hit {
     pub attrs: BTreeMap<String, Value>,
 }
 
-/// A cheap, allocation-free snapshot of a store's RAM/disk footprint — the
-/// introspection hook a host uses to decide whether it can afford more data before
-/// hitting a memory ceiling. `vector_bytes` is the dominant, predictable cost; the
-/// in-RAM index (ids + attrs) is extra on top and not counted here.
+/// A cheap, allocation-free snapshot of a store's RAM/disk footprint — the hook a host uses to
+/// decide whether it can afford more data before a memory ceiling. `vector_bytes` is the dominant,
+/// predictable cost; the in-RAM index of ids and attrs is extra and not counted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Footprint {
     /// Physical rows in the data matrix (live + not-yet-compacted dead rows).
@@ -426,10 +420,9 @@ pub enum Op {
         collection: String,
         id: String,
     },
-    /// Upsert a **text-only** document — no embedding, so no `row` into the data
-    /// segment. Appended after the original variants so existing logs (which never
-    /// contain it) still decode: bincode tags enum variants by declaration index, so
-    /// new variants must only ever be added at the end.
+    /// Upsert a **text-only** document — no embedding, so no `row` into the data segment. Appended
+    /// after the original variants so existing logs (which never contain it) still decode: bincode
+    /// tags enum variants by declaration index, so new variants must only ever be added at the end.
     UpsertText {
         collection: String,
         id: String,

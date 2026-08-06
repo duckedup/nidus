@@ -354,10 +354,9 @@ impl AnyEmbedder {
     }
 }
 
-/// Delegate a method call to the wrapped adapter. The `not(any(...))` wildcard
-/// arm keeps the match exhaustive (and this method compilable) when the enum
-/// has no variants; it is `unreachable` because `build` can never construct an
-/// uninhabited value.
+/// Delegate a method call to the wrapped adapter. The `not(any(...))` wildcard arm keeps the match
+/// exhaustive (and this method compilable) when the enum has no variants; it is `unreachable`
+/// because `build` can never construct an uninhabited value.
 macro_rules! delegate {
     ($self:ident, $e:ident => $call:expr) => {
         match $self {

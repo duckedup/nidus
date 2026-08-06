@@ -1,8 +1,6 @@
-//! Quantization: the in-RAM int8 / binary state, its build-and-extend maintenance, and
-//! the two-pass quantized search path (a quantized first pass selects candidates, the
-//! exact f32 [`rerank_candidates`](Store::rerank_candidates) orders them). Keeping the
-//! state types and the search that reads their internals in one module means their
-//! fields stay private here. Pure-f32 brute force lives in [`super::read`].
+//! Quantization: the in-RAM int8/binary state, its build-and-extend maintenance, and the two-pass
+//! search (quantized first pass selects, exact f32 rerank orders). State types live beside the
+//! search that reads their internals so their fields stay private. Pure f32 is in [`super::read`].
 
 use anyhow::{Result, bail};
 
@@ -13,11 +11,10 @@ use crate::data::Segments;
 use crate::model::{Distance, Hit, QuantKind, SearchOpts};
 use crate::search::{QuantParams, TopK, pack_signs, pack_signs_into};
 
-/// Build the ANN [`Walk`] for the store's current quantization state (nidus-ndu): a
-/// quantized walk when a populated int8/binary matrix is present — the ANN graph/lists
-/// were built in that same space — else the exact f32 walk. A free function (not a
-/// `&self` method) so callers can construct it from the disjoint `quant`/`data` fields
-/// while holding `&mut self.ann` for build/insert.
+/// Build the ANN [`Walk`] for the current quantization state (nidus-ndu): a quantized walk when a
+/// populated matrix is present, since the graph was built in that space, else the exact f32 walk. A
+/// free function so callers can build it from the disjoint `quant`/`data` fields while holding
+/// `&mut self.ann`.
 pub(super) fn ann_walk_for<'a>(
     quant: Option<&'a Quant>,
     data: &'a Segments,
@@ -139,12 +136,10 @@ impl Store {
         }
     }
 
-    /// Incrementally extend the quantized matrix after `upsert` appended rows
-    /// `[prev_rows, row_count())` — O(batch), not O(N). int8 quantizes the new rows
-    /// against the existing scale, falling back to a full [`rebuild_quant`] when there
-    /// is no scale yet or the row count has grown past [`REFIT_GROWTH`]× the fit set (so
-    /// a drifting distribution can't keep saturating a stale scale). Binary is scale-free
-    /// — it just packs the new rows' sign bits, never refits.
+    /// Extend the quantized matrix after `upsert` appended rows — O(batch), not O(N). int8 reuses
+    /// the existing scale, falling back to a full rebuild with no scale yet or past
+    /// [`REFIT_GROWTH`]× the fit set, so a drifting distribution cannot saturate a stale scale.
+    /// Binary is scale-free and never refits.
     pub(super) fn extend_quant(&mut self, prev_rows: u64) {
         let total = self.data.row_count();
         let dim = self.data.dimension();
@@ -158,10 +153,9 @@ impl Store {
             self.rebuild_quant();
             return;
         }
-        // Copy just the batch's new rows out of `data` (O(batch)) before touching the
-        // quant state, so this stays incremental even on a multi-segment store (where the
-        // new rows may span the active segment) and avoids borrowing `data` and `quant` at
-        // once.
+        // Copy just the batch's new rows out of `data` (O(batch)) before touching the quant state,
+        // so this stays incremental even on a multi-segment store (where the new rows may span the
+        // active segment) and avoids borrowing `data` and `quant` at once.
         let new_count = (total - prev_rows) as usize;
         let mut batch: Vec<f32> = Vec::with_capacity(new_count * dim);
         for row in prev_rows..total {
@@ -196,10 +190,9 @@ impl Store {
         self.config.quantization.map_or(1, |q| q.rescore)
     }
 
-    /// If a populated quantized matrix is present, run the matching two-pass search and
-    /// return its hits; `None` means quantization is off (or not yet built), so the
-    /// caller falls back to the exact f32 scan in [`super::read`]. This is the seam that
-    /// keeps every read of the [`Quant`] state's private fields inside this module.
+    /// Run the matching two-pass search when a populated quantized matrix is present; `None` means
+    /// quantization is off or unbuilt, so the caller falls back to the exact f32 scan. The seam that
+    /// keeps every read of [`Quant`]'s private fields inside this module.
     pub(super) fn search_quantized<'a>(
         &self,
         q: &[f32],
@@ -222,11 +215,9 @@ impl Store {
         }
     }
 
-    /// Two-pass int8 search: int8 first-pass selects candidates, f32 reranks. The int8
-    /// first pass is the lever that scales with threads — int8 moves 4× fewer bytes than
-    /// f32, so it is compute- not bandwidth-bound — so it splits across `workers` (when
-    /// engaged), while the f32 rerank stays serial (only `top_k × rescore` rows, too few
-    /// to amortize a second fan-out).
+    /// Two-pass int8 search: int8 selects candidates, f32 reranks. The first pass is what scales
+    /// with threads — moving 4× fewer bytes makes it compute- not bandwidth-bound — so it splits
+    /// across `workers`, while the rerank stays serial at too few rows to amortize a second fan-out.
     pub(super) fn search_int8<'a>(
         &self,
         q: &[f32],
@@ -245,10 +236,9 @@ impl Store {
         let mut q_i8 = vec![0i8; dim];
         s.params.quantize(q, &mut q_i8);
 
-        // First pass: int8 scoring to select overscan candidates. The int8 score is
-        // monotonic with the f32 score (shared symmetric scale), so it picks the right
-        // candidate set; exact scores come from the f32 rerank below. Parallel when
-        // engaged (the int8 sweep is the part that scales with threads), else serial.
+        // First pass: int8 scoring to select overscan candidates. The int8 score is monotonic with
+        // f32 (shared symmetric scale), so it picks the right set; exact scores come from the rerank
+        // below. Parallel when engaged, else serial.
         let is_euclidean = self.config.distance == Distance::Euclidean;
         let topk_q = if workers > 1 {
             parallel_topk(scan, workers, overscan, |chunk| {

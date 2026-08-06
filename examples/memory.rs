@@ -153,10 +153,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ── 6. recall() — relevant text out ──────────────────────────────────────
-    // The query is embedded (via the query side of the embedder) and matched by
-    // cosine similarity. `RecallOpts` maps onto the store's SearchOpts — top_k,
-    // a score floor, and an optional metadata filter.
+    // ── 6. recall() — relevant text out ────────────────────────────────────── The query is
+    // embedded (via the query side of the embedder) and matched by cosine similarity. `RecallOpts`
+    // maps onto the store's SearchOpts — top_k, a score floor, and an optional metadata filter.
     let opts = RecallOpts {
         top_k: 3,
         min_score: 0.0,

@@ -144,10 +144,9 @@ fn oversize_body_is_rejected_with_413() {
     assert_eq!(status, 200, "server still usable: {body}");
 }
 
-/// Concurrent clients against one server. The handlers take a write/read lock on a
-/// shared `Nidus` from within `spawn_blocking`, so a lock-ordering mistake would
-/// deadlock here — and `oneshot()` tests, being sequential and single-task, could not
-/// surface it.
+/// Concurrent clients against one server. The handlers take a write/read lock on a shared `Nidus`
+/// from within `spawn_blocking`, so a lock-ordering mistake would deadlock here — and `oneshot()`
+/// tests, being sequential and single-task, could not surface it.
 #[test]
 fn concurrent_clients_are_served() {
     let dir = tempfile::tempdir().unwrap();

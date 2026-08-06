@@ -150,10 +150,9 @@ impl Memory {
 // ── Internals (generic over `impl Embedder` so unit tests can drive them with a
 // fake embedder, and so the borrow of `self.db` / `self.embedder` splits cleanly) ──
 
-/// Ensure `collection` exists and its embedding space matches `embedder`,
-/// pinning the identity + dimension on first use. Errors on a dimension mismatch
-/// with the store, or on an embedder identity that differs from what the
-/// collection was first written with.
+/// Ensure `collection` exists and its embedding space matches `embedder`, pinning the identity +
+/// dimension on first use. Errors on a dimension mismatch with the store, or on an embedder
+/// identity that differs from what the collection was first written with.
 pub(crate) fn ensure_collection_and_pin<E: Embedder>(
     db: &mut Nidus,
     embedder: &E,

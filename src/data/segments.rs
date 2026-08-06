@@ -51,10 +51,9 @@ pub struct Segments {
 }
 
 impl Segments {
-    /// Open every segment named by `manifest` over `persistence`, assembled into one global
-    /// row space. `cap` (the store's `max_vector_bytes`) is enforced **before** loading any
-    /// segment into RAM — summing each segment object's vector bytes and refusing past the
-    /// cap (§6.6 "refuse before allocating", generalized across segments).
+    /// Open every segment named by `manifest`, assembled into one global row space. `cap` is
+    /// enforced *before* any segment loads into RAM, summing each object's vector bytes and refusing
+    /// past it — §6.6's "refuse before allocating", generalized across segments.
     pub fn open(
         persistence: Arc<dyn Persistence>,
         manifest: &Manifest,
@@ -128,11 +127,9 @@ impl Segments {
         })
     }
 
-    /// Re-read **only** the active (last) segment object — picking up rows a separate writer
-    /// appended — leaving every immutable segment untouched (they never change). The result is
-    /// *staged*, not installed: the caller finishes its remaining fallible work and then calls
-    /// [`install_active`](Self::install_active), so a [`refresh`](crate::Nidus::refresh) that
-    /// races a concurrent writer stays atomic (all IO into locals, one infallible swap).
+    /// Re-read only the active segment, picking up a separate writer's appends and leaving the
+    /// immutable ones untouched. *Staged*, not installed: the caller finishes its fallible work then
+    /// calls [`install_active`](Self::install_active), so a racing refresh stays atomic.
     pub fn reopen_active(&self, cap: Option<u64>) -> Result<PendingActive> {
         let p = self
             .persistence
@@ -157,21 +154,19 @@ impl Segments {
         Ok(PendingActive { data, row_count })
     }
 
-    /// Install a [`reopen_active`](Self::reopen_active)-staged active segment and adopt the new
-    /// manifest `version` — the infallible swap that completes an incremental refresh. Immutable
-    /// segments and bases are unchanged (only the active segment grows); adopting `version` keeps
-    /// the next [`refresh`](crate::Nidus::refresh) currency check accurate.
+    /// Install a staged active segment and adopt the new manifest `version` — the infallible swap
+    /// completing an incremental refresh. Immutable segments and bases are unchanged; adopting
+    /// `version` keeps the next currency check accurate.
     pub fn install_active(&mut self, pending: PendingActive, version: u64) {
         let last = self.segs.len() - 1;
         self.segs[last].data = pending.data;
         self.version = version;
     }
 
-    /// Whether `names` is exactly this set's current segment list (same names, same order) — the
-    /// **structural** change signal for [`refresh`](crate::Nidus::refresh): an unchanged list
-    /// means only the active segment grew (plain appends → incremental path); a changed list
-    /// means a seal/compaction restructured the set (→ full re-open). Used instead of the manifest
-    /// `version`, which in cluster mode advances on *every* commit (it is the commit counter).
+    /// Whether `names` matches this set's segment list exactly — the structural change signal for
+    /// refresh: unchanged means only the active segment grew (incremental path), changed means a
+    /// seal/compaction restructured it. Used instead of the version, which in cluster mode advances
+    /// on every commit.
     pub fn segment_names_match(&self, names: &[String]) -> bool {
         self.segs.len() == names.len() && self.segs.iter().zip(names).all(|(s, n)| &s.name == n)
     }
@@ -208,18 +203,16 @@ impl Segments {
         self.segs.last().unwrap().data.row_count()
     }
 
-    /// The manifest version this segment set was loaded/sealed at — the Phase-4
-    /// reader-refresh signal (SPEC §14.6): a [`ReadOnly`](crate::OpenMode::ReadOnly) reader
-    /// adopts a newer manifest when the on-disk version exceeds this. Bumped on every
-    /// seal/rewrite (the structural commits); plain appends leave it unchanged.
+    /// The manifest version this set was loaded/sealed at — the Phase-4 reader-refresh signal (SPEC
+    /// §14.6): a `ReadOnly` reader adopts a newer manifest when the on-disk version exceeds it.
+    /// Bumped on every seal/rewrite; plain appends leave it unchanged.
     pub fn version(&self) -> u64 {
         self.version
     }
 
-    /// Advance the manifest version by one and return it — the cluster **commit counter**
-    /// (SPEC §14.6 phase 5). In cluster mode the writer calls this on every durable batch so
-    /// the published manifest version strictly increases on *any* change (not just seals), and
-    /// a reader's [`refresh`](crate::Nidus::refresh) detects every commit with one manifest read.
+    /// Advance the manifest version and return it — the cluster commit counter (SPEC §14.6 phase 5).
+    /// Called on every durable batch, so the published version strictly increases on any change and
+    /// a reader detects every commit with one manifest read.
     pub fn bump_version(&mut self) -> u64 {
         self.version += 1;
         self.version
@@ -298,12 +291,9 @@ impl Segments {
         Cow::Owned(all)
     }
 
-    /// Seal the active segment into an immutable one and start a fresh active segment,
-    /// returning `true` when a seal happened. A no-op (returns `false`) when the active
-    /// segment is empty — sealing nothing would leave an empty segment that breaks the
-    /// strictly-increasing `base` invariant. No data is moved; the previously-active segment
-    /// is simply never appended to again. The caller publishes the new manifest (the commit
-    /// point) afterward.
+    /// Seal the active segment and start a fresh one, returning whether a seal happened. A no-op on
+    /// an empty active segment, which would otherwise break the strictly-increasing `base` invariant.
+    /// No data moves; the caller publishes the new manifest (the commit point) afterward.
     pub fn seal(&mut self) -> Result<bool> {
         if self.active_rows() == 0 {
             return Ok(false);
@@ -329,10 +319,9 @@ impl Segments {
         Ok(true)
     }
 
-    /// Collapse every segment into a single fresh active [`BASE_SEGMENT`] holding exactly
-    /// `rows` (the compaction path). Returns the names of the segments that are no longer
-    /// referenced (the caller deletes those objects). `rows.len()` must be a multiple of
-    /// `dimension`.
+    /// Collapse every segment into a single fresh active [`BASE_SEGMENT`] holding exactly `rows`
+    /// (the compaction path). Returns the names of the segments that are no longer referenced (the
+    /// caller deletes those objects). `rows.len()` must be a multiple of `dimension`.
     pub fn rewrite(&mut self, rows: &[f32]) -> Result<Vec<String>> {
         // The base segment (always `BASE_SEGMENT`, by construction) is rewritten in place;
         // the rest become unreferenced.

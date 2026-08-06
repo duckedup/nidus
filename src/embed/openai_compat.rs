@@ -25,10 +25,9 @@ impl OpenAiCompatEmbedder {
                 "openai-compat requires an explicit model".into(),
             ));
         }
-        // Accept both the host root ("https://api.together.xyz") and the
-        // /v1-suffixed form the OpenAI SDK / gateway docs publish
-        // ("https://api.together.xyz/v1") — we append "/v1/embeddings"
-        // ourselves, so strip a trailing "/v1" to avoid "/v1/v1/embeddings".
+        // Accept both the host root ("https://api.together.xyz") and the /v1-suffixed form the
+        // OpenAI SDK / gateway docs publish ("https://api.together.xyz/v1") — we append
+        // "/v1/embeddings" ourselves, so strip a trailing "/v1" to avoid "/v1/v1/embeddings".
         let base_url = resolve_base(Some(base), "");
         let base_url = base_url
             .strip_suffix("/v1")

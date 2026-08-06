@@ -145,10 +145,9 @@ pub struct OpLog {
 }
 
 impl OpLog {
-    /// Open or create the `log` file at `path` (convenience over
-    /// [`open_with`](Self::open_with): wraps a local `FileAppender`). The store path
-    /// goes through the persistence backend's appender via `open_with`; this direct
-    /// path-based form backs the log's own file tests.
+    /// Open or create the `log` file at `path` (convenience over [`open_with`](Self::open_with):
+    /// wraps a local `FileAppender`). The store path goes through the persistence backend's
+    /// appender via `open_with`; this direct path-based form backs the log's own file tests.
     #[cfg(test)]
     pub fn open(path: &std::path::Path) -> Result<(OpLog, Vec<Op>)> {
         let appender = crate::backend::FileAppender::open(path)

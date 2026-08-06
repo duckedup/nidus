@@ -196,10 +196,9 @@ impl Nidus {
         self.store.create_collection_with_fts(name, fields)
     }
 
-    /// Declare (or redeclare) which attribute fields of `collection` are full-text
-    /// indexed for BM25 search, each with its analyzer [`Language`]. May be called
-    /// before or after upserting — declaring it on a collection that already holds docs
-    /// builds the index from them once. Redeclaring rebuilds the affected fields.
+    /// Declare which attribute fields of `collection` are full-text indexed for BM25, each with its
+    /// analyzer [`Language`]. Callable before or after upserting — on a collection that already holds
+    /// docs it builds the index once. Redeclaring rebuilds the affected fields.
     pub fn set_fts_schema(
         &mut self,
         collection: &str,
@@ -285,11 +284,9 @@ impl Nidus {
         self.store.search(&refs, query, opts)
     }
 
-    /// Full-text (BM25) search over a [`Scope`] for `query` — the indexed field plus
-    /// query text — merged into one ranking. Requires the field to be declared in the
-    /// collection's FTS schema (see [`set_fts_schema`](Self::set_fts_schema)). Reuses
-    /// [`SearchOpts`] (`top_k`, `filter`); here `min_score` is a raw BM25 floor rather
-    /// than a cosine one. Text-only and vector-bearing docs are both eligible.
+    /// Full-text (BM25) search over a [`Scope`], merged into one ranking. Requires the field to be
+    /// declared in the collection's FTS schema. Reuses [`SearchOpts`], but `min_score` here is a raw
+    /// BM25 floor rather than a cosine one; text-only and vector-bearing docs are both eligible.
     pub fn text_search<'a>(
         &self,
         scope: impl Into<Scope<'a>>,
@@ -301,10 +298,9 @@ impl Nidus {
         self.store.text_search(&refs, query, opts)
     }
 
-    /// Hybrid search over a [`Scope`]: fuse a vector query and a BM25 text query into a
-    /// single ranking with Reciprocal Rank Fusion (see [`HybridOpts`]). A doc that
-    /// surfaces in only one leg (e.g. a text-only doc, or one whose vector matches but
-    /// whose text does not) is still ranked by that leg.
+    /// Hybrid search over a [`Scope`]: fuse a vector query and a BM25 text query into one ranking
+    /// with Reciprocal Rank Fusion (see [`HybridOpts`]). A doc surfacing in only one leg is still
+    /// ranked by that leg.
     pub fn hybrid_search<'a>(
         &self,
         scope: impl Into<Scope<'a>>,
@@ -346,22 +342,17 @@ impl Nidus {
         self.store.compact()
     }
 
-    /// Adopt a separate writer's newer committed state into a lock-free
-    /// [`ReadOnly`](OpenMode::ReadOnly) handle without reopening the store. A `ReadOnly`
-    /// handle is a consistent snapshot taken when it opened; `refresh` advances it to the
-    /// store's current committed state — picking up the writer's appends, seals, deletes,
-    /// and compactions — at a single consistent point (never a torn mix).
+    /// Adopt a separate writer's newer committed state into a lock-free `ReadOnly` handle without
+    /// reopening. Such a handle is a snapshot taken at open; `refresh` advances it to the current
+    /// committed state at a single consistent point, never a torn mix.
     pub fn refresh(&mut self) -> Result<bool> {
         self.store.refresh()
     }
 
-    /// Write the approximate-nearest-neighbour index ([`Config::ann`]) to its on-disk
-    /// cache so the next [`open`](Self::open) loads it instead of rebuilding the graph
-    /// (the expensive part of opening an ANN store). This is an explicit, out-of-band
-    /// operation — it is never triggered by `upsert`/`flush`, so the write path stays
-    /// fast — so call it before shutting down a long-lived handle (e.g. a search
-    /// server). A no-op when ANN is disabled, the store is in-memory or read-only, or
-    /// nothing changed since the last persist. `compact()` refreshes the cache too.
+    /// Write the ANN index ([`Config::ann`]) to its on-disk cache so the next [`open`](Self::open)
+    /// loads it instead of rebuilding the graph. Explicit and out-of-band — never triggered by
+    /// `upsert`/`flush` — so call it before shutting down a long-lived handle. `compact()` also
+    /// refreshes the cache.
     pub fn persist_index(&mut self) -> Result<()> {
         self.store.persist_index()
     }

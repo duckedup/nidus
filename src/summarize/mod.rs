@@ -319,10 +319,9 @@ async fn send_checked(
 
 // ── Shared test server ───────────────────────────────────────────────────────
 
-/// A one-shot local HTTP server used by the provider wire tests: it accepts a
-/// single connection, captures the raw request, and replies with a canned
-/// status + JSON body. Lives here (rather than duplicated per adapter) so both
-/// the Anthropic and OpenAI tests share one implementation.
+/// A one-shot local HTTP server used by the provider wire tests: it accepts a single connection,
+/// captures the raw request, and replies with a canned status + JSON body. Lives here (rather than
+/// duplicated per adapter) so both the Anthropic and OpenAI tests share one implementation.
 #[cfg(all(
     test,
     any(feature = "summarize-anthropic", feature = "summarize-openai")

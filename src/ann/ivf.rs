@@ -195,10 +195,9 @@ impl IvfIndex {
         let probe = self.n_probe.min(centroid_scores.len());
         centroid_scores.select_nth_unstable_by(probe - 1, |a, b| b.0.total_cmp(&a.0));
 
-        // Score every row in the probed lists via the walk (quantized codes when the
-        // walk carries a codebook, else exact f32); keep the best `n_candidates`. The
-        // store reranks these rows exactly afterward, so a quantized score is only a
-        // selection proxy here.
+        // Score every row in the probed lists via the walk (quantized codes when the walk carries a
+        // codebook, else exact f32); keep the best `n_candidates`. The store reranks these rows
+        // exactly afterward, so a quantized score is only a selection proxy here.
         let qs = walk.query_scorer(query);
         let mut scored: Vec<(u64, f32)> = Vec::new();
         for &(_, c) in &centroid_scores[..probe] {
