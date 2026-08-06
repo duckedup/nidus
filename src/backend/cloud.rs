@@ -1,10 +1,4 @@
 //! Shared blocking HTTP for the object-store backends (S3/GCS).
-//!
-//! A thin [`ureq`] wrapper that returns `(status, body)` and **never** treats a non-2xx
-//! response as an error — the callers map status themselves (404 → `None`, etc.). TLS
-//! is ureq's default rustls + `ring`, self-contained via `webpki-roots` (no system cert
-//! store, no OpenSSL). The sans-IO clients (`rusty-s3`/`tame-gcs`) build and sign the
-//! requests; this only executes them.
 
 use anyhow::{Context, Result, anyhow};
 use http::{HeaderMap, Response};
@@ -16,20 +10,6 @@ pub(crate) struct Http {
 }
 
 /// Whether a transport failure is worth one immediate retry.
-///
-/// The case this exists for is a **stale pooled connection**: the agent keeps connections
-/// alive, the server (or an intervening proxy) closes one after its own idle timeout, and
-/// the next request reuses the dead socket and fails with "Peer disconnected" / a reset
-/// before any bytes are served. There is nothing wrong with the request — a fresh
-/// connection succeeds — so failing the caller's operation on it is a self-inflicted error.
-///
-/// Observed for real: a `nidus serve` instance exited during a cluster e2e run because a
-/// lease claim hit exactly this, which is why it is handled here rather than left to every
-/// call site.
-///
-/// Only *connection-level* failures qualify. An HTTP status is never retried here (the
-/// client is built with `http_status_as_error(false)`, so statuses are not errors at all),
-/// and a timeout is not retried either — that would double the caller's worst case.
 fn worth_retrying(e: &ureq::Error) -> bool {
     match e {
         ureq::Error::Io(io) => matches!(

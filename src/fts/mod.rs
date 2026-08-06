@@ -1,16 +1,4 @@
 //! Opt-in BM25 full-text search index (the FTS leg of SPEC.md §9).
-//!
-//! A *derived secondary index*, like [`crate::ann`]: built from the documents'
-//! text-bearing attrs, rebuildable from the op-log, and cached on disk only as an
-//! optimization. Each full-text-indexed `(collection, field)` owns one [`FieldIndex`]
-//! — an inverted index (term → postings) plus the per-doc lengths BM25 needs. A query
-//! is [analyzed](analyzer) into terms, scored against a field, and ranked by BM25.
-//!
-//! Identity is an FTS-local **docnum** (a dense `[0, n)` id), not the data-matrix row:
-//! FTS indexes only a subset of docs per field and text-only docs have no row at all.
-//! A candidate docnum is *hint-verified* against the live `id ↔ docnum` maps before it
-//! scores, so deletes/overwrites need no posting rewrite (they leave a tombstone the
-//! lookup skips). Pure safe Rust, Miri-clean, zero FFI.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;

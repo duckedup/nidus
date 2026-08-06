@@ -175,16 +175,6 @@ mod tests {
 
         // Set its mtime to the distant past by using a zero ttl — any file
         // created before "now" will appear stale with ttl=0.
-        // With ttl of Duration::ZERO, is_stale checks age > 0, which will be
-        // true for any file created even 1ns ago. We ensure staleness by
-        // sleeping a tiny bit or simply using a small ttl.
-        //
-        // Actually, with ttl=0 and a freshly written file, the mtime is "now"
-        // and age ≈ 0, so age > 0 may or may not be true depending on clock
-        // resolution. To guarantee staleness, modify the file mtime explicitly.
-        //
-        // Use filetime to backdate the mtime. But we can't add deps — instead
-        // we create the file and then sleep 10ms and use a ttl=1ms.
         std::thread::sleep(Duration::from_millis(20));
 
         // Acquire with a ttl of 1ms — the 20ms-old file is stale.

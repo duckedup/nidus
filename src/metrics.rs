@@ -1,27 +1,4 @@
 //! Process-wide counters, exported as Prometheus text by `GET /metrics` (nidus-abx.4).
-//!
-//! `GET /cluster` and `GET /stats` report **state** — role, lease owner, commit counter,
-//! footprint. Neither reports what the instance has been *doing*, which is the other half
-//! of an incident: whether the object store has been retrying all morning, whether queries
-//! are hitting the ANN index or falling through to the brute-force tail, how many lease
-//! renewals failed transiently before one failed definitively.
-//!
-//! **No dependency.** The `prometheus` crate (or worse, `opentelemetry`) would blow the
-//! build-and-ship budget CLAUDE.md protects, for a text format that is a handful of lines
-//! to render — the same trade that keeps `crc.rs` hand-rolled. Rendering lives in
-//! `server/metrics.rs`, behind the `cli` feature; this module is just the numbers, and is
-//! compiled into the plain library because the library is what increments them.
-//!
-//! **No locks, ever.** Recording is a single `fetch_add(Relaxed)`. The store is already
-//! serialised behind one `RwLock`, and an observability layer that took a lock of its own
-//! anywhere near it would become the contention point it exists to diagnose. `Relaxed` is
-//! sufficient and deliberate: these are counters read by a scraper, not synchronisation —
-//! nothing is ordered against them, and a scrape that catches two counters a few
-//! nanoseconds apart is not a bug in a monotonic-counter model.
-//!
-//! Counters are process-wide statics rather than per-`Nidus` fields. That is the right
-//! scope for a scrape endpoint (a process serves one store) and it means an increment deep
-//! in the backend needs no handle threaded down to it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -76,10 +53,6 @@ impl Gauge {
 }
 
 /// Every counter the library maintains, as one `static`.
-///
-/// Grouped in a struct rather than scattered as loose statics so the scrape renderer can
-/// walk them in one place and a new counter cannot be added without a name landing beside
-/// it. Field docs are the metric HELP text — keep them one line and factual.
 #[derive(Debug)]
 pub struct Metrics {
     // ── Writer lease (cluster mode) ──────────────────────────────────────────
@@ -100,11 +73,6 @@ pub struct Metrics {
     /// Mutating batches that needed a durable barrier (upserts, deletes, …).
     pub write_batches: Counter,
     /// Durable barriers actually issued — one fsync of `data` then `log`.
-    ///
-    /// The pair above is the whole point: without group commit these two counters move
-    /// together, and every batch pays its own disk barrier. With it, `write_batches`
-    /// outruns `durability_barriers` by the average group size, which is exactly the
-    /// coalescing factor and the only honest way to see it from outside.
     pub durability_barriers: Counter,
 
     // ── Object store / memory tier ───────────────────────────────────────────
@@ -155,12 +123,6 @@ impl Metrics {
     }
 
     /// `(metric name, HELP text, value)` for every counter, in scrape order.
-    ///
-    /// The struct is **destructured** rather than field-accessed, deliberately: adding a
-    /// counter to `Metrics` without naming it here is then a compile error, instead of a
-    /// counter that is faithfully maintained and never exported — a hole nobody notices
-    /// until the one incident where they needed it. Names carry the `nidus_` prefix and
-    /// the `_total` suffix Prometheus expects of a counter.
     pub fn counters(&self) -> Vec<(&'static str, &'static str, u64)> {
         let Metrics {
             lease_renew_attempts,
@@ -275,11 +237,6 @@ impl Metrics {
 static METRICS: Metrics = Metrics::new();
 
 /// Access the process-wide counters.
-///
-/// Public so an embedding application can scrape the same numbers without running the
-/// server — the library is the thing being observed, so hiding them behind the `cli`
-/// feature would put them out of reach of exactly the in-process caller who might want a
-/// dashboard.
 pub fn metrics() -> &'static Metrics {
     &METRICS
 }

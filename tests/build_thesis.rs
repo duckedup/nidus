@@ -1,33 +1,4 @@
 //! Build-thesis guard for the AI ingest layer (epic nidus-54l).
-//!
-//! nidus's identity is a **pure-Rust, dependency-lean, seconds-fast** embeddable
-//! vector store. The off-by-default AI ingest layer (`embed`/`summarize`/`memory`
-//! and their per-provider features) adds an async network edge — `reqwest` +
-//! `tokio` + `hyper` — exactly like the `cli`/`serve` feature adds the tokio/axum
-//! stack. That edge must never leak into the DEFAULT build: `cargo add nidus` has
-//! to stay the pure sync store with none of those crates compiled.
-//!
-//! This file enforces that thesis at COMPILE TIME via `cfg`. It has two halves,
-//! selected by the active feature set, so it stays green on both CI lanes:
-//!
-//!   * DEFAULT lane (`cargo test`) — none of the ingest features are on, so the
-//!     test binary links with NO reqwest/tokio/hyper. The mere fact that this
-//!     integration crate compiles and runs under plain `cargo test` (reqwest is
-//!     not a dev-dependency, and nothing here can reach it) is itself part of the
-//!     proof; the `default_build_is_pure` assertion pins the intent.
-//!
-//!   * INGEST lane (`cargo test --features memory,embed-all,summarize-all`, etc.)
-//!     — the feature-implication graph is asserted: every provider feature pulls
-//!     its base (`embed`/`summarize`), and each base is what gates `reqwest` +
-//!     `tokio`. This keeps a provider feature from ever being wired up WITHOUT the
-//!     async edge it needs (or, conversely, a stray edge with no provider).
-//!
-//! The AUTHORITATIVE, empirical dep-absence check — `cargo tree -e no-dev` must
-//! show none of reqwest/tokio/hyper on the default build, and rustls/ring (never
-//! aws-lc/OpenSSL) on the ingest build — lives in CI (`.github/workflows/ci.yml`,
-//! the `build-thesis` step) and the `just ci-ingest` recipe. Doing the tree grep
-//! there rather than shelling out from a test keeps this crate a fast, offline,
-//! pure compile-time invariant. This whole layer is miri-skipped (async edge).
 
 // Every assertion in this file is a DELIBERATE compile-time `cfg!` guard — its
 // operand is a constant on purpose (that is the whole point: pin the feature

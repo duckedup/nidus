@@ -1,7 +1,4 @@
 //! Mistral embedding adapter (`mistral-embed` default).
-//!
-//! OpenAI-shaped `/v1/embeddings`; reuses [`super::openai_shaped`]. Fixed
-//! 1024-dimension output.
 
 use super::{EmbedConfig, EmbedError, Embedder, openai_shaped, resolve_base};
 

@@ -1,18 +1,5 @@
 //! Hierarchical Navigable Small World graph (Malkov & Yashunin, 2016), the default
 //! ANN index. Pure safe Rust, no dependencies.
-//!
-//! Internal node ids are dense (`0..nodes`), assigned in build/insert order; `rows`
-//! maps each node id back to its physical `data` row. Adjacency is `links[node][level]`
-//! of neighbour node ids, with `links[node].len()` being that node's top level + 1.
-//! Higher layers are progressively sparser; layer 0 holds every node. A query greedily
-//! descends from the entry point through the upper layers, then runs an `ef`-width beam
-//! search at layer 0; the best candidates (mapped back to rows) are returned for the
-//! store to filter and rerank.
-//!
-//! Everything scores through the [`Walk`] where **higher = nearer**, so the beam is a
-//! "keep the highest scores" collector and "closer" means "higher score". The walk is
-//! exact f32 by default, or quantized int8/binary codes when the store combines ANN with
-//! quantization (nidus-ndu) — build and search then run in that same quantized space.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;

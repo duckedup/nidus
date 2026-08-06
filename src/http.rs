@@ -1,16 +1,4 @@
 //! Generic HTTP retry infrastructure shared by every reqwest-based adapter.
-//!
-//! Both the embedding adapters (`embed/`) and the summarization adapters
-//! (`summarize/`) talk to remote HTTP APIs with the same shape of resilience:
-//! a bounded number of retries with exponential backoff on transient send
-//! failures and retryable status codes. This module owns that loop so the
-//! adapters don't each reimplement it (the dedupe rule — one source, two
-//! callers).
-//!
-//! [`send_with_retry`] returns the final [`reqwest::Response`] — it does NOT
-//! interpret the body. Callers inspect the status and parse (or map to their
-//! own `EmbedError`/`SummarizeError`) as they see fit; only transport errors
-//! that persist past the retry budget surface as an `Err`.
 
 // Every item here is shared retry infra whose ONLY consumers are the per-provider
 // adapters in `embed/` and `summarize/`. A feature set that enables a base
@@ -25,11 +13,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 /// Retry classification + timing for a family of requests.
-///
-/// `retryable` is a status-code predicate: when it returns `true` for a
-/// response's status and the retry budget isn't exhausted, the request is
-/// retried after a backoff. Construct via [`RetryPolicy::standard`] or
-/// [`RetryPolicy::server_errors`].
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
     pub max_retries: usize,
@@ -76,16 +59,6 @@ pub fn backoff(policy: &RetryPolicy, attempt: usize) -> Duration {
 }
 
 /// Send a request with bounded exponential-backoff retry.
-///
-/// `build` is called once per attempt to construct a fresh
-/// [`reqwest::RequestBuilder`] (a builder is consumed by `send`, so it can't
-/// be reused across attempts). `label` is used only in the error context and
-/// retry warnings.
-///
-/// Returns the response as soon as a non-retryable status is seen or the
-/// retry budget is exhausted — the caller is responsible for inspecting the
-/// status and reading/parsing the body. Only a transport error that survives
-/// every retry is returned as `Err`.
 pub async fn send_with_retry<F>(
     policy: &RetryPolicy,
     label: &str,

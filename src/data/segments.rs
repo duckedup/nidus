@@ -1,17 +1,4 @@
 //! [`Segments`]: the live segment set as one logical vector matrix (SPEC §14.2).
-//!
-//! A store's vectors live in an ordered list of immutable **segment** objects plus one
-//! **active** (appendable) segment — the last in the list. [`Segments`] presents them to the
-//! rest of the store as a single dense **global row-id space**: global row `R` lives in the
-//! segment whose cumulative `[base, base+rows)` range contains it, served at local row
-//! `R - base`. This is the key that keeps segmentation transparent to the search/quant/ANN
-//! paths — they address vectors by dense global row exactly as they did over the one
-//! monolithic matrix; only *where* a row physically sits changed.
-//!
-//! Each segment is a [`DataSegment`] over its own backend object (via
-//! [`crate::backend::appender_for`]); the [`Manifest`](crate::manifest::Manifest) names them
-//! and is the atomic commit point. Sealing rotates the active segment to immutable and starts
-//! a fresh one — no data is moved (a sealed segment is simply never appended to again).
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -60,10 +47,6 @@ pub struct Segments {
     /// Monotonic manifest version (Phase-4 reader refresh).
     version: u64,
     /// Compare-and-swap fencing for the object-store appenders (cluster mode, SPEC §14.6).
-    /// Threaded into every [`appender_for`] this set opens — the active segment, segments
-    /// minted on [`seal`](Self::seal), and the base on [`rewrite`](Self::rewrite) — so a
-    /// superseded cluster writer's whole-object rewrite is fenced. `false` for the
-    /// single-writer default and in-memory stores.
     cas: bool,
 }
 
@@ -150,11 +133,6 @@ impl Segments {
     /// *staged*, not installed: the caller finishes its remaining fallible work and then calls
     /// [`install_active`](Self::install_active), so a [`refresh`](crate::Nidus::refresh) that
     /// races a concurrent writer stays atomic (all IO into locals, one infallible swap).
-    ///
-    /// This is the incremental refresh fast path (SPEC §14.6 / nidus-bdg): valid only when the
-    /// manifest version is unchanged (no seal/compaction restructured the set). On a version
-    /// change the caller re-opens the whole set via [`open`](Self::open). The `cap`
-    /// (`max_vector_bytes`) is re-checked against the grown total before the new bytes resolve.
     pub fn reopen_active(&self, cap: Option<u64>) -> Result<PendingActive> {
         let p = self
             .persistence

@@ -449,11 +449,6 @@ impl DataSegment {
     /// Append one vector (length must equal `dimension`), returning its row index.
     /// Updates RAM + the file tail. Does NOT fsync — the caller batches then calls
     /// [`sync`](Self::sync).
-    ///
-    /// **Atomic per row.** If the file write fails partway (e.g. ENOSPC), the file
-    /// is rolled back to the row boundary it started at, so a torn partial row
-    /// never persists for the next append to write past — and RAM is left
-    /// untouched. On success, RAM and the file advance together.
     pub fn append(&mut self, vector: &[f32]) -> Result<u64> {
         if vector.len() != self.dimension {
             bail!(

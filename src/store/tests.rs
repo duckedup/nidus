@@ -610,10 +610,6 @@ fn upsert_rollback_survives_reopen() {
 // ── Fsync::OnFlush durability (nidus-4h2) ─────────────────────────────────
 
 /// Everything written under `OnFlush` is present after `flush()` + reopen.
-///
-/// The happy-path guard for gating the phase-2 `data` sync: that sync is what used to
-/// order data ahead of the log on every call, and `flush()` is now solely responsible for
-/// establishing it. If the gate ever dropped writes, this fails first.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn on_flush_persists_every_batch_once_flushed() {
@@ -637,12 +633,6 @@ fn on_flush_persists_every_batch_once_flushed() {
 
 /// A crash that leaves the log durable while the rows it names are not must drop the
 /// dangling tail and reopen cleanly — never fail, never surface a phantom record.
-///
-/// This is the exact state gating the phase-2 sync makes reachable under `OnFlush`, so it
-/// is the test that licenses the gate. Simulated by truncating `data` behind an intact
-/// log, which is what a machine crash between the two files looks like on restart. The
-/// surviving prefix must still be readable and searchable — a store that recovered into
-/// an unusable state would be no better than a torn one.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_log_ahead_of_data_tail_is_dropped_on_reopen() {
@@ -4332,12 +4322,6 @@ mod object_backed {
     }
 
     /// **Group commit issues fewer barriers than there are batches — counted, not inferred.**
-    ///
-    /// On a whole-object backend a segment's `sync()` *is* a `put`, so `put_count` is a direct
-    /// barrier counter: the same measurement an fsync counter makes on local files, but
-    /// deterministic and Miri-clean. The assertion the ticket asks for (nidus-xb9.1) is the
-    /// comparison between the two halves — same four batches, same bytes, four barriers versus
-    /// one.
     #[test]
     fn group_commit_coalesces_the_barrier_across_batches() {
         let raw = Arc::new(InMemObjectStore::default());
@@ -4391,11 +4375,6 @@ mod object_backed {
     }
 
     /// **In cluster mode the coalesced group publishes the commit counter once, not per batch.**
-    ///
-    /// The manifest publish is a CAS round trip to the object store on every durable batch, so
-    /// on a cluster writer it is a second per-call cost sitting beside the fsync. Group commit
-    /// has to fold that one too, and — the part worth asserting — the commit counter must still
-    /// end up advanced, or peers would never see the group at all.
     #[test]
     fn group_commit_publishes_one_cluster_commit_for_the_group() {
         let raw = Arc::new(InMemObjectStore::default());
@@ -4442,12 +4421,6 @@ mod object_backed {
     }
 
     /// **A failed barrier fails every write in its group.**
-    ///
-    /// The one way group commit could become a lie: N writes applied, the shared barrier
-    /// fails, and some of them are reported successful anyway. Here the writer is superseded
-    /// mid-group (a peer commits a manifest under it), so the CAS at the commit point refuses
-    /// — and `commit` must surface that rather than swallowing it, because the caller is
-    /// waiting on it to decide whether to answer `200`.
     #[test]
     fn a_failed_group_barrier_is_reported_not_swallowed() {
         let raw = Arc::new(InMemObjectStore::default());
@@ -4491,23 +4464,6 @@ mod object_backed {
 // ── Cooperative cancellation ────────────────────────────────────────────────
 
 /// **A cancelled scan stops instead of running to completion.**
-///
-/// A server request deadline drops the response future, which frees the client but not the
-/// CPU: the scan is on a blocking task and blocking tasks are not cancellable. The scan
-/// kernels therefore check an ambient token, and this is the proof it reaches them through
-/// a real `search` — otherwise the deadline is a promise to the caller and a lie to the
-/// machine.
-///
-/// Deliberately tiny. The check fires at the head of every block, so cancellation is
-/// observable on the first one; more data would only slow the suite down — badly, under
-/// Miri — without testing anything further. The parallel fan-out's token handoff is the
-/// part that would need real volume to reach through `search`, so it is unit tested
-/// directly against `parallel_topk` in `super::scoring` instead. An earlier version of this
-/// file tried it here with 40k rows and quietly exercised the *serial* path, because that
-/// is still an order of magnitude under `PARALLEL_SCAN_WORK_FLOOR`.
-///
-/// Asserted on the *outcome* (an error rather than results), never on elapsed time: a
-/// timing assertion here would flake on a shared runner and prove nothing.
 #[test]
 fn a_cancelled_search_stops_and_errors() {
     let mut store = Store::in_memory(8).unwrap();

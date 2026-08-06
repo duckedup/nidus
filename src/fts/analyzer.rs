@@ -1,13 +1,4 @@
 //! The text analyzer: raw text → normalized terms for BM25 indexing and querying.
-//!
-//! Pure safe Rust, zero FFI (no ICU / `unicode-segmentation` C deps), Miri-clean. The
-//! pipeline for [`Language::English`] is: lowercase → tokenize on Unicode
-//! alphanumeric runs → drop stopwords → [Porter stem](stem). The same analyzer runs at
-//! index time and query time, so a query term matches a stored term iff they reduce to
-//! the same stem.
-//!
-//! [`Language`] is the seam for more languages: each maps to its own stopword set and
-//! stemmer, selected in [`analyze`]. Only English is implemented today.
 
 use serde::{Deserialize, Serialize};
 

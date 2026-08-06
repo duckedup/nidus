@@ -266,8 +266,6 @@ impl Store {
     /// Two-pass binary search: a Hamming first-pass over the 32×-smaller sign-bit matrix
     /// selects candidates, f32 reranks. Cosine only (enforced at `open`), so the query is
     /// already unit-normalized when it reaches here; its sign code is invariant to that.
-    /// The binary first pass moves 32× fewer bytes than f32, so it scales with `workers`
-    /// even harder than int8; the f32 rerank stays serial.
     pub(super) fn search_binary<'a>(
         &self,
         q: &[f32],

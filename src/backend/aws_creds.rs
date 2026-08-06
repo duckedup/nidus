@@ -1,20 +1,4 @@
 //! AWS credential resolution for the [`S3`](super::S3) backend.
-//!
-//! Two classes, picked by the environment (mirroring the AWS SDK default chain):
-//!
-//! - **Static** — long-lived keys in `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
-//!   (+ optional `AWS_SESSION_TOKEN`). Never expire; used verbatim.
-//! - **Keyless / temporary** — no static keys, so credentials are fetched from a metadata
-//!   source and **refreshed before they expire**:
-//!   - **Web identity (IRSA)** — `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`: exchange the
-//!     projected token at STS `AssumeRoleWithWebIdentity`. This is how EKS pods authenticate.
-//!   - **ECS / Fargate** — `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` (or `…_FULL_URI`): the
-//!     task-role endpoint.
-//!   - **EC2 instance role** — IMDSv2 on `169.254.169.254` (token-protected). Tried last.
-//!
-//! The HTTP responses (STS XML, ECS/IMDS JSON, the ISO-8601 expiry) are parsed by the small,
-//! dependency-free, unit-tested helpers at the bottom — the same "parse fixed wire shapes
-//! against in-memory buffers" discipline the codecs use, so they stay Miri-clean.
 
 use std::sync::Mutex;
 use std::time::Duration;

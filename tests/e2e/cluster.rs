@@ -1,26 +1,5 @@
 //! Cluster-mode end-to-end tests: **several real `nidus serve` processes** over a shared
 //! object store and a shared memory tier.
-//!
-//! The cluster tests in `src/store/tests.rs` are thorough about the *logic* but run
-//! entirely in one process — `cluster_writer()` and `cluster_reader()` are two `Store`
-//! values in the same test function over `InMemObjectStore` + `LocalRam`, and a lost lease
-//! is simulated with `drop()`. That leaves three things unproven, all of which are what
-//! actually breaks in production:
-//!
-//! * **Real S3 semantics.** The compare-and-swap fencing relies on conditional-write
-//!   behaviour (`If-Match` on an ETag). `InMemObjectStore` models what we *believe* S3
-//!   does; only a real server proves it.
-//! * **Process boundaries.** A writer that is `drop()`ped releases its lease cleanly. A
-//!   writer that is killed, or merely *stalled*, does not — and that is the case the
-//!   fencing exists for.
-//! * **The server.** Nothing proved the HTTP layer drives any of this. It did not:
-//!   see `nidus-6bb`, found by exactly this suite.
-//!
-//! **These tests need Docker services and so are `#[ignore]`d** — `just test-cli` stays
-//! service-free. Run them with `just test-e2e-cluster` (see that recipe for the
-//! `docker run` lines), or point them at your own services with `NIDUS_E2E_S3_ENDPOINT`,
-//! `NIDUS_E2E_S3_BUCKET`, `NIDUS_E2E_S3_KEY`, `NIDUS_E2E_S3_SECRET`, and
-//! `NIDUS_E2E_REDIS_URL`.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -43,10 +22,6 @@ fn service(var: &str, default: &str) -> String {
 }
 
 /// Fail fast, once per process, if the backing services are not reachable.
-///
-/// Without this the first symptom is a child process dying with `Connection refused`
-/// buried in its captured stderr — technically diagnosable, but it does not tell you the
-/// one thing you need to know, which is that you forgot to start the services.
 fn require_services() {
     static CHECKED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     CHECKED.get_or_init(|| {
@@ -64,12 +39,6 @@ fn require_services() {
         // No Redis round trip needed: a TCP connect distinguishes "nothing listening"
         // (the mistake this guards) from a protocol-level problem, which the store's own
         // error would explain better than we could here.
-        //
-        // Reduce the URL to one reachable `host:port`: drop the scheme, then any `/db` or
-        // `?cluster=true` tail, then take the FIRST of a comma-separated seed list — a
-        // Valkey Cluster URL carries every seed, and handing the whole list to
-        // `TcpStream::connect` fails on a perfectly healthy cluster. Reaching one seed is
-        // all this guard needs to prove.
         let addr = redis
             .split_once("://")
             .map_or(redis.as_str(), |(_, rest)| rest)
@@ -99,10 +68,6 @@ fn unique_prefix(name: &str) -> String {
 }
 
 /// One instance in a cluster over `prefix`. `read_only` picks a lock-free reader.
-///
-/// `--dir` still gets a temp directory: in cluster mode the durable bytes live in the
-/// object store, but the flag is still required, so each instance gets its own scratch
-/// path exactly as separate machines would.
 fn instance(prefix: &str, read_only: bool, extra: &[&str]) -> (tempfile::TempDir, RunningServer) {
     instance_with_ttl(prefix, read_only, LOCK_TTL_SECS, extra)
 }
@@ -253,10 +218,6 @@ fn ids(server: &RunningServer) -> Vec<String> {
 }
 
 /// The headline behaviour: a reader instance picks up a writer instance's commits.
-///
-/// This is what `nidus-6bb` was: every underlying piece worked, but no server code path
-/// called `refresh()`, so a reader served its open-time snapshot forever. `POST /refresh`
-/// is the fix, and `adopted` distinguishes "advanced" from "nothing new".
 #[test]
 #[ignore = "needs minio + valkey (just test-e2e-cluster)"]
 fn reader_adopts_writer_commits_on_refresh() {
@@ -341,8 +302,6 @@ fn second_writer_is_excluded_across_processes() {
 /// A writer that *dies* — SIGKILL, no clean release, lease left behind — must not wedge
 /// the store: past the TTL another instance takes over, and everything the dead writer
 /// acknowledged is still there.
-///
-/// `drop()` cannot express this, because dropping releases the lease properly.
 #[test]
 #[ignore = "needs minio + valkey (just test-e2e-cluster)"]
 fn killed_writer_lease_is_taken_over_with_data_intact() {
@@ -367,19 +326,6 @@ fn killed_writer_lease_is_taken_over_with_data_intact() {
 /// **The split-brain fence.** A writer that stalls after its lease check — a long GC
 /// pause, a descheduled host — can wake up already superseded and still believe it holds
 /// the lease. SIGSTOP manufactures exactly that stall, which `drop()` cannot.
-///
-/// nidus fences this twice: the lease is re-verified at the start of each batch, and every
-/// durable write is a compare-and-swap on the version last seen (`If-Match` on the ETag,
-/// from nidus-ahw). **Observed here: the lease re-check fires first**, so this test proves
-/// the outer fence and asserts on its message; the CAS backstop behind it is covered by
-/// the in-RAM tests, which can force that exact interleaving.
-///
-/// Real-S3 CAS semantics are not untested, though — in cluster mode *every* durable write
-/// goes through `put_cas`, so all six tests in this file would fail if minio's `If-Match`
-/// handling disagreed with what `InMemObjectStore` models.
-///
-/// What must never happen, by either fence: a successful write that discards the
-/// successor's committed data.
 #[cfg(unix)]
 #[test]
 #[ignore = "needs minio + valkey (just test-e2e-cluster)"]
@@ -430,22 +376,6 @@ fn stalled_writer_is_fenced_and_cannot_clobber() {
 }
 
 /// **Automatic promotion — the availability property, with no external restart.**
-///
-/// Before `--wait-for-lease`, a second writer exited the instant it found the lease held
-/// (asserted above), so a "hot standby" could only be approximated by a supervisor
-/// restarting a crash-looping pod: failover took lease TTL *plus* whatever backoff the
-/// supervisor had reached, and `CrashLoopBackOff` is an alert rather than a design.
-///
-/// Here the standby stays up and is promoted on its own. Note what it asserts along the
-/// way, because each part was a separate way to get this wrong:
-///
-/// * while waiting, the standby is **live but not ready** — a failing liveness probe would
-///   have a supervisor kill the very instance meant to be waiting, and a passing readiness
-///   probe would have a load balancer send it traffic it cannot serve;
-/// * its data routes answer `503`, not `500` — nothing is broken, there is just no store;
-/// * promotion happens within roughly the lease TTL of the incumbent dying, **without any
-///   external restart** — the assertion that was impossible to write before;
-/// * and the promoted instance can write, and sees everything its predecessor committed.
 #[cfg(unix)]
 #[test]
 #[ignore = "needs minio + valkey (just test-e2e-cluster)"]
@@ -490,21 +420,6 @@ fn standby_is_promoted_after_the_writer_dies() {
 }
 
 /// **An idle writer keeps its lease, so a standby does not steal it** (nidus-lp4.6).
-///
-/// The lease used to be renewed *only* at the start of a write batch. That was fine before
-/// standbys existed: nothing was waiting to take over. Once `--wait-for-lease` shipped, a
-/// writer that simply had nothing to do for longer than `lock_ttl` — or was mid-way through
-/// one very large batch — would have its lease judged stale and be replaced, discarding a
-/// perfectly healthy writer (and, mid-batch, its work).
-///
-/// `nidus serve` now renews out of band on a timer using a `LeaseRenewer` that does **not**
-/// need the store lock, so renewal continues even while a long write holds the guard.
-///
-/// **This was the nidus-lp4.7 reproduction** — a standby acquiring the lease while the
-/// incumbent was alive and well within its TTL, leaving two instances both reporting
-/// `holds_writer_handle` (a mutual-exclusion failure, not merely an availability one). It
-/// found two real bugs and now passes, so it is part of the normal suite. Its assertions were
-/// never weakened to get there; see the git history of `backend/object.rs` for the fixes.
 #[cfg(unix)]
 #[test]
 #[ignore = "needs minio + valkey (just test-e2e-cluster)"]
@@ -558,17 +473,6 @@ fn idle_writer_keeps_its_lease_against_a_waiting_standby() {
 }
 
 /// **A fenced writer reports unready without waiting for a write to find out** (nidus-lp4.7).
-///
-/// `fenced` used to be latched *only* by a failing write. The background renewer — which runs
-/// every `lock_ttl/3` and is therefore the first thing to learn the lease is gone — printed
-/// the loss to stderr and dropped it. So a superseded writer with no traffic kept answering
-/// `/ready` with 200 and reporting `holds_writer_handle: true` indefinitely, and an
-/// orchestrator had no way to see it until a write happened to arrive and fail. On a
-/// low-traffic store that could be a long time, and it is precisely the interval during which
-/// two instances both look like the writer.
-///
-/// Distinct from `fenced_writer_reports_unready`, which latches the state *via* a rejected
-/// write: this one asserts the discovery happens on its own, with no write attempted at all.
 #[cfg(unix)]
 #[test]
 #[ignore = "needs minio + valkey (just test-e2e-cluster)"]
@@ -614,14 +518,6 @@ fn a_superseded_writer_discovers_it_is_fenced_without_any_write() {
 }
 
 /// **A fenced writer must stop reporting ready** (nidus-lp4.1).
-///
-/// This was the sharpest production gap: `/health` was a hardcoded `"ok"`, and the shipped
-/// chart probed it for *readiness*. So a writer that had been superseded — every write
-/// failing with "writer lease lost" — stayed in the Service and kept receiving writes it
-/// could not perform. The one signal Kubernetes could act on was inverted.
-///
-/// Reproduces it the way it actually happens: stall the writer past its lease, let a peer
-/// take over, then let the stalled writer wake up and try to write.
 #[cfg(unix)]
 #[test]
 #[ignore = "needs minio + valkey (just test-e2e-cluster)"]
@@ -671,10 +567,6 @@ fn fenced_writer_reports_unready() {
 }
 
 /// **A reader past its staleness bound reports unready** (nidus-lp4.4).
-///
-/// A cluster reader only advances when something refreshes it, so a reader whose refresher
-/// died would otherwise serve ever-older results while looking perfectly healthy. With
-/// `--max-staleness` set, readiness is what escalates that.
 #[test]
 #[ignore = "needs minio + valkey (just test-e2e-cluster)"]
 fn stale_reader_reports_unready() {
@@ -785,10 +677,6 @@ fn cluster_endpoint_distinguishes_writer_from_reader() {
 
 /// A reader restarted from scratch reconstructs the same state, so the shared backend and
 /// tier are a complete record of the store — not just a delta over some local file.
-///
-/// Note this asserts the *result*, not the mechanism: whether the reader adopted the
-/// valkey working-set snapshot or replayed the log is not observable over HTTP. The
-/// adopt-vs-replay path itself is covered by the in-RAM tests in `src/store/tests.rs`.
 #[test]
 #[ignore = "needs minio + valkey (just test-e2e-cluster)"]
 fn fresh_reader_reconstructs_state_from_shared_backend() {

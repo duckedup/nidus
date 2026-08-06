@@ -1,20 +1,6 @@
 //! Memory-tier glue (SPEC §13.3): publish the in-RAM working set to a shared
 //! [`MemoryTier`](crate::backend::MemoryTier), and adopt it on `open` instead of
 //! replaying the log + rebuilding the index.
-//!
-//! The "working set" serialized here is the **replay-derived index** — the collections
-//! (`id → (row, attrs)`), the dead-row count, and the declared FTS schemas. That is the
-//! one piece of in-RAM state with no other cache: every worker would otherwise rebuild
-//! it by replaying the whole op log. The vectors (`data`) are bulk-read regardless, and
-//! the `ann`/`fts` postings keep their own derived caches and fast rebuilds, so they are
-//! deliberately *not* duplicated into this blob.
-//!
-//! It reuses the [`crate::index_cache`] frame/decode codec (magic + version + watermark +
-//! validity key + CRC) so there is one on-the-wire format for every derived cache. The
-//! **watermark is the log byte offset** and the payload carries the data row count; a
-//! snapshot is adopted only when *both* match the just-opened store exactly. The tier is
-//! a rebuildable cache, so every error here is swallowed — a missing, stale, or
-//! unreachable tier just falls back to the log replay, never failing `open`/`flush`.
 
 use std::collections::HashMap;
 

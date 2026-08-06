@@ -1,18 +1,4 @@
 //! nidus-bench — cross-engine exact-KNN performance-parity benchmark.
-//!
-//! Run via `just bench [engines] [key=value ...]`. All engines are pinned to exact
-//! brute-force cosine KNN, so this measures parity (and tracks regressions), not a race.
-//!
-//! Args (all `key=value`, repeatable lists are comma-separated):
-//!   n=10000,100000     corpus sizes
-//!   dim=384,768        embedding dimensions
-//!   top_k=10           neighbours to retrieve
-//!   queries=100        distinct query vectors per cell
-//!   warmup=10          unrecorded warmup queries
-//!   iters=5            measured passes over the query set
-//!   seed=42            PRNG seed (determinism)
-//!   threshold=1.25     max nidus_p50 / best_p50 before a cell is a FAIL
-//!   json=<path>        override the JSON artifact path
 
 use std::path::PathBuf;
 use std::process::ExitCode;

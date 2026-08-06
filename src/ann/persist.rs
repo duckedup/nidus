@@ -1,12 +1,4 @@
 //! On-disk codec for the ANN index — a **derived cache**, not source of truth.
-//!
-//! The graph/lists are fully reconstructable from the `data` vectors, so this file is
-//! an optimization: it lets `open()` load the index instead of rebuilding it. The
-//! framing (header + bincode + CRC + atomic write) lives in [`crate::index_cache`],
-//! shared with the FTS cache; this module only composes ANN's **validity key** and
-//! converts between the live [`Ann`] and its serializable snapshot. Every load is
-//! best-effort — a missing, stale (config/dim/metric/params changed), or CRC-failed
-//! file returns `None` and the caller rebuilds; it is never fatal.
 
 use anyhow::Result;
 

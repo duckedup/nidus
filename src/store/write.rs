@@ -82,11 +82,6 @@ impl Store {
     }
 
     /// Whether *this* mutation issues its own durable barrier.
-    ///
-    /// [`Fsync::PerBatch`] says yes — unless the host has taken the barrier over for a group
-    /// of mutations ([`Nidus::deferred`](crate::Nidus::deferred), nidus-xb9.1), in which case
-    /// the bytes are appended now and one [`commit`](Self::commit) covers the whole group.
-    /// Under [`Fsync::OnFlush`] the answer is no either way: `flush()` is the barrier.
     fn barrier_now(&self) -> bool {
         self.config.fsync == Fsync::PerBatch && !self.defer_barrier
     }
@@ -109,10 +104,6 @@ impl Store {
     /// Enter a deferred-barrier scope (**group commit**, nidus-xb9.1), returning the previous
     /// setting for [`end_deferred`](Self::end_deferred) to restore. Returning the old value
     /// rather than just clearing makes nesting safe.
-    ///
-    /// The safe wrapper is [`Nidus::deferred`](crate::Nidus::deferred); the primitive lives
-    /// here as a pair because the closure that wrapper takes needs `&mut Nidus`, and handing
-    /// out a `&mut Store` from inside it is not possible.
     pub(crate) fn begin_deferred(&mut self) -> bool {
         std::mem::replace(&mut self.defer_barrier, true)
     }
@@ -125,24 +116,6 @@ impl Store {
     }
 
     /// The group barrier: make everything appended since the last barrier durable.
-    ///
-    /// This is the fsync that the mutations inside [`deferred`](Self::deferred) skipped — one
-    /// for the whole group instead of one each, which is the entire saving. Syncs `data` then
-    /// `log` (the §6.2 order) and, in cluster mode, publishes the commit counter once for the
-    /// group rather than once per batch.
-    ///
-    /// Deliberately narrower than [`flush`](Self::flush): it takes the barrier and nothing
-    /// else. No segment seal, no working-set publish — those are periodic housekeeping, and
-    /// doing them per group would put a whole-working-set serialize-and-PUT on the write path
-    /// of every batch, trading one saved fsync for something far more expensive.
-    ///
-    /// **A no-op when nothing is owed**, at the cost of one branch: a caller that already
-    /// synced (the ordinary `PerBatch` path, one client at a time) pays nothing here. That is
-    /// what keeps group commit from making the uncontended single-writer path slower.
-    ///
-    /// Under [`Fsync::OnFlush`] it is also a no-op — that policy's whole point is that the
-    /// write path takes no barrier and `flush()` is the durability point — so a host that
-    /// always calls `commit` still gets exactly the policy its config asked for.
     pub fn commit(&mut self) -> Result<()> {
         if !self.pending_barrier || self.config.fsync == Fsync::OnFlush {
             return Ok(());
@@ -179,13 +152,6 @@ impl Store {
     /// Publish the current segment set as the `manifest` — the atomic commit point for a
     /// seal/compaction (and, in cluster mode, every durable batch). No-op for in-memory or
     /// read-only stores (no durable manifest).
-    ///
-    /// In cluster mode the publish is a **compare-and-swap** against the manifest token this
-    /// writer last wrote ([`manifest_cas`](Store::manifest_cas), SPEC §14.6 / nidus-ahw): a
-    /// writer superseded mid-batch finds the on-disk manifest changed under it and is fenced
-    /// here, at the commit point, before its stale segment set can become the truth. On a
-    /// backend without CAS the publish degrades to a plain put (fenced only per-batch by the
-    /// lease). Outside cluster mode it is the plain atomic put it always was.
     fn persist_manifest(&mut self) -> Result<()> {
         if self.in_memory || self.config.open_mode == OpenMode::ReadOnly {
             return Ok(());
@@ -380,7 +346,6 @@ impl Store {
         // Phase 0: reserve every growable buffer up-front, fallibly, so the commit
         // phase (Phase 5) can never reallocate / OOM. Nothing is mutated here, so an
         // OOM just returns — no rollback needed (data + log untouched).
-        // `row` is `Some` for a vector-bearing record, `None` for a text-only one.
         let mut staged: Vec<(String, Option<u64>, BTreeMap<String, Value>)> = Vec::new();
         staged
             .try_reserve_exact(records.len())
@@ -409,10 +374,6 @@ impl Store {
 
         // Phase 1: append all vectors to data (SPEC §6.2 write order). Roll back on
         // any failure — nothing else has been touched yet.
-        // NOTE: `rec.attrs.clone()` (BTreeMap) and `rec.id.clone()` (String) can
-        // still abort on OOM — std offers no `try_reserve` for either. These are
-        // small metadata next to the N×dim×4 vector matrix, which `data.append`
-        // reserves fallibly; the `max_vector_bytes` cap guards the dominant memory.
         let should_normalize = self.config.distance == Distance::Cosine;
         for rec in records {
             let row = match &rec.vector {
@@ -443,26 +404,6 @@ impl Store {
         crate::metrics::metrics().write_batches.inc();
 
         // Phase 2: fsync data before writing log records — under `PerBatch` only.
-        //
-        // Gated to match phase 4 below (nidus-4h2). It used to be unconditional, which
-        // made `Fsync::OnFlush` — documented as "fsync only on explicit flush(), faster,
-        // weaker durability" — still pay a full disk barrier per `upsert` CALL. Measured
-        // at ~3.8ms on APFS (where `sync_all` is `F_FULLFSYNC`), constant regardless of
-        // store size, so the "fast" policy delivered roughly half the speedup it promised
-        // and small batches were dominated by a barrier the caller had opted out of.
-        //
-        // Dropping it under `OnFlush` cannot corrupt the store. The ordering this sync
-        // enforces — data durable before the log records naming its rows — is re-created
-        // by `flush()`, which syncs data then log in exactly this order. In between, a
-        // crash can leave the log durable while the rows it references are not, and that
-        // is precisely the state the lock-free reader rule already handles: `replay_ops`
-        // ignores any `Upsert` whose row is beyond the data file (§6.2). The tail is
-        // dropped, never torn — which is the durability contract `OnFlush` advertises
-        // ("a crash can lose acknowledged writes").
-        //
-        // Group commit (nidus-xb9.1) skips it for the same reason and with the same
-        // reasoning — but there the caller has promised to call `commit()` before it
-        // acknowledges anything, so no write is *reported* durable ahead of its bytes.
         if barrier_now && let Err(e) = self.data.sync() {
             self.data
                 .truncate_to(data_mark)
@@ -550,9 +491,6 @@ impl Store {
         self.invalidate_scan_order();
         // Cluster: announce this committed batch via the manifest commit counter so reader
         // instances detect it (this path commits durably itself, bypassing `maybe_sync`).
-        // Deferred to `commit()`/`flush()` under OnFlush and under group commit — where one
-        // manifest publish then covers the whole group, so the coalescing saves an
-        // object-store round trip as well as an fsync. A no-op outside cluster mode.
         if barrier_now {
             self.note_cluster_commit()?;
         }

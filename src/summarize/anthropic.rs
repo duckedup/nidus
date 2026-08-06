@@ -1,9 +1,4 @@
 //! Anthropic Messages API summarizer adapter.
-//!
-//! Sends the assembled prompt to the Claude Messages API
-//! (`POST /v1/messages`) and parses the first text block out of the response.
-//! Transient failures (429/5xx, Anthropic's 529 "overloaded") are retried with
-//! bounded exponential backoff via [`crate::http`].
 
 use serde::Deserialize;
 

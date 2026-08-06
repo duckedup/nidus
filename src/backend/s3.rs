@@ -1,19 +1,4 @@
 //! [`S3`]: an Amazon S3 (and S3-compatible: R2, MinIO, …) [`Persistence`] backend.
-//!
-//! Selected by `s3://<bucket>[/<prefix>]`, with credentials/region/endpoint from the
-//! standard AWS environment. Region/endpoint come from `AWS_REGION`/`AWS_DEFAULT_REGION`
-//! and `AWS_ENDPOINT_URL`; **credentials** resolve through [`AwsCredentials`] — static
-//! `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`), or the
-//! keyless chain (EKS IRSA web identity, ECS task role, EC2 instance role), refreshed as
-//! they expire. Object
-//! ops are whole-object `get`/`put`/`delete`/`list`; there is **no native append**
-//! (`appender` returns `None`), so S3 is for snapshots and whole-object use, not as a
-//! live append-backed `data`/`log` store.
-//!
-//! [`rusty-s3`](rusty_s3) is sans-IO: it builds and Sigv4-signs each request into a
-//! presigned [`Url`], which [`Http`] then executes. Signing is pure RustCrypto HMAC —
-//! no network, no async — so it is unit-testable offline, and the execution path is
-//! covered by a localhost mock in the tests.
 
 use std::time::Duration;
 

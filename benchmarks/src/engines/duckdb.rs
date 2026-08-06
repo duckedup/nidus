@@ -1,11 +1,6 @@
 //! DuckDB adapter — exact brute-force KNN via the built-in `array_cosine_similarity`
 //! over a fixed-size `FLOAT[dim]` ARRAY column. No VSS/HNSW extension: a full scan,
 //! the apples-to-apples match for nidus.
-//!
-//! Inserts use Arrow `RecordBatch` + `Appender::append_record_batch` (the row appender
-//! can't build array columns). Queries bind the probe as `dim` scalar f32 params and
-//! reconstruct it with `array_value(...)` (array *params* aren't supported by the
-//! bindings, but scalars are), so there's no per-query SQL rebuild.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

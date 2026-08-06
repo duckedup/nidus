@@ -1,16 +1,4 @@
 //! A live `nidus serve` child process, for benchmarks that measure the HTTP path.
-//!
-//! Extracted from [`crate::engines::server`] so the write-path decomposition
-//! (the `nidus-bench-write` binary) drives the server through the *same* spawn,
-//! readiness, and POST code rather than a second copy of it. The engine adapter is a
-//! [`VectorStore`](crate::VectorStore) impl on top of this; the write bench needs a
-//! different shape entirely (its own batch sizes, its own flags, timing split around the
-//! socket call), so what they share is the process, not the interface.
-//!
-//! Not shared with `tests/e2e/harness.rs` despite the overlap: that lives in another
-//! crate's test target (unreachable from here), and its contract is deliberately
-//! different — it panics with the child's stderr attached, which is right for an
-//! assertion and wrong for a benchmark that must return `Result` and stay quiet.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -120,12 +108,6 @@ impl ServeProcess {
         };
 
         // Wait for the store to be OPEN, not merely for the process to be alive.
-        //
-        // `/ready` rather than `/health`: since nidus-abx.1 the liveness probe answers as
-        // soon as the router is up and deliberately does *not* gate on the store, so a
-        // first request racing the open gets a `503 store is not open yet`. Readiness is
-        // the probe that means "will serve traffic", which is exactly the precondition a
-        // benchmark needs before it starts a clock.
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         loop {
             if let Ok(res) = proc.agent.get(format!("{}/ready", proc.base)).call()
@@ -146,20 +128,11 @@ impl ServeProcess {
     }
 
     /// POST an already-encoded body.
-    ///
-    /// Separate from [`post`](Self::post) so a caller can keep client-side JSON encoding
-    /// *outside* the timed section — which is the whole point of the write-path
-    /// decomposition, where encode and transport are the two costs being told apart.
     pub fn post_bytes(&self, path: &str, bytes: &[u8]) -> Result<Value> {
         post_on(&self.agent, &self.base, path, bytes)
     }
 
     /// One unlabelled sample from `GET /metrics`.
-    ///
-    /// A benchmark that reports only wall clock can say a change made things faster; it
-    /// cannot say *why*. Reading the server's own counters lets a run attribute the number
-    /// to the mechanism — e.g. how many writes actually shared a barrier (nidus-xb9.1)
-    /// rather than inferring it from the shape of the curve.
     pub fn metric(&self, name: &str) -> Result<f64> {
         let text = self
             .agent

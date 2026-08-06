@@ -1,31 +1,4 @@
 //! [`RedisTier`]: a shared [`MemoryTier`] over the Redis wire protocol (SPEC §13.3).
-//!
-//! A single `redis-rs` *blocking* client speaks RESP, so one backend covers the whole
-//! RESP-compatible family — **Redis, Valkey, KeyDB, and DragonflyDB** — selected by URL
-//! scheme:
-//!
-//! - `redis://…`  / `valkey://…` / `keydb://…` / `dragonfly://…` → plain TCP
-//! - `rediss://…` / `valkeys://…`                               → TLS (via `tls-rustls`)
-//!
-//! The non-`redis` schemes are pure aliases: they are rewritten to `redis://`/`rediss://`
-//! before being handed to the client, since the servers are protocol-identical.
-//!
-//! A `?cluster=true` query opens a **Redis/Valkey Cluster** client instead (via the `cluster`
-//! feature): the host is a seed node — or several, comma-separated, to tolerate one being
-//! down at startup (`redis://a,b,c?cluster=true`) — the rest of the topology is discovered,
-//! and slot routing + `MOVED`/`ASK` redirection are handled by the client. Single-node and
-//! cluster connections share one code path — both are driven as `&mut dyn ConnectionLike`
-//! through the low-level [`Cmd`](redis::Cmd) API.
-//!
-//! As a [`MemoryTier`] this is **model (a)** (SPEC §13.3): a *shared, rebuildable* cache
-//! of the serialized working set, not a source of truth. `store` is `SET` (with `EX`
-//! when a ttl is given), `load` is `GET`; an evicted or absent key is `Ok(None)`, never
-//! fatal — the persistence tier remains authoritative.
-//!
-//! Sync by design: `default-features = false` keeps `redis-rs` on its blocking
-//! `Connection`, so nothing async (no tokio) enters the tree. A connection is cached
-//! behind a `Mutex` and transparently reopened if a command fails (a dropped/expired
-//! TCP connection), so callers never juggle reconnection.
 
 use std::sync::Mutex;
 use std::time::Duration;

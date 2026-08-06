@@ -1,7 +1,4 @@
 //! Voyage AI embedding adapter (`voyage-3` default).
-//!
-//! Bespoke wire shape: `POST /v1/embeddings` with an `input_type` tag
-//! (`document` vs `query`), response `{data:[{embedding}]}`.
 
 use serde::Deserialize;
 

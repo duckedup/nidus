@@ -1,16 +1,8 @@
 //! Prompt building for single-shot summarization.
-//!
-//! Adapted from the ported code-summarizer's prompt, with all code-specific
-//! framing (files, symbols, imports, languages) stripped out — nidus knows
-//! nothing about the caller's domain. The target output is dense, search-
-//! optimized prose that embeds well and matches natural-language queries.
 
 /// The default system prompt. Turns arbitrary text into dense, retrieval-
 /// friendly prose. Overridable per adapter ([`SummarizeConfig::system_prompt`])
 /// or per call ([`SummarizeOpts::system`]).
-///
-/// [`SummarizeConfig::system_prompt`]: super::SummarizeConfig::system_prompt
-/// [`SummarizeOpts::system`]: super::SummarizeOpts::system
 pub const DEFAULT_SYSTEM_PROMPT: &str = "\
 You are a summarizer for a semantic search index. Your summaries will be \
 embedded as vectors and matched against natural-language queries.\n\n\

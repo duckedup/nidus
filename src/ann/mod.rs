@@ -1,16 +1,4 @@
 //! Opt-in approximate-nearest-neighbour index (SPEC.md §9).
-//!
-//! Exact brute-force is the default; this module is reached only when
-//! [`crate::Config::ann`] is set. It builds an in-RAM index over the `data` rows and
-//! answers a query by *walking* the index for an over-fetched candidate set rather
-//! than scanning every row. The store then post-filters those candidates by
-//! scope/filter/`min_score` and reranks them with the exact f32 score — so the index
-//! only has to pick a good candidate *set*; final ordering is always exact.
-//!
-//! Two algorithms are selected by [`AnnKind`]: [`HnswGraph`] (a navigable small-world
-//! graph, the default) and [`IvfIndex`] (k-means inverted lists). Both are pure
-//! safe Rust with no dependencies — the only randomness is a hand-rolled seeded
-//! [`SplitMix64`] PRNG, so builds are deterministic and the logic runs under Miri.
 
 use serde::{Deserialize, Serialize};
 
@@ -84,8 +72,6 @@ enum WalkQuant<'a> {
     None,
     /// int8 scalar codes, flat row-major (`dim` per row). `euclidean` picks
     /// [`euclidean_neg_sq_i8`] over [`dot_i8`]; both are monotonic with the f32 score.
-    /// `params` is the store's shared scale — the query must be quantized with the same
-    /// scale the stored codes were, so the int8 scores stay mutually comparable.
     Int8 {
         codes: &'a [i8],
         dim: usize,
@@ -98,16 +84,6 @@ enum WalkQuant<'a> {
 }
 
 /// How the ANN index measures "nearness" during build and search (nidus-ndu).
-///
-/// It always carries the f32 `data` matrix (IVF fits its centroids in f32, and the exact
-/// variant scores rows straight from it) plus an optional quantized codebook. When a
-/// codebook is present the *walk* — the graph hops / list scans the index does to pick a
-/// candidate set — scores cheap quantized codes instead of f32; the store then reranks the
-/// resulting candidate rows with the exact f32 score, so the walk only has to choose a good
-/// candidate *set*. Higher score = nearer in every variant.
-///
-/// Borrows the store's `data` and (when quantized) its code matrix, so it is cheap to
-/// build per query/build and `Sync` for the parallel HNSW build.
 pub(crate) struct Walk<'a> {
     data: &'a Segments,
     score_fn: ScoreFn,

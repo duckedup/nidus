@@ -1,8 +1,4 @@
 //! OpenAI embedding adapter (`text-embedding-3-small` default).
-//!
-//! Speaks the shared OpenAI `/v1/embeddings` wire shape via
-//! [`super::openai_shaped`] (the dedupe helper). Responses are reordered by the
-//! `index` field, which OpenAI does not guarantee is sorted.
 
 use super::{EmbedConfig, EmbedError, Embedder, openai_shaped, resolve_base};
 

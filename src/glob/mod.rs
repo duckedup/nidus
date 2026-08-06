@@ -1,10 +1,6 @@
 //! Minimal GLOB matcher. Contract: see the root `SPEC.md` §7.1.
 
 /// Returns true if `text` matches the GLOB `pattern`.
-///
-/// Supports `*` (any run, including empty), `?` (exactly one char), and character
-/// classes `[abc]` / ranges `[a-z]` / negation `[!..]` or `[^..]`. A literal `*`,
-/// `?`, or `[` is matched only via a class. Operates on Unicode scalar values.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let txt: Vec<char> = text.chars().collect();

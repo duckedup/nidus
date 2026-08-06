@@ -1,38 +1,4 @@
 //! Cooperative cancellation for long scans (nidus-abx.2 follow-up).
-//!
-//! A server request deadline frees the *client*: axum drops the response future and the
-//! caller gets its `504`. It does not free the *CPU* — the search is running on a
-//! `spawn_blocking` task, and blocking tasks are not cancellable, so an abandoned query
-//! went on paying for a full brute-force scan with nobody left to receive it. Under load
-//! that is the worst possible time to be doing free work.
-//!
-//! Nothing outside the scan can fix that: the only place that can stop a running loop is
-//! the loop. So the scan kernels check a flag, and whoever owns the request sets it.
-//!
-//! ## Why ambient rather than a parameter
-//!
-//! The obvious design is a field on [`SearchOpts`](crate::SearchOpts). It was rejected:
-//! that struct is public and constructed with struct literals in ~30 places in this repo
-//! alone, so a new field is a breaking change for every embedding application, in exchange
-//! for a concern almost none of them have. A parallel set of `*_cancellable` methods was
-//! rejected for the same reason in reverse — it doubles the search API surface forever.
-//!
-//! So the token is **ambient**: [`Cancel::scope`] installs it for the current thread, and
-//! the kernels consult it. That is honest about the actual lifetime involved — one call, on
-//! one thread — and it means every scan path is covered, including ones added later, with
-//! no signature to remember to thread through.
-//!
-//! The cost of ambience is that it does not cross a thread boundary by itself, which
-//! matters because a parallel scan fans out to worker threads. [`current`] exists for
-//! exactly that: the fan-out captures the token before spawning and re-installs it in each
-//! worker. That handoff is the one place this has to be got right, and it is one place.
-//!
-//! ## Cost
-//!
-//! One relaxed atomic load per [`CHECK_EVERY`] rows, and nothing at all when no token is
-//! installed (a thread-local read of `None`). The check is batched rather than per-row
-//! because a per-row atomic load would be a measurable tax on the tightest loop in the
-//! crate, paid by every query to help the rare abandoned one.
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -41,17 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Result, bail};
 
 /// How many rows a scan kernel processes between cancellation checks.
-///
-/// 1024 rows is a few microseconds of scanning even at large dimensions — fine-grained
-/// enough that an abandoned query stops promptly, coarse enough that the atomic load
-/// disappears into the scoring work beside it.
 pub(crate) const CHECK_EVERY: usize = 1024;
 
 /// A shared "stop what you are doing" flag.
-///
-/// Cloning is cheap and every clone observes the same signal. Cancellation is one-way:
-/// once set it stays set, because a token that could be un-cancelled would invite a race
-/// where a scan resumes work its caller has already given up on.
 #[derive(Clone, Debug, Default)]
 pub struct Cancel(Arc<AtomicBool>);
 
@@ -101,9 +59,6 @@ pub(crate) fn cancelled() -> bool {
 }
 
 /// `Err` once the caller has given up, for the `?` sites in the scan kernels.
-///
-/// The message is deliberately distinctive: it can surface in a log line, and "the client
-/// left" must not read like a store fault.
 pub(crate) fn check() -> Result<()> {
     if cancelled() {
         bail!("search cancelled: the caller stopped waiting for this request");

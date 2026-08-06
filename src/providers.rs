@@ -1,14 +1,4 @@
 //! Provider capability registry (epic nidus-54l, ticket .9).
-//!
-//! The single source of truth for *which vendor can do what*. A domain is the
-//! **capability**, not the vendor: a provider may embed, summarize, or both.
-//! The `embed` and `summarize` factories (and the `remember`/`recall` memory
-//! layer) consult [`supports`] before dispatching, and use [`names_with`] to
-//! build helpful "available &lt;cap&gt; providers: …" errors.
-//!
-//! This reconciles the [`EmbedProvider`](crate::embed::EmbedProvider) and
-//! `SummarizeProvider` enums into one string-keyed model so naming/validation
-//! is shared across both capabilities.
 
 /// What a provider can be used for. A provider may support more than one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,11 +24,6 @@ pub struct ProviderInfo {
 }
 
 /// The canonical list of providers nidus ships.
-///
-/// Embedders: Voyage, OpenAI, Ollama, Cohere, Gemini, Mistral, Jina, plus the
-/// generic `openai-compat` catch-all (Azure/Together/Fireworks/vLLM/LiteLLM/…).
-/// Summarizers: Anthropic and the OpenAI-compatible chat-completions adapter
-/// (`openai` here serves both `/v1/embeddings` and `/v1/chat/completions`).
 pub const PROVIDERS: &[ProviderInfo] = &[
     ProviderInfo {
         name: "voyage",

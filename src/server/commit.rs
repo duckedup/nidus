@@ -72,10 +72,6 @@ use crate::Nidus;
 type Db = Arc<RwLock<Option<Nidus>>>;
 
 /// Deliver one queued write's answer, now that the group's barrier has been resolved.
-///
-/// `Some(reason)` means the barrier failed and nothing in the group is durable; `None` means
-/// it succeeded. A write that failed on its own (a dimension mismatch, say) reports its own
-/// error either way — it rolled itself back and never needed the barrier.
 type Ack = Box<dyn FnOnce(Option<&str>) + Send>;
 
 /// Apply one queued write under the leader's store guard, yielding its [`Ack`] and whether
@@ -87,11 +83,6 @@ type Apply = Box<dyn FnOnce(&mut Nidus) -> (Ack, bool) + Send>;
 pub(super) struct Committer {
     inner: Mutex<Inner>,
     /// Groups committed, and writes applied across them.
-    ///
-    /// Their ratio *is* the coalescing — `writes / groups` is the average number of requests
-    /// that shared one disk barrier, and it is the only number that shows from outside whether
-    /// group commit is doing anything on this instance. `1.0` means writes never overlap here,
-    /// which is a true and useful thing to know rather than a failure.
     groups: AtomicU64,
     writes: AtomicU64,
     /// Writes submitted, ever. `submitted - writes` is the current backlog — reported as a
@@ -137,21 +128,12 @@ impl Committer {
     }
 
     /// Writes submitted but not yet applied: the current write backlog.
-    ///
-    /// Saturating because the two counters are read separately and a write can land between
-    /// them — a momentarily negative depth would be an artefact of the read, not a state the
-    /// queue was ever in.
     pub(super) fn depth(&self) -> u64 {
         self.submitted()
             .saturating_sub(self.writes.load(Ordering::Relaxed))
     }
 
     /// The queue mutex, recovering from a poisoned lock rather than propagating.
-    ///
-    /// A panic here can only have come from `VecDeque` bookkeeping — the store work happens
-    /// well outside this critical section — and the queue's invariants do not span the lock.
-    /// Refusing every future write because one unrelated panic touched this mutex would be
-    /// the more damaging failure.
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner
             .lock()
@@ -159,9 +141,6 @@ impl Committer {
     }
 
     /// Submit `f` and wait for the barrier that makes it durable.
-    ///
-    /// Returns `f`'s own error if the write itself failed, or a barrier error if the group's
-    /// fsync did — never `Ok` for a write that is not on disk.
     pub(super) async fn submit<F, T>(
         self: &Arc<Self>,
         db: Db,
@@ -254,9 +233,6 @@ impl Committer {
     }
 
     /// Apply one group under a single exclusive store guard, then one barrier for all of it.
-    ///
-    /// The guard is re-taken per group rather than held across the whole `drive` loop: under a
-    /// continuous write stream, holding it would leave readers no window at all.
     fn commit_group(&self, db: &Db, group: Vec<Apply>) {
         // A poisoned store lock means a previous write panicked mid-mutation; the store's
         // invariants are unknown, so refuse rather than write into it. Dropping the jobs

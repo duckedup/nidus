@@ -115,13 +115,6 @@ pub(super) fn score_chunk_bin<'a>(
 /// Split `scan` across `workers` threads, score each chunk with `score_one` into its
 /// own bounded top-k of capacity `cap`, then merge the per-worker results into one.
 /// The shared parallel-scan engine behind both the f32 and int8 first passes.
-///
-/// Each worker sorts its own chunk by physical row before scoring, so the per-chunk
-/// sweep stays storage-ordered for the prefetcher — the global row-sort is skipped on
-/// the parallel path (the prefetch win is per-chunk, and per-chunk sorts run in
-/// parallel instead of as serial pre-work, cutting the Amdahl tax). Reads of `data` /
-/// the quant matrix are shared `&` across threads; the only mutation is each worker
-/// reordering its disjoint `&mut` chunk.
 pub(super) fn parallel_topk<'a, T, F>(
     scan: &mut [(u64, &'a str, &'a str)],
     workers: usize,
@@ -180,17 +173,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// **Cancellation must reach the parallel scan's worker threads.**
-    ///
-    /// The token is ambient per-thread (`crate::cancel`) and a freshly spawned thread
-    /// inherits nothing, so the fan-out has to hand it over explicitly. That handoff is the
-    /// one place the ambient model needs help, and therefore the one most worth a test.
-    ///
-    /// Driven through `parallel_topk` directly with a forced worker count, rather than
-    /// through `Store::search`: making a real search fan out requires clearing
-    /// `PARALLEL_SCAN_WORK_FLOOR`, i.e. upwards of a million floats, which is both far
-    /// slower than this needs to be and — as an earlier version of this test proved by
-    /// passing while silently running the *serial* path — easy to get wrong by a factor
-    /// that nothing checks.
     #[test]
     fn cancellation_reaches_every_parallel_worker() {
         const WORKERS: usize = 4;

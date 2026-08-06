@@ -4,18 +4,6 @@
 //! named object on any backend — a local file (`./snap.tar.gz`, `file:///b/snap.tar.gz`)
 //! today, an object store (`s3://…`) once one lands (SPEC §13.7). It is *exactly*
 //! object-granular, which is why every backend does it trivially.
-//!
-//! A store is a directory of named objects; `data` (the flat `f32` matrix) and `log`
-//! (the commit record) are the durable source of truth. `lock` is per-process writer
-//! exclusion and the derived caches (`ann`/`fts`) are rebuildable — none belong in a
-//! backup. We read `data` then `log` from the source backend.
-//!
-//! **Why a hot backup is consistent (no writer lock needed).** The writer fsyncs
-//! `data` *before* appending committing records to `log`, and every reader ignores log
-//! records that reference a row beyond the data object's size (`row ≥ data_len / dim`).
-//! So capturing `data` first and `log` second sees exactly what a lock-free reader
-//! would: a log record for a row not yet in the captured `data` is simply ignored on
-//! restore-open — possibly a hair stale, never torn.
 
 use std::io::Read;
 use std::path::Path;
@@ -130,10 +118,6 @@ pub fn backup(source: &str, out_location: &str) -> Result<BackupReport> {
 
 /// Restore the store in the archive at `in_location` into the persistence location
 /// `target` (a local path/`file://`, or an `s3://`/`gs://` object store).
-///
-/// If `target` already holds a store, the caller must confirm: with
-/// `assume_yes == false` we prompt on stderr and read one line from stdin;
-/// anything but `y`/`yes` (including EOF / a non-interactive pipe) aborts.
 pub fn restore(
     in_location: &str,
     target_location: &str,

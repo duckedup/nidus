@@ -1,14 +1,4 @@
 //! `nidus serve` adapter — the SAME nidus, reached over HTTP instead of in-process.
-//!
-//! Every other engine here (including [`super::nidus`]) drives a library in-process, so
-//! the parity table measures storage and search but says nothing about what the *server*
-//! costs. Running the identical dataset through this adapter puts a "nidus (server)" row
-//! beside "nidus", and the gap between them is precisely the HTTP overhead: JSON-encoding
-//! `dim` floats per request, the `Arc<RwLock<Nidus>>` + `spawn_blocking` hop, and socket
-//! framing.
-//!
-//! The process itself — binary discovery, spawn, readiness, POST, kill-on-drop — lives in
-//! [`crate::serve`], shared with the write-path decomposition bench.
 
 use std::path::Path;
 

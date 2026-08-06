@@ -1,10 +1,4 @@
 //! Generic OpenAI-compatible embedding adapter.
-//!
-//! Reaches any gateway that speaks the standard `/v1/embeddings` shape (Azure
-//! OpenAI, Together, Fireworks, vLLM, LiteLLM, DeepInfra, …). It **requires** an
-//! explicit `base_url`; the API key is optional (some gateways are keyless).
-//! Because the model dimension is not knowable for an arbitrary gateway, the
-//! constructor is async and probes it with one embed call (like Ollama).
 
 use super::{EmbedConfig, EmbedError, Embedder, openai_shaped, resolve_base};
 

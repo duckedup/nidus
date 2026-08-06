@@ -1,8 +1,5 @@
 //! The `log` file: an append-only, framed, checksummed op stream — the commit
 //! record and crash-recovery mechanism. Contract: see the root `SPEC.md` §5.2, §6.1, §6.6.
-//!
-//! Each record is framed `[len: u32][payload: bincode(Op)][crc32: u32]`, all
-//! little-endian; `crc32` (via `crc32fast`) covers the payload.
 
 use anyhow::{Context, Result, bail};
 
@@ -192,11 +189,6 @@ impl OpLog {
 
     /// Append one framed record. Does NOT fsync — the caller batches then calls
     /// [`sync`](Self::sync).
-    ///
-    /// **Atomic per frame.** If the write fails partway (e.g. ENOSPC), the appender
-    /// rolls back to the offset it started at, so a torn frame never persists mid-file
-    /// — without this, the next append would write past the partial bytes and
-    /// `parse_all_frames` would reject the result as hard `Corruption` on reopen.
     pub fn append(&mut self, op: &Op) -> Result<()> {
         let mut frame_buf = Vec::new();
         frame(op, &mut frame_buf)?;

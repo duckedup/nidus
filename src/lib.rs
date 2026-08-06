@@ -58,8 +58,6 @@ pub mod server;
 // ── AI ingest layer (epic nidus-54l) — all behind off-by-default features ────
 // The async edge: text-native `remember`/`recall` on top of the sync store
 // core, which depends on NONE of this. See Cargo.toml `[features]`.
-//
-// Shared HTTP retry helper for every reqwest-based adapter (embed + summarize).
 #[cfg(any(feature = "embed", feature = "summarize"))]
 mod http;
 // Provider capability registry (Embed | Summarize): the single source of truth
@@ -170,37 +168,17 @@ impl Nidus {
     /// Who this instance is within the store, and how current it is — role, whether it
     /// holds the writer handle, whether it has been **fenced**, and how stale a reader is
     /// (SPEC §14.6). See [`ClusterStatus`].
-    ///
-    /// Reads only in-RAM state, so it is safe to call as often as a health check needs.
     pub fn cluster_status(&self) -> ClusterStatus {
         self.store.cluster_status()
     }
 
     /// A lock-free handle to the facts a readiness probe needs — role, whether this writer
     /// has been fenced, and how stale a reader is. See [`Readiness`].
-    ///
-    /// Unlike [`cluster_status`](Self::cluster_status), reading through this handle takes no
-    /// lock at all, so a probe cannot be delayed — or answered wrongly — by a long write
-    /// holding the store guard. Take it once when the store opens and keep it: it shares the
-    /// store's atomics, so it never goes out of date.
     pub fn readiness(&self) -> Readiness {
         self.store.readiness()
     }
 
     /// A handle to this instance's cluster writer lease, for keeping it warm out of band.
-    ///
-    /// The lease is renewed at the start of every write batch, which is enough when batches
-    /// are short. A batch that takes longer than [`Config::lock_ttl`] — a very large upsert,
-    /// or a slow object-store PUT — would otherwise let a standby conclude the writer died
-    /// and take over, fencing a writer that was perfectly healthy and throwing away its
-    /// work. Renewing on a timer from this handle closes that window, and because the handle
-    /// is independent of the store lock it keeps working *during* the long write.
-    ///
-    /// This hands back a [`LeaseRenewer`] — a `Drop`-free handle — rather than the lease
-    /// itself, because the lease is an owning guard that releases on drop.
-    ///
-    /// `None` outside cluster mode, and for readers. `nidus serve` drives this itself; a
-    /// library caller embedding nidus in an async host can do the same.
     pub fn lease_renewer(&self) -> Option<LeaseRenewer> {
         self.store.lease_renewer()
     }
@@ -286,9 +264,6 @@ impl Nidus {
     }
 
     /// List records matching `filter` across a [`Scope`], without vector scoring.
-    /// Skips `offset` matches and returns up to `limit` more, in insertion order,
-    /// all with `score: 0.0`. Pass `offset = 0` for the first page; advance by
-    /// `limit` to paginate.
     pub fn list<'a>(
         &self,
         scope: impl Into<Scope<'a>>,
@@ -350,34 +325,6 @@ impl Nidus {
 
     /// Run `f` with the per-batch durable barrier **deferred**, so several mutations can
     /// share one fsync instead of taking one each — the group-commit primitive.
-    ///
-    /// Inside `f`, [`upsert`](Self::upsert)/[`delete`](Self::delete)/… append their bytes and
-    /// update the in-RAM index exactly as they always do, but issue no fsync. Afterwards
-    /// [`commit`](Self::commit) takes **one** barrier covering all of them. Nothing about the
-    /// durable write order changes: each batch is still appended data-before-log, and `commit`
-    /// still syncs `data` before `log`.
-    ///
-    /// # The contract you take on
-    ///
-    /// **Do not report any of `f`'s results as successful until [`commit`](Self::commit)
-    /// returns `Ok`.** Until then the bytes are appended but not durable — precisely the state
-    /// the lock-free reader rule drops from the tail on replay (SPEC §6.2). Acknowledging
-    /// before the barrier would turn this from "fewer fsyncs" into "silently weaker
-    /// durability", which is not a trade worth offering.
-    ///
-    /// This is what `nidus serve` does with concurrent writes: the request that reaches the
-    /// store first applies every other queued write too, one barrier covers the group, and
-    /// only then does each request get its `200`. That is where the per-call `~7.6ms` disk
-    /// barrier stops being paid once per request.
-    ///
-    /// # Notes
-    ///
-    /// * Nesting is safe — the previous setting is restored, including when `f` errors.
-    /// * A **panic** out of `f` skips the restore, leaving the store in the deferred state; a
-    ///   panic while holding a store this way should be treated as fatal to the store (in
-    ///   `nidus serve` it poisons the lock, which takes the instance out of service).
-    /// * Under [`Fsync::OnFlush`] this changes nothing: that policy already defers every
-    ///   barrier to `flush()`.
     pub fn deferred<T>(&mut self, f: impl FnOnce(&mut Nidus) -> Result<T>) -> Result<T> {
         let prev = self.store.begin_deferred();
         let out = f(self);
@@ -387,15 +334,6 @@ impl Nidus {
 
     /// Take the barrier that [`deferred`](Self::deferred) mutations skipped: fsync `data` then
     /// `log`, and in cluster mode publish the commit counter once for the whole group.
-    ///
-    /// A **no-op when no barrier is owed** — a caller on the ordinary per-batch path that
-    /// already synced pays a branch and nothing more, which is what keeps the uncontended
-    /// single-writer path exactly as fast as it was. Also a no-op under
-    /// [`Fsync::OnFlush`], where `flush()` is by definition the durability point.
-    ///
-    /// Narrower than [`flush`](Self::flush) on purpose: it takes the barrier and skips the
-    /// housekeeping (segment seal, shared working-set publish), which would otherwise put a
-    /// whole-working-set write on the hot path of every group.
     pub fn commit(&mut self) -> Result<()> {
         self.store.commit()
     }
@@ -417,12 +355,6 @@ impl Nidus {
     /// handle is a consistent snapshot taken when it opened; `refresh` advances it to the
     /// store's current committed state — picking up the writer's appends, seals, deletes,
     /// and compactions — at a single consistent point (never a torn mix).
-    ///
-    /// Returns `Ok(true)` when newer state was adopted and `Ok(false)` when the handle was
-    /// already current — the cheap common case, a single small manifest read plus a `log`
-    /// stat, so it is safe to call before a batch of queries. A `ReadWrite` handle (already
-    /// the source of truth) and an in-memory store always return `Ok(false)`. This is the
-    /// basis for a search-only process tracking a store another process is writing.
     pub fn refresh(&mut self) -> Result<bool> {
         self.store.refresh()
     }

@@ -1,13 +1,5 @@
 //! Criterion regression benchmarks for nidus — the "are we getting better / did we
 //! regress?" signal, complementing the cross-engine parity table.
-//!
-//! These exercise nidus through its PUBLIC API (open_in_memory → upsert → search), which
-//! drives the same dot-product + top-k hot paths as a real query, without any bench-only
-//! surface on the crate. criterion is a dev-dependency of nidus-bench only, so it never
-//! enters nidus's own build/test/CI path.
-//!
-//!   just bench-crit                        run all
-//!   just bench-crit --save-baseline main   record a baseline to diff later runs against
 
 use std::collections::BTreeMap;
 
@@ -158,19 +150,6 @@ fn bench_ingest(c: &mut Criterion) {
 
 /// The **file-backed** write path, across fsync policy and batch size — the regression
 /// lane for nidus-xb9.1 (group commit).
-///
-/// [`bench_ingest`] above cannot serve as that baseline: it uses `open_in_memory` and one
-/// 10k-record call, so it touches no filesystem, takes no disk barrier, and has no
-/// batch-size axis. Every quantity group commit is meant to move is invisible to it. This
-/// group opens a real store in a temp dir and varies the two things that actually decide
-/// write throughput.
-///
-/// This group is deliberately *small and few-sampled*, unlike every other one here. A
-/// `PerBatch` call costs a real disk barrier (~3.8ms on APFS, where `sync_all` is
-/// `F_FULLFSYNC`), so cost is driven by call count, and criterion's defaults would turn
-/// the `b1` row alone into several minutes on every `just bench-crit`. `n = 200` with
-/// `sample_size(10)` keeps the whole group to roughly twenty seconds while still
-/// resolving the thing being watched — the per-call barrier — to well inside a percent.
 fn bench_write_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_path");
     // The floor criterion allows. These are IO benchmarks whose variance comes from the

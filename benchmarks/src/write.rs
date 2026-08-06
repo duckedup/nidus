@@ -1,46 +1,4 @@
 //! nidus-bench-write — where a single writer's throughput actually goes (nidus-xb9).
-//!
-//! Epic nidus-xb9 asks whether writes should be scaled out past the one fenced writer
-//! lease. Its stated prerequisite is a measurement, because nidus-8fn had already found a
-//! 10–12× gap between in-process ingest (~139–169k vec/s) and ingest over HTTP (~14k/s)
-//! and attributed it, unverified, to "JSON float encoding". Scaling writers out before
-//! knowing which layer actually saturates would be optimising the wrong one.
-//!
-//! So this bench decomposes one writer's ingest path into the stages a vector actually
-//! passes through, and times each in isolation:
-//!
-//! | stage | what it is |
-//! | --- | --- |
-//! | `encode` | client turns `dim` floats into JSON — pure CPU, client side |
-//! | `decode` | server turns that JSON back into `Record`s — pure CPU, server side |
-//! | `append` | `Nidus::upsert` with [`Fsync::OnFlush`]: normalise, append, index |
-//! | `fsync` | the same upsert with [`Fsync::PerBatch`], minus `append` |
-//! | `http` | the real round trip against a live `nidus serve` |
-//!
-//! `http - (decode + append + fsync)` is then the residual: sockets, the tokio hop, the
-//! middleware stack, and the `RwLock`. Naming it as a residual rather than measuring it
-//! directly is deliberate — it is whatever is left, so nothing can hide in it.
-//!
-//! Two sweeps answer the questions the decomposition raises:
-//!
-//! * **Batch size.** Per-request costs (one fsync, one round trip) amortise over a batch;
-//!   per-vector costs (JSON) do not. The sweep separates them, which is the direct test of
-//!   option 1 in nidus-xb9 — batch coalescing / group commit.
-//! * **Concurrent clients.** Every write takes the store exclusively, so if throughput is
-//!   flat as clients rise the writer is lock-bound and only scale-out or a faster critical
-//!   section helps; if it rises, the bottleneck was above the store and a single writer
-//!   still has headroom.
-//!
-//! Run via `just bench-write [key=value ...]`:
-//!   n=50000              vectors ingested per pass
-//!   dim=384,768          embedding dimension(s)
-//!   batch=1,10,100,1000  records per upsert call/request
-//!   clients=1,2,4,8      concurrent HTTP writers (needs the `server` feature)
-//!   max_requests=500     ceiling on upsert calls per pass (see `Plan::new`)
-//!   seed=42              PRNG seed
-//!
-//! The HTTP half needs the `server` feature and a release `nidus` binary; without them
-//! the in-process decomposition still runs and says so.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -66,11 +24,6 @@ struct Args {
     max_requests: usize,
     seed: u64,
     /// Where to write the machine-readable run, if anywhere.
-    ///
-    /// A printed table is for reading; a baseline is for *diffing*. nidus-xb9.1 (group
-    /// commit) has to beat a specific number, and re-deriving that number by eyeballing
-    /// two terminal dumps is how a 10% regression goes unnoticed. Mirrors the parity
-    /// harness, which already emits `target/bench-results/<stamp>.json`.
     json: Option<PathBuf>,
 }
 
@@ -125,11 +78,6 @@ fn parse_args() -> Result<Args> {
 // ── the wire body ────────────────────────────────────────────────────────────
 
 /// Mirror of the server's `UpsertRequest` (`src/server/dto.rs`).
-///
-/// Copied rather than imported because that DTO is behind nidus's `cli` feature and is not
-/// public API. The point of this bench is that the bytes are identical to what the server
-/// parses, so if the two ever drift the decode measurement quietly stops measuring the
-/// server's work — the shape is one field and has been stable since the endpoint shipped.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WireBody {
     records: Vec<Record>,
@@ -151,10 +99,6 @@ fn batch_records(dataset: &Dataset, start: usize, len: usize) -> Vec<Record> {
 }
 
 /// The exact batches a pass will ingest, and how many vectors that adds up to.
-///
-/// Built once per `(n, batch)` and handed to every pass, so the in-process and HTTP
-/// numbers on one line are always over identical work — a decomposition whose stages
-/// measured different amounts of data would subtract to nonsense.
 struct Plan {
     /// `(start_row, len)` per upsert call.
     batches: Vec<(usize, usize)>,
@@ -164,13 +108,6 @@ struct Plan {
 
 impl Plan {
     /// Cover `n` rows in `batch`-sized calls, stopping after `max_requests` of them.
-    ///
-    /// The cap exists because small batches are dominated by *per-request* cost, and on
-    /// macOS `File::sync_all` is `F_FULLFSYNC` — a real drive barrier of several
-    /// milliseconds. At `batch=1` the uncapped sweep would be 50k barriers per pass, tens
-    /// of minutes to re-measure a per-request cost that a few thousand samples already
-    /// pin down. Throughput per vector is what is being measured, so a shorter pass costs
-    /// precision, not validity — and the effective `n` is printed rather than implied.
     fn new(n: usize, batch: usize, max_requests: usize) -> Plan {
         let batches: Vec<(usize, usize)> = (0..n)
             .step_by(batch)
@@ -205,10 +142,6 @@ fn codec_pass(dataset: &Dataset, plan: &Plan) -> Result<(Duration, Duration)> {
 }
 
 /// Time `Nidus::upsert` over every batch under one fsync policy.
-///
-/// Store creation is untimed; the closing `flush` is included, because under
-/// [`Fsync::OnFlush`] that is where durability is actually paid for and leaving it out
-/// would flatter the policy by exactly the cost being measured.
 fn store_pass(dataset: &Dataset, plan: &Plan, fsync: Fsync) -> Result<Duration> {
     let tmp = tempfile::Builder::new()
         .prefix("nidus-bench-write-")
@@ -355,10 +288,6 @@ fn stage_row(name: &str, d: Duration, n: usize, total: Duration) {
 }
 
 /// Write the run as JSON for diffing against a later one.
-///
-/// Records the knobs alongside the numbers: a baseline compared against a run with a
-/// different `n`, `seed` or `max_requests` is not a comparison, and without the inputs
-/// in the file there is nothing to catch that.
 fn write_json(path: &Path, args: &Args, cells: &[Value]) -> Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)

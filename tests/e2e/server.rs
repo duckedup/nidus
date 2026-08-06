@@ -210,14 +210,6 @@ fn second_server_on_the_same_dir_is_refused() {
 }
 
 /// Cluster mode is refused on a backend without compare-and-swap (nidus-lp4.2).
-///
-/// A local-filesystem store trips the earlier "must be a shared object store" guard, so
-/// this asserts the guard chain as a user meets it: `--cluster` on a local store never
-/// starts, and the reason names what is missing rather than failing obscurely later.
-///
-/// The CAS requirement itself matters because cluster safety *is* the conditional write —
-/// without it the lease is advisory, two instances can both think they hold it, and the
-/// mid-batch fence does not exist at all.
 #[test]
 fn cluster_mode_is_refused_without_the_required_backends() {
     let dir = tempfile::tempdir().unwrap();
@@ -342,16 +334,6 @@ fn opt_in_flags_reach_the_running_store() {
 }
 
 /// **A long write must not make the instance report NOT ready** (nidus-abx.3).
-///
-/// Readiness used to be answered through `cluster_status`, which needs the store lock: a
-/// large upsert holds the write guard for its whole duration, `try_read` returned
-/// `WouldBlock`, and the probe turned that into a `503`. Kubernetes would then pull the
-/// instance out of the Service in the middle of the very batch it existed to perform — and
-/// for a cluster writer there is no second instance to take the traffic.
-///
-/// The in-process test `a_busy_store_is_still_ready` proves the property deterministically by
-/// holding the guard directly; this one proves it survives the real binary, a real socket,
-/// and a genuinely long write.
 #[test]
 fn a_long_write_does_not_make_the_instance_report_unready() {
     let dir = tempfile::tempdir().unwrap();
@@ -400,21 +382,6 @@ fn a_long_write_does_not_make_the_instance_report_unready() {
 
 /// **Group commit does not weaken durability: every acknowledged concurrent write survives
 /// SIGKILL** (nidus-xb9.1).
-///
-/// This is the assertion the ticket asks for, and the only one that can be trusted. Group
-/// commit is a promise that N writes share one disk barrier *without* any of them being
-/// acknowledged early — and a throughput number cannot tell the difference between keeping
-/// that promise and quietly dropping the barrier. Only a crash can.
-///
-/// So: hammer one server with concurrent writers, keep the id of every write that came back
-/// `200`, `SIGKILL` the process (nothing flushes, no destructor runs, no graceful shutdown),
-/// restart over the same directory, and demand that every single acknowledged id is there. A
-/// bug that acknowledged before the barrier — or that let one group's barrier cover a write
-/// appended after it — shows up here as a missing record, and nowhere else.
-///
-/// The concurrency is what makes it a group-commit test rather than a restatement of
-/// `killed_server_leaves_data_intact_and_lock_reclaimable`: with a single client every group
-/// has one member and the shared barrier is never exercised at all.
 #[test]
 fn every_acknowledged_concurrent_write_survives_sigkill() {
     let dir = tempfile::tempdir().unwrap();

@@ -1,22 +1,6 @@
 //! Object-store live-backing adapters (SPEC §13.7): the seam that lets a **live** store
 //! run on a whole-object [`Persistence`] backend (S3/GCS) that has no native append or
 //! `O_EXCL` lock.
-//!
-//! - [`ObjectAppender`] backs a `data`/`log` segment by an in-RAM buffer (reusing
-//!   [`MemAppender`]'s append/truncate/read mechanics) and rewrites the whole object with
-//!   one atomic [`Persistence::put`] on `sync`/`rewrite`. So the segments keep their exact
-//!   append-then-fsync discipline; the object store just turns each "fsync" into a
-//!   whole-object rewrite (O(object), the cost §13.5 names).
-//! - [`object_try_lock`] is the writer lock for object stores: a TTL'd lock object,
-//!   released by deleting it on drop. A fresh acquire goes through the backend's atomic
-//!   create-if-absent ([`Persistence::try_create_exclusive`] — S3 `If-None-Match: *`,
-//!   GCS `ifGenerationMatch=0`), so exactly one of N racing writers wins — **race-free**.
-//!   A backend without that primitive falls back to a best-effort get-then-put
-//!   (**advisory**: two writers racing the gap could both acquire), which still suits
-//!   nidus's single-writer / low-write-rate positioning.
-//!
-//! Both hold an `Arc` of the same backend the store uses, so segments, caches, and the
-//! lock all go through one client.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -153,12 +137,6 @@ impl Drop for ObjectLock {
 /// Writer lock over a whole-object backend (S3/GCS). `Ok(Some)` when the lock object was
 /// absent (claimed) or older than `ttl` (a crashed holder — reclaimed); `Ok(None)` when a
 /// fresh holder has it (contention, never an error).
-///
-/// A fresh acquire uses the backend's atomic create-if-absent
-/// ([`Persistence::try_create_exclusive`]), so among N writers racing an unlocked store
-/// exactly one wins — **race-free**. Only a backend that returns `None` from that method
-/// (no atomic primitive) falls back to a best-effort get-then-put (**advisory** — the read
-/// and write are not atomic).
 pub fn object_try_lock(
     persistence: &Arc<dyn Persistence>,
     key: &str,
@@ -307,12 +285,6 @@ pub struct ClusterLease {
 }
 
 /// A **non-owning** handle that can renew a lease but never releases it.
-///
-/// Deliberately separate from [`ClusterLease`], which is an owning guard: its `Drop`
-/// deletes the lease object. Cloning the guard to hand a copy to a renewer would therefore
-/// release the lease the moment that copy was dropped — a self-inflicted split-brain, since
-/// a peer's create-if-absent then succeeds against the briefly-absent object. Renewal needs
-/// the key and owner token, not ownership, so it gets its own `Drop`-free type.
 #[derive(Clone)]
 pub struct LeaseRenewer {
     persistence: Arc<dyn Persistence>,
@@ -321,23 +293,12 @@ pub struct LeaseRenewer {
     /// Latched when a renewal proves the lease **definitively** lost. Shared with the owning
     /// store's `fenced` flag, so an out-of-band renewal failure is *observable* rather than
     /// only logged (nidus-lp4.7).
-    ///
-    /// A background renewer is the first thing to learn the lease is gone — it runs every
-    /// `lock_ttl/3` where a write may not come for minutes. Before this, that discovery was
-    /// printed to stderr and dropped on the floor: the store's `fenced` flag was set only by
-    /// a *failing write*, so a superseded writer kept answering `/ready` with 200 and
-    /// reporting `holds_writer_handle: true` until traffic happened to arrive. Sharing the
-    /// latch is what makes readiness honest the moment the lease is lost, which is the whole
-    /// point of nidus-lp4.1.
     fenced: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LeaseRenewer {
     /// Re-stamp the lease, extending its TTL. Errors if this instance has been superseded
     /// — the same fencing signal a write would hit.
-    ///
-    /// A definitive loss ([`LeaseLost`]) latches the shared `fenced` flag; a transient
-    /// backend error does not, so a dropped connection fails this renewal and nothing more.
     pub fn renew(&self) -> Result<()> {
         match renew_lease_object(&self.persistence, &self.key, &self.owner) {
             Err(e) if is_lease_lost(&e) => {
@@ -350,12 +311,6 @@ impl LeaseRenewer {
 }
 
 /// Latch a store's `fenced` flag, counting the transition exactly once.
-///
-/// Both the out-of-band renewer above and the op-driven pre-batch renew in
-/// `store::write` discover a definitive loss and must latch. `swap` rather than `store`
-/// so `nidus_lease_fenced_total` counts the *transition*: fencing is permanent, so a
-/// counter that ticked on every subsequent failed write would report an escalating
-/// problem where there is one, unchanging fact.
 pub(crate) fn latch_fenced(fenced: &std::sync::atomic::AtomicBool) {
     if !fenced.swap(true, std::sync::atomic::Ordering::AcqRel) {
         crate::metrics::metrics().lease_fenced.inc();
@@ -364,9 +319,6 @@ pub(crate) fn latch_fenced(fenced: &std::sync::atomic::AtomicBool) {
 
 impl ClusterLease {
     /// A `Drop`-free handle for renewing this lease out of band — see [`LeaseRenewer`].
-    ///
-    /// `fenced` is the owning store's latch, shared so that a lease lost on a background
-    /// renewal is recorded where readiness can see it.
     pub fn renewer(&self, fenced: Arc<std::sync::atomic::AtomicBool>) -> LeaseRenewer {
         LeaseRenewer {
             persistence: self.persistence.clone(),
@@ -377,9 +329,6 @@ impl ClusterLease {
     }
 
     /// This instance's fencing token — the owner id written into the lease object.
-    /// Surfaced for operator introspection (`nidus-lp4.5`): during an incident the first
-    /// question is which instance holds the lease, and comparing this against the lease
-    /// object answers it.
     pub fn owner(&self) -> &str {
         &self.owner
     }
@@ -489,9 +438,6 @@ fn renew_lease_object_inner(
                         }
                     }
                     // No conditional overwrite on this backend: fall back to the plain put.
-                    // Cluster mode refuses such a backend outright (nidus-lp4.2), so this is
-                    // only reachable for a single-node advisory lock, where it is the
-                    // documented limit rather than a hole.
                     CasOutcome::Unsupported => {
                         persistence.put(key, &body).context("renew writer lease")
                     }
@@ -566,17 +512,6 @@ fn parse_owner(bytes: &[u8]) -> Option<String> {
 }
 
 /// Lease tracing at `debug` level (`NIDUS_LOG=debug`, or the legacy `NIDUS_LEASE_DEBUG=1`).
-///
-/// Kept in-tree deliberately: what defeated the first pass at nidus-lp4.7 was not being able
-/// to tell which instance a log line came from, so every line carries the emitting process's
-/// pid, the key, and the TTL actually in force. A lease bug is a multi-process race that
-/// reproduces on a real object store and nowhere else — when it happens again, this is the
-/// difference between an afternoon and a week.
-///
-/// It now routes through the general levelled logger (nidus-abx.4) rather than its own
-/// env-var switch, so lease tracing turns up and down with everything else instead of being
-/// a one-subsystem special case — but `NIDUS_LEASE_DEBUG` still works, because runbooks and
-/// CI jobs set it.
 fn lease_debug(args: std::fmt::Arguments<'_>) {
     crate::diag::diag!(
         crate::diag::Level::Debug,
@@ -589,12 +524,6 @@ fn lease_debug(args: std::fmt::Arguments<'_>) {
 /// The error a renewal returns when this instance has **definitively** lost the lease to
 /// another — as distinct from a transient backend failure (a dropped connection, a 5xx from
 /// the object store), which says nothing about who holds the lease.
-///
-/// The two demand opposite responses, which is why they need telling apart (nidus-lp4.7).
-/// Losing the lease is permanent: the instance can never write again and must latch `fenced`
-/// so a readiness probe pulls it out of rotation. A transient error must fail only the
-/// request in flight — latching on a network blip would take a perfectly healthy writer out
-/// of service for good, the same availability trap that once made standbys crash-loop.
 #[derive(Debug)]
 pub struct LeaseLost(String);
 
@@ -619,19 +548,6 @@ fn lease_lost(msg: impl Into<String>) -> anyhow::Error {
 }
 
 /// Whether a lock/lease stamped at `stamp` is still **live** at `now` under `ttl`.
-///
-/// The comparison is `age <= ttl`, not `age < ttl`, and the extra second is not slack — it is
-/// what makes the test sound (nidus-lp4.7). Stamps have **one-second granularity**, so an age
-/// computed from two truncated stamps can read a full second higher than the time that
-/// actually elapsed: a lease renewed at `t=1.99` (stamped `1`) and read at `t=3.01` (now `3`)
-/// reads as `age=2` after only 1.02s. Under a strict `age < ttl` that lease is declared dead
-/// at `ttl=2` while its holder is alive and renewing — a peer then reclaims it and both
-/// instances believe they hold the writer handle.
-///
-/// So: reclaim only once the age is *certainly* past the TTL. Real elapsed time is greater
-/// than `age - 1`, hence `age >= ttl + 1` is the first safe moment. The cost is bounded and
-/// on the right side — a takeover happens within `ttl..=ttl+1` seconds rather than
-/// `ttl-1..=ttl` — and it is availability, not safety, that pays.
 pub(super) fn is_live(now: u64, stamp: u64, ttl: Duration) -> bool {
     now.saturating_sub(stamp) <= ttl.as_secs()
 }

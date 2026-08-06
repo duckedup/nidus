@@ -1,22 +1,4 @@
 //! Embedding abstraction + provider adapters (epic nidus-54l, tickets .1/.2/.3).
-//!
-//! The [`Embedder`] trait turns natural-language text into a dense `Vec<f32>`
-//! ready to hand to the sync store. Concrete adapters live in the sibling
-//! provider files, each gated behind its own `embed-<name>` feature; the
-//! runtime-selectable [`AnyEmbedder`] enum wraps whichever ones were compiled
-//! in and is what callers hold.
-//!
-//! The trait uses **native `async` methods** (return-position `impl Future`),
-//! so it is intentionally **not** object-safe — there is no `Box<dyn Embedder>`.
-//! Dispatch across providers goes through the closed [`AnyEmbedder`] enum.
-//!
-//! ## Providers
-//!
-//! - Voyage, OpenAI, Ollama, Cohere, Gemini, Mistral, Jina embedders, plus the
-//!   generic `openai-compat` catch-all (Azure/Together/Fireworks/vLLM/LiteLLM/…).
-//! - OpenAI, Mistral, Jina, and openai-compat all speak the same
-//!   `/v1/embeddings` wire shape, so they share one request/parse helper
-//!   ([`openai_shaped`]). Voyage, Cohere, and Gemini are bespoke.
 
 use std::fmt;
 
@@ -240,10 +222,6 @@ pub fn embedder_identity(e: &impl Embedder) -> String {
 
 /// One variant per compiled-in provider. This is the concrete type callers
 /// hold; it implements [`Embedder`] by delegating to the wrapped adapter.
-///
-/// With **zero** provider features enabled the enum has no variants (it is
-/// uninhabited) and [`build`](AnyEmbedder::build) always returns a
-/// [`EmbedError::Config`] telling you which feature to turn on.
 pub enum AnyEmbedder {
     #[cfg(feature = "embed-voyage")]
     Voyage(voyage::VoyageEmbedder),
@@ -276,9 +254,6 @@ impl AnyEmbedder {
     /// Build an embedder for `provider` from `config`. Async because some
     /// adapters (Ollama, openai-compat) probe their embedding dimension with a
     /// live call during construction.
-    ///
-    /// Returns [`EmbedError::Config`] when the requested provider's feature was
-    /// not compiled in.
     pub async fn build(provider: EmbedProvider, config: EmbedConfig) -> Result<Self, EmbedError> {
         // Fill in the provider default when the caller left the model empty.
         // This references both `provider` and `config` unconditionally, so the
@@ -483,11 +458,6 @@ pub(crate) fn resolve_base(base_url: Option<&str>, default: &str) -> String {
 /// POST `body` as JSON to `url`, with bounded retry, mapping the outcome onto
 /// [`EmbedError`]: transport failure → [`EmbedError::Backend`], non-2xx →
 /// [`EmbedError::Api`], and a 2xx body that will not parse → [`EmbedError::Decode`].
-///
-/// `api_key` becomes a bearer header when `Some`; `headers` are applied verbatim
-/// (that is how Gemini passes `x-goog-api-key` and how callers pass their extra
-/// headers). This is the ONE shared request/response helper for every hosted
-/// adapter (the dedupe rule).
 #[cfg(any(
     feature = "embed-voyage",
     feature = "embed-openai",
@@ -626,12 +596,6 @@ pub(crate) mod testutil {
     use std::thread;
 
     /// What the mock captured about the single request it served.
-    ///
-    /// `#[allow(dead_code)]`: this is shared test scaffolding. Which fields a
-    /// given provider's tests assert on varies (some check `method`, some only
-    /// `path`/`body`), so a single-provider build (e.g. only `embed-openai-compat`)
-    /// legitimately leaves one unread — that is not dead code, just unused by that
-    /// one adapter's suite.
     #[allow(dead_code)]
     pub struct Captured {
         pub method: String,

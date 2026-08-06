@@ -1,9 +1,5 @@
 //! LanceDB adapter — exact brute-force KNN via `bypass_vector_index` (no IVF/HNSW),
 //! the apples-to-apples match for nidus.
-//!
-//! LanceDB's API is async; the harness is sync, so this adapter owns a tokio runtime and
-//! `block_on`s each call. Inserts go through an Arrow `RecordBatch` (UInt64 ids +
-//! FixedSizeList<Float32>); the query stream is collected with `futures`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -1,16 +1,4 @@
 //! Single-shot text summarization (epic nidus-54l, tickets .7/.8).
-//!
-//! The optional "summarize-then-embed" leg of the AI ingest layer: given a
-//! blob of arbitrary text, produce a dense, retrieval-friendly summary that is
-//! a better embedding target than the raw text. nidus knows nothing about the
-//! caller's domain — unlike the code-specific summarizer this was ported from,
-//! the trait here is a single generic [`Summarizer::summarize`] over `(text,
-//! opts)`.
-//!
-//! The public surface is a native-async trait (RPITIT, no `async_trait`, no
-//! `Box<dyn>`), a typed [`SummarizeError`] at the edge, a [`SummarizeConfig`]
-//! builder, the [`SummarizeProvider`] selector, and the closed [`AnySummarizer`]
-//! enum that dispatches to whichever provider adapters were compiled in.
 
 pub mod prompts;
 
@@ -26,11 +14,6 @@ use crate::providers::{self, Capability};
 // ── Trait ───────────────────────────────────────────────────────────────────
 
 /// Turns arbitrary text into a dense, search-friendly summary.
-///
-/// Native async: [`summarize`](Self::summarize) returns an
-/// `impl Future + Send` rather than boxing, so callers pay no allocation and the
-/// trait stays object-unsafe by design — dispatch across providers goes through
-/// the closed [`AnySummarizer`] enum, not `dyn Summarizer`.
 pub trait Summarizer: Send + Sync {
     /// Summarize `text` into retrieval-friendly prose.
     fn summarize(

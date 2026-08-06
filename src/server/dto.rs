@@ -1,10 +1,4 @@
 //! Wire types for the HTTP API and the CLI's JSON I/O.
-//!
-//! Request bodies deserialize into these; responses serialize out of them. The
-//! core library types `Record`/`Value`/`Filter` already derive serde, so they ride
-//! the wire directly. `Hit`/`Footprint` deliberately do *not* (the library keeps
-//! its serde surface intentional), so we mirror them here and convert at the edge —
-//! the binary layer adapts to the library, never the reverse.
 
 use std::collections::BTreeMap;
 
@@ -96,12 +90,6 @@ pub struct HybridSearchRequest {
 
 /// Body of `POST /collections/{name}/fts-schema`: the attribute fields to full-text
 /// index. Every field uses the US English analyzer — the only [`Language`] today.
-///
-/// Forward-compat note: when a second language ships, expressing per-field language
-/// over the wire means evolving `fields` from `Vec<String>` to a typed
-/// `Vec<{ field, language }>`. That is a breaking wire change, deliberately deferred
-/// until there is a second language to choose (the library API already takes
-/// `(field, Language)` pairs, so only this DTO + handler need to grow).
 #[derive(Debug, Deserialize)]
 pub struct FtsSchemaRequest {
     pub fields: Vec<String>,
@@ -122,11 +110,6 @@ pub struct ListRequest {
 }
 
 /// Body of `POST /collections/{name}/remember` (the `memory` feature).
-///
-/// Text in: the server embeds `text` (optionally summarizing it first when
-/// `mode` is `"summarize"`) and upserts a record under `id` with `attrs`. The
-/// embedder is chosen at serve time (`--embed-provider …`); a request to this
-/// route on a server started without one is a `400`.
 #[cfg(feature = "memory")]
 #[derive(Debug, Deserialize)]
 pub struct RememberRequest {
@@ -141,10 +124,6 @@ pub struct RememberRequest {
 }
 
 /// Body of `POST /collections/{name}/recall` (the `memory` feature).
-///
-/// Query text in, ranked hits out: the server embeds `query` and runs a vector
-/// search over `collection`. Mirrors [`SearchRequest`] minus the caller-supplied
-/// vector (which the server produces from `query`).
 #[cfg(feature = "memory")]
 #[derive(Debug, Deserialize)]
 pub struct RecallRequest {

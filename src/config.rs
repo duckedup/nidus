@@ -10,17 +10,6 @@ use crate::model::{AnnConfig, Distance, Quantization};
 
 /// What a [`OpenMode::ReadWrite`] open does when another instance already holds the
 /// writer handle.
-///
-/// The default, [`Fail`](LeaseWait::Fail), is the historical behaviour: contention is
-/// immediately the "store is locked" error. That is right for a CLI command and for the
-/// single-writer case, but it makes a *hot standby* impossible — a second instance started
-/// while the incumbent is alive exits at once, so under a supervisor it crash-loops, and
-/// failover takes however long the supervisor's backoff has grown to.
-///
-/// Waiting instead turns that into a supported standby: the process stays up, retries
-/// acquisition, and takes over within roughly [`Config::lock_ttl`] of the holder dying.
-/// This needs no coordinator and no consensus — the object store's compare-and-swap is
-/// already the linearizable authority that makes exactly one claimant win (SPEC §14.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum LeaseWait {
     /// Fail immediately on contention. The default.
@@ -78,13 +67,6 @@ pub struct Config {
     /// How stale a read-only instance may be before it should stop serving. `None` (the
     /// default) means no bound — the historical behaviour, where a reader serves its
     /// snapshot for as long as it likes.
-    ///
-    /// A cluster reader only advances when something calls `refresh()`, so without a bound
-    /// a reader whose refresher has died serves ever-older results indefinitely and looks
-    /// perfectly healthy doing it. With a bound set, [`ClusterStatus::staleness_secs`]
-    /// exceeding it is what `nidus serve`'s readiness probe fails on, so a load balancer
-    /// takes the instance out of rotation instead. Purely a *reporting* threshold: reads
-    /// are never rejected by the library itself.
     pub max_staleness: Option<Duration>,
     /// Hard ceiling on the vector matrix (`rows * dimension * 4` bytes); `None`
     /// disables (the default — no behavior change). Enforced *before* allocating:
@@ -125,9 +107,6 @@ pub struct Config {
     /// Roll the active segment into an immutable one once it reaches this many rows
     /// (SPEC §14.2/§14.4 — "WAL→segment"). `None` (the default) never auto-seals, so a
     /// store stays a single segment and behaves exactly as the pre-segment monolith did.
-    /// When set, `upsert`/`flush` seal the active segment past the threshold and start a
-    /// fresh one; the segment set is named by the `manifest`, the atomic commit point.
-    /// A soft bound: a single batch is never split, so a segment can exceed it by one batch.
     pub segment_max_rows: Option<u64>,
     /// Build a per-segment IVF index over each **immutable** segment that holds at least
     /// this many rows (SPEC §14.3 — "brute-force is the tail, not the engine"). `None`
@@ -165,12 +144,6 @@ pub struct Config {
     /// holds a heartbeated **lease** and advances the manifest on every commit, and any number
     /// of [`ReadOnly`](OpenMode::ReadOnly) readers that pick up its writes via
     /// [`refresh`](crate::Nidus::refresh). Default `false` (single-node).
-    ///
-    /// When `true`, the store is rejected unless **both** [`persistence`](Self::persistence) is
-    /// a shared object store (`s3://…`/`gs://…`) **and** [`memory`](Self::memory) is a shared
-    /// tier (`redis://…`) — local files / process RAM are single-node by definition. It is not
-    /// a managed cluster: there is no coordinator, replication, or rebalancing — the object
-    /// store plus the versioned manifest *are* the coordination.
     pub cluster: bool,
 }
 

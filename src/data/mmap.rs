@@ -1,12 +1,6 @@
 //! The one memory-map seam (SPEC §9 / §14.6 phase 3). This module is the **sole** place in
 //! the crate that uses `unsafe`: it wraps the platform `mmap` syscall (via `memmap2`) behind a
 //! safe [`MappedSegment`] that hands out a read-only `&[u8]` view of an immutable segment file.
-//!
-//! Everything outside this module — including the `&[u8]` → `&[f32]` reinterpret in
-//! [`DataSegment`](super::DataSegment) — stays in safe Rust (the cast goes through
-//! `bytemuck::cast_slice`, sound by the on-disk layout invariant: `mmap` returns a
-//! page-aligned base and the fixed 64-byte header leaves the row region 4-aligned with a
-//! length that is a multiple of `size_of::<f32>()` — see `mmap_rows` in the parent module).
 
 use std::fs::File;
 use std::path::Path;

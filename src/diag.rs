@@ -91,9 +91,6 @@ pub(crate) fn enabled(lvl: Level) -> bool {
 }
 
 /// Emit one logfmt line. Called only from [`diag!`], which has already checked the level.
-///
-/// `msg` is a `Display` rather than a `&str` so a call site can hand over a
-/// `format_args!` without allocating for a line that a level check might still drop.
 pub(crate) fn emit(
     lvl: Level,
     target: &str,
@@ -167,12 +164,6 @@ macro_rules! diag {
 pub(crate) use diag;
 
 /// A UTC RFC 3339 timestamp with millisecond precision, from `std` alone.
-///
-/// Rendering a human-readable date is the one thing structured logging needs that `std`
-/// does not hand over. Pulling `chrono`/`time` into the *library* tree for it would be a
-/// dependency decision (CLAUDE.md) for ~20 lines of arithmetic, and unix millis in the log
-/// would push the conversion onto whoever is reading stderr at 3am. So: the standard
-/// civil-from-days algorithm, era-based and exact for every date `SystemTime` can hold.
 struct Timestamp(u64);
 
 impl Timestamp {
