@@ -465,10 +465,8 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/collections/{name}/remember", post(remember))
         .route("/collections/{name}/recall", post(recall));
 
-    // The MCP `2026-07-28` surface (nidus-zm2). Nested *here*, before the `.layer()` calls
-    // below, so it inherits the whole middleware stack — body limit, backpressure, bearer
-    // auth, metrics — rather than growing its own copy of each. That is what keeps it an
-    // adapter: `mcp::service` returns a plain `tower` service and owns no policy.
+    // The MCP surface (nidus-zm2), nested *before* the `.layer()` calls below so it inherits
+    // the whole middleware stack instead of growing its own copy of each layer.
     #[cfg(feature = "mcp")]
     let router = router.nest_service("/mcp", mcp::service(state.clone(), max_body_bytes));
 

@@ -252,18 +252,9 @@ impl RunningServer {
 
     /// `POST path` with a JSON body plus caller-supplied headers.
     ///
-    /// Exists for the MCP suite, whose protocol lives partly *in the headers*:
-    /// `2026-07-28` requires `Mcp-Method`/`Mcp-Name` on every Streamable HTTP POST so
-    /// gateways can route without parsing the body, and it needs an `Accept` naming both
-    /// `application/json` and `text/event-stream`. Testing that surface through
-    /// [`post`](Self::post) would be testing a different protocol.
-    ///
-    /// A later header of the same name overrides an earlier one, so a caller can pass a
-    /// deliberately wrong `Mcp-Name` after a right one to exercise header/body mismatch.
-    ///
-    /// Gated on `mcp` because that suite is its only caller and a plain `cli` build compiles
-    /// this file with the suite cfg'd out — where an ungated helper is dead code, and
-    /// `lint-cli` runs with `-D warnings`.
+    /// For the MCP suite, which carries part of its protocol in headers (`Mcp-Method`,
+    /// `Mcp-Name`). A later header of the same name wins, so a test can append a wrong
+    /// `Mcp-Name` to exercise header/body mismatch. `mcp`-gated: else it is dead code.
     #[cfg(feature = "mcp")]
     pub fn post_with_headers(
         &self,

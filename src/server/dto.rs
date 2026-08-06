@@ -28,11 +28,8 @@ pub struct DeleteRequest {
     pub filter: Option<Filter>,
 }
 
-/// The default result count, shared by every surface that takes a `top_k`.
-///
-/// `pub(super)` so the MCP tools reuse it rather than picking their own number — a store
-/// that returned 10 hits over HTTP and a different count over MCP for the same query would
-/// be a confusing difference with no reason behind it.
+/// The default result count. `pub(super)` so the MCP tools share it rather than picking
+/// their own, which would answer one query two different ways depending on the surface.
 pub(super) fn default_top_k() -> usize {
     10
 }

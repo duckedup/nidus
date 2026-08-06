@@ -236,6 +236,17 @@ each.
   stay private. When you add a big new concern to an already-large module, prefer a
   new sibling file over appending to it — and move the matching tests into the
   module's own `tests.rs` rather than growing one giant test block.
+- **Comments: 3 lines maximum, and they must add clarity.** This is a hard cap on every
+  comment and doc comment — `//`, `///`, `//!` — counting the whole block, including any
+  `///` blank separators. A comment earns its place by saying something the code cannot:
+  the non-obvious *why*, a constraint that will bite, a bug it guards against. It does not
+  earn its place by restating the code, justifying the design at length, arguing with an
+  imagined reviewer, or recording the history of how the decision was reached. **Rationale
+  that needs more than three lines belongs in the commit message, the PR, `SPEC.md`, or a
+  `bd` issue — not above the code.** When trimming, keep the fact and drop the argument:
+  "rmcp reports `rmcp 3.1.1` here, not this crate" beats a paragraph explaining why that
+  matters. Long comments are not thoroughness; they push the code off the screen and go
+  stale where prose in a commit cannot.
 - **Commit style**: emoji prefix + short description (e.g. `🪺 op-log codec`).
 - **Issue tracking**: `bd` (beads) — run `bd ready` for available work.
 - **Branch workflow**: one branch per issue or bundled epic, push for PR review.
