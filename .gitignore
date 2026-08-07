@@ -26,3 +26,6 @@
 .dolt/
 *.db
 .beads-credential-key
+
+# Agent worktrees (created inside the repo by isolated subagent runs)
+.claude/worktrees/
