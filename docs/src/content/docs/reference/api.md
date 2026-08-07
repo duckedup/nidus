@@ -123,6 +123,7 @@ pub enum Predicate {
     Eq(String, Value),      // attrs[key] == value
     Ne(String, Value),      // attrs[key] present and != value
     Glob(String, String),   // attrs[key] is a Str matching the glob (* ? [..])
+    IGlob(String, String),  // same, ignoring ASCII case
     In(String, Vec<Value>), // attrs[key] is one of the values
     NotIn(String, Vec<Value>), // attrs[key] present and not one of the values
     Lt(String, Value),      // attrs[key] <  value  (same-type, orderable)

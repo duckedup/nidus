@@ -43,6 +43,10 @@ pub fn matches(filter: &Filter, attrs: &BTreeMap<String, Value>) -> bool {
             Some(Value::Str(s)) => crate::glob::glob_match(pattern, s),
             _ => false,
         },
+        Predicate::IGlob(key, pattern) => match attrs.get(key) {
+            Some(Value::Str(s)) => crate::glob::glob_match_ascii_ci(pattern, s),
+            _ => false,
+        },
         Predicate::In(key, set) => match attrs.get(key) {
             Some(v) => set.contains(v),
             None => false,
@@ -269,6 +273,67 @@ mod tests {
         let a = attrs(&[("kind", Value::Str("file".into()))]);
         let f = filter(vec![Predicate::Glob("kind".into(), "file".into())]);
         assert!(matches(&f, &a));
+    }
+
+    // ── IGlob predicate ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn iglob_folds_ascii_case() {
+        let a = attrs(&[("path", Value::Str("src/finance/rates.rs".into()))]);
+        let f = filter(vec![Predicate::IGlob(
+            "path".into(),
+            "Src/Finance/*".into(),
+        )]);
+        assert!(matches(&f, &a));
+    }
+
+    #[test]
+    fn iglob_where_glob_would_miss() {
+        // The predicate pair on identical inputs — the whole point of IGlob.
+        let a = attrs(&[("file", Value::Str("README.md".into()))]);
+        assert!(!matches(
+            &filter(vec![Predicate::Glob("file".into(), "*.MD".into())]),
+            &a
+        ));
+        assert!(matches(
+            &filter(vec![Predicate::IGlob("file".into(), "*.MD".into())]),
+            &a
+        ));
+    }
+
+    #[test]
+    fn iglob_still_respects_the_pattern() {
+        let a = attrs(&[("path", Value::Str("tests/foo.rs".into()))]);
+        let f = filter(vec![Predicate::IGlob("path".into(), "SRC/*".into())]);
+        assert!(!matches(&f, &a));
+    }
+
+    #[test]
+    fn iglob_non_str_value_fails() {
+        // Same type discipline as Glob: only a Str attr is matchable.
+        let a = attrs(&[("x", Value::Int(42))]);
+        let f = filter(vec![Predicate::IGlob("x".into(), "*".into())]);
+        assert!(!matches(&f, &a));
+    }
+
+    #[test]
+    fn iglob_absent_key_fails() {
+        let a = BTreeMap::new();
+        let f = filter(vec![Predicate::IGlob("path".into(), "src/*".into())]);
+        assert!(!matches(&f, &a));
+    }
+
+    #[test]
+    fn iglob_non_ascii_is_not_folded() {
+        let a = attrs(&[("path", Value::Str("docs/café.md".into()))]);
+        assert!(matches(
+            &filter(vec![Predicate::IGlob("path".into(), "DOCS/café.MD".into())]),
+            &a
+        ));
+        assert!(!matches(
+            &filter(vec![Predicate::IGlob("path".into(), "DOCS/CAFÉ.MD".into())]),
+            &a
+        ));
     }
 
     // ── In predicate ─────────────────────────────────────────────────────────────
@@ -718,6 +783,7 @@ mod tests {
             Predicate::Le("d".into(), Value::Int(10)),
             Predicate::Gt("e".into(), Value::Int(10)),
             Predicate::Ge("f".into(), Value::Int(10)),
+            Predicate::IGlob("g".into(), "src/*".into()),
         ];
         let f = filter(preds);
         let bytes = bincode::serialize(&f).unwrap();

@@ -144,7 +144,8 @@ hits, err := db.Search(ctx, nidus.SearchRequest{
 })
 ```
 
-Predicates: `Eq`, `Ne`, `Glob`, `In`, `NotIn`, `Lt`, `Le`, `Gt`, `Ge`. They take `any`
+Predicates: `Eq`, `Ne`, `Glob`, `IGlob`, `In`, `NotIn`, `Lt`, `Le`, `Gt`, `Ge`. `IGlob`
+is `Glob` with ASCII case folded on both sides. They take `any`
 so `nidus.Eq("year", 2024)` reads naturally; a value the store has no type for (a
 float, say) is remembered on the predicate and surfaces as an ordinary error from the
 call that used the filter. Check it earlier with `Predicate.Err()` / `Filter.Err()`.

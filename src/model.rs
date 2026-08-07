@@ -252,6 +252,8 @@ pub enum Predicate {
     Ne(String, Value),
     /// `attrs[key]` is a [`Value::Str`] matching the glob pattern.
     Glob(String, String),
+    /// [`Predicate::Glob`], ignoring ASCII case on both sides. Non-ASCII is not folded.
+    IGlob(String, String),
     /// `attrs[key]` is equal to one of the values in the set.
     In(String, Vec<Value>),
     /// `attrs[key]` is present and *not* equal to any value in the set.

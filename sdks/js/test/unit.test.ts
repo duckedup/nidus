@@ -62,6 +62,12 @@ describe("filter builder", () => {
       { Glob: ["path", "src/*"] },
     ]);
   });
+
+  it("tags iglob distinctly from glob, sharing the bare-string operand", () => {
+    const pred = f.iglob("path", "Src/*") as { IGlob: [string, string] };
+    expect(pred).toEqual({ IGlob: ["path", "Src/*"] });
+    expect(typeof pred.IGlob[1]).toBe("string");
+  });
 });
 
 describe("NidusClient request shaping", () => {

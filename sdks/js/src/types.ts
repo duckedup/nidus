@@ -56,6 +56,7 @@ export type Predicate =
   | { Eq: [string, Value] }
   | { Ne: [string, Value] }
   | { Glob: [string, string] }
+  | { IGlob: [string, string] }
   | { In: [string, Value[]] }
   | { NotIn: [string, Value[]] }
   | { Lt: [string, Value] }

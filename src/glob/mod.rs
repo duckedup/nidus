@@ -7,6 +7,15 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     match_pattern(&pat, &txt)
 }
 
+/// [`glob_match`], folding ASCII case on both sides. Sound because `to_ascii_lowercase` is a
+/// per-char map that leaves every metacharacter (`*?[]!^-`) alone, so pattern structure survives
+/// and `[A-Z]` folds to `[a-z]`. Non-ASCII is passthrough: `É` never matches `é`.
+pub fn glob_match_ascii_ci(pattern: &str, text: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let txt: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+    match_pattern(&pat, &txt)
+}
+
 /// Parses a character class starting after the `[`. Returns `(matched, chars_consumed)`
 /// where `chars_consumed` is the number of pattern chars consumed (not including the `[`).
 /// If the class is unterminated (no `]`), returns `None` so the caller treats `[` literally.
@@ -149,7 +158,7 @@ fn match_pattern(pat: &[char], txt: &[char]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::glob_match;
+    use super::{glob_match, glob_match_ascii_ci};
 
     // ── Literal matches ──────────────────────────────────────────────────────────
 
@@ -445,5 +454,103 @@ mod tests {
         assert!(glob_match("?*", "a")); // one char, then any
         assert!(glob_match("?*", "ab"));
         assert!(!glob_match("?*", "")); // needs at least one char
+    }
+
+    // ── ASCII-case-insensitive matching ───────────────────────────────────────────
+
+    #[test]
+    fn ci_literal_folds_both_directions() {
+        assert!(glob_match_ascii_ci("HELLO", "hello"));
+        assert!(glob_match_ascii_ci("hello", "HELLO"));
+        assert!(glob_match_ascii_ci("HeLlO", "hElLo"));
+        assert!(!glob_match_ascii_ci("hello", "world"));
+    }
+
+    #[test]
+    fn ci_is_a_superset_of_case_sensitive_matching() {
+        // Anything the case-sensitive matcher accepts, the folding one must accept too.
+        for (pat, txt) in [
+            ("src/*.rs", "src/main.rs"),
+            ("file?.rs", "file1.rs"),
+            ("[0-9]", "5"),
+            ("[!0-9]", "a"),
+            ("*", ""),
+            ("a**c", "aXc"),
+        ] {
+            assert!(glob_match(pat, txt), "case-sensitive: {pat} vs {txt}");
+            assert!(glob_match_ascii_ci(pat, txt), "folding: {pat} vs {txt}");
+        }
+    }
+
+    #[test]
+    fn ci_path_prefix_scope() {
+        // The wdpkr `--scope Src/Finance` case: a shell tab-completes a casing the index
+        // does not store, and the scope must still match.
+        assert!(glob_match_ascii_ci("Src/Finance/*", "src/finance/rates.rs"));
+        assert!(glob_match_ascii_ci("src/finance/*", "Src/Finance/Rates.rs"));
+        assert!(!glob_match("Src/Finance/*", "src/finance/rates.rs"));
+    }
+
+    #[test]
+    fn ci_extension_match() {
+        assert!(glob_match_ascii_ci("*.MD", "README.md"));
+        assert!(glob_match_ascii_ci("*.md", "README.MD"));
+        assert!(!glob_match("*.MD", "README.md"));
+    }
+
+    #[test]
+    fn ci_uppercase_class_folds_to_lowercase() {
+        // `[A-Z]` must not become unmatchable once the text is folded.
+        assert!(glob_match_ascii_ci("[A-Z]", "m"));
+        assert!(glob_match_ascii_ci("[A-Z]", "M"));
+        assert!(glob_match_ascii_ci("[a-z]", "M"));
+        assert!(glob_match_ascii_ci("file[A-Z].rs", "filex.rs"));
+    }
+
+    #[test]
+    fn ci_negated_class_folds() {
+        assert!(!glob_match_ascii_ci("[!A-Z]", "m"));
+        assert!(!glob_match_ascii_ci("[!a-z]", "M"));
+        assert!(glob_match_ascii_ci("[!a-z]", "5"));
+    }
+
+    #[test]
+    fn ci_digit_and_punctuation_classes_are_unaffected() {
+        assert!(glob_match_ascii_ci("[0-9_]", "3"));
+        assert!(glob_match_ascii_ci("[0-9_]", "_"));
+        assert!(!glob_match_ascii_ci("[0-9_]", "a"));
+    }
+
+    #[test]
+    fn ci_metacharacters_keep_their_meaning() {
+        // Folding must not disturb `*`, `?`, or class syntax.
+        assert!(glob_match_ascii_ci("A*C", "abbbc"));
+        assert!(glob_match_ascii_ci("A?C", "abc"));
+        assert!(!glob_match_ascii_ci("A?C", "ac"));
+        assert!(glob_match_ascii_ci("[ABC", "[abc")); // unterminated `[` is still literal
+    }
+
+    #[test]
+    fn ci_non_ascii_is_not_folded() {
+        // Deliberate: a locale-dependent fold would make the same pattern mean different
+        // things on different machines.
+        assert!(glob_match_ascii_ci("héllo", "héllo"));
+        assert!(!glob_match_ascii_ci("HÉLLO", "héllo"));
+        assert!(glob_match_ascii_ci("HÉLLO", "HÉLLO"));
+        // The ASCII letters around a non-ASCII char still fold.
+        assert!(glob_match_ascii_ci("Hé*O", "héllo"));
+    }
+
+    #[test]
+    fn ci_anchoring_is_unchanged() {
+        assert!(!glob_match_ascii_ci("AB", "xab"));
+        assert!(!glob_match_ascii_ci("AB", "abx"));
+        assert!(glob_match_ascii_ci("AB", "ab"));
+    }
+
+    #[test]
+    fn ci_empty_pattern() {
+        assert!(glob_match_ascii_ci("", ""));
+        assert!(!glob_match_ascii_ci("", "X"));
     }
 }

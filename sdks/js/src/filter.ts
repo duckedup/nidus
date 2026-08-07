@@ -24,6 +24,13 @@ export const f = {
   }),
   /** `attrs[key]` is a `Str` matching the glob pattern (`*`, `?`, `[..]`). */
   glob: (key: string, pattern: string): Predicate => ({ Glob: [key, pattern] }),
+  /**
+   * {@link f.glob}, ignoring **ASCII** case on both sides — `"Src/*"` matches
+   * `"src/main.rs"`. Non-ASCII is not folded (`É` does not match `é`).
+   */
+  iglob: (key: string, pattern: string): Predicate => ({
+    IGlob: [key, pattern],
+  }),
   /** `attrs[key]` equals one of `values`. */
   in: (key: string, values: AttrInput[]): Predicate => ({
     In: [key, values.map(encodeValue)],
