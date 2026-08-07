@@ -8,7 +8,7 @@ use super::quant::{BinState, Int8State, Quant};
 use super::scoring::PARALLEL_SCAN_WORK_FLOOR;
 use super::*;
 use crate::Fsync;
-use crate::model::{Filter, Predicate, Quantization, Record, SearchOpts, Value};
+use crate::model::{Filter, ListOpts, Predicate, Quantization, Record, SearchOpts, Value};
 use crate::search::normalize;
 
 /// Extract the int8 state from a store's quant slot, panicking if it is off or binary.
@@ -36,8 +36,7 @@ fn rec_with(id: &str, vector: Vec<f32>, attrs: BTreeMap<String, Value>) -> Recor
 fn default_opts(top_k: usize) -> SearchOpts {
     SearchOpts {
         top_k,
-        filter: Filter::default(),
-        min_score: None,
+        ..Default::default()
     }
 }
 
@@ -246,8 +245,8 @@ fn min_score_filters_low_results() {
     // Query along y — score will be ~0.0, below min_score of 0.5.
     let opts = SearchOpts {
         top_k: 5,
-        filter: Filter::default(),
         min_score: Some(0.5),
+        ..Default::default()
     };
     let hits = store.search(&["col"], &[0.0, 1.0, 0.0], &opts).unwrap();
     assert!(hits.is_empty(), "doc should be filtered by min_score");
@@ -277,7 +276,7 @@ fn filter_scoping_in_search() {
             "lang".to_string(),
             Value::Str("rust".to_string()),
         )]),
-        min_score: None,
+        ..Default::default()
     };
     let hits = store.search(&["col"], &[1.0, 0.0, 0.0], &opts).unwrap();
     assert_eq!(hits.len(), 1);
@@ -938,8 +937,8 @@ fn euclidean_min_score_filters() {
         .unwrap();
     let opts = SearchOpts {
         top_k: 5,
-        filter: Filter::default(),
         min_score: Some(-1.0),
+        ..Default::default()
     };
     let hits = store.search(&["col"], &[0.0, 0.0], &opts).unwrap();
     assert!(
@@ -1072,7 +1071,15 @@ fn list_returns_all_matching() {
         "lang".to_string(),
         Value::Str("rust".to_string()),
     )]);
-    let hits = store.list(&["col"], &filter, 0, 100).unwrap();
+    let hits = store
+        .list(
+            &["col"],
+            &ListOpts {
+                filter,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert_eq!(hits.len(), 2);
     let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
     assert!(ids.contains(&"r1"));
@@ -1088,7 +1095,15 @@ fn list_respects_limit() {
             .upsert("col", &[rec(&format!("d{i}"), vec![i as f32, 0.0])])
             .unwrap();
     }
-    let hits = store.list(&["col"], &Filter::default(), 0, 3).unwrap();
+    let hits = store
+        .list(
+            &["col"],
+            &ListOpts {
+                limit: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert_eq!(hits.len(), 3);
 }
 
@@ -1097,7 +1112,15 @@ fn list_scores_are_zero() {
     let mut store = Store::in_memory(2).unwrap();
     store.create_collection("col").unwrap();
     store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
-    let hits = store.list(&["col"], &Filter::default(), 0, 10).unwrap();
+    let hits = store
+        .list(
+            &["col"],
+            &ListOpts {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].score, 0.0);
 }
@@ -1108,7 +1131,7 @@ fn list_empty_filter_returns_all() {
     store.create_collection("col").unwrap();
     store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
     store.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
-    let hits = store.list(&["col"], &Filter::default(), 0, 100).unwrap();
+    let hits = store.list(&["col"], &ListOpts::default()).unwrap();
     assert_eq!(hits.len(), 2);
 }
 
@@ -1119,7 +1142,7 @@ fn list_multi_collection() {
     store.create_collection("b").unwrap();
     store.upsert("a", &[rec("x", vec![1.0, 0.0])]).unwrap();
     store.upsert("b", &[rec("y", vec![0.0, 1.0])]).unwrap();
-    let hits = store.list(&["a", "b"], &Filter::default(), 0, 100).unwrap();
+    let hits = store.list(&["a", "b"], &ListOpts::default()).unwrap();
     assert_eq!(hits.len(), 2);
 }
 
@@ -1133,7 +1156,7 @@ fn list_insertion_order() {
     store
         .upsert("col", &[rec("second", vec![0.0, 1.0])])
         .unwrap();
-    let hits = store.list(&["col"], &Filter::default(), 0, 100).unwrap();
+    let hits = store.list(&["col"], &ListOpts::default()).unwrap();
     assert_eq!(hits[0].id, "first");
     assert_eq!(hits[1].id, "second");
 }
@@ -1152,12 +1175,19 @@ fn list_offset_paginates() {
     let mut paged: Vec<String> = Vec::new();
     for page in 0..4 {
         let hits = store
-            .list(&["col"], &Filter::default(), page * 3, 3)
+            .list(
+                &["col"],
+                &ListOpts {
+                    offset: page * 3,
+                    limit: 3,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         paged.extend(hits.into_iter().map(|h| h.id));
     }
     let full: Vec<String> = store
-        .list(&["col"], &Filter::default(), 0, 100)
+        .list(&["col"], &ListOpts::default())
         .unwrap()
         .into_iter()
         .map(|h| h.id)
@@ -1174,7 +1204,16 @@ fn list_offset_past_end_is_empty() {
     let mut store = Store::in_memory(2).unwrap();
     store.create_collection("col").unwrap();
     store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
-    let hits = store.list(&["col"], &Filter::default(), 5, 10).unwrap();
+    let hits = store
+        .list(
+            &["col"],
+            &ListOpts {
+                offset: 5,
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert!(hits.is_empty());
 }
 
@@ -1316,7 +1355,7 @@ fn scan_cache_whole_store_filter_matches_subset_path() {
             "tag".to_string(),
             Value::Str("keep".to_string()),
         )]),
-        min_score: None,
+        ..Default::default()
     };
     let hits = store.search(&["col"], &[1.0, 0.0, 0.0], &opts).unwrap();
     let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
@@ -1426,7 +1465,7 @@ fn quantized_search_with_filter() {
             "lang".to_string(),
             Value::Str("rust".to_string()),
         )]),
-        min_score: None,
+        ..Default::default()
     };
     let hits = store.search(&["col"], &[1.0, 0.0, 0.0], &opts).unwrap();
     assert_eq!(hits.len(), 1);
@@ -1842,8 +1881,8 @@ fn parallel_search_respects_filter_and_min_score() {
     // A min_score floor must be honored across all worker chunks.
     let opts = SearchOpts {
         top_k: 30,
-        filter: Filter::default(),
         min_score: Some(0.99),
+        ..Default::default()
     };
     let hits = parallel.search(&["col"], &q, &opts).unwrap();
     assert!(hits.iter().all(|h| h.score >= 0.99));
@@ -2080,7 +2119,7 @@ fn ann_post_filter_returns_only_matching() {
             "kind".to_string(),
             Value::Str("b".to_string()),
         )]),
-        min_score: None,
+        ..Default::default()
     };
     let hits = s.search(&["col"], &data[1], &opts).unwrap();
     assert!(!hits.is_empty(), "filtered ANN should still return results");
@@ -2264,7 +2303,7 @@ fn ann_selective_filter_keeps_exact_recall() {
             let opts = SearchOpts {
                 top_k: k,
                 filter: rare_filter(),
-                min_score: None,
+                ..Default::default()
             };
             let got = ann.search(&["col"], q, &opts).unwrap();
             let want = exact.search(&["col"], q, &opts).unwrap();
@@ -2413,7 +2452,15 @@ fn list_includes_text_only_docs() {
             ],
         )
         .unwrap();
-    let hits = store.list(&["col"], &Filter::default(), 0, 10).unwrap();
+    let hits = store
+        .list(
+            &["col"],
+            &ListOpts {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
     assert_eq!(
         ids,
@@ -3004,7 +3051,7 @@ fn text_search_respects_filter_and_delete() {
             "lang".to_string(),
             Value::Str("rust".to_string()),
         )]),
-        min_score: None,
+        ..Default::default()
     };
     let hits = store
         .text_search(&["docs"], &FtsQuery::new("body", "shared"), &opts)
@@ -4619,4 +4666,107 @@ fn a_refused_query_is_not_counted_as_a_served_one() {
         unmoved,
         "a rejected query must not move the served-query counter"
     );
+}
+
+/// A caller-supplied `top_k` reached the bounded heap's reservation unclamped and aborted
+/// on "capacity overflow" (nidus-m50.17). It must simply return everything there is.
+#[test]
+fn an_absurd_top_k_returns_every_doc_instead_of_panicking() {
+    let mut store = Store::in_memory(3).unwrap();
+    store.create_collection("col").unwrap();
+    store
+        .upsert(
+            "col",
+            &[rec("a", vec![1.0, 0.0, 0.0]), rec("b", vec![0.0, 1.0, 0.0])],
+        )
+        .unwrap();
+    let huge = store
+        .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(usize::MAX / 2))
+        .unwrap();
+    // Identical to a sane `top_k` over the same store: the clamp bounds only the allocation.
+    let sane = store
+        .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(10))
+        .unwrap();
+    assert_eq!(huge, sane);
+    assert_eq!(huge.len(), 2);
+    assert_eq!(huge[0].id, "a");
+}
+
+/// A frozen record of `hybrid_search`'s exact output, asserted bit-for-bit so the RRF
+/// extraction into `crate::fuse` cannot quietly change a fused score or a tie-break.
+#[test]
+// BM25's `idf` calls `ln`, which Miri evaluates non-deterministically; the fused bits
+// then vary by an ULP run-to-run. Real float semantics make these exact.
+#[cfg_attr(miri, ignore)]
+fn hybrid_search_is_unchanged_by_the_fusion_extraction() {
+    let (store, vector, text) = golden_fixture();
+    // Ids paired with the exact bits of their fused score, most relevant first.
+    let ranked = |top_k, rrf_k, candidates| -> Vec<(String, u32)> {
+        let opts = HybridOpts {
+            top_k,
+            rrf_k,
+            candidates,
+            ..Default::default()
+        };
+        store
+            .hybrid_search(&["docs"], &vector, &text, &opts)
+            .unwrap()
+            .iter()
+            .map(|h| (h.id.clone(), h.score.to_bits()))
+            .collect()
+    };
+    let frozen = |pairs: &[(&str, u32)]| -> Vec<(String, u32)> {
+        pairs
+            .iter()
+            .map(|(id, b)| ((*id).to_string(), *b))
+            .collect()
+    };
+
+    assert_eq!(
+        ranked(5, 60.0, 100),
+        frozen(&[
+            ("a", 1023751753),
+            ("d", 1023476752),
+            ("c", 1015434122),
+            ("b", 1015292168),
+            ("e", 1015154721),
+        ])
+    );
+    // A non-default `rrf_k`, and `candidates` below `top_k` so the leg-depth clamp runs.
+    assert_eq!(
+        ranked(3, 5.0, 2),
+        frozen(&[("a", 1050573288), ("c", 1042983595), ("b", 1041385765)])
+    );
+}
+
+/// Five docs spanning every fusion case: both legs, vector-only, text-only, and a doc
+/// each leg ranks differently — so a change in either leg or in the fusion shows up.
+fn golden_fixture() -> (Store, Vec<f32>, FtsQuery) {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .unwrap();
+    let mut a = Record::new("a", vec![1.0, 0.0, 0.0], BTreeMap::new());
+    a.attrs.insert(
+        "body".to_string(),
+        Value::Str("quantum physics lecture notes".to_string()),
+    );
+    let mut b = Record::new("b", vec![0.9, 0.1, 0.0], BTreeMap::new());
+    b.attrs.insert(
+        "body".to_string(),
+        Value::Str("unrelated cooking recipe".to_string()),
+    );
+    let c = doc("c", "quantum physics quantum entanglement");
+    let mut d = Record::new("d", vec![0.0, 1.0, 0.0], BTreeMap::new());
+    d.attrs.insert(
+        "body".to_string(),
+        Value::Str("the physics of cooking".to_string()),
+    );
+    let e = Record::new("e", vec![0.5, 0.5, 0.0], BTreeMap::new());
+    store.upsert("docs", &[a, b, c, d, e]).unwrap();
+    (
+        store,
+        vec![1.0, 0.0, 0.0],
+        FtsQuery::new("body", "quantum physics"),
+    )
 }

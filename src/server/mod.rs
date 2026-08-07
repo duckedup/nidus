@@ -22,10 +22,10 @@ use axum::{
 use serde_json::{Value as JsonValue, json};
 use tokio::net::TcpListener;
 
-use crate::{FtsQuery, HybridOpts, Language, Nidus, Record, Scope, SearchOpts};
+use crate::{FtsQuery, HybridOpts, Language, ListOpts, Nidus, Record, Scope, SearchOpts};
 use dto::{
     AnnDto, DeleteRequest, FootprintDto, FtsSchemaRequest, HitDto, HybridSearchRequest,
-    ListRequest, SearchRequest, TextSearchRequest, UpsertRequest,
+    ListRequest, MAX_TOP_K, SearchRequest, TextSearchRequest, UpsertRequest,
 };
 
 // ── AI-ingest (memory) imports: only under the `memory` feature (pulled by the
@@ -657,6 +657,7 @@ async fn search(
     State(st): State<AppState>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
+    check_top_k(req.top_k)?;
     let hits = run_read(st, move |db| {
         let SearchRequest {
             query,
@@ -699,7 +700,12 @@ async fn list(
             limit,
             filter,
         } = req;
-        scoped(&scope, |s| db.list(s, &filter, offset, limit))
+        let opts = ListOpts {
+            offset,
+            limit,
+            filter,
+        };
+        scoped(&scope, |s| db.list(s, &opts))
     })
     .await?;
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
@@ -726,6 +732,7 @@ async fn text_search(
     State(st): State<AppState>,
     Json(req): Json<TextSearchRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
+    check_top_k(req.top_k)?;
     let hits = run_read(st, move |db| {
         let TextSearchRequest {
             field,
@@ -751,6 +758,7 @@ async fn hybrid_search(
     State(st): State<AppState>,
     Json(req): Json<HybridSearchRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
+    check_top_k(req.top_k)?;
     let hits = run_read(st, move |db| {
         let HybridSearchRequest {
             vector,
@@ -880,6 +888,7 @@ async fn recall(
     Path(name): Path<String>,
     Json(req): Json<RecallRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
+    check_top_k(req.top_k)?;
     let embedder = st.embedder.clone().ok_or_else(missing_embedder_error)?;
 
     let RecallRequest {
@@ -986,13 +995,23 @@ impl ApiError {
 
     /// A `400 Bad Request` with a caller-facing message (e.g. a memory route hit
     /// on a server started without an embedder, or an unknown `remember` mode).
-    #[cfg(feature = "memory")]
     fn bad_request(err: anyhow::Error) -> Self {
         ApiError {
             status: StatusCode::BAD_REQUEST,
             err,
         }
     }
+}
+
+/// Refuse an absurd `top_k` at the edge (nidus-m50.17): a `k` in the billions is a bad
+/// request, not a deep query, and nothing downstream should have to survive one.
+fn check_top_k(top_k: usize) -> Result<(), ApiError> {
+    if top_k > MAX_TOP_K {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "top_k {top_k} exceeds the maximum of {MAX_TOP_K}"
+        )));
+    }
+    Ok(())
 }
 
 /// Map a store error to an HTTP status. Defaults to `500`; recognises the
@@ -1175,6 +1194,55 @@ mod tests {
         assert_eq!(stats["ann"], JsonValue::Null); // exact search by default
         assert_eq!(stats["collections"], json!(["docs"]));
         assert_eq!(stats["footprint"]["doc_count"], 2);
+    }
+
+    /// A `top_k` nothing clamps used to reach the bounded top-k heap and abort the process
+    /// on "capacity overflow" (nidus-m50.17). The edge must call it a bad request instead.
+    #[tokio::test]
+    async fn an_absurd_top_k_is_a_bad_request_not_a_panic() {
+        let app = test_router(3);
+        for (path, body) in [
+            (
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": usize::MAX / 2}),
+            ),
+            (
+                "/text-search",
+                json!({"field": "body", "query": "x", "top_k": MAX_TOP_K + 1}),
+            ),
+            (
+                "/hybrid-search",
+                json!({"vector": [1, 0, 0], "field": "body", "text": "x", "top_k": MAX_TOP_K + 1}),
+            ),
+        ] {
+            let resp = app.clone().oneshot(post(path, body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+            let err = json_body(resp).await["error"].as_str().unwrap().to_string();
+            assert!(err.contains("top_k"), "{path}: {err}");
+        }
+    }
+
+    /// The bound is a ceiling, not a narrowing: everything up to it still searches.
+    #[tokio::test]
+    async fn a_top_k_at_the_maximum_still_searches() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [{"id": "a", "vector": [1, 0, 0], "attrs": {}}]}),
+            ))
+            .await
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": MAX_TOP_K}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await[0]["id"], "a");
     }
 
     /// Before the store opens — a standby awaiting promotion — liveness must answer while

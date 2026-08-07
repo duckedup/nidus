@@ -152,8 +152,7 @@ async fn main() -> anyhow::Result<()> {
     // maps onto the store's SearchOpts — top_k, a score floor, and an optional metadata filter.
     let opts = RecallOpts {
         top_k: 3,
-        min_score: 0.0,
-        filter: None,
+        ..Default::default()
     };
     let hits = memory
         .recall("notes", "how do users sign in?", &opts)

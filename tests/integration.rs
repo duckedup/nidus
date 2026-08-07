@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use nidus::{
-    AnnConfig, Config, Distance, Filter, Nidus, OpenMode, Predicate, Quantization, Record, Scope,
-    SearchOpts, Value,
+    AnnConfig, Config, Distance, Filter, ListOpts, Nidus, OpenMode, Predicate, Quantization,
+    Record, Scope, SearchOpts, Value,
 };
 
 fn rec(id: &str, vector: Vec<f32>, kind: &str) -> Record {
@@ -94,7 +94,7 @@ fn filter_and_min_score() {
             "kind".into(),
             Value::Str("file".into()),
         )]),
-        min_score: None,
+        ..Default::default()
     };
     let hits = db.search("c", &[1.0, 0.0, 0.0], &filtered).unwrap();
     assert!(hits.iter().all(|h| h.id != "sym1"));
@@ -102,8 +102,8 @@ fn filter_and_min_score() {
     // min_score drops the orthogonal "far".
     let gated = SearchOpts {
         top_k: 10,
-        filter: Filter::default(),
         min_score: Some(0.5),
+        ..Default::default()
     };
     let hits = db.search("c", &[1.0, 0.0, 0.0], &gated).unwrap();
     assert!(hits.iter().all(|h| h.id != "far"));
@@ -412,21 +412,45 @@ fn nested_filters_and_containment_through_the_store() {
             &SearchOpts {
                 top_k: 10,
                 filter: f.clone(),
-                min_score: None,
+                ..Default::default()
             },
         )
         .unwrap();
     assert_eq!(ids(hits), vec!["b", "c"]);
 
     // The same filter through `list`, which takes the non-scoring path.
-    assert_eq!(ids(db.list("c", &f, 0, 10).unwrap()), vec!["b", "c"]);
+    assert_eq!(
+        ids(db
+            .list(
+                "c",
+                &ListOpts {
+                    filter: f,
+                    limit: 10,
+                    ..Default::default()
+                }
+            )
+            .unwrap()),
+        vec!["b", "c"]
+    );
 
     // ContainsAny overlaps on either candidate.
     let any_tag = Filter(vec![Predicate::ContainsAny(
         "tags".into(),
         vec![Value::Str("go".into()), Value::Str("wip".into())],
     )]);
-    assert_eq!(ids(db.list("c", &any_tag, 0, 10).unwrap()), vec!["a", "c"]);
+    assert_eq!(
+        ids(db
+            .list(
+                "c",
+                &ListOpts {
+                    filter: any_tag,
+                    limit: 10,
+                    ..Default::default()
+                }
+            )
+            .unwrap()),
+        vec!["a", "c"]
+    );
 
     // delete_where resolves a nested filter to ids before logging, so this is also
     // the check that a group survives the write path.
@@ -441,7 +465,15 @@ fn nested_filters_and_containment_through_the_store() {
         .unwrap();
     assert_eq!(removed, 1); // only "c" lacks the rust tag
     assert_eq!(
-        ids(db.list("c", &Filter::default(), 0, 10).unwrap()),
+        ids(db
+            .list(
+                "c",
+                &ListOpts {
+                    limit: 10,
+                    ..Default::default()
+                }
+            )
+            .unwrap()),
         vec!["a", "b", "d"]
     );
 }

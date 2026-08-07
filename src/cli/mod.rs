@@ -11,8 +11,8 @@ use serde::Serialize;
 
 use crate::server::dto::{AnnDto, FootprintDto, HitDto};
 use crate::{
-    AnnConfig, Config, Distance, Filter, Fsync, FtsQuery, HybridOpts, Language, LeaseWait, Nidus,
-    OpenMode, Quantization, Record, Scope, SearchOpts,
+    AnnConfig, Config, Distance, Filter, Fsync, FtsQuery, HybridOpts, Language, LeaseWait,
+    ListOpts, Nidus, OpenMode, Quantization, Record, Scope, SearchOpts,
 };
 
 // AI-ingest (memory) wiring for `serve`: only under the `memory` feature (pulled
@@ -789,11 +789,16 @@ pub fn run(cli: Cli) -> Result<()> {
                 Some(s) => serde_json::from_str(&s)?,
                 None => Filter::default(),
             };
+            let opts = ListOpts {
+                offset,
+                limit,
+                filter,
+            };
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
             let hits = if refs.is_empty() {
-                db.list(Scope::All, &filter, offset, limit)?
+                db.list(Scope::All, &opts)?
             } else {
-                db.list(Scope::Collections(&refs), &filter, offset, limit)?
+                db.list(Scope::Collections(&refs), &opts)?
             };
             let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
             print_json(&out)

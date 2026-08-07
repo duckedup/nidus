@@ -332,6 +332,27 @@ pub struct SearchOpts {
     pub min_score: Option<f32>,
 }
 
+/// Query parameters for a metadata-only listing (no vector scoring).
+#[derive(Clone, Debug)]
+pub struct ListOpts {
+    /// How many matches to skip before collecting, for pagination.
+    pub offset: usize,
+    /// Maximum number of records returned. Defaults to 100.
+    pub limit: usize,
+    /// Metadata filter; the default matches every record.
+    pub filter: Filter,
+}
+
+impl Default for ListOpts {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            limit: 100,
+            filter: Filter::default(),
+        }
+    }
+}
+
 /// Options for a hybrid (vector + BM25) search, fused with Reciprocal Rank Fusion.
 #[derive(Clone, Debug)]
 pub struct HybridOpts {
@@ -359,12 +380,31 @@ impl Default for HybridOpts {
 
 /// One search result. Carries its source `collection` (ids are unique only within a
 /// collection) and the matched record's `attrs`, but deliberately not its vector.
+/// `#[non_exhaustive]`: build one with [`Hit::new`] so added fields stay additive.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Hit {
     pub collection: String,
     pub id: String,
     pub score: f32,
     pub attrs: BTreeMap<String, Value>,
+}
+
+impl Hit {
+    /// One result from `collection`, scored `score`, carrying the record's `attrs`.
+    pub fn new(
+        collection: impl Into<String>,
+        id: impl Into<String>,
+        score: f32,
+        attrs: BTreeMap<String, Value>,
+    ) -> Self {
+        Self {
+            collection: collection.into(),
+            id: id.into(),
+            score,
+            attrs,
+        }
+    }
 }
 
 /// A cheap, allocation-free snapshot of a store's RAM/disk footprint — the hook a host uses to

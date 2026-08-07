@@ -1,6 +1,6 @@
 ---
 title: API reference
-description: The full nidus public surface — Nidus, Config, Record, Value, Filter, Predicate, Scope, SearchOpts, FtsQuery, HybridOpts, Hit, Footprint.
+description: The full nidus public surface — Nidus, Config, Record, Value, Filter, Predicate, Scope, SearchOpts, FtsQuery, HybridOpts, ListOpts, Hit, Footprint.
 ---
 
 The complete public API. All fallible methods return `anyhow::Result`. For the
@@ -54,7 +54,7 @@ searchers plus one writer (see
 
 | Method | Signature | Notes |
 | ------ | --------- | ----- |
-| `list` | `fn list<'a>(&self, scope: impl Into<Scope<'a>>, filter: &Filter, offset: usize, limit: usize) -> Result<Vec<Hit>>` | Metadata-only query — no vector, returns filter-matched records in insertion order; `offset`/`limit` paginate. |
+| `list` | `fn list<'a>(&self, scope: impl Into<Scope<'a>>, opts: &ListOpts) -> Result<Vec<Hit>>` | Metadata-only query — no vector, returns filter-matched records in insertion order; `ListOpts`'s `offset`/`limit` paginate. |
 | `search` | `fn search<'a>(&self, scope: impl Into<Scope<'a>>, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>` | Ranked search over a scope using the store's distance metric. |
 | `text_search` | `fn text_search<'a>(&self, scope: impl Into<Scope<'a>>, query: &FtsQuery, opts: &SearchOpts) -> Result<Vec<Hit>>` | [BM25 full-text search](/guides/search/#full-text-search-bm25); `min_score` is a raw BM25 floor. |
 | `hybrid_search` | `fn hybrid_search<'a>(&self, scope: impl Into<Scope<'a>>, vector: &[f32], text: &FtsQuery, opts: &HybridOpts) -> Result<Vec<Hit>>` | [Hybrid vector + BM25](/guides/search/#hybrid-search-rrf), fused with Reciprocal Rank Fusion. |
@@ -226,17 +226,42 @@ pub struct HybridOpts {
 Implements `Default` (`top_k: 10`). There is no `min_score` — a fused RRF score has no
 absolute scale.
 
+## `ListOpts`
+
+Options for the metadata-only `list` query.
+
+```rust
+pub struct ListOpts {
+    pub offset: usize,   // matches to skip, for pagination
+    pub limit: usize,    // maximum records returned (default 100)
+    pub filter: Filter,  // metadata filter; default matches everything
+}
+```
+
+Implements `Default` — `ListOpts { limit: 20, ..Default::default() }` is the
+idiomatic call.
+
 ## `Hit`
 
 One search result. Carries its source collection and the matched attrs, but
-**not** the vector.
+**not** the vector. `#[non_exhaustive]`: build one with `Hit::new`.
 
 ```rust
+#[non_exhaustive]
 pub struct Hit {
     pub collection: String,
     pub id: String,
     pub score: f32,   // meaning depends on the store's Distance metric
     pub attrs: BTreeMap<String, Value>,
+}
+
+impl Hit {
+    pub fn new(
+        collection: impl Into<String>,
+        id: impl Into<String>,
+        score: f32,
+        attrs: BTreeMap<String, Value>,
+    ) -> Self;
 }
 ```
 

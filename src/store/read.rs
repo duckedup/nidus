@@ -12,8 +12,9 @@ use crate::ann::Walk;
 use crate::config::Config;
 use crate::filter;
 use crate::fts::Language;
+use crate::fuse::{FusionLeg, rrf_fuse};
 use crate::model::{
-    AnnConfig, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts, SearchOpts, Value,
+    AnnConfig, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts, ListOpts, SearchOpts,
 };
 use crate::search::{TopK, dot, euclidean_neg_sq, normalize};
 
@@ -79,14 +80,8 @@ impl Store {
             .collect()
     }
 
-    /// List records matching `filter` across `collections`, without vector scoring.
-    pub fn list(
-        &self,
-        collections: &[&str],
-        filter: &Filter,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Vec<Hit>> {
+    /// List records matching `opts.filter` across `collections`, without vector scoring.
+    pub fn list(&self, collections: &[&str], opts: &ListOpts) -> Result<Vec<Hit>> {
         let cap: usize = collections
             .iter()
             .filter_map(|c| self.collections.get(*c))
@@ -100,7 +95,7 @@ impl Store {
                 continue;
             };
             for (id, entry) in &col.docs {
-                if !filter::matches(filter, &entry.attrs) {
+                if !filter::matches(&opts.filter, &entry.attrs) {
                     continue;
                 }
                 scan.push((entry.row, col_name, id.as_str()));
@@ -115,8 +110,8 @@ impl Store {
         });
         let results = scan
             .iter()
-            .skip(offset)
-            .take(limit)
+            .skip(opts.offset)
+            .take(opts.limit)
             .map(|&(_, collection, id)| {
                 let attrs = self
                     .collections
@@ -124,12 +119,7 @@ impl Store {
                     .and_then(|c| c.docs.get(id))
                     .map(|e| e.attrs.clone())
                     .unwrap_or_default();
-                Hit {
-                    collection: collection.to_string(),
-                    id: id.to_string(),
-                    score: 0.0,
-                    attrs,
-                }
+                Hit::new(collection, id, 0.0, attrs)
             })
             .collect();
         Ok(results)
@@ -435,39 +425,17 @@ impl Store {
         let leg_opts = SearchOpts {
             top_k: opts.candidates.max(opts.top_k),
             filter: opts.filter.clone(),
-            min_score: None,
+            ..Default::default()
         };
         let vector_leg = self.search(collections, vector, &leg_opts)?;
         let text_leg = self.text_search(collections, text, &leg_opts)?;
 
-        // Fuse by reciprocal rank, keyed by (collection, id), carrying attrs.
-        let k = opts.rrf_k;
-        let mut fused: HashMap<(String, String), (f32, BTreeMap<String, Value>)> = HashMap::new();
-        for (rank, h) in vector_leg.into_iter().enumerate() {
-            let e = fused.entry((h.collection, h.id)).or_insert((0.0, h.attrs));
-            e.0 += 1.0 / (k + rank as f32 + 1.0);
-        }
-        for (rank, h) in text_leg.into_iter().enumerate() {
-            let e = fused.entry((h.collection, h.id)).or_insert((0.0, h.attrs));
-            e.0 += 1.0 / (k + rank as f32 + 1.0);
-        }
-
-        let mut hits: Vec<Hit> = fused
-            .into_iter()
-            .map(|((collection, id), (score, attrs))| Hit {
-                collection,
-                id,
-                score,
-                attrs,
-            })
-            .collect();
-        hits.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.collection.cmp(&b.collection))
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        // The per-leg detail is dropped here; `hybrid_search` reports only the fused score.
+        let fused = rrf_fuse(
+            vec![FusionLeg::new(vector_leg), FusionLeg::new(text_leg)],
+            opts.rrf_k,
+        );
+        let mut hits: Vec<Hit> = fused.into_iter().map(|(hit, _per_leg)| hit).collect();
         hits.truncate(opts.top_k);
         Ok(hits)
     }
@@ -505,12 +473,7 @@ impl Store {
                     .and_then(|c| c.docs.get(id))
                     .map(|e| e.attrs.clone())
                     .unwrap_or_default();
-                Hit {
-                    collection: collection.to_string(),
-                    id: id.to_string(),
-                    score,
-                    attrs,
-                }
+                Hit::new(collection, id, score, attrs)
             })
             .collect()
     }

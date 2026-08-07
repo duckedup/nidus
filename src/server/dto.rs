@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AnnConfig, AnnKind, Filter, Footprint, Hit, Record, Value};
+use crate::{AnnConfig, AnnKind, Filter, Footprint, Hit, ListOpts, Record, Value};
 
 /// Body of `POST /collections/{name}/upsert`.
 #[derive(Debug, Deserialize)]
@@ -28,6 +28,11 @@ pub(super) fn default_top_k() -> usize {
     10
 }
 
+/// The largest `top_k` any request surface accepts. Past this a request is an allocation
+/// demand rather than a query — no store returns ten thousand hits usefully — and the
+/// bounded top-k kernel would otherwise be handed a `k` it must defend against itself.
+pub(super) const MAX_TOP_K: usize = 10_000;
+
 /// Body of `POST /search`. An empty `scope` searches every collection.
 #[derive(Debug, Deserialize)]
 pub struct SearchRequest {
@@ -42,8 +47,9 @@ pub struct SearchRequest {
     pub filter: Filter,
 }
 
+/// Derived from [`ListOpts`] so the wire default and the library default cannot drift.
 fn default_limit() -> usize {
-    100
+    ListOpts::default().limit
 }
 
 fn default_rrf_k() -> f32 {

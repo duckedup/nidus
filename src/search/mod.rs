@@ -304,12 +304,17 @@ pub struct TopK<T> {
     heap: BinaryHeap<Entry<T>>,
 }
 
+/// Ceiling on [`TopK::new`]'s *up-front* reservation. The heap still grows on demand, so
+/// any `k` a store could plausibly fill behaves identically; this only stops an absurd
+/// caller-supplied `k` from aborting the process on "capacity overflow" (nidus-m50.17).
+const TOPK_RESERVE_CAP: usize = 8192;
+
 impl<T> TopK<T> {
     /// A collector that keeps the top `k` items.
     pub fn new(k: usize) -> Self {
         TopK {
             k,
-            heap: BinaryHeap::with_capacity(k.saturating_add(1)),
+            heap: BinaryHeap::with_capacity(k.saturating_add(1).min(TOPK_RESERVE_CAP)),
         }
     }
 
@@ -530,6 +535,28 @@ mod tests {
     }
 
     // ── TopK ──────────────────────────────────────────────────────────────────
+
+    /// `with_capacity(k + 1)` on an unclamped `k` aborted the process on "capacity
+    /// overflow" (nidus-m50.17). The reservation is a hint; the heap still grows on demand.
+    #[test]
+    fn topk_survives_an_absurd_k() {
+        let mut tk: TopK<i32> = TopK::new(usize::MAX / 2);
+        tk.offer(1.0, 42);
+        tk.offer(2.0, 99);
+        assert_eq!(tk.into_sorted_desc(), vec![(2.0, 99), (1.0, 42)]);
+    }
+
+    /// A `k` past the reservation ceiling still *keeps* that many items — the clamp bounds
+    /// the up-front allocation only, never the result set.
+    #[test]
+    fn topk_keeps_more_than_it_reserves() {
+        let n = TOPK_RESERVE_CAP + 10;
+        let mut tk: TopK<usize> = TopK::new(n);
+        for i in 0..n {
+            tk.offer(i as f32, i);
+        }
+        assert_eq!(tk.into_sorted_desc().len(), n);
+    }
 
     #[test]
     fn topk_k_zero_keeps_nothing() {

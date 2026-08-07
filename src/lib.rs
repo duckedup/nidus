@@ -31,6 +31,8 @@ mod data;
 mod diag;
 mod filter;
 mod fts;
+// Reciprocal Rank Fusion over several ranked legs, keeping each leg's own rank/score.
+mod fuse;
 mod glob;
 mod index_cache;
 mod lock;
@@ -87,7 +89,7 @@ pub use config::{Config, Fsync, LeaseWait, OpenMode};
 pub use fts::Language;
 pub use model::{
     AnnConfig, AnnKind, ClusterStatus, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts,
-    Predicate, QuantKind, Quantization, Record, Role, SearchOpts, Value,
+    ListOpts, Predicate, QuantKind, Quantization, Record, Role, SearchOpts, Value,
 };
 pub use store::Readiness;
 
@@ -258,17 +260,11 @@ impl Nidus {
         }
     }
 
-    /// List records matching `filter` across a [`Scope`], without vector scoring.
-    pub fn list<'a>(
-        &self,
-        scope: impl Into<Scope<'a>>,
-        filter: &Filter,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Vec<Hit>> {
+    /// List records matching `opts.filter` across a [`Scope`], without vector scoring.
+    pub fn list<'a>(&self, scope: impl Into<Scope<'a>>, opts: &ListOpts) -> Result<Vec<Hit>> {
         let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        self.store.list(&refs, filter, offset, limit)
+        self.store.list(&refs, opts)
     }
 
     /// Search a [`Scope`] — one collection, a subset, or the whole store — for the
