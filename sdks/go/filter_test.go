@@ -10,8 +10,10 @@ package nidus
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestPredicateWireShapes pins every variant's encoding. The key is always the first
@@ -28,6 +30,14 @@ func TestPredicateWireShapes(t *testing.T) {
 		{"Eq bool", Eq("draft", false), `{"Eq":["draft",{"Bool":false}]}`},
 		{"Eq null", Eq("summary", nil), `{"Eq":["summary","Null"]}`},
 		{"Eq list", Eq("tags", []string{"a", "b"}), `{"Eq":["tags",{"List":["a","b"]}]}`},
+		{"Eq float", Eq("score", 1.5), `{"Eq":["score",{"Float":1.5}]}`},
+		// A range over instants: the operand is epoch milliseconds, so the comparison the
+		// server does is integer arithmetic on an absolute point in time.
+		{
+			"Ge datetime",
+			Ge("seen", time.UnixMilli(1700000000000).UTC()),
+			`{"Ge":["seen",{"DateTime":1700000000000}]}`,
+		},
 		{"Ne", Ne("lang", "go"), `{"Ne":["lang",{"Str":"go"}]}`},
 		{"Lt", Lt("year", 2024), `{"Lt":["year",{"Int":2024}]}`},
 		{"Le", Le("year", 2024), `{"Le":["year",{"Int":2024}]}`},
@@ -210,24 +220,27 @@ func TestPredicateCarriesANormalizationError(t *testing.T) {
 		pred Predicate
 		want string // a substring the error must contain
 	}{
-		{"Eq float", Eq("score", 1.5), `Eq("score")`},
-		{"Ne float", Ne("score", 1.5), `Ne("score")`},
-		{"Lt float", Lt("score", 1.5), `Lt("score")`},
-		{"Le float", Le("score", 1.5), `Le("score")`},
-		{"Gt float", Gt("score", 1.5), `Gt("score")`},
-		{"Ge float", Ge("score", 1.5), `Ge("score")`},
-		{"In float", In("score", "ok", 1.5), `In("score") value 1`},
-		{"NotIn float", NotIn("score", 1.5), `NotIn("score") value 0`},
-		{"Eq unsupported type", Eq("k", []int{1}), `Eq("k")`},
-		{"Contains float", Contains("tags", 1.5), `Contains("tags")`},
-		{"NotContains float", NotContains("tags", 1.5), `NotContains("tags")`},
-		{"ContainsAny float", ContainsAny("tags", "ok", 1.5), `ContainsAny("tags") value 1`},
+		{"Eq slice", Eq("score", []int{1}), `Eq("score")`},
+		{"Ne slice", Ne("score", []int{1}), `Ne("score")`},
+		{"Lt slice", Lt("score", []int{1}), `Lt("score")`},
+		{"Le slice", Le("score", []int{1}), `Le("score")`},
+		{"Gt slice", Gt("score", []int{1}), `Gt("score")`},
+		{"Ge slice", Ge("score", []int{1}), `Ge("score")`},
+		{"In slice", In("score", "ok", []int{1}), `In("score") value 1`},
+		{"NotIn slice", NotIn("score", []int{1}), `NotIn("score") value 0`},
+		{"Eq unsupported type", Eq("k", struct{ A int }{1}), `Eq("k")`},
+		// A NaN is the other shape that cannot travel: it is a float64, so the type
+		// check passes, and JSON has no spelling for it.
+		{"Eq NaN", Eq("score", math.NaN()), `Eq("score")`},
+		{"Contains slice", Contains("tags", []int{1}), `Contains("tags")`},
+		{"NotContains slice", NotContains("tags", []int{1}), `NotContains("tags")`},
+		{"ContainsAny slice", ContainsAny("tags", "ok", []int{1}), `ContainsAny("tags") value 1`},
 		// A broken leaf must not be able to hide inside a group: the combinators
 		// propagate it, or the request ships a body missing a condition entirely.
-		{"error inside Any", Any(Eq("a", 1), Eq("score", 1.5)), `Eq("score")`},
-		{"error inside All", All(Eq("score", 1.5)), `Eq("score")`},
-		{"error inside Not", Not(Eq("score", 1.5)), `Eq("score")`},
-		{"error nested two deep", Not(Any(All(Eq("score", 1.5)))), `Eq("score")`},
+		{"error inside Any", Any(Eq("a", 1), Eq("score", []int{1})), `Eq("score")`},
+		{"error inside All", All(Eq("score", []int{1})), `Eq("score")`},
+		{"error inside Not", Not(Eq("score", []int{1})), `Eq("score")`},
+		{"error nested two deep", Not(Any(All(Eq("score", []int{1})))), `Eq("score")`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -258,7 +271,7 @@ func TestFilterErrReportsTheFirstFailure(t *testing.T) {
 		t.Errorf("nil Filter reported %v", err)
 	}
 
-	f := And(Eq("ok", 1), Eq("first", 1.5), Eq("second", 2.5))
+	f := And(Eq("ok", 1), Eq("first", []int{1}), Eq("second", []int{2}))
 	err := f.Err()
 	if err == nil {
 		t.Fatal("Err() = nil, want the first failure")

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Sequence
+from datetime import datetime, timezone
 
 import pytest
 
@@ -159,10 +160,34 @@ def test_a_boolean_operand_is_not_encoded_as_an_int() -> None:
     assert f.in_("flags", [True, False]) == {"In": ["flags", [{"Bool": True}, {"Bool": False}]]}
 
 
-def test_a_float_operand_is_rejected() -> None:
-    """No float attribute type, so no float comparisons either — fail at the call site."""
-    with pytest.raises(TypeError, match="no float attribute type"):
-        f.gt("year", 2020.5)
+def test_a_float_operand_keeps_its_type_through_the_predicate() -> None:
+    """Comparisons are same-type only, so ``2020`` and ``2020.0`` are different filters.
+
+    The predicate builders normalize through ``encode_value``, which means the Python type
+    of the operand is what picks ``Int`` or ``Float`` — a range over a ``Float`` attribute
+    written with an ``int`` operand matches nothing, silently.
+    """
+    assert f.gt("score", 2020.5) == {"Gt": ["score", {"Float": 2020.5}]}
+    assert f.gt("score", 2020.0) == {"Gt": ["score", {"Float": 2020.0}]}
+    assert f.gt("year", 2020) == {"Gt": ["year", {"Int": 2020}]}
+    assert f.in_("score", [1.5, 2]) == {"In": ["score", [{"Float": 1.5}, {"Int": 2}]]}
+
+
+def test_a_datetime_operand_encodes_as_epoch_milliseconds() -> None:
+    """A range over instants: both operand forms reach the same wire number."""
+    when = datetime(2023, 11, 14, 22, 13, 20, tzinfo=timezone.utc)
+    assert f.ge("seen", when) == {"Ge": ["seen", {"DateTime": 1700000000000}]}
+    assert f.ge("seen", v.datetime(1700000000000)) == f.ge("seen", when)
+
+
+def test_an_unencodable_operand_is_rejected_at_the_call_site() -> None:
+    """A value with no attribute type fails here, not as a 400 naming serde."""
+    with pytest.raises(TypeError, match="set"):
+        f.gt("year", {2020})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="finite"):
+        f.gt("score", float("nan"))
+    with pytest.raises(ValueError, match="aware datetime"):
+        f.ge("seen", datetime(2023, 11, 14))
 
 
 def test_filter_serializes_as_a_bare_array() -> None:

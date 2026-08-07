@@ -206,6 +206,14 @@ pub enum Value {
     Int(i64),
     Bool(bool),
     List(Vec<String>),
+    /// A double. Comparison is IEEE: `NaN` matches nothing (not even itself), and
+    /// `0.0 == -0.0`. Distinct from [`Value::Int`] — comparisons are same-type only.
+    Float(f64),
+    /// A UTC instant as **epoch milliseconds**. There is no timezone and no local
+    /// time: an instant is absolute, and rendering it is the caller's business.
+    DateTime(i64),
+    // Append-only: bincode encodes the variant index, so inserting above this line
+    // would silently reinterpret every value in every existing store.
 }
 
 /// A document: a caller-supplied id, an **optional** embedding, and typed metadata.

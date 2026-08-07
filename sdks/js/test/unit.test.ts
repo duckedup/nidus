@@ -26,17 +26,48 @@ describe("value encoding", () => {
     expect(encodeValue(2024)).toEqual({ Int: 2024 });
     expect(encodeValue(true)).toEqual({ Bool: true });
     expect(encodeValue(["a", "b"])).toEqual({ List: ["a", "b"] });
+    expect(encodeValue(1.5)).toEqual({ Float: 1.5 });
+    expect(encodeValue(new Date(1700000000000))).toEqual({
+      DateTime: 1700000000000,
+    });
     expect(encodeValue(null)).toBe("Null");
   });
 
   it("passes an already-tagged value through unchanged", () => {
     expect(encodeValue(v.str("x"))).toEqual({ Str: "x" });
+    expect(encodeValue(v.float(2))).toEqual({ Float: 2 });
+    expect(encodeValue(v.datetime(0))).toEqual({ DateTime: 0 });
     expect(encodeValue(v.nil())).toBe("Null");
   });
 
-  it("rejects a non-integer number (no float attribute type)", () => {
-    expect(() => encodeValue(1.5)).toThrow(TypeError);
+  it("splits Int from Float by Number.isInteger, since JS has no int type", () => {
+    // `1.0 === 1` in JS, so the *value* is all there is to go on. Go and Python decide
+    // from the static type instead, which is why `2.0` is a Float there and an Int here.
+    expect(encodeValue(1.5)).toEqual({ Float: 1.5 });
+    expect(encodeValue(2.0)).toEqual({ Int: 2 });
+    expect(encodeValue(-0)).toEqual({ Int: -0 });
+    // v.float is the escape hatch: it pins a whole-numbered field to Float, which is
+    // what keeps a Float range filter from skipping the records that came out round.
+    expect(v.float(2)).toEqual({ Float: 2 });
+    expect(v.int(2)).toEqual({ Int: 2 });
     expect(() => v.int(1.5)).toThrow(TypeError);
+  });
+
+  it("rejects the numbers JSON cannot spell", () => {
+    // JSON.stringify writes these as `null`, which serde then refuses to read as an f64.
+    for (const bad of [NaN, Infinity, -Infinity]) {
+      expect(() => encodeValue(bad)).toThrow(TypeError);
+      expect(() => v.float(bad)).toThrow(TypeError);
+    }
+  });
+
+  it("encodes a Date as epoch milliseconds in UTC", () => {
+    const when = new Date("2023-11-14T22:13:20.000Z");
+    expect(encodeValue(when)).toEqual({ DateTime: 1700000000000 });
+    expect(v.datetime(when)).toEqual({ DateTime: 1700000000000 });
+    // The raw millisecond form is accepted too, for a caller who already holds one.
+    expect(v.datetime(1700000000000)).toEqual({ DateTime: 1700000000000 });
+    expect(() => v.datetime(new Date("not a date"))).toThrow(TypeError);
   });
 
   it("round-trips through decode", () => {
@@ -44,6 +75,13 @@ describe("value encoding", () => {
     expect(decodeValue(encodeValue(7) as never)).toBe(7);
     expect(decodeValue(encodeValue(null) as never)).toBe(null);
     expect(decodeValue(encodeValue(["a"]) as never)).toEqual(["a"]);
+    expect(decodeValue(encodeValue(1.5) as never)).toBe(1.5);
+    // A DateTime decodes to a Date, not a number, so re-encoding reproduces the tag
+    // rather than demoting the instant to an Int.
+    const when = new Date("2023-11-14T22:13:20.000Z");
+    const back = decodeValue(encodeValue(when) as never);
+    expect(back).toEqual(when);
+    expect(encodeValue(back as Date)).toEqual({ DateTime: 1700000000000 });
   });
 });
 
@@ -61,6 +99,17 @@ describe("filter builder", () => {
       { In: ["tag", [{ Str: "a" }, { Str: "b" }]] },
       { Glob: ["path", "src/*"] },
     ]);
+  });
+
+  it("carries the operand's encoded type into the predicate", () => {
+    // Same-type-only comparison makes this the difference between a range that matches
+    // and one that silently matches nothing, and the operand is where it is decided.
+    expect(f.ge("score", 1.5)).toEqual({ Ge: ["score", { Float: 1.5 }] });
+    expect(f.ge("score", v.float(2))).toEqual({ Ge: ["score", { Float: 2 }] });
+    expect(f.ge("year", 2)).toEqual({ Ge: ["year", { Int: 2 }] });
+    expect(f.ge("seen", new Date(1700000000000))).toEqual({
+      Ge: ["seen", { DateTime: 1700000000000 }],
+    });
   });
 
   it("tags iglob distinctly from glob, sharing the bare-string operand", () => {

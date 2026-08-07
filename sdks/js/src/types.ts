@@ -7,8 +7,8 @@
 
 /**
  * A typed attribute value, externally tagged exactly as `nidus` serde-encodes
- * `Value` on the wire: `{ Str }`, `{ Int }`, `{ Bool }`, `{ List }`, or the bare
- * string `"Null"`.
+ * `Value` on the wire: `{ Str }`, `{ Int }`, `{ Bool }`, `{ List }`, `{ Float }`,
+ * `{ DateTime }` (epoch milliseconds, UTC), or the bare string `"Null"`.
  *
  * `Null` is distinct from an absent key: absence means "not set / not indexed",
  * `Null` means "set, and empty/none".
@@ -18,16 +18,26 @@ export type Value =
   | { Int: number }
   | { Bool: boolean }
   | { List: string[] }
+  | { Float: number }
+  | { DateTime: number }
   | "Null";
 
 /**
  * What callers may pass anywhere a {@link Value} is expected: either an
  * explicitly-tagged `Value` (from the `v.*` helpers) or a plain JS scalar that
- * the SDK normalizes — `string → Str`, `boolean → Bool`, integer `number → Int`,
- * `string[] → List`, `null → Null`. A non-integer number throws (the store has no
- * float attribute type; floats belong in the vector, not in attrs).
+ * the SDK normalizes — `string → Str`, `boolean → Bool`, `string[] → List`,
+ * `Date → DateTime`, `null → Null`, and a `number` to `Int` or `Float` by
+ * `Number.isInteger` (JS has no int type, so the value has to decide; use
+ * {@link v.float} to pin a whole-numbered field to `Float`).
  */
-export type AttrInput = Value | string | number | boolean | string[] | null;
+export type AttrInput =
+  | Value
+  | string
+  | number
+  | boolean
+  | string[]
+  | Date
+  | null;
 
 /** A document: caller-supplied `id`, an optional embedding, and typed metadata. */
 export interface NidusRecord {
@@ -85,8 +95,11 @@ export interface Hit {
   attrs: Record<string, DecodedValue>;
 }
 
-/** A {@link Value} decoded back to a plain JS value. */
-export type DecodedValue = string | number | boolean | string[] | null;
+/**
+ * A {@link Value} decoded back to a plain JS value. A `DateTime` comes back as a
+ * `Date`, not a number, so a decoded `attrs` map re-encodes to what it came from.
+ */
+export type DecodedValue = string | number | boolean | string[] | Date | null;
 
 /** On-disk footprint, mirroring `FootprintDto`. */
 export interface Footprint {

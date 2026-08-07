@@ -755,21 +755,21 @@ func TestUnencodableFilterFailsBeforeSending(t *testing.T) {
 		{"Search", func(ctx context.Context, c *Client) error {
 			_, err := c.Search(ctx, SearchRequest{
 				Query:  []float32{1, 0, 0},
-				Filter: And(Eq("lang", "rust"), Ge("score", 0.5)),
+				Filter: And(Eq("lang", "rust"), Ge("score", []int{1})),
 			})
 			return err
 		}},
 		{"List", func(ctx context.Context, c *Client) error {
-			_, err := c.List(ctx, ListRequest{Filter: And(Eq("score", 1.5))})
+			_, err := c.List(ctx, ListRequest{Filter: And(Eq("score", []int{1}))})
 			return err
 		}},
 		{"DeleteWhere", func(ctx context.Context, c *Client) error {
-			_, err := c.DeleteWhere(ctx, "docs", And(Eq("score", 1.5)))
+			_, err := c.DeleteWhere(ctx, "docs", And(Eq("score", []int{1})))
 			return err
 		}},
 		{"TextSearch", func(ctx context.Context, c *Client) error {
 			_, err := c.TextSearch(ctx, TextSearchRequest{
-				Field: "body", Query: "fox", Filter: And(Eq("score", 1.5)),
+				Field: "body", Query: "fox", Filter: And(Eq("score", []int{1})),
 			})
 			return err
 		}},
@@ -781,14 +781,14 @@ func TestUnencodableFilterFailsBeforeSending(t *testing.T) {
 
 			err := tc.call(context.Background(), db)
 			if err == nil {
-				t.Fatal("call succeeded; a filter holding a float must not be sent")
+				t.Fatal("call succeeded; a filter holding an unencodable value must not be sent")
 			}
 			if got := fake.snapshot(); got.calls != 0 {
 				t.Errorf("the server saw %d requests; nothing should have been sent, and "+
 					"body = %s", got.calls, got.body)
 			}
-			if !strings.Contains(err.Error(), "float") {
-				t.Errorf("error = %q, want it to name the float that could not be encoded", err)
+			if !strings.Contains(err.Error(), "cannot use") {
+				t.Errorf("error = %q, want it to name the value that could not be encoded", err)
 			}
 			// Not an *Error: nothing was sent, so there is no status, and Status 0
 			// ("never got an answer") would misattribute a caller mistake to the network.

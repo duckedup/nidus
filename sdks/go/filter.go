@@ -6,9 +6,9 @@
 //
 // Each Predicate is a positive assertion about a *present* attribute: an absent key
 // matches nothing, including the negative predicates (Ne, NotIn) and the ranges.
-// Comparisons are same-type only — Int↔Int numerically, Str↔Str lexically,
-// Bool↔Bool — which is why the builders normalize through [ValueOf] rather than
-// coercing types to make a comparison "work".
+// Comparisons are same-type only — Int↔Int numerically, Float↔Float by IEEE, Str↔Str
+// lexically, DateTime↔DateTime as instants — which is why the builders normalize
+// through [ValueOf] rather than coercing types to make a comparison "work".
 //
 // Two asymmetries to keep straight, because they are the wire format and not a choice:
 // Glob's and IGlob's second tuple element is a bare string (the pattern), while every
@@ -172,9 +172,8 @@ func set(op, key string, raw []any) Predicate {
 }
 
 // Err reports a value that could not be normalized when the predicate was built
-// (for example a float, which is not an attribute type). It is nil for a usable
-// predicate. Checking it is optional: the same error comes back from the request
-// that carries the filter.
+// (a []int, say, or a NaN). It is nil for a usable predicate. Checking it is
+// optional: the same error comes back from the request that carries the filter.
 func (p Predicate) Err() error { return p.err }
 
 // Err returns the first predicate error in the filter, or nil.

@@ -36,9 +36,9 @@ const db = new NidusClient({
 
 ## Upserting and searching
 
-`attrs` accept plain JS values — strings, integers, booleans, string arrays, and
-`null` — and are normalized to nidus's typed values for you. (For an explicit type,
-use the `v.*` helpers.)
+`attrs` accept plain JS values — strings, numbers, booleans, string arrays, `Date`s,
+and `null` — and are normalized to nidus's typed values for you. (For an explicit
+type, use the `v.*` helpers.)
 
 ```ts
 await db.createCollection("docs");
@@ -56,10 +56,40 @@ for (const hit of hits) {
 }
 ```
 
+nidus has separate `Int` and `Float` attribute types and compares them same-type only,
+but JS has one `number` and `1.0 === 1` — so a plain number becomes an `Int` when
+`Number.isInteger` says so and a `Float` otherwise. That means a whole-numbered
+measurement lands as an `Int` in whichever records it came out round, and a `Float`
+range filter then skips exactly those. Pin such a field with `v.float`:
+
+```ts
+import { v } from "@duckedup/nidus";
+
+await db.upsert("docs", [
+  {
+    id: "d",
+    attrs: {
+      score: v.float(1), // a Float even though the value is whole
+      ratio: 0.75, // already a Float — not an integer
+      year: 2024, // an Int
+      seen: new Date(), // a DateTime: a UTC instant, epoch milliseconds
+    },
+  },
+]);
+```
+
+A `DateTime` carries no timezone and has millisecond resolution; it decodes back to a
+`Date`, so a decoded `attrs` map re-encodes to what it came from. `NaN` and `Infinity`
+throw — JSON has no spelling for them. The Go and Python SDKs have the numeric types JS
+lacks and decide from those instead, so a Python `2.0` or a Go `float64(2)` is a
+`Float` where a bare `2` here is an `Int`.
+
 ## Filtering
 
 Build an AND-filter with the `f.*` helpers. Each predicate is a positive assertion
-about a present attribute (an absent key matches nothing).
+about a present attribute (an absent key matches nothing). Comparisons are same-type
+only, so an operand must encode to the attribute's type — `f.ge("score", v.float(2))`,
+not `f.ge("score", 2)`, for a `Float` attribute.
 
 ```ts
 import { f } from "@duckedup/nidus";

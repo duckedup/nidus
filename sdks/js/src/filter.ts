@@ -3,7 +3,9 @@
 // A `Filter` is AND-combined predicates; on the wire it is a plain array. Each
 // predicate is a *positive assertion about a present attribute* — an absent key
 // matches nothing, including the negative predicates (`ne`/`notIn`) and ranges.
-// Comparisons are same-type only (Int↔Int numeric, Str↔Str lexical, Bool↔Bool).
+// Comparisons are same-type only (Int↔Int numeric, Float↔Float by IEEE, Str↔Str
+// lexical, Bool↔Bool, DateTime↔DateTime as instants), so an operand's encoded type
+// has to match the attribute's: `ge("score", v.float(2))`, not `ge("score", 2)`.
 
 import type { AttrInput, Filter, Predicate, Value } from "./types.js";
 import { encodeValue } from "./values.js";

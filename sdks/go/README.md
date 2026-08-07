@@ -56,9 +56,13 @@ header sent on every request.
 
 ## Upserting and searching
 
-Attributes are typed: `nidus.Str`, `nidus.Int`, `nidus.Bool`, `nidus.List`,
-`nidus.Null`. There is no float attribute — floats belong in the vector — and the
-constructors say so at compile time rather than at the server's 400.
+Attributes are typed: `nidus.Str`, `nidus.Int`, `nidus.Float`, `nidus.Bool`,
+`nidus.List`, `nidus.DateTime`, `nidus.Null`. `Int` and `Float` are separate types on
+the server and comparisons are same-type only, so `nidus.Int(2)` never matches a
+`Float` attribute; `nidus.ValueOf` decides between them from the Go type, which means
+`float64(2024)` is a `Float`. A `DateTime` is a UTC instant carried as epoch
+milliseconds — `nidus.DateTime(t)` from a `time.Time`, or `nidus.DateTimeMillis(ms)`
+if you already have the count. NaN and ±Infinity are refused: JSON cannot spell them.
 
 ```go
 ctx := context.Background()
@@ -67,7 +71,8 @@ if err := db.CreateCollection(ctx, "docs"); err != nil { /* … */ }
 
 n, err := db.Upsert(ctx, "docs", []nidus.Record{
     {ID: "a", Vector: []float32{0.1, 0.2, 0.3},
-        Attrs: nidus.Attrs{"lang": nidus.Str("rust"), "year": nidus.Int(2024)}},
+        Attrs: nidus.Attrs{"lang": nidus.Str("rust"), "year": nidus.Int(2024),
+            "score": nidus.Float(0.75), "seen": nidus.DateTime(time.Now())}},
     {ID: "b", Vector: []float32{0.4, 0.5, 0.6},
         Attrs: nidus.Attrs{"lang": nidus.Str("go"), "year": nidus.Int(2023)}},
     // a text-only doc — omit the vector
@@ -110,9 +115,11 @@ and names the offending key when a value has no nidus type.
 one with the comma-ok accessors:
 
 ```go
-lang, ok := hit.Attrs["lang"].Str()   // "", false if absent or not a string
-year, ok := hit.Attrs["year"].Int()   // full int64 precision, never rounded via float64
+lang, ok := hit.Attrs["lang"].Str()      // "", false if absent or not a string
+year, ok := hit.Attrs["year"].Int()      // full int64 precision, never rounded via float64
 tags, ok := hit.Attrs["tags"].List()
+score, ok := hit.Attrs["score"].Float()  // an Int does NOT widen into this accessor
+seen, ok := hit.Attrs["seen"].DateTime() // a time.Time in UTC
 ```
 
 This is a deliberate deviation from the JavaScript SDK, which decodes attrs to plain JS
@@ -122,7 +129,8 @@ gives you a testable `false` instead of a plausible-looking empty string. When y
 want the loose map, ask for it:
 
 ```go
-plain := hit.Attrs.Decode() // map[string]any: string, int64, bool, []string, nil
+plain := hit.Attrs.Decode() // map[string]any: string, int64, float64, bool, []string,
+                            // time.Time, nil
 ```
 
 ## Filtering
@@ -147,8 +155,11 @@ hits, err := db.Search(ctx, nidus.SearchRequest{
 Predicates: `Eq`, `Ne`, `Glob`, `IGlob`, `In`, `NotIn`, `Lt`, `Le`, `Gt`, `Ge`. `IGlob`
 is `Glob` with ASCII case folded on both sides. They take `any`
 so `nidus.Eq("year", 2024)` reads naturally; a value the store has no type for (a
-float, say) is remembered on the predicate and surfaces as an ordinary error from the
-call that used the filter. Check it earlier with `Predicate.Err()` / `Filter.Err()`.
+`[]int`, say, or a NaN) is remembered on the predicate and surfaces as an ordinary error
+from the call that used the filter. Check it earlier with `Predicate.Err()` /
+`Filter.Err()`. Comparisons are same-type only, so give a range the same type the
+attribute was written with — `Ge("score", 0.5)` for a `Float`, `Ge("year", 2020)` for an
+`Int`, `Ge("seen", t)` for a `DateTime`.
 
 ## Full-text and hybrid search
 

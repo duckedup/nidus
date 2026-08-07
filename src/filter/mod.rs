@@ -6,13 +6,18 @@ use std::collections::BTreeMap;
 use crate::model::{Filter, Predicate, Value};
 
 /// Same-type ordering of two [`Value`]s for the range predicates: `Int` numeric, `Str` lexical,
-/// `Bool` as `false < true`. `None` for different or non-orderable variants, which is what makes a
-/// range predicate fail on an absent or wrong-type attribute rather than match spuriously.
+/// `Bool` as `false < true`, `Float` by IEEE partial order, `DateTime` chronological. `None` for
+/// different or non-orderable variants, which is what makes a range predicate fail on an absent or
+/// wrong-type attribute rather than match spuriously.
 fn value_cmp(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
         (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
         (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
+        // `partial_cmp` is `None` for NaN, so a NaN bound or attribute simply fails the
+        // predicate rather than imposing a total order that would rank it somewhere.
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
+        (Value::DateTime(x), Value::DateTime(y)) => Some(x.cmp(y)),
         _ => None,
     }
 }
@@ -1062,5 +1067,133 @@ mod tests {
         let bytes = bincode::serialize(&f).unwrap();
         let back: Filter = bincode::deserialize(&bytes).unwrap();
         assert_eq!(f, back);
+    }
+
+    // ── Float and DateTime (nidus-m50.4) ─────────────────────────────────────────
+
+    #[test]
+    fn float_range_and_equality() {
+        let a = attrs(&[("score", Value::Float(0.75))]);
+        assert!(matches(
+            &filter(vec![Predicate::Gt("score".into(), Value::Float(0.5))]),
+            &a
+        ));
+        assert!(matches(
+            &filter(vec![Predicate::Le("score".into(), Value::Float(0.75))]),
+            &a
+        ));
+        assert!(!matches(
+            &filter(vec![Predicate::Lt("score".into(), Value::Float(0.5))]),
+            &a
+        ));
+        assert!(matches(
+            &filter(vec![Predicate::Eq("score".into(), Value::Float(0.75))]),
+            &a
+        ));
+    }
+
+    #[test]
+    fn float_does_not_compare_against_int() {
+        // Same-type only, as for Str/Int — documented, and consistent with the rest.
+        let a = attrs(&[("score", Value::Int(1))]);
+        assert!(!matches(
+            &filter(vec![Predicate::Gt("score".into(), Value::Float(0.5))]),
+            &a
+        ));
+        let b = attrs(&[("score", Value::Float(1.0))]);
+        assert!(!matches(
+            &filter(vec![Predicate::Gt("score".into(), Value::Int(0))]),
+            &b
+        ));
+    }
+
+    #[test]
+    fn nan_matches_nothing_including_itself() {
+        // partial_cmp is None for NaN, so every range predicate fails rather than
+        // NaN being silently ordered somewhere.
+        let a = attrs(&[("score", Value::Float(f64::NAN))]);
+        for p in [
+            Predicate::Lt("score".into(), Value::Float(0.0)),
+            Predicate::Le("score".into(), Value::Float(0.0)),
+            Predicate::Gt("score".into(), Value::Float(0.0)),
+            Predicate::Ge("score".into(), Value::Float(0.0)),
+            Predicate::Eq("score".into(), Value::Float(f64::NAN)),
+        ] {
+            assert!(!matches(&filter(vec![p]), &a));
+        }
+    }
+
+    #[test]
+    fn negative_zero_equals_zero() {
+        // IEEE equality, inherited from f64's PartialEq. Worth pinning: it is the one
+        // place Value equality is not bitwise.
+        let a = attrs(&[("z", Value::Float(-0.0))]);
+        assert!(matches(
+            &filter(vec![Predicate::Eq("z".into(), Value::Float(0.0))]),
+            &a
+        ));
+    }
+
+    #[test]
+    fn datetime_orders_chronologically_and_is_not_an_int() {
+        let a = attrs(&[("at", Value::DateTime(1_700_000_000_000))]);
+        assert!(matches(
+            &filter(vec![Predicate::Ge(
+                "at".into(),
+                Value::DateTime(1_600_000_000_000)
+            )]),
+            &a
+        ));
+        assert!(!matches(
+            &filter(vec![Predicate::Ge(
+                "at".into(),
+                Value::DateTime(1_800_000_000_000)
+            )]),
+            &a
+        ));
+        // A DateTime is not an Int, so the epoch number alone does not match it.
+        assert!(!matches(
+            &filter(vec![Predicate::Ge("at".into(), Value::Int(0))]),
+            &a
+        ));
+    }
+
+    #[test]
+    fn appending_variants_did_not_renumber_the_existing_ones() {
+        // bincode encodes the variant *index*. Every value in every existing store is
+        // decoded by that index, so the pre-0.44 variants must still sit at 0..=4 —
+        // this is the whole back-compat contract for adding a Value type.
+        for (want_index, value) in [
+            (0u32, Value::Null),
+            (1, Value::Str("s".into())),
+            (2, Value::Int(1)),
+            (3, Value::Bool(true)),
+            (4, Value::List(vec!["a".into()])),
+            (5, Value::Float(1.0)),
+            (6, Value::DateTime(1)),
+        ] {
+            let bytes = bincode::serialize(&value).unwrap();
+            let tag = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            assert_eq!(tag, want_index, "variant index moved for {value:?}");
+        }
+    }
+
+    #[test]
+    fn a_value_encoded_before_the_new_variants_still_decodes() {
+        // The literal bytes an older nidus wrote for Int(42): tag 2, then the i64.
+        let mut old = 2u32.to_le_bytes().to_vec();
+        old.extend_from_slice(&42i64.to_le_bytes());
+        let back: Value = bincode::deserialize(&old).unwrap();
+        assert_eq!(back, Value::Int(42));
+    }
+
+    #[test]
+    fn float_and_datetime_round_trip_through_serde() {
+        let f = filter(vec![
+            Predicate::Eq("a".into(), Value::Float(1.5)),
+            Predicate::Ge("b".into(), Value::DateTime(1_700_000_000_000)),
+        ]);
+        let bytes = bincode::serialize(&f).unwrap();
+        assert_eq!(bincode::deserialize::<Filter>(&bytes).unwrap(), f);
     }
 }

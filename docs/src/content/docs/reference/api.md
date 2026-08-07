@@ -108,8 +108,18 @@ pub enum Value {
     Int(i64),
     Bool(bool),
     List(Vec<String>),
+    Float(f64),      // IEEE: NaN matches nothing, 0.0 == -0.0
+    DateTime(i64),   // UTC epoch milliseconds
 }
 ```
+
+`Float` and `Int` are **not** interchangeable: comparisons are same-type only, so
+`Ge("score", Float(0.5))` does not match a record storing `Int(1)`. `NaN` is unordered
+and unequal to itself, so it fails every predicate, `Eq("k", NaN)` included.
+
+`DateTime` is an absolute instant in UTC epoch milliseconds — there is no timezone and
+no local-time form. It is distinct from `Int` so a filter or a recency ranking can tell
+a time from a number without relying on a naming convention.
 
 ## `Predicate` & `Filter`
 

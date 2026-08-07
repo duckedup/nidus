@@ -220,6 +220,7 @@ impl From<AnnConfig> for AnnDto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Predicate;
 
     #[test]
     fn ann_dto_hnsw_emits_only_hnsw_knobs() {
@@ -240,5 +241,56 @@ mod tests {
         // HNSW-only knobs are skipped for an IVF index.
         assert!(v.get("m").is_none());
         assert!(v.get("ef_search").is_none());
+    }
+
+    /// The externally-tagged JSON every SDK mirrors by hand. Asserted here because the
+    /// crate's own round-trip is bincode, which would not catch a change in the JSON
+    /// spelling — and a silent change there breaks three clients at once.
+    #[test]
+    fn value_json_spelling_is_stable() {
+        let cases = [
+            (Value::Null, serde_json::json!("Null")),
+            (Value::Str("x".into()), serde_json::json!({ "Str": "x" })),
+            (Value::Int(42), serde_json::json!({ "Int": 42 })),
+            (Value::Bool(true), serde_json::json!({ "Bool": true })),
+            (
+                Value::List(vec!["a".into()]),
+                serde_json::json!({ "List": ["a"] }),
+            ),
+            (Value::Float(1.5), serde_json::json!({ "Float": 1.5 })),
+            (
+                Value::DateTime(1_700_000_000_000),
+                serde_json::json!({ "DateTime": 1_700_000_000_000i64 }),
+            ),
+        ];
+        for (value, want) in cases {
+            let got = serde_json::to_value(&value).unwrap();
+            assert_eq!(got, want, "wire spelling changed for {value:?}");
+            let back: Value = serde_json::from_value(got).unwrap();
+            assert_eq!(back, value);
+        }
+    }
+
+    /// A whole number sent as `Float` must stay a `Float` — JSON writes 1.0 as `1.0`,
+    /// but a client that reads it back as `Int` would break same-type comparison.
+    #[test]
+    fn a_whole_float_does_not_decode_as_an_int() {
+        let json = serde_json::to_string(&Value::Float(1.0)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&json).unwrap(),
+            Value::Float(1.0)
+        );
+    }
+
+    #[test]
+    fn group_predicate_json_spelling_is_stable() {
+        let p = Predicate::Not(Box::new(Predicate::Any(vec![Predicate::Contains(
+            "tags".into(),
+            Value::Str("wip".into()),
+        )])));
+        assert_eq!(
+            serde_json::to_value(&p).unwrap(),
+            serde_json::json!({ "Not": { "Any": [{ "Contains": ["tags", { "Str": "wip" }] }] } })
+        );
     }
 }

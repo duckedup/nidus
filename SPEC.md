@@ -121,6 +121,8 @@ pub enum Value {
     Int(i64),
     Bool(bool),
     List(Vec<String>),
+    Float(f64),                 // IEEE: NaN matches nothing, 0.0 == -0.0
+    DateTime(i64),              // UTC epoch milliseconds; no timezone, no local time
 }
 ```
 
@@ -138,6 +140,21 @@ pub enum Value {
   it lets a caller tell apart "this field was not computed/indexed" (absent) from
   "computed, and the value is empty" (e.g. `List([])`) — a distinction that matters
   for things like optional graph edges or tags.
+- **`Value` is append-only.** The op-log encodes a value by its *variant index*
+  (bincode), so a new variant may only be added at the end; inserting one above an
+  existing variant would silently reinterpret every value in every existing store.
+  `Float` and `DateTime` were appended for exactly this reason, and a test asserts the
+  pre-existing variants still occupy indices 0..=4.
+- **`Float` is IEEE, and deliberately not interchangeable with `Int`.** Comparison is
+  same-type only (§7), so `Ge("score", Float(0.5))` does not match a record storing
+  `Int(1)` — the same rule that already separates `Str` from `Int`. `NaN` is not
+  ordered and is not equal to itself, so it fails every predicate including
+  `Eq(k, NaN)`, rather than being forced into a total order to make it sortable.
+- **`DateTime` is UTC epoch milliseconds** — an absolute instant. There is no timezone
+  field and no local-time form: a timezone is a rendering concern, and storing one
+  would make the same instant compare unequal to itself. It is a distinct type from
+  `Int` so that a range filter and a recency ranking can tell "a number" from "a time"
+  without a naming convention the store cannot enforce.
 
 ---
 
@@ -209,6 +226,12 @@ pub enum Predicate {
     Le(String, Value),                   // attr <= value
     Gt(String, Value),                   // attr >  value
     Ge(String, Value),                   // attr >= value
+    Contains(String, Value),             // attr (List) holds value
+    NotContains(String, Value),          // attr present, a List, and does not hold value
+    ContainsAny(String, Vec<Value>),     // attr (List) overlaps the set
+    All(Vec<Predicate>),                 // every sub-predicate holds (empty = true)
+    Any(Vec<Predicate>),                 // some sub-predicate holds  (empty = false)
+    Not(Box<Predicate>),                 // sub-predicate does not hold
 }
 
 // A cheap, allocation-free footprint snapshot (§6.6). `vector_bytes` is the

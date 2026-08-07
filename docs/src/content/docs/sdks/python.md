@@ -121,9 +121,11 @@ call site instead of quietly returning `None`. `attrs` itself is a plain `dict`:
 `.get` unless every record in scope is known to carry the key, since attrs are per-record
 rather than a schema.
 
-There is no float attribute type — floats belong in the vector — so passing one raises
-`TypeError` rather than silently truncating. For an explicit type, use the `v.*` helpers
-(`v.str`, `v.int`, `v.bool`, `v.list`, `v.nil`):
+Python decides `Int` vs `Float` from the **runtime type**, so `2.0` is a `Float` and `2`
+is an `Int`. That matters because comparisons are same-type only: a `Float` range filter
+never matches a record whose value was stored as an `Int`. For an explicit type, use the
+`v.*` helpers (`v.str`, `v.int`, `v.float`, `v.bool`, `v.list`, `v.datetime`, `v.nil`);
+`v.datetime` takes a `datetime` and travels as UTC epoch milliseconds:
 
 ```python
 from nidus import v

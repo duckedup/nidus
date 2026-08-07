@@ -102,14 +102,32 @@ dataclasses (`collection`, `id`, `score`, `attrs`). `attrs` is a plain `dict`, s
 for `.get` unless every record in scope is known to carry the key — a search spans
 whatever the scope holds, and attrs are per-record, not a schema.
 
-There is no float attribute type — floats belong in the vector, so passing one raises
-`TypeError` rather than silently truncating. For an explicit type, use the `v.*`
-helpers (`v.str`, `v.int`, `v.bool`, `v.list`, `v.nil`):
+The Python type of an attribute decides its nidus type, and the pair that matters is
+`Int` vs `Float`: `2` is an `Int`, `2.0` is a `Float`. They are separate types on the
+server and comparisons are same-type only, so a `Float` attribute filtered with an `int`
+operand matches nothing — keep a numeric field's Python type uniform across records.
+`nan` and `inf` are refused (`ValueError`): JSON cannot spell them.
+
+A `datetime` becomes a `DateTime` — a UTC instant carried as epoch **milliseconds**, so
+sub-millisecond precision is truncated and the timezone is not stored. It must be
+**aware**; a naive `datetime` raises `ValueError` rather than being assumed to be UTC,
+because the wrong guess is off by hours in valid-looking JSON. Reading one back gives an
+aware `datetime`, not an `int`, so a decoded `attrs` map re-encodes to what it came from.
+
+For an explicit type, use the `v.*` helpers (`v.str`, `v.int`, `v.float`, `v.bool`,
+`v.list`, `v.datetime`, `v.nil`):
 
 ```python
+from datetime import datetime, timezone
+
 from nidus import v
 
-db.upsert("docs", [{"id": "d", "attrs": {"tags": v.list(["a", "b"]), "rank": v.int(7)}}])
+db.upsert("docs", [{"id": "d", "attrs": {
+    "tags": v.list(["a", "b"]),
+    "rank": v.int(7),
+    "score": v.float(1),                      # a whole number, stored as a Float
+    "seen": v.datetime(datetime.now(timezone.utc)),
+}}])
 ```
 
 `v.nil()` is the explicit `Null` value — "set, and empty" — which is a different fact
@@ -145,9 +163,10 @@ Python, so `f.in_`, `f.not_in`, and `f.and_` are the JS SDK's `f.in`, `f.notIn`,
 A `Filter` is just a `list` of predicates, AND-combined, so `f.and_(...)` is sugar for
 building that list — `filter=[f.eq("lang", "rust")]` is equally valid.
 
-Comparisons are same-type only (int↔int numeric, str↔str lexical, bool↔bool). A range
-predicate against a mismatched type matches nothing, which is the usual reason a filter
-mysteriously returns no rows.
+Comparisons are same-type only (int↔int numeric, float↔float by IEEE, str↔str lexical,
+bool↔bool, datetime↔datetime as instants). A range predicate against a mismatched type
+matches nothing, which is the usual reason a filter mysteriously returns no rows — and
+`f.gt("score", 2)` against a `Float` attribute is exactly that mismatch.
 
 ## Full-text and hybrid search
 
@@ -309,9 +328,9 @@ A status of `0` is the sentinel for **no response at all** — connection refuse
 failure, or the request exceeded `timeout`. Every nidus SDK uses the same sentinel, so
 "was this even reachable?" is answered identically in all of them.
 
-Value errors are raised locally, before any request: a `float` attribute or a
-non-string list element is a `TypeError`, and an integer outside `i64` is a `ValueError`
-(Python's ints are unbounded; the store's `Int` is not).
+Value errors are raised locally, before any request: an attribute type the store has no
+variant for (or a non-string list element) is a `TypeError`, and an integer outside `i64`,
+a non-finite `float`, or a naive `datetime` is a `ValueError`.
 
 ## Documentation
 

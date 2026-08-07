@@ -1,13 +1,13 @@
 // Value and Attrs — the store's typed attribute value, and its JSON codec.
 //
 // On the wire a Value is the externally-tagged serde encoding of the crate's
-// `Value` enum (src/model.rs): {"Str":…}, {"Int":…}, {"Bool":…}, {"List":[…]}, and
-// the unit variant as the bare string "Null". Callers should never hand-write those
-// shapes; that is what the constructors here are for.
+// `Value` enum (src/model.rs): {"Str":…}, {"Int":…}, {"Bool":…}, {"List":[…]},
+// {"Float":…}, {"DateTime":…}, and the unit variant as the bare string "Null".
+// Callers should never hand-write those shapes; that is what the constructors are for.
 //
 // Go has no sum types, so Value is an opaque struct with a kind discriminant and
 // unexported payload fields. The alternative — an `any` — would let a caller build
-// an attribute nidus cannot store (a float, a []int) and only find out when the
+// an attribute nidus cannot store (a []int, a struct) and only find out when the
 // server answered 400. With unexported fields an invalid Value is unrepresentable
 // from outside the package: every path in is a constructor or ValueOf, and both
 // reject what the store has no type for.
@@ -34,6 +34,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Kind discriminates which variant a [Value] holds.
@@ -47,6 +48,8 @@ const (
 	KindInt
 	KindBool
 	KindList
+	KindFloat
+	KindDateTime
 	// KindUnknown is a tag this SDK version does not know, preserved verbatim.
 	KindUnknown
 )
@@ -64,6 +67,10 @@ func (k Kind) String() string {
 		return "Bool"
 	case KindList:
 		return "List"
+	case KindFloat:
+		return "Float"
+	case KindDateTime:
+		return "DateTime"
 	case KindUnknown:
 		return "Unknown"
 	default:
@@ -78,14 +85,15 @@ func (k Kind) String() string {
 // caller tells not-computed apart from computed-empty), so never collapse one into
 // the other on either side of the wire.
 //
-// There is deliberately no float variant. Floats belong in the vector; an attribute
-// float is either a rounding bug waiting to happen or a value that should have been
-// a string, and the encode path says so out loud rather than truncating.
+// Comparisons on the server are same-type only, which is what makes Int and Float two
+// variants rather than one number: an Int attribute never compares against a Float
+// operand, so keep a given attribute's Go type uniform across every record you write.
 type Value struct {
 	kind Kind
 	s    string
-	i    int64
+	i    int64 // KindInt, and KindDateTime as epoch milliseconds
 	b    bool
+	f    float64
 	l    []string
 	raw  json.RawMessage // KindUnknown only: the bytes exactly as they arrived
 }
@@ -98,6 +106,20 @@ func Int(i int64) Value { return Value{kind: KindInt, i: i} }
 
 // Bool is a boolean attribute.
 func Bool(b bool) Value { return Value{kind: KindBool, b: b} }
+
+// Float is a double attribute. NaN and ±Inf are refused by the encoder rather than
+// here, since JSON has no spelling for them — prefer [ValueOf], which catches one at
+// the call site.
+func Float(f float64) Value { return Value{kind: KindFloat, f: f} }
+
+// DateTime is a UTC instant. It travels as epoch milliseconds, so sub-millisecond
+// precision is truncated (time.Time.UnixMilli rounds toward negative infinity) and the
+// location is dropped — an instant is absolute, and rendering it is the caller's job.
+func DateTime(t time.Time) Value { return Value{kind: KindDateTime, i: t.UnixMilli()} }
+
+// DateTimeMillis is [DateTime] built straight from an epoch-millisecond count, for a
+// caller who already holds one and would otherwise round-trip through time.UnixMilli.
+func DateTimeMillis(ms int64) Value { return Value{kind: KindDateTime, i: ms} }
 
 // List is a list-of-strings attribute. The items are copied, so a later write to
 // the caller's slice cannot mutate a Value that has already been built.
@@ -136,6 +158,20 @@ func (v Value) Int() (int64, bool) { return v.i, v.kind == KindInt }
 // Bool returns the boolean and true when v is a [KindBool], else false and false.
 func (v Value) Bool() (bool, bool) { return v.b, v.kind == KindBool }
 
+// Float returns the double and true when v is a [KindFloat], else 0 and false. It does
+// not widen an [Int]: the two are separate types on the server and reading one as the
+// other here would hide that from the caller.
+func (v Value) Float() (float64, bool) { return v.f, v.kind == KindFloat }
+
+// DateTime returns the instant in UTC and true when v is a [KindDateTime], else the
+// zero Time and false.
+func (v Value) DateTime() (time.Time, bool) {
+	if v.kind != KindDateTime {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(v.i).UTC(), true
+}
+
 // List returns a copy of the items and true when v is a [KindList], else nil and
 // false. The copy keeps the Value immutable from the caller's side.
 func (v Value) List() ([]string, bool) {
@@ -147,10 +183,10 @@ func (v Value) List() ([]string, bool) {
 	return out, true
 }
 
-// Any returns the value as a plain Go value: string, int64, bool, []string, or nil
-// for Null. A [KindUnknown] value comes back as its [json.RawMessage] — the same
-// "hand it back untouched" behaviour the JS SDK has, so forward-compatible data
-// stays inspectable instead of vanishing.
+// Any returns the value as a plain Go value: string, int64, bool, []string, float64,
+// time.Time, or nil for Null. A [KindUnknown] value comes back as its
+// [json.RawMessage] — the same "hand it back untouched" behaviour the JS SDK has, so
+// forward-compatible data stays inspectable instead of vanishing.
 func (v Value) Any() any {
 	switch v.kind {
 	case KindStr:
@@ -162,6 +198,11 @@ func (v Value) Any() any {
 	case KindList:
 		items, _ := v.List()
 		return items
+	case KindFloat:
+		return v.f
+	case KindDateTime:
+		t, _ := v.DateTime()
+		return t
 	case KindUnknown:
 		return v.raw
 	default:
@@ -185,6 +226,10 @@ func (v Value) String() string {
 			quoted[i] = strconv.Quote(item)
 		}
 		return "[" + strings.Join(quoted, ", ") + "]"
+	case KindFloat:
+		return strconv.FormatFloat(v.f, 'g', -1, 64)
+	case KindDateTime:
+		return time.UnixMilli(v.i).UTC().Format(time.RFC3339Nano)
 	case KindUnknown:
 		return string(v.raw)
 	default:
@@ -219,6 +264,17 @@ func (v Value) MarshalJSON() ([]byte, error) {
 		return json.Marshal(struct {
 			List []string `json:"List"`
 		}{items})
+	case KindFloat:
+		if err := finiteFloat(v.f); err != nil {
+			return nil, err
+		}
+		return json.Marshal(struct {
+			Float float64 `json:"Float"`
+		}{v.f})
+	case KindDateTime:
+		return json.Marshal(struct {
+			DateTime int64 `json:"DateTime"`
+		}{v.i})
 	case KindUnknown:
 		if v.raw == nil {
 			return nil, fmt.Errorf("nidus: KindUnknown Value has no preserved JSON")
@@ -286,27 +342,37 @@ func (v *Value) UnmarshalJSON(b []byte) error {
 		}
 		*v = Str(s)
 	case "Int":
-		// Reject a quoted payload before decoding. encoding/json accepts a JSON *string*
-		// holding a number literal into a json.Number ("2024" → 2024), so the decode
-		// below would let a wrong-shaped payload through and then silently rewrite it as
-		// a bare number on the way out. The server's Int is an i64 and serde both emits
-		// and accepts a bare JSON number only, so a string here is a contract violation,
-		// not something to repair on the server's behalf.
-		if p := bytes.TrimSpace(payload); len(p) > 0 && p[0] == '"' {
-			return fmt.Errorf(
-				"nidus: Int attribute %s is a string; an Int travels as a bare JSON number",
-				preview(p),
-			)
+		n, err := numberPayload("Int", payload)
+		if err != nil {
+			return err
 		}
-		var n json.Number
-		if err := json.Unmarshal(payload, &n); err != nil {
-			return fmt.Errorf("nidus: Int attribute is not a number: %w", err)
-		}
-		i, err := intFromJSON(n)
+		i, err := intFromJSON("Int", n)
 		if err != nil {
 			return err
 		}
 		*v = Int(i)
+	case "Float":
+		n, err := numberPayload("Float", payload)
+		if err != nil {
+			return err
+		}
+		// ParseFloat over the literal, not a json.Unmarshal into a float64: that would
+		// read a `null` payload as a silent 0.0, where an empty json.Number fails here.
+		f, err := strconv.ParseFloat(n.String(), 64)
+		if err != nil {
+			return fmt.Errorf("nidus: %q is not a valid Float attribute: %w", n.String(), err)
+		}
+		*v = Float(f)
+	case "DateTime":
+		n, err := numberPayload("DateTime", payload)
+		if err != nil {
+			return err
+		}
+		ms, err := intFromJSON("DateTime", n)
+		if err != nil {
+			return err
+		}
+		*v = DateTimeMillis(ms)
 	case "Bool":
 		var b bool
 		if err := json.Unmarshal(payload, &b); err != nil {
@@ -344,12 +410,14 @@ func (v *Value) setUnknown(raw []byte) {
 //	string         → Str
 //	bool           → Bool
 //	int, int8…int64, uint, uint8…uint64 (in i64 range) → Int
+//	float32, float64 (finite) → Float
+//	time.Time      → DateTime
 //	[]string       → List
 //	[]any          → List, if every element is a string
 //
-// Anything else is an error, and float32/float64 emphatically so: the store has no
-// float attribute type, and an SDK that quietly rounded 0.5 to 0 would corrupt data
-// on the way in. Put floats in the vector, or format them as strings.
+// The static type decides Int vs Float, so float64(2024) is a Float. JS has no such
+// type and decides by Number.isInteger instead, so an attribute written from both SDKs
+// needs `v.float` on the JS side to stay one type. Anything else here is an error.
 func ValueOf(x any) (Value, error) {
 	switch t := x.(type) {
 	case Value:
@@ -380,6 +448,14 @@ func ValueOf(x any) (Value, error) {
 		return Int(int64(t)), nil
 	case uint64:
 		return uintValue(t)
+	case float32:
+		// Widened, not reinterpreted: 0.1 as a float32 is 0.10000000149011612 as a
+		// float64, which is the number the caller has been holding all along.
+		return floatValue(float64(t))
+	case float64:
+		return floatValue(t)
+	case time.Time:
+		return DateTime(t), nil
 	case []string:
 		return List(t...), nil
 	case []any:
@@ -397,11 +473,6 @@ func ValueOf(x any) (Value, error) {
 			items[i] = s
 		}
 		return listValue(items), nil
-	case float32, float64:
-		return Value{}, fmt.Errorf(
-			"nidus: attributes have no float type (got %v); floats belong in the vector — "+
-				"use an integer or a string", t,
-		)
 	default:
 		return Value{}, fmt.Errorf("nidus: cannot use %T as an attribute value", x)
 	}
@@ -427,6 +498,25 @@ func uintValue(u uint64) (Value, error) {
 	return Int(int64(u)), nil
 }
 
+// floatValue is the ValueOf half of the finiteness rule, so a NaN in a filter fails at
+// the call site rather than from the request that carries it.
+func floatValue(f float64) (Value, error) {
+	if err := finiteFloat(f); err != nil {
+		return Value{}, err
+	}
+	return Float(f), nil
+}
+
+// finiteFloat refuses the three doubles JSON cannot spell. serde_json writes them as
+// `null` and then refuses to read one back, so a NaN that reached the wire would come
+// home as a 400 naming the server's parser rather than the attribute that caused it.
+func finiteFloat(f float64) error {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return fmt.Errorf("nidus: %v cannot be a Float attribute; JSON has no NaN or Infinity", f)
+	}
+	return nil
+}
+
 // Attrs is a record's typed metadata, keyed by attribute name.
 //
 // Deliberate deviation from the JS SDK: values stay as [Value] on [Hit] and
@@ -437,7 +527,7 @@ func uintValue(u uint64) (Value, error) {
 type Attrs map[string]Value
 
 // AttrsOf normalizes a plain map into [Attrs], running [ValueOf] over each entry.
-// The failing key is named in the error, since "cannot use float64" alone is not
+// The failing key is named in the error, since "cannot use []int" alone is not
 // enough to find the offending field in a wide document.
 func AttrsOf(m map[string]any) (Attrs, error) {
 	out := make(Attrs, len(m))
@@ -471,7 +561,30 @@ func (a Attrs) MarshalJSON() ([]byte, error) {
 	return json.Marshal(map[string]Value(a))
 }
 
-// intFromJSON turns a JSON number into the i64 the server's Int variant holds.
+// numberPayload decodes a numeric variant's payload to its literal digits.
+//
+// The quoted-string check comes first because encoding/json accepts a JSON *string*
+// holding a number literal into a json.Number ("2024" → 2024), so the decode below
+// would let a wrong-shaped payload through and silently rewrite it as a bare number on
+// the way out. serde emits and accepts a bare JSON number only, so a string here is a
+// contract violation, not something to repair on the server's behalf.
+func numberPayload(tag string, payload json.RawMessage) (json.Number, error) {
+	if p := bytes.TrimSpace(payload); len(p) > 0 && p[0] == '"' {
+		return "", fmt.Errorf(
+			"nidus: %s attribute %s is a string; it travels as a bare JSON number",
+			tag, preview(p),
+		)
+	}
+	var n json.Number
+	if err := json.Unmarshal(payload, &n); err != nil {
+		return "", fmt.Errorf("nidus: %s attribute is not a number: %w", tag, err)
+	}
+	return n, nil
+}
+
+// intFromJSON turns a JSON number into the i64 behind the server's Int and DateTime
+// variants (a DateTime is epoch milliseconds, so it has the same range and the same
+// precision hazard).
 //
 // It reads the literal text rather than a float64 on purpose: encoding/json's
 // default number type is float64, which silently rounds integers above 2^53 — the
@@ -480,9 +593,9 @@ func (a Attrs) MarshalJSON() ([]byte, error) {
 //
 // A fractional part is tolerated only when it is all zeros ("2024.0" → 2024),
 // because some other encoder may have written an integer that way and JSON cannot
-// tell us it meant an integer. "2024.5" is an error, never a truncation: there is no
-// float attribute type, and dropping the .5 would be silent data loss.
-func intFromJSON(n json.Number) (int64, error) {
+// tell us it meant an integer. "2024.5" is an error, never a truncation: a fractional
+// number is a Float attribute, and dropping the .5 would be silent data loss.
+func intFromJSON(tag string, n json.Number) (int64, error) {
 	s := n.String()
 	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return i, nil
@@ -496,16 +609,16 @@ func intFromJSON(n json.Number) (int64, error) {
 	}
 	f, err := strconv.ParseFloat(s, 64)
 	if err != nil {
-		return 0, fmt.Errorf("nidus: %s is not a valid Int attribute: %w", s, err)
+		return 0, fmt.Errorf("nidus: %s is not a valid %s attribute: %w", s, tag, err)
 	}
 	if f != math.Trunc(f) {
 		return 0, fmt.Errorf(
-			"nidus: Int attribute %s is not an integer; nidus has no float attribute type", s,
+			"nidus: %s attribute %s is not an integer; a fractional number is a Float", tag, s,
 		)
 	}
 	// float64(1<<63) is exactly 2^63, the first value an int64 cannot hold.
 	if f < math.MinInt64 || f >= float64(1<<63) {
-		return 0, fmt.Errorf("nidus: Int attribute %s overflows int64", s)
+		return 0, fmt.Errorf("nidus: %s attribute %s overflows int64", tag, s)
 	}
 	return int64(f), nil
 }
