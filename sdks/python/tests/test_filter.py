@@ -28,8 +28,11 @@ import pytest
 from nidus import AttrInput, Filter, Predicate, f, v
 
 
-def test_every_predicate_variant_has_the_two_tuple_shape() -> None:
-    """Ten variants, each externally tagged over ``[key, operand]``."""
+def test_every_leaf_predicate_variant_has_the_two_tuple_shape() -> None:
+    """Thirteen leaf variants, each externally tagged over ``[key, operand]``.
+
+    The combinators deliberately break this shape; see the group tests below.
+    """
     assert f.eq("lang", "rust") == {"Eq": ["lang", {"Str": "rust"}]}
     assert f.ne("lang", "go") == {"Ne": ["lang", {"Str": "go"}]}
     assert f.glob("path", "src/*") == {"Glob": ["path", "src/*"]}
@@ -42,6 +45,41 @@ def test_every_predicate_variant_has_the_two_tuple_shape() -> None:
     assert f.le("year", 2020) == {"Le": ["year", {"Int": 2020}]}
     assert f.gt("year", 2020) == {"Gt": ["year", {"Int": 2020}]}
     assert f.ge("year", 2020) == {"Ge": ["year", {"Int": 2020}]}
+    assert f.contains("tags", "rust") == {"Contains": ["tags", {"Str": "rust"}]}
+    assert f.not_contains("tags", "wip") == {"NotContains": ["tags", {"Str": "wip"}]}
+    assert f.contains_any("tags", ["rust", "go"]) == {
+        "ContainsAny": ["tags", [{"Str": "rust"}, {"Str": "go"}]]
+    }
+
+
+def test_the_combinators_are_not_key_value_tuples() -> None:
+    """``all_``/``any_`` wrap a bare list of predicates, ``not_`` a single one."""
+    assert f.any_(f.eq("a", 1), f.eq("b", 2)) == {
+        "Any": [{"Eq": ["a", {"Int": 1}]}, {"Eq": ["b", {"Int": 2}]}]
+    }
+    assert f.all_(f.eq("a", 1)) == {"All": [{"Eq": ["a", {"Int": 1}]}]}
+    assert f.not_(f.eq("a", 1)) == {"Not": {"Eq": ["a", {"Int": 1}]}}
+
+
+def test_empty_groups_are_empty_lists_not_null() -> None:
+    """The identities (``All`` true, ``Any`` false) only hold if they deserialize."""
+    assert f.all_() == {"All": []}
+    assert f.any_() == {"Any": []}
+
+
+def test_groups_nest() -> None:
+    """A group holding a group — the whole point of the combinators."""
+    nested = f.not_(f.any_(f.contains("tags", "wip")))
+    assert nested == {"Not": {"Any": [{"Contains": ["tags", {"Str": "wip"}]}]}}
+    assert json.loads(json.dumps(nested)) == nested
+
+
+def test_all_is_a_predicate_while_and_is_a_filter() -> None:
+    """The distinction that decides which one a caller needs: only ``all_`` nests."""
+    assert isinstance(f.and_(f.eq("a", 1)), list)
+    assert isinstance(f.all_(f.eq("a", 1)), dict)
+    # So a conjunction can sit inside a disjunction only via all_.
+    assert f.any_(f.all_(f.eq("a", 1))) == {"Any": [{"All": [{"Eq": ["a", {"Int": 1}]}]}]}
 
 
 def test_glob_takes_a_bare_string_while_the_others_take_a_value() -> None:

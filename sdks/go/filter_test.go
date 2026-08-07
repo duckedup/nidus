@@ -48,6 +48,34 @@ func TestPredicateWireShapes(t *testing.T) {
 		{"quoted key", Eq(`a"b`, "v"), `{"Eq":["a\"b",{"Str":"v"}]}`},
 		// A Value passed straight through, rather than a plain Go value to normalize.
 		{"pre-built Value", Eq("n", Int(9007199254740993)), `{"Eq":["n",{"Int":9007199254740993}]}`},
+		// Containment: the two unary forms share the leaf tuple shape, ContainsAny
+		// takes an array exactly as In does.
+		{"Contains", Contains("tags", "rust"), `{"Contains":["tags",{"Str":"rust"}]}`},
+		{"NotContains", NotContains("tags", "wip"), `{"NotContains":["tags",{"Str":"wip"}]}`},
+		{
+			"ContainsAny",
+			ContainsAny("tags", "rust", "go"),
+			`{"ContainsAny":["tags",[{"Str":"rust"},{"Str":"go"}]]}`,
+		},
+		{"ContainsAny with no values", ContainsAny("tags"), `{"ContainsAny":["tags",[]]}`},
+		// The combinators break the key/value tuple shape entirely.
+		{
+			"Any",
+			Any(Eq("project", "nidus"), Eq("project", "beads")),
+			`{"Any":[{"Eq":["project",{"Str":"nidus"}]},{"Eq":["project",{"Str":"beads"}]}]}`,
+		},
+		{"All", All(Eq("a", 1)), `{"All":[{"Eq":["a",{"Int":1}]}]}`},
+		{"Not wraps a single predicate", Not(Eq("a", 1)), `{"Not":{"Eq":["a",{"Int":1}]}}`},
+		// Empty groups must be `[]`, not `null`: the server's field is a Vec, and the
+		// identities (All=true, Any=false) only hold if it deserializes at all.
+		{"All with no predicates", All(), `{"All":[]}`},
+		{"Any with no predicates", Any(), `{"Any":[]}`},
+		// Nesting is the whole point: a group holding a group.
+		{
+			"nested groups",
+			Not(Any(Contains("tags", "wip"))),
+			`{"Not":{"Any":[{"Contains":["tags",{"Str":"wip"}]}]}}`,
+		},
 	}
 
 	for _, tc := range cases {
@@ -191,6 +219,15 @@ func TestPredicateCarriesANormalizationError(t *testing.T) {
 		{"In float", In("score", "ok", 1.5), `In("score") value 1`},
 		{"NotIn float", NotIn("score", 1.5), `NotIn("score") value 0`},
 		{"Eq unsupported type", Eq("k", []int{1}), `Eq("k")`},
+		{"Contains float", Contains("tags", 1.5), `Contains("tags")`},
+		{"NotContains float", NotContains("tags", 1.5), `NotContains("tags")`},
+		{"ContainsAny float", ContainsAny("tags", "ok", 1.5), `ContainsAny("tags") value 1`},
+		// A broken leaf must not be able to hide inside a group: the combinators
+		// propagate it, or the request ships a body missing a condition entirely.
+		{"error inside Any", Any(Eq("a", 1), Eq("score", 1.5)), `Eq("score")`},
+		{"error inside All", All(Eq("score", 1.5)), `Eq("score")`},
+		{"error inside Not", Not(Eq("score", 1.5)), `Eq("score")`},
+		{"error nested two deep", Not(Any(All(Eq("score", 1.5)))), `Eq("score")`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

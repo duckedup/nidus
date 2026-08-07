@@ -31,12 +31,42 @@ fn range_matches(
     }
 }
 
+/// True iff `attrs[key]` is a list and `pred` holds over its elements. An absent or
+/// non-list attribute is never a match, so `NotContains` requires the key present and
+/// list-typed exactly as `Ne` requires it present.
+fn list_matches(
+    attrs: &BTreeMap<String, Value>,
+    key: &str,
+    pred: impl Fn(&[String]) -> bool,
+) -> bool {
+    match attrs.get(key) {
+        Some(Value::List(items)) => pred(items),
+        _ => false,
+    }
+}
+
+/// The string a list element could equal. Lists hold strings, so any other variant is a
+/// needle that can never be found — reported as `None` rather than silently coerced.
+fn needle(value: &Value) -> Option<&str> {
+    match value {
+        Value::Str(s) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
 /// True iff every predicate in `filter` matches `attrs`; an empty filter matches everything. Every
 /// predicate requires `key` present, so an absent attribute matches nothing — including the negative
 /// and range predicates. `SPEC.md` §7.1 has the full per-predicate semantics.
 pub fn matches(filter: &Filter, attrs: &BTreeMap<String, Value>) -> bool {
+    filter.0.iter().all(|p| matches_one(p, attrs))
+}
+
+/// Evaluate one predicate, recursing through the [`Predicate::All`]/[`Predicate::Any`]/
+/// [`Predicate::Not`] groups. Untrusted input cannot recurse without bound: serde_json
+/// caps nesting at 128 before a filter ever reaches here, and no `Op` carries a filter.
+fn matches_one(predicate: &Predicate, attrs: &BTreeMap<String, Value>) -> bool {
     use Ordering::{Equal, Greater, Less};
-    filter.0.iter().all(|predicate| match predicate {
+    match predicate {
         Predicate::Eq(key, expected) => attrs.get(key) == Some(expected),
         Predicate::Ne(key, expected) => matches!(attrs.get(key), Some(v) if v != expected),
         Predicate::Glob(key, pattern) => match attrs.get(key) {
@@ -56,7 +86,24 @@ pub fn matches(filter: &Filter, attrs: &BTreeMap<String, Value>) -> bool {
         Predicate::Le(key, bound) => range_matches(attrs, key, bound, &[Less, Equal]),
         Predicate::Gt(key, bound) => range_matches(attrs, key, bound, &[Greater]),
         Predicate::Ge(key, bound) => range_matches(attrs, key, bound, &[Greater, Equal]),
-    })
+        Predicate::Contains(key, value) => match needle(value) {
+            Some(want) => list_matches(attrs, key, |items| items.iter().any(|i| i == want)),
+            None => false,
+        },
+        Predicate::NotContains(key, value) => match needle(value) {
+            Some(want) => list_matches(attrs, key, |items| !items.iter().any(|i| i == want)),
+            // An unfindable needle is trivially absent, but the key must still be a list.
+            None => list_matches(attrs, key, |_| true),
+        },
+        Predicate::ContainsAny(key, set) => list_matches(attrs, key, |items| {
+            set.iter()
+                .filter_map(needle)
+                .any(|want| items.iter().any(|i| i == want))
+        }),
+        Predicate::All(preds) => preds.iter().all(|p| matches_one(p, attrs)),
+        Predicate::Any(preds) => preds.iter().any(|p| matches_one(p, attrs)),
+        Predicate::Not(pred) => !matches_one(pred, attrs),
+    }
 }
 
 #[cfg(test)]
@@ -249,9 +296,15 @@ mod tests {
 
     #[test]
     fn glob_list_value_fails() {
+        // Glob is Str-only by design; looking inside a list is `Contains`.
         let a = attrs(&[("tags", Value::List(vec!["rust".into()]))]);
         let f = filter(vec![Predicate::Glob("tags".into(), "*".into())]);
         assert!(!matches(&f, &a));
+        let c = filter(vec![Predicate::Contains(
+            "tags".into(),
+            Value::Str("rust".into()),
+        )]);
+        assert!(matches(&c, &a));
     }
 
     #[test]
@@ -786,6 +839,226 @@ mod tests {
             Predicate::IGlob("g".into(), "src/*".into()),
         ];
         let f = filter(preds);
+        let bytes = bincode::serialize(&f).unwrap();
+        let back: Filter = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(f, back);
+    }
+
+    // ── Array containment (nidus-m50.2) ──────────────────────────────────────────
+
+    fn tagged(tags: &[&str]) -> BTreeMap<String, Value> {
+        attrs(&[(
+            "tags",
+            Value::List(tags.iter().map(|s| s.to_string()).collect()),
+        )])
+    }
+
+    fn contains(needle: &str) -> Filter {
+        filter(vec![Predicate::Contains(
+            "tags".into(),
+            Value::Str(needle.into()),
+        )])
+    }
+
+    #[test]
+    fn contains_finds_an_element() {
+        assert!(matches(&contains("rust"), &tagged(&["go", "rust"])));
+    }
+
+    #[test]
+    fn contains_missing_element_fails() {
+        assert!(!matches(&contains("zig"), &tagged(&["go", "rust"])));
+    }
+
+    #[test]
+    fn contains_empty_list_fails() {
+        assert!(!matches(&contains("rust"), &tagged(&[])));
+    }
+
+    #[test]
+    fn contains_absent_key_fails() {
+        assert!(!matches(&contains("rust"), &BTreeMap::new()));
+    }
+
+    #[test]
+    fn contains_is_not_substring_matching() {
+        // "rust" must not match the element "rustacean" — Glob covers substrings.
+        assert!(!matches(&contains("rust"), &tagged(&["rustacean"])));
+    }
+
+    #[test]
+    fn contains_on_a_scalar_string_fails() {
+        // A plain Str is not a one-element list; Glob is the tool for that.
+        let a = attrs(&[("tags", Value::Str("rust".into()))]);
+        assert!(!matches(&contains("rust"), &a));
+    }
+
+    #[test]
+    fn contains_non_string_needle_never_matches() {
+        // Lists hold strings, so an Int needle is unfindable rather than coerced.
+        let f = filter(vec![Predicate::Contains("tags".into(), Value::Int(1))]);
+        assert!(!matches(&f, &tagged(&["1"])));
+    }
+
+    #[test]
+    fn not_contains_requires_the_key_to_be_a_present_list() {
+        let f = filter(vec![Predicate::NotContains(
+            "tags".into(),
+            Value::Str("zig".into()),
+        )]);
+        assert!(matches(&f, &tagged(&["rust"])));
+        assert!(matches(&f, &tagged(&[])));
+        // Absent key and wrong type both fail, exactly as `Ne` does.
+        assert!(!matches(&f, &BTreeMap::new()));
+        assert!(!matches(&f, &attrs(&[("tags", Value::Str("zig".into()))])));
+    }
+
+    #[test]
+    fn contains_any_needs_one_overlap() {
+        let f = filter(vec![Predicate::ContainsAny(
+            "tags".into(),
+            vec![Value::Str("zig".into()), Value::Str("rust".into())],
+        )]);
+        assert!(matches(&f, &tagged(&["rust", "go"])));
+        assert!(!matches(&f, &tagged(&["go"])));
+    }
+
+    #[test]
+    fn contains_any_with_an_empty_set_fails() {
+        // No candidate can overlap, so this is false even for a populated list.
+        let f = filter(vec![Predicate::ContainsAny("tags".into(), vec![])]);
+        assert!(!matches(&f, &tagged(&["rust"])));
+    }
+
+    #[test]
+    fn contains_all_is_expressed_by_composing_with_all() {
+        // No dedicated ContainsAll variant: boolean composition already covers it.
+        let f = filter(vec![Predicate::All(vec![
+            Predicate::Contains("tags".into(), Value::Str("rust".into())),
+            Predicate::Contains("tags".into(), Value::Str("go".into())),
+        ])]);
+        assert!(matches(&f, &tagged(&["go", "rust", "zig"])));
+        assert!(!matches(&f, &tagged(&["rust"])));
+    }
+
+    // ── Boolean composition (nidus-m50.1) ────────────────────────────────────────
+
+    fn project(name: &str) -> Predicate {
+        Predicate::Eq("project".into(), Value::Str(name.into()))
+    }
+
+    #[test]
+    fn any_is_a_disjunction() {
+        let f = filter(vec![Predicate::Any(vec![
+            project("nidus"),
+            project("beads"),
+        ])]);
+        assert!(matches(
+            &f,
+            &attrs(&[("project", Value::Str("nidus".into()))])
+        ));
+        assert!(matches(
+            &f,
+            &attrs(&[("project", Value::Str("beads".into()))])
+        ));
+        assert!(!matches(
+            &f,
+            &attrs(&[("project", Value::Str("other".into()))])
+        ));
+    }
+
+    #[test]
+    fn empty_group_identities() {
+        // AND of nothing is true, OR of nothing is false — the standard identities,
+        // and All's matches Filter's own "empty matches everything".
+        assert!(matches(
+            &filter(vec![Predicate::All(vec![])]),
+            &BTreeMap::new()
+        ));
+        assert!(!matches(
+            &filter(vec![Predicate::Any(vec![])]),
+            &BTreeMap::new()
+        ));
+    }
+
+    #[test]
+    fn not_inverts_a_group() {
+        let a = attrs(&[
+            ("kind", Value::Str("scratch".into())),
+            ("stale", Value::Bool(true)),
+        ]);
+        let f = filter(vec![Predicate::Not(Box::new(Predicate::All(vec![
+            Predicate::Eq("kind".into(), Value::Str("scratch".into())),
+            Predicate::Eq("stale".into(), Value::Bool(true)),
+        ])))]);
+        assert!(!matches(&f, &a));
+        // Flipping either conjunct makes the inner AND false, so Not becomes true.
+        let b = attrs(&[
+            ("kind", Value::Str("scratch".into())),
+            ("stale", Value::Bool(false)),
+        ]);
+        assert!(matches(&f, &b));
+    }
+
+    #[test]
+    fn not_differs_from_ne_on_an_absent_key() {
+        // The trap worth pinning: Ne asserts a present-and-different attribute, while
+        // Not(Eq) is satisfied by the attribute simply not being there.
+        let empty = BTreeMap::new();
+        assert!(!matches(
+            &filter(vec![Predicate::Ne("k".into(), Value::Int(1))]),
+            &empty
+        ));
+        assert!(matches(
+            &filter(vec![Predicate::Not(Box::new(Predicate::Eq(
+                "k".into(),
+                Value::Int(1)
+            )))]),
+            &empty
+        ));
+    }
+
+    #[test]
+    fn groups_nest_arbitrarily() {
+        // (project = nidus OR project = beads) AND NOT (tags contains wip)
+        let f = filter(vec![
+            Predicate::Any(vec![project("nidus"), project("beads")]),
+            Predicate::Not(Box::new(Predicate::Contains(
+                "tags".into(),
+                Value::Str("wip".into()),
+            ))),
+        ]);
+        let mut ok = tagged(&["done"]);
+        ok.insert("project".into(), Value::Str("nidus".into()));
+        assert!(matches(&f, &ok));
+
+        let mut wip = tagged(&["wip"]);
+        wip.insert("project".into(), Value::Str("nidus".into()));
+        assert!(!matches(&f, &wip));
+    }
+
+    #[test]
+    fn deeply_nested_groups_evaluate() {
+        // 64 levels of Not — well inside serde_json's 128 nesting cap, which is what
+        // bounds this from an untrusted body.
+        let mut p = Predicate::Eq("k".into(), Value::Int(1));
+        for _ in 0..64 {
+            p = Predicate::Not(Box::new(p));
+        }
+        // An even number of negations is the identity.
+        assert!(matches(&filter(vec![p]), &attrs(&[("k", Value::Int(1))])));
+    }
+
+    #[test]
+    fn group_and_containment_predicates_round_trip_through_serde() {
+        let f = filter(vec![
+            Predicate::Contains("tags".into(), Value::Str("rust".into())),
+            Predicate::NotContains("tags".into(), Value::Str("wip".into())),
+            Predicate::ContainsAny("tags".into(), vec![Value::Str("a".into())]),
+            Predicate::Any(vec![project("nidus")]),
+            Predicate::All(vec![project("beads")]),
+            Predicate::Not(Box::new(project("other"))),
+        ]);
         let bytes = bincode::serialize(&f).unwrap();
         let back: Filter = bincode::deserialize(&bytes).unwrap();
         assert_eq!(f, back);

@@ -55,6 +55,27 @@ export const f = {
   ge: (key: string, value: AttrInput): Predicate => ({
     Ge: [key, encodeValue(value)],
   }),
+  /** `attrs[key]` is a `List` containing `value` (whole-element, not substring). */
+  contains: (key: string, value: AttrInput): Predicate => ({
+    Contains: [key, encodeValue(value)],
+  }),
+  /** `attrs[key]` is a present `List` not containing `value`. */
+  notContains: (key: string, value: AttrInput): Predicate => ({
+    NotContains: [key, encodeValue(value)],
+  }),
+  /** `attrs[key]` is a `List` sharing at least one element with `values`. */
+  containsAny: (key: string, values: AttrInput[]): Predicate => ({
+    ContainsAny: [key, values.map(encodeValue)],
+  }),
+  /** Every sub-predicate holds. `all()` is `true`. */
+  all: (...preds: Predicate[]): Predicate => ({ All: preds }),
+  /** At least one sub-predicate holds. `any()` is `false`. */
+  any: (...preds: Predicate[]): Predicate => ({ Any: preds }),
+  /**
+   * The sub-predicate does not hold. Differs from {@link f.ne} on an absent key:
+   * `not(eq(k, v))` matches a record with no `k`, `ne(k, v)` does not.
+   */
+  not: (pred: Predicate): Predicate => ({ Not: pred }),
   /** Collect predicates into a {@link Filter} (purely sugar — they already AND). */
   and: (...preds: Predicate[]): Filter => preds,
 } as const;

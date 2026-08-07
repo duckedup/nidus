@@ -359,3 +359,89 @@ fn ann_readonly_reopen_loads_cache() {
     );
     db.persist_index().unwrap(); // no-op under ReadOnly, must not error
 }
+
+/// Boolean composition and containment through the real scan path (nidus-m50.1/.2).
+/// `filter::matches` is unit-tested directly; this pins that the same semantics survive
+/// the store's scan, including its empty-filter fast path and `list`/`delete_where`.
+#[test]
+fn nested_filters_and_containment_through_the_store() {
+    fn doc(id: &str, project: &str, tags: &[&str]) -> Record {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("project".to_string(), Value::Str(project.to_string()));
+        attrs.insert(
+            "tags".to_string(),
+            Value::List(tags.iter().map(|s| s.to_string()).collect()),
+        );
+        Record::new(id, vec![1.0, 0.0, 0.0], attrs)
+    }
+
+    let mut db = Nidus::open_in_memory(3).unwrap();
+    db.create_collection("c").unwrap();
+    db.upsert(
+        "c",
+        &[
+            doc("a", "nidus", &["rust", "wip"]),
+            doc("b", "nidus", &["rust"]),
+            doc("c", "beads", &["go"]),
+            doc("d", "other", &["rust"]),
+        ],
+    )
+    .unwrap();
+
+    let ids = |hits: Vec<nidus::Hit>| {
+        let mut v: Vec<String> = hits.into_iter().map(|h| h.id).collect();
+        v.sort();
+        v
+    };
+
+    // (project = nidus OR project = beads) AND NOT tags contains "wip".
+    let f = Filter(vec![
+        Predicate::Any(vec![
+            Predicate::Eq("project".into(), Value::Str("nidus".into())),
+            Predicate::Eq("project".into(), Value::Str("beads".into())),
+        ]),
+        Predicate::Not(Box::new(Predicate::Contains(
+            "tags".into(),
+            Value::Str("wip".into()),
+        ))),
+    ]);
+    let hits = db
+        .search(
+            "c",
+            &[1.0, 0.0, 0.0],
+            &SearchOpts {
+                top_k: 10,
+                filter: f.clone(),
+                min_score: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(ids(hits), vec!["b", "c"]);
+
+    // The same filter through `list`, which takes the non-scoring path.
+    assert_eq!(ids(db.list("c", &f, 0, 10).unwrap()), vec!["b", "c"]);
+
+    // ContainsAny overlaps on either candidate.
+    let any_tag = Filter(vec![Predicate::ContainsAny(
+        "tags".into(),
+        vec![Value::Str("go".into()), Value::Str("wip".into())],
+    )]);
+    assert_eq!(ids(db.list("c", &any_tag, 0, 10).unwrap()), vec!["a", "c"]);
+
+    // delete_where resolves a nested filter to ids before logging, so this is also
+    // the check that a group survives the write path.
+    let removed = db
+        .delete_where(
+            "c",
+            &Filter(vec![Predicate::Not(Box::new(Predicate::ContainsAny(
+                "tags".into(),
+                vec![Value::Str("rust".into())],
+            )))]),
+        )
+        .unwrap();
+    assert_eq!(removed, 1); // only "c" lacks the rust tag
+    assert_eq!(
+        ids(db.list("c", &Filter::default(), 0, 10).unwrap()),
+        vec!["a", "b", "d"]
+    );
+}

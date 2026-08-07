@@ -266,9 +266,29 @@ pub enum Predicate {
     Gt(String, Value),
     /// `attrs[key] >= value` (same-type, orderable).
     Ge(String, Value),
+    /// `attrs[key]` is a [`Value::List`] containing `value`. Lists hold strings, so a
+    /// non-[`Value::Str`] needle never matches. Substring matching on a plain `Str` is
+    /// [`Predicate::Glob`], not this.
+    Contains(String, Value),
+    /// `attrs[key]` is a [`Value::List`] *not* containing `value`. Like [`Predicate::Ne`],
+    /// it requires the key present and list-typed.
+    NotContains(String, Value),
+    /// `attrs[key]` is a [`Value::List`] sharing at least one element with the set.
+    /// "Contains all of" is [`Predicate::All`] over several [`Predicate::Contains`].
+    ContainsAny(String, Vec<Value>),
+    /// Every sub-predicate holds. Empty is `true`, matching [`Filter`]'s empty case.
+    All(Vec<Predicate>),
+    /// At least one sub-predicate holds. Empty is `false` — the identity for OR.
+    Any(Vec<Predicate>),
+    /// The sub-predicate does *not* hold. Note this differs from the negative leaf
+    /// predicates on an absent key: `Not(Eq(k, v))` is true when `k` is missing, whereas
+    /// `Ne(k, v)` is false. Use `Ne`/`NotIn`/`NotContains` to require presence.
+    Not(Box<Predicate>),
 }
 
-/// A conjunction (AND) of predicates. An empty filter matches everything.
+/// A conjunction (AND) of predicates. An empty filter matches everything. Arbitrary
+/// boolean shapes nest through the [`Predicate::All`]/[`Predicate::Any`]/[`Predicate::Not`]
+/// group variants rather than through this outer list.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Filter(pub Vec<Predicate>);
 

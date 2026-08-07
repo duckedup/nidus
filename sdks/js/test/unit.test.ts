@@ -68,6 +68,44 @@ describe("filter builder", () => {
     expect(pred).toEqual({ IGlob: ["path", "Src/*"] });
     expect(typeof pred.IGlob[1]).toBe("string");
   });
+
+  it("encodes the containment predicates over a list attribute", () => {
+    expect(f.contains("tags", "rust")).toEqual({
+      Contains: ["tags", { Str: "rust" }],
+    });
+    expect(f.notContains("tags", "wip")).toEqual({
+      NotContains: ["tags", { Str: "wip" }],
+    });
+    expect(f.containsAny("tags", ["rust", "go"])).toEqual({
+      ContainsAny: ["tags", [{ Str: "rust" }, { Str: "go" }]],
+    });
+  });
+
+  it("encodes combinators outside the key/value tuple shape", () => {
+    // all/any wrap a bare array of predicates; not wraps a single one.
+    expect(f.any(f.eq("a", 1), f.eq("b", 2))).toEqual({
+      Any: [{ Eq: ["a", { Int: 1 }] }, { Eq: ["b", { Int: 2 }] }],
+    });
+    expect(f.all(f.eq("a", 1))).toEqual({ All: [{ Eq: ["a", { Int: 1 }] }] });
+    expect(f.not(f.eq("a", 1))).toEqual({ Not: { Eq: ["a", { Int: 1 }] } });
+  });
+
+  it("emits empty groups as [] so the identities survive deserialization", () => {
+    expect(f.all()).toEqual({ All: [] });
+    expect(f.any()).toEqual({ Any: [] });
+  });
+
+  it("nests groups arbitrarily", () => {
+    expect(f.not(f.any(f.contains("tags", "wip")))).toEqual({
+      Not: { Any: [{ Contains: ["tags", { Str: "wip" }] }] },
+    });
+  });
+
+  it("distinguishes f.all (a predicate) from f.and (a filter)", () => {
+    // Only f.all nests: f.and returns the top-level array.
+    expect(Array.isArray(f.and(f.eq("a", 1)))).toBe(true);
+    expect(Array.isArray(f.all(f.eq("a", 1)))).toBe(false);
+  });
 });
 
 describe("NidusClient request shaping", () => {

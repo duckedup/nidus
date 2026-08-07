@@ -62,7 +62,13 @@ export type Predicate =
   | { Lt: [string, Value] }
   | { Le: [string, Value] }
   | { Gt: [string, Value] }
-  | { Ge: [string, Value] };
+  | { Ge: [string, Value] }
+  | { Contains: [string, Value] }
+  | { NotContains: [string, Value] }
+  | { ContainsAny: [string, Value[]] }
+  | { All: Predicate[] }
+  | { Any: Predicate[] }
+  | { Not: Predicate };
 
 /**
  * A conjunction (AND) of predicates. On the wire `Filter` is a newtype over

@@ -132,12 +132,50 @@ The predicates:
 - **`Lt` / `Le` / `Gt` / `Ge(key, value)`** — ordered range comparison, **same-type
   and orderable only**: `Int` numeric, `Str` lexical, `Bool` (`false < true`). A
   cross-type or non-orderable (`Null`, `List`) comparison never matches.
+- **`Contains(key, value)`** / **`NotContains(key, value)`** — `attrs[key]` is a
+  `List` that does / does not hold `value`. Matching is whole-element, not substring:
+  `Contains("tags", "rust")` does not match `["rustacean"]`, and `Contains` on a plain
+  `Str` fails — a string is not a one-element list.
+- **`ContainsAny(key, values)`** — `attrs[key]` is a `List` sharing at least one
+  element with the set. There is no `ContainsAll`; `All` over several `Contains`
+  already says it.
 
-Every predicate is a positive assertion about a **present** attribute: a record that
-lacks `key` matches *nothing* — including `Ne` / `NotIn` and the range predicates. (So
-`Ne("status", "archived")` does not match a record with no `status` at all.) There is
-no OR/disjunction — a `Filter` is always an AND; compose at the call site if you need
-alternatives.
+Every *leaf* predicate is a positive assertion about a **present** attribute: a record
+that lacks `key` matches *nothing* — including `Ne` / `NotIn` / `NotContains` and the
+range predicates. (So `Ne("status", "archived")` does not match a record with no
+`status` at all.)
+
+### Combining predicates
+
+A `Filter` is a conjunction, but `All`, `Any`, and `Not` are themselves predicates that
+take predicates, so any boolean shape nests inside one:
+
+```rust
+use nidus::{Filter, Predicate, Value};
+
+// (lang = rust OR lang = go) AND NOT tags contains "generated"
+let filter = Filter(vec![
+    Predicate::Any(vec![
+        Predicate::Eq("lang".into(), Value::Str("rust".into())),
+        Predicate::Eq("lang".into(), Value::Str("go".into())),
+    ]),
+    Predicate::Not(Box::new(Predicate::Contains(
+        "tags".into(),
+        Value::Str("generated".into()),
+    ))),
+]);
+```
+
+Empty groups take the usual identities: `All(vec![])` matches everything (like an empty
+`Filter`), `Any(vec![])` matches nothing.
+
+:::caution[`Not` and `Ne` differ on a missing attribute]
+`Ne("status", "archived")` asserts the attribute is **present and different**, so it
+does not match a record with no `status`. `Not(Eq("status", "archived"))` negates the
+truth value, so it **does** match that record — `Eq` was false, and `Not` inverted it.
+Reach for `Ne` / `NotIn` / `NotContains` when the attribute must exist, and `Not` when
+you want a genuine complement.
+:::
 
 Filters can also drive deletion without a search:
 

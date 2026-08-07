@@ -114,9 +114,9 @@ pub enum Value {
 ## `Predicate` & `Filter`
 
 A `Filter` is a conjunction (AND) of predicates; an empty filter matches
-everything. Every predicate is a positive assertion about a **present** attribute —
-a record lacking `key` matches no predicate, including the negative (`Ne`/`NotIn`)
-and range ones.
+everything. Every *leaf* predicate is a positive assertion about a **present**
+attribute — a record lacking `key` matches no leaf predicate, including the negative
+(`Ne`/`NotIn`/`NotContains`) and range ones.
 
 ```rust
 pub enum Predicate {
@@ -130,6 +130,14 @@ pub enum Predicate {
     Le(String, Value),      // attrs[key] <= value
     Gt(String, Value),      // attrs[key] >  value
     Ge(String, Value),      // attrs[key] >= value
+
+    Contains(String, Value),         // attrs[key] is a List holding value
+    NotContains(String, Value),      // attrs[key] is a present List not holding value
+    ContainsAny(String, Vec<Value>), // attrs[key] is a List overlapping the set
+
+    All(Vec<Predicate>),    // every sub-predicate holds  (empty = true)
+    Any(Vec<Predicate>),    // some sub-predicate holds   (empty = false)
+    Not(Box<Predicate>),    // the sub-predicate does not hold
 }
 
 pub struct Filter(pub Vec<Predicate>);
@@ -138,6 +146,14 @@ pub struct Filter(pub Vec<Predicate>);
 The range predicates (`Lt`/`Le`/`Gt`/`Ge`) compare **same-type, orderable** values
 only: `Int` numerically, `Str` lexically, `Bool` as `false < true`. A cross-type or
 non-orderable (`Null`, `List`) comparison never matches.
+
+`Contains`/`NotContains`/`ContainsAny` look inside a `List`, matching whole elements
+rather than substrings — `Contains("tags", "rust")` does not match `["rustacean"]`.
+
+`All`/`Any`/`Not` are predicates over predicates, so arbitrary boolean shapes nest
+without `Filter` itself changing. Note `Not` differs from `Ne` on a **missing**
+attribute: `Ne(k, v)` is false (it requires `k` present), while `Not(Eq(k, v))` is
+true. Use `Ne`/`NotIn`/`NotContains` to require presence, `Not` for set complement.
 
 ## `Distance`
 

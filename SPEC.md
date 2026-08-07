@@ -553,11 +553,43 @@ path in a casing the store does not have — so `IGlob` is the right default for
 path scoping, and `Glob` for anything that must compare exactly.
 
 `filter::matches` AND-combines predicates (empty filter matches everything); an
-absent key fails **every** predicate — including the negative ones (`Ne`, `NotIn`)
-and the range ones. Each predicate is a positive assertion about a *present*
-attribute, so a record lacking the key is never a match (e.g. `Ne "status"
+absent key fails **every** leaf predicate — including the negative ones (`Ne`, `NotIn`,
+`NotContains`) and the range ones. Each leaf predicate is a positive assertion about a
+*present* attribute, so a record lacking the key is never a match (e.g. `Ne "status"
 "archived"` does not match a record with no `status`). `Eq(key, Null)` likewise
 requires the key to be present and equal to `Null` (absent ≠ `Null`, per §3).
+
+### 7.2 Array containment
+
+`Contains`, `NotContains`, and `ContainsAny` look *inside* a `List`. Lists hold strings
+(§3), so a non-`Str` needle is unfindable rather than coerced — `Contains("tags", Int 1)`
+does not match the list `["1"]`. Matching is whole-element equality, not substring:
+`Contains("tags", "rust")` does not match `["rustacean"]`; `Glob` is the tool for
+substrings, and it remains `Str`-only (a `List` fails it). `Contains` on a scalar `Str`
+fails — a string is not a one-element list. `NotContains` requires the key present and
+list-typed, mirroring `Ne`; `ContainsAny` with an empty candidate set is `false`, since
+nothing can overlap. There is deliberately **no** `ContainsAll` variant: `All` over
+several `Contains` already expresses it.
+
+### 7.3 Boolean composition
+
+`All`, `Any`, and `Not` are predicates that take predicates, so arbitrary boolean shapes
+nest without changing `Filter` itself — it stays a conjunction, and the existing flat
+`[p, q]` wire form keeps its exact meaning and its scan fast path. Empty groups take the
+standard identities: `All([])` is `true` (matching `Filter`'s empty case), `Any([])` is
+`false`.
+
+`Not` negates the *truth value* of its sub-expression, which makes it behave differently
+from the negative leaf predicates on an absent key. `Ne(k, v)` is `false` when `k` is
+missing (it asserts a present-and-different attribute); `Not(Eq(k, v))` is `true`, because
+`Eq` was false. Both are useful — reach for `Ne`/`NotIn`/`NotContains` to require the
+attribute exist, and `Not` for genuine set complement. This is the one asymmetry in the
+filter language that reliably surprises, so it is tested explicitly.
+
+Nesting depth is bounded before evaluation: filters reach the store only through
+serde_json (HTTP body, CLI `--where`), which caps nesting at 128, and no op-log `Op`
+carries a filter — `delete_where` resolves to ids before logging. So a filter can be
+neither deep enough to exhaust the stack nor persisted to blow up on replay.
 
 ---
 

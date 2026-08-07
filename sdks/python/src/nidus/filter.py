@@ -31,9 +31,10 @@ class f:
     """Predicate constructors, mirroring ``sdks/js/src/filter.ts`` name for name.
 
     Each accepts a plain Python value (auto-normalized) or an explicit ``v.*``
-    :data:`~nidus.values.Value`. Three names carry a trailing underscore because ``in``
-    and ``and`` are reserved words in Python — ``f.in_``, ``f.not_in``, and ``f.and_``
-    are JS's ``f.in``, ``f.notIn``, and ``f.and``. Nothing else deviates.
+    :data:`~nidus.values.Value`. Some names carry a trailing underscore where JS's does
+    not, because the bare word is reserved (``in``, ``and``, ``not``) or shadows a
+    builtin (``all``, ``any``): ``f.in_``, ``f.not_in``, ``f.and_``, ``f.all_``,
+    ``f.any_``, ``f.not_``. Nothing else deviates.
     """
 
     @staticmethod
@@ -103,9 +104,62 @@ class f:
         return {"Ge": [key, encode_value(value)]}
 
     @staticmethod
+    def contains(key: str, value: AttrInput) -> Predicate:
+        """``attrs[key]`` is a list containing ``value``.
+
+        Whole-element, not substring: ``contains("tags", "rust")`` does not match
+        ``["rustacean"]``. Use :meth:`glob` for substrings on a plain string.
+        """
+        return {"Contains": [key, encode_value(value)]}
+
+    @staticmethod
+    def not_contains(key: str, value: AttrInput) -> Predicate:
+        """``attrs[key]`` is a present list *not* containing ``value``.
+
+        Like :meth:`ne`, it requires the attribute to exist and be a list.
+        """
+        return {"NotContains": [key, encode_value(value)]}
+
+    @staticmethod
+    def contains_any(key: str, values: Sequence[AttrInput]) -> Predicate:
+        """``attrs[key]`` is a list sharing at least one element with ``values``.
+
+        An empty set matches nothing. "Contains all of" is :meth:`all_` over several
+        :meth:`contains`.
+        """
+        return {"ContainsAny": [key, [encode_value(v) for v in values]]}
+
+    @staticmethod
+    def all_(*preds: Predicate) -> Predicate:
+        """Every sub-predicate holds. ``all_()`` is true, the identity for AND.
+
+        (JS: ``f.all`` — ``all`` shadows a builtin.) Unlike :meth:`and_` this returns a
+        *predicate*, so it can nest inside another group.
+        """
+        return {"All": list(preds)}
+
+    @staticmethod
+    def any_(*preds: Predicate) -> Predicate:
+        """At least one sub-predicate holds. ``any_()`` is false, the identity for OR.
+
+        (JS: ``f.any`` — ``any`` shadows a builtin.)
+        """
+        return {"Any": list(preds)}
+
+    @staticmethod
+    def not_(pred: Predicate) -> Predicate:
+        """The sub-predicate does not hold. (JS: ``f.not`` — ``not`` is reserved.)
+
+        Differs from :meth:`ne` on an absent key: ``not_(eq(k, v))`` matches a record
+        with no ``k`` at all, whereas ``ne(k, v)`` does not.
+        """
+        return {"Not": pred}
+
+    @staticmethod
     def and_(*preds: Predicate) -> Filter:
         """Collect predicates into a :data:`Filter` — sugar, since they already AND.
 
-        (JS: ``f.and`` — ``and`` is reserved.)
+        (JS: ``f.and`` — ``and`` is reserved.) For a conjunction *inside* a group use
+        :meth:`all_`, which is a predicate rather than a filter.
         """
         return list(preds)
