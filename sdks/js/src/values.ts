@@ -42,7 +42,9 @@ export const v = {
   datetime: (when: Date | number): Value => {
     const ms = when instanceof Date ? when.getTime() : when;
     if (!Number.isSafeInteger(ms)) {
-      throw new TypeError(`v.datetime expects a valid Date or epoch ms, got ${when}`);
+      throw new TypeError(
+        `v.datetime expects a valid Date or epoch ms, got ${when}`,
+      );
     }
     return { DateTime: ms };
   },
@@ -73,7 +75,7 @@ export function encodeValue(input: AttrInput): Value {
     case "number":
       return Number.isInteger(input) ? v.int(input) : v.float(input);
     case "object":
-      // A Date before the array check: both are objects, and only one is a list.
+      // Date before the array check: both are objects, only one is a list.
       if (input instanceof Date) return v.datetime(input);
       if (Array.isArray(input)) {
         if (!input.every((e) => typeof e === "string")) {
@@ -106,8 +108,8 @@ export function decodeValue(value: Value): DecodedValue {
   if ("Bool" in value) return value.Bool;
   if ("List" in value) return value.List;
   if ("Float" in value) return value.Float;
-  // A Date, not the raw number: decoding to a number would demote every instant to an
-  // Int when a decoded attrs map is written back.
+  // A Date, not the raw number: a number would demote every instant to an Int
+  // when a decoded attrs map is written back.
   if ("DateTime" in value) return new Date(value.DateTime);
   // Unknown tag (forward-compat): hand it back untouched.
   return value as unknown as DecodedValue;
