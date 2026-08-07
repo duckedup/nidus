@@ -313,6 +313,32 @@ def test_fts_schema_body() -> None:
     assert _wire.fts_schema_body(["body", "title"]) == {"fields": ["body", "title"]}
 
 
+def test_fts_schema_body_carries_per_field_tuning() -> None:
+    """A mapping travels as an object; the two forms mix in one call."""
+    assert _wire.fts_schema_body(
+        ["title", {"field": "body", "k1": 1.5, "ascii_folding": True, "max_token_len": 40}]
+    ) == {
+        "fields": [
+            "title",
+            {"field": "body", "k1": 1.5, "ascii_folding": True, "max_token_len": 40},
+        ]
+    }
+    # An unset knob is omitted, so a knob-less mapping is the bare name in object form.
+    assert _wire.fts_schema_body([{"field": "body"}]) == {"fields": [{"field": "body"}]}
+    # An explicit zero is a real value and must survive (b = 0 disables normalization).
+    assert _wire.fts_schema_body([{"field": "body", "b": 0.0}]) == {
+        "fields": [{"field": "body", "b": 0.0}]
+    }
+
+
+def test_fts_schema_body_refuses_a_misspelled_knob() -> None:
+    """The server ignores unknown keys, so a typo would index with folding silently off."""
+    with pytest.raises(TypeError, match="asciiFolding"):
+        _wire.fts_schema_body([{"field": "body", "asciiFolding": True}])  # type: ignore[list-item]
+    with pytest.raises(TypeError, match="'field' key"):
+        _wire.fts_schema_body([{"k1": 1.5}])  # type: ignore[list-item]
+
+
 def test_meta_body_is_the_bare_map() -> None:
     """The meta handler deserializes a bare ``BTreeMap<String, String>``, not a wrapper."""
     assert _wire.meta_body({"owner": "search-team"}) == {"owner": "search-team"}

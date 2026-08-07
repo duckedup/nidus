@@ -2,20 +2,68 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::fold::fold_ascii;
+
 /// The analyzer language for a full-text field. Extensible; only English is implemented
 /// today (the variant gates the stopword set + stemmer in [`analyze`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Language {
-    /// US English: ASCII-folding lowercase, English stopwords, Porter stemming.
+    /// US English: lowercase, English stopwords, Porter stemming.
     #[default]
+    #[serde(alias = "english", alias = "en")]
     English,
+}
+
+/// How one full-text field turns text into terms — applied identically at index and query
+/// time, so a query term can only match a stored term when both were analyzed the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Analyzer {
+    /// Picks the stopword set and stemmer.
+    pub language: Language,
+    /// Fold Latin diacritics to ASCII before stemming ("café" → "cafe").
+    pub ascii_folding: bool,
+    /// Drop tokens longer than this many chars. `None` keeps every token.
+    pub max_token_len: Option<usize>,
+}
+
+impl Default for Analyzer {
+    /// US English, no folding, no length cap — the behaviour of every release before the
+    /// analyzer became configurable.
+    fn default() -> Self {
+        Self {
+            language: Language::default(),
+            ascii_folding: false,
+            max_token_len: None,
+        }
+    }
+}
+
+impl Analyzer {
+    /// Set the language.
+    pub fn language(mut self, language: Language) -> Self {
+        self.language = language;
+        self
+    }
+
+    /// Turn ASCII folding on or off.
+    pub fn ascii_folding(mut self, on: bool) -> Self {
+        self.ascii_folding = on;
+        self
+    }
+
+    /// Drop tokens longer than `chars`.
+    pub fn max_token_len(mut self, chars: usize) -> Self {
+        self.max_token_len = Some(chars);
+        self
+    }
 }
 
 /// Analyze `text` into a sequence of normalized terms (in document order, duplicates
 /// kept so term frequencies are countable). Empty input → no terms.
-pub(crate) fn analyze(text: &str, lang: Language) -> Vec<String> {
-    match lang {
-        Language::English => tokenize(text)
+pub(crate) fn analyze(text: &str, cfg: Analyzer) -> Vec<String> {
+    let tokens = tokenize(text, cfg.ascii_folding, cfg.max_token_len);
+    match cfg.language {
+        Language::English => tokens
             .into_iter()
             .filter(|t| !is_stopword(t))
             .map(|t| stem(&t))
@@ -27,20 +75,33 @@ pub(crate) fn analyze(text: &str, lang: Language) -> Vec<String> {
 /// Split `text` into lowercased tokens on runs of Unicode alphanumerics, everything else being a
 /// separator. Lowercasing is std's `char::to_lowercase`, which covers the Latin script we target —
 /// a pragmatic stand-in for full UAX #29 segmentation that stays dependency-free.
-fn tokenize(text: &str) -> Vec<String> {
+fn tokenize(text: &str, ascii_folding: bool, max_token_len: Option<usize>) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
+    // The length cap counts the token as the text held it, before folding can expand it
+    // ("ß" → "ss"), so the cap means the same thing whether folding is on or off.
+    let mut push = |cur: &mut String| {
+        let token = std::mem::take(cur);
+        if max_token_len.is_some_and(|max| token.chars().count() > max) {
+            return;
+        }
+        out.push(if ascii_folding {
+            fold_ascii(&token)
+        } else {
+            token
+        });
+    };
     for ch in text.chars() {
         if ch.is_alphanumeric() {
             for lc in ch.to_lowercase() {
                 cur.push(lc);
             }
         } else if !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
+            push(&mut cur);
         }
     }
     if !cur.is_empty() {
-        out.push(cur);
+        push(&mut cur);
     }
     out
 }
@@ -466,18 +527,53 @@ impl Porter {
 mod tests {
     use super::*;
 
+    /// Tokenize with today's defaults (no folding, no length cap).
+    fn tok(text: &str) -> Vec<String> {
+        tokenize(text, false, None)
+    }
+
     #[test]
     fn tokenize_splits_and_lowercases() {
         assert_eq!(
-            tokenize("Hello, World! 123-foo"),
+            tok("Hello, World! 123-foo"),
             vec!["hello", "world", "123", "foo"]
         );
-        assert!(tokenize("   ").is_empty());
+        assert!(tok("   ").is_empty());
+    }
+
+    #[test]
+    fn ascii_folding_is_off_by_default_and_folds_when_on() {
+        assert_eq!(tok("Café RÉSUMÉ"), vec!["café", "résumé"]);
+        assert_eq!(tokenize("Café RÉSUMÉ", true, None), vec!["cafe", "resume"]);
+    }
+
+    #[test]
+    fn folded_and_unfolded_spellings_share_a_term() {
+        let cfg = Analyzer::default().ascii_folding(true);
+        assert_eq!(analyze("café", cfg), analyze("cafe", cfg));
+        // Without folding they stay distinct, which is exactly the pre-existing behaviour.
+        assert_ne!(
+            analyze("café", Analyzer::default()),
+            analyze("cafe", Analyzer::default())
+        );
+    }
+
+    #[test]
+    fn max_token_len_drops_only_the_oversized_tokens() {
+        assert_eq!(
+            tokenize("ok aaaaaaaa fine", false, Some(4)),
+            vec!["ok", "fine"]
+        );
+        // The cap counts chars, not bytes, so a 4-char accented token survives a cap of 4.
+        assert_eq!(tokenize("héllo", false, Some(4)), Vec::<String>::new());
+        assert_eq!(tokenize("héll", false, Some(4)), vec!["héll"]);
+        // And it is measured before folding expands "ß" into two ASCII chars.
+        assert_eq!(tokenize("straße", true, Some(6)), vec!["strasse"]);
     }
 
     #[test]
     fn stopwords_are_dropped() {
-        let terms = analyze("The quick brown fox and the lazy dog", Language::English);
+        let terms = analyze("The quick brown fox and the lazy dog", Analyzer::default());
         // "the", "and" are stopwords; the rest stem to themselves here.
         assert!(!terms.iter().any(|t| t == "the" || t == "and"));
         assert!(terms.contains(&"quick".to_string()));
@@ -552,8 +648,8 @@ mod tests {
 
     #[test]
     fn analyze_is_query_index_symmetric() {
-        let doc = analyze("The cats were running quickly", Language::English);
-        let query = analyze("run cat", Language::English);
+        let doc = analyze("The cats were running quickly", Analyzer::default());
+        let query = analyze("run cat", Analyzer::default());
         for q in &query {
             assert!(
                 doc.contains(q),

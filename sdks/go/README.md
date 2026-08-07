@@ -154,6 +154,7 @@ call that used the filter. Check it earlier with `Predicate.Err()` / `Filter.Err
 
 ```go
 if err := db.SetFtsSchema(ctx, "docs", []string{"body"}); err != nil { /* … */ }
+// SetFtsFields is the same call with per-field BM25/analyzer tuning.
 
 // BM25 text search. Scores are raw BM25 — unbounded, not comparable across queries.
 text, err := db.TextSearch(ctx, nidus.TextSearchRequest{

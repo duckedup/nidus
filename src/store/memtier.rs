@@ -6,10 +6,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Language;
 use crate::backend::MemoryTier;
 use crate::config::Config;
-use crate::fts::Fts;
+use crate::fts::{Fts, FtsField};
 
 use super::{Collection, Store};
 
@@ -18,8 +17,8 @@ use super::{Collection, Store};
 /// stores sharing one server don't collide.
 const WORKING_SET_OBJECT: &str = "workingset";
 
-/// One FTS collection's declared schema in the snapshot (`(field, language)` pairs).
-type SchemaEntry<'a> = (&'a str, &'a [(String, Language)]);
+/// One FTS collection's declared schema in the snapshot.
+type SchemaEntry<'a> = (&'a str, &'a [FtsField]);
 
 /// The borrowing view serialized on publish — no clone of the index.
 #[derive(Serialize)]
@@ -37,7 +36,7 @@ struct WorkingSet {
     data_rows: u64,
     dead_rows: u64,
     collections: HashMap<String, Collection>,
-    fts_schemas: Vec<(String, Vec<(String, Language)>)>,
+    fts_schemas: Vec<(String, Vec<FtsField>)>,
 }
 
 /// A working set adopted from the tier, ready to become the store's in-RAM index.
@@ -60,7 +59,7 @@ impl AdoptedIndex {
 /// The validity key for the working-set snapshot: any change to the embedding shape
 /// invalidates a cached blob (a differently-shaped store must not adopt it).
 pub(super) fn working_set_key(config: &Config) -> Vec<u8> {
-    format!("ws-v1:{}:{:?}", config.dimension, config.distance).into_bytes()
+    format!("ws-v2:{}:{:?}", config.dimension, config.distance).into_bytes()
 }
 
 /// Try to adopt the shared working set: `Some(index)` only when the tier holds a snapshot whose
@@ -171,7 +170,7 @@ mod tests {
     #[test]
     fn adopts_only_a_matching_snapshot() {
         let tier = LocalRam::new();
-        let key = b"ws-v1:3:Cosine";
+        let key = b"ws-v2:3:Cosine";
         publish(&tier, key, 1, 100);
 
         // Exact match on key + watermark + data_rows → adopted.
@@ -186,7 +185,7 @@ mod tests {
         assert!(try_adopt(Some(&tier), key, 2, 100).unwrap().is_none());
         // Validity-key mismatch (different dim/metric) → rebuild.
         assert!(
-            try_adopt(Some(&tier), b"ws-v1:4:Cosine", 1, 100)
+            try_adopt(Some(&tier), b"ws-v2:4:Cosine", 1, 100)
                 .unwrap()
                 .is_none()
         );

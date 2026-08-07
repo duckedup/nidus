@@ -2927,7 +2927,7 @@ fn mmap_with_per_segment_index_keeps_recall() {
 
 // ── Full-text search (BM25) ─────────────────────────────────────────────────
 
-use crate::Language;
+use crate::fts::{Analyzer, FtsField, Language};
 use crate::model::FtsQuery;
 
 fn doc(id: &str, body: &str) -> Record {
@@ -2940,7 +2940,7 @@ fn doc(id: &str, body: &str) -> Record {
 fn text_search_ranks_and_stems() {
     let mut store = Store::in_memory(3).unwrap();
     store
-        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .set_fts_schema("docs", &[FtsField::new("body")])
         .unwrap();
     store
         .upsert(
@@ -2970,7 +2970,7 @@ fn text_search_indexes_docs_upserted_before_schema() {
     let mut store = Store::in_memory(3).unwrap();
     store.upsert("docs", &[doc("a", "alpha beta")]).unwrap();
     store
-        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .set_fts_schema("docs", &[FtsField::new("body")])
         .unwrap();
     let hits = store
         .text_search(
@@ -2987,7 +2987,7 @@ fn text_search_indexes_docs_upserted_before_schema() {
 fn text_search_respects_filter_and_delete() {
     let mut store = Store::in_memory(3).unwrap();
     store
-        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .set_fts_schema("docs", &[FtsField::new("body")])
         .unwrap();
     let mut a = doc("a", "shared term");
     a.attrs
@@ -3037,7 +3037,7 @@ fn text_search_survives_reopen_and_compact() {
     {
         let mut store = Store::open(Config::new(&path, 2)).unwrap();
         store
-            .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+            .set_fts_schema("docs", &[FtsField::new("body")])
             .unwrap();
         store
             .upsert(
@@ -3070,7 +3070,7 @@ fn hybrid_collection_text_and_vector_coexist() {
     // A collection can hold vector docs and full-text fields on the same records.
     let mut store = Store::in_memory(3).unwrap();
     store
-        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .set_fts_schema("docs", &[FtsField::new("body")])
         .unwrap();
     let mut r = Record::new("a", vec![1.0, 0.0, 0.0], BTreeMap::new());
     r.attrs.insert(
@@ -3098,7 +3098,7 @@ use crate::model::HybridOpts;
 fn hybrid_search_fuses_vector_and_text() {
     let mut store = Store::in_memory(3).unwrap();
     store
-        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .set_fts_schema("docs", &[FtsField::new("body")])
         .unwrap();
     // a: strong vector match, weak text. b: weak vector, strong text. c: text-only.
     let mut a = Record::new("a", vec![1.0, 0.0, 0.0], BTreeMap::new());
@@ -3148,7 +3148,7 @@ fn hybrid_search_fuses_vector_and_text() {
 fn hybrid_search_is_deterministic() {
     let mut store = Store::in_memory(3).unwrap();
     store
-        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .set_fts_schema("docs", &[FtsField::new("body")])
         .unwrap();
     store
         .upsert(
@@ -3181,7 +3181,7 @@ fn fts_cache_persists_and_reloads() {
     {
         let mut store = Store::open(Config::new(&path, 2)).unwrap();
         store
-            .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+            .set_fts_schema("docs", &[FtsField::new("body")])
             .unwrap();
         store
             .upsert("docs", &[doc("a", "alpha beta"), doc("b", "beta gamma")])
@@ -3234,7 +3234,7 @@ fn text_only_churn_auto_compacts_fts_on_reopen() {
     {
         let mut store = Store::open(Config::new(&path, 2)).unwrap();
         store
-            .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+            .set_fts_schema("docs", &[FtsField::new("body")])
             .unwrap();
         // Insert 4 ids, then overwrite each several times → many tombstones, zero rows.
         for round in 0..5 {
@@ -3280,9 +3280,7 @@ fn text_search_across_collections_analyzes_once() {
     // query once per language internally).
     let mut store = Store::in_memory(3).unwrap();
     for c in ["a", "b"] {
-        store
-            .set_fts_schema(c, &[("body".to_string(), Language::English)])
-            .unwrap();
+        store.set_fts_schema(c, &[FtsField::new("body")]).unwrap();
     }
     store.upsert("a", &[doc("a1", "running fast")]).unwrap();
     store.upsert("b", &[doc("b1", "runners run")]).unwrap();
@@ -3300,6 +3298,223 @@ fn text_search_across_collections_analyzes_once() {
         vec!["a1", "b1"],
         "stemmed match across both collections"
     );
+}
+
+// ── FTS schema: per-field BM25 / analyzer configuration (nidus-m50.13) ───────────
+
+#[test]
+fn a_legacy_fts_schema_op_replays_with_the_default_params() {
+    // A store written before the params were tunable holds `SetFtsSchema`, not
+    // `SetFtsFields`. It must still open, scored exactly as it was.
+    let ops = vec![
+        Op::CreateCollection {
+            collection: "docs".to_string(),
+        },
+        Op::SetFtsSchema {
+            collection: "docs".to_string(),
+            fields: vec![("body".to_string(), Language::English)],
+        },
+    ];
+    let (collections, _dead, fts) = Store::replay_ops(ops, 0);
+    assert!(collections.contains_key("docs"));
+    let decl = fts.schema_for("docs").expect("legacy schema restored");
+    assert_eq!(decl, &[FtsField::new("body")]);
+    assert_eq!(decl[0].k1, 1.2);
+    assert_eq!(decl[0].b, 0.75);
+    assert_eq!(
+        fts.field_analyzer("docs", "body"),
+        Some(Analyzer::default())
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn an_old_format_log_still_opens_and_searches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store.create_collection("docs").unwrap();
+        // Write the *legacy* op straight to the log, as a pre-m50.13 nidus would have.
+        store
+            .log
+            .append(&Op::SetFtsSchema {
+                collection: "docs".to_string(),
+                fields: vec![("body".to_string(), Language::English)],
+            })
+            .unwrap();
+        store.flush().unwrap();
+        store
+            .upsert(
+                "docs",
+                &[doc("a", "the cat sat"), doc("b", "cats and cats")],
+            )
+            .unwrap();
+        store.flush().unwrap();
+    }
+    let store = Store::open(Config::new(&path, 2)).unwrap();
+    let hits = store
+        .text_search(&["docs"], &FtsQuery::new("body", "cat"), &default_opts(10))
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["b", "a"]
+    );
+    // The frozen default score (idf = ln(1.2), norm exactly 1 at k1 = 1.2 / b = 0.75),
+    // so the legacy path is not silently re-tuned.
+    assert!((hits[1].score - 0.182_321_6).abs() < 1e-5, "{hits:?}");
+}
+
+#[test]
+fn per_field_params_change_the_ranking_they_are_declared_on() {
+    // `b = 0` on `body` removes length normalization, which is enough to flip the
+    // short-doc-wins ordering the default produces.
+    let ranked = |field: FtsField| {
+        let mut store = Store::in_memory(3).unwrap();
+        store.set_fts_schema("docs", &[field]).unwrap();
+        store
+            .upsert(
+                "docs",
+                &[
+                    doc("short", "needle"),
+                    doc(
+                        "long",
+                        "needle needle plus assorted unrelated padding words here",
+                    ),
+                ],
+            )
+            .unwrap();
+        let hits = store
+            .text_search(
+                &["docs"],
+                &FtsQuery::new("body", "needle"),
+                &default_opts(10),
+            )
+            .unwrap();
+        hits[0].id.clone()
+    };
+    assert_eq!(ranked(FtsField::new("body")), "short");
+    assert_eq!(ranked(FtsField::new("body").b(0.0)), "long");
+}
+
+#[test]
+fn analyzer_options_apply_at_index_and_query_time() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body").ascii_folding(true)])
+        .unwrap();
+    store.upsert("docs", &[doc("a", "un café noir")]).unwrap();
+    // Folding is symmetric: either spelling of the query finds the accented document.
+    for q in ["cafe", "café"] {
+        let hits = store
+            .text_search(&["docs"], &FtsQuery::new("body", q), &default_opts(10))
+            .unwrap();
+        assert_eq!(hits.len(), 1, "query {q:?} must match the folded term");
+    }
+}
+
+#[test]
+fn set_fts_schema_rejects_params_bm25_cannot_use() {
+    let mut store = Store::in_memory(3).unwrap();
+    assert!(
+        store
+            .set_fts_schema("docs", &[FtsField::new("body").b(2.0)])
+            .is_err()
+    );
+    assert!(
+        store
+            .set_fts_schema("docs", &[FtsField::new("body").k1(-1.0)])
+            .is_err()
+    );
+    // The rejected schema was never applied, so nothing is indexed.
+    assert!(store.fts.schema_for("docs").is_none());
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn changing_a_bm25_param_rebuilds_instead_of_serving_the_stale_cache() {
+    // The consequential case: the postings on disk are still valid, so only the cache
+    // *key* stands between a reopen and results scored under the old k1/b.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let corpus = [
+        doc("short", "needle"),
+        doc(
+            "long",
+            "needle needle plus assorted unrelated padding words here",
+        ),
+    ];
+    let key_default;
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store
+            .set_fts_schema("docs", &[FtsField::new("body")])
+            .unwrap();
+        store.upsert("docs", &corpus).unwrap();
+        store.persist_index().unwrap();
+        key_default = store.fts.cache_key();
+        assert!(path.join("fts").exists());
+    }
+    {
+        // Redeclare with b = 0 and nothing else changed.
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store
+            .set_fts_schema("docs", &[FtsField::new("body").b(0.0)])
+            .unwrap();
+        assert_ne!(store.fts.cache_key(), key_default, "the key must move");
+        store.persist_index().unwrap();
+    }
+    {
+        // Reopen: the cache on disk is keyed for b = 0, so the new scores are served.
+        let store = Store::open(Config::new(&path, 2)).unwrap();
+        let hits = store
+            .text_search(
+                &["docs"],
+                &FtsQuery::new("body", "needle"),
+                &default_opts(10),
+            )
+            .unwrap();
+        assert_eq!(hits[0].id, "long", "reopened under the new b");
+    }
+    {
+        // And back: reverting the schema must not adopt the b = 0 cache either.
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store
+            .set_fts_schema("docs", &[FtsField::new("body")])
+            .unwrap();
+        assert_eq!(store.fts.cache_key(), key_default);
+        let hits = store
+            .text_search(
+                &["docs"],
+                &FtsQuery::new("body", "needle"),
+                &default_opts(10),
+            )
+            .unwrap();
+        assert_eq!(hits[0].id, "short", "back to the default ranking");
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn compact_re_emits_the_full_field_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let field = FtsField::new("body").k1(1.7).b(0.3).ascii_folding(true);
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store
+            .set_fts_schema("docs", std::slice::from_ref(&field))
+            .unwrap();
+        store.upsert("docs", &[doc("a", "un café noir")]).unwrap();
+        store.compact().unwrap();
+    }
+    // The post-compact log must carry the params, not a default-shaped schema.
+    let store = Store::open(Config::new(&path, 2)).unwrap();
+    assert_eq!(store.fts.schema_for("docs"), Some(&[field][..]));
+    let hits = store
+        .text_search(&["docs"], &FtsQuery::new("body", "cafe"), &default_opts(10))
+        .unwrap();
+    assert_eq!(hits.len(), 1, "folding survived the compaction");
 }
 
 // ── Segments: seal / manifest / migration (SPEC §14, Phase 1) ────────────────────
@@ -4580,7 +4795,7 @@ fn search_rejects_a_bad_dimension_on_the_ann_path_too() {
 fn hybrid_search_rejects_a_bad_dimension_regardless_of_top_k() {
     let mut store = Store::in_memory(3).unwrap();
     store
-        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .set_fts_schema("docs", &[FtsField::new("body")])
         .unwrap();
     store
         .upsert("docs", &[doc("c", "quantum physics")])

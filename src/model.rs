@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::fts::Language;
+use crate::fts::{FtsField, Language};
 
 /// The similarity / distance metric used for scoring. Pinned at store creation
 /// (stored in the data header) — reopening with a different metric is an error.
@@ -430,11 +430,104 @@ pub enum Op {
         id: String,
         attrs: BTreeMap<String, Value>,
     },
-    /// Declare a collection's full-text-indexed fields (the FTS schema). Replayed on
-    /// open to rebuild the inverted index; re-emitted by `compact`. Appended at the end
-    /// for the same forward-compatibility reason as `UpsertText`.
+    /// **Legacy**, superseded by `SetFtsFields`: an FTS schema carrying only a language per
+    /// field. Never written any more, but still decoded on replay — a log written before the
+    /// BM25/analyzer params were tunable must still open, with the defaults applied.
     SetFtsSchema {
         collection: String,
         fields: Vec<(String, Language)>,
     },
+    /// Declare a collection's full-text-indexed fields with their BM25 and analyzer params.
+    /// Replayed on open to rebuild the inverted index; re-emitted by `compact`. Appended at
+    /// the end for the same forward-compatibility reason as `UpsertText`.
+    SetFtsFields {
+        collection: String,
+        fields: Vec<FtsField>,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appending_variants_did_not_renumber_the_existing_ones() {
+        // bincode tags a variant by its **declaration index**, so inserting one anywhere
+        // but the end silently reinterprets every op in every store's existing log.
+        let cases: [(Op, u32); 8] = [
+            (
+                Op::CreateCollection {
+                    collection: "c".into(),
+                },
+                0,
+            ),
+            (
+                Op::DropCollection {
+                    collection: "c".into(),
+                },
+                1,
+            ),
+            (
+                Op::SetMeta {
+                    collection: "c".into(),
+                    meta: BTreeMap::new(),
+                },
+                2,
+            ),
+            (
+                Op::Upsert {
+                    collection: "c".into(),
+                    id: "i".into(),
+                    row: 0,
+                    attrs: BTreeMap::new(),
+                },
+                3,
+            ),
+            (
+                Op::Delete {
+                    collection: "c".into(),
+                    id: "i".into(),
+                },
+                4,
+            ),
+            (
+                Op::UpsertText {
+                    collection: "c".into(),
+                    id: "i".into(),
+                    attrs: BTreeMap::new(),
+                },
+                5,
+            ),
+            (
+                Op::SetFtsSchema {
+                    collection: "c".into(),
+                    fields: vec![("body".into(), Language::English)],
+                },
+                6,
+            ),
+            (
+                Op::SetFtsFields {
+                    collection: "c".into(),
+                    fields: vec![FtsField::new("body")],
+                },
+                7,
+            ),
+        ];
+        for (op, want) in cases {
+            let bytes = bincode::serialize(&op).unwrap();
+            let tag = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            assert_eq!(tag, want, "{op:?} must stay variant {want}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_fts_schema_op_still_decodes() {
+        // The exact bytes an old nidus wrote for `SetFtsSchema { "docs", [("body", English)] }`.
+        let op = Op::SetFtsSchema {
+            collection: "docs".into(),
+            fields: vec![("body".into(), Language::English)],
+        };
+        let bytes = bincode::serialize(&op).unwrap();
+        assert_eq!(bincode::deserialize::<Op>(&bytes).unwrap(), op);
+    }
 }

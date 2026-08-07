@@ -163,6 +163,12 @@ carried the filter. `Predicate.Err()` and `Filter.Err()` check it earlier.
 ```go
 err := db.SetFtsSchema(ctx, "docs", []string{"body"})
 
+// …or tune BM25 / the analyzer per field. Unset knobs take the server's defaults.
+k1, folding := float32(1.5), true
+err = db.SetFtsFields(ctx, "docs", []nidus.FtsField{
+    {Field: "body", K1: &k1, AsciiFolding: &folding},
+})
+
 // BM25 text search — scores are raw BM25, not comparable across queries
 text, err := db.TextSearch(ctx, nidus.TextSearchRequest{
     Field: "body", Query: "vector store", TopK: 10,

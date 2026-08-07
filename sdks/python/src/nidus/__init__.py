@@ -34,7 +34,7 @@ from ._version import __version__
 from .client import NidusClient, Transport
 from .errors import NidusError
 from .filter import Filter, Predicate, f
-from .types import AnnInfo, Footprint, Hit, Hits, Record, RecordInput, Stats
+from .types import AnnInfo, Footprint, FtsField, Hit, Hits, Record, RecordInput, Stats
 from .values import (
     AttrInput,
     DecodedValue,
@@ -65,6 +65,7 @@ __all__ = [
     "DecodedValue",
     "Filter",
     "Footprint",
+    "FtsField",
     "Hit",
     "Hits",
     "NidusClient",

@@ -310,12 +310,28 @@ func (c *Client) Records(ctx context.Context, name string) ([]Record, error) {
 // SetFtsSchema declares which attribute fields are full-text indexed, which is what
 // makes [Client.TextSearch] and [Client.HybridSearch] able to see them. Fields already
 // written are indexed as part of applying the schema.
+//
+// Every field takes the server's BM25 and analyzer defaults. Use
+// [Client.SetFtsFields] to tune k1, b, or the analyzer per field.
 func (c *Client) SetFtsSchema(ctx context.Context, name string, fields []string) error {
 	if fields == nil {
 		fields = []string{}
 	}
 	body := struct {
 		Fields []string `json:"fields"`
+	}{fields}
+	return c.request(ctx, http.MethodPost, collPath(name, "/fts-schema"), body, nil)
+}
+
+// SetFtsFields is [Client.SetFtsSchema] with per-field BM25 and analyzer tuning. It
+// hits the same endpoint: the server accepts a bare field name or a field object, and
+// an [FtsField] whose knobs are all unset encodes to the same defaults.
+func (c *Client) SetFtsFields(ctx context.Context, name string, fields []FtsField) error {
+	if fields == nil {
+		fields = []FtsField{}
+	}
+	body := struct {
+		Fields []FtsField `json:"fields"`
 	}{fields}
 	return c.request(ctx, http.MethodPost, collPath(name, "/fts-schema"), body, nil)
 }

@@ -9,6 +9,7 @@ import { NidusError } from "./errors.js";
 import type {
   DecodedRecord,
   Filter,
+  FtsField,
   Hit,
   HybridSearchOptions,
   ListOptions,
@@ -167,10 +168,17 @@ export class NidusClient {
     }));
   }
 
-  /** Declare the full-text-indexed attribute fields for a collection. */
-  async setFtsSchema(name: string, fields: string[]): Promise<void> {
+  /**
+   * Declare the full-text-indexed attribute fields for a collection. A bare string
+   * takes the server's BM25/analyzer defaults; an {@link FtsField} object tunes `k1`,
+   * `b`, and the analyzer for that field alone.
+   */
+  async setFtsSchema(
+    name: string,
+    fields: (string | FtsField)[],
+  ): Promise<void> {
     await this.request("POST", `/collections/${enc(name)}/fts-schema`, {
-      fields,
+      fields: fields.map(encodeFtsField),
     });
   }
 
@@ -364,6 +372,23 @@ interface RawHit {
 /** Path-segment encode a collection name (allows slashes/spaces in names). */
 function enc(name: string): string {
   return encodeURIComponent(name);
+}
+
+/**
+ * Encode one `setFtsSchema` field. A string passes through as the server's bare-name
+ * form; an object becomes the snake_case body, pruned so an unset knob keeps the
+ * server's default rather than being sent as `undefined`.
+ */
+function encodeFtsField(f: string | FtsField): unknown {
+  if (typeof f === "string") return f;
+  return prune({
+    field: f.field,
+    k1: f.k1,
+    b: f.b,
+    language: f.language,
+    ascii_folding: f.asciiFolding,
+    max_token_len: f.maxTokenLen,
+  });
 }
 
 /** Drop `undefined` fields so server `#[serde(default)]`s apply instead. */

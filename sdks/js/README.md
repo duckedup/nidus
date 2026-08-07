@@ -80,6 +80,7 @@ const hits = await db.search({
 
 ```ts
 await db.setFtsSchema("docs", ["body"]);
+// Per-field tuning: await db.setFtsSchema("docs", [{ field: "body", k1: 1.5 }]);
 
 // BM25 text search
 const text = await db.textSearch({ field: "body", query: "vector store", topK: 10 });

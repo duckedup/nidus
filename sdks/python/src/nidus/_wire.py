@@ -42,13 +42,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from urllib.parse import quote
 
 from . import _guards
 from .errors import NidusError
 from .filter import Filter
-from .types import AnnInfo, Footprint, Hit, Record, RecordInput, Stats
+from .types import AnnInfo, Footprint, FtsField, Hit, Record, RecordInput, Stats
 from .values import AttrInput, Value, decode_attrs, encode_attrs
 
 # ── Paths ────────────────────────────────────────────────────────────────────────────
@@ -173,8 +173,40 @@ def delete_where_body(filter: Filter) -> dict[str, Any]:  # noqa: A002
     return {"filter": list(filter)}
 
 
-def fts_schema_body(fields: Sequence[str]) -> dict[str, Any]:
-    return {"fields": _guards.str_sequence(fields, "set_fts_schema(name, fields)")}
+#: The knobs an :class:`~nidus.FtsField` may carry, in the order the server documents them.
+_FTS_FIELD_KNOBS = ("k1", "b", "language", "ascii_folding", "max_token_len")
+
+
+def fts_schema_body(fields: Sequence[Union[str, FtsField]]) -> dict[str, Any]:
+    """Body for the FTS schema. A bare name and a knob-less mapping mean the same thing.
+
+    An unknown key is a ``TypeError`` rather than a silently dropped one: the server
+    ignores what it does not recognise, so a misspelled ``asciiFolding`` would otherwise
+    index the field with folding off and report success.
+    """
+    _guards.reject_bare_string(fields, "set_fts_schema(name, fields)")
+    return {"fields": [_fts_field(f) for f in fields]}
+
+
+def _fts_field(spec: Union[str, FtsField]) -> Union[str, dict[str, Any]]:
+    if isinstance(spec, str):
+        return spec
+    if not isinstance(spec, Mapping) or "field" not in spec:
+        raise TypeError(
+            "set_fts_schema(name, fields) expects each field to be a name or a mapping "
+            f"with a 'field' key, got {spec!r}"
+        )
+    # As a plain Mapping: a TypedDict cannot be indexed by a variable key.
+    knobs: Mapping[str, Any] = spec
+    unknown = set(knobs) - {"field", *_FTS_FIELD_KNOBS}
+    if unknown:
+        raise TypeError(
+            f"set_fts_schema(name, fields): unknown key(s) {sorted(unknown)} — "
+            f"expected any of {sorted(_FTS_FIELD_KNOBS)}"
+        )
+    body: dict[str, Any] = {"field": str(knobs["field"])}
+    body.update({k: knobs[k] for k in _FTS_FIELD_KNOBS if k in knobs})
+    return body
 
 
 def search_body(
