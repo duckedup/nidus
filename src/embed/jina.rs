@@ -1,8 +1,4 @@
 //! Jina embedding adapter (`jina-embeddings-v3` default).
-//!
-//! OpenAI-shaped `/v1/embeddings` plus a `task` field
-//! (`retrieval.passage` for documents, `retrieval.query` for queries); reuses
-//! [`super::openai_shaped`]. Fixed 1024-dimension output.
 
 use super::{EmbedConfig, EmbedError, Embedder, openai_shaped, resolve_base};
 

@@ -1,9 +1,4 @@
 //! Shared data vocabulary used across nidus modules.
-//!
-//! Pure type definitions plus serde derives. *Behavior* lives in the modules that
-//! own it — `filter` evaluates a [`Filter`], `log` (de)serializes an [`Op`], etc.
-//! This module is the single source of truth for the types those modules share, so
-//! they can be built independently and still agree on shapes.
 
 use std::collections::BTreeMap;
 
@@ -91,23 +86,15 @@ pub enum AnnKind {
     /// Hierarchical Navigable Small World graph. Native incremental insert (matches
     /// nidus's append-only upsert), high recall, no training pass. The default.
     Hnsw,
-    /// Inverted-file index: k-means centroids partition the space into lists; a query
-    /// probes the nearest few lists. Lower edge memory than HNSW, but its centroids
-    /// are fit from the data present at build time, so heavy incremental growth drifts
-    /// until the next [`crate::Nidus::compact`] rebuild.
+    /// Inverted-file index: k-means centroids partition the space into lists and a query probes the
+    /// nearest few. Lower edge memory than HNSW, but centroids are fit at build time, so heavy
+    /// incremental growth drifts until the next [`crate::Nidus::compact`].
     Ivf,
 }
 
-/// Configuration for approximate-nearest-neighbour search. When set on
-/// [`crate::Config::ann`] the store maintains an in-RAM ANN index and `search`
-/// consults it — walking the index for an over-fetched candidate set, then applying
-/// the scope/filter/`min_score` and an exact f32 rerank. Approximate: recall is
-/// traded for speed past brute-force's comfort zone (≫ a few million vectors).
-///
-/// Construct with [`AnnConfig::hnsw`] or [`AnnConfig::ivf`] and adjust via the
-/// setters. ANN may be combined with [`Quantization`]: the index walk then scores
-/// quantized codes for cheaper candidate selection, and the exact f32 rerank over the
-/// resulting candidates restores accuracy.
+/// Configuration for approximate-nearest-neighbour search. Set on [`crate::Config::ann`], the store
+/// maintains an in-RAM index and `search` walks it for an over-fetched candidate set, then applies
+/// scope/filter/`min_score` and an exact f32 rerank — recall traded for speed past brute force.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnnConfig {
     /// Which index drives the candidate walk.
@@ -128,10 +115,9 @@ pub struct AnnConfig {
     /// IVF: how many of the nearest lists a query scans. Higher = better recall,
     /// slower queries. Ignored for HNSW.
     pub n_probe: usize,
-    /// Over-fetch multiple: the walk collects `top_k * overscan` candidates before the
-    /// scope/filter/`min_score` post-filter and f32 rerank, so a metadata filter or a
-    /// collection-subset scope still has survivors to rank. Higher = better recall
-    /// under selective filters, slower queries.
+    /// Over-fetch multiple: the walk collects `top_k * overscan` candidates before the post-filter
+    /// and rerank, so a metadata filter or subset scope still has survivors to rank. Higher means
+    /// better recall under selective filters and slower queries.
     pub overscan: usize,
     /// Seed for the index's PRNG (HNSW level assignment, IVF centroid init), so a
     /// build is deterministic and tests are reproducible.
@@ -213,10 +199,6 @@ impl AnnConfig {
 }
 
 /// A typed metadata value attached to a [`Record`].
-///
-/// `Null` is **distinct from an absent key**: absence means "not set / not indexed",
-/// while `Null` means "set, and empty/none". Callers rely on this to tell
-/// not-computed apart from computed-empty (e.g. optional relation lists).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Null,
@@ -227,13 +209,6 @@ pub enum Value {
 }
 
 /// A document: a caller-supplied id, an **optional** embedding, and typed metadata.
-///
-/// `vector` is `None` for a **text-only** document — one with no embedding, indexed and
-/// retrieved purely by full-text search and metadata. Such a doc occupies no row in the
-/// vector matrix and never appears in a vector `search`; it coexists in the same
-/// collection as vector-bearing docs. When `Some`, the vector's length must equal the
-/// store dimension. Use [`Record::new`] for a vector doc and [`Record::text_only`] for a
-/// text-only one.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     /// Caller-supplied identity; the upsert key (idempotent within a collection).
@@ -269,13 +244,6 @@ impl Record {
 }
 
 /// A single attribute predicate. Predicates are AND-combined inside a [`Filter`].
-///
-/// Every predicate is a *positive assertion about a present attribute*: if `key` is
-/// absent from a record's attrs, **no** predicate matches it — including the negative
-/// ones (`Ne`/`NotIn`) and the range ones. The comparison variants are same-type only
-/// (`Int`↔`Int` numeric, `Str`↔`Str` lexical, `Bool`↔`Bool` with `false < true`);
-/// a cross-type or non-orderable comparison (`Null`, `List`) never matches a range.
-/// See the root `SPEC.md` §7.1.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Predicate {
     /// `attrs[key] == value`.
@@ -302,10 +270,9 @@ pub enum Predicate {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Filter(pub Vec<Predicate>);
 
-/// A full-text query: the indexed `field` to search and the raw query `text`. The text
-/// is analyzed (lowercase → tokenize → stopword → stem) with the field's configured
-/// language at query time, exactly as documents were at index time, so a query term
-/// matches a stored term when they share a stem.
+/// A full-text query: the indexed `field` and the raw query `text`. The text is analyzed
+/// (lowercase → tokenize → stopword → stem) with the field's language at query time, exactly as
+/// documents were at index time, so a query term matches a stored term sharing its stem.
 #[derive(Clone, Debug)]
 pub struct FtsQuery {
     /// The full-text-indexed attribute field to search (declared in the FTS schema).
@@ -336,11 +303,6 @@ pub struct SearchOpts {
 }
 
 /// Options for a hybrid (vector + BM25) search, fused with Reciprocal Rank Fusion.
-///
-/// RRF ranks by *position* in each leg, not raw score, so the incomparable scales of
-/// cosine/euclidean/dot-product and unbounded BM25 never need normalizing, and a doc
-/// missing from one leg is carried by the other. There is no `min_score`: a fused RRF
-/// score has no interpretable scale (threshold the legs via the pure methods instead).
 #[derive(Clone, Debug)]
 pub struct HybridOpts {
     /// Final result count after fusion.
@@ -375,10 +337,9 @@ pub struct Hit {
     pub attrs: BTreeMap<String, Value>,
 }
 
-/// A cheap, allocation-free snapshot of a store's RAM/disk footprint — the
-/// introspection hook a host uses to decide whether it can afford more data before
-/// hitting a memory ceiling. `vector_bytes` is the dominant, predictable cost; the
-/// in-RAM index (ids + attrs) is extra on top and not counted here.
+/// A cheap, allocation-free snapshot of a store's RAM/disk footprint — the hook a host uses to
+/// decide whether it can afford more data before a memory ceiling. `vector_bytes` is the dominant,
+/// predictable cost; the in-RAM index of ids and attrs is extra and not counted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Footprint {
     /// Physical rows in the data matrix (live + not-yet-compacted dead rows).
@@ -411,11 +372,6 @@ pub enum Role {
 
 /// Who this instance is and how current it is — the introspection an operator needs
 /// during an incident, and what a readiness probe consults (SPEC §14.6).
-///
-/// Cheap by construction: every field is already in RAM, so this performs **no** IO and
-/// takes no store lock. That matters because a readiness probe may run every few seconds
-/// per instance, and a probe that reached the object store would both cost money and stall
-/// behind whatever the store is doing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClusterStatus {
     /// What this instance is.
@@ -464,10 +420,9 @@ pub enum Op {
         collection: String,
         id: String,
     },
-    /// Upsert a **text-only** document — no embedding, so no `row` into the data
-    /// segment. Appended after the original variants so existing logs (which never
-    /// contain it) still decode: bincode tags enum variants by declaration index, so
-    /// new variants must only ever be added at the end.
+    /// Upsert a **text-only** document — no embedding, so no `row` into the data segment. Appended
+    /// after the original variants so existing logs (which never contain it) still decode: bincode
+    /// tags enum variants by declaration index, so new variants must only ever be added at the end.
     UpsertText {
         collection: String,
         id: String,

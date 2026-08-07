@@ -1,10 +1,4 @@
 //! Generic OpenAI-compatible embedding adapter.
-//!
-//! Reaches any gateway that speaks the standard `/v1/embeddings` shape (Azure
-//! OpenAI, Together, Fireworks, vLLM, LiteLLM, DeepInfra, …). It **requires** an
-//! explicit `base_url`; the API key is optional (some gateways are keyless).
-//! Because the model dimension is not knowable for an arbitrary gateway, the
-//! constructor is async and probes it with one embed call (like Ollama).
 
 use super::{EmbedConfig, EmbedError, Embedder, openai_shaped, resolve_base};
 
@@ -31,10 +25,9 @@ impl OpenAiCompatEmbedder {
                 "openai-compat requires an explicit model".into(),
             ));
         }
-        // Accept both the host root ("https://api.together.xyz") and the
-        // /v1-suffixed form the OpenAI SDK / gateway docs publish
-        // ("https://api.together.xyz/v1") — we append "/v1/embeddings"
-        // ourselves, so strip a trailing "/v1" to avoid "/v1/v1/embeddings".
+        // Accept both the host root ("https://api.together.xyz") and the /v1-suffixed form the
+        // OpenAI SDK / gateway docs publish ("https://api.together.xyz/v1") — we append
+        // "/v1/embeddings" ourselves, so strip a trailing "/v1" to avoid "/v1/v1/embeddings".
         let base_url = resolve_base(Some(base), "");
         let base_url = base_url
             .strip_suffix("/v1")

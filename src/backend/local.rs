@@ -1,9 +1,6 @@
-//! [`LocalFs`]: a [`Persistence`] backend over a local directory — the default, and
-//! the impl every other backend's behaviour is checked against. Each object is a file
-//! `<dir>/<key>`; whole-object writes are atomic (temp + fsync + rename), the native
-//! [`Appender`] is a plain `File` (so the live `data`/`log` path keeps its exact
-//! append + fsync + rename discipline with zero overhead), and `try_lock` is the
-//! existing O_EXCL [`WriteLock`](crate::lock::WriteLock) — one source, not a copy.
+//! [`LocalFs`]: a [`Persistence`] backend over a local directory — the default, and the impl every
+//! other backend is checked against. Each object is a file `<dir>/<key>`, whole-object writes are
+//! atomic, and `try_lock` reuses the existing O_EXCL [`WriteLock`](crate::lock::WriteLock).
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};

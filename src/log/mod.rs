@@ -1,8 +1,5 @@
 //! The `log` file: an append-only, framed, checksummed op stream — the commit
 //! record and crash-recovery mechanism. Contract: see the root `SPEC.md` §5.2, §6.1, §6.6.
-//!
-//! Each record is framed `[len: u32][payload: bincode(Op)][crc32: u32]`, all
-//! little-endian; `crc32` (via `crc32fast`) covers the payload.
 
 use anyhow::{Context, Result, bail};
 
@@ -148,10 +145,9 @@ pub struct OpLog {
 }
 
 impl OpLog {
-    /// Open or create the `log` file at `path` (convenience over
-    /// [`open_with`](Self::open_with): wraps a local `FileAppender`). The store path
-    /// goes through the persistence backend's appender via `open_with`; this direct
-    /// path-based form backs the log's own file tests.
+    /// Open or create the `log` file at `path` (convenience over [`open_with`](Self::open_with):
+    /// wraps a local `FileAppender`). The store path goes through the persistence backend's
+    /// appender via `open_with`; this direct path-based form backs the log's own file tests.
     #[cfg(test)]
     pub fn open(path: &std::path::Path) -> Result<(OpLog, Vec<Op>)> {
         let appender = crate::backend::FileAppender::open(path)
@@ -159,11 +155,9 @@ impl OpLog {
         Self::open_with(Box::new(appender))
     }
 
-    /// Open the log over an already-opened persistence [`Appender`]: **replay** all
-    /// committed records into a `Vec<Op>` (in order) and return the write handle
-    /// alongside them. A torn or CRC-failing *tail* record (crash mid-append) is
-    /// recovered by truncating to the last good record — not an error. A bad record in
-    /// the *middle* is corruption (error).
+    /// Open the log over an already-opened [`Appender`]: replay every committed record into a
+    /// `Vec<Op>` in order and return the write handle alongside them. A torn or CRC-failing *tail*
+    /// record is recovered by truncating to the last good one; a bad record mid-log is corruption.
     pub fn open_with(mut appender: Box<dyn Appender>) -> Result<(OpLog, Vec<Op>)> {
         // Read the entire log (the `read_to_end` default reserves fallibly, so a huge
         // log fails with an error instead of aborting the process on allocation).
@@ -192,11 +186,6 @@ impl OpLog {
 
     /// Append one framed record. Does NOT fsync — the caller batches then calls
     /// [`sync`](Self::sync).
-    ///
-    /// **Atomic per frame.** If the write fails partway (e.g. ENOSPC), the appender
-    /// rolls back to the offset it started at, so a torn frame never persists mid-file
-    /// — without this, the next append would write past the partial bytes and
-    /// `parse_all_frames` would reject the result as hard `Corruption` on reopen.
     pub fn append(&mut self, op: &Op) -> Result<()> {
         let mut frame_buf = Vec::new();
         frame(op, &mut frame_buf)?;

@@ -1,20 +1,5 @@
 //! Scale and correctness end-to-end: a realistic corpus pushed through the HTTP API,
 //! with results checked against ground truth computed here in the test.
-//!
-//! The rest of the e2e suite uses three-dimensional hand-picked vectors, which proves the
-//! wire protocol and process behaviour but says nothing about whether ranking is *right*
-//! over a real corpus, or what the server costs. The benchmarks in `benchmarks/` do cover
-//! realistic scale and recall — but every one of them drives `Nidus` in-process, so the
-//! HTTP path (JSON-encoding hundreds of floats per request, the `Arc<RwLock>` +
-//! `spawn_blocking` hop, socket framing) is measured nowhere. This module closes that gap:
-//! same corpus size as a small benchmark cell, but every byte goes over a socket.
-//!
-//! **On the timing assertions.** These run in a *debug* build on a shared CI runner, so
-//! absolute numbers are meaningless and anything tight would flake. The ceilings here are
-//! deliberately order-of-magnitude — they catch "someone made search quadratic" or "every
-//! request now re-encodes the corpus", not a 20% regression. Real performance tracking
-//! belongs in `benchmarks/` (`just bench`), which builds `--release`. Measured values are
-//! always printed, so the CI log carries the trend even though the gate is loose.
 
 use std::time::{Duration, Instant};
 
@@ -96,10 +81,6 @@ impl Corpus {
 
     /// Exact top-k by cosine, computed here so the server's answer is checked against an
     /// independent implementation rather than against itself.
-    ///
-    /// nidus unit-normalises on insert and scores by dot product, so normalising both
-    /// sides here reproduces cosine exactly. `keep` optionally restricts to the rows a
-    /// filter would admit.
     fn ground_truth(
         &self,
         query: &[f32],
@@ -170,11 +151,6 @@ fn recall_at_k(returned: &[String], truth: &[(String, f32)]) -> f64 {
 }
 
 /// **Exact search over a realistic corpus, through HTTP, must be exactly right.**
-///
-/// Default search is exhaustive, so this is not a recall target: the ranking the server
-/// returns must equal the ground truth ranking, id for id and in order. That makes this
-/// the test that would catch a scoring bug, a vector mangled by JSON round-tripping, or a
-/// scan that quietly skips rows — none of which a three-vector smoke test can see.
 #[test]
 fn exact_search_at_scale_matches_ground_truth() {
     let corpus = Corpus::generate(0xC0FFEE, N, DIM, 5);
@@ -273,13 +249,9 @@ fn filtered_search_at_scale_matches_ground_truth() {
     }
 }
 
-/// The quantized first pass is a *speed/recall trade*, so the contract is recall, not an
-/// exact match. This pins that the trade is actually being made well end-to-end: int8
-/// codes select candidates, an exact f32 rerank orders them, and what comes back over
-/// HTTP still contains nearly all of the true top-k.
-///
-/// A low bar on purpose — it should catch "quantization is returning noise", not track
-/// small recall movements, which `just bench-quant` measures properly.
+/// The quantized first pass is a speed/recall trade, so the contract is recall, not an exact match.
+/// This pins that the trade is made well end-to-end: int8 codes select, an exact f32 rerank orders,
+/// and what comes back over HTTP still contains nearly all of the true top-k.
 #[test]
 fn quantized_search_at_scale_keeps_high_recall() {
     let corpus = Corpus::generate(0x00A17_u64, N, DIM, 3);

@@ -1,40 +1,4 @@
 //! Text-native memory API (epic nidus-54l, tickets .4 + .10).
-//!
-//! This is the headline "all-in-one memory" surface: text in ([`remember`]),
-//! relevant text out ([`recall`]). It sits at the async edge, on top of the
-//! synchronous [`Nidus`] core, and turns natural-language text into vectors with
-//! an [`AnyEmbedder`] (optionally summarizing first with an [`AnySummarizer`])
-//! before handing rows to the store.
-//!
-//! [`remember`]: Memory::remember
-//! [`recall`]: Memory::recall
-//!
-//! ## Embedder-wiring decision (ticket .4's open question)
-//!
-//! **[`Memory`] OWNS a [`Nidus`] plus an [`AnyEmbedder`] (and an optional
-//! [`AnySummarizer`]).** It does NOT bake embedding into [`Nidus`] itself.
-//!
-//! The reason is the escape hatch. [`Nidus`]'s raw `upsert`/`search` API takes a
-//! caller-supplied `Vec<f32>` and stays completely untouched by this layer — a
-//! host that already has its own embeddings (or wants a model nidus doesn't
-//! ship an adapter for) keeps using [`Nidus`] directly, with zero async and zero
-//! provider deps. `Memory` is a strictly additive convenience wrapper layered
-//! over that same store; you can always [`into_inner`](Memory::into_inner) back
-//! to the bare [`Nidus`], or reach it via [`db`](Memory::db) /
-//! [`db_mut`](Memory::db_mut). Embedding is a property of *this handle*, not of
-//! the on-disk store, so one process can wrap a store with an OpenAI embedder
-//! while another opens the same directory raw.
-//!
-//! ## Embedding-space safety
-//!
-//! Vectors produced by different models live in incomparable spaces, so mixing
-//! them in one collection makes cosine ranking meaningless. On the first
-//! [`remember`](Memory::remember) into a collection, `Memory` pins the
-//! embedder's identity (`"provider/model"`) and dimension into the collection's
-//! metadata ([`META_EMBEDDER`] / [`META_DIM`]). Every later write re-checks that
-//! identity and **refuses** (an `Err`) if a different embedder is now in play —
-//! catching an accidental cross-model write before it corrupts a collection's
-//! ranking.
 
 use std::collections::BTreeMap;
 
@@ -71,8 +35,6 @@ pub enum RememberMode {
     Raw,
     /// Summarize the text first, embed the **summary**, and store both the
     /// summary and a pointer to the source (see [`META_SUMMARY`]/[`META_SOURCE`]).
-    /// Requires a summarizer — attach one with
-    /// [`with_summarizer`](Memory::with_summarizer).
     #[cfg(feature = "summarize")]
     Summarize,
 }
@@ -90,9 +52,6 @@ pub struct RecallOpts {
 }
 
 /// A text-native memory handle over a [`Nidus`] store and an embedder.
-///
-/// See the [module docs](self) for the ownership rationale and embedding-space
-/// safety model.
 pub struct Memory {
     db: Nidus,
     embedder: AnyEmbedder,
@@ -122,10 +81,6 @@ impl Memory {
 
     /// Remember `text` under `id` in `collection`, embedding it (per `mode`) and
     /// upserting a record with `attrs`.
-    ///
-    /// Creates `collection` if absent. On the first write it pins the embedder's
-    /// identity and dimension into the collection metadata; on later writes it
-    /// refuses if a different embedder is in play (see the [module docs](self)).
     pub async fn remember(
         &mut self,
         collection: &str,
@@ -167,9 +122,6 @@ impl Memory {
     }
 
     /// Recall the nearest remembered records to `query_text` from `collection`.
-    ///
-    /// Embeds the query (via [`Embedder::embed_query`]) and runs a vector search
-    /// with `opts` mapped onto [`SearchOpts`].
     pub async fn recall(
         &self,
         collection: &str,
@@ -198,14 +150,9 @@ impl Memory {
 // ── Internals (generic over `impl Embedder` so unit tests can drive them with a
 // fake embedder, and so the borrow of `self.db` / `self.embedder` splits cleanly) ──
 
-/// Ensure `collection` exists and its embedding space matches `embedder`,
-/// pinning the identity + dimension on first use. Errors on a dimension mismatch
-/// with the store, or on an embedder identity that differs from what the
-/// collection was first written with.
-///
-/// `pub(crate)` so the HTTP server (`crate::server`) can reuse the exact same
-/// pin/identity logic when it embeds text on behalf of a network client — rather
-/// than reimplementing it and risking drift from this write path.
+/// Ensure `collection` exists and its embedding space matches `embedder`, pinning the identity +
+/// dimension on first use. Errors on a dimension mismatch with the store, or on an embedder
+/// identity that differs from what the collection was first written with.
 pub(crate) fn ensure_collection_and_pin<E: Embedder>(
     db: &mut Nidus,
     embedder: &E,
@@ -237,9 +184,6 @@ pub(crate) fn ensure_collection_and_pin<E: Embedder>(
 }
 
 /// Bail if `collection` was pinned to a different embedder than `identity`.
-/// Shared by the write-side pin and the recall-side guard so a cross-model mix
-/// is refused symmetrically (comparing vectors from different embedding models
-/// is meaningless — see the [module docs](self)).
 fn bail_if_identity_differs(
     collection: &str,
     existing: &str,
@@ -273,15 +217,9 @@ async fn embed_and_store<E: Embedder>(
     Ok(())
 }
 
-/// Recall-side identity guard: refuse a recall whose embedder differs from the
-/// one `collection` was written with. Symmetric with the write-side pin —
-/// recalling with a different (even same-dimension) embedder than the collection
-/// was written with would silently return meaningless cross-space rankings, so
-/// refuse it up front. A collection with no pinned embedder (never written
-/// through `Memory`) imposes no constraint.
-///
-/// `pub(crate)` so the HTTP server reuses this exact guard on its recall path
-/// (the write side reuses [`ensure_collection_and_pin`]).
+/// Recall-side identity guard: refuse a recall whose embedder differs from the one `collection` was
+/// written with, since even a same-dimension mismatch returns meaningless cross-space rankings. A
+/// collection with no pinned embedder — never written through `Memory` — imposes no constraint.
 pub(crate) fn guard_recall_identity<E: Embedder>(
     db: &Nidus,
     embedder: &E,

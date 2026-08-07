@@ -1,7 +1,6 @@
-//! [`LocalRam`]: the trivial [`MemoryTier`] — the working set *is* the process heap,
-//! nothing shared. It is the default and the behavioural baseline for the sharing
-//! tiers (Redis/Valkey/Memcached, Phase 2): same load/store contract, just no other
-//! process can see it. `ttl` is ignored — local RAM never evicts.
+//! [`LocalRam`]: the trivial [`MemoryTier`] — the working set *is* the process heap, nothing
+//! shared. The default, and the behavioural baseline for the sharing tiers: same load/store
+//! contract, just invisible to other processes. `ttl` is ignored, since local RAM never evicts.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

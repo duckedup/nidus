@@ -610,10 +610,6 @@ fn upsert_rollback_survives_reopen() {
 // ── Fsync::OnFlush durability (nidus-4h2) ─────────────────────────────────
 
 /// Everything written under `OnFlush` is present after `flush()` + reopen.
-///
-/// The happy-path guard for gating the phase-2 `data` sync: that sync is what used to
-/// order data ahead of the log on every call, and `flush()` is now solely responsible for
-/// establishing it. If the gate ever dropped writes, this fails first.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn on_flush_persists_every_batch_once_flushed() {
@@ -637,12 +633,6 @@ fn on_flush_persists_every_batch_once_flushed() {
 
 /// A crash that leaves the log durable while the rows it names are not must drop the
 /// dangling tail and reopen cleanly — never fail, never surface a phantom record.
-///
-/// This is the exact state gating the phase-2 sync makes reachable under `OnFlush`, so it
-/// is the test that licenses the gate. Simulated by truncating `data` behind an intact
-/// log, which is what a machine crash between the two files looks like on restart. The
-/// surviving prefix must still be readable and searchable — a store that recovered into
-/// an unusable state would be no better than a torn one.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn a_log_ahead_of_data_tail_is_dropped_on_reopen() {
@@ -1189,10 +1179,8 @@ fn list_offset_past_end_is_empty() {
 }
 
 // ── scan-order cache (nidus-dxt) ─────────────────────────────────────
-//
-// The whole-store fast path caches a row-sorted scan across queries; these pin
-// that it stays consistent with the doc set — i.e. every write that changes the
-// docs invalidates it, so a search after a write never reads a stale order.
+// The whole-store fast path caches a row-sorted scan across queries; these pin that every write
+// changing the doc set invalidates it, so a search after a write never reads a stale order.
 
 #[test]
 fn scan_cache_reflects_upsert_between_searches() {
@@ -1816,10 +1804,9 @@ fn threaded_store(dim: usize, n: usize, threads: usize) -> Store {
     threaded_store_cfg(dim, n, threads, false)
 }
 
-// Ignored under Miri: needs enough work to clear PARALLEL_SCAN_WORK_FLOOR to engage
-// the threaded path, which Miri runs at ~100x slowdown (minutes). The thread::scope
-// scan is `#![forbid(unsafe_code)]` safe Rust over shared `&` reads — the borrow
-// checker already proves it data-race-free, so Miri adds no coverage here.
+// Ignored under Miri: clearing PARALLEL_SCAN_WORK_FLOOR takes minutes at Miri's ~100x slowdown,
+// and the scan is safe Rust over shared `&` reads that the borrow checker already proves
+// data-race-free, so Miri adds no coverage.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn parallel_search_matches_serial() {
@@ -2144,10 +2131,9 @@ fn ann_quant_store(dim: usize, cfg: AnnConfig, quant: Quantization, vectors: &[V
     s
 }
 
-// ANN + quantization combined: the index walk runs in the quantized space and the f32
-// rerank restores accuracy. Recall is necessarily a touch below the exact-walk ANN
-// (the coarse codes steer the walk less precisely), so the thresholds are looser than
-// the pure-ANN tests above — but well clear of chance.
+// ANN + quantization: the walk runs in the quantized space and the f32 rerank restores accuracy.
+// Coarse codes steer the walk less precisely, so recall sits a touch below exact-walk ANN and the
+// thresholds are looser than above — still well clear of chance.
 
 #[test]
 #[cfg_attr(miri, ignore)]
@@ -3802,11 +3788,8 @@ fn cluster_mode_rejects_a_local_filesystem_store() {
 }
 
 // ── Live object-store backing + shared memory tier (Miri-clean: all in-RAM) ──────
-//
-// Exercises the whole-object live-backing path (ObjectAppender rewrites the whole
-// `data`/`log` object on each sync) and the shared memory tier (publish on flush, adopt
-// on reopen) through a fake in-RAM whole-object Persistence — no files, no network, no
-// fsync — so it runs under Miri alongside the rest of the store logic.
+// Exercises the whole-object live-backing path and the shared memory tier through a fake in-RAM
+// whole-object Persistence — no files, no network, no fsync — so it runs under Miri.
 
 mod object_backed {
     use std::collections::HashMap;
@@ -3819,11 +3802,9 @@ mod object_backed {
     use super::*;
     use crate::backend::{BackendLock, CasOutcome, LocalRam, MemoryTier, Persistence};
 
-    /// A whole-object Persistence backed by an in-RAM map: no native appender (forcing an
-    /// `ObjectAppender`) and no native lock (forcing the advisory object lock) — exactly
-    /// the shape S3/GCS present, but synchronous and Miri-clean. Each object carries a
-    /// monotonic **generation** (a globally-increasing counter), modelling an S3 `ETag` /
-    /// GCS generation so the compare-and-swap paths (`get_cas`/`put_cas`) are exercised.
+    /// A whole-object Persistence over an in-RAM map: no native appender or lock, forcing the
+    /// `ObjectAppender` and advisory-lock paths — the shape S3/GCS present, but synchronous and
+    /// Miri-clean. Each object carries a monotonic generation, modelling an `ETag` so CAS is exercised.
     #[derive(Default)]
     struct InMemObjectStore {
         objects: Mutex<HashMap<String, (Vec<u8>, u64)>>,
@@ -3831,10 +3812,9 @@ mod object_backed {
         /// Per-key read count (`get` + `get_cas`), so a test can assert which objects a
         /// refresh fetched — e.g. that an incremental refresh skips immutable segments.
         gets: Mutex<HashMap<String, u64>>,
-        /// Per-key **durable write** count (`put` + `put_cas`). On a whole-object backend a
-        /// segment's `sync()` *is* a `put`, so this counts barriers the way an fsync counter
-        /// would on local files — which is what makes group-commit coalescing directly
-        /// measurable rather than inferred (nidus-xb9.1).
+        /// Per-key durable write count. On a whole-object backend a segment's `sync()` *is* a `put`,
+        /// so this counts barriers the way an fsync counter would locally — which makes group-commit
+        /// coalescing directly measurable rather than inferred (nidus-xb9.1).
         puts: Mutex<HashMap<String, u64>>,
     }
 
@@ -4214,11 +4194,9 @@ mod object_backed {
         w.create_collection("col").unwrap();
         w.upsert("col", &[rec("a", vec![1.0, 0.0, 0.0])]).unwrap();
 
-        // Simulate a peer that took over the lease and committed its own batch: it rewrites the
-        // shared durable objects, advancing their compare-and-swap tokens and stranding this
-        // now-superseded writer's anchors. (Its `lock` object is left untouched so the per-batch
-        // lease *renew* still passes — this isolates the CAS fence from the lease fence, exercising
-        // exactly the mid-batch window the lease alone cannot close: nidus-ahw.)
+        // Simulate a peer taking over and committing: it rewrites the shared objects, advancing
+        // their CAS tokens and stranding this writer's anchors. Its `lock` is left untouched so the
+        // lease renew still passes, isolating the CAS fence and the window the lease cannot close.
         for key in ["data", "log", "manifest"] {
             let bytes = backend.get(key).unwrap().unwrap();
             backend.put(key, &bytes).unwrap(); // identical bytes, fresh generation token
@@ -4332,12 +4310,6 @@ mod object_backed {
     }
 
     /// **Group commit issues fewer barriers than there are batches — counted, not inferred.**
-    ///
-    /// On a whole-object backend a segment's `sync()` *is* a `put`, so `put_count` is a direct
-    /// barrier counter: the same measurement an fsync counter makes on local files, but
-    /// deterministic and Miri-clean. The assertion the ticket asks for (nidus-xb9.1) is the
-    /// comparison between the two halves — same four batches, same bytes, four barriers versus
-    /// one.
     #[test]
     fn group_commit_coalesces_the_barrier_across_batches() {
         let raw = Arc::new(InMemObjectStore::default());
@@ -4391,11 +4363,6 @@ mod object_backed {
     }
 
     /// **In cluster mode the coalesced group publishes the commit counter once, not per batch.**
-    ///
-    /// The manifest publish is a CAS round trip to the object store on every durable batch, so
-    /// on a cluster writer it is a second per-call cost sitting beside the fsync. Group commit
-    /// has to fold that one too, and — the part worth asserting — the commit counter must still
-    /// end up advanced, or peers would never see the group at all.
     #[test]
     fn group_commit_publishes_one_cluster_commit_for_the_group() {
         let raw = Arc::new(InMemObjectStore::default());
@@ -4442,12 +4409,6 @@ mod object_backed {
     }
 
     /// **A failed barrier fails every write in its group.**
-    ///
-    /// The one way group commit could become a lie: N writes applied, the shared barrier
-    /// fails, and some of them are reported successful anyway. Here the writer is superseded
-    /// mid-group (a peer commits a manifest under it), so the CAS at the commit point refuses
-    /// — and `commit` must surface that rather than swallowing it, because the caller is
-    /// waiting on it to decide whether to answer `200`.
     #[test]
     fn a_failed_group_barrier_is_reported_not_swallowed() {
         let raw = Arc::new(InMemObjectStore::default());
@@ -4491,23 +4452,6 @@ mod object_backed {
 // ── Cooperative cancellation ────────────────────────────────────────────────
 
 /// **A cancelled scan stops instead of running to completion.**
-///
-/// A server request deadline drops the response future, which frees the client but not the
-/// CPU: the scan is on a blocking task and blocking tasks are not cancellable. The scan
-/// kernels therefore check an ambient token, and this is the proof it reaches them through
-/// a real `search` — otherwise the deadline is a promise to the caller and a lie to the
-/// machine.
-///
-/// Deliberately tiny. The check fires at the head of every block, so cancellation is
-/// observable on the first one; more data would only slow the suite down — badly, under
-/// Miri — without testing anything further. The parallel fan-out's token handoff is the
-/// part that would need real volume to reach through `search`, so it is unit tested
-/// directly against `parallel_topk` in `super::scoring` instead. An earlier version of this
-/// file tried it here with 40k rows and quietly exercised the *serial* path, because that
-/// is still an order of magnitude under `PARALLEL_SCAN_WORK_FLOOR`.
-///
-/// Asserted on the *outcome* (an error rather than results), never on elapsed time: a
-/// timing assertion here would flake on a shared runner and prove nothing.
 #[test]
 fn a_cancelled_search_stops_and_errors() {
     let mut store = Store::in_memory(8).unwrap();
@@ -4553,12 +4497,8 @@ fn a_cancelled_search_stops_and_errors() {
 }
 
 // ── Query-dimension validation (nidus-c5v) ───────────────────────────────────
-//
-// Dimension is pinned in the `data` header at creation, so a query of the wrong length
-// is unanswerable. It used to be answered anyway: `dot` zips two slices and stops at the
-// shorter, so a mismatched query was scored over a prefix and came back as `Ok` — a
-// plausible-looking or empty ranking rather than an error. These are pure in-memory
-// tests (Miri-clean) because that is exactly where the arithmetic lives.
+// Dimension is pinned in the `data` header, so a wrong-length query is unanswerable. It used to be
+// answered anyway: `dot` zips and stops at the shorter, returning a plausible-looking prefix score.
 
 /// The wording matters beyond readability: the server's `classify` maps this substring to
 /// `400`, so a reworded message would silently downgrade the HTTP status to `500`.
@@ -4652,10 +4592,9 @@ fn hybrid_search_rejects_a_bad_dimension_regardless_of_top_k() {
             top_k,
             ..Default::default()
         };
-        // `top_k: 0` short-circuits before the vector leg runs, so without an explicit
-        // guard in `hybrid_search` the same bad query would be accepted at `top_k: 0` and
-        // refused at `top_k: 10`. A verdict that depends on `top_k` is a miserable thing
-        // to debug.
+        // `top_k: 0` short-circuits before the vector leg runs, so without an explicit guard in
+        // `hybrid_search` the same bad query would be accepted at `top_k: 0` and refused at `top_k:
+        // 10`. A verdict that depends on `top_k` is a miserable thing to debug.
         let err = store
             .hybrid_search(&["docs"], &[1.0, 0.0], &query, &opts)
             .expect_err("hybrid must refuse a mismatched vector at any top_k");

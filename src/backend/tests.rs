@@ -126,14 +126,9 @@ struct MapState {
     next_gen: u64,
 }
 
-/// A whole-object [`Persistence`] backed by an in-RAM map. `cas == true` models a real
-/// compare-and-swap object store (S3/GCS): every write mints a fresh generation, and
-/// [`get_cas`](Persistence::get_cas)/[`put_cas`](Persistence::put_cas) are honoured (so
-/// [`try_create_exclusive`](Persistence::try_create_exclusive) works for free through its
-/// default delegation, exactly as the live backends do). `cas == false` models a backend with
-/// no atomic primitive at all — the advisory get-then-put fallback. `inject_renew` is a test
-/// hook: when set, the next `get_cas` performs one "concurrent peer write" right after reading,
-/// so a reclaimer's token goes stale in the read→write gap (the TOCTOU the CAS reclaim fences).
+/// A whole-object [`Persistence`] over an in-RAM map. `cas == true` models a real CAS object store,
+/// `false` one with no atomic primitive (the advisory fallback). `inject_renew` makes the next
+/// `get_cas` do a concurrent peer write, staling a reclaimer's token in the read→write gap.
 struct MapBackend {
     state: Mutex<MapState>,
     cas: bool,
@@ -378,11 +373,6 @@ fn cluster_lease_renew_reclaims_a_vanished_lease() {
 
 /// **A live lease must never read as stale** just because stamps are truncated to whole
 /// seconds (nidus-lp4.7).
-///
-/// The staleness verdict compares two one-second-granularity stamps, so the age it computes
-/// can overstate the elapsed time by nearly a full second. Under a strict `age < ttl` that
-/// gap is a split brain: a holder renewing happily is declared dead and a peer reclaims its
-/// lease, after which both instances believe they hold the writer handle.
 #[test]
 fn a_lease_stays_live_for_its_whole_ttl_despite_truncated_stamps() {
     use super::object::is_live;
@@ -401,13 +391,6 @@ fn a_lease_stays_live_for_its_whole_ttl_despite_truncated_stamps() {
 }
 
 /// **A renewal must not steal back a lease a peer already reclaimed** (nidus-lp4.7).
-///
-/// This was a mutual-exclusion break, not merely a cosmetic one. Renewal used to be
-/// get-then-**unconditional**-put, a read-modify-write race: the holder reads the lease and
-/// sees itself, a peer reclaims it in the gap, and the holder's blind put then stamps its own
-/// ownership straight back over the peer's lease. Both instances then report
-/// `holds_writer_handle: true` with different owner tokens — exactly the reported symptom.
-/// The conditional write turns that into a detected loss.
 #[test]
 fn cluster_lease_renewal_cannot_steal_back_a_lease_a_peer_reclaimed() {
     let backend = MapBackend::concrete(true, None);
@@ -435,11 +418,6 @@ fn cluster_lease_renewal_cannot_steal_back_a_lease_a_peer_reclaimed() {
 }
 
 /// The flip side: an instance's **own** concurrent renewal must not fence it (nidus-lp4.7).
-///
-/// The op-driven pre-batch renewal and the server's background timer can fire at once, and
-/// re-stamping is idempotent, so one losing the CAS to the other is harmless. Treating every
-/// lost CAS as a takeover would make a healthy writer fence *itself* — a self-inflicted
-/// outage, and a strictly worse bug than the one being fixed.
 #[test]
 fn cluster_lease_renewal_tolerates_this_instances_own_concurrent_renewal() {
     let backend = MapBackend::concrete(true, None);
@@ -457,11 +435,6 @@ fn cluster_lease_renewal_tolerates_this_instances_own_concurrent_renewal() {
 }
 
 /// **A transient backend error is not a lost lease** (nidus-lp4.7).
-///
-/// Object stores drop connections. Renewal used to report every failure the same way, and the
-/// write path latched `fenced` on any of them — so one blip retired a healthy writer
-/// permanently, recoverable only by a restart. The lease is only *lost* when the store says
-/// somebody else holds it.
 #[test]
 fn a_transient_backend_error_is_not_a_lost_lease() {
     let backend = MapBackend::concrete(true, None);
@@ -495,12 +468,6 @@ fn a_transient_backend_error_is_not_a_lost_lease() {
 }
 
 /// **A lease lost on a *background* renewal must latch the shared fence** (nidus-lp4.7).
-///
-/// The background renewer runs every `lock_ttl/3`, so it is the first thing to learn the lease
-/// is gone — a write may not arrive for minutes. That discovery used to be printed to stderr
-/// and dropped: `fenced` was set only by a failing write, so a superseded writer kept
-/// answering `/ready` with 200 and reporting `holds_writer_handle: true`. Sharing the latch is
-/// what makes the readiness signal of nidus-lp4.1 honest.
 #[test]
 fn a_background_renewal_that_loses_the_lease_latches_the_shared_fence() {
     let backend = MapBackend::arc(true);

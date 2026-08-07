@@ -1,17 +1,4 @@
 //! The `manifest`: the atomic commit point that names the live segments (SPEC §14.2).
-//!
-//! A store is no longer one `data` matrix but a set of immutable **segments** (plus the
-//! append-only `log` as the WAL). The manifest is a tiny object naming those segments in
-//! global-row order — the **last** one is the active (appendable) segment. Publishing a new
-//! manifest with [`Persistence::put`] (atomic whole-object write) is what makes a seal or a
-//! compaction visible: a reader either sees the old segment set or the new one, never a torn
-//! mix, exactly as a row past size `S` is invisible until committed (§6.2 generalized).
-//!
-//! On-disk frame: `[crc32: u32 LE][bincode(payload)]`. No length prefix and no torn-tail
-//! recovery (unlike the streaming [`log`](crate::log)): the manifest is one whole object
-//! written atomically, so it is either fully the old bytes or fully the new bytes — the CRC
-//! only guards against bit-rot / a truncated read, which is a hard error, not a recoverable
-//! tail.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};

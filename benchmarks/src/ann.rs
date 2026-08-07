@@ -1,24 +1,4 @@
 //! nidus-bench-ann — approximate-nearest-neighbour recall & speed sweep.
-//!
-//! Mirrors `nidus-bench-quant`: builds one exact (f32) nidus store and one store
-//! per ANN variant over identical data, then reports each variant's **recall@k**
-//! against an independent exact ground truth, plus build time, query latency, and
-//! speedup vs the exact brute-force path. This is the evidence for where `Config::ann`
-//! stands at nidus's target scale and how to set `ef_search` / `n_probe`.
-//!
-//! Run via `just bench-ann [key=value ...]`:
-//!   n=100000           corpus size(s), comma-separated
-//!   dim=384,768        embedding dimension(s)
-//!   top_k=10           neighbours to retrieve
-//!   ef_search=64,128   HNSW query beam widths to sweep
-//!   n_probe=8,32       IVF probe counts to sweep
-//!   queries=100        distinct query vectors
-//!   warmup=10          unrecorded warmup queries
-//!   iters=5            measured passes over the query set
-//!   seed=42            PRNG seed
-//!   clustered=0        1 = realistic clustered data, 0 = uniform random (ANN worst case)
-//!   clusters=64        cluster count when clustered=1
-//!   threads=1          query_threads for the cold-open rebuild (parallel HNSW build)
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;

@@ -1,13 +1,4 @@
 //! `nidus serve` — a thin HTTP wrapper over one open [`Nidus`] (SPEC.md §9).
-//!
-//! The core stays an in-process, synchronous library; this module is the optional
-//! server seam the SPEC anticipates — a separate wrapper, not a change to the core.
-//! The store is held behind `Arc<RwLock<Nidus>>` and every operation runs on a
-//! blocking task (`spawn_blocking`), the exact pattern the README/CLAUDE.md
-//! prescribe for driving the synchronous store from async code: take the lock
-//! (shared for reads, exclusive for writes), run the CPU/IO-bound op off the async
-//! executor, drop the lock — never held across an `.await`. Endpoints map 1:1 to
-//! the public API.
 
 mod auth;
 mod commit;
@@ -67,10 +58,9 @@ pub struct ServeConfig {
     /// large upsert legitimately runs for minutes while a search is milliseconds. `None`
     /// disables it.
     pub write_timeout: Option<std::time::Duration>,
-    /// How long a request body may go without delivering a frame before it is abandoned
-    /// (nidus-6c2). An **idle** bound, not a total one: a body that keeps arriving is never
-    /// cut off however large it is. `None` disables it, which also removes the only thing
-    /// stopping a silent client from pinning a concurrency permit.
+    /// How long a request body may stall between frames before it is abandoned (nidus-6c2). An
+    /// *idle* bound, not a total one. `None` disables it, removing the only thing stopping a
+    /// silent client from pinning a concurrency permit.
     pub body_idle_timeout: Option<std::time::Duration>,
     /// Fail readiness once a read-only instance is staler than this (mirrors
     /// [`Config::max_staleness`](crate::Config::max_staleness)). `None` = no bound.
@@ -78,11 +68,6 @@ pub struct ServeConfig {
     /// Refresh a read-only instance on this interval so it stays current without a sidecar
     /// or cron calling `POST /refresh`. `None` (the default) leaves refreshing entirely to
     /// the caller.
-    ///
-    /// A server-side tokio task, deliberately NOT a library background thread — "no
-    /// background threads" is a property of the sync core, and the server is already async.
-    /// Also deliberately not a refresh-per-read: that would put a manifest fetch on the hot
-    /// path of exactly the read-heavy fan-out cluster mode exists for.
     pub refresh_interval: Option<std::time::Duration>,
     /// How often to renew the cluster writer lease out of band. Should be well under
     /// `Config::lock_ttl` — a third of it is a reasonable default — so a long write cannot
@@ -100,11 +85,6 @@ pub struct ServeConfig {
 }
 
 /// Shared, cloneable handle to the one open store.
-///
-/// The store sits behind an `RwLock`, not a `Mutex`: read endpoints (search,
-/// list, get) take `&Nidus` and run **concurrently**, while writes take the
-/// exclusive guard. Brute-force search is CPU-bound, so letting parallel queries
-/// use multiple cores is the whole point at this scale.
 #[derive(Clone)]
 struct AppState {
     /// `None` until the store finishes opening — a standby writer waiting for promotion
@@ -112,17 +92,10 @@ struct AppState {
     /// [`serve`] for why the listener comes up first.
     db: Arc<RwLock<Option<Nidus>>>,
     /// Mirrors `db.is_some()` for [`ready`] to read.
-    ///
-    /// Not just `db.read().is_some()`: that takes a **blocking** lock, and `ready` runs on
-    /// the async executor rather than a blocking task. A long write (a large upsert holds
-    /// the write guard for seconds) would then stall every readiness probe behind it — and
-    /// with enough concurrent probes, stall executor threads themselves. A probe must
-    /// answer in constant time no matter what the store is doing, so it reads an atomic.
     open: Arc<std::sync::atomic::AtomicBool>,
-    /// The lock-free readiness handle, published once the store opens (see
-    /// [`crate::Readiness`]). A `OnceLock` because a store opens exactly once per process,
-    /// so this needs publication but never mutation — and reading it costs an atomic load,
-    /// which is what keeps [`ready`] off the store lock entirely (nidus-abx.3).
+    /// The lock-free readiness handle, published once the store opens. A `OnceLock` because a
+    /// store opens exactly once per process; reading it costs an atomic load, which keeps
+    /// [`ready`] off the store lock entirely (nidus-abx.3).
     readiness: Arc<std::sync::OnceLock<crate::Readiness>>,
     /// Readiness fails past this much reader staleness (`Config::max_staleness`), copied
     /// here so a probe never has to reach into the store's config behind the lock.
@@ -146,18 +119,6 @@ struct AppState {
 
 /// Bind the address, open the store, and serve until a shutdown signal (Ctrl-C /
 /// SIGTERM); flush and release the writer handle on shutdown.
-///
-/// `open` is a closure rather than an already-open [`Nidus`] because **binding happens
-/// first**. Opening can block for a long time by design: a standby writer
-/// ([`LeaseWait::Forever`](crate::LeaseWait)) waits for the incumbent to die before it
-/// gets a handle. If nothing were listening during that wait, a supervisor's liveness
-/// probe would fail and kill the very standby that is meant to be waiting — turning the
-/// feature into the crash-loop it exists to remove.
-///
-/// So the listener comes up immediately and the store is opened on a blocking task.
-/// Until it succeeds, `/health` answers (the process is alive) while `/ready` and every
-/// data route answer `503` (there is no store yet). An open *failure* — as opposed to
-/// waiting — shuts the server down and is returned from here.
 pub async fn serve<F>(open: F, cfg: ServeConfig) -> anyhow::Result<()>
 where
     F: FnOnce() -> anyhow::Result<Nidus> + Send + 'static,
@@ -239,16 +200,6 @@ where
     });
 
     // Keep the writer lease warm on a timer.
-    //
-    // The lease is otherwise renewed only at the START of each write batch, which is fine
-    // while batches are short. A batch longer than `lock_ttl` — a very large upsert, or a
-    // slow object-store PUT — would let a standby (nidus-lp4.3) conclude the writer died and
-    // take over, fencing a writer that was perfectly healthy and discarding its work. That
-    // became a live risk the moment standbys shipped.
-    //
-    // Renewing needs its own lease handle, NOT the store lock: a long write holds the write
-    // guard for its whole duration, so a renewer that waited on the lock would be blocked
-    // exactly when it matters. `Nidus::lease_handle` exists for this.
     {
         let db = state.db.clone();
         let ttl = renew_every;
@@ -280,11 +231,9 @@ where
                 let lease = lease.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Err(e) = lease.renew() {
-                        // A definitive loss latches the store's `fenced` flag through the
-                        // renewer's shared handle, so `/ready` starts failing and `/cluster`
-                        // reports it immediately — without waiting for a write to discover it
-                        // (nidus-lp4.7). A transient backend error latches nothing: this tick
-                        // simply failed, and the next one will try again.
+                        // A definitive loss latches the store's `fenced` flag, so `/ready` and
+                        // `/cluster` report it without waiting for a write to discover it
+                        // (nidus-lp4.7). A transient error latches nothing; the next tick retries.
                         if crate::backend::is_lease_lost(&e) {
                             crate::diag::diag!(
                                 crate::diag::Level::Error,
@@ -311,7 +260,6 @@ where
     // Optional self-refresh, so a read-only instance stays current without a sidecar
     // calling POST /refresh. A tokio task rather than a library background thread: "no
     // background threads" is a property of the sync core, and the server is already async.
-    // `refresh()` is a no-op on a writer, so this is harmless whatever the role.
     if let Some(interval) = cfg.refresh_interval {
         let db = state.db.clone();
         tokio::spawn(async move {
@@ -371,18 +319,6 @@ where
 
 /// Warn at startup when the bind address makes the security posture worse than the
 /// configuration suggests (nidus-abx.6).
-///
-/// nidus serves **plain HTTP by design** — TLS is expected to be terminated in front of it
-/// by an ingress, sidecar, or mesh, which does that job better than a TLS stack compiled
-/// into the store would. The defect this closes is not the absence of TLS but the silence
-/// about it: a reader who follows the deployment guide, sets `--token`, and binds
-/// `0.0.0.0` has no indication that the credential they just configured crosses the network
-/// in cleartext on every request, alongside every vector and metadata value.
-///
-/// **Warn, never refuse.** Refusing a non-loopback bind would break every legitimate
-/// deployment that terminates TLS at a proxy — which is precisely the architecture being
-/// recommended — so this has to stay advisory. It is emitted at `warn`, which is on by
-/// default, and it names the concrete consequence rather than gesturing at "security".
 fn warn_on_exposure(bound: Option<std::net::SocketAddr>, has_token: bool) {
     let Some(addr) = bound else { return };
     match exposure(addr, has_token) {
@@ -408,9 +344,6 @@ fn warn_on_exposure(bound: Option<std::net::SocketAddr>, has_token: bool) {
 }
 
 /// What a bind address plus the auth setting says about exposure.
-///
-/// Split from the warning itself so the *decision* can be tested exactly, without a test
-/// having to scrape stderr or bind a public socket on a developer's machine.
 #[derive(Debug, PartialEq, Eq)]
 enum Exposure {
     /// Loopback: nothing leaves the box, so there is nothing to warn about.
@@ -470,15 +403,9 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
     #[cfg(feature = "mcp")]
     let router = router.nest_service("/mcp", mcp::service(state.clone(), max_body_bytes));
 
-    // Layer order matters, and `.layer()` applies **outermost last**. Reading inside-out:
-    //
-    //   body limit  ← per-extractor, closest to the handler
-    //   backpressure ← admit or shed; holds a permit for the handler's whole lifetime
-    //   auth         ← outside backpressure so an unauthenticated request is rejected
-    //                  without ever consuming a permit
-    //   observe      ← outermost, so a 401 and a shed 503 are both counted and logged;
-    //                  an error rate that excludes the errors clients actually see is
-    //                  worse than no error rate at all
+    // `.layer()` applies outermost last, so inside-out this reads: body limit, backpressure,
+    // auth (outside backpressure, so an unauthenticated request never consumes a permit), then
+    // observe outermost, so a 401 and a shed 503 are both counted.
     router
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(middleware::from_fn_with_state(
@@ -490,12 +417,9 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .with_state(state)
 }
 
-/// Resolve on the first shutdown signal: Ctrl-C (SIGINT) everywhere, plus SIGTERM on
-/// Unix — the signal Docker/Kubernetes send to stop a container. Catching SIGTERM is
-/// what lets the graceful path below run (flush + writer-lock release on `Nidus` drop)
-/// before exit; without it the process is eventually SIGKILLed, the writer lock is
-/// never released, and a restarted pod must wait out the full lock TTL before it can
-/// re-acquire it. With it, a rolling restart hands the lock over immediately.
+/// Resolve on the first shutdown signal: Ctrl-C everywhere, plus SIGTERM on Unix. Catching
+/// SIGTERM is what lets the graceful path run (flush + writer-lock release on drop); without it
+/// the process is SIGKILLed and a restarted pod waits out the full lock TTL.
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -524,27 +448,9 @@ async fn shutdown_signal() {
 // ── Handlers ──────────────────────────────────────────────────────────────
 
 /// Liveness: the process is up and the HTTP stack is answering.
-///
-/// Deliberately says nothing about the store. A standby writer waiting for promotion is
-/// *alive* — killing it is precisely the wrong response, since waiting is its job — so this
-/// must keep answering while [`AppState::db`] is still empty. Whether the instance can
-/// actually serve traffic is [`ready`]'s question.
 async fn health(State(st): State<AppState>) -> Response {
     // A **poisoned** store lock is the one condition under which this process is broken
     // beyond recovery, and it must be escalated rather than papered over (nidus-abx.1).
-    //
-    // std only poisons an `RwLock` when a panic unwinds while it is held for *writing* —
-    // verified, not assumed — so a poisoned store is by construction one whose in-RAM index
-    // was mid-mutation when the panic hit and may no longer match the durable bytes. Every
-    // request from here on fails, permanently, because poisoning never clears. Suppressing
-    // it (`clear_poison`, or catching the panic) would resume serving from that suspect
-    // index while discarding the only evidence — a loud correct failure traded for a quiet
-    // wrong one. So the poison flag is treated as the useful signal it is: report unhealthy,
-    // let liveness restart the process, and let a fresh instance rebuild from disk.
-    //
-    // In a cluster that restart is also what unblocks failover: a poisoned writer goes on
-    // renewing its lease from the background renewer (which deliberately holds no store
-    // lock), so no standby can be promoted until this process actually dies.
     if st.db.is_poisoned() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -556,29 +462,13 @@ async fn health(State(st): State<AppState>) -> Response {
         )
             .into_response();
     }
-    // Note what is deliberately NOT checked: whether the lock is currently *held*. A long
-    // write makes the store busy, not broken, and restarting an instance mid-batch would be
-    // far worse than the bug this guards. `is_poisoned` reads a flag and never acquires, so
-    // busy-ness is invisible here — the same distinction `ready` makes (nidus-abx.3).
+    // Deliberately NOT checked: whether the lock is *held*. A long write is busy, not broken,
+    // and restarting mid-batch would be worse than the bug this guards. `is_poisoned` reads a
+    // flag without acquiring, so busy-ness is invisible here (nidus-abx.3).
     "ok".into_response()
 }
 
 /// Readiness: this instance has a store open and can serve requests.
-///
-/// `503` while a standby waits for the writer handle, so a load balancer routes around it
-/// instead of sending requests that would all answer `503` anyway. Split from
-/// [`health`] because the two genuinely differ for a standby: live, but not ready.
-///
-/// Beyond "is a store open", readiness asks whether this instance can serve *usefully*, so
-/// it also fails for a **fenced** writer (superseded — every write will fail) and for a
-/// reader past its `--max-staleness` bound.
-///
-/// **Answered entirely from atomics, with no store lock** (nidus-abx.3). This used to route
-/// through `cluster_status`, which needs the lock: `try_read` returned `WouldBlock` while a
-/// large upsert held the write guard, and the probe reported `503` — so the single writer
-/// dropped out of the load balancer in the middle of the very batch it existed to perform.
-/// Busy is not unhealthy. Reading through the lock-free [`crate::Readiness`] handle removes
-/// the `WouldBlock` case from this path altogether rather than merely tolerating it.
 async fn ready(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
     let (role, staleness_secs) = readiness_check(&st)?;
     Ok(Json(json!({
@@ -589,15 +479,6 @@ async fn ready(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> 
 }
 
 /// The readiness decision, in one place.
-///
-/// `GET /ready` answers with it and `/metrics` exports it as `nidus_ready`. Factored
-/// because they had already drifted once in draft — the gauge omitted the staleness bound,
-/// so a reader that had stopped refreshing would report `nidus_ready 1` on the dashboard
-/// while `/ready` was `503`ing it out of the load balancer. Two answers to "is this
-/// instance serving" is worse than either one alone.
-///
-/// Returns `(role, staleness_secs)` when ready. Every check reads an atomic and acquires
-/// nothing (nidus-abx.3), so both callers stay off the store lock.
 fn readiness_check(st: &AppState) -> Result<(String, u64), ApiError> {
     if !st.open.load(std::sync::atomic::Ordering::Acquire) {
         return Err(ApiError::from(not_open()));
@@ -605,10 +486,6 @@ fn readiness_check(st: &AppState) -> Result<(String, u64), ApiError> {
     // A poisoned lock means every data route now fails permanently (nidus-abx.1), so this
     // instance must leave the Service as well as being restarted by liveness — waiting for
     // the restart would keep traffic arriving at something that can only 500.
-    //
-    // Checked here rather than inherited from `read_status`, which this handler no longer
-    // calls: `is_poisoned` reads a flag and acquires nothing, so it keeps readiness entirely
-    // off the lock. Making readiness lock-free must not make it blind.
     if st.db.is_poisoned() {
         return Err(ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -649,10 +526,6 @@ fn readiness_check(st: &AppState) -> Result<(String, u64), ApiError> {
 }
 
 /// `GET /cluster` — role, writer-handle state, fencing token, commit counter, staleness.
-///
-/// The introspection an operator needs mid-incident: which instance holds the writer
-/// handle, whether this one has been fenced, and how far behind a reader is. Reads only
-/// in-RAM state, so it is safe to scrape.
 async fn cluster(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
     let s = read_status(&st)?;
     Ok(Json(json!({
@@ -668,11 +541,6 @@ async fn cluster(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError
 }
 
 /// Read [`ClusterStatus`] without blocking the async executor.
-///
-/// `try_read` rather than `read`: a probe must answer in constant time, and a blocking
-/// acquisition would queue behind a long write (a large upsert holds the guard for
-/// seconds). Contention is reported as `503` — momentarily unable to answer is the honest
-/// response, and far better than stalling executor threads under a probe storm.
 fn read_status(st: &AppState) -> Result<crate::ClusterStatus, ApiError> {
     match st.db.try_read() {
         Ok(guard) => match guard.as_ref() {
@@ -918,29 +786,14 @@ async fn compact(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError
 }
 
 /// `POST /refresh` — adopt a writer's newer committed state (SPEC §14.6).
-///
-/// A read-only instance over a shared store loads a snapshot at open and would otherwise
-/// serve it forever; this is how a caller advances it. Explicit rather than automatic
-/// because the alternative — refreshing before every read — puts a manifest fetch on the
-/// hot path of exactly the read-heavy fan-out this mode exists for. Callers that want
-/// near-live reads can poll it; those that write through one instance need never call it.
-///
-/// `adopted` reports whether newer state was actually taken up, so a poller can tell "no
-/// change" from "advanced". Harmless in every other configuration: a writer already holds
-/// the only mutating handle and an in-memory store has no backend, so both answer `false`.
 async fn refresh(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
     let adopted = run_write(st, |db| db.refresh()).await?;
     Ok(Json(json!({ "adopted": adopted })))
 }
 
 // ── Memory handlers (the `memory` feature) ───────────────────────────────────
-//
-// CRITICAL async/lock discipline (see the module docs): embedding and
-// summarizing are async network IO and MUST happen OUTSIDE the store `RwLock`
-// — the guard is never held across an `.await`. So each handler does the
-// network work lock-free first, then takes the lock only for the synchronous
-// store step. The pin/identity/search logic is REUSED from `crate::memory`
-// (the same code the in-process `Memory` uses), not reimplemented here.
+// CRITICAL: embedding and summarizing are async network IO and MUST happen OUTSIDE the store
+// `RwLock` — never hold the guard across an `.await`. Logic is reused from `crate::memory`.
 
 /// `POST /collections/{name}/remember` — text in. Optionally summarize, then
 /// embed (both lock-free), then upsert under the write lock. `mode` is `"raw"`
@@ -1093,11 +946,6 @@ where
 /// Run a **write** operation under the exclusive lock, **group-committed**: it is applied
 /// together with whatever other writes are queued at that moment, and the group shares one
 /// disk barrier (see [`commit`], nidus-xb9.1).
-///
-/// The result is returned only after that barrier succeeds, so this is exactly as durable as
-/// the fsync-per-call path it replaced — a `200` from here still means the bytes are on disk.
-/// A single writer with nothing queued beside it forms a group of one and pays the same
-/// append-then-barrier it always did.
 async fn run_write<F, T>(st: AppState, f: F) -> Result<T, ApiError>
 where
     F: FnOnce(&mut Nidus) -> anyhow::Result<T> + Send + 'static,
@@ -1120,11 +968,9 @@ where
 
 // ── Error response ──────────────────────────────────────────────────────────
 
-/// A handler error carrying the HTTP status to report. The body is always
-/// `{ "error": … }`. Status is classified from the error so clients can tell a
-/// bad request from a genuine server fault (the library uses `anyhow`, so the
-/// classification is by message — the few client-fault errors the store raises
-/// have stable, distinctive wording).
+/// A handler error carrying the HTTP status to report; the body is always `{ "error": … }`.
+/// Status is classified from the error so clients can tell a bad request from a server fault —
+/// by message, since the library uses `anyhow`.
 struct ApiError {
     status: StatusCode,
     err: anyhow::Error,
@@ -1151,11 +997,6 @@ impl ApiError {
 
 /// Map a store error to an HTTP status. Defaults to `500`; recognises the
 /// store's client-fault messages and the writer-lock conflict.
-/// The error every data route returns before the store is open — a standby writer still
-/// waiting for promotion, or the brief window during a normal open.
-///
-/// `503` with `Retry-After` semantics is the honest answer: the request is valid and the
-/// process is healthy, it simply has no store to serve yet.
 fn not_open() -> anyhow::Error {
     anyhow::anyhow!(
         "store is not open yet: this instance is waiting for the writer handle \
@@ -1203,10 +1044,9 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// The single place tests build [`AppState`], so adding a field updates one site instead of
-/// every helper. Lives at module level, not inside `mod tests`, so the `memory`-gated
-/// `memory_tests` module sees it too via `use super::*` — those helpers compile only on the
-/// `serve` lane, which is exactly how they drifted out of sync unnoticed.
+/// The single place tests build [`AppState`], so a new field updates one site. At module level
+/// rather than inside `mod tests` so the `memory`-gated `memory_tests` sees it too — those
+/// compile only on the `serve` lane, which is how they drifted out of sync unnoticed.
 #[cfg(test)]
 fn test_state(db: Option<Nidus>) -> AppState {
     let open = db.is_some();
@@ -1337,11 +1177,9 @@ mod tests {
         assert_eq!(stats["footprint"]["doc_count"], 2);
     }
 
-    /// Before the store is open — a standby waiting for promotion — liveness must still
-    /// answer while readiness and every data route say `503`. Getting this backwards is
-    /// what makes a standby unusable: a failing liveness probe has a supervisor kill the
-    /// very instance that is meant to be waiting, and a passing readiness probe has a load
-    /// balancer send it traffic it cannot serve.
+    /// Before the store opens — a standby awaiting promotion — liveness must answer while
+    /// readiness and every data route say `503`. Backwards, a failing liveness probe kills the
+    /// instance meant to be waiting and a passing readiness one sends it unservable traffic.
     #[tokio::test]
     async fn not_open_is_live_but_not_ready() {
         let app = router_over(None);
@@ -1366,16 +1204,6 @@ mod tests {
     }
 
     /// **A busy store is still ready** (nidus-abx.3).
-    ///
-    /// Readiness used to be answered through `cluster_status`, which needs the store lock, so
-    /// a large upsert holding the write guard turned into `WouldBlock` and then a `503`. In a
-    /// cluster that pulled the single writer out of the load balancer in the middle of the
-    /// very batch it existed to perform. Busy is not unhealthy.
-    // Holding the guard across the awaits is the whole point: it models a write batch in
-    // flight while probes arrive. It cannot deadlock — the handlers under test are precisely
-    // the ones that must never take this lock, which is what the assertions verify. If a
-    // future change made `/ready` or `/health` acquire it, this test would hang rather than
-    // fail, which is itself a loud signal.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_busy_store_is_still_ready() {
@@ -1408,19 +1236,6 @@ mod tests {
     }
 
     /// **Concurrent writes are applied as one group sharing one barrier** (nidus-xb9.1).
-    ///
-    /// The measured ceiling this exists to move is the per-call disk barrier: `~7.6ms` paid
-    /// once per `upsert` *call*, so eight concurrent clients used to take eight barriers to
-    /// commit eight batches. What has to be true afterwards is that the group actually forms —
-    /// `writes > groups` — and that every request in it still gets its `200`.
-    ///
-    /// Forming a group deterministically needs the writes to genuinely overlap, so the store
-    /// guard is held while they queue. That is not a contrivance: it is exactly the state a
-    /// server is in whenever a write is already running when the next arrives, which the
-    /// concurrency sweep showed is most of the time under load.
-    // The guard is held across awaits on purpose (see `a_busy_store_is_still_ready`): it is
-    // what puts several writes in the queue at once. The tasks below are spawned, not awaited,
-    // so nothing here waits on the lock it holds.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_writes_share_one_barrier_and_all_still_get_their_200() {
@@ -1441,14 +1256,9 @@ mod tests {
                 .status()
             });
         }
-        // Wait until every write has reached the queue. The leader is parked on the guard held
-        // below, so none of them can complete — but it may already have *drained* them, which
-        // is why this waits on the monotonic submitted count rather than the queue's length:
-        // the length is 0 in exactly the case where the coalescing worked best.
-        //
-        // `sleep`, not `yield_now`: this thread has to genuinely stand aside, and the test
-        // binary runs hundreds of tests at once, so a spin loop just keeps the CPU it is
-        // waiting for the workers to have.
+        // Wait until every write reaches the queue, counted by the monotonic submitted count
+        // rather than queue length — the length is 0 in exactly the case where coalescing worked
+        // best. `sleep`, not `yield_now`: a spin loop keeps the CPU the workers need.
         for _ in 0..2_000 {
             if state.commit.submitted() >= N as u64 {
                 break;
@@ -1486,11 +1296,6 @@ mod tests {
     }
 
     /// **A single write forms a group of one and is never made to wait for company.**
-    ///
-    /// The classic way to get group commit wrong is a timed window: throughput rises under load
-    /// and every uncontended write pays a delay it gains nothing from. There is no window here,
-    /// and this is the guard against one appearing — with nothing else queued, one request must
-    /// produce exactly one group.
     #[tokio::test]
     async fn a_lone_write_commits_immediately_as_a_group_of_one() {
         let (app, state) = router_and_state(3);
@@ -1514,24 +1319,15 @@ mod tests {
 
     /// **A poisoned store lock must report UNHEALTHY** so liveness restarts the process
     /// (nidus-abx.1).
-    ///
-    /// `std` poisons an `RwLock` only when a panic unwinds while it is held for *writing*, so
-    /// a poisoned store is by construction one whose in-RAM index was mid-mutation and may no
-    /// longer match the durable bytes. Poisoning never clears, so every later request fails
-    /// forever — while `/health` used to return a hardcoded `"ok"`, meaning liveness never
-    /// fired and the pod was never recycled. In a cluster that is worse than a crash: the
-    /// background lease renewer holds no store lock, so the bricked writer keeps renewing its
-    /// lease and no standby can be promoted.
     #[tokio::test]
     async fn a_poisoned_store_lock_reports_unhealthy_so_liveness_restarts_it() {
         let (app, state) = router_and_state(3);
         let resp = app.clone().oneshot(get("/health")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "healthy to begin with");
 
-        // Poison it the way a panicking write handler would: unwind while holding the
-        // exclusive guard. The panic hook is silenced for the moment it takes, so a
-        // deliberate panic does not look like a failure in the test log. (Worst case a
-        // *concurrent* test's panic message is suppressed; that test still fails.)
+        // Poison it the way a panicking write handler would: unwind holding the exclusive guard.
+        // The panic hook is silenced meanwhile so a deliberate panic does not look like a test
+        // failure; worst case a concurrent test's message is suppressed, and it still fails.
         let db = state.db.clone();
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
@@ -1555,18 +1351,16 @@ mod tests {
         let body = json_body(resp).await;
         assert_eq!(body["status"], "unhealthy");
 
-        // Readiness must agree, so the instance leaves the Service as well as getting
-        // restarted — otherwise traffic keeps arriving at something that can only 500 for
-        // however long the liveness probe takes to fire. (This assertion caught exactly that
-        // gap: making readiness lock-free initially made it blind to the poison flag.)
+        // Readiness must agree, so the instance leaves the Service as well as being restarted;
+        // otherwise traffic keeps arriving at something that can only 500. This assertion caught
+        // that gap — making readiness lock-free initially made it blind to the poison flag.
         let resp = app.clone().oneshot(get("/ready")).await.unwrap();
         assert_ne!(resp.status(), StatusCode::OK);
     }
 
-    /// A panic on the **read** path must NOT brick the instance — it does not poison the
-    /// lock, so this whole failure mode is writer-only. Guards the reasoning in
-    /// `a_poisoned_store_lock_reports_unhealthy_so_liveness_restarts_it`: if std ever changed
-    /// here, the health check above would start firing on harmless search panics.
+    /// A panic on the *read* path must NOT brick the instance — it does not poison the lock, so
+    /// the failure mode is writer-only. If std ever changed here, the health check above would
+    /// start firing on harmless search panics.
     #[tokio::test]
     async fn a_panic_on_the_read_path_leaves_the_instance_healthy() {
         let (app, state) = router_and_state(3);
@@ -1656,10 +1450,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// `POST /refresh` is routed and answers `adopted: false` where there is nothing to
-    /// adopt — an in-memory store tracks no separate writer. Whether a cluster *reader*
-    /// actually takes up a writer's commits needs two processes and a shared backend, so
-    /// that lives in `tests/e2e/cluster.rs`.
+    /// `POST /refresh` is routed and answers `adopted: false` when there is nothing to adopt —
+    /// an in-memory store tracks no separate writer. Whether a cluster reader really takes up a
+    /// writer's commits needs two processes, so that lives in `tests/e2e/cluster.rs`.
     #[tokio::test]
     async fn refresh_is_a_no_op_without_a_shared_writer() {
         let app = test_router(3);
@@ -1739,11 +1532,9 @@ mod tests {
 
     // ── Backpressure (nidus-abx.2) ──────────────────────────────────────────
 
-    /// A router whose admission control is already exhausted. `Limits::new(0, …)` hands out
-    /// no permits at all, so **every** non-exempt request sheds — a deterministic stand-in
-    /// for saturation that needs no concurrency and cannot flake. (Not reachable through
-    /// configuration: `resolve_concurrency` reads `0` as "auto".) That the permit pool
-    /// itself fills and drains correctly is `limits::tests::in_flight_tracks_outstanding_permits`.
+    /// A router whose admission control is already exhausted: `Limits::new(0, …)` hands out no
+    /// permits, so every non-exempt request sheds — deterministic saturation that cannot flake.
+    /// Not reachable by config, where `resolve_concurrency` reads `0` as "auto".
     fn saturated_router() -> Router {
         let db = Nidus::open_in_memory(3).unwrap();
         let state = AppState {
@@ -1780,10 +1571,9 @@ mod tests {
         assert!(body["error"].as_str().unwrap().contains("overloaded"));
     }
 
-    /// **Probes are never shed.** They take no store lock, so they cost nothing to admit —
-    /// and shedding them under load would fail liveness and get a busy-but-healthy instance
-    /// restarted, which is exactly the availability trap nidus-abx.1/.3 closed one layer
-    /// down. `/metrics` too: an incident is when someone is looking.
+    /// Probes are never shed: they take no store lock, and shedding them under load would fail
+    /// liveness and restart a busy-but-healthy instance — the trap nidus-abx.1/.3 closed one
+    /// layer down. `/metrics` too, since an incident is when someone is looking.
     #[tokio::test]
     async fn probes_and_metrics_survive_saturation() {
         let app = saturated_router();
@@ -1800,8 +1590,6 @@ mod tests {
     /// A request cannot occupy a connection indefinitely. The deadline answers `504` —
     /// **not** `503`: this request *was* admitted and its work is still running, so an
     /// immediate retry would pile a second copy onto an instance already behind.
-    // Holding the guard across awaits is the point: it is a write batch in flight that the
-    // read below can never get past, so the deadline is the only thing that can end it.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_request_that_outlives_its_deadline_gets_504() {
@@ -1891,12 +1679,6 @@ mod tests {
     /// The two in-flight gauges are separate series with separate meanings, and the
     /// permit gauge says out loud that it excludes work whose deadline already fired
     /// (nidus-bcg).
-    ///
-    /// Asserted rather than left to the docs because the discrepancy is invisible in a
-    /// scrape: the gauge reads plausibly low, and an operator correlating it with the shed
-    /// count has no way to tell "nothing is running" from "the permit was handed back
-    /// while the scan finishes noticing". The HELP text is the only place that distinction
-    /// is delivered to the person reading it.
     #[tokio::test]
     async fn the_two_in_flight_gauges_are_distinct_and_self_describing() {
         let app = test_router(3);
@@ -1948,10 +1730,6 @@ mod tests {
 
     /// `nidus_ready` must always agree with `GET /ready` — they share one decision
     /// (`readiness_check`), and this is the regression guard on that.
-    ///
-    /// A dashboard that disagrees with the load balancer about whether an instance is
-    /// serving is worse than no dashboard: the poisoned case below is exactly when someone
-    /// is looking at both.
     #[tokio::test]
     async fn the_ready_gauge_agrees_with_the_ready_probe() {
         async fn ready_pair(app: &Router) -> (bool, bool) {
@@ -2023,10 +1801,9 @@ mod tests {
 
     // ── Exposure warnings (nidus-abx.6) ─────────────────────────────────────
 
-    /// The startup warning is **advisory** — it must never refuse. Refusing a non-loopback
-    /// bind would break every deployment that terminates TLS at a proxy, which is the
-    /// architecture the docs recommend. This asserts the function is total: no panic, no
-    /// error, on every combination including an unknown address.
+    /// The startup warning is advisory and must never refuse: refusing a non-loopback bind would
+    /// break every deployment terminating TLS at a proxy, the architecture the docs recommend.
+    /// Asserts the function is total over every combination.
     #[test]
     fn exposure_warnings_never_refuse() {
         let loopback: std::net::SocketAddr = "127.0.0.1:7700".parse().unwrap();
@@ -2039,10 +1816,6 @@ mod tests {
     }
 
     /// The two configurations that earn a warning, and the one that does not.
-    ///
-    /// A loopback bind must stay silent: `nidus serve` on a laptop is the frictionless
-    /// default the docs lead with, and a security warning printed on every ordinary run is
-    /// one an operator learns to scroll past — which costs exactly the case it exists for.
     #[test]
     fn exposure_is_classified_by_reachability_then_auth() {
         let cases = [
@@ -2107,11 +1880,6 @@ mod tests {
 
     /// A wrong-dimension query is a `400` with a message that names both lengths, on every
     /// route that takes a query vector (nidus-c5v).
-    ///
-    /// This is the regression that matters most to a caller: before the guard, these
-    /// answered `200` with an empty (or prefix-scored) ranking, so the overwhelmingly
-    /// common cause — swapping embedding models without re-indexing — surfaced as "search
-    /// stopped working" rather than an error naming the actual problem.
     #[tokio::test]
     async fn wrong_dimension_query_is_a_400_on_every_vector_route() {
         let app = test_router(3);
@@ -2173,16 +1941,8 @@ mod tests {
 }
 
 // ── Memory-route tests (the `memory` feature) ────────────────────────────────
-//
-// These drive the `/remember` + `/recall` handlers **offline**: the server's
-// embedder is an `OpenAiCompat` adapter pointed at a tiny in-process TCP mock
-// that always answers with a fixed `{"data":[{"embedding":[…],"index":0}]}`.
-// No real provider network is touched (mirrors the mock in `src/embed/*`).
-//
-// Requires `embed-openai-compat`: the mock is driven through the OpenAI-compatible
-// embedder, so a `memory` build with no provider adapter compiled (an `AnyEmbedder`
-// with zero variants) has nothing to exercise here. Every CI test lane that turns
-// on `memory` also enables `embed-all`, so coverage is unchanged.
+// Drive `/remember` + `/recall` offline against an in-process TCP mock — no provider network.
+// Requires `embed-openai-compat`; every CI lane enabling `memory` also enables `embed-all`.
 #[cfg(all(test, feature = "memory", feature = "embed-openai-compat"))]
 mod memory_tests {
     use super::*;
@@ -2200,11 +1960,9 @@ mod memory_tests {
     const EMBED_BODY: &str = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
     const DIM: usize = 3;
 
-    /// A multi-connection HTTP/1.1 mock: accepts connections forever on a
-    /// background thread, drains each request (headers + Content-Length body),
-    /// and replies with `EMBED_BODY`. Unlike the one-shot `embed::testutil`
-    /// mock, this survives the several calls a remember→recall flow makes
-    /// (dimension probe on build, then embed, then embed_query).
+    /// A multi-connection HTTP/1.1 mock: accepts forever on a background thread, drains each
+    /// request, and replies with `EMBED_BODY`. Unlike the one-shot `embed::testutil` mock, it
+    /// survives the several calls a remember→recall flow makes.
     fn spawn_embed_mock() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
         let addr = listener.local_addr().expect("mock addr");

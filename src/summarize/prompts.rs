@@ -1,16 +1,8 @@
 //! Prompt building for single-shot summarization.
-//!
-//! Adapted from the ported code-summarizer's prompt, with all code-specific
-//! framing (files, symbols, imports, languages) stripped out — nidus knows
-//! nothing about the caller's domain. The target output is dense, search-
-//! optimized prose that embeds well and matches natural-language queries.
 
 /// The default system prompt. Turns arbitrary text into dense, retrieval-
 /// friendly prose. Overridable per adapter ([`SummarizeConfig::system_prompt`])
 /// or per call ([`SummarizeOpts::system`]).
-///
-/// [`SummarizeConfig::system_prompt`]: super::SummarizeConfig::system_prompt
-/// [`SummarizeOpts::system`]: super::SummarizeOpts::system
 pub const DEFAULT_SYSTEM_PROMPT: &str = "\
 You are a summarizer for a semantic search index. Your summaries will be \
 embedded as vectors and matched against natural-language queries.\n\n\
@@ -27,10 +19,9 @@ they are the bridge between the source's vocabulary and a searcher's query.\n\
 pub const DEFAULT_INSTRUCTION: &str =
     "Summarize the following text into dense, retrieval-friendly prose:";
 
-/// Assemble the user message from the source `text` and optional caller
-/// `instructions`. When `instructions` is present (and non-blank) it becomes
-/// the lead-in; otherwise [`DEFAULT_INSTRUCTION`] is used. The text follows,
-/// separated by a blank line.
+/// Assemble the user message from the source `text` and optional caller `instructions`. When
+/// `instructions` is present (and non-blank) it becomes the lead-in; otherwise
+/// [`DEFAULT_INSTRUCTION`] is used. The text follows, separated by a blank line.
 pub fn user_message(text: &str, instructions: Option<&str>) -> String {
     let lead = instructions
         .map(str::trim)

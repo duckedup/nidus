@@ -1,8 +1,6 @@
-//! Reads and search. Cheap accessors (`dimension`, `collections`, `footprint`, …),
-//! the row-sorted scan plumbing (`scan_order`/`with_sorted_scan`) that feeds every
-//! query the data matrix in storage order, the exact f32 brute-force [`search`](Store::search),
-//! and the approximate [`search_ann`](Store::search_ann). The quantized first-pass
-//! search it dispatches to lives in [`super::quant`].
+//! Reads and search: cheap accessors, the row-sorted scan plumbing that feeds every query the
+//! data matrix in storage order, exact f32 brute force, and the approximate `search_ann`. The
+//! quantized first pass lives in [`super::quant`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -62,11 +60,9 @@ impl Store {
             .unwrap_or_default()
     }
 
-    // NOTE: `get_all` materializes the whole collection (vector + attr clones) into
-    // a fresh Vec and returns it directly, so it is not fallible — an OOM here can
-    // still abort. Making it `Result` would break the public API for a bulk-read
-    // convenience; hosts holding huge collections should prefer `search`/scoped
-    // reads. The write and open paths (the exhaustion-critical ones) are fallible.
+    // `get_all` materializes the whole collection into a fresh Vec and is not fallible, so an
+    // OOM here can still abort. Making it `Result` would break the public API for a bulk-read
+    // convenience; huge collections should prefer `search`. The write/open paths are fallible.
     pub fn get_all(&self, collection: &str) -> Vec<crate::model::Record> {
         let Some(col) = self.collections.get(collection) else {
             return Vec::new();
@@ -84,10 +80,6 @@ impl Store {
     }
 
     /// List records matching `filter` across `collections`, without vector scoring.
-    /// Skips the first `offset` matches and returns up to `limit` more, all with
-    /// `score: 0.0`. Unlike `search`, this **includes text-only docs** (no vector) —
-    /// it is a metadata query. The window `[offset, offset + limit)` paginates a stable
-    /// ordering: vector-bearing docs first by physical row, then text-only docs by id.
     pub fn list(
         &self,
         collections: &[&str],
@@ -158,10 +150,9 @@ impl Store {
         }
     }
 
-    /// Total **scannable** (vector-bearing) docs across all collections — the scan-order
-    /// cache's length and the yardstick for "does this scope cover every vector doc?"
-    /// (`scan_cap == scannable count`). Text-only docs carry no row and are excluded:
-    /// they never enter a vector scan.
+    /// Total scannable (vector-bearing) docs across all collections — the scan-order cache's
+    /// length, and the yardstick for "does this scope cover every vector doc?". Text-only docs
+    /// carry no row and never enter a vector scan.
     fn scannable_doc_count(&self) -> usize {
         self.collections
             .values()
@@ -189,10 +180,6 @@ impl Store {
     }
 
     /// A read guard over the cached row-sorted scan order, rebuilding it first if stale.
-    /// The returned guard always holds `Some`. Double-checked under the write lock so
-    /// concurrent searchers rebuild at most once. Fallible only on the rebuild's
-    /// `try_reserve` (OOM) — the per-entry `String` clones share the codebase's
-    /// no-`try_reserve`-for-clones caveat (small next to the vector matrix).
     fn scan_order(&self) -> Result<std::sync::RwLockReadGuard<'_, Option<ScanOrder>>> {
         // Fast path: already built and current.
         {
@@ -226,17 +213,6 @@ impl Store {
     }
 
     /// Build the in-scope, filter-passing scan **in row order** and hand it to `f`.
-    /// This is the single place row-sorted access is established for `search` and
-    /// `list`, so both reach the data matrix storage-ordered (nidus-33k) — and skip the
-    /// per-query sort when they can (nidus-dxt).
-    ///
-    /// Two ways there. When the scope covers every live doc (`scan_cap == live count` —
-    /// the single-collection store and `Scope::All`, the common cases), the scan is
-    /// drawn from the lazily-cached global order, so the sort is amortized across all
-    /// queries between writes rather than redone each time. Otherwise (a strict subset)
-    /// it falls back to iterating just the in-scope collections and sorting that smaller
-    /// scan — which is cheaper than walking the whole-store cache to extract a small
-    /// slice. Either way `f` receives an already row-sorted `&mut` scan.
     fn with_sorted_scan<R>(
         &self,
         collections: &[&str],
@@ -301,23 +277,6 @@ impl Store {
     // ── Search ──────────────────────────────────────────────────────────────────
 
     /// Reject a query vector whose length is not the store's pinned dimension (nidus-c5v).
-    ///
-    /// Dimension is fixed in the `data` header at creation, so a mismatched query is
-    /// never a question the store can answer — but it *is* one it can silently appear to
-    /// answer. Without this guard the query is scored against rows of a different width:
-    /// `dot` zips the two slices, so it stops at the shorter one and happily returns a
-    /// score computed over a prefix. The caller gets `200` and a plausible-looking
-    /// (or empty) ranking rather than an error.
-    ///
-    /// That matters more than a normal input-validation miss because of *how* callers
-    /// reach it: the overwhelmingly common way to send a wrong-length query is to change
-    /// embedding models without re-indexing. The symptom is then "my search got worse"
-    /// or "no results" — indistinguishable from a genuinely empty store, and the one
-    /// failure mode a vector store cannot afford to express as a quiet wrong answer.
-    ///
-    /// `upsert` has always rejected a mismatched vector (`store/write.rs`); this makes the
-    /// read path agree. The wording deliberately keeps the substring the server's
-    /// `classify` already matches to return `400`, so no new mapping is needed.
     fn check_query_dim(&self, query: &[f32]) -> Result<()> {
         let dim = self.data.dimension();
         if query.len() != dim {
@@ -333,14 +292,6 @@ impl Store {
     /// Brute-force search over the union of `collections`, merged into one ranking
     /// (one bounded top-k heap fed by every in-scope collection). The scoring function
     /// is determined by the store's [`Distance`] metric.
-    ///
-    /// Dispatches to the approximate [`search_ann`](Self::search_ann) when an ANN index
-    /// is configured, then to the quantized two-pass path
-    /// ([`search_quantized`](Self::search_quantized)) when quantization is on, and
-    /// otherwise scores the row-sorted scan exactly via [`rank_scan`](Self::rank_scan).
-    ///
-    /// Errors when `query.len()` is not the store's dimension — see
-    /// [`check_query_dim`](Self::check_query_dim).
     pub fn search(
         &self,
         collections: &[&str],
@@ -349,9 +300,6 @@ impl Store {
     ) -> Result<Vec<Hit>> {
         // Before the metric: a request the store refuses is not a query it served, so
         // counting it would overstate `search_queries` and skew every ratio built on it.
-        // This is also the single funnel for *every* vector path — exact, quantized, ANN,
-        // and per-segment all dispatch below it, and `hybrid_search`'s vector leg calls
-        // straight into here — so one check covers them all.
         self.check_query_dim(query)?;
 
         // Which path served a query is the difference between "queries are slow" and
@@ -370,29 +318,25 @@ impl Store {
             Distance::Euclidean => euclidean_neg_sq,
         };
 
-        // ANN path: walk the index for an over-fetched candidate set, then post-filter
-        // by scope + filter + min_score and rerank. Approximate — recall is traded for
-        // speed. A selective filter/scope can starve that candidate walk, so
-        // `search_ann` first falls back to an exact prefilter when the survivor set is
-        // small enough to score directly (nidus-0ou). Skips the linear scan otherwise.
+        // ANN path: walk the index for an over-fetched candidate set, then post-filter and
+        // rerank — recall traded for speed. A selective filter/scope can starve the walk, so
+        // `search_ann` falls back to an exact prefilter when survivors are few (nidus-0ou).
         if self.ann.is_some() {
             m.search_ann.inc();
             return self.search_ann(collections, &q, opts, score_fn);
         }
 
-        // Per-segment fan-out: walk each cold segment's IVF index and brute-force the
-        // exhaustive tail (the active segment + any sub-threshold sealed segment), merged
-        // into one ranking (SPEC §14.3). Engaged only when at least one segment is indexed
-        // — i.e. `segment_index_min_rows` is set and a sealed segment has crossed it.
+        // Per-segment fan-out: walk each cold segment's IVF index and brute-force the tail (the
+        // active segment plus any sub-threshold sealed one), merged into one ranking (SPEC §14.3).
+        // Engaged only once a sealed segment has crossed `segment_index_min_rows`.
         if self.seg_indexes.iter().any(Option::is_some) {
             m.search_segmented.inc();
             return self.search_segmented(collections, &q, opts, score_fn);
         }
 
-        // Gather the in-scope, filter-passing rows in physical-row order (for
-        // cache-friendly sequential `data` access — nidus-33k). `with_sorted_scan`
-        // hands back an already row-sorted scan, reusing the cached whole-store order
-        // where it can so the sort is not redone every query (nidus-dxt).
+        // Gather in-scope, filter-passing rows in physical-row order, for sequential `data`
+        // access (nidus-33k). `with_sorted_scan` reuses the cached whole-store order where it can,
+        // so the sort is not redone every query (nidus-dxt).
         self.with_sorted_scan(collections, &opts.filter, |scan| {
             // Only the brute-force paths reach here, which is exactly why the counter lives
             // here: "rows scanned" is a meaningful cost on a linear scan and meaningless on
@@ -414,13 +358,9 @@ impl Store {
         })
     }
 
-    /// Full-text (BM25) search over `collections`, ranked by BM25 relevance for
-    /// `query.field`. Reuses the same `Hit`/`Filter`/top-k machinery as vector
-    /// `search`: each in-scope collection's matches are scored, the metadata `filter`
-    /// and `min_score` (here a **raw BM25** floor, not cosine) are applied, and one
-    /// bounded heap merges them into a single ranking. Text-only and vector-bearing
-    /// docs are both eligible — relevance is purely textual. Results are tie-broken by
-    /// `(collection, id)` for determinism.
+    /// Full-text (BM25) search over `collections`, reusing the same `Hit`/`Filter`/top-k
+    /// machinery as vector `search`. `min_score` here is a raw BM25 floor, not cosine. Text-only
+    /// and vector-bearing docs are both eligible; ties break on `(collection, id)`.
     pub fn text_search(
         &self,
         collections: &[&str],
@@ -473,12 +413,9 @@ impl Store {
         Ok(hits)
     }
 
-    /// Hybrid search: fuse a vector query and a BM25 text query into one ranking with
-    /// Reciprocal Rank Fusion. Each leg is run independently (reusing
-    /// [`search`](Self::search) and [`text_search`](Self::text_search) with the shared
-    /// `filter`, pulled `candidates` deep), then a doc's fused score is the sum over the
-    /// legs of `1 / (rrf_k + rank + 1)`. A doc present in only one leg is carried by it.
-    /// Results are tie-broken by `(collection, id)` for determinism.
+    /// Hybrid search: fuse a vector and a BM25 leg with Reciprocal Rank Fusion. Each leg runs
+    /// independently `candidates` deep, then a doc's fused score is the sum of
+    /// `1 / (rrf_k + rank + 1)`; a doc in only one leg is carried by it. Ties break on `(collection, id)`.
     pub fn hybrid_search(
         &self,
         collections: &[&str],
@@ -486,10 +423,9 @@ impl Store {
         text: &FtsQuery,
         opts: &HybridOpts,
     ) -> Result<Vec<Hit>> {
-        // Ahead of the `top_k == 0` shortcut, not after it: the vector leg calls `search`,
-        // which validates, but that shortcut returns before the leg ever runs. Validating
-        // here too means one bad query does not change verdict — accepted or rejected —
-        // based on `top_k`, which would be a confusing thing to debug.
+        // Ahead of the `top_k == 0` shortcut, not after: the vector leg validates, but the
+        // shortcut returns before the leg runs. Validating here means a bad query does not change
+        // verdict based on `top_k`.
         self.check_query_dim(vector)?;
 
         if opts.top_k == 0 {
@@ -536,12 +472,9 @@ impl Store {
         Ok(hits)
     }
 
-    /// Score an already-gathered, in-scope, filter-passing scan exactly (f32) into
-    /// ranked [`Hit`]s. The shared tail of the brute-force path and the ANN
-    /// exact-prefilter fallback ([`Self::search_ann`]): both arrive with a row-sorted
-    /// scan and need the same bounded top-k + hit assembly. Splits across worker
-    /// threads when the scan clears the parallel work floor, else scores serially —
-    /// both yield the same bounded top-k (ties aside).
+    /// Score an already-gathered, filter-passing scan exactly into ranked [`Hit`]s — the shared
+    /// tail of the brute-force path and the ANN exact-prefilter fallback. Splits across workers
+    /// once the scan clears the parallel floor, else scores serially, for the same top-k.
     fn rank_scan<'b>(
         &self,
         q: &[f32],
@@ -582,20 +515,9 @@ impl Store {
             .collect()
     }
 
-    /// ANN search: walk the index for `top_k × overscan` candidate rows, then resolve
-    /// each to its owning doc, keep only those in scope and passing the filter, and
-    /// rank by the exact f32 score (the candidate scores returned by the index are
-    /// already the exact metric — both the HNSW beam and the IVF probe score real
-    /// rows). Candidate→doc resolution is verified against the live index, so stale
-    /// graph nodes (deleted/overwritten rows) are skipped.
-    ///
-    /// The walk over-fetches so a *permissive* filter/scope still leaves `top_k`
-    /// survivors to rank. A **selective** one would starve it (the survivors are too
-    /// sparse among the nearest `n_candidates` overall), silently dropping recall — so
-    /// when the in-scope, filter-passing population is small enough to score directly
-    /// (`≤ total/overscan`, below which the walk can't be trusted), we skip the graph
-    /// and brute-force exactly those rows instead. That fallback is cheap *because*
-    /// the filter is selective, and it restores exact recall (nidus-0ou).
+    /// ANN search: walk the index for `top_k × overscan` candidate rows, resolve each to its doc,
+    /// keep those in scope and passing the filter, and rank by exact f32 score. Resolution is
+    /// verified against the live index, so stale graph nodes are skipped.
     fn search_ann(
         &self,
         collections: &[&str],
@@ -613,12 +535,9 @@ impl Store {
         let overscan = self.config.ann.map_or(1, |a| a.overscan).max(1);
         let n_candidates = opts.top_k.saturating_mul(overscan).max(opts.top_k);
 
-        // Exact-prefilter fallback. Only a narrowed query (a filter or a strict scope
-        // subset) can starve the walk; an unfiltered whole-store search always takes
-        // the graph. The ANN post-filter reliably surfaces `top_k` survivors only when
-        // selectivity ≥ 1/overscan, i.e. the survivor population ≥ total/overscan;
-        // below that we gather the survivors directly (bailing out as soon as the
-        // population proves it is *not* selective) and score them exactly.
+        // Exact-prefilter fallback: only a narrowed query can starve the walk. The post-filter
+        // surfaces `top_k` survivors reliably only when the survivor population ≥ total/overscan;
+        // below that, gather survivors directly and score them exactly.
         let total = self.scannable_doc_count();
         let in_scope = self.scannable_in_scope(collections);
         let narrowed = !opts.filter.0.is_empty() || in_scope < total;
@@ -643,15 +562,9 @@ impl Store {
         Ok(self.hits_from_topk(topk))
     }
 
-    /// Resolve walked candidate rows to their owning docs, drop the out-of-scope /
-    /// filtered / stale / below-`min_score` ones, exact-rerank the survivors, and offer
-    /// them into `topk`. The shared tail of every index-walk search — the global ANN path
-    /// ([`search_ann`](Self::search_ann)) and the per-segment fan-out
-    /// ([`search_segmented`](Self::search_segmented)) both funnel their candidate rows
-    /// through it. A candidate→doc lookup is a *hint*: it is re-verified against the live
-    /// index (`docs[id].row == row`), so deleted/overwritten rows are skipped. The walk's
-    /// own score is only a selection proxy (approximate under quantization), so the true
-    /// f32 score — and `min_score` — is recomputed here from the original vectors.
+    /// Resolve walked candidates to their docs, drop the out-of-scope/filtered/stale ones,
+    /// exact-rerank, and offer into `topk` — the shared tail of both index-walk searches. The
+    /// walk's score is only a selection proxy, so the true f32 score is recomputed here.
     fn offer_candidates<'b>(
         &'b self,
         candidates: &[(u64, f32)],
@@ -693,14 +606,6 @@ impl Store {
     /// Per-segment fan-out search (SPEC §14.3): brute-force the **exhaustive tail** (the
     /// active segment plus any sealed segment below `segment_index_min_rows`) and **walk
     /// each cold segment's IVF** for candidates, fusing both into one ranking.
-    ///
-    /// The two row sets are disjoint by construction — a row lives in exactly one segment,
-    /// and a segment is either indexed or brute-forced — so the legs never double-count a
-    /// doc. The exact leg scores every in-scope, filter-passing row of the unindexed
-    /// segments; the IVF leg over-fetches `top_k × overscan` candidates per cold segment,
-    /// then [`offer_candidates`](Self::offer_candidates) verifies, filters, and exact-reranks
-    /// them. The merged list is ordered by exact score (tie-broken by `(collection, id)`)
-    /// and truncated to `top_k`.
     fn search_segmented(
         &self,
         collections: &[&str],
@@ -721,10 +626,9 @@ impl Store {
             .filter_map(|(&(base, rows), ix)| ix.as_ref().map(|_| (base, base + rows)))
             .collect();
 
-        // Exhaustive tail: in-scope, filter-passing rows that fall outside every indexed
-        // segment. Gathered straight from the live index (text-only docs carry no row),
-        // then row-sorted for cache-friendly sequential `data` access and scored exactly
-        // through the shared brute-force tail.
+        // Exhaustive tail: in-scope, filter-passing rows outside every indexed segment, gathered
+        // from the live index, row-sorted for sequential `data` access, and scored exactly through
+        // the shared brute-force tail.
         let mut scan: Vec<(u64, &str, &str)> = Vec::new();
         for &col_name in collections {
             let Some(col) = self.collections.get(col_name) else {
@@ -770,14 +674,9 @@ impl Store {
         Ok(hits)
     }
 
-    /// Gather in-scope, filter-passing rows for the exact-prefilter fallback, bailing
-    /// out the moment the population exceeds `cap`. `Some(scan)` means the filter/scope
-    /// is selective enough that the whole survivor set fits within `cap` — exact
-    /// scoring over it is cheap *and* recall-complete, which the ANN post-filter walk
-    /// cannot guarantee once it starves. `None` means the query is permissive
-    /// (population > `cap`), so the caller should walk the graph. Pure metadata work,
-    /// no vector scoring; the early bail keeps the permissive case `O(cap)` rather than
-    /// `O(scope)`.
+    /// Gather in-scope, filter-passing rows for the exact-prefilter fallback, bailing once the
+    /// population exceeds `cap`. `Some` = selective enough to score exactly and stay
+    /// recall-complete; `None` = permissive, so walk the graph. The bail keeps it `O(cap)`.
     fn collect_selective_scan<'b>(
         &'b self,
         collections: &[&'b str],

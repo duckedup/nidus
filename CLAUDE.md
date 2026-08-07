@@ -246,7 +246,9 @@ each.
   `bd` issue — not above the code.** When trimming, keep the fact and drop the argument:
   "rmcp reports `rmcp 3.1.1` here, not this crate" beats a paragraph explaining why that
   matters. Long comments are not thoroughness; they push the code off the screen and go
-  stale where prose in a commit cannot.
+  stale where prose in a commit cannot. **One exception:** a doc example (a ```` ``` ````
+  fence) is test code, not commentary, so it does not count toward the cap — the prose
+  around it still does.
 - **Commit style**: emoji prefix + short description (e.g. `🪺 op-log codec`).
 - **Issue tracking**: `bd` (beads) — run `bd ready` for available work.
 - **Branch workflow**: one branch per issue or bundled epic, push for PR review.

@@ -5,11 +5,9 @@ use std::collections::BTreeMap;
 
 use crate::model::{Filter, Predicate, Value};
 
-/// Same-type ordering of two [`Value`]s for the range predicates. Returns `None` when
-/// the two values are not comparable: different variants, or a non-orderable variant
-/// (`Null`, `List`). `Int`↔`Int` is numeric, `Str`↔`Str` lexical, `Bool`↔`Bool` orders
-/// `false < true`. The `None` case is what makes a range predicate fail on an
-/// absent/wrong-type attribute rather than match spuriously.
+/// Same-type ordering of two [`Value`]s for the range predicates: `Int` numeric, `Str` lexical,
+/// `Bool` as `false < true`. `None` for different or non-orderable variants, which is what makes a
+/// range predicate fail on an absent or wrong-type attribute rather than match spuriously.
 fn value_cmp(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
@@ -33,10 +31,9 @@ fn range_matches(
     }
 }
 
-/// True iff every predicate in `filter` matches `attrs` (an empty filter matches
-/// everything). Every predicate requires `key` to be present — an absent attribute
-/// matches nothing, including the negative (`Ne`/`NotIn`) and range predicates. See the
-/// root `SPEC.md` §7.1 for the full per-predicate semantics.
+/// True iff every predicate in `filter` matches `attrs`; an empty filter matches everything. Every
+/// predicate requires `key` present, so an absent attribute matches nothing — including the negative
+/// and range predicates. `SPEC.md` §7.1 has the full per-predicate semantics.
 pub fn matches(filter: &Filter, attrs: &BTreeMap<String, Value>) -> bool {
     use Ordering::{Equal, Greater, Less};
     filter.0.iter().all(|predicate| match predicate {

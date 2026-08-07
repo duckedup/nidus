@@ -1,13 +1,6 @@
 //! Inverted-file (IVF) index: k-means centroids partition the vectors into lists; a
 //! query scores the centroids, probes the nearest `n_probe` lists, and scores only the
 //! rows in those lists. Pure safe Rust, no dependencies.
-//!
-//! Lower edge memory than HNSW, but the centroids are fit from the rows present at
-//! build time. Incremental `insert_rows` assigns each new row to its nearest existing
-//! centroid without refitting, so heavy growth drifts the partition until the next
-//! `compact` triggers a full rebuild. Candidate scores returned here are already the
-//! exact f32 metric (we score real rows), so recall loss comes only from rows sitting
-//! in unprobed lists.
 
 use crate::ann::{AnnSnapshotRef, ScoreFn, SplitMix64, Walk, score_fn_for};
 use crate::model::{AnnConfig, Distance};
@@ -71,9 +64,6 @@ impl IvfIndex {
 
     // IVF build is already cheap (k-means over a fixed iteration count, ~seconds even
     // at scale), so it stays serial; `_workers` keeps the signature uniform with HNSW.
-    // The k-means fit and centroids are always f32 (a mean of quantized codes is
-    // meaningless), so build reads the f32 matrix straight from `walk.data()`; only the
-    // per-row scan in `search` consults the walk's quantized codes (nidus-ndu).
     pub(crate) fn build(&mut self, walk: &Walk, live_rows: &[u64], _workers: usize) {
         let data = walk.data();
         self.centroids.clear();
@@ -205,10 +195,9 @@ impl IvfIndex {
         let probe = self.n_probe.min(centroid_scores.len());
         centroid_scores.select_nth_unstable_by(probe - 1, |a, b| b.0.total_cmp(&a.0));
 
-        // Score every row in the probed lists via the walk (quantized codes when the
-        // walk carries a codebook, else exact f32); keep the best `n_candidates`. The
-        // store reranks these rows exactly afterward, so a quantized score is only a
-        // selection proxy here.
+        // Score every row in the probed lists via the walk (quantized codes when the walk carries a
+        // codebook, else exact f32); keep the best `n_candidates`. The store reranks these rows
+        // exactly afterward, so a quantized score is only a selection proxy here.
         let qs = walk.query_scorer(query);
         let mut scored: Vec<(u64, f32)> = Vec::new();
         for &(_, c) in &centroid_scores[..probe] {

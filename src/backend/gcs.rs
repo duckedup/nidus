@@ -1,20 +1,4 @@
 //! [`Gcs`]: a Google Cloud Storage [`Persistence`] backend.
-//!
-//! Selected by `gs://<bucket>[/<prefix>]` (alias `gcs://`). Authenticated with a
-//! service-account key — its path in `GOOGLE_APPLICATION_CREDENTIALS`, or the JSON inline
-//! in `GOOGLE_APPLICATION_CREDENTIALS_JSON` — and, when neither is set, the GCE/GKE
-//! **metadata server** (Workload Identity), so a pod with a bound service account needs no
-//! key file. Like [`S3`](super::S3) it is a whole-object backend (`get`/`put`/`delete`/
-//! `list`, no native append) — for snapshots and whole-object use.
-//!
-//! [`tame-gcs`](tame_gcs) and [`tame-oauth`](tame_oauth) are sans-IO: they build the
-//! GCS request (and the OAuth2 token-exchange request) as [`http::Request`]s, which
-//! [`Http`] executes. `tame-oauth` signs the service-account JWT (RSA via `ring`) and
-//! caches the access token internally.
-//!
-//! Note: unlike S3, the request/auth path is exercised only by construction-level unit
-//! tests here — there is no clean local mock for GCS's fixed OAuth token endpoint, so
-//! end-to-end behaviour is verified against a real bucket out of band.
 
 use std::time::Duration;
 
@@ -55,9 +39,6 @@ pub struct Gcs {
 
 impl Gcs {
     /// Build from the part of a `gs://` URL after the scheme: `<bucket>[/<prefix>]`.
-    /// Credentials come from a service-account key (`GOOGLE_APPLICATION_CREDENTIALS_JSON`
-    /// inline, or `GOOGLE_APPLICATION_CREDENTIALS` as a path) or, when neither is set, the
-    /// GCE/GKE metadata server (Workload Identity).
     pub(crate) fn from_url(rest: &str) -> Result<Gcs> {
         let (bucket, prefix) = match rest.split_once('/') {
             Some((b, p)) => (b, p.trim_end_matches('/')),
@@ -194,10 +175,9 @@ impl Persistence for Gcs {
     fn put_cas(&self, key: &str, bytes: &[u8], expected: Option<&str>) -> Result<CasOutcome> {
         validate_key(key)?;
         let oid = self.object_id(key)?;
-        // `ifGenerationMatch=<gen>` makes the insert a compare-and-swap; `=0` makes it a
-        // create-if-absent (`expected: None`). It is a signed query param baked into the URI
-        // (no extra header on the wire). A non-numeric `expected` can never match a real
-        // generation, so it maps to a value (-1) that fails the precondition cleanly.
+        // `ifGenerationMatch=<gen>` makes the insert a compare-and-swap, `=0` a create-if-absent —
+        // a signed query param baked into the URI, not a header. A non-numeric `expected` can never
+        // match a real generation, so it maps to -1 and fails the precondition cleanly.
         let want_gen = match expected {
             Some(t) => t.parse::<i64>().unwrap_or(-1),
             None => 0,

@@ -1,21 +1,4 @@
 //! nidus-bench-quant — int8 scalar-quantization recall & speed sweep.
-//!
-//! Holds quantization to the same bar as the parity harness: it builds one exact
-//! (f32) nidus store and one quantized store per `rescore` factor over identical
-//! data, then reports each variant's **recall@k** against an independent exact
-//! ground truth plus its query latency and speedup vs the exact path. This is the
-//! evidence for whether quantization wins at nidus's target scale and what the
-//! default `rescore` should be.
-//!
-//! Run via `just bench-quant [key=value ...]`:
-//!   n=100000           corpus size(s), comma-separated
-//!   dim=384,768        embedding dimension(s)
-//!   top_k=10           neighbours to retrieve
-//!   rescore=1,2,4,8    overscan factors to sweep
-//!   queries=100        distinct query vectors
-//!   warmup=10          unrecorded warmup queries
-//!   iters=5            measured passes over the query set
-//!   seed=42            PRNG seed
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;

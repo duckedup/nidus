@@ -1,38 +1,8 @@
 //! Build-thesis guard for the AI ingest layer (epic nidus-54l).
-//!
-//! nidus's identity is a **pure-Rust, dependency-lean, seconds-fast** embeddable
-//! vector store. The off-by-default AI ingest layer (`embed`/`summarize`/`memory`
-//! and their per-provider features) adds an async network edge — `reqwest` +
-//! `tokio` + `hyper` — exactly like the `cli`/`serve` feature adds the tokio/axum
-//! stack. That edge must never leak into the DEFAULT build: `cargo add nidus` has
-//! to stay the pure sync store with none of those crates compiled.
-//!
-//! This file enforces that thesis at COMPILE TIME via `cfg`. It has two halves,
-//! selected by the active feature set, so it stays green on both CI lanes:
-//!
-//!   * DEFAULT lane (`cargo test`) — none of the ingest features are on, so the
-//!     test binary links with NO reqwest/tokio/hyper. The mere fact that this
-//!     integration crate compiles and runs under plain `cargo test` (reqwest is
-//!     not a dev-dependency, and nothing here can reach it) is itself part of the
-//!     proof; the `default_build_is_pure` assertion pins the intent.
-//!
-//!   * INGEST lane (`cargo test --features memory,embed-all,summarize-all`, etc.)
-//!     — the feature-implication graph is asserted: every provider feature pulls
-//!     its base (`embed`/`summarize`), and each base is what gates `reqwest` +
-//!     `tokio`. This keeps a provider feature from ever being wired up WITHOUT the
-//!     async edge it needs (or, conversely, a stray edge with no provider).
-//!
-//! The AUTHORITATIVE, empirical dep-absence check — `cargo tree -e no-dev` must
-//! show none of reqwest/tokio/hyper on the default build, and rustls/ring (never
-//! aws-lc/OpenSSL) on the ingest build — lives in CI (`.github/workflows/ci.yml`,
-//! the `build-thesis` step) and the `just ci-ingest` recipe. Doing the tree grep
-//! there rather than shelling out from a test keeps this crate a fast, offline,
-//! pure compile-time invariant. This whole layer is miri-skipped (async edge).
 
-// Every assertion in this file is a DELIBERATE compile-time `cfg!` guard — its
-// operand is a constant on purpose (that is the whole point: pin the feature
-// graph at build time). `clippy::assertions_on_constants` would flag each one,
-// so it is allowed crate-wide for this guard file.
+// Every assertion here is a deliberate compile-time `cfg!` guard, so its operand is a constant on
+// purpose — pinning the feature graph at build time. `clippy::assertions_on_constants` would flag
+// each one, hence the crate-wide allow in this guard file.
 #![allow(clippy::assertions_on_constants)]
 
 /// DEFAULT build: none of the AI-ingest features are enabled, so the async edge
@@ -72,10 +42,8 @@ fn default_build_is_pure() {
 }
 
 // ── Ingest lane: the feature-implication graph that wires the async edge. ──────
-//
-// Each `assert!` is compiled ONLY when its provider feature is active, so on the
-// pure lane none of these exist; on the ingest lane they pin that a provider can
-// never be enabled without the base feature that pulls reqwest + tokio.
+// Each `assert!` compiles only when its provider feature is active, so none exist on the pure lane;
+// on the ingest lane they pin that a provider cannot be enabled without its reqwest+tokio base.
 
 /// A provider/umbrella feature must always drag in its base `embed` feature —
 /// that base is what enables `dep:reqwest` + `dep:tokio`. If any embedder is on

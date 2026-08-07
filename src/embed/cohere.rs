@@ -1,8 +1,4 @@
 //! Cohere embedding adapter (`embed-english-v3.0` default).
-//!
-//! Bespoke wire shape: `POST /v2/embed` with `{model, texts, input_type,
-//! embedding_types:["float"]}`, response `{embeddings:{float:[[..]]}}`.
-//! `input_type` is `search_document` for documents, `search_query` for queries.
 
 use serde::Deserialize;
 

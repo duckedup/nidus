@@ -1,13 +1,5 @@
 //! Criterion regression benchmarks for nidus — the "are we getting better / did we
 //! regress?" signal, complementing the cross-engine parity table.
-//!
-//! These exercise nidus through its PUBLIC API (open_in_memory → upsert → search), which
-//! drives the same dot-product + top-k hot paths as a real query, without any bench-only
-//! surface on the crate. criterion is a dev-dependency of nidus-bench only, so it never
-//! enters nidus's own build/test/CI path.
-//!
-//!   just bench-crit                        run all
-//!   just bench-crit --save-baseline main   record a baseline to diff later runs against
 
 use std::collections::BTreeMap;
 
@@ -38,11 +30,9 @@ fn build_store(n: usize, dim: usize) -> Nidus {
     db
 }
 
-/// Build a file-backed store (in a tempdir) with a specific `query_threads` and
-/// optional quantization, so the parallel-scan path (f32, int8, or binary) can be
-/// driven through the public `Config` API. Returns the `TempDir` guard alongside the
-/// store to keep the backing files alive. Binary quantization pins cosine distance
-/// (its only supported metric).
+/// Build a file-backed store in a tempdir with a specific `query_threads` and optional
+/// quantization, driving the parallel-scan path through the public `Config` API. Returns the
+/// `TempDir` guard too, to keep the backing files alive.
 fn build_store_threaded(
     n: usize,
     dim: usize,
@@ -89,12 +79,9 @@ fn bench_search(c: &mut Criterion) {
     group.finish();
 }
 
-/// Same large search, swept across `query_threads` — the reproducible measurement
-/// behind the parallel-scan speedup claim, across the f32, int8, and binary first
-/// passes. The f32 scan is memory-bandwidth-bound, so its gain is sublinear; int8
-/// moves 4× fewer bytes and binary 32× (compute- not bandwidth-bound), so those are
-/// the paths that should scale with threads — binary hardest. One group each so they
-/// diff separately, and the int8/binary groups also expose the recall/latency trade.
+/// The same large search swept across `query_threads` — the reproducible measurement behind the
+/// parallel-scan claim. The f32 scan is bandwidth-bound so its gain is sublinear; int8 and binary
+/// move 4×/32× fewer bytes and should scale with threads. One group each so they diff separately.
 fn bench_parallel_search(c: &mut Criterion) {
     let (n, dim) = (100_000usize, 768usize);
     let query = data::generate(SEED ^ 1, 1, dim, 0).vectors;
@@ -158,19 +145,6 @@ fn bench_ingest(c: &mut Criterion) {
 
 /// The **file-backed** write path, across fsync policy and batch size — the regression
 /// lane for nidus-xb9.1 (group commit).
-///
-/// [`bench_ingest`] above cannot serve as that baseline: it uses `open_in_memory` and one
-/// 10k-record call, so it touches no filesystem, takes no disk barrier, and has no
-/// batch-size axis. Every quantity group commit is meant to move is invisible to it. This
-/// group opens a real store in a temp dir and varies the two things that actually decide
-/// write throughput.
-///
-/// This group is deliberately *small and few-sampled*, unlike every other one here. A
-/// `PerBatch` call costs a real disk barrier (~3.8ms on APFS, where `sync_all` is
-/// `F_FULLFSYNC`), so cost is driven by call count, and criterion's defaults would turn
-/// the `b1` row alone into several minutes on every `just bench-crit`. `n = 200` with
-/// `sample_size(10)` keeps the whole group to roughly twenty seconds while still
-/// resolving the thing being watched — the per-call barrier — to well inside a percent.
 fn bench_write_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_path");
     // The floor criterion allows. These are IO benchmarks whose variance comes from the

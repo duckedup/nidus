@@ -1,10 +1,4 @@
 //! nidus-bench — cross-engine exact-KNN performance-parity harness.
-//!
-//! The goal is **parity, not winning**: confirm nidus's exact brute-force cosine KNN
-//! stays in line with DuckDB and LanceDB, and catch regressions over time. Every engine
-//! is pinned to *exact* search (no ANN index). The harness computes its own independent
-//! exact ground truth and reports each engine's **recall@k** against it — including
-//! nidus's, so no engine is trusted as the oracle; ~100% confirms the configs are exact.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -81,10 +75,6 @@ pub struct EngineResult {
 }
 
 /// Run one engine across one cell: create → ingest → warm up → time queries.
-///
-/// `truth` is the harness's own exact top-k per query (see [`exact_ground_truth`]) — the
-/// recall reference, computed independently of every engine so none (not even nidus) is
-/// trusted as the oracle.
 pub fn run_engine<E: VectorStore>(
     cell: Cell,
     data: &Dataset,

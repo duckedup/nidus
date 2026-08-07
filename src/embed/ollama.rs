@@ -1,9 +1,4 @@
 //! Ollama local embedding adapter (`nomic-embed-text` default), keyless.
-//!
-//! Ollama serves arbitrary user-installed models, so the dimension is not known
-//! statically: the constructor is async and probes it with one embed call.
-//! Bespoke wire shape: `POST /api/embed` with `{model, input:text}`, response
-//! `{embeddings:[[..]]}`. Batches are sent sequentially.
 
 use serde::Deserialize;
 

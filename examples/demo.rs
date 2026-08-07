@@ -1,12 +1,4 @@
 //! End-to-end smoke test of the public API — the quickest way to see nidus work.
-//!
-//! Run it:
-//!     cargo run --example demo        (or: just demo)
-//!
-//! It opens a file-backed store in a temp dir, indexes a handful of toy 4-dim
-//! vectors across two collections, then demonstrates: single-collection search,
-//! whole-store (`Scope::All`) search, a metadata filter + `min_score`, and
-//! durability by reopening the store from disk.
 
 use std::collections::BTreeMap;
 

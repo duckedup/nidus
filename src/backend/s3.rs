@@ -1,19 +1,4 @@
 //! [`S3`]: an Amazon S3 (and S3-compatible: R2, MinIO, …) [`Persistence`] backend.
-//!
-//! Selected by `s3://<bucket>[/<prefix>]`, with credentials/region/endpoint from the
-//! standard AWS environment. Region/endpoint come from `AWS_REGION`/`AWS_DEFAULT_REGION`
-//! and `AWS_ENDPOINT_URL`; **credentials** resolve through [`AwsCredentials`] — static
-//! `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`), or the
-//! keyless chain (EKS IRSA web identity, ECS task role, EC2 instance role), refreshed as
-//! they expire. Object
-//! ops are whole-object `get`/`put`/`delete`/`list`; there is **no native append**
-//! (`appender` returns `None`), so S3 is for snapshots and whole-object use, not as a
-//! live append-backed `data`/`log` store.
-//!
-//! [`rusty-s3`](rusty_s3) is sans-IO: it builds and Sigv4-signs each request into a
-//! presigned [`Url`], which [`Http`] then executes. Signing is pure RustCrypto HMAC —
-//! no network, no async — so it is unit-testable offline, and the execution path is
-//! covered by a localhost mock in the tests.
 
 use std::time::Duration;
 
@@ -31,11 +16,9 @@ use crate::backend::cloud::Http;
 /// the window between signing and the (immediate) execution.
 const PRESIGN_TTL: Duration = Duration::from_secs(300);
 
-/// The `If-None-Match: *` precondition that makes a PUT a create-if-absent (it succeeds
-/// only when no object matches — i.e. none exists). The header name is **lowercase**:
-/// SigV4 signs canonical (lowercased) header names, and rusty-s3 signs the name as given,
-/// so it must already be lowercase here to match what AWS recomputes. HTTP header names
-/// are case-insensitive on the wire, so sending it lowercase is equally fine.
+/// The `If-None-Match: *` precondition making a PUT a create-if-absent. The name must be lowercase
+/// here: SigV4 signs canonical lowercased names and rusty-s3 signs the name as given, so anything
+/// else fails what AWS recomputes. Header names are case-insensitive on the wire regardless.
 const IF_NONE_MATCH_HEADER: &str = "if-none-match";
 const IF_NONE_MATCH_ANY: &str = "*";
 
@@ -163,10 +146,9 @@ impl Persistence for S3 {
     fn put_cas(&self, key: &str, bytes: &[u8], expected: Option<&str>) -> Result<CasOutcome> {
         validate_key(key)?;
         let path = self.path(key);
-        // `If-Match: <etag>` makes the PUT a compare-and-swap; `If-None-Match: *` makes it a
-        // create-if-absent (`expected: None`). Either header is *signed* (added before signing)
-        // so it must be sent verbatim on the wire. A 412 means the precondition failed — a peer
-        // changed the object since `expected` (or it already exists), i.e. we are fenced.
+        // `If-Match: <etag>` makes the PUT a compare-and-swap, `If-None-Match: *` a
+        // create-if-absent. Either header is signed, so it must go on the wire verbatim. A 412 means
+        // the precondition failed — a peer changed the object, or it already exists: we are fenced.
         let (name, value) = match expected {
             Some(etag) => (IF_MATCH_HEADER, etag),
             None => (IF_NONE_MATCH_HEADER, IF_NONE_MATCH_ANY),

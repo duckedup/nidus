@@ -1,10 +1,4 @@
 //! Serving-edge hardening against a real process (epic nidus-abx).
-//!
-//! What the in-process `tower::oneshot` suites structurally cannot reach: a *shared*
-//! permit pool under genuinely concurrent connections (a `oneshot` router serves one
-//! request at a time, so admission control there can only be tested by pre-exhausting it),
-//! the CLI-flag → `ServeConfig` wiring for the new knobs, `NIDUS_LOG` filtering in the
-//! process that reads it, and `/metrics` served over a real socket.
 
 use serde_json::{Value, json};
 use std::io::Write as _;
@@ -34,32 +28,6 @@ fn seed(server: &crate::harness::RunningServer, n: usize) {
 }
 
 /// **Beyond the concurrency limit, requests are shed with `503` — not queued** (nidus-abx.2).
-///
-/// `CLIENTS` threads issue `REQUESTS_PER_CLIENT` searches each against
-/// `--max-concurrent-requests 1`. With that many requests in flight and one permit,
-/// shedding is a structural certainty rather than a race the test hopes to win.
-///
-/// ## Two things this test does deliberately, both learned the hard way
-///
-/// **Each thread gets its own `ureq::Agent`**, rather than sharing the harness's. Sixteen
-/// threads hammering one connection pool is a *client* configuration no real deployment
-/// has, and it was the shape that failed on CI: the shared pool's connections churn under
-/// contention and a thread eventually picks up one the far side has already closed
-/// ("Peer disconnected"). Independent agents model independent callers, which is what the
-/// server is actually being tested against.
-///
-/// **Transport errors are counted, not fatal.** The harness's `post` panics on any socket
-/// error, which is right for a functional assertion and wrong here: on a shared two-core
-/// runner, loopback sockets under sustained concurrency occasionally fault for reasons that
-/// say nothing about admission control. They are reported in the failure message so a real
-/// regression (everything failing at the transport) is still visible — what would hide a
-/// regression is silence, not tolerance. Every assertion that matters is unchanged.
-///
-/// Note what is NOT relaxed: statuses other than 200/503 still fail, every 503 must be
-/// marked retryable, and the server's own shed counter must corroborate what clients saw.
-///
-/// The one timing assertion is order-of-magnitude and generous, per CLAUDE.md — this is a
-/// debug build on a shared runner.
 #[test]
 fn concurrent_load_beyond_the_limit_is_shed_not_queued() {
     const CLIENTS: usize = 16;
@@ -191,23 +159,6 @@ fn concurrent_load_beyond_the_limit_is_shed_not_queued() {
 
 /// **A client that withholds its request body must not pin a concurrency permit**
 /// (nidus-6c2).
-///
-/// The store permit used to be taken before the handler ran, and the handler is what
-/// awaits the body — so a client that sent complete headers with a `Content-Length` and
-/// then went silent held a permit for the whole request deadline, or forever with
-/// `--read-timeout 0`. Against `--max-concurrent-requests 1` that was a one-connection
-/// denial of service.
-///
-/// The body is now received in its own phase, before any store permit is taken, so the
-/// assertion is the strong one: with a silent client parked on the connection, ordinary
-/// traffic keeps being served *throughout* — not "recovers eventually".
-///
-/// Driven over a raw socket, because no HTTP client will send headers promising a body and
-/// then refuse to send it — that is precisely the misbehaviour under test.
-///
-/// `--read-timeout 0` and `--body-idle-timeout 0` are both set deliberately: they remove
-/// every deadline that could paper over the problem by eventually releasing the permit, so
-/// this passes only if the phase split is doing the work on its own.
 #[test]
 fn a_withheld_request_body_does_not_pin_a_permit() {
     let dir = tempfile::tempdir().unwrap();
@@ -255,10 +206,6 @@ fn a_withheld_request_body_does_not_pin_a_permit() {
 
 /// Both timeout flags and the concurrency flag reach `ServeConfig` — the wiring the
 /// in-process suites cannot see, because they construct `AppState` directly.
-///
-/// `--read-timeout 1` with `--max-concurrent-requests` left at auto: an ordinary search is
-/// milliseconds, so the deadline must NOT fire. A flag that silently aborted healthy
-/// traffic would be worse than no flag.
 #[test]
 fn timeout_flags_are_wired_and_do_not_fire_on_healthy_traffic() {
     let dir = tempfile::tempdir().unwrap();
@@ -274,10 +221,6 @@ fn timeout_flags_are_wired_and_do_not_fire_on_healthy_traffic() {
 }
 
 /// `--max-concurrent-requests 0` is the documented "auto" value, not "admit nothing".
-///
-/// Worth its own test because the failure mode is total: reading `0` as a literal cap would
-/// make every configured-to-default server shed every request, while still passing every
-/// unit test that constructs `Limits` directly.
 #[test]
 fn zero_concurrency_means_auto_not_zero() {
     let dir = tempfile::tempdir().unwrap();
@@ -367,11 +310,6 @@ fn request_ids_round_trip_into_the_access_log() {
 }
 
 /// `NIDUS_LOG` turns detail down, in the process that reads it.
-///
-/// At `error`, the per-request access lines must disappear while the startup banner (a
-/// plain `println`, not a log record) stays — that split is what lets a test suite or a
-/// noisy production deployment silence traffic logging without losing the line that
-/// reports the bound port.
 #[test]
 fn nidus_log_filters_the_access_log() {
     let dir = tempfile::tempdir().unwrap();
@@ -397,11 +335,6 @@ fn nidus_log_filters_the_access_log() {
 }
 
 /// A loopback bind must NOT print an exposure warning (nidus-abx.6).
-///
-/// The complementary case — that a non-loopback bind *does* warn — is
-/// `server::tests::exposure_is_classified_by_reachability_then_auth`, unit-tested on the
-/// classification rather than here: binding `0.0.0.0` from a test would open a real
-/// off-box socket on whatever machine runs it, which is not a thing a test suite should do.
 #[test]
 fn a_loopback_bind_prints_no_security_warning() {
     let dir = tempfile::tempdir().unwrap();

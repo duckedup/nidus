@@ -1,26 +1,4 @@
 //! Pluggable storage & memory backends (SPEC.md §13).
-//!
-//! nidus generalizes "a local directory, vectors in local RAM" along **two
-//! independent, composable axes**, each behind a small **sync, `dyn`-safe** trait:
-//!
-//! - [`Persistence`] — where the durable *source-of-truth* bytes (`data`/`log`) and
-//!   the derived caches (`ann`/`fts`) live. [`LocalFs`] (default), plus [`S3`] and
-//!   [`Gcs`] object stores. Object-granular: whole-object get/put/delete/list, plus an
-//!   **optional** native [`Appender`] capability (local files have it; object stores
-//!   return `None` and rewrite whole objects) and a best-effort [`try_lock`].
-//! - [`MemoryTier`] — where the in-RAM working set is held so it can be *shared* and
-//!   *reloaded without a rebuild*. [`LocalRam`] (default — the process heap) and a
-//!   [`RedisTier`] over the RESP family (Redis/Valkey/KeyDB/DragonflyDB).
-//!
-//! Both are **sync deliberately** (SPEC §13.4): search is CPU-over-RAM and never
-//! touches a backend, every backend *can* be sync, and a sync trait is `dyn`-safe out
-//! of the box — genuine runtime plug-and-play. Selection is by **URL scheme**
-//! ([`open_persistence`] / [`open_memory_tier`]).
-//!
-//! The live store runs over these traits: its `data`/`log` segments are
-//! [`Appender`]s the [`Persistence`] backend hands out, and its `ann`/`fts` caches and
-//! writer lock go through `get`/`put`/`try_lock`. Routing snapshot/backup through
-//! [`Persistence`] lands alongside the remote backends, where it first becomes meaningful.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,9 +34,6 @@ pub use s3::S3;
 /// Where the durable bytes live: whole **named byte objects** in two classes —
 /// source-of-truth (`data`/`log`, never reconstructable) and derived caches
 /// (`ann`/`fts`, droppable). The common denominator of local files / S3 / GCS.
-///
-/// `key` is a single flat object name (e.g. `"data"`, `"ann"`); it must not contain
-/// path separators or `..` (implementations reject those).
 pub trait Persistence: Send + Sync {
     /// Fetch a whole object. `Ok(None)` when it does not exist (not an error).
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
@@ -73,27 +48,17 @@ pub trait Persistence: Send + Sync {
     /// List the object keys present.
     fn list(&self) -> Result<Vec<String>>;
 
-    /// A native append handle for `key`, if this backend supports in-place appends
-    /// (local files do — the `data`/`log` discipline of §6). Object stores return
-    /// `Ok(None)`; their callers rewrite whole objects via [`put`](Self::put)
-    /// instead. `Err` is a real IO failure opening the handle.
+    /// A native append handle for `key`, if this backend supports in-place appends (local files do
+    /// — the `data`/`log` discipline of §6). Object stores return `Ok(None)`; their callers rewrite
+    /// whole objects via [`put`](Self::put) instead. `Err` is a real IO failure opening the handle.
     fn appender(&self, key: &str) -> Result<Option<Box<dyn Appender>>> {
         let _ = key;
         Ok(None)
     }
 
-    /// Atomically create object `key` with `bytes` **only if it does not already
-    /// exist** — the create-if-absent primitive a race-free object writer lock needs
-    /// (S3 `If-None-Match: *`, GCS `ifGenerationMatch=0`). Returns `Ok(Some(true))`
-    /// when this call created it, `Ok(Some(false))` when it already existed (lost the
-    /// race — **not** an error), and `Ok(None)` when the backend offers no atomic
-    /// create-if-absent (the object-lock caller then falls back to the best-effort
-    /// advisory put). `Err` is a real IO failure.
-    ///
-    /// This is the `expected: None` case of [`put_cas`](Self::put_cas) — the default impl
-    /// delegates there, so a backend gets create-if-absent for free once it implements
-    /// `put_cas`. (Kept as its own method because the writer-lock paths read more clearly
-    /// in create-if-absent terms.)
+    /// Atomically create `key` only if absent — the primitive a race-free object writer lock
+    /// needs. `Some(true)` = this call created it, `Some(false)` = it existed (lost the race, not
+    /// an error), `None` = the backend has no atomic create-if-absent. `Err` is real IO failure.
     fn try_create_exclusive(&self, key: &str, bytes: &[u8]) -> Result<Option<bool>> {
         match self.put_cas(key, bytes, None)? {
             CasOutcome::Written(_) => Ok(Some(true)),
@@ -104,81 +69,46 @@ pub trait Persistence: Send + Sync {
 
     /// Read an object together with an opaque **CAS token** (an S3 `ETag` / GCS generation)
     /// identifying its current version, for a later conditional [`put_cas`](Self::put_cas).
-    /// `Ok(None)` when the object is absent. The token is `None` when the backend supports no
-    /// compare-and-swap — the default impl returns [`get`](Self::get)'s bytes with no token,
-    /// so a caller that finds `None` knows to fall back to a plain [`put`](Self::put).
     fn get_cas(&self, key: &str) -> Result<Option<(Vec<u8>, Option<String>)>> {
         Ok(self.get(key)?.map(|bytes| (bytes, None)))
     }
 
-    /// Atomically write `bytes` to `key` **only if** its current CAS token equals
-    /// `expected` (`Some(token)`), or **only if it does not exist** (`None`) — the
-    /// compare-and-swap that fences a superseded cluster writer (SPEC §14.6): a stale
-    /// writer's token no longer matches, so its write is refused rather than clobbering a
-    /// peer's committed state (S3 `If-Match`/`If-None-Match`, GCS `ifGenerationMatch`). See
-    /// [`CasOutcome`]. Default: [`Unsupported`](CasOutcome::Unsupported) — the caller falls
-    /// back to a plain [`put`](Self::put).
+    /// Write `bytes` to `key` only if its CAS token equals `expected`, or only if absent when
+    /// `None` — the compare-and-swap that fences a superseded cluster writer (SPEC §14.6). See
+    /// [`CasOutcome`]; the default is `Unsupported`, and the caller falls back to a plain `put`.
     fn put_cas(&self, key: &str, bytes: &[u8], expected: Option<&str>) -> Result<CasOutcome> {
         let _ = (key, bytes, expected);
         Ok(CasOutcome::Unsupported)
     }
 
     /// Best-effort exclusive lock on `key` (the writer-exclusion primitive, §6.3).
-    /// `Ok(Some(guard))` on success — the lock releases when the guard drops;
-    /// `Ok(None)` when another holder has it (contention is **not** an error);
-    /// `Err` only on a real IO failure. `ttl` reclaims a lock older than it (a
-    /// crashed holder).
     fn try_lock(&self, key: &str, ttl: Duration) -> Result<Option<Box<dyn BackendLock>>>;
 
-    /// The filesystem path of object `key`, when this backend stores it as a plain local
-    /// file that can be memory-mapped (SPEC §9 / §14.6 phase 3). `None` for object-store and
-    /// in-RAM backends — those cannot be mapped, so a caller with `Config::mmap` falls back to
-    /// loading the segment into RAM. The default is `None`; [`LocalFs`] overrides it.
+    /// The filesystem path of `key` when this backend stores it as a mappable local file (SPEC §9
+    /// / §14.6 phase 3). `None` for object-store and in-RAM backends, so a caller with
+    /// `Config::mmap` falls back to loading into RAM. [`LocalFs`] overrides the `None` default.
     fn local_path(&self, key: &str) -> Option<PathBuf> {
         let _ = key;
         None
     }
 
-    /// Whether [`try_lock`](Self::try_lock) provides a real exclusive lock (local
-    /// `O_EXCL`). Whole-object stores return `false`: a live object-backed store goes
-    /// through the [`object_try_lock`] path instead — race-free where the backend
-    /// implements [`try_create_exclusive`](Self::try_create_exclusive) (S3/GCS),
-    /// advisory otherwise. Default `true`.
+    /// Whether [`try_lock`](Self::try_lock) is a real exclusive lock (local `O_EXCL`). Whole-object
+    /// stores return `false` and go through the object-lock path instead — race-free where the
+    /// backend implements `try_create_exclusive`, advisory otherwise. Default `true`.
     fn has_native_lock(&self) -> bool {
         true
     }
 
     /// Whether this backend implements a real compare-and-swap
     /// ([`put_cas`](Self::put_cas) / [`get_cas`](Self::get_cas)).
-    ///
-    /// **Cluster mode requires this** and refuses a backend without it (SPEC §14.6).
-    /// Without CAS the writer lease degrades to advisory: two instances can both believe
-    /// they hold it, and the mid-batch fence — which is a *conditional* write or nothing —
-    /// simply does not exist, so a stale writer can clobber a peer's committed bytes.
-    /// Tolerable for a single-node advisory lock; not for the mode whose entire safety
-    /// argument is the conditional write.
-    ///
-    /// Deliberately separate from [`has_native_lock`](Self::has_native_lock), which asks a
-    /// different question and would give the wrong answer here: GCS reports `false` there
-    /// (it has no `O_EXCL`) yet fully supports CAS via `ifGenerationMatch`, so gating on
-    /// the lock capability would reject a perfectly good cluster backend.
-    ///
-    /// Default `false` — a backend must opt in by implementing `put_cas`.
     fn supports_cas(&self) -> bool {
         false
     }
 }
 
-/// A durable, append-shaped byte stream — the native local-FS capability that the
-/// `data`/`log` segments need (§5–§6): random-access read (to load/replay on open),
-/// append with per-write rollback, truncate to a byte boundary, fsync, and atomic
-/// whole-file rewrite (compaction). Object-store backends do not provide this (see
-/// [`Persistence::appender`]).
-///
-/// `Send + Sync` because a [`Store`](crate::Nidus) holding an appender is shared as
-/// `Arc<RwLock<Nidus>>`: searchers take `&self` and never touch the appender (it is a
-/// `&mut self`-only, write-path resource), so sharing `&dyn Appender` across threads is
-/// sound — both concrete impls (a `File`, an in-RAM `Vec<u8>`) are themselves `Sync`.
+/// A durable, append-shaped byte stream — the native local-FS capability `data`/`log` need
+/// (§5–§6): random-access read, append with per-write rollback, truncate to a boundary, fsync, and
+/// atomic whole-file rewrite. Object-store backends do not provide this.
 pub trait Appender: Send + Sync {
     /// The current committed length in bytes — the append point.
     fn len(&self) -> Result<u64>;
@@ -188,10 +118,9 @@ pub trait Appender: Send + Sync {
         Ok(self.len()? == 0)
     }
 
-    /// Read exactly `buf.len()` bytes starting at byte `offset` into `buf`. Errors if
-    /// fewer than that many bytes remain. The load/replay primitive — lets a caller
-    /// stream a large segment in bounded chunks (no whole-object materialization, so
-    /// `data` keeps its low transient open-time footprint).
+    /// Read exactly `buf.len()` bytes from `offset`, erroring if fewer remain. The load/replay
+    /// primitive: a caller streams a large segment in bounded chunks, so `data` keeps its low
+    /// transient open-time footprint.
     fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()>;
 
     /// Append `bytes`. **Atomic:** on a partial write (e.g. ENOSPC) the stream is
@@ -225,10 +154,9 @@ pub trait Appender: Send + Sync {
 
 /// The outcome of a compare-and-swap object write ([`Persistence::put_cas`]).
 pub enum CasOutcome {
-    /// The write committed. Carries the object's **new** CAS token when the backend reports
-    /// one (S3 returns it as the response `ETag`); `None` when the backend has no cheap way
-    /// to report it, in which case the caller re-reads via [`Persistence::get_cas`] to learn
-    /// the new token before its next conditional write.
+    /// The write committed, carrying the object's new CAS token when the backend reports one.
+    /// `None` when it has no cheap way to, in which case the caller re-reads via
+    /// [`Persistence::get_cas`] before its next conditional write.
     Written(Option<String>),
     /// The precondition failed: the object's current token differs from `expected` (a
     /// concurrent writer changed it since), or — for `expected: None` — the object already
@@ -239,16 +167,14 @@ pub enum CasOutcome {
     Unsupported,
 }
 
-/// A held backend lock, released on drop (RAII). Returned by
-/// [`Persistence::try_lock`]; the concrete guard owns whatever the backend needs to
-/// release (a lock file, a conditional-PUT marker, …). `Send + Sync` for the same
-/// reason as [`Appender`] — a held lock lives inside the shared [`Store`](crate::Nidus).
+/// A held backend lock, released on drop. The concrete guard owns whatever the backend needs to
+/// release — a lock file, a conditional-PUT marker. `Send + Sync` for the same reason as
+/// [`Appender`]: a held lock lives inside the shared [`Store`](crate::Nidus).
 pub trait BackendLock: Send + Sync {}
 
-/// Where the in-RAM working set is held so it can be **shared across processes** and
-/// **reloaded without a rebuild** (SPEC §13.3). A rebuildable cache of the serialized
-/// working state — model (a): an empty or evicted tier is never fatal (the
-/// persistence tier is the truth). [`LocalRam`] is the trivial impl.
+/// Where the in-RAM working set is held so it can be shared across processes and reloaded without
+/// a rebuild (SPEC §13.3). A rebuildable cache: an empty or evicted tier is never fatal, since the
+/// persistence tier is the truth. [`LocalRam`] is the trivial impl.
 pub trait MemoryTier: Send + Sync {
     /// Pull the shared working-set blob for `key`. `Ok(None)` when absent/evicted.
     fn load(&self, key: &str) -> Result<Option<Vec<u8>>>;
@@ -269,22 +195,9 @@ impl<T: MemoryTier + ?Sized> MemoryTier for Arc<T> {
     }
 }
 
-/// The append handle for segment/`log` object `key`: the backend's native [`Appender`]
-/// when it has one (local files — the `data`/`log` discipline of §6), else an
-/// [`ObjectAppender`] (an in-RAM buffer rewritten as a whole object on sync) over the
-/// shared backend handle (object stores). Shared by [`Store`](crate::Nidus)'s `data`/`log`
-/// wiring and the [`Segments`](crate::data::Segments) aggregator so every durable byte
-/// stream is opened identically.
-///
-/// Note: the object-store path loads the whole object into RAM here, *before* a caller's
-/// `max_vector_bytes` check (§6.6) can run. So for object stores that "refuse before
-/// allocating" guard relaxes to "refuse after one full copy is resident" — inherent to a
-/// whole-object backend, and acceptable at nidus's dev/small-scale positioning.
-/// `cas` selects the [`ObjectAppender`] commit discipline for an object-store segment:
-/// `false` (the default) rewrites the whole object on every sync; `true` (cluster mode,
-/// SPEC §14.6) makes each sync a **compare-and-swap** so a superseded writer's whole-object
-/// rewrite is fenced rather than clobbering a peer's committed bytes. Native local-FS
-/// appenders ignore it (cluster mode requires an object store, never a local file).
+/// The append handle for segment/`log` object `key`: the backend's native [`Appender`] for local
+/// files, else an `ObjectAppender` (an in-RAM buffer rewritten whole on sync). Shared by the
+/// `data`/`log` wiring and [`Segments`](crate::data::Segments) so every stream opens identically.
 pub(crate) fn appender_for(
     persistence: &Arc<dyn Persistence>,
     key: &str,
@@ -314,11 +227,6 @@ pub(crate) fn validate_key(key: &str) -> Result<()> {
 }
 
 /// Open a **persistence** backend from a URL/location string (SPEC §13.4):
-///
-/// - `file://<path>` or a bare `<path>` → [`LocalFs`] rooted at that directory.
-/// - `s3://…` / `gs://…` (`gcs://…`) → a clear "not yet" error (planned, Phase 3).
-///
-/// The directory is created if absent.
 pub fn open_persistence(location: &str) -> Result<Box<dyn Persistence>> {
     if let Some(rest) = strip_scheme(location, "s3") {
         return Ok(Box::new(S3::from_url(rest)?));
@@ -332,12 +240,6 @@ pub fn open_persistence(location: &str) -> Result<Box<dyn Persistence>> {
 }
 
 /// Open a **memory tier** backend from a URL/location string (SPEC §13.3):
-///
-/// - empty, `local`, or `ram` → [`LocalRam`] (the process heap; nothing shared).
-/// - `redis://…` / `rediss://…` (TLS), and the RESP-compatible aliases `valkey://…`,
-///   `valkeys://…`, `keydb://…`, `dragonfly://…` → a shared [`RedisTier`].
-///
-/// An unrecognized scheme is rejected with a clear error rather than a silent fallback.
 pub fn open_memory_tier(location: &str) -> Result<Box<dyn MemoryTier>> {
     match location {
         "" | "local" | "ram" => return Ok(Box::new(LocalRam::new())),
@@ -359,11 +261,9 @@ pub fn open_memory_tier(location: &str) -> Result<Box<dyn MemoryTier>> {
 pub(crate) const REDIS_SCHEMES: [&str; 6] =
     ["redis", "rediss", "valkey", "valkeys", "keydb", "dragonfly"];
 
-/// Open the persistence backend holding a single named **object** addressed by
-/// `location` — splitting it into a backend root and an object key at the last `/`
-/// (a bare name, no `/`, roots at the current directory). Used for snapshots, whose
-/// destination/source is one archive object on any backend: `./snap.tar.gz`,
-/// `file:///backups/snap.tar.gz`, or (once it lands) `s3://bucket/snap.tar.gz`.
+/// Open the persistence backend holding the single object at `location`, split into a backend root
+/// and an object key at the last `/` (a bare name roots at the current directory). For snapshots,
+/// whose source/destination is one archive object on any backend.
 pub fn open_object_location(location: &str) -> Result<(Box<dyn Persistence>, String)> {
     let (root, key) = split_object_location(location)?;
     Ok((open_persistence(root)?, key.to_string()))

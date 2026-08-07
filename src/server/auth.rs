@@ -1,10 +1,4 @@
 //! Bearer-token authentication for `nidus serve` (nidus-abx.5).
-//!
-//! Two things live here, together on purpose: the token *type*, which knows how to compare
-//! itself, and the middleware, which is its only caller. Keeping the comparison inside a
-//! newtype rather than exposing the secret as a `String` is what stops a future second call
-//! site from reintroducing `presented == expected` — the plain comparison is no longer
-//! reachable, because `Token` has no accessor that hands the bytes back.
 
 use axum::{
     Json,
@@ -18,16 +12,6 @@ use serde_json::json;
 use super::AppState;
 
 /// The configured bearer token, comparable only in constant time.
-///
-/// `str` equality short-circuits on the first differing byte, so its running time varies
-/// with how many leading bytes of a guess were right — a textbook timing oracle on a
-/// secret. The practical severity is low (lifting that signal out of network jitter, over
-/// a handful of bytes, takes an enormous number of samples, and an attacker who can do it
-/// has easier options), but it is unambiguously the wrong primitive for a secret and the
-/// fix is ten lines, so the trade is trivially favourable.
-///
-/// **Dependency-free by choice.** `subtle` is the usual answer and is tiny, but so is this;
-/// the same reasoning keeps `crc.rs` hand-rolled.
 #[derive(Clone)]
 pub(super) struct Token(std::sync::Arc<str>);
 
@@ -38,23 +22,15 @@ impl Token {
 
     /// Whether `presented` is the configured token, in time independent of how many
     /// leading bytes match.
-    ///
-    /// The length check is deliberate and comes first. Comparing different-length inputs
-    /// leaks the length whatever you do — a fixed-time loop over the longer of the two
-    /// still runs longer — so there is nothing to be gained by hiding it, and folding
-    /// unequal lengths into the loop only invites an indexing bug. Leaking the token's
-    /// *length* is acceptable; leaking a *prefix match* is not, and that is what the fold
-    /// below prevents.
     pub(super) fn verify(&self, presented: &str) -> bool {
         let expected = self.0.as_bytes();
         let presented = presented.as_bytes();
         if expected.len() != presented.len() {
             return false;
         }
-        // Fold every byte pair into one accumulator and test it once at the end, so the
-        // work done — and every branch taken — is the same whether the first byte differs
-        // or none of them do. `black_box` keeps a future optimiser from noticing that the
-        // accumulator can be abandoned as soon as it is nonzero.
+        // Fold every byte pair into one accumulator and test it once at the end, so the work and
+        // every branch taken are identical whether the first byte differs or none do. `black_box`
+        // stops a future optimiser abandoning the accumulator as soon as it is nonzero.
         let mut diff: u8 = 0;
         for (a, b) in expected.iter().zip(presented) {
             diff |= a ^ b;
@@ -64,13 +40,6 @@ impl Token {
 }
 
 /// Paths that answer without a credential.
-///
-/// `/health` and `/ready` because an orchestrator would read a `401` as "not ready" and
-/// never route to a perfectly healthy instance. `/metrics` for the same reason — a scraper
-/// that gets a `401` reports the target as down — and because the endpoint is deliberately
-/// label-free of collection names, so what it exposes is traffic shape, not data. That is
-/// a real disclosure and it is documented as one: put `/metrics` on a scrape-only path,
-/// alongside the TLS stance in the deployment guide.
 pub(super) fn is_public(path: &str) -> bool {
     matches!(path, "/health" | "/ready" | "/metrics")
 }

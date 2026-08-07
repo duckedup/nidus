@@ -1,18 +1,5 @@
 //! Hierarchical Navigable Small World graph (Malkov & Yashunin, 2016), the default
 //! ANN index. Pure safe Rust, no dependencies.
-//!
-//! Internal node ids are dense (`0..nodes`), assigned in build/insert order; `rows`
-//! maps each node id back to its physical `data` row. Adjacency is `links[node][level]`
-//! of neighbour node ids, with `links[node].len()` being that node's top level + 1.
-//! Higher layers are progressively sparser; layer 0 holds every node. A query greedily
-//! descends from the entry point through the upper layers, then runs an `ef`-width beam
-//! search at layer 0; the best candidates (mapped back to rows) are returned for the
-//! store to filter and rerank.
-//!
-//! Everything scores through the [`Walk`] where **higher = nearer**, so the beam is a
-//! "keep the highest scores" collector and "closer" means "higher score". The walk is
-//! exact f32 by default, or quantized int8/binary codes when the store combines ANN with
-//! quantization (nidus-ndu) — build and search then run in that same quantized space.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -317,10 +304,9 @@ impl HnswGraph {
         out
     }
 
-    /// The HNSW neighbour-selection heuristic: walk candidates nearest-first and keep
-    /// one only if it is nearer to the base than to any already-kept neighbour. This
-    /// spreads links across directions (better navigability) instead of clustering them
-    /// all toward the single nearest region.
+    /// The HNSW neighbour-selection heuristic: walk candidates nearest-first, keeping one only if it
+    /// is nearer to the base than to any already-kept neighbour. This spreads links across directions
+    /// rather than clustering them toward the single nearest region.
     fn select_neighbors(&self, walk: &Walk, candidates: &[Scored], m: usize) -> Vec<u32> {
         select_neighbors(&self.rows, walk, candidates, m)
     }
@@ -393,13 +379,9 @@ impl HnswGraph {
             .collect()
     }
 
-    /// Build the graph across `workers` threads. Node levels are assigned serially
-    /// (deterministic, cheap), then the expensive per-node neighbour search + linking
-    /// runs concurrently: adjacency is guarded by one `Mutex` per node and the entry
-    /// point by an `RwLock`. Edges always lock the two endpoints in node-id order, so
-    /// there is no deadlock; safe Rust rules out data races, so the only effect of
-    /// concurrency is that the graph (and thus exact recall) varies slightly with the
-    /// thread count — determinism holds only on the serial path.
+    /// Build the graph across `workers` threads: levels assigned serially, then neighbour search and
+    /// linking run concurrently under one `Mutex` per node, locking endpoints in node-id order so
+    /// nothing deadlocks. The graph varies with thread count, so determinism needs the serial path.
     fn build_parallel(&mut self, walk: &Walk, live_rows: &[u64], workers: usize) {
         let n = live_rows.len();
         self.rows = live_rows.to_vec();
@@ -445,10 +427,9 @@ impl HnswGraph {
 /// serial path is used instead (also the case for incremental upserts).
 const PARALLEL_BUILD_MIN: usize = 1024;
 
-/// The HNSW neighbour-selection heuristic (free function so the serial method and the
-/// parallel builder share one implementation). Walks candidates nearest-first, keeping
-/// one only if it is nearer to the base than to any already-kept neighbour; tops up
-/// with the nearest remaining if the heuristic underfills `m`.
+/// The HNSW neighbour-selection heuristic, a free function so the serial method and the parallel
+/// builder share one implementation. Keeps a candidate only if it is nearer to the base than to any
+/// already-kept neighbour, topping up with the nearest remaining if that underfills `m`.
 fn select_neighbors(rows: &[u64], walk: &Walk, candidates: &[Scored], m: usize) -> Vec<u32> {
     let mut selected: Vec<u32> = Vec::with_capacity(m);
     for cand in candidates {

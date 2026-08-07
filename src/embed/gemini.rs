@@ -1,14 +1,4 @@
 //! Google Gemini embedding adapter (`text-embedding-004` default).
-//!
-//! Bespoke wire shape (Generative Language API), authenticated with the
-//! `x-goog-api-key` header:
-//! - single: `POST /v1beta/models/{model}:embedContent` →
-//!   `{embedding:{values:[..]}}`
-//! - batch:  `POST /v1beta/models/{model}:batchEmbedContents` with
-//!   `{requests:[..]}` → `{embeddings:[{values:[..]}]}`
-//!
-//! `taskType` is `RETRIEVAL_DOCUMENT` for documents, `RETRIEVAL_QUERY` for
-//! queries.
 
 use serde::Deserialize;
 
@@ -23,8 +13,6 @@ const TASK_QUERY: &str = "RETRIEVAL_QUERY";
 
 /// Default output dimension per model. The legacy `text-embedding-004` /
 /// `embedding-001` emit 768; the GA `gemini-embedding-001` defaults to 3072.
-/// (gemini-embedding-001 supports MRL truncation via `output_dimensionality`,
-/// which we do not set, so it returns its 3072 default.)
 fn dimension_for_model(model: &str) -> usize {
     match model {
         "text-embedding-004" | "embedding-001" => 768,

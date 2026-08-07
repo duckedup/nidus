@@ -1,9 +1,4 @@
 //! OpenAI-compatible chat-completions summarizer adapter.
-//!
-//! Sends the assembled prompt to `POST /v1/chat/completions` with a bearer
-//! token and parses `choices[0].message.content`. The `base_url` override makes
-//! the same adapter serve Azure OpenAI, LiteLLM, vLLM, and Ollama's `/v1`
-//! surface. Transient failures (429/5xx) are retried via [`crate::http`].
 
 use serde::Deserialize;
 

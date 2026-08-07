@@ -1,51 +1,4 @@
 //! Backpressure: a concurrency cap, load shedding, and per-request timeouts (nidus-abx.2).
-//!
-//! Before this the entire middleware stack was a body limit and auth — which bounds how
-//! big **one** request can be, and nothing about how **many** or how **long**. Both gaps
-//! are reachable from ordinary client behaviour rather than malice:
-//!
-//! * Every accepted request that needs the store queues on one `RwLock`. In-flight bodies
-//!   accumulate in RAM on a store whose whole design is "the working set is in RAM", so
-//!   the queue competes for memory with the data, and there was no point at which the
-//!   server said *too much* — it simply degraded until the allocator or the OOM killer
-//!   intervened. Note the library defends its own allocations with `try_reserve`
-//!   (SPEC §6.6); unbounded request queueing above it bypassed that guard entirely.
-//! * A long write takes the exclusive guard for the whole batch, so readers queued behind
-//!   it indefinitely rather than failing fast. From a client's perspective the server hung.
-//!
-//! ## Why hand-rolled rather than tower's layers
-//!
-//! `tower` is already a dependency and ships `ConcurrencyLimitLayer` / `LoadShedLayer` /
-//! `TimeoutLayer`, so the obvious move is to compose those. Three things decided against it:
-//!
-//! 1. **Probes must never be shed.** `/health`, `/ready` and `/metrics` have to answer while
-//!    the instance is saturated — that is exactly when someone is looking. A tower layer
-//!    wrapping the router sheds everything uniformly, so a load spike would fail liveness
-//!    and get a busy-but-healthy instance *restarted*: the same availability trap
-//!    nidus-abx.1 and .3 just closed, reopened one layer up. Exempting paths needs a filter
-//!    on the request, which is what this middleware is.
-//! 2. **`ConcurrencyLimitLayer`'s permit pool is per-clone**, and axum clones the router per
-//!    connection, so the honest composition is `GlobalConcurrencyLimitLayer` — at which
-//!    point the shared `Semaphore` here is the same object with less indirection.
-//! 3. **The response is the product.** A shed request should carry `Retry-After` and a JSON
-//!    body the SDKs already know how to read; tower's layers surface `Overloaded`/`Elapsed`
-//!    as errors that `HandleErrorLayer` must downcast and re-dress. Same result, more
-//!    moving parts.
-//!
-//! ## A deadline frees the CPU too, not just the client
-//!
-//! Dropping the response future returns a `504` to the caller but cannot stop the work:
-//! the search is on a `spawn_blocking` task, and blocking tasks are not cancellable. So the
-//! deadline arm also **signals the scan to stop**, through the cooperative token in
-//! [`crate::cancel`] — the scan kernels check it every a few thousand rows and bail. Under
-//! load, finishing a scan nobody is waiting for is the worst possible use of a core.
-//!
-//! It is cooperative, so it is prompt rather than instant: work already inside a chunk
-//! finishes. That is the right trade — a per-row check would tax every query to help the
-//! rare abandoned one.
-//!
-//! **No per-IP rate limiting.** That belongs at the proxy that already terminates TLS in
-//! front of nidus (see the deployment guide); duplicating it here would be the wrong layer.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -84,11 +37,6 @@ pub(super) struct Limits {
     body_idle_timeout: Option<Duration>,
     /// Permits for the **body-reception** phase, which happens before a store permit is
     /// taken. See [`backpressure`] for why the two phases are separate.
-    ///
-    /// Sized [`BODY_SLOT_FACTOR`]× the store limit rather than given its own flag: it
-    /// bounds memory, not CPU, and the two are not independent in any way an operator
-    /// would want to tune separately. A derived number that is right is better than a
-    /// knob nobody knows how to set.
     body_slots: Semaphore,
     /// Largest body this server will receive, enforced here because the body is consumed
     /// before the extractors (and therefore before `DefaultBodyLimit`) ever see it.
@@ -96,11 +44,6 @@ pub(super) struct Limits {
 }
 
 /// How many bodies may be arriving at once, as a multiple of the store-work limit.
-///
-/// Bigger than 1× on purpose: body reception is IO-bound and usually over in microseconds,
-/// so sizing it to the CPU-bound store limit would shed real traffic to protect against a
-/// phase that is not the bottleneck. Bounded at all because an unbounded count of
-/// concurrent bodies is the exact memory problem nidus-abx.2 exists to prevent.
 const BODY_SLOT_FACTOR: usize = 4;
 
 impl Limits {
@@ -133,13 +76,6 @@ impl Limits {
 }
 
 /// Resolve `--max-concurrent-requests`, where `0` means "auto".
-///
-/// Auto is `8 ×` available parallelism, floored at 64. The multiplier is not arbitrary:
-/// search is CPU-bound brute force, so admitting far more concurrent scans than cores buys
-/// no throughput and costs memory — but a cap at core count would shed on a modest burst of
-/// cheap requests (`/stats`, a small `get`) that never touch a core for long, so it is a
-/// small multiple rather than 1×. The floor keeps a one- or two-core container from shedding
-/// under trivial load, where the limit would be protecting nothing.
 pub(super) fn resolve_concurrency(configured: usize) -> usize {
     if configured > 0 {
         return configured;
@@ -149,10 +85,6 @@ pub(super) fn resolve_concurrency(configured: usize) -> usize {
 }
 
 /// Admission control + deadline, as one middleware.
-///
-/// Probes are exempt from both: they take no store lock (nidus-abx.1/.3 made sure of that),
-/// so they cost nothing to admit, and they are the one thing that must still answer when
-/// everything else is shedding.
 pub(super) async fn backpressure(
     State(st): State<AppState>,
     mut req: Request,
@@ -164,14 +96,8 @@ pub(super) async fn backpressure(
     let limits = &st.limits;
 
     // ── Phase 1: receive the body, WITHOUT a store permit (nidus-6c2) ───────────────
-    //
-    // The store permit used to be taken first, and the handler is what awaits the body —
-    // so a client that sent headers and then went silent pinned a permit for the whole
-    // request deadline, denying service to work that was ready to run. Receiving the body
-    // first means a stalled client can no longer touch the store's admission pool at all.
-    //
-    // It is still bounded, by its own larger pool: an unbounded number of bodies arriving
-    // at once is the memory problem this epic exists to prevent, just relocated.
+    // The permit used to come first, and the handler awaits the body, so a silent client pinned one
+    // for the whole deadline. Body-first keeps a stalled client off the store's pool; still bounded.
     match receive_body(limits, req).await {
         Ok(received) => req = received,
         Err(response) => return response,
@@ -225,12 +151,6 @@ pub(super) async fn backpressure(
 
 tokio::task_local! {
     /// The cancellation token for the request being handled on this task.
-    ///
-    /// A task-local rather than a request extension or a handler argument: `run_read` /
-    /// `run_write` are where the token has to be picked up, and they are called from every
-    /// handler but receive neither the `Request` nor an extractor. A task-local reaches
-    /// them without threading a parameter through a dozen signatures that have no other
-    /// reason to know about cancellation.
     pub(super) static CANCEL: crate::Cancel;
 }
 
@@ -240,10 +160,9 @@ pub(super) fn current_cancel() -> Option<crate::Cancel> {
     CANCEL.try_with(Clone::clone).ok()
 }
 
-/// `503` with `Retry-After: 1`. A shed request is **retryable**: nothing was attempted, the
-/// store is untouched, and the same request a moment later will very likely succeed. That
-/// is exactly the contract `503` carries, and it composes with the readiness signal an
-/// orchestrator already reads.
+/// `503` with `Retry-After: 1`. A shed request is **retryable**: nothing was attempted, the store
+/// is untouched, and the same request a moment later will very likely succeed. That is exactly the
+/// contract `503` carries, and it composes with the readiness signal an orchestrator already reads.
 fn overloaded(limit: usize) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -261,8 +180,6 @@ fn overloaded(limit: usize) -> Response {
 
 /// `504`, not `503`: the request *was* admitted and *is* being worked on, so an immediate
 /// retry would pile a second copy of the same work onto an instance that is already behind.
-/// The distinction matters to a client deciding whether to retry — which is why the body
-/// says so rather than leaving it to be inferred from the status.
 fn timed_out(after: Duration) -> Response {
     (
         StatusCode::GATEWAY_TIMEOUT,
@@ -280,14 +197,6 @@ fn timed_out(after: Duration) -> Response {
 
 /// Read the request body to completion under the idle timeout and the size cap, holding a
 /// body slot rather than a store permit.
-///
-/// Buffering here rather than leaving it to the extractors is what moves the wait off the
-/// store's admission pool. It costs nothing extra in memory: every body was already
-/// buffered whole by the `Json` extractor a moment later — this only moves *where*.
-///
-/// Consuming the body means `DefaultBodyLimit` never sees it, so the size cap is enforced
-/// here too. `Content-Length` is checked first when the client sent one (every real client
-/// does), which rejects an oversized upload before a single byte of it is read.
 async fn receive_body(limits: &Limits, req: Request) -> Result<Request, Response> {
     let declared = req
         .headers()
@@ -351,35 +260,6 @@ fn too_large(max: usize) -> Response {
 }
 
 /// A request body that gives up if it goes quiet (nidus-6c2).
-///
-/// ## The hole this closes
-///
-/// A permit is acquired before the handler runs, and the handler is what awaits the body.
-/// So a client that sends complete headers with a `Content-Length` and then sends nothing
-/// pins a permit — reproduced with a raw socket: against `--max-concurrent-requests 1` and
-/// `--read-timeout 0`, one silent connection sheds every other request indefinitely. It is
-/// a slow-loris, aimed at admission control rather than at memory, and it is partly
-/// self-inflicted: before the concurrency cap existed there were no permits to exhaust.
-///
-/// ## Why *idle*, not total
-///
-/// The obvious fix — one deadline on the whole body — is wrong here. A legitimate upsert
-/// can be a 256 MiB payload over a slow link, so any total bound tight enough to be useful
-/// against a silent client would abort real uploads. What actually distinguishes an attack
-/// from a slow upload is **progress**: this resets its clock on every frame, so a body that
-/// keeps arriving is never cut off however long it takes, and one that stalls dies quickly.
-/// (Same semantic as nginx's `client_body_timeout`, and for the same reason.)
-///
-/// ## What it does not do
-///
-/// The permit is still held while the body arrives, which is deliberate — that is what
-/// bounds concurrent body buffering against a store whose working set is in RAM. So this
-/// shortens the window an attacker can pin a permit for; it does not remove it. Genuine
-/// slow-client defence belongs at the proxy, alongside the rate limiting and TLS the
-/// deployment guide already puts there.
-///
-/// A stalled body surfaces as a body-read error, which axum's extractors report as `400`
-/// rather than `408`. The status is cosmetic; releasing the permit is the point.
 struct IdleTimeoutBody {
     inner: Body,
     idle: Duration,
@@ -441,12 +321,6 @@ impl http_body::Body for IdleTimeoutBody {
 }
 
 /// Whether a request mutates the store, and so gets the longer deadline.
-///
-/// Method alone is not enough: the search routes are `POST` because a query vector does not
-/// belong in a URL, so they would be misclassified as writes and inherit a deadline meant
-/// for a multi-minute upsert. Naming the read-shaped POSTs explicitly and treating every
-/// other mutating method as a write is the safe direction to be wrong in — a *new* mutating
-/// route added later defaults to the generous bound rather than being cut off mid-batch.
 fn is_mutation(method: &Method, path: &str) -> bool {
     if method == Method::GET || method == Method::HEAD {
         return false;

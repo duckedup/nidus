@@ -38,17 +38,9 @@ pub struct Cli {
     command: Command,
 }
 
-/// Store location, shared by every subcommand. For an existing store both the
-/// dimension and distance metric are read from the on-disk header, so `--dim`
-/// and `--distance` are only needed when creating a store (or to override and
-/// double-check an existing one — a mismatch is then a hard error).
-///
-/// Every flag also reads from a `NIDUS_*` environment variable (the flag still
-/// wins when both are given), so a container — e.g. the published Docker image —
-/// can be configured entirely through the environment with no command line.
-/// `Default` (an empty `dir`, every flag absent) is exactly what clap produces when
-/// no store flag is given, so tests can name only the fields they care about — see
-/// [`IngestArgs`], which does the same.
+/// Store location, shared by every subcommand. For an existing store the dimension and distance
+/// are read from the on-disk header, so `--dim`/`--distance` are only needed when creating one, or
+/// to double-check an existing one — a mismatch is then a hard error.
 #[derive(Args, Debug, Default)]
 struct StoreArgs {
     /// Store directory (created on first write). Unused — but still required — when
@@ -65,10 +57,9 @@ struct StoreArgs {
     /// Open without taking the writer lock (rejects mutations).
     #[arg(long, env = "NIDUS_READ_ONLY")]
     read_only: bool,
-    /// Opt into an approximate-nearest-neighbour index: `hnsw` or `ivf`. Omit for
-    /// exact brute-force search (the default). Unlike `--dim`/`--distance`, the ANN
-    /// choice is *not* stored in the header — pass it on every open (including
-    /// `serve`) where you want the index built/consulted.
+    /// Opt into an approximate-nearest-neighbour index: `hnsw` or `ivf`. Omit for exact brute-force
+    /// search (the default). Unlike `--dim`/`--distance`, the ANN choice is *not* stored in the
+    /// header — pass it on every open (including `serve`) where you want the index built/consulted.
     #[arg(long, env = "NIDUS_ANN")]
     ann: Option<AnnKindArg>,
     /// HNSW: max neighbours per node above layer 0. Ignored without `--ann hnsw`.
@@ -93,11 +84,9 @@ struct StoreArgs {
     /// Build PRNG seed (deterministic index). Applies to both ANN kinds. Ignored without `--ann`.
     #[arg(long, env = "NIDUS_ANN_SEED")]
     ann_seed: Option<u64>,
-    /// Where the durable bytes live (SPEC §13.2). Omit (or a path / `file://…`) for local
-    /// files under `--dir`; `s3://<bucket>[/<prefix>]` or `gs://<bucket>[/<prefix>]` for a
-    /// live object-store-backed store (whole-object rewrite on flush). With an object
-    /// store pass `--dim` — the remote header is not peeked. Credentials come from the
-    /// standard environment (AWS_*/GOOGLE_APPLICATION_CREDENTIALS).
+    /// Where the durable bytes live (SPEC §13.2). Omit for local files under `--dir`; `s3://…` or
+    /// `gs://…` for a live object-backed store. Pass `--dim` with an object store, since the remote
+    /// header is not peeked; credentials come from the standard environment.
     #[arg(long, env = "NIDUS_PERSISTENCE")]
     persistence: Option<String>,
     /// Share the in-RAM working set across processes (SPEC §13.3): a `redis://…` (or
@@ -107,9 +96,6 @@ struct StoreArgs {
     memory: Option<String>,
     /// Run as one of several cooperating instances over a *shared* store (SPEC §14.6):
     /// requires an object-store `--persistence` **and** a Redis-family `--memory` tier.
-    /// One instance holds a renewing writer lease; the others are either `--read-only`
-    /// readers that pick up each commit, or `--wait-for-lease` standbys waiting to be
-    /// promoted. Not a managed cluster — no coordinator, replication, or rebalancing.
     #[arg(long, env = "NIDUS_CLUSTER")]
     cluster: bool,
     /// Memory-map immutable segments instead of holding them in RAM — lets a store
@@ -154,14 +140,9 @@ struct StoreArgs {
     /// In `--cluster` mode this is also the writer-lease window.
     #[arg(long, value_name = "SECONDS", env = "NIDUS_LOCK_TTL")]
     lock_ttl: Option<u64>,
-    /// Wait for the writer handle instead of exiting when another instance holds it —
-    /// this instance becomes a **standby** and is promoted within roughly `--lock-ttl` of
-    /// the holder dying. Without this, a second writer exits immediately, so a supervisor
-    /// restarts it in a loop and failover takes as long as its backoff.
-    ///
-    /// Bare `--wait-for-lease` waits indefinitely (what a hot standby wants); give it a
-    /// number of seconds to give up after that long instead.
-    ///
+    /// Wait for the writer handle instead of exiting when another instance holds it: this becomes a
+    /// standby, promoted within roughly `--lock-ttl` of the holder dying. Without it a second writer
+    /// exits immediately and failover takes as long as the supervisor's backoff.
     #[arg(
         long,
         value_name = "SECONDS",
@@ -172,10 +153,6 @@ struct StoreArgs {
     wait_for_lease: Option<String>,
     /// Fail the readiness probe once a `--read-only` instance has gone this many seconds
     /// without verifying it is current. Omit for no bound (the default).
-    ///
-    /// A cluster reader only advances when something refreshes it, so without a bound a
-    /// reader whose refresher has died serves ever-older results while looking healthy.
-    /// Pair with `--refresh-interval`, or with an external `POST /refresh`.
     #[arg(long, value_name = "SECONDS", env = "NIDUS_MAX_STALENESS")]
     max_staleness: Option<u64>,
     /// Refuse to open a store whose vector matrix would exceed this many bytes — the
@@ -185,10 +162,9 @@ struct StoreArgs {
 }
 
 impl StoreArgs {
-    /// Resolve the `(dimension, distance)` to open with. An explicit flag always
-    /// wins (and is then verified against the header on open); otherwise the
-    /// value is read from an existing store's header. When neither is available
-    /// — no store yet and no `--dim` — creation cannot proceed, so we ask for it.
+    /// Resolve the `(dimension, distance)` to open with. An explicit flag wins and is verified
+    /// against the header on open; otherwise the value comes from an existing store's header. With
+    /// neither — no store and no `--dim` — creation cannot proceed.
     fn resolve(&self) -> Result<(usize, Distance)> {
         // The local-file header peek only applies to a local store; an object-store
         // location (`s3://`/`gs://`) has no peekable local `data`, so `--dim` is required.
@@ -301,10 +277,9 @@ impl StoreArgs {
         })
     }
 
-    /// Build the `Option<AnnConfig>` from the `--ann*` flags. `None` (no `--ann`)
-    /// keeps exact brute-force search; otherwise start from the kind's defaults and
-    /// override only the params the caller supplied. Param flags for the *other*
-    /// kind are accepted but inert (matching `AnnConfig`'s own ignore semantics).
+    /// Build the `Option<AnnConfig>` from the `--ann*` flags. No `--ann` keeps exact brute force;
+    /// otherwise start from the kind's defaults and override only what was supplied. Param flags for
+    /// the other kind are accepted but inert, matching `AnnConfig`'s own semantics.
     fn ann_config(&self) -> Option<AnnConfig> {
         let base = match self.ann? {
             AnnKindArg::Hnsw => AnnConfig::hnsw(),
@@ -336,14 +311,9 @@ impl StoreArgs {
     }
 }
 
-/// Embedder / summarizer configuration for the text-native memory routes
-/// (`/remember`, `/recall`) of `nidus serve`. Flattened into the `Serve`
-/// subcommand only when the `memory` feature is compiled in (the `serve`
-/// umbrella). With no `--embed-provider`, the server still starts — it just
-/// serves the raw vector endpoints, and the memory routes answer `400`.
-///
-/// `Default` (all-`None`) is used by tests and is the "no ingest configured"
-/// state.
+/// Embedder/summarizer configuration for `nidus serve`'s text-native memory routes, flattened into
+/// the `Serve` subcommand only under the `memory` feature. With no `--embed-provider` the server
+/// still starts, serving the raw vector endpoints while the memory routes answer `400`.
 #[cfg(feature = "memory")]
 #[derive(Args, Debug, Default)]
 struct IngestArgs {
@@ -499,18 +469,10 @@ enum Command {
         /// Cap on store-touching requests in flight. Past it, requests are **shed** with a
         /// retryable `503` + `Retry-After` rather than queued — the store's working set is
         /// in RAM, so an unbounded queue of in-flight bodies competes with the data itself.
-        ///
-        /// `0` (the default) means auto: 8× CPU cores, floored at 64. Search is CPU-bound
-        /// brute force, so admitting far more concurrent scans than cores buys no
-        /// throughput and costs memory. `/health`, `/ready` and `/metrics` are never shed.
         #[arg(long, default_value_t = 0, env = "NIDUS_MAX_CONCURRENT_REQUESTS")]
         max_concurrent_requests: usize,
         /// Deadline in seconds for a read request (search, list, stats). Default 30.
         /// `0` disables it.
-        ///
-        /// Frees the client *and* asks the work to stop. A scan on a blocking task cannot
-        /// be cancelled outright, so the deadline signals it cooperatively: the kernels
-        /// check every few thousand rows and bail, which is prompt rather than instant.
         #[arg(
             long,
             value_name = "SECONDS",
@@ -520,10 +482,6 @@ enum Command {
         read_timeout: u64,
         /// Deadline in seconds for a mutating request (upsert, delete, compact, flush).
         /// Default 600. `0` disables it.
-        ///
-        /// Deliberately far longer than `--read-timeout`: a large upsert legitimately runs
-        /// for minutes under one write lock, and a bound tight enough for a search would
-        /// abort it mid-batch.
         #[arg(
             long,
             value_name = "SECONDS",
@@ -533,12 +491,6 @@ enum Command {
         write_timeout: u64,
         /// Abandon a request body that goes this many seconds without delivering data.
         /// Default 15. `0` disables it.
-        ///
-        /// An **idle** bound, not a total one — the clock resets on every chunk, so a large
-        /// upload over a slow link is never cut off however long it takes. It exists because
-        /// a request holds a concurrency permit while its body arrives: without it, a client
-        /// that sends headers and then goes silent pins a permit (nidus-6c2). Setting it to
-        /// `0` removes that protection; real slow-client defence belongs at the proxy.
         #[arg(
             long,
             value_name = "SECONDS",
@@ -549,18 +501,11 @@ enum Command {
         /// Refresh this instance every N seconds so a `--read-only` reader stays current
         /// without a sidecar or cron calling `POST /refresh`. Omit to leave refreshing
         /// entirely to the caller (the default).
-        ///
-        /// A server-side interval, deliberately not a refresh on every read: that would put
-        /// a manifest fetch on the hot path of exactly the read-heavy fan-out cluster mode
-        /// exists for. Reads may be up to N seconds stale — pair with `--max-staleness` to
-        /// have readiness fail if refreshing stops working.
         #[arg(long, value_name = "SECONDS", env = "NIDUS_REFRESH_INTERVAL")]
         refresh_interval: Option<u64>,
-        /// Refuse to start unless the store is backed by *shared, non-local* backends:
-        /// object-store `--persistence` (`s3://…`/`gs://…`) **and** a Redis-family
-        /// `--memory` tier (`redis://…`). This is the contract the published Docker
-        /// image runs under — a container has no durable local disk, so a local-file or
-        /// process-RAM store would silently lose data on restart.
+        /// Refuse to start unless the store is on shared, non-local backends: an object-store
+        /// `--persistence` *and* a Redis-family `--memory` tier. The contract the published Docker
+        /// image runs under, since a container has no durable disk and would lose data on restart.
         #[arg(long, env = "NIDUS_REQUIRE_REMOTE")]
         require_remote: bool,
         /// Embedder / summarizer flags for the text-native `/remember` + `/recall`
@@ -711,10 +656,6 @@ enum Command {
         store: StoreArgs,
     },
     /// Snapshot a store into a single compressed archive (`.tar.gz`).
-    ///
-    /// Safe to run alongside a writer (e.g. `nidus serve`): it captures a
-    /// consistent, lock-free snapshot without blocking writes. Ideal for a
-    /// pre-upgrade backup or a periodic cron snapshot.
     Backup {
         /// Store directory to back up (the source when `--persistence` is omitted).
         #[arg(long, short = 'd')]
@@ -1006,9 +947,6 @@ fn open(store: &StoreArgs, mutating: bool) -> Result<Nidus> {
 }
 
 /// The `serve` flags, as one struct.
-///
-/// A plain argument list had reached eight positional parameters of mostly-`u64`, which is
-/// exactly the shape where a transposed pair compiles cleanly and misconfigures the server.
 struct ServeArgs {
     addr: String,
     token: Option<String>,
@@ -1022,9 +960,6 @@ struct ServeArgs {
 }
 
 /// Seconds from a flag to a deadline, where `0` means "no deadline".
-///
-/// `0` rather than a separate `--no-read-timeout` flag: it reads naturally, it is what an
-/// operator reaches for first, and it keeps the escape hatch on the same knob as the value.
 fn timeout_secs(secs: u64) -> Option<std::time::Duration> {
     (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }

@@ -1,63 +1,6 @@
-//! Group commit for the write path (nidus-xb9.1).
-//!
-//! ## The measurement this exists to move
-//!
-//! `just bench-write` put a number on the write ceiling: **~7.6ms of fixed cost per upsert
-//! call**, paid whether that call carries one record or a thousand — a disk barrier
-//! (`fsync` of `data`, then `log`) plus, in cluster mode, a manifest publish. It is why
-//! `batch=1` gets 125 vec/s over HTTP while `batch=1000` gets 33k from the same code path.
-//!
-//! A single `nidus serve` already has 2–8 upserts genuinely in flight at once, and the
-//! concurrency sweep plateaus at ~85k vec/s (384-d) because **every one of them pays its own
-//! barrier**. The plateau sits exactly on the in-process durable rate, so the exclusive write
-//! section is the asymptote, and merging the barriers is how that asymptote moves.
-//!
-//! ## The shape
-//!
-//! Classic WAL group commit. Writes are submitted to a queue instead of racing for the store
-//! lock. Whichever request finds no leader becomes one: it takes the store's exclusive guard
-//! **once**, applies every write queued at that moment with the barrier deferred
-//! ([`Nidus::deferred`]), then takes **one** barrier for the whole group
-//! ([`Nidus::commit`]) and only then answers all of them.
-//!
-//! ```text
-//!   without group commit          with group commit
-//!   ────────────────────          ─────────────────
-//!   append ─ fsync ─ 200          append ┐
-//!            append ─ fsync ─ 200 append ├─ fsync ─ 200 ×N
-//!                     append ─ …  append ┘
-//! ```
-//!
-//! Every existing invariant holds. The durable write order is untouched (each batch appends
-//! data before log; the barrier syncs data before log). No request is answered before its own
-//! bytes are durable — that is the entire point of splitting apply from acknowledge, and the
-//! reason [`Nidus::deferred`] documents the obligation rather than hiding it. A failed barrier
-//! fails *every* member of its group, because none of them can honestly be called durable.
-//!
-//! ## Why no window, no timer, no wait
-//!
-//! The classic mistake in a group-commit implementation is to *wait* for a group to form —
-//! which buys throughput under load by taxing every single-client write with a delay it
-//! gains nothing from. There is no timer here. The leader drains whatever is **already**
-//! queued and goes; with one client that is always a group of one, and the path is the same
-//! append-then-barrier it was before, minus a queue push. Batching only ever happens because
-//! work was genuinely waiting.
-//!
-//! ## Leadership, and why it is a flag rather than a thread
-//!
-//! A dedicated commit thread was the alternative. This is less machinery for the same
-//! behaviour: no lifecycle to own, nothing to shut down, and no thread sitting idle in a
-//! read-only instance. The election is one `bool` under the queue's mutex, and it is
-//! *elected together with the enqueue* — a write either finds a leader that is guaranteed to
-//! come back for it, or becomes the leader itself. There is no third outcome, which is what
-//! rules out the lost-wakeup this design would otherwise be prone to.
-//!
-//! One incidental win: under write load the blocking pool now holds roughly one task per
-//! *group* instead of one per request.
-//!
-//! The queue is unbounded because it is already bounded — the concurrency semaphore in
-//! [`super::limits`] caps store-touching requests in flight, and nothing can be queued here
-//! without holding one of those permits.
+//! Group commit for the write path (nidus-xb9.1): concurrent writes queue, the first to
+//! reach the store applies the whole queue under one exclusive guard, and one barrier covers
+//! them all. No timed window, so a lone write still pays exactly what it did. SPEC §6.4.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,10 +15,6 @@ use crate::Nidus;
 type Db = Arc<RwLock<Option<Nidus>>>;
 
 /// Deliver one queued write's answer, now that the group's barrier has been resolved.
-///
-/// `Some(reason)` means the barrier failed and nothing in the group is durable; `None` means
-/// it succeeded. A write that failed on its own (a dimension mismatch, say) reports its own
-/// error either way — it rolled itself back and never needed the barrier.
 type Ack = Box<dyn FnOnce(Option<&str>) + Send>;
 
 /// Apply one queued write under the leader's store guard, yielding its [`Ack`] and whether
@@ -87,18 +26,11 @@ type Apply = Box<dyn FnOnce(&mut Nidus) -> (Ack, bool) + Send>;
 pub(super) struct Committer {
     inner: Mutex<Inner>,
     /// Groups committed, and writes applied across them.
-    ///
-    /// Their ratio *is* the coalescing — `writes / groups` is the average number of requests
-    /// that shared one disk barrier, and it is the only number that shows from outside whether
-    /// group commit is doing anything on this instance. `1.0` means writes never overlap here,
-    /// which is a true and useful thing to know rather than a failure.
     groups: AtomicU64,
     writes: AtomicU64,
-    /// Writes submitted, ever. `submitted - writes` is the current backlog — reported as a
-    /// gauge, and the reason this is a monotonic counter rather than the queue's length: an
-    /// atomic can be read by a scrape without taking the queue's mutex, and it does not
-    /// evaporate the instant a leader drains the queue, which makes it something a test can
-    /// synchronise on.
+    /// Writes submitted, ever; `submitted - writes` is the current backlog. Monotonic rather than
+    /// the queue's length because an atomic reads without taking the queue's mutex, and it does not
+    /// evaporate the instant a leader drains — which makes it something a test can synchronise on.
     submitted: AtomicU64,
 }
 
@@ -137,21 +69,12 @@ impl Committer {
     }
 
     /// Writes submitted but not yet applied: the current write backlog.
-    ///
-    /// Saturating because the two counters are read separately and a write can land between
-    /// them — a momentarily negative depth would be an artefact of the read, not a state the
-    /// queue was ever in.
     pub(super) fn depth(&self) -> u64 {
         self.submitted()
             .saturating_sub(self.writes.load(Ordering::Relaxed))
     }
 
     /// The queue mutex, recovering from a poisoned lock rather than propagating.
-    ///
-    /// A panic here can only have come from `VecDeque` bookkeeping — the store work happens
-    /// well outside this critical section — and the queue's invariants do not span the lock.
-    /// Refusing every future write because one unrelated panic touched this mutex would be
-    /// the more damaging failure.
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner
             .lock()
@@ -159,9 +82,6 @@ impl Committer {
     }
 
     /// Submit `f` and wait for the barrier that makes it durable.
-    ///
-    /// Returns `f`'s own error if the write itself failed, or a barrier error if the group's
-    /// fsync did — never `Ok` for a write that is not on disk.
     pub(super) async fn submit<F, T>(
         self: &Arc<Self>,
         db: Db,
@@ -232,10 +152,9 @@ impl Committer {
 
     /// Lead: commit group after group until the queue is empty, then stand down.
     fn drive(&self, db: &Db) {
-        // Backstop for an unwind out of `commit_group` — a panicking write must not leave the
-        // queue leaderless, which would hang every write that came after it. Disarmed on the
-        // orderly exit below, where standing down happens under the same lock as the emptiness
-        // check it is based on.
+        // Backstop for an unwind out of `commit_group`: a panicking write must not leave the queue
+        // leaderless, which would hang every write behind it. Disarmed on the orderly exit below,
+        // where standing down happens under the same lock as the emptiness check behind it.
         let mut standdown = StandDown { c: Some(self) };
         loop {
             let group: Vec<Apply> = {
@@ -254,9 +173,6 @@ impl Committer {
     }
 
     /// Apply one group under a single exclusive store guard, then one barrier for all of it.
-    ///
-    /// The guard is re-taken per group rather than held across the whole `drive` loop: under a
-    /// continuous write stream, holding it would leave readers no window at all.
     fn commit_group(&self, db: &Db, group: Vec<Apply>) {
         // A poisoned store lock means a previous write panicked mid-mutation; the store's
         // invariants are unknown, so refuse rather than write into it. Dropping the jobs

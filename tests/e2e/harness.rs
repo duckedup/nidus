@@ -1,19 +1,4 @@
 //! Spawn a real `nidus serve` and talk to it over HTTP.
-//!
-//! The awkward parts of driving a child server, solved once here so the suites read as
-//! assertions rather than process plumbing:
-//!
-//! * **Which binary?** `env!("CARGO_BIN_EXE_nidus")` — cargo builds the `nidus` target
-//!   before the test runs and hands us its path, so there is no guessing at
-//!   `target/debug` and no chance of testing a stale build.
-//! * **Which port?** `--addr 127.0.0.1:0` lets the kernel pick, and the startup line
-//!   reports the bound address, so concurrent tests never collide on a fixed port.
-//! * **Is it up yet?** [`Server::start`] polls `/health` and only returns once the
-//!   server answers, so no suite needs a hopeful `sleep`.
-//! * **Diagnosing a red run.** Every line the child writes to stderr is captured; a
-//!   failed startup panics with that transcript attached instead of an opaque timeout.
-//! * **Leaks.** [`Drop`] kills and reaps the child, so a failing assertion (which
-//!   unwinds past any explicit cleanup) can't leave an orphan holding the writer lock.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -88,18 +73,11 @@ impl Server {
 
     /// Spawn the server and return as soon as it has *bound*, without waiting for the
     /// store to open.
-    ///
-    /// For a standby writer, which by design never becomes ready while the incumbent
-    /// holds the lease — [`start`](Self::start) would wait forever. The caller then drives
-    /// readiness itself with [`RunningServer::ready_within`].
     pub fn start_unready(self) -> RunningServer {
         self.spawn()
     }
 
     /// Spawn the server and wait until its store is open.
-    ///
-    /// Panics — rather than returning an error — because every caller is a test for which
-    /// a server that won't start is a failure, and the panic carries the child's stderr.
     pub fn start(self) -> RunningServer {
         let server = self.spawn();
         server.await_ready();
@@ -227,10 +205,6 @@ impl RunningServer {
     }
 
     /// `POST path` with a JSON body, as `(status, body)`.
-    ///
-    /// Serialises here and hands the bytes to [`post_bytes`](Self::post_bytes) rather
-    /// than using ureq's `send_json`, which needs a ureq feature the library does not
-    /// otherwise want — one request path, and no dependency widened for a test.
     pub fn post(&self, path: &str, body: &Value) -> (u16, Value) {
         let bytes = serde_json::to_vec(body).expect("serialise request body");
         self.post_bytes(path, &bytes)
@@ -251,10 +225,6 @@ impl RunningServer {
     }
 
     /// `POST path` with a JSON body plus caller-supplied headers.
-    ///
-    /// For the MCP suite, which carries part of its protocol in headers (`Mcp-Method`,
-    /// `Mcp-Name`). A later header of the same name wins, so a test can append a wrong
-    /// `Mcp-Name` to exercise header/body mismatch. `mcp`-gated: else it is dead code.
     #[cfg(feature = "mcp")]
     pub fn post_with_headers(
         &self,
@@ -278,9 +248,6 @@ impl RunningServer {
     /// Ask the server to shut down the way a supervisor would (SIGTERM), and wait for it
     /// to exit — the path that flushes and releases the writer lock. Returns whether it
     /// exited successfully.
-    ///
-    /// Unix-only: there is no portable SIGTERM in `std` (`Child::kill` is SIGKILL), and
-    /// shelling out to `kill` keeps the harness dependency-free.
     #[cfg(unix)]
     pub fn shutdown(mut self) -> bool {
         self.signal("TERM");
@@ -335,11 +302,6 @@ impl RunningServer {
     }
 
     /// Poll `/ready` until it answers or [`STARTUP_TIMEOUT`] elapses.
-    ///
-    /// `/ready`, not `/health`: the server binds *before* opening the store (so a standby
-    /// waiting for promotion still answers liveness probes), which means `/health` returns
-    /// `200` while there is no store yet and every data route would `503`. `/ready` is the
-    /// signal that the store is actually open — the condition these suites need.
     fn await_ready(&self) {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         let url = self.url("/ready");
@@ -408,10 +370,6 @@ fn await_addr(
 }
 
 /// Scrape `/metrics` as text.
-///
-/// Deliberately not [`RunningServer::get`]: the exposition is `text/plain`, so the JSON
-/// decode there would flatten every sample to `Value::Null`. Lives here rather than in one
-/// suite because more than one of them reads the scrape.
 pub fn scrape(server: &RunningServer) -> String {
     ureq::get(format!("{}/metrics", server.base_url()))
         .call()

@@ -1,54 +1,4 @@
 //! Traffic-level observability: `GET /metrics`, and the access log behind it (nidus-abx.4).
-//!
-//! `crate::metrics` holds the counters the *library* maintains (lease renewals, backend
-//! retries, which search path served a query). This module adds the ones only the *server*
-//! can know — request rate, latency distribution, and error rate by route — and renders
-//! both as Prometheus text.
-//!
-//! ## Bounded cardinality, by construction
-//!
-//! Every request is labelled with a route **template**, not its path, and
-//! [`route_label`] returns `&'static str` — so a collection name physically cannot reach a
-//! metric label. That is a correctness property (an unbounded label set is the classic way
-//! to take a Prometheus server down with a metrics endpoint) and a disclosure one: the
-//! scrape reveals traffic shape, never what is stored. It is what makes leaving `/metrics`
-//! unauthenticated a defensible default.
-//!
-//! Deliberately *not* `axum::extract::MatchedPath`: whether that extension is populated
-//! depends on where in the layer stack a middleware sits, and a metric that silently
-//! degrades to `other` because a layer moved is worse than one that never depended on it.
-//!
-//! ## Cheapness is a hard constraint
-//!
-//! Recording is `fetch_add(Relaxed)` on a fixed, preallocated array — no map, no
-//! allocation, and above all no lock. The store is already serialised behind one `RwLock`;
-//! an observability layer that contended with it would become the problem it exists to
-//! diagnose.
-//!
-//! ## The two in-flight gauges measure different things, on purpose (nidus-bcg)
-//!
-//! * `nidus_http_requests_in_flight` — handler futures alive, probes included. Counted by
-//!   the [`InFlight`] guard, so a client that disconnects mid-request decrements it.
-//! * `nidus_http_admitted_in_flight` — **concurrency permits held**, read straight off the
-//!   semaphore in [`super::limits`]. This is the one to correlate with
-//!   `nidus_http_requests_shed_total`: shedding happens exactly when it reaches
-//!   `nidus_http_concurrency_limit`.
-//!
-//! The permit gauge is named after the admission decision, and it reports that decision
-//! exactly. It is therefore **not** a count of work executing: when a request hits its
-//! deadline the permit is released immediately — holding it would shed live traffic on
-//! behalf of work nobody is waiting for — while the blocking task keeps running until it
-//! observes the cancellation token. For that window the gauge is low.
-//!
-//! The window is bounded by cooperative cancellation: the scan kernels check the token
-//! every few thousand rows, so it is milliseconds, not a whole scan. It is entered exactly
-//! `nidus_http_requests_timed_out_total` times — if that counter is flat, the discrepancy
-//! has never occurred on this instance, which is the measurement to make before wanting a
-//! second gauge for it.
-//!
-//! Folding orphaned work into the permit gauge was considered and rejected: the gauge
-//! would then no longer correspond to the admission decision it is named after, which is
-//! the only reason to graph it against the shed count.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -91,22 +41,15 @@ const ROUTES: &[&str] = &[
 ];
 
 /// Upper bounds, in seconds, for the latency histogram (plus an implicit `+Inf`).
-///
-/// Spread wide on purpose: nidus-8fn measured the HTTP path at ~100–140µs of constant
-/// overhead, and a large upsert legitimately runs for minutes, so the honest range this has
-/// to resolve spans five orders of magnitude. Buckets bunch where the interesting
-/// transitions are — sub-millisecond for a small search, seconds for a scan over a big
-/// store, tens of seconds for a batch write.
 const BUCKETS: &[f64] = &[
     0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
 /// Per-route request counts, split by status class, plus a latency histogram.
 struct RouteStats {
-    /// Index 0..=4 → 1xx..5xx. A class rather than the exact code: it answers "what is the
-    /// error rate" without multiplying the label set by every status the server can return,
-    /// and the two statuses an operator actually needs to tell apart under load — a shed
-    /// `503` and a deadline `504` — have their own counters below.
+    /// Index 0..=4 → 1xx..5xx. A class, not the exact code: it answers "what is the error rate"
+    /// without multiplying the label set by every status, and the two an operator must tell apart
+    /// under load — a shed `503` and a deadline `504` — have their own counters below.
     by_class: [AtomicU64; 5],
     /// Cumulative bucket counts (`le`), Prometheus-style: each is "requests at or under
     /// this bound", filled in at render time from the per-bucket tallies here.
@@ -150,10 +93,9 @@ pub(super) struct HttpMetrics {
     routes: [RouteStats; ROUTES.len()],
     /// Requests currently being handled, probes included.
     in_flight: crate::metrics::Gauge,
-    /// Requests whose client vanished before a response was produced — axum drops the
-    /// handler future when the connection closes, so these never reach a status. Worth its
-    /// own counter: a rising count is clients giving up, which looks like nothing at all in
-    /// a request/status breakdown that only ever sees completed requests.
+    /// Requests whose client vanished before a response — axum drops the handler future when the
+    /// connection closes, so these never reach a status. Worth its own counter: a rising count is
+    /// clients giving up, invisible in a breakdown that only sees completed requests.
     cancelled: crate::metrics::Counter,
     /// Requests refused with `503` because the concurrency cap was reached (nidus-abx.2).
     pub(super) shed: crate::metrics::Counter,
@@ -177,12 +119,6 @@ impl HttpMetrics {
 }
 
 /// RAII for the in-flight gauge.
-///
-/// **Not** a matching `inc()`/`dec()` pair around the await: axum drops the handler future
-/// when a client disconnects mid-request, so the `dec()` would simply never run and the
-/// gauge would ratchet upward forever — a metric that silently becomes a lie, on exactly
-/// the traffic pattern (impatient clients under load) you would be watching it for. `Drop`
-/// runs on the cancellation path too.
 struct InFlight {
     /// Set once a response was produced, so `Drop` can tell "finished" from "abandoned".
     completed: bool,
@@ -211,13 +147,6 @@ pub(super) fn http() -> &'static HttpMetrics {
 }
 
 /// Map a request path to its slot in [`ROUTES`].
-///
-/// An **index**, not a label: the index is what `HTTP.routes` is addressed by, and deriving
-/// a `&'static str` only to search for it again would be two scans and an unreachable
-/// fallback. `ROUTES[route_index(path)]` is the name.
-///
-/// Collection names are collapsed to `{name}`, so `/collections/secret-project/upsert` and
-/// `/collections/notes/upsert` share one series — see the module docs on why that matters.
 fn route_index(path: &str) -> usize {
     let slot = |name: &str| ROUTES.iter().position(|r| *r == name).expect("known route");
     // Exact routes first — the common case, and unambiguous.
@@ -253,9 +182,6 @@ fn route_label(path: &str) -> &'static str {
 const REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
 /// The outermost middleware: time the request, label it, log it, echo its id.
-///
-/// Sits outside auth and backpressure so a `401` and a shed `503` are both counted — an
-/// error rate that excludes the errors a client is actually seeing is worse than none.
 pub(super) async fn observe(req: Request, next: Next) -> Response {
     let started = Instant::now();
     let slot = route_index(req.uri().path());
@@ -301,11 +227,6 @@ pub(super) async fn observe(req: Request, next: Next) -> Response {
 }
 
 /// Take the caller's `x-request-id` when it is present and sane, otherwise mint one.
-///
-/// Honouring an inbound id is what makes nidus a link in someone else's trace rather than
-/// the place correlation stops. It is bounded and filtered before use: the value ends up in
-/// a log line and a response header, and an unvalidated header is how a caller injects a
-/// newline into your logs.
 fn request_id(req: &Request) -> String {
     if let Some(given) = req
         .headers()
@@ -325,11 +246,6 @@ fn request_id(req: &Request) -> String {
 }
 
 /// A fresh id: process id and a monotonic counter, hex.
-///
-/// Not a UUID and not random — nothing here needs unguessability, only uniqueness within a
-/// deployment's log stream, and pulling `uuid`/`rand` into the tree for that would be a
-/// dependency decision (CLAUDE.md) in exchange for nothing. The pid disambiguates instances
-/// on one host; the counter disambiguates requests within one process.
 fn mint_request_id() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -337,12 +253,6 @@ fn mint_request_id() -> String {
 }
 
 /// `GET /metrics` — the Prometheus text exposition, hand-rolled.
-///
-/// Unauthenticated on purpose (see `auth::is_public`), and lock-free: every number read
-/// here is an atomic, so a scrape during a multi-minute upsert answers instantly instead of
-/// queueing behind the write guard. That is the same discipline `/ready` follows and for
-/// the same reason — the endpoints you consult during an incident must not be the ones the
-/// incident blocks.
 pub(super) async fn metrics_endpoint(State(st): State<AppState>) -> Response {
     let mut out = String::with_capacity(8 * 1024);
     render(&mut out, &st);
@@ -446,11 +356,8 @@ fn render(out: &mut String, st: &AppState) {
     }
 
     // ── Group commit (nidus-xb9.1) ──────────────────────────────────────────
-    //
-    // `writes / groups` is the average number of requests that shared one disk barrier. Read
-    // it against `nidus_write_batches_total` / `nidus_durability_barriers_total` above: those
-    // count the store's barriers whoever asked for them, these attribute the coalescing to
-    // concurrent HTTP writes.
+    // `writes / groups` is the average number of requests sharing one disk barrier. The store's own
+    // barrier counters above count them whoever asked; these attribute coalescing to HTTP writes.
     let (groups, writes) = st.commit.stats();
     for (name, help, value) in [
         (
@@ -499,11 +406,8 @@ fn render(out: &mut String, st: &AppState) {
     }
 
     // ── Instance state ──────────────────────────────────────────────────────
-    //
-    // The *same* decision `GET /ready` answers with, not a re-derivation of it — a
-    // dashboard that disagreed with the load balancer about whether an instance is serving
-    // would be worse than no dashboard. Lock-free like the probe, so a scrape during a long
-    // write answers instantly.
+    // The *same* decision `GET /ready` answers with, not a re-derivation: a dashboard disagreeing
+    // with the load balancer would be worse than none. Lock-free, so a scrape answers instantly.
     let _ = writeln!(
         out,
         "# HELP nidus_ready Whether this instance reports ready (1) or not (0)"

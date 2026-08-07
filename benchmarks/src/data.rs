@@ -1,7 +1,4 @@
 //! Deterministic synthetic dataset generation.
-//!
-//! No `rand` dependency — a tiny splitmix64 PRNG gives reproducible vectors from a
-//! seed, so every engine sees byte-identical input and runs are comparable over time.
 
 /// splitmix64 — a fast, well-distributed seedable PRNG (public-domain algorithm).
 pub struct Rng(u64);

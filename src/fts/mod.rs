@@ -1,16 +1,4 @@
 //! Opt-in BM25 full-text search index (the FTS leg of SPEC.md §9).
-//!
-//! A *derived secondary index*, like [`crate::ann`]: built from the documents'
-//! text-bearing attrs, rebuildable from the op-log, and cached on disk only as an
-//! optimization. Each full-text-indexed `(collection, field)` owns one [`FieldIndex`]
-//! — an inverted index (term → postings) plus the per-doc lengths BM25 needs. A query
-//! is [analyzed](analyzer) into terms, scored against a field, and ranked by BM25.
-//!
-//! Identity is an FTS-local **docnum** (a dense `[0, n)` id), not the data-matrix row:
-//! FTS indexes only a subset of docs per field and text-only docs have no row at all.
-//! A candidate docnum is *hint-verified* against the live `id ↔ docnum` maps before it
-//! scores, so deletes/overwrites need no posting rewrite (they leave a tombstone the
-//! lookup skips). Pure safe Rust, Miri-clean, zero FFI.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -133,10 +121,9 @@ impl FieldIndex {
         }
     }
 
-    /// Live BM25 score for every doc matching at least one already-analyzed
-    /// `query_term`, as `(id, score)`. Unranked (the caller feeds these into the shared
-    /// top-k heap so scope/filter/top-k apply uniformly with vector search). Takes
-    /// pre-analyzed terms so a multi-collection query is analyzed once, not per field.
+    /// Live BM25 score for every doc matching at least one analyzed `query_term`, as `(id, score)`.
+    /// Unranked — the caller feeds these into the shared top-k heap so scope/filter apply uniformly
+    /// with vector search. Takes pre-analyzed terms so a multi-collection query analyzes once.
     pub(crate) fn score(&self, query_terms: &[String]) -> Vec<(&str, f32)> {
         if query_terms.is_empty() || self.doc_count == 0 {
             return Vec::new();
@@ -193,10 +180,9 @@ impl FieldIndex {
     }
 }
 
-/// All FTS state for a store: the per-`(collection, field)` indexes plus the declared
-/// schema (`collection → [(field, language)]`). The schema is the source of truth for
-/// which attrs are full-text indexed; it is persisted via the op-log and replayed on
-/// open.
+/// All FTS state for a store: the per-`(collection, field)` indexes plus the declared schema
+/// (`collection → [(field, language)]`). The schema is the source of truth for which attrs are
+/// full-text indexed; it is persisted via the op-log and replayed on open.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Fts {
     fields: HashMap<(String, String), FieldIndex>,
@@ -210,10 +196,9 @@ impl Fts {
         !self.schema.is_empty()
     }
 
-    /// The on-disk cache validity key: the cache format version, the BM25 params, and
-    /// the full declared schema (deterministically ordered via `BTreeMap`). Any change
-    /// to the analyzer params or the schema flips the key, so a stale cache is rejected
-    /// by [`crate::index_cache`] and the index is rebuilt.
+    /// The on-disk cache validity key: format version, BM25 params, and the full declared schema,
+    /// deterministically ordered. Any change to the analyzer params or schema flips it, so
+    /// [`crate::index_cache`] rejects a stale cache and the index is rebuilt.
     pub(crate) fn cache_key(&self) -> Vec<u8> {
         /// Bump when the inverted-index layout or analyzer behaviour changes.
         const FTS_CACHE_VERSION: u8 = 1;
@@ -242,10 +227,9 @@ impl Fts {
             .map(FieldIndex::language)
     }
 
-    /// Fraction of indexed docs that are tombstoned (dead) across all field indexes —
-    /// the FTS analog of the dead-row ratio, used to trigger an auto-compact rebuild for
-    /// text-only workloads (whose deletes leave no data rows). `0.0` when nothing is
-    /// indexed. Reads the per-field `tombstones`/`doc_count`.
+    /// Fraction of indexed docs tombstoned across all field indexes — the FTS analog of the
+    /// dead-row ratio, which triggers an auto-compact rebuild for text-only workloads whose deletes
+    /// leave no data rows. `0.0` when nothing is indexed.
     pub(crate) fn tombstone_ratio(&self) -> f32 {
         let mut tomb: u64 = 0;
         let mut live: u64 = 0;
@@ -274,10 +258,9 @@ impl Fts {
         self.schema.insert(collection.to_string(), fields.to_vec());
     }
 
-    /// Index document `id`'s text into every declared field of `collection`. A field
-    /// with no text (absent / non-string attr) tombstones any prior value for that id,
-    /// so a doc only lives in a field's index while it has text there. No-op if the
-    /// collection has no FTS schema.
+    /// Index document `id`'s text into every declared field of `collection`. A field with no text
+    /// (absent / non-string attr) tombstones any prior value for that id, so a doc only lives in a
+    /// field's index while it has text there. No-op if the collection has no FTS schema.
     pub(crate) fn index_doc(
         &mut self,
         collection: &str,
@@ -330,10 +313,9 @@ impl Fts {
         }
     }
 
-    /// BM25-score already-analyzed `query_terms` against `collection`.`field`, as
-    /// `(id, score)` for live matches. Empty when the field isn't indexed or nothing
-    /// matches. The caller analyzes the query once (per [`field_language`]) and reuses
-    /// the term list across collections.
+    /// BM25-score already-analyzed `query_terms` against `collection`.`field`, as `(id, score)` for
+    /// live matches. Empty when the field isn't indexed or nothing matches. The caller analyzes the
+    /// query once (per [`field_language`]) and reuses the term list across collections.
     pub(crate) fn score(
         &self,
         collection: &str,

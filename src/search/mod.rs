@@ -26,17 +26,6 @@ const DOT_LANES: usize = 8;
 /// Dot product of two equal-length slices. For unit vectors this is cosine
 /// similarity. Panics or is undefined if lengths differ — callers guarantee equal
 /// length (the store pins the dimension).
-///
-/// The hot path of brute-force search. A naive `zip().map().sum()` forces a single
-/// sequential accumulator: because f32 addition is not associative, LLVM may not
-/// reorder it, so without fast-math it stays scalar and leaves the vector units idle.
-/// Here we keep [`DOT_LANES`] *independent* running sums — lane `i` only ever touches
-/// elements `i, i+LANES, i+2·LANES, …` — so each lane is its own associative reduction
-/// chain the optimizer is free to vectorize, and the lanes share no dependency. The
-/// per-lane partials are folded at the end (pairwise, again independent of input
-/// length). Summation order differs from the naive left fold, so the f32 result can
-/// round a hair differently; that only matters at exact-tie boundaries in ranking,
-/// which are arbitrary anyway.
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "dot: slice lengths must be equal");
 
@@ -107,15 +96,6 @@ pub fn euclidean_neg_sq(a: &[f32], b: &[f32]) -> f32 {
 /// Global **symmetric** int8 quantization: a single scale maps every component
 /// `v → round(v / scale)` clamped to `[-127, 127]`, with `scale = max|v| / 127`
 /// over the whole matrix and zero-point fixed at 0.
-///
-/// Symmetric and uniform-across-dimensions is the point: with no per-dimension
-/// offset and one shared scale, `dot_i8(a, b) = (1/scale²)·dot(a, b)` and
-/// `euclidean_neg_sq_i8(a, b) = (1/scale²)·(−‖a − b‖²)` — both differ from the
-/// true f32 score only by the positive constant `1/scale²`, so the int8 score is
-/// **monotonic** with the true score. That is exactly what the first pass needs:
-/// it picks the right candidate set, and the f32 rerank restores exact scores.
-/// (Per-dimension affine quantization would break this — the offset and per-axis
-/// scale² terms don't cancel, so the int8 dot no longer tracks the true dot.)
 #[derive(Clone, Copy)]
 pub struct QuantParams {
     /// f32 units per int8 step. Zero when there are no (or all-zero) vectors.
@@ -214,21 +194,15 @@ pub fn euclidean_neg_sq_i8(a: &[i8], b: &[i8]) -> i32 {
 /// Pack the **sign bits** of `v` into `u64` words: bit `i` is set iff `v[i] >= 0.0`.
 /// The last word is zero-padded for indices past `v.len()`, so packed vectors of equal
 /// dimension always have equal word length and the padding never affects a later XOR.
-///
-/// This is the binary (SimHash) code for *angular* similarity: the sign pattern of a
-/// vector is invariant to the positive scaling that unit-normalization applies, so the
-/// code of a normalized vector equals the code of its raw form. `+0.0` and `-0.0` both
-/// pack as a set bit (`-0.0 >= 0.0` is true), keeping the rule total and deterministic.
 pub fn pack_signs(v: &[f32]) -> Vec<u64> {
     let mut out = vec![0u64; v.len().div_ceil(64)];
     pack_signs_into(v, &mut out);
     out
 }
 
-/// Pack the sign bits of `v` into the pre-sized word slice `out` (length
-/// `v.len().div_ceil(64)`), zeroing it first. The store's row-major matrix packer
-/// writes each row's code into its slice of one big `Vec<u64>` with this — no per-row
-/// allocation. See [`pack_signs`] for the sign rule and padding contract.
+/// Pack the sign bits of `v` into the pre-sized word slice `out`, zeroing it first. The store's
+/// row-major packer writes each row's code into its slice of one big `Vec<u64>` this way, with no
+/// per-row allocation. See [`pack_signs`] for the sign rule and padding contract.
 pub fn pack_signs_into(v: &[f32], out: &mut [u64]) {
     out.iter_mut().for_each(|w| *w = 0);
     for (i, &x) in v.iter().enumerate() {
@@ -238,13 +212,9 @@ pub fn pack_signs_into(v: &[f32], out: &mut [u64]) {
     }
 }
 
-/// Hamming distance between two equal-length packed bit vectors: the number of
-/// differing bits, `Σ (aᵢ ^ bᵢ).count_ones()`. Pure integer (a `POPCNT` reduction),
-/// so it runs under Miri and needs no FFI. Kept in [`DOT_LANES`] independent lanes for
+/// Hamming distance between two equal-length packed bit vectors: `Σ (aᵢ ^ bᵢ).count_ones()`. Pure
+/// integer, so it runs under Miri and needs no FFI, and kept in [`DOT_LANES`] independent lanes for
 /// the same instruction-level-parallelism reason as [`dot`].
-///
-/// The binary first-pass proxy: fewer differing sign bits ⇒ smaller angle between the
-/// vectors ⇒ higher cosine similarity. Callers negate it so "higher is better" holds.
 pub fn hamming(a: &[u64], b: &[u64]) -> u32 {
     debug_assert_eq!(a.len(), b.len(), "hamming: word lengths must be equal");
 
@@ -266,11 +236,8 @@ pub fn hamming(a: &[u64], b: &[u64]) -> u32 {
 }
 
 // ── Internal total-order wrapper for f32 scores ──────────────────────────────
-//
-// `BinaryHeap` requires `Ord`. Since `f32` is not `Ord` (NaN), we wrap the
-// score with a newtype that uses `f32::total_cmp`, which places NaN below all
-// finite values (at the bottom of the total order). This means NaN scores are
-// the lowest possible and will be evicted before any real result.
+// `BinaryHeap` needs `Ord`, and `f32` is not (NaN), so this newtype uses `f32::total_cmp`, which
+// puts NaN below every finite value — so a NaN score is evicted before any real result.
 
 #[derive(Clone, Copy, PartialEq)]
 struct OrdF32(f32);
@@ -287,8 +254,6 @@ impl Ord for OrdF32 {
     fn cmp(&self, other: &Self) -> Ordering {
         // Custom total order that places NaN as the *lowest* possible score,
         // so NaN never displaces a real result in the heap.
-        // Note: f32::total_cmp places NaN as the *highest* (largest bit pattern),
-        // which is the opposite of what we want here.
         match (self.0.is_nan(), other.0.is_nan()) {
             (true, true) => Ordering::Equal,
             (true, false) => Ordering::Less,    // NaN < any real
@@ -302,9 +267,8 @@ impl Ord for OrdF32 {
 }
 
 // ── Entry stored in the min-heap ──────────────────────────────────────────────
-//
-// The heap is a max-heap by default; to get a min-heap we reverse the ordering
-// so the smallest score sits at the top and is the first candidate for eviction.
+// `BinaryHeap` is a max-heap, so the ordering is reversed here: the smallest score sits at the top
+// and is the first candidate for eviction.
 
 struct Entry<T> {
     score: OrdF32,
@@ -378,9 +342,6 @@ impl<T> TopK<T> {
     /// Consume the collector, returning the kept items sorted by score descending.
     pub fn into_sorted_desc(self) -> Vec<(f32, T)> {
         // Drain the heap into a Vec, then sort descending.
-        // BinaryHeap::into_iter_sorted would give descending order too (it's a
-        // max-heap with reversed Ord), but we use sort for clarity and stability
-        // vis-à-vis ties.
         let mut v: Vec<(f32, T)> = self.heap.into_iter().map(|e| (e.score.0, e.item)).collect();
         // Sort highest first; NaN treated as lowest (sorted to end).
         v.sort_by_key(|&(s, _)| std::cmp::Reverse(OrdF32(s)));

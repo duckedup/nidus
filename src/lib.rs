@@ -1,16 +1,12 @@
-// `#![deny(unsafe_code)]`, not `forbid`: nidus is unsafe-free everywhere except the single
-// memory-map call in `src/data/mmap.rs` (the one conscious FFI opt-in, SPEC §9/§14.6), which
-// carries a scoped `#[allow(unsafe_code)]`. `deny` lets that one site opt in; every other use
-// of `unsafe` anywhere in the crate is still a hard compile error.
+// `deny`, not `forbid`: the single memory-map call in `src/data/mmap.rs` (SPEC §9/§14.6)
+// carries a scoped `#[allow(unsafe_code)]`. Every other `unsafe` in the crate stays a hard
+// compile error.
 #![deny(unsafe_code)]
 //! # nidus
 //!
-//! A small, pure-Rust embeddable vector store: brute-force cosine search over a
-//! single append-only directory, with typed metadata filters and many logical
-//! collections sharing one embedding space. No SQL, no query engine; safe Rust
-//! throughout but for the one opt-in memory-map call.
-//!
-//! See `SPEC.md` for the full design.
+//! A small, pure-Rust embeddable vector store: brute-force cosine search over one
+//! append-only directory, with typed metadata filters and many collections sharing one
+//! embedding space. See `SPEC.md` for the full design.
 //!
 //! ```no_run
 //! use nidus::{Nidus, Config, Record, SearchOpts, Scope};
@@ -58,8 +54,6 @@ pub mod server;
 // ── AI ingest layer (epic nidus-54l) — all behind off-by-default features ────
 // The async edge: text-native `remember`/`recall` on top of the sync store
 // core, which depends on NONE of this. See Cargo.toml `[features]`.
-//
-// Shared HTTP retry helper for every reqwest-based adapter (embed + summarize).
 #[cfg(any(feature = "embed", feature = "summarize"))]
 mod http;
 // Provider capability registry (Embed | Summarize): the single source of truth
@@ -170,37 +164,17 @@ impl Nidus {
     /// Who this instance is within the store, and how current it is — role, whether it
     /// holds the writer handle, whether it has been **fenced**, and how stale a reader is
     /// (SPEC §14.6). See [`ClusterStatus`].
-    ///
-    /// Reads only in-RAM state, so it is safe to call as often as a health check needs.
     pub fn cluster_status(&self) -> ClusterStatus {
         self.store.cluster_status()
     }
 
     /// A lock-free handle to the facts a readiness probe needs — role, whether this writer
     /// has been fenced, and how stale a reader is. See [`Readiness`].
-    ///
-    /// Unlike [`cluster_status`](Self::cluster_status), reading through this handle takes no
-    /// lock at all, so a probe cannot be delayed — or answered wrongly — by a long write
-    /// holding the store guard. Take it once when the store opens and keep it: it shares the
-    /// store's atomics, so it never goes out of date.
     pub fn readiness(&self) -> Readiness {
         self.store.readiness()
     }
 
     /// A handle to this instance's cluster writer lease, for keeping it warm out of band.
-    ///
-    /// The lease is renewed at the start of every write batch, which is enough when batches
-    /// are short. A batch that takes longer than [`Config::lock_ttl`] — a very large upsert,
-    /// or a slow object-store PUT — would otherwise let a standby conclude the writer died
-    /// and take over, fencing a writer that was perfectly healthy and throwing away its
-    /// work. Renewing on a timer from this handle closes that window, and because the handle
-    /// is independent of the store lock it keeps working *during* the long write.
-    ///
-    /// This hands back a [`LeaseRenewer`] — a `Drop`-free handle — rather than the lease
-    /// itself, because the lease is an owning guard that releases on drop.
-    ///
-    /// `None` outside cluster mode, and for readers. `nidus serve` drives this itself; a
-    /// library caller embedding nidus in an async host can do the same.
     pub fn lease_renewer(&self) -> Option<LeaseRenewer> {
         self.store.lease_renewer()
     }
@@ -222,10 +196,9 @@ impl Nidus {
         self.store.create_collection_with_fts(name, fields)
     }
 
-    /// Declare (or redeclare) which attribute fields of `collection` are full-text
-    /// indexed for BM25 search, each with its analyzer [`Language`]. May be called
-    /// before or after upserting — declaring it on a collection that already holds docs
-    /// builds the index from them once. Redeclaring rebuilds the affected fields.
+    /// Declare which attribute fields of `collection` are full-text indexed for BM25, each with its
+    /// analyzer [`Language`]. Callable before or after upserting — on a collection that already holds
+    /// docs it builds the index once. Redeclaring rebuilds the affected fields.
     pub fn set_fts_schema(
         &mut self,
         collection: &str,
@@ -286,9 +259,6 @@ impl Nidus {
     }
 
     /// List records matching `filter` across a [`Scope`], without vector scoring.
-    /// Skips `offset` matches and returns up to `limit` more, in insertion order,
-    /// all with `score: 0.0`. Pass `offset = 0` for the first page; advance by
-    /// `limit` to paginate.
     pub fn list<'a>(
         &self,
         scope: impl Into<Scope<'a>>,
@@ -314,11 +284,9 @@ impl Nidus {
         self.store.search(&refs, query, opts)
     }
 
-    /// Full-text (BM25) search over a [`Scope`] for `query` — the indexed field plus
-    /// query text — merged into one ranking. Requires the field to be declared in the
-    /// collection's FTS schema (see [`set_fts_schema`](Self::set_fts_schema)). Reuses
-    /// [`SearchOpts`] (`top_k`, `filter`); here `min_score` is a raw BM25 floor rather
-    /// than a cosine one. Text-only and vector-bearing docs are both eligible.
+    /// Full-text (BM25) search over a [`Scope`], merged into one ranking. Requires the field to be
+    /// declared in the collection's FTS schema. Reuses [`SearchOpts`], but `min_score` here is a raw
+    /// BM25 floor rather than a cosine one; text-only and vector-bearing docs are both eligible.
     pub fn text_search<'a>(
         &self,
         scope: impl Into<Scope<'a>>,
@@ -330,10 +298,9 @@ impl Nidus {
         self.store.text_search(&refs, query, opts)
     }
 
-    /// Hybrid search over a [`Scope`]: fuse a vector query and a BM25 text query into a
-    /// single ranking with Reciprocal Rank Fusion (see [`HybridOpts`]). A doc that
-    /// surfaces in only one leg (e.g. a text-only doc, or one whose vector matches but
-    /// whose text does not) is still ranked by that leg.
+    /// Hybrid search over a [`Scope`]: fuse a vector query and a BM25 text query into one ranking
+    /// with Reciprocal Rank Fusion (see [`HybridOpts`]). A doc surfacing in only one leg is still
+    /// ranked by that leg.
     pub fn hybrid_search<'a>(
         &self,
         scope: impl Into<Scope<'a>>,
@@ -350,34 +317,6 @@ impl Nidus {
 
     /// Run `f` with the per-batch durable barrier **deferred**, so several mutations can
     /// share one fsync instead of taking one each — the group-commit primitive.
-    ///
-    /// Inside `f`, [`upsert`](Self::upsert)/[`delete`](Self::delete)/… append their bytes and
-    /// update the in-RAM index exactly as they always do, but issue no fsync. Afterwards
-    /// [`commit`](Self::commit) takes **one** barrier covering all of them. Nothing about the
-    /// durable write order changes: each batch is still appended data-before-log, and `commit`
-    /// still syncs `data` before `log`.
-    ///
-    /// # The contract you take on
-    ///
-    /// **Do not report any of `f`'s results as successful until [`commit`](Self::commit)
-    /// returns `Ok`.** Until then the bytes are appended but not durable — precisely the state
-    /// the lock-free reader rule drops from the tail on replay (SPEC §6.2). Acknowledging
-    /// before the barrier would turn this from "fewer fsyncs" into "silently weaker
-    /// durability", which is not a trade worth offering.
-    ///
-    /// This is what `nidus serve` does with concurrent writes: the request that reaches the
-    /// store first applies every other queued write too, one barrier covers the group, and
-    /// only then does each request get its `200`. That is where the per-call `~7.6ms` disk
-    /// barrier stops being paid once per request.
-    ///
-    /// # Notes
-    ///
-    /// * Nesting is safe — the previous setting is restored, including when `f` errors.
-    /// * A **panic** out of `f` skips the restore, leaving the store in the deferred state; a
-    ///   panic while holding a store this way should be treated as fatal to the store (in
-    ///   `nidus serve` it poisons the lock, which takes the instance out of service).
-    /// * Under [`Fsync::OnFlush`] this changes nothing: that policy already defers every
-    ///   barrier to `flush()`.
     pub fn deferred<T>(&mut self, f: impl FnOnce(&mut Nidus) -> Result<T>) -> Result<T> {
         let prev = self.store.begin_deferred();
         let out = f(self);
@@ -387,15 +326,6 @@ impl Nidus {
 
     /// Take the barrier that [`deferred`](Self::deferred) mutations skipped: fsync `data` then
     /// `log`, and in cluster mode publish the commit counter once for the whole group.
-    ///
-    /// A **no-op when no barrier is owed** — a caller on the ordinary per-batch path that
-    /// already synced pays a branch and nothing more, which is what keeps the uncontended
-    /// single-writer path exactly as fast as it was. Also a no-op under
-    /// [`Fsync::OnFlush`], where `flush()` is by definition the durability point.
-    ///
-    /// Narrower than [`flush`](Self::flush) on purpose: it takes the barrier and skips the
-    /// housekeeping (segment seal, shared working-set publish), which would otherwise put a
-    /// whole-working-set write on the hot path of every group.
     pub fn commit(&mut self) -> Result<()> {
         self.store.commit()
     }
@@ -412,28 +342,16 @@ impl Nidus {
         self.store.compact()
     }
 
-    /// Adopt a separate writer's newer committed state into a lock-free
-    /// [`ReadOnly`](OpenMode::ReadOnly) handle without reopening the store. A `ReadOnly`
-    /// handle is a consistent snapshot taken when it opened; `refresh` advances it to the
-    /// store's current committed state — picking up the writer's appends, seals, deletes,
-    /// and compactions — at a single consistent point (never a torn mix).
-    ///
-    /// Returns `Ok(true)` when newer state was adopted and `Ok(false)` when the handle was
-    /// already current — the cheap common case, a single small manifest read plus a `log`
-    /// stat, so it is safe to call before a batch of queries. A `ReadWrite` handle (already
-    /// the source of truth) and an in-memory store always return `Ok(false)`. This is the
-    /// basis for a search-only process tracking a store another process is writing.
+    /// Adopt a separate writer's newer committed state into a lock-free `ReadOnly` handle without
+    /// reopening. Such a handle is a snapshot taken at open; `refresh` advances it to the current
+    /// committed state at a single consistent point, never a torn mix.
     pub fn refresh(&mut self) -> Result<bool> {
         self.store.refresh()
     }
 
-    /// Write the approximate-nearest-neighbour index ([`Config::ann`]) to its on-disk
-    /// cache so the next [`open`](Self::open) loads it instead of rebuilding the graph
-    /// (the expensive part of opening an ANN store). This is an explicit, out-of-band
-    /// operation — it is never triggered by `upsert`/`flush`, so the write path stays
-    /// fast — so call it before shutting down a long-lived handle (e.g. a search
-    /// server). A no-op when ANN is disabled, the store is in-memory or read-only, or
-    /// nothing changed since the last persist. `compact()` refreshes the cache too.
+    /// Write the ANN index ([`Config::ann`]) to its on-disk cache so the next [`open`](Self::open)
+    /// loads it instead of rebuilding the graph. Explicit and out-of-band, never triggered by
+    /// `upsert`/`flush`, so call it before shutting down a long-lived handle; `compact()` also does.
     pub fn persist_index(&mut self) -> Result<()> {
         self.store.persist_index()
     }

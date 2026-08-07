@@ -1,31 +1,4 @@
 //! [`RedisTier`]: a shared [`MemoryTier`] over the Redis wire protocol (SPEC §13.3).
-//!
-//! A single `redis-rs` *blocking* client speaks RESP, so one backend covers the whole
-//! RESP-compatible family — **Redis, Valkey, KeyDB, and DragonflyDB** — selected by URL
-//! scheme:
-//!
-//! - `redis://…`  / `valkey://…` / `keydb://…` / `dragonfly://…` → plain TCP
-//! - `rediss://…` / `valkeys://…`                               → TLS (via `tls-rustls`)
-//!
-//! The non-`redis` schemes are pure aliases: they are rewritten to `redis://`/`rediss://`
-//! before being handed to the client, since the servers are protocol-identical.
-//!
-//! A `?cluster=true` query opens a **Redis/Valkey Cluster** client instead (via the `cluster`
-//! feature): the host is a seed node — or several, comma-separated, to tolerate one being
-//! down at startup (`redis://a,b,c?cluster=true`) — the rest of the topology is discovered,
-//! and slot routing + `MOVED`/`ASK` redirection are handled by the client. Single-node and
-//! cluster connections share one code path — both are driven as `&mut dyn ConnectionLike`
-//! through the low-level [`Cmd`](redis::Cmd) API.
-//!
-//! As a [`MemoryTier`] this is **model (a)** (SPEC §13.3): a *shared, rebuildable* cache
-//! of the serialized working set, not a source of truth. `store` is `SET` (with `EX`
-//! when a ttl is given), `load` is `GET`; an evicted or absent key is `Ok(None)`, never
-//! fatal — the persistence tier remains authoritative.
-//!
-//! Sync by design: `default-features = false` keeps `redis-rs` on its blocking
-//! `Connection`, so nothing async (no tokio) enters the tree. A connection is cached
-//! behind a `Mutex` and transparently reopened if a command fails (a dropped/expired
-//! TCP connection), so callers never juggle reconnection.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -35,10 +8,9 @@ use redis::{Client, ConnectionLike, RedisResult, cluster::ClusterClient};
 
 use super::MemoryTier;
 
-/// A live blocking connection — a single-node [`redis::Connection`] or a
-/// [`ClusterConnection`](redis::cluster::ClusterConnection) — behind one object-safe trait
-/// so the rest of the tier is topology-agnostic. Commands are issued through the low-level
-/// [`Cmd`](redis::Cmd) API, which takes `&mut dyn ConnectionLike`.
+/// A live blocking connection — single-node or cluster — behind one object-safe trait, so the rest
+/// of the tier is topology-agnostic. Commands go through the low-level [`Cmd`](redis::Cmd) API,
+/// which takes `&mut dyn ConnectionLike`.
 type Conn = Box<dyn ConnectionLike + Send>;
 
 /// A shared memory tier backed by a Redis-protocol server (Redis/Valkey/KeyDB/Dragonfly),
@@ -55,13 +27,9 @@ pub struct RedisTier {
 }
 
 impl RedisTier {
-    /// Build from a memory-tier location: a `redis://`/`rediss://`/`valkey://`/
-    /// `valkeys://`/`keydb://`/`dragonfly://` URL. An optional `?prefix=<ns>` query
-    /// namespaces every key (`<ns>:<key>`), and `?cluster=true` opens a Redis/Valkey
-    /// **Cluster** client over one or more comma-separated seed hosts
-    /// (`redis://a,b,c?cluster=true`) — the rest of the topology is discovered. Both query
-    /// keys are stripped before the URL reaches the client. The connection is opened lazily
-    /// on first use, so construction never blocks on the network.
+    /// Build from a memory-tier URL (`redis://`, `valkey://`, `keydb://`, …). `?prefix=<ns>`
+    /// namespaces every key and `?cluster=true` opens a Cluster client over comma-separated seeds;
+    /// both query keys are stripped first. The connection opens lazily and never blocks here.
     pub(crate) fn from_url(location: &str) -> Result<RedisTier> {
         let (nodes, prefix, cluster) = normalize_url(location)?;
         let open: Box<dyn Fn() -> RedisResult<Conn> + Send + Sync> = if cluster {
@@ -146,11 +114,9 @@ impl MemoryTier for RedisTier {
     }
 }
 
-/// Rewrite a memory-tier location into a `redis-rs`-acceptable URL plus the optional key
-/// prefix and a cluster flag. Maps the alias schemes onto Redis's own (`valkey`/`keydb`/
-/// `dragonfly` → `redis`, `valkeys` → `rediss`, since the servers are protocol-identical)
-/// and strips the `?prefix=<ns>` / `?cluster=<bool>` query keys. Pure string logic —
-/// unit-tested directly.
+/// Rewrite a memory-tier location into a `redis-rs`-acceptable URL plus the optional prefix and
+/// cluster flag, mapping the alias schemes onto Redis's own (the servers are protocol-identical) and
+/// stripping the query keys. Pure string logic, unit-tested directly.
 fn normalize_url(location: &str) -> Result<(Vec<String>, String, bool)> {
     let (scheme, rest) = location
         .split_once("://")

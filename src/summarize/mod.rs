@@ -1,16 +1,4 @@
 //! Single-shot text summarization (epic nidus-54l, tickets .7/.8).
-//!
-//! The optional "summarize-then-embed" leg of the AI ingest layer: given a
-//! blob of arbitrary text, produce a dense, retrieval-friendly summary that is
-//! a better embedding target than the raw text. nidus knows nothing about the
-//! caller's domain — unlike the code-specific summarizer this was ported from,
-//! the trait here is a single generic [`Summarizer::summarize`] over `(text,
-//! opts)`.
-//!
-//! The public surface is a native-async trait (RPITIT, no `async_trait`, no
-//! `Box<dyn>`), a typed [`SummarizeError`] at the edge, a [`SummarizeConfig`]
-//! builder, the [`SummarizeProvider`] selector, and the closed [`AnySummarizer`]
-//! enum that dispatches to whichever provider adapters were compiled in.
 
 pub mod prompts;
 
@@ -26,11 +14,6 @@ use crate::providers::{self, Capability};
 // ── Trait ───────────────────────────────────────────────────────────────────
 
 /// Turns arbitrary text into a dense, search-friendly summary.
-///
-/// Native async: [`summarize`](Self::summarize) returns an
-/// `impl Future + Send` rather than boxing, so callers pay no allocation and the
-/// trait stays object-unsafe by design — dispatch across providers goes through
-/// the closed [`AnySummarizer`] enum, not `dyn Summarizer`.
 pub trait Summarizer: Send + Sync {
     /// Summarize `text` into retrieval-friendly prose.
     fn summarize(
@@ -311,11 +294,9 @@ impl Summarizer for AnySummarizer {
 
 // ── Shared adapter plumbing ─────────────────────────────────────────────────────
 
-/// Send a prepared request with retry, then classify the response: transport
-/// failure past the retry budget → [`SummarizeError::Backend`], a non-2xx
-/// status → [`SummarizeError::Api`], success → the [`reqwest::Response`] for the
-/// caller to parse. Shared by every provider adapter (the dedupe rule — one
-/// source, two callers) so status/error handling lives in exactly one place.
+/// Send a prepared request with retry, then classify: transport failure past the budget →
+/// [`SummarizeError::Backend`], non-2xx → [`SummarizeError::Api`], success → the response to parse.
+/// Shared by every provider adapter so status handling lives in exactly one place.
 #[cfg(any(feature = "summarize-anthropic", feature = "summarize-openai"))]
 async fn send_checked(
     policy: &crate::http::RetryPolicy,
@@ -336,10 +317,9 @@ async fn send_checked(
 
 // ── Shared test server ───────────────────────────────────────────────────────
 
-/// A one-shot local HTTP server used by the provider wire tests: it accepts a
-/// single connection, captures the raw request, and replies with a canned
-/// status + JSON body. Lives here (rather than duplicated per adapter) so both
-/// the Anthropic and OpenAI tests share one implementation.
+/// A one-shot local HTTP server used by the provider wire tests: it accepts a single connection,
+/// captures the raw request, and replies with a canned status + JSON body. Lives here (rather than
+/// duplicated per adapter) so both the Anthropic and OpenAI tests share one implementation.
 #[cfg(all(
     test,
     any(feature = "summarize-anthropic", feature = "summarize-openai")
