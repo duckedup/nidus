@@ -4607,11 +4607,16 @@ fn a_refused_query_is_not_counted_as_a_served_one() {
     // `search_queries` underpins every ratio built on it (ANN-vs-exact share, mean rows
     // scanned). Counting a request the store refused would overstate the denominator.
     let store = Store::in_memory(3).unwrap();
-    let before = crate::metrics::metrics().search_queries.get();
-    assert!(store.search(&["col"], &[1.0], &default_opts(5)).is_err());
-    assert_eq!(
-        crate::metrics::metrics().search_queries.get(),
-        before,
+    // The counter is process-global and sibling tests search concurrently, so a moved
+    // counter is ambiguous while a still one is proof. Pass on the first clean window; a
+    // real regression increments in every window and still fails.
+    let unmoved = (0..64).any(|_| {
+        let before = crate::metrics::metrics().search_queries.get();
+        assert!(store.search(&["col"], &[1.0], &default_opts(5)).is_err());
+        crate::metrics::metrics().search_queries.get() == before
+    });
+    assert!(
+        unmoved,
         "a rejected query must not move the served-query counter"
     );
 }
