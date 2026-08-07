@@ -9,7 +9,7 @@ default-members = ["."]
 
 [package]
 name = "nidus"
-version = "0.41.0"
+version = "0.42.0"
 edition = "2024"
 rust-version = "1.96"
 description = "A small, pure-Rust embeddable vector store: brute-force or ANN cosine search over a single append-only directory, with pluggable persistence (local files, S3, GCS). No SQL, no query engine; builds in seconds."
@@ -98,12 +98,23 @@ summarize-all = ["summarize-anthropic", "summarize-openai"]
 # summarize-then-embed mode.
 memory = ["embed"]
 
+# The MCP 2026-07-28 server surface (nidus-zm2): `nidus serve` also answers MCP at
+# `/mcp`, so any MCP client can use the memory layer as agent memory with no glue code.
+#
+# Implies `memory` on purpose. The MCP tool surface is deliberately TEXT-NATIVE — no
+# model can emit a 384-float array as a tool argument, so the raw vector routes stay
+# off it and `remember`/`recall` (which embed server-side) are the point. An `mcp`
+# build without `memory` could still answer `text_search`/`stats`, but it would be a
+# vector store advertising itself to agents while unable to accept anything an agent
+# can say. Folded into `serve` below for the same reason.
+mcp = ["cli", "memory", "dep:rmcp"]
+
 # `nidus serve` WITH the memory endpoints (server-side remember/recall over the
 # HTTP API — the SDKs send text, the server embeds/summarizes). Umbrella over the
 # CLI/server stack plus the full ingest layer, so the shipped binary and the JS
 # SDK's server-side memory work out of the box. `cli` alone still builds a lean
 # server with only the raw vector endpoints; the memory routes are `memory`-gated.
-serve = ["cli", "memory", "embed-all", "summarize-all"]
+serve = ["cli", "memory", "embed-all", "summarize-all", "mcp"]
 
 # The core is four small pure-Rust crates with no C and no FFI. The S3/GCS
 # persistence backends (below) add a few more — still all pure Rust except `ring`
@@ -172,6 +183,30 @@ serde_json = { version = "1", optional = true }
 # zlib. cli-feature-only, so the pure-`cargo add nidus` tree is untouched.
 tar = { version = "0.4", optional = true }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
+
+# The MCP 2026-07-28 server surface (nidus-zm2), `mcp`-gated. Pure Rust, no FFI: 27
+# crates marginal over the existing `cli` tree of 163, ~4.3s of cold build, and the
+# DEFAULT library build is untouched — so `cargo add nidus`, `just deps`, and the
+# build-thesis dep-absence guard are unaffected by construction.
+#
+# Taken rather than hand-rolled deliberately. The 2026-07-28 core is small enough to
+# hand-roll (stateless JSON-RPC dispatch over one POST route), and `crc.rs`/`auth.rs`
+# set the precedent for hand-rolling small things. But those are FROZEN specs; MCP has
+# revised three times in eighteen months and now ships a formal twelve-month
+# deprecation treadmill. The part that survives 2.0 is the version matrix
+# (`ProtocolVersion::KNOWN_VERSIONS`, negotiating `initialize` down for older peers,
+# per-version required-`_meta` validation, clearing `resultType` for pre-2.0 clients),
+# and hand-rolling that means either 2.0-only — talking to almost no client deployed
+# today — or reimplementing the sessions and SSE that 2.0 removed from the spec but
+# not from reality. Pinned tight: four releases in the nine days after the spec landed.
+#
+# Only the server half is compiled: no client, no reqwest, no OAuth, no child-process
+# transport. `schemars` rides along as a hard dependency of `rmcp` but we do NOT derive
+# with it — tool schemas are hand-written JSON literals (see `server/mcp.rs`).
+rmcp = { version = "=3.1.1", default-features = false, features = [
+    "server",
+    "transport-streamable-http-server",
+], optional = true }
 
 # AI-ingest-only dep — compiled ONLY under the `embed`/`summarize` features,
 # never by default library consumers. `default-features = false` + `rustls-tls`

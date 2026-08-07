@@ -250,6 +250,31 @@ impl RunningServer {
         read(res, path, &self.stderr())
     }
 
+    /// `POST path` with a JSON body plus caller-supplied headers.
+    ///
+    /// For the MCP suite, which carries part of its protocol in headers (`Mcp-Method`,
+    /// `Mcp-Name`). A later header of the same name wins, so a test can append a wrong
+    /// `Mcp-Name` to exercise header/body mismatch. `mcp`-gated: else it is dead code.
+    #[cfg(feature = "mcp")]
+    pub fn post_with_headers(
+        &self,
+        path: &str,
+        body: &Value,
+        headers: &[(&str, &str)],
+    ) -> (u16, Value) {
+        let bytes = serde_json::to_vec(body).expect("serialise request body");
+        let mut req = self
+            .auth(self.agent.post(self.url(path)))
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let res = req.send(&bytes).unwrap_or_else(|e| {
+            panic!("POST {path}: {e}\n--- server stderr ---\n{}", self.stderr())
+        });
+        read(res, path, &self.stderr())
+    }
+
     /// Ask the server to shut down the way a supervisor would (SIGTERM), and wait for it
     /// to exit — the path that flushes and releases the writer lock. Returns whether it
     /// exited successfully.

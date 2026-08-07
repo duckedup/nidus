@@ -84,6 +84,18 @@ just serve DIR DIM # cargo run --features cli -- serve --dir DIR --dim DIM
 just install       # cargo install --path . --features cli
 ```
 
+`nidus serve` also answers **MCP `2026-07-28`** at `/mcp` behind the `mcp` feature
+(folded into `serve`), so any MCP client can use the memory layer as agent memory.
+`src/server/mcp.rs` is an *adapter*: every tool routes through the same
+`run_read`/`run_write` helpers the HTTP handlers use, and the service is
+`nest_service`'d **inside** the middleware stack so it inherits the body limit,
+backpressure, bearer auth, and metrics rather than reimplementing any of them. Two
+things there are load-bearing and easy to break: the tool surface is **text-native**
+(no tool may take a raw `vector` — a model cannot emit one, and `tests/e2e/mcp.rs`
+asserts it), and tool schemas are **hand-written JSON**, never `schemars`-derived,
+because the descriptions drive tool-selection quality. Verify with
+`cargo clippy --all-targets --features mcp -- -D warnings` and `just test-e2e`.
+
 When you touch `src/cli/`, `src/server/`, or `src/bin/`, gate it on the `cli`
 feature and verify with `just ci-cli` (the core `just ci` does not compile it).
 Do NOT move these deps into the default feature set or use them from the library
@@ -162,6 +174,7 @@ src/
 ├── bin/nidus.rs # thin entry point: parse args → cli::run
 ├── cli/         # clap subcommands over a store dir (serve, upsert, search, …)
 └── server/      # axum/tokio HTTP wrapper over one Nidus; server/dto.rs = wire types
+                 #   server/mcp.rs = the MCP 2026-07-28 surface at /mcp (`mcp` feature)
 ```
 
 **Storage model.** A store is a directory: `data` (append-only flat `f32` matrix,
@@ -223,6 +236,17 @@ each.
   stay private. When you add a big new concern to an already-large module, prefer a
   new sibling file over appending to it — and move the matching tests into the
   module's own `tests.rs` rather than growing one giant test block.
+- **Comments: 3 lines maximum, and they must add clarity.** This is a hard cap on every
+  comment and doc comment — `//`, `///`, `//!` — counting the whole block, including any
+  `///` blank separators. A comment earns its place by saying something the code cannot:
+  the non-obvious *why*, a constraint that will bite, a bug it guards against. It does not
+  earn its place by restating the code, justifying the design at length, arguing with an
+  imagined reviewer, or recording the history of how the decision was reached. **Rationale
+  that needs more than three lines belongs in the commit message, the PR, `SPEC.md`, or a
+  `bd` issue — not above the code.** When trimming, keep the fact and drop the argument:
+  "rmcp reports `rmcp 3.1.1` here, not this crate" beats a paragraph explaining why that
+  matters. Long comments are not thoroughness; they push the code off the screen and go
+  stale where prose in a commit cannot.
 - **Commit style**: emoji prefix + short description (e.g. `🪺 op-log codec`).
 - **Issue tracking**: `bd` (beads) — run `bd ready` for available work.
 - **Branch workflow**: one branch per issue or bundled epic, push for PR review.

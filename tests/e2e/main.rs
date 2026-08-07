@@ -15,5 +15,7 @@ mod harness;
 
 mod cluster;
 mod hardening;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod scale;
 mod server;

@@ -73,7 +73,7 @@ test-cli:
 # Included in `test-cli` (they need no services and run in seconds); this recipe is
 # for iterating on them alone. Pass a filter, e.g. `just test-e2e token`.
 test-e2e *FILTER:
-    cargo test --features cli --test e2e {{ FILTER }}
+    cargo test --features cli,mcp --test e2e {{ FILTER }}
 
 # Start the services the cluster e2e tests need (real S3 + real Redis-family tier).
 # The container definitions live in scripts/e2e-services.sh — one source of truth,

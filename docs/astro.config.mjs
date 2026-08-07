@@ -71,6 +71,7 @@ export default defineConfig({
             { label: "Memory stores", link: "/guides/memory-stores/" },
             { label: "Search & filters", link: "/guides/search/" },
             { label: "Remember & recall", link: "/guides/remember-and-recall/" },
+            { label: "MCP (agent memory)", link: "/guides/mcp/" },
             { label: "Embedding in a host app", link: "/guides/integrating/" },
             { label: "Command line", link: "/guides/cli-and-server/" },
             { label: "HTTP server", link: "/guides/http-server/" },

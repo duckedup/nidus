@@ -13,6 +13,8 @@ mod auth;
 mod commit;
 pub mod dto;
 mod limits;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod metrics;
 
 use std::sync::{Arc, RwLock};
@@ -462,6 +464,11 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
     let router = router
         .route("/collections/{name}/remember", post(remember))
         .route("/collections/{name}/recall", post(recall));
+
+    // The MCP surface (nidus-zm2), nested *before* the `.layer()` calls below so it inherits
+    // the whole middleware stack instead of growing its own copy of each layer.
+    #[cfg(feature = "mcp")]
+    let router = router.nest_service("/mcp", mcp::service(state.clone(), max_body_bytes));
 
     // Layer order matters, and `.layer()` applies **outermost last**. Reading inside-out:
     //

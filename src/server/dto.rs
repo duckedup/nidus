@@ -28,7 +28,9 @@ pub struct DeleteRequest {
     pub filter: Option<Filter>,
 }
 
-fn default_top_k() -> usize {
+/// The default result count. `pub(super)` so the MCP tools share it rather than picking
+/// their own, which would answer one query two different ways depending on the surface.
+pub(super) fn default_top_k() -> usize {
     10
 }
 
