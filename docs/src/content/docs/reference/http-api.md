@@ -365,7 +365,7 @@ curl -s localhost:7700/list \
 (hits with a `score` of `0`, since nothing is scored).
 
 The `filter` in both `/search` and `/list` is an AND of predicates: `Eq`, `Ne`,
-`Glob`, `In`, `NotIn`, `Lt`, `Le`, `Gt`, `Ge`. See
+`Glob`, `IGlob`, `In`, `NotIn`, `Lt`, `Le`, `Gt`, `Ge`. See
 [Search & filters](/guides/search/) for the full predicate grammar.
 
 ## Maintenance

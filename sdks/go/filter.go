@@ -11,8 +11,8 @@
 // coercing types to make a comparison "work".
 //
 // One asymmetry to keep straight, because it is the wire format and not a choice:
-// Glob's second tuple element is a bare string (the pattern), while every other
-// predicate's is a tagged Value, and In/NotIn's is an array of them.
+// Glob's and IGlob's second tuple element is a bare string (the pattern), while every
+// other predicate's is a tagged Value, and In/NotIn's is an array of them.
 
 package nidus
 
@@ -26,6 +26,7 @@ const (
 	opEq    = "Eq"
 	opNe    = "Ne"
 	opGlob  = "Glob"
+	opIGlob = "IGlob"
 	opIn    = "In"
 	opNotIn = "NotIn"
 	opLt    = "Lt"
@@ -34,15 +35,15 @@ const (
 	opGe    = "Ge"
 )
 
-// A Predicate is one attribute condition. Build it with [Eq], [Ne], [Glob], [In],
-// [NotIn], [Lt], [Le], [Gt], or [Ge]; the fields are unexported so a predicate the
-// server cannot parse cannot be constructed.
+// A Predicate is one attribute condition. Build it with [Eq], [Ne], [Glob], [IGlob],
+// [In], [NotIn], [Lt], [Le], [Gt], or [Ge]; the fields are unexported so a predicate
+// the server cannot parse cannot be constructed.
 type Predicate struct {
 	op   string
 	key  string
 	val  Value   // Eq, Ne, Lt, Le, Gt, Ge
 	vals []Value // In, NotIn
-	pat  string  // Glob
+	pat  string  // Glob, IGlob
 	err  error   // a normalization failure, surfaced from MarshalJSON
 }
 
@@ -69,6 +70,12 @@ func Ne(key string, v any) Predicate { return unary(opNe, key, v) }
 // asymmetric variant on the wire.
 func Glob(key, pattern string) Predicate {
 	return Predicate{op: opGlob, key: key, pat: pattern}
+}
+
+// IGlob is [Glob] ignoring ASCII case on both sides: IGlob("path", "Src/*") matches
+// "src/main.rs". Non-ASCII is not folded, so É does not match é.
+func IGlob(key, pattern string) Predicate {
+	return Predicate{op: opIGlob, key: key, pat: pattern}
 }
 
 // In matches records where attrs[key] equals one of vals.
@@ -141,12 +148,12 @@ func (p Predicate) MarshalJSON() ([]byte, error) {
 	}
 	if p.op == "" {
 		return nil, fmt.Errorf(
-			"nidus: zero-value Predicate; build one with Eq, Ne, Glob, In, NotIn, Lt, Le, Gt or Ge",
+			"nidus: zero-value Predicate; build one with Eq, Ne, Glob, IGlob, In, NotIn, Lt, Le, Gt or Ge",
 		)
 	}
 	var second any
 	switch p.op {
-	case opGlob:
+	case opGlob, opIGlob:
 		second = p.pat
 	case opIn, opNotIn:
 		// A nil set must still be `[]`: the server's is a Vec, and `null` would fail

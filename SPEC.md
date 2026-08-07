@@ -202,6 +202,7 @@ pub enum Predicate {
     Eq(String, Value),                   // attr == value
     Ne(String, Value),                   // attr present and != value
     Glob(String, String),                // attr (Str) matches glob pattern
+    IGlob(String, String),               // same, ignoring ASCII case
     In(String, Vec<Value>),              // attr ∈ set
     NotIn(String, Vec<Value>),           // attr present and ∉ set
     Lt(String, Value),                   // attr <  value  (same-type, orderable)
@@ -520,8 +521,9 @@ reliable guard there is to refuse work *before* allocating:
   displaces a real result. `normalize` leaves a zero / non-finite / near-zero
   (`< ~1e-12`) vector unchanged, so it scores 0 against everything.
 - **Filters** (`Filter` = AND of `Predicate`s) are evaluated against `attrs` before
-  scoring: `Eq` (typed equality), `Ne` (typed inequality), `Glob` (pattern match on a
-  `Str` attr, §7.1), `In` / `NotIn` (set membership), and `Lt`/`Le`/`Gt`/`Ge` (ordered
+  scoring: `Eq` (typed equality), `Ne` (typed inequality), `Glob` / `IGlob` (pattern
+  match on a `Str` attr, case-sensitive and ASCII-case-insensitive, §7.1), `In` /
+  `NotIn` (set membership), and `Lt`/`Le`/`Gt`/`Ge` (ordered
   range comparison). This covers typical needs: path-prefix scoping (`Glob "path*"`),
   type/language/kind equality, exact-path matches, glob-based bulk deletes, presence
   sweeps, numeric/date ranges (`Ge "ts" 1700000000`), and exclusions (`Ne "status"
@@ -538,6 +540,17 @@ short keys like file paths. The pattern is **anchored at both ends** (the whole
 pattern must match the whole text); an unterminated `[` (no closing `]`) is treated
 as a literal `[`. This matches common SQL `GLOB` semantics so an application
 migrating off such a backend behaves identically.
+
+`IGlob` is the same subset with **ASCII** case folded on both sides — the pattern and
+the attribute are each mapped through `to_ascii_lowercase` before matching. Every
+metacharacter (`*`, `?`, `[`, `]`, `!`, `^`, `-`) is outside `A-Z`, so folding cannot
+disturb pattern structure, and an uppercase range like `[A-Z]` folds to `[a-z]` rather
+than becoming unmatchable. The fold is deliberately ASCII-only and context-free: `É`
+does not match `é`, because a locale-dependent fold would make the same pattern mean
+different things on different machines. Case-*sensitive* path comparison is usually
+not a useful distinction — on a case-insensitive filesystem a caller can easily hold a
+path in a casing the store does not have — so `IGlob` is the right default for
+path scoping, and `Glob` for anything that must compare exactly.
 
 `filter::matches` AND-combines predicates (empty filter matches everything); an
 absent key fails **every** predicate — including the negative ones (`Ne`, `NotIn`)

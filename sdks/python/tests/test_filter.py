@@ -29,10 +29,11 @@ from nidus import AttrInput, Filter, Predicate, f, v
 
 
 def test_every_predicate_variant_has_the_two_tuple_shape() -> None:
-    """Nine variants, each externally tagged over ``[key, operand]``."""
+    """Ten variants, each externally tagged over ``[key, operand]``."""
     assert f.eq("lang", "rust") == {"Eq": ["lang", {"Str": "rust"}]}
     assert f.ne("lang", "go") == {"Ne": ["lang", {"Str": "go"}]}
     assert f.glob("path", "src/*") == {"Glob": ["path", "src/*"]}
+    assert f.iglob("path", "Src/*") == {"IGlob": ["path", "Src/*"]}
     assert f.in_("status", ["published", "draft"]) == {
         "In": ["status", [{"Str": "published"}, {"Str": "draft"}]]
     }
@@ -48,6 +49,8 @@ def test_glob_takes_a_bare_string_while_the_others_take_a_value() -> None:
     glob = f.glob("path", "src/*")
     assert glob["Glob"][1] == "src/*"
     assert isinstance(glob["Glob"][1], str)
+    iglob = f.iglob("path", "src/*")
+    assert isinstance(iglob["IGlob"][1], str)
 
     # Every other variant tags its operand. `f.eq("path", "src/*")` on the same inputs is
     # the contrast: same key, same string, different wire shape.

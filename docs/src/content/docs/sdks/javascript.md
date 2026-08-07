@@ -91,7 +91,8 @@ const hits = await db.search({
 });
 ```
 
-Predicates: `eq`, `ne`, `glob`, `in`, `notIn`, `lt`, `le`, `gt`, `ge`.
+Predicates: `eq`, `ne`, `glob`, `iglob`, `in`, `notIn`, `lt`, `le`, `gt`, `ge`.
+`iglob` is `glob` with ASCII case folded on both sides.
 
 ## Full-text and hybrid search
 

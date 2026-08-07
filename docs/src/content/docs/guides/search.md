@@ -122,6 +122,11 @@ The predicates:
   `value` (any `Value` type, typed).
 - **`Glob(key, pattern)`** — `attrs[key]` is a `Str` matching the glob. Supports
   `*`, `?`, and `[...]` character classes.
+- **`IGlob(key, pattern)`** — the same, with **ASCII** case folded on both sides, so
+  `"Src/Auth/*"` matches `"src/auth/mod.rs"`. Non-ASCII is not folded (`É` does not
+  match `é`) — the fold is context-free so a pattern means the same thing on every
+  machine. Prefer this for path scoping, where an exact-case comparison mostly just
+  returns nothing; keep `Glob` where case is a real distinction.
 - **`In(key, values)`** / **`NotIn(key, values)`** — `attrs[key]` is / is not one of
   the values in the set.
 - **`Lt` / `Le` / `Gt` / `Ge(key, value)`** — ordered range comparison, **same-type

@@ -55,6 +55,15 @@ class f:
         """
         return {"Glob": [key, pattern]}
 
+    @staticmethod
+    def iglob(key: str, pattern: str) -> Predicate:
+        """:meth:`glob`, ignoring **ASCII** case on both sides.
+
+        ``f.iglob("path", "Src/*")`` matches ``"src/main.rs"``. Non-ASCII is not folded,
+        so ``É`` does not match ``é``. Second element is a bare string, as with ``glob``.
+        """
+        return {"IGlob": [key, pattern]}
+
     # `in_`/`not_in` are the only constructors taking a *set* of values, and a `str` is a
     # `Sequence[str]` while `str` is also an `AttrInput` — so `f.in_("lang", "rust")` type-
     # checks under `mypy --strict`, encodes four one-character predicates, and the server

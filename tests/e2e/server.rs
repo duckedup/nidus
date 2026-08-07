@@ -86,6 +86,38 @@ fn full_lifecycle_over_real_http() {
     assert_eq!(stats["footprint"]["doc_count"], 3);
 }
 
+/// `IGlob` folds ASCII case where `Glob` does not, end to end through a real request
+/// body. Covers the wire tag deserializing at all, which an in-crate filter test cannot.
+#[test]
+fn iglob_filter_folds_case_over_the_wire() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+
+    // The stored casing differs from the casing the query will use.
+    let (status, body) = server.post(
+        "/collections/docs/upsert",
+        &json!({"records": [
+            {"id": "x", "vector": [1, 0, 0], "attrs": {"path": {"Str": "src/finance/rates.rs"}}}
+        ]}),
+    );
+    assert_eq!(status, 200, "upsert failed: {body}");
+
+    let search = |pred: Value| {
+        let (status, hits) = server.post(
+            "/search",
+            &json!({"query": [1, 0, 0], "top_k": 5, "filter": [pred]}),
+        );
+        assert_eq!(status, 200, "search failed: {hits}");
+        hits.as_array().map(Vec::len).unwrap_or_default()
+    };
+
+    assert_eq!(search(json!({"IGlob": ["path", "Src/Finance/*"]})), 1);
+    assert_eq!(search(json!({"Glob": ["path", "Src/Finance/*"]})), 0);
+    // Folding widens case only — a genuinely different path still misses.
+    assert_eq!(search(json!({"IGlob": ["path", "Tests/*"]})), 0);
+}
+
 /// `--token` is enforced on real requests, and `/health` stays exempt so a load
 /// balancer can probe an authenticated server.
 #[test]

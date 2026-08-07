@@ -155,7 +155,8 @@ hits = db.search(
 )
 ```
 
-Predicates: `eq`, `ne`, `glob`, `in_`, `not_in`, `lt`, `le`, `gt`, `ge`, plus `and_`.
+Predicates: `eq`, `ne`, `glob`, `iglob`, `in_`, `not_in`, `lt`, `le`, `gt`, `ge`, plus
+`and_`. `iglob` is `glob` with ASCII case folded on both sides.
 
 Those three trailing underscores are not a style choice: `in` and `and` are **reserved
 words** in Python, so `f.in_`, `f.not_in`, and `f.and_` are the JavaScript SDK's `f.in`,

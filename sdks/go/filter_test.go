@@ -41,6 +41,8 @@ func TestPredicateWireShapes(t *testing.T) {
 		{"In with no values", In("lang"), `{"In":["lang",[]]}`},
 		{"NotIn with no values", NotIn("lang"), `{"NotIn":["lang",[]]}`},
 		{"Glob", Glob("path", "src/*.rs"), `{"Glob":["path","src/*.rs"]}`},
+		// IGlob shares Glob's bare-string second element, and only the tag differs.
+		{"IGlob", IGlob("path", "Src/*.RS"), `{"IGlob":["path","Src/*.RS"]}`},
 		// A key with JSON-significant characters must be escaped as a string, not
 		// interpolated — the key is caller data.
 		{"quoted key", Eq(`a"b`, "v"), `{"Eq":["a\"b",{"Str":"v"}]}`},
