@@ -103,8 +103,11 @@ jobs:
       #
       # No NODE_AUTH_TOKEN: authentication is via OIDC trusted publishing, configured at
       # npmjs.com → @duckedup/nidus → Settings → Trusted Publishing (org: duckedup,
-      # repo: nidus, workflow: sdk-js-release.yml). Provenance is emitted automatically.
-      # Keep this filename stable — the trusted publisher is keyed to it.
+      # repo: nidus). Provenance is emitted automatically.
+      #
+      # The configured workflow MUST be `release.yml`, not this file (nidus-bkt). npm
+      # validates the *calling* workflow's name under `workflow_call`, not the one holding
+      # the publish, so keying it here 404'd every release from #66 to 0.43.0.
       - name: Publish
         working-directory: sdks/js
         env:
@@ -115,7 +118,14 @@ jobs:
             echo "@duckedup/nidus ${VERSION} is already published — nothing to do"
             exit 0
           fi
-          npm publish
+          # npm reports an unauthorized write as 404, not 403, which reads as "package
+          # missing" and cost nidus-bkt four silent releases. Name the real cause.
+          if ! npm publish; then
+            echo "::error::npm publish failed. A 404 on PUT means UNAUTHORIZED, not missing:" \
+                 "check npmjs.com → @duckedup/nidus → Trusted Publishing names the CALLING" \
+                 "workflow (release.yml), not sdk-js-release.yml. See nidus-bkt."
+            exit 1
+          fi
 
       - name: Create tag and GitHub release
         env:
