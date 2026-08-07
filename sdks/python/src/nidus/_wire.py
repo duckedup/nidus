@@ -181,6 +181,7 @@ def search_body(
     query: Sequence[float],
     scope: Optional[Sequence[str]] = None,
     top_k: Optional[int] = None,
+    offset: Optional[int] = None,
     min_score: Optional[float] = None,
     filter: Optional[Filter] = None,  # noqa: A002
 ) -> dict[str, Any]:
@@ -188,13 +189,15 @@ def search_body(
 
     ``scope`` and ``filter`` are always sent, as ``[]`` when unset — an empty scope means
     "every collection" and an empty filter means "match everything", so the empty array is
-    the real value, not a missing one. ``top_k``/``min_score`` are pruned when unset.
+    the real value, not a missing one. ``top_k``/``offset``/``min_score`` are pruned when
+    unset, so an omitted ``offset`` is byte-identical to the pre-pagination request.
     """
     return prune(
         {
             "query": _guards.float_sequence(query, "search(query=...)"),
             "scope": _scope(scope),
             "top_k": top_k,
+            "offset": offset,
             "min_score": min_score,
             "filter": list(filter) if filter is not None else [],
         }
@@ -206,6 +209,7 @@ def text_search_body(
     query: str,
     scope: Optional[Sequence[str]] = None,
     top_k: Optional[int] = None,
+    offset: Optional[int] = None,
     min_score: Optional[float] = None,
     filter: Optional[Filter] = None,  # noqa: A002
 ) -> dict[str, Any]:
@@ -216,6 +220,7 @@ def text_search_body(
             "query": query,
             "scope": _scope(scope),
             "top_k": top_k,
+            "offset": offset,
             "min_score": min_score,
             "filter": list(filter) if filter is not None else [],
         }
@@ -228,6 +233,7 @@ def hybrid_search_body(
     text: str,
     scope: Optional[Sequence[str]] = None,
     top_k: Optional[int] = None,
+    offset: Optional[int] = None,
     filter: Optional[Filter] = None,  # noqa: A002
     rrf_k: Optional[float] = None,
     candidates: Optional[int] = None,
@@ -235,7 +241,7 @@ def hybrid_search_body(
     """Body for ``POST /hybrid-search`` (vector + BM25 fused via RRF).
 
     Note there is no ``min_score``: the score is a fused RRF rank, not a similarity, so
-    the server offers no floor for it.
+    the server offers no floor for it. ``offset`` pages the *fused* ranking.
     """
     return prune(
         {
@@ -244,6 +250,7 @@ def hybrid_search_body(
             "text": text,
             "scope": _scope(scope),
             "top_k": top_k,
+            "offset": offset,
             "filter": list(filter) if filter is not None else [],
             "rrf_k": rrf_k,
             "candidates": candidates,

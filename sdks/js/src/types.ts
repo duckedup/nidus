@@ -136,6 +136,8 @@ export interface SearchOptions {
   query: number[];
   scope?: string[];
   topK?: number;
+  /** Skip this many top-ranked hits, for pagination. `offset + topK` may not exceed 10000. */
+  offset?: number;
   minScore?: number;
   filter?: Filter;
 }
@@ -146,6 +148,8 @@ export interface TextSearchOptions {
   query: string;
   scope?: string[];
   topK?: number;
+  /** Skip this many top-ranked hits, for pagination. */
+  offset?: number;
   /** A raw BM25 score floor (not cosine). */
   minScore?: number;
   filter?: Filter;
@@ -158,6 +162,8 @@ export interface HybridSearchOptions {
   text: string;
   scope?: string[];
   topK?: number;
+  /** Skip this many hits of the *fused* ranking, for pagination. */
+  offset?: number;
   filter?: Filter;
   rrfK?: number;
   candidates?: number;

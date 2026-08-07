@@ -18,6 +18,29 @@ use crate::model::{
 };
 use crate::search::{TopK, dot, euclidean_neg_sq, normalize};
 
+/// The options a search *path* runs with: rank `offset + top_k` deep, then let the caller's
+/// single tail drop `offset`. `offset` is zeroed so no inner path can paginate a second time.
+fn deepened(opts: &SearchOpts) -> SearchOpts {
+    SearchOpts {
+        top_k: opts.offset.saturating_add(opts.top_k),
+        offset: 0,
+        ..opts.clone()
+    }
+}
+
+/// Drop the first `offset` ranked hits — the ONE place a page boundary is cut. An offset past
+/// the end is an empty page, never an error: a caller walking pages must be able to stop.
+fn paginate(mut hits: Vec<Hit>, offset: usize) -> Vec<Hit> {
+    if offset == 0 {
+        return hits;
+    }
+    if offset >= hits.len() {
+        return Vec::new();
+    }
+    hits.drain(..offset);
+    hits
+}
+
 impl Store {
     // ── Cheap accessors ─────────────────────────────────────────────────────────
 
@@ -308,44 +331,47 @@ impl Store {
             Distance::Euclidean => euclidean_neg_sq,
         };
 
-        // ANN path: walk the index for an over-fetched candidate set, then post-filter and
-        // rerank — recall traded for speed. A selective filter/scope can starve the walk, so
-        // `search_ann` falls back to an exact prefilter when survivors are few (nidus-0ou).
-        if self.ann.is_some() {
+        // Each branch ranks `offset + top_k` deep and hands the ranking to ONE tail that drops
+        // `offset`. Single-tail on purpose: a branch that paginated itself — or that applied the
+        // offset before the top-k cap — still compiles and is silently wrong (nidus-m50.8).
+        let deep = deepened(opts);
+        let ranked = if self.ann.is_some() {
+            // ANN: walk the index for an over-fetched candidate set, then post-filter and rerank —
+            // recall traded for speed. A selective filter/scope can starve the walk, so `search_ann`
+            // falls back to an exact prefilter when survivors are few (nidus-0ou).
             m.search_ann.inc();
-            return self.search_ann(collections, &q, opts, score_fn);
-        }
-
-        // Per-segment fan-out: walk each cold segment's IVF index and brute-force the tail (the
-        // active segment plus any sub-threshold sealed one), merged into one ranking (SPEC §14.3).
-        // Engaged only once a sealed segment has crossed `segment_index_min_rows`.
-        if self.seg_indexes.iter().any(Option::is_some) {
+            self.search_ann(collections, &q, &deep, score_fn)?
+        } else if self.seg_indexes.iter().any(Option::is_some) {
+            // Per-segment fan-out: walk each cold segment's IVF index and brute-force the tail (the
+            // active segment plus any sub-threshold sealed one), merged into one ranking (SPEC
+            // §14.3). Engaged only once a sealed segment has crossed `segment_index_min_rows`.
             m.search_segmented.inc();
-            return self.search_segmented(collections, &q, opts, score_fn);
-        }
+            self.search_segmented(collections, &q, &deep, score_fn)?
+        } else {
+            // Gather in-scope, filter-passing rows in physical-row order, for sequential `data`
+            // access (nidus-33k). `with_sorted_scan` reuses the cached whole-store order where it
+            // can, so the sort is not redone every query (nidus-dxt).
+            self.with_sorted_scan(collections, &deep.filter, |scan| {
+                // Only the brute-force paths reach here, which is exactly why the counter lives
+                // here: "rows scanned" is a meaningful cost on a linear scan and meaningless on
+                // an ANN walk, so counting it in one place keeps the metric honest.
+                m.search_vectors_scanned.add(scan.len() as u64);
 
-        // Gather in-scope, filter-passing rows in physical-row order, for sequential `data`
-        // access (nidus-33k). `with_sorted_scan` reuses the cached whole-store order where it can,
-        // so the sort is not redone every query (nidus-dxt).
-        self.with_sorted_scan(collections, &opts.filter, |scan| {
-            // Only the brute-force paths reach here, which is exactly why the counter lives
-            // here: "rows scanned" is a meaningful cost on a linear scan and meaningless on
-            // an ANN walk, so counting it in one place keeps the metric honest.
-            m.search_vectors_scanned.add(scan.len() as u64);
+                // Decide once whether this query splits across workers (configured threads +
+                // enough scan work to amortize spawn cost).
+                let workers = self.parallel_workers(scan.len());
 
-            // Decide once whether this query splits across workers (configured threads +
-            // enough scan work to amortize spawn cost).
-            let workers = self.parallel_workers(scan.len());
-
-            // Two-pass quantized search if enabled and the quantized matrix is populated;
-            // otherwise the standard exact f32 brute-force path.
-            if let Some(res) = self.search_quantized(&q, scan, opts, score_fn, workers) {
-                m.search_quantized.inc();
-                return res;
-            }
-            m.search_exact.inc();
-            self.rank_scan(&q, scan, score_fn, opts)
-        })
+                // Two-pass quantized search if enabled and the quantized matrix is populated;
+                // otherwise the standard exact f32 brute-force path.
+                if let Some(res) = self.search_quantized(&q, scan, &deep, score_fn, workers) {
+                    m.search_quantized.inc();
+                    return res;
+                }
+                m.search_exact.inc();
+                self.rank_scan(&q, scan, score_fn, &deep)
+            })?
+        };
+        Ok(paginate(ranked, opts.offset))
     }
 
     /// Full-text (BM25) search over `collections`, reusing the same `Hit`/`Filter`/top-k
@@ -360,7 +386,8 @@ impl Store {
         if opts.top_k == 0 {
             return Ok(Vec::new());
         }
-        let mut topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
+        // Same shape as `search`: rank `offset + top_k` deep, cut the page in one place at the end.
+        let mut topk: TopK<(&str, &str)> = TopK::new(opts.offset.saturating_add(opts.top_k));
         // Analyze the query text once per distinct field language across the scope
         // (collections usually share one), not once per collection.
         let mut analyzed: HashMap<Language, Vec<String>> = HashMap::new();
@@ -392,15 +419,8 @@ impl Store {
                 topk.offer(score, (col_name, id));
             }
         }
-        let mut hits = self.hits_from_topk(topk);
-        hits.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.collection.cmp(&b.collection))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        Ok(hits)
+        // `TopK` already resolves ties on `(collection, id)`, so no re-sort is needed here.
+        Ok(paginate(self.hits_from_topk(topk), opts.offset))
     }
 
     /// Hybrid search: fuse a vector and a BM25 leg with Reciprocal Rank Fusion. Each leg runs
@@ -421,9 +441,10 @@ impl Store {
         if opts.top_k == 0 {
             return Ok(Vec::new());
         }
-        // Pull each leg at least `top_k` deep so fusion can fill `top_k`.
+        // Pull each leg at least a full page deep (`offset + top_k`) so fusion can fill it.
+        let page = opts.offset.saturating_add(opts.top_k);
         let leg_opts = SearchOpts {
-            top_k: opts.candidates.max(opts.top_k),
+            top_k: opts.candidates.max(page),
             filter: opts.filter.clone(),
             ..Default::default()
         };
@@ -435,7 +456,10 @@ impl Store {
             vec![FusionLeg::new(vector_leg), FusionLeg::new(text_leg)],
             opts.rrf_k,
         );
-        let mut hits: Vec<Hit> = fused.into_iter().map(|(hit, _per_leg)| hit).collect();
+        let hits: Vec<Hit> = fused.into_iter().map(|(hit, _per_leg)| hit).collect();
+        // The page is cut on the *fused* ranking, never per leg — a leg's rank is an input to
+        // the fused score, so paginating a leg would change which documents fuse at all.
+        let mut hits = paginate(hits, opts.offset);
         hits.truncate(opts.top_k);
         Ok(hits)
     }

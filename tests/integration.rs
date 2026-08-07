@@ -477,3 +477,47 @@ fn nested_filters_and_containment_through_the_store() {
         vec!["a", "b", "d"]
     );
 }
+
+/// Paging through a public `search` from a consumer's seat: the pages tile the ranking, an
+/// offset past the end stops the walk, and the default page is what it always was.
+#[test]
+fn search_pagination_walks_the_ranking_once() {
+    let mut db = Nidus::open_in_memory(3).unwrap();
+    db.create_collection("c").unwrap();
+    let recs: Vec<Record> = (0..7)
+        .map(|i| rec(&format!("d{i}"), vec![1.0, i as f32 * 0.1, 0.0], "file"))
+        .collect();
+    db.upsert("c", &recs).unwrap();
+    let q = [1.0, 0.0, 0.0];
+
+    let mut walked: Vec<String> = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = db
+            .search(
+                "c",
+                &q,
+                &SearchOpts {
+                    top_k: 3,
+                    offset,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        walked.extend(page.iter().map(|h| h.id.clone()));
+        offset += 3;
+    }
+    assert_eq!(walked, ["d0", "d1", "d2", "d3", "d4", "d5", "d6"]);
+
+    // The default page is untouched by the new knob.
+    let default_page: Vec<String> = db
+        .search("c", &q, &opts(3))
+        .unwrap()
+        .iter()
+        .map(|h| h.id.clone())
+        .collect();
+    assert_eq!(default_page, ["d0", "d1", "d2"]);
+}

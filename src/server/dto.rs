@@ -28,12 +28,13 @@ pub(super) fn default_top_k() -> usize {
     10
 }
 
-/// The largest `top_k` any request surface accepts. Past this a request is an allocation
-/// demand rather than a query — no store returns ten thousand hits usefully — and the
-/// bounded top-k kernel would otherwise be handed a `k` it must defend against itself.
+/// The largest `offset + top_k` any request surface accepts. Past this a request is an
+/// allocation demand rather than a query — no store returns ten thousand hits usefully — and
+/// the bounded top-k kernel would otherwise be handed a `k` it must defend against itself.
 pub(super) const MAX_TOP_K: usize = 10_000;
 
-/// Body of `POST /search`. An empty `scope` searches every collection.
+/// Body of `POST /search`. An empty `scope` searches every collection; `offset` skips
+/// that many top-ranked hits, for pagination.
 #[derive(Debug, Deserialize)]
 pub struct SearchRequest {
     pub query: Vec<f32>,
@@ -41,6 +42,8 @@ pub struct SearchRequest {
     pub scope: Vec<String>,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
+    #[serde(default)]
+    pub offset: usize,
     #[serde(default)]
     pub min_score: Option<f32>,
     #[serde(default)]
@@ -69,6 +72,8 @@ pub struct TextSearchRequest {
     pub scope: Vec<String>,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
+    #[serde(default)]
+    pub offset: usize,
     /// A raw BM25 score floor (not cosine).
     #[serde(default)]
     pub min_score: Option<f32>,
@@ -86,6 +91,8 @@ pub struct HybridSearchRequest {
     pub scope: Vec<String>,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
+    #[serde(default)]
+    pub offset: usize,
     #[serde(default)]
     pub filter: Filter,
     #[serde(default = "default_rrf_k")]

@@ -252,6 +252,8 @@ async fn recall_with<E: Embedder>(
         },
         filter: opts.filter.clone().unwrap_or_default(),
         min_score: (opts.min_score > 0.0).then_some(opts.min_score),
+        // No `offset` on `RecallOpts` by design (nidus-m50.15): the memory API stays lean.
+        ..Default::default()
     };
     db.search(collection, &query, &search_opts)
 }

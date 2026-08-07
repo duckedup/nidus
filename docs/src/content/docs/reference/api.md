@@ -55,7 +55,7 @@ searchers plus one writer (see
 | Method | Signature | Notes |
 | ------ | --------- | ----- |
 | `list` | `fn list<'a>(&self, scope: impl Into<Scope<'a>>, opts: &ListOpts) -> Result<Vec<Hit>>` | Metadata-only query — no vector, returns filter-matched records in insertion order; `ListOpts`'s `offset`/`limit` paginate. |
-| `search` | `fn search<'a>(&self, scope: impl Into<Scope<'a>>, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>` | Ranked search over a scope using the store's distance metric. |
+| `search` | `fn search<'a>(&self, scope: impl Into<Scope<'a>>, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>` | Ranked search over a scope using the store's distance metric; `SearchOpts`'s `offset`/`top_k` paginate. |
 | `text_search` | `fn text_search<'a>(&self, scope: impl Into<Scope<'a>>, query: &FtsQuery, opts: &SearchOpts) -> Result<Vec<Hit>>` | [BM25 full-text search](/guides/search/#full-text-search-bm25); `min_score` is a raw BM25 floor. |
 | `hybrid_search` | `fn hybrid_search<'a>(&self, scope: impl Into<Scope<'a>>, vector: &[f32], text: &FtsQuery, opts: &HybridOpts) -> Result<Vec<Hit>>` | [Hybrid vector + BM25](/guides/search/#hybrid-search-rrf), fused with Reciprocal Rank Fusion. |
 | `flush` | `fn flush(&mut self) -> Result<()>` | Force an fsync (relevant under `Fsync::OnFlush`). |
@@ -185,13 +185,19 @@ For all metrics, higher score = more relevant.
 ```rust
 pub struct SearchOpts {
     pub top_k: usize,            // maximum number of results
+    pub offset: usize,           // top-ranked results to skip, for pagination
     pub filter: Filter,          // pre-scoring metadata filter
     pub min_score: Option<f32>,  // drop results below this score
 }
 ```
 
-Implements `Default` — `SearchOpts { top_k: 5, ..Default::default() }` is the
-idiomatic call. Reused by `text_search`, where `min_score` is a raw BM25 floor.
+Implements `Default` (`offset: 0`) — `SearchOpts { top_k: 5, ..Default::default() }`
+is the idiomatic call. Reused by `text_search`, where `min_score` is a raw BM25 floor.
+
+Results are ordered by `(score desc, collection, id)`. The ranking is computed
+`offset + top_k` deep and the page cut once, at the end; an `offset` past the last
+result is an empty `Vec`, not an error. See
+[paginating a search](/guides/search/#paginating-a-search).
 
 ## `FtsQuery` & `Language`
 
@@ -217,14 +223,15 @@ with Reciprocal Rank Fusion).
 ```rust
 pub struct HybridOpts {
     pub top_k: usize,      // final result count
+    pub offset: usize,     // fused results to skip, for pagination
     pub filter: Filter,    // applied to both legs
     pub rrf_k: f32,        // RRF rank-bias constant (default 60)
     pub candidates: usize, // depth pulled per leg before fusing (default 100)
 }
 ```
 
-Implements `Default` (`top_k: 10`). There is no `min_score` — a fused RRF score has no
-absolute scale.
+Implements `Default` (`top_k: 10`, `offset: 0`). `offset` pages the **fused** ranking,
+never a leg. There is no `min_score` — a fused RRF score has no absolute scale.
 
 ## `ListOpts`
 

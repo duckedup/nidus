@@ -366,6 +366,45 @@ func TestSearchOmitsZeroTopK(t *testing.T) {
 	}
 }
 
+// TestSearchPaginationOffsetIsAdditive pins the new knob against the promise that a
+// client which never sets it sends byte-identical requests: a zero Offset is omitted
+// (the server's own default), and a set one travels in the server's spelling.
+func TestSearchPaginationOffsetIsAdditive(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}, TopK: 5}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); strings.Contains(body, "offset") {
+		t.Errorf("body = %s, must not mention offset when Offset is 0", body)
+	}
+
+	if _, err := db.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}, TopK: 5, Offset: 10}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"query":[1,0,0],"top_k":5,"offset":10}` {
+		t.Errorf("body = %s, want offset:10", body)
+	}
+
+	if _, err := db.TextSearch(ctx, TextSearchRequest{Field: "body", Query: "fox", Offset: 3}); err != nil {
+		t.Fatalf("TextSearch failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"field":"body","query":"fox","offset":3}` {
+		t.Errorf("body = %s, want offset:3", body)
+	}
+
+	if _, err := db.HybridSearch(ctx, HybridSearchRequest{
+		Vector: []float32{1, 0, 0}, Field: "body", Text: "fox", Offset: 3,
+	}); err != nil {
+		t.Fatalf("HybridSearch failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"vector":[1,0,0],"field":"body","text":"fox","offset":3}` {
+		t.Errorf("body = %s, want offset:3", body)
+	}
+}
+
 // TestListOmitsZeroLimit — same trap on /list, where the server's default limit is
 // 100. Offset's default is 0 so omitting a zero offset is harmless, but it is
 // asserted here too so the whole body is pinned rather than half of it.

@@ -182,6 +182,7 @@ export class NidusClient {
       query: opts.query,
       scope: opts.scope ?? [],
       top_k: opts.topK,
+      offset: opts.offset,
       min_score: opts.minScore,
       filter: opts.filter ?? [],
     });
@@ -194,6 +195,7 @@ export class NidusClient {
       query: opts.query,
       scope: opts.scope ?? [],
       top_k: opts.topK,
+      offset: opts.offset,
       min_score: opts.minScore,
       filter: opts.filter ?? [],
     });
@@ -207,6 +209,7 @@ export class NidusClient {
       text: opts.text,
       scope: opts.scope ?? [],
       top_k: opts.topK,
+      offset: opts.offset,
       filter: opts.filter ?? [],
       rrf_k: opts.rrfK,
       candidates: opts.candidates,

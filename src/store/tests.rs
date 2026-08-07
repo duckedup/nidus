@@ -2382,6 +2382,7 @@ fn ann_selective_filter_respects_min_score() {
         top_k: 10,
         filter: rare_filter(),
         min_score: Some(0.99), // essentially only a near-identical vector clears this
+        ..Default::default()
     };
     let hits = ann.search(&["col"], &data[0], &opts).unwrap();
     assert!(hits.iter().all(|h| h.score >= 0.99));
@@ -4769,4 +4770,223 @@ fn golden_fixture() -> (Store, Vec<f32>, FtsQuery) {
         vec![1.0, 0.0, 0.0],
         FtsQuery::new("body", "quantum physics"),
     )
+}
+
+// ── Pagination (nidus-m50.8) ───────────────────────────────────────────────
+
+/// Ten docs whose cosine scores against `[1, 0, 0]` are strictly decreasing in `d0..d9`,
+/// so the expected ranking is known without recomputing it.
+fn ranked_store() -> Store {
+    let mut store = Store::in_memory(3).unwrap();
+    let recs: Vec<Record> = (0..10)
+        .map(|i| rec(&format!("d{i}"), vec![1.0, i as f32 * 0.1, 0.0]))
+        .collect();
+    store.upsert("docs", &recs).unwrap();
+    store
+}
+
+fn ids(hits: &[crate::model::Hit]) -> Vec<String> {
+    hits.iter().map(|h| h.id.clone()).collect()
+}
+
+fn page(top_k: usize, offset: usize) -> SearchOpts {
+    SearchOpts {
+        top_k,
+        offset,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn search_pages_partition_the_ranking() {
+    let store = ranked_store();
+    let q = [1.0, 0.0, 0.0];
+    let first = store.search(&["docs"], &q, &page(3, 0)).unwrap();
+    let second = store.search(&["docs"], &q, &page(3, 3)).unwrap();
+    let both = store.search(&["docs"], &q, &page(6, 0)).unwrap();
+
+    assert_eq!(ids(&first).len(), 3);
+    assert_eq!(ids(&second).len(), 3);
+    // Page 1 ++ page 2 is exactly the top 6 — no gap, no overlap, no reordering.
+    let joined: Vec<String> = ids(&first).into_iter().chain(ids(&second)).collect();
+    assert_eq!(joined, ids(&both));
+    assert_eq!(joined, vec!["d0", "d1", "d2", "d3", "d4", "d5"]);
+}
+
+#[test]
+fn search_offset_past_the_result_set_is_an_empty_page() {
+    let store = ranked_store();
+    let q = [1.0, 0.0, 0.0];
+    // Past the ranking entirely, and past it by exactly one — both are empty, not an error.
+    assert!(
+        store
+            .search(&["docs"], &q, &page(5, 10))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .search(&["docs"], &q, &page(5, 1_000))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.search(&["docs"], &q, &page(5, 9)).unwrap().len(), 1);
+}
+
+#[test]
+fn search_with_the_default_offset_is_unchanged() {
+    let store = ranked_store();
+    let q = [1.0, 0.0, 0.0];
+    let implicit = store.search(&["docs"], &q, &default_opts(4)).unwrap();
+    let explicit = store.search(&["docs"], &q, &page(4, 0)).unwrap();
+    assert_eq!(ids(&implicit), ids(&explicit));
+    assert_eq!(ids(&implicit), vec!["d0", "d1", "d2", "d3"]);
+}
+
+#[test]
+fn a_zero_top_k_page_is_empty_at_any_offset() {
+    let store = ranked_store();
+    let q = [1.0, 0.0, 0.0];
+    assert!(store.search(&["docs"], &q, &page(0, 0)).unwrap().is_empty());
+    assert!(store.search(&["docs"], &q, &page(0, 3)).unwrap().is_empty());
+}
+
+/// Every doc scores identically here, so only the tie-break decides the ranking — which is
+/// exactly the case that made pagination incoherent before the total order.
+#[test]
+fn tied_scores_paginate_without_repeating_or_dropping_a_doc() {
+    let mut store = Store::in_memory(3).unwrap();
+    let recs: Vec<Record> = ["e", "c", "a", "f", "b", "d"]
+        .iter()
+        .map(|id| rec(id, vec![1.0, 0.0, 0.0]))
+        .collect();
+    store.upsert("docs", &recs).unwrap();
+    let q = [1.0, 0.0, 0.0];
+
+    let mut walked: Vec<String> = Vec::new();
+    for offset in [0, 2, 4] {
+        walked.extend(ids(&store.search(&["docs"], &q, &page(2, offset)).unwrap()));
+    }
+    assert_eq!(walked, vec!["a", "b", "c", "d", "e", "f"]);
+}
+
+/// The same query must give the same page every time, or a caller paging through a static
+/// store sees documents move between pages.
+#[test]
+fn tied_scores_are_stable_across_repeated_searches() {
+    let mut store = Store::in_memory(3).unwrap();
+    let recs: Vec<Record> = (0..12)
+        .map(|i| rec(&format!("t{i:02}"), vec![1.0, 0.0, 0.0]))
+        .collect();
+    store.upsert("docs", &recs).unwrap();
+    let q = [1.0, 0.0, 0.0];
+
+    let first = ids(&store.search(&["docs"], &q, &page(4, 4)).unwrap());
+    assert_eq!(first, vec!["t04", "t05", "t06", "t07"]);
+    for _ in 0..20 {
+        assert_eq!(
+            ids(&store.search(&["docs"], &q, &page(4, 4)).unwrap()),
+            first
+        );
+    }
+}
+
+/// Ties across collections break on the collection name first, then the id.
+#[test]
+fn tied_scores_break_on_collection_before_id() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert("zeta", &[rec("a", vec![1.0, 0.0, 0.0])])
+        .unwrap();
+    store
+        .upsert("alpha", &[rec("z", vec![1.0, 0.0, 0.0])])
+        .unwrap();
+    let hits = store
+        .search(&["zeta", "alpha"], &[1.0, 0.0, 0.0], &page(2, 0))
+        .unwrap();
+    assert_eq!(hits[0].collection, "alpha");
+    assert_eq!(hits[1].collection, "zeta");
+}
+
+#[test]
+fn text_search_paginates() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[("body".to_string(), Language::English)])
+        .unwrap();
+    // Term frequency decreasing in i, so BM25 ranks t0 .. t5 in order.
+    let recs: Vec<Record> = (0..6)
+        .map(|i| doc(&format!("t{i}"), &"quantum ".repeat(6 - i)))
+        .collect();
+    store.upsert("docs", &recs).unwrap();
+
+    let q = FtsQuery::new("body", "quantum");
+    let first = store.text_search(&["docs"], &q, &page(2, 0)).unwrap();
+    let second = store.text_search(&["docs"], &q, &page(2, 2)).unwrap();
+    let both = store.text_search(&["docs"], &q, &page(4, 0)).unwrap();
+    let joined: Vec<String> = ids(&first).into_iter().chain(ids(&second)).collect();
+    assert_eq!(joined, ids(&both));
+    assert!(
+        store
+            .text_search(&["docs"], &q, &page(2, 99))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+// BM25's `ln` is non-deterministic under Miri by design, so a fused ranking can reorder by
+// an ULP there — the same reason `hybrid_search_is_deterministic` is ignored.
+#[cfg_attr(miri, ignore)]
+fn hybrid_search_paginates_the_fused_ranking() {
+    let (store, vector, text) = golden_fixture();
+    let full = store
+        .hybrid_search(
+            &["docs"],
+            &vector,
+            &text,
+            &HybridOpts {
+                top_k: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let second = store
+        .hybrid_search(
+            &["docs"],
+            &vector,
+            &text,
+            &HybridOpts {
+                top_k: 2,
+                offset: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(ids(&second), ids(&full)[2..4].to_vec());
+
+    let past_the_end = store
+        .hybrid_search(
+            &["docs"],
+            &vector,
+            &text,
+            &HybridOpts {
+                top_k: 3,
+                offset: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(past_the_end.is_empty());
+}
+
+/// The page must be cut *after* the top-k cap. Deepening by `offset` is what makes page 2
+/// exist at all: rank only `top_k` deep first and it would be empty.
+#[test]
+fn a_page_past_the_first_is_not_starved_by_the_top_k_cap() {
+    let store = ranked_store();
+    let hits = store
+        .search(&["docs"], &[1.0, 0.0, 0.0], &page(2, 6))
+        .unwrap();
+    assert_eq!(ids(&hits), vec!["d6", "d7"]);
 }

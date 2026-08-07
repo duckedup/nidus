@@ -326,6 +326,10 @@ impl FtsQuery {
 pub struct SearchOpts {
     /// Maximum number of results.
     pub top_k: usize,
+    /// How many top-ranked results to skip before collecting, for pagination. The ranking is
+    /// still computed `offset + top_k` deep, and a page is stable only against an unchanging
+    /// store (SPEC §7).
+    pub offset: usize,
     /// Pre-scoring metadata filter (applied before the dot product).
     pub filter: Filter,
     /// Drop results scoring below this cosine similarity.
@@ -358,6 +362,9 @@ impl Default for ListOpts {
 pub struct HybridOpts {
     /// Final result count after fusion.
     pub top_k: usize,
+    /// How many fused results to skip before collecting, for pagination. Applied *after*
+    /// fusion, so a page boundary falls on the fused ranking (SPEC §7).
+    pub offset: usize,
     /// Metadata filter applied to *both* legs before fusion.
     pub filter: Filter,
     /// RRF rank-bias constant `k`: larger flattens the weight of top ranks. Default 60.
@@ -371,6 +378,7 @@ impl Default for HybridOpts {
     fn default() -> Self {
         Self {
             top_k: 10,
+            offset: 0,
             filter: Filter::default(),
             rrf_k: 60.0,
             candidates: 100,

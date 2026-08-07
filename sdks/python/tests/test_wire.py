@@ -202,18 +202,31 @@ def test_search_body_sends_an_explicit_zero_min_score() -> None:
     assert _wire.search_body([1.0], min_score=0.25)["min_score"] == 0.25
 
 
+def test_search_body_paginates_with_an_optional_offset() -> None:
+    """``offset`` is additive: omitted, the body is byte-identical to the pre-pagination one."""
+    assert "offset" not in _wire.search_body([1.0], top_k=5)
+    assert _wire.search_body([1.0], top_k=5, offset=0)["offset"] == 0
+    assert _wire.search_body([1.0], top_k=5, offset=20)["offset"] == 20
+    assert "offset" not in _wire.text_search_body("body", "fox")
+    assert _wire.text_search_body("body", "fox", offset=3)["offset"] == 3
+    assert "offset" not in _wire.hybrid_search_body([1.0], "body", "fox")
+    assert _wire.hybrid_search_body([1.0], "body", "fox", offset=3)["offset"] == 3
+
+
 def test_search_body_full() -> None:
     """Every option set, in the server's ``snake_case`` spelling."""
     assert _wire.search_body(
         [1.0, 0.0, 0.0],
         scope=["docs"],
         top_k=5,
+        offset=10,
         min_score=0.1,
         filter=f.and_(f.eq("lang", "rust")),
     ) == {
         "query": [1.0, 0.0, 0.0],
         "scope": ["docs"],
         "top_k": 5,
+        "offset": 10,
         "min_score": 0.1,
         "filter": [{"Eq": ["lang", {"Str": "rust"}]}],
     }

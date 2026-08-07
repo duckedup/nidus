@@ -66,6 +66,7 @@ use nidus::SearchOpts;
 
 let opts = SearchOpts {
     top_k: 10,             // keep at most this many hits
+    offset: 0,             // skip this many top-ranked hits (pagination)
     min_score: Some(0.5),  // drop anything below this score (None = no floor)
     ..Default::default()
 };
@@ -74,6 +75,40 @@ let opts = SearchOpts {
 
 `top_k` is enforced by a bounded heap, so memory stays flat regardless of how
 many rows are scored.
+
+Results are ordered by **score descending, then `collection`, then `id`**. That
+tie-break is a guarantee, not a coincidence: it makes a query against an unchanged
+store return the same ranking every time, which is what lets you page through it.
+
+## Paginating a search
+
+`offset` skips that many top-ranked hits, so successive pages tile one ranking with
+no gap and no overlap. It works the same on `search`, `text_search`, and
+`hybrid_search`.
+
+```rust
+use nidus::SearchOpts;
+
+let query = vec![0.1_f32; 384];
+let page1 = db.search("code", &query, &SearchOpts { top_k: 20, ..Default::default() })?;
+let page2 = db.search(
+    "code",
+    &query,
+    &SearchOpts { top_k: 20, offset: 20, ..Default::default() },
+)?;
+# anyhow::Ok(())
+```
+
+Things worth knowing:
+
+- The ranking is computed `offset + top_k` deep, so a later page costs a little more
+  than the first. `offset + top_k` may not exceed **10 000** over HTTP — past that a
+  request is refused with a `400` rather than quietly shortened.
+- An `offset` past the end returns an **empty** list, not an error. That is the signal
+  to stop walking.
+- For `hybrid_search` the page is cut on the *fused* ranking, never on one leg.
+- A page is stable only against an **unchanging** store. Concurrent upserts and deletes
+  shift the ranking, so a document can move between pages during a paged walk.
 
 ## Typed metadata
 
@@ -389,8 +424,8 @@ let hits = db.text_search(
   at index and query time. The `Language` enum is the seam for further languages.
 - **What gets indexed.** `Str` attrs are indexed directly; `List` attrs are indexed
   per element. A document only lives in a field's index while it has text there.
-- **`SearchOpts`.** `top_k` and `filter` work exactly as for vector search; here
-  `min_score` is a **raw BM25** floor (not a cosine one). Results are tie-broken by
+- **`SearchOpts`.** `top_k`, `offset`, and `filter` work exactly as for vector search;
+  here `min_score` is a **raw BM25** floor (not a cosine one). Results are tie-broken by
   `(collection, id)` for determinism.
 - **Text-only documents.** A `Record` may carry no vector (`Record::text_only`) — a
   pure full-text document. It is found by `text_search` and never by vector `search`.
@@ -417,9 +452,9 @@ let hits = db.hybrid_search(
 RRF fuses by **rank position**, not raw score, so the incomparable scales of cosine
 (or euclidean/dot-product) and unbounded BM25 never need normalizing, and a document
 that surfaces in only one leg (a strong vector match with weak text, or a text-only
-doc) is still ranked. `HybridOpts` exposes `top_k`, a `filter` applied to both legs,
-`rrf_k` (the rank-bias constant, default 60), and `candidates` (how deep each leg is
-pulled before fusing, default 100). There is no `min_score` — a fused RRF score has no
+doc) is still ranked. `HybridOpts` exposes `top_k`, `offset` (which pages the fused
+ranking, never a leg), a `filter` applied to both legs, `rrf_k` (the rank-bias constant,
+default 60), and `candidates` (how deep each leg is pulled before fusing, default 100). There is no `min_score` — a fused RRF score has no
 absolute scale; threshold the individual legs via `search` / `text_search` if you need
 a floor.
 

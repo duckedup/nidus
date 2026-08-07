@@ -175,6 +175,22 @@ describe("NidusClient request shaping", () => {
     });
   });
 
+  it("omits offset when unset and sends it on every paginated search when set", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    // Unset: byte-identical to a client that predates pagination.
+    await db.search({ query: [1, 0, 0], topK: 5 });
+    expect(calls[0]!.json).toEqual({ query: [1, 0, 0], scope: [], top_k: 5, filter: [] });
+
+    await db.search({ query: [1, 0, 0], topK: 5, offset: 10 });
+    expect(calls[1]!.json).toMatchObject({ top_k: 5, offset: 10 });
+    await db.textSearch({ field: "body", query: "fox", offset: 3 });
+    expect(calls[2]!.json).toMatchObject({ offset: 3 });
+    await db.hybridSearch({ vector: [1, 0, 0], field: "body", text: "fox", offset: 3 });
+    expect(calls[3]!.json).toMatchObject({ offset: 3 });
+  });
+
   it("sends search with camelCase mapped to snake_case and decodes hit attrs", async () => {
     const { fn, calls } = mockFetch([
       { collection: "docs", id: "a", score: 0.9, attrs: { lang: { Str: "rust" } } },

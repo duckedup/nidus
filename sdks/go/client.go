@@ -327,7 +327,8 @@ func (c *Client) SetFtsSchema(ctx context.Context, name string, fields []string)
 // An empty [SearchRequest.Scope] searches every collection and merges the results into
 // one ranking — sound because a store has a single embedding space. Leave TopK zero to
 // take the server's default rather than asking for zero results; see the note in
-// types.go on the omit-vs-zero trap.
+// types.go on the omit-vs-zero trap. Offset skips that many top-ranked hits, so
+// successive pages tile the ranking; Offset+TopK may not exceed 10000.
 func (c *Client) Search(ctx context.Context, req SearchRequest) ([]Hit, error) {
 	return c.hits(ctx, "/search", req)
 }

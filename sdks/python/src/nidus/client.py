@@ -177,13 +177,25 @@ class NidusClient:
         query: Sequence[float],
         scope: Optional[Sequence[str]] = None,
         top_k: Optional[int] = None,
+        offset: Optional[int] = None,
         min_score: Optional[float] = None,
         filter: Optional[Filter] = None,  # noqa: A002
     ) -> Hits:
-        """Vector (cosine) nearest-neighbour search. An empty ``scope`` searches everything."""
+        """Vector (cosine) nearest-neighbour search. An empty ``scope`` searches everything.
+
+        ``offset`` skips that many top-ranked hits, so successive pages tile one ranking;
+        the server refuses ``offset + top_k`` above 10000.
+        """
         return self._search(
             _wire.SEARCH,
-            _wire.search_body(query, scope=scope, top_k=top_k, min_score=min_score, filter=filter),
+            _wire.search_body(
+                query,
+                scope=scope,
+                top_k=top_k,
+                offset=offset,
+                min_score=min_score,
+                filter=filter,
+            ),
         )
 
     def text_search(
@@ -193,14 +205,21 @@ class NidusClient:
         query: str,
         scope: Optional[Sequence[str]] = None,
         top_k: Optional[int] = None,
+        offset: Optional[int] = None,
         min_score: Optional[float] = None,
         filter: Optional[Filter] = None,  # noqa: A002
     ) -> Hits:
-        """BM25 full-text search over one indexed field."""
+        """BM25 full-text search over one indexed field, paginated by ``offset``."""
         return self._search(
             _wire.TEXT_SEARCH,
             _wire.text_search_body(
-                field, query, scope=scope, top_k=top_k, min_score=min_score, filter=filter
+                field,
+                query,
+                scope=scope,
+                top_k=top_k,
+                offset=offset,
+                min_score=min_score,
+                filter=filter,
             ),
         )
 
@@ -212,11 +231,16 @@ class NidusClient:
         text: str,
         scope: Optional[Sequence[str]] = None,
         top_k: Optional[int] = None,
+        offset: Optional[int] = None,
         filter: Optional[Filter] = None,  # noqa: A002
         rrf_k: Optional[float] = None,
         candidates: Optional[int] = None,
     ) -> Hits:
-        """Hybrid search: fuse a vector query and a BM25 text query via RRF."""
+        """Hybrid search: fuse a vector query and a BM25 text query via RRF.
+
+        ``offset`` pages the *fused* ranking, never a leg — a leg's rank is an input to
+        the fused score.
+        """
         return self._search(
             _wire.HYBRID_SEARCH,
             _wire.hybrid_search_body(
@@ -225,6 +249,7 @@ class NidusClient:
                 text,
                 scope=scope,
                 top_k=top_k,
+                offset=offset,
                 filter=filter,
                 rrf_k=rrf_k,
                 candidates=candidates,

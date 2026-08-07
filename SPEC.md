@@ -208,7 +208,8 @@ pub enum Scope<'a> {
 }
 // impl From<&str> / From<&[&str]> for Scope — ergonomic single- and multi-collection calls.
 
-pub struct SearchOpts { pub top_k: usize, pub filter: Filter, pub min_score: Option<f32> }
+// `offset` skips that many top-ranked hits (§7 pagination); 0 is the whole first page.
+pub struct SearchOpts { pub top_k: usize, pub offset: usize, pub filter: Filter, pub min_score: Option<f32> }
 
 // `collection` identifies the source namespace — required when a query spans more
 // than one, and (id) is only unique within a collection.
@@ -543,6 +544,28 @@ reliable guard there is to refuse work *before* allocating:
   `f32::total_cmp`, and `NaN` is treated as the lowest possible score so it never
   displaces a real result. `normalize` leaves a zero / non-finite / near-zero
   (`< ~1e-12`) vector unchanged, so it scores 0 against everything.
+- **Ranking is a total order — a contract, not an implementation detail.** Results are
+  ordered by `(score descending, collection ascending, id ascending)`. The tie-break is
+  applied *inside* the bounded heap, not only when sorting the survivors, so which of two
+  equal-scoring documents is retained at the `k` boundary does not depend on the order the
+  scan happened to visit them in. Every ranked surface obeys it: vector `search`, BM25
+  `text_search`, the RRF fusion in `hybrid_search`, and the ANN / per-segment paths.
+  Consequence, and the reason it is stated here: the same query against an unchanged store
+  returns the same ranking every time, which is what makes pagination coherent.
+- **Pagination is offset/limit** (`SearchOpts::offset` + `top_k`, `HybridOpts::offset`,
+  `ListOpts::offset` + `limit`) — deliberately *not* an opaque cursor. A search ranks
+  `offset + top_k` deep and then drops the first `offset`; the drop happens in exactly one
+  place, after the top-k cap, because applying it before would silently return a short page.
+  For hybrid search the cut is on the **fused** ranking, never on a leg: a leg's rank is an
+  input to the fused score, so paginating a leg would change which documents fuse at all.
+  An `offset` past the end of the results is an empty page, not an error — a caller walking
+  pages must be able to stop. `offset + top_k` is bounded by 10 000 at the HTTP boundary,
+  and exceeding it is a `400`, never a clamp (a shortened page is indistinguishable from
+  the end of the results). The memory API's `RecallOpts` deliberately has no `offset`.
+  > Stability caveat: a page is stable only against an **unchanging** store. Concurrent
+  > upserts and deletes shift the ranking, so a document can move between pages or be
+  > seen twice across a paged walk. Offset/limit cannot deliver more than that, and
+  > pretending otherwise with a cursor would only hide where the guarantee ends.
 - **Filters** (`Filter` = AND of `Predicate`s) are evaluated against `attrs` before
   scoring: `Eq` (typed equality), `Ne` (typed inequality), `Glob` / `IGlob` (pattern
   match on a `Str` attr, case-sensitive and ASCII-case-insensitive, §7.1), `In` /

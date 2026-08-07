@@ -311,20 +311,28 @@ curl -s localhost:7700/search \
 | `query` | — (required) | query vector; length must equal the store dimension |
 | `scope` | all collections | collection names to search |
 | `top_k` | `10` | maximum hits to return |
+| `offset` | `0` | top-ranked hits to skip, for pagination |
 | `min_score` | none | drop hits scoring below this similarity |
 | `filter` | none | AND of predicates applied before scoring |
 
-Returns hits sorted by descending score:
+Returns hits ordered by `(score desc, collection, id)` — the tie-break is a guarantee,
+which is what makes paging coherent:
 
 ```json
 [{"collection": "docs", "id": "a", "score": 1.0, "attrs": {"lang": {"Str": "rust"}}}]
 ```
 
+`offset` pages one ranking: `{"top_k": 20}` then `{"top_k": 20, "offset": 20}` tiles it
+with no gap and no overlap. An `offset` past the last hit returns `[]` rather than an
+error. `offset + top_k` may not exceed **10 000** — beyond that the request is a `400`,
+never a silently shortened page. A page is stable only against an unchanging store;
+concurrent writes shift the ranking under a paged walk.
+
 ### `POST /text-search`
 
 BM25 full-text search of a declared field. Returns the same hit shape as `/search`.
-Takes `field`, `query`, `scope`, `top_k`, `filter`, and `min_score` — here a **raw
-BM25** floor (not cosine).
+Takes `field`, `query`, `scope`, `top_k`, `offset`, `filter`, and `min_score` — here a
+**raw BM25** floor (not cosine).
 
 ```bash
 curl -s localhost:7700/text-search \
@@ -335,8 +343,8 @@ curl -s localhost:7700/text-search \
 ### `POST /hybrid-search`
 
 Fuse a vector query and a BM25 text query with Reciprocal Rank Fusion. Takes `vector`
-+ `field` + `text`, plus `top_k`, `filter`, `rrf_k` (default 60), and `candidates`
-(default 100). There is no `min_score` (a fused RRF score has no absolute scale).
++ `field` + `text`, plus `top_k`, `offset` (which pages the **fused** ranking, never a
+leg), `filter`, `rrf_k` (default 60), and `candidates` (default 100). There is no `min_score` (a fused RRF score has no absolute scale).
 Returns the same hit shape as `/search`.
 
 ```bash

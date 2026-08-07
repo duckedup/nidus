@@ -13,9 +13,9 @@
 // "does the server treat a zero as a real value":
 //
 //   - TopK, Limit and Offset are plain ints. Asking for zero results is not a thing
-//     anyone means, so letting 0 stand for "unset" loses nothing — and sending
-//     "top_k": 0 would be the silent empty-result bug this whole scheme exists to
-//     prevent.
+//     anyone means, and a zero Offset is the server's own default, so letting 0 stand
+//     for "unset" loses nothing — and sending "top_k": 0 would be the silent
+//     empty-result bug this whole scheme exists to prevent.
 //   - MinScore, RRFK and Candidates are pointers, because for all three the server's
 //     zero is meaningful: a score floor of exactly 0; an RRF constant of 0 (the
 //     server fuses with 1/(rrf_k + rank + 1), src/store/read.rs, so 0 is the
@@ -120,6 +120,7 @@ type SearchRequest struct {
 	Query    []float32 `json:"query"`
 	Scope    []string  `json:"scope,omitempty"`
 	TopK     int       `json:"top_k,omitempty"`     // 0 takes the server's default
+	Offset   int       `json:"offset,omitempty"`    // skip this many top-ranked hits
 	MinScore *float32  `json:"min_score,omitempty"` // nil is "no floor"; &0 is a floor of zero
 	Filter   Filter    `json:"filter,omitempty"`
 }
@@ -133,6 +134,7 @@ type TextSearchRequest struct {
 	Query    string   `json:"query"`
 	Scope    []string `json:"scope,omitempty"`
 	TopK     int      `json:"top_k,omitempty"`
+	Offset   int      `json:"offset,omitempty"`
 	MinScore *float32 `json:"min_score,omitempty"`
 	Filter   Filter   `json:"filter,omitempty"`
 }
@@ -151,6 +153,7 @@ type HybridSearchRequest struct {
 	Text       string    `json:"text"`
 	Scope      []string  `json:"scope,omitempty"`
 	TopK       int       `json:"top_k,omitempty"`
+	Offset     int       `json:"offset,omitempty"`
 	Filter     Filter    `json:"filter,omitempty"`
 	RRFK       *float32  `json:"rrf_k,omitempty"`
 	Candidates *int      `json:"candidates,omitempty"`

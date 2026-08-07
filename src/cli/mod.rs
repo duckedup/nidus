@@ -552,6 +552,9 @@ enum Command {
         query_file: Option<PathBuf>,
         #[arg(long, short = 'k', default_value_t = 10)]
         top_k: usize,
+        /// Skip this many top-ranked hits before returning (pagination).
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Drop hits scoring below this cosine similarity.
         #[arg(long)]
         min_score: Option<f32>,
@@ -600,6 +603,9 @@ enum Command {
         collections: Vec<String>,
         #[arg(long, short = 'k', default_value_t = 10)]
         top_k: usize,
+        /// Skip this many top-ranked hits before returning (pagination).
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Drop hits scoring below this raw BM25 score.
         #[arg(long)]
         min_score: Option<f32>,
@@ -623,6 +629,9 @@ enum Command {
         collections: Vec<String>,
         #[arg(long, short = 'k', default_value_t = 10)]
         top_k: usize,
+        /// Skip this many top-ranked fused hits before returning (pagination).
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// AND-filter as JSON, applied to both legs.
         #[arg(long = "where")]
         filter: Option<String>,
@@ -754,6 +763,7 @@ pub fn run(cli: Cli) -> Result<()> {
             collections,
             query_file,
             top_k,
+            offset,
             min_score,
             filter,
         } => {
@@ -765,6 +775,7 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             let opts = SearchOpts {
                 top_k,
+                offset,
                 min_score,
                 filter,
             };
@@ -822,6 +833,7 @@ pub fn run(cli: Cli) -> Result<()> {
             query,
             collections,
             top_k,
+            offset,
             min_score,
             filter,
         } => {
@@ -832,6 +844,7 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             let opts = SearchOpts {
                 top_k,
+                offset,
                 min_score,
                 filter,
             };
@@ -852,6 +865,7 @@ pub fn run(cli: Cli) -> Result<()> {
             query_file,
             collections,
             top_k,
+            offset,
             filter,
             rrf_k,
             candidates,
@@ -864,6 +878,7 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             let opts = HybridOpts {
                 top_k,
+                offset,
                 filter,
                 rrf_k,
                 candidates,

@@ -657,17 +657,19 @@ async fn search(
     State(st): State<AppState>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
-    check_top_k(req.top_k)?;
+    check_page(req.offset, req.top_k)?;
     let hits = run_read(st, move |db| {
         let SearchRequest {
             query,
             scope,
             top_k,
+            offset,
             min_score,
             filter,
         } = req;
         let opts = SearchOpts {
             top_k,
+            offset,
             min_score,
             filter,
         };
@@ -732,18 +734,20 @@ async fn text_search(
     State(st): State<AppState>,
     Json(req): Json<TextSearchRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
-    check_top_k(req.top_k)?;
+    check_page(req.offset, req.top_k)?;
     let hits = run_read(st, move |db| {
         let TextSearchRequest {
             field,
             query,
             scope,
             top_k,
+            offset,
             min_score,
             filter,
         } = req;
         let opts = SearchOpts {
             top_k,
+            offset,
             min_score,
             filter,
         };
@@ -758,7 +762,7 @@ async fn hybrid_search(
     State(st): State<AppState>,
     Json(req): Json<HybridSearchRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
-    check_top_k(req.top_k)?;
+    check_page(req.offset, req.top_k)?;
     let hits = run_read(st, move |db| {
         let HybridSearchRequest {
             vector,
@@ -766,12 +770,14 @@ async fn hybrid_search(
             text,
             scope,
             top_k,
+            offset,
             filter,
             rrf_k,
             candidates,
         } = req;
         let opts = HybridOpts {
             top_k,
+            offset,
             filter,
             rrf_k,
             candidates,
@@ -888,7 +894,7 @@ async fn recall(
     Path(name): Path<String>,
     Json(req): Json<RecallRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
-    check_top_k(req.top_k)?;
+    check_page(0, req.top_k)?;
     let embedder = st.embedder.clone().ok_or_else(missing_embedder_error)?;
 
     let RecallRequest {
@@ -907,6 +913,7 @@ async fn recall(
         top_k,
         min_score,
         filter,
+        ..Default::default()
     };
     let hits = run_read(st, move |db| {
         crate::memory::guard_recall_identity(db, embedder.as_ref(), &name)?;
@@ -1003,12 +1010,14 @@ impl ApiError {
     }
 }
 
-/// Refuse an absurd `top_k` at the edge (nidus-m50.17): a `k` in the billions is a bad
-/// request, not a deep query, and nothing downstream should have to survive one.
-fn check_top_k(top_k: usize) -> Result<(), ApiError> {
-    if top_k > MAX_TOP_K {
+/// Refuse an absurd page at the edge (nidus-m50.17, nidus-m50.8). The bound is on
+/// `offset + top_k`, since that is how deep the ranking is actually computed — and it is a
+/// refusal, not a clamp: a silently shortened page would look like the end of the results.
+fn check_page(offset: usize, top_k: usize) -> Result<(), ApiError> {
+    let depth = offset.saturating_add(top_k);
+    if depth > MAX_TOP_K {
         return Err(ApiError::bad_request(anyhow::anyhow!(
-            "top_k {top_k} exceeds the maximum of {MAX_TOP_K}"
+            "offset {offset} + top_k {top_k} exceeds the maximum of {MAX_TOP_K}"
         )));
     }
     Ok(())
@@ -1243,6 +1252,82 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(json_body(resp).await[0]["id"], "a");
+    }
+
+    /// The bound is on how deep the ranking is computed, so a legal `top_k` with an offset
+    /// that pushes past the ceiling is refused — and refused, not clamped, because a
+    /// silently shortened page is indistinguishable from the end of the results.
+    #[tokio::test]
+    async fn an_offset_that_pushes_past_the_maximum_is_a_bad_request() {
+        let app = test_router(3);
+        for (path, body) in [
+            (
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": 10, "offset": MAX_TOP_K}),
+            ),
+            (
+                "/text-search",
+                json!({"field": "body", "query": "x", "top_k": 1, "offset": MAX_TOP_K}),
+            ),
+            (
+                "/hybrid-search",
+                json!({"vector": [1, 0, 0], "field": "body", "text": "x", "offset": MAX_TOP_K}),
+            ),
+        ] {
+            let resp = app.clone().oneshot(post(path, body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+            let err = json_body(resp).await["error"].as_str().unwrap().to_string();
+            assert!(err.contains("offset"), "{path}: {err}");
+        }
+        // Exactly at the ceiling still searches.
+        let resp = app
+            .oneshot(post(
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": 10, "offset": MAX_TOP_K - 10}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// `offset` is additive: omitting it must behave exactly as before it existed, and
+    /// supplying it must cut the same ranking into non-overlapping pages.
+    #[tokio::test]
+    async fn search_offset_paginates_over_http() {
+        let app = test_router(3);
+        for (i, id) in ["a", "b", "c", "d"].iter().enumerate() {
+            app.clone()
+                .oneshot(post(
+                    "/collections/docs/upsert",
+                    json!({"records": [{"id": id, "vector": [1.0, i as f32 * 0.1, 0.0], "attrs": {}}]}),
+                ))
+                .await
+                .unwrap();
+        }
+        let hits = |body: JsonValue| {
+            let app = app.clone();
+            async move {
+                let resp = app.oneshot(post("/search", body)).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                json_body(resp).await
+            }
+        };
+
+        let implicit = hits(json!({"query": [1, 0, 0], "top_k": 2})).await;
+        let explicit = hits(json!({"query": [1, 0, 0], "top_k": 2, "offset": 0})).await;
+        assert_eq!(implicit, explicit, "an omitted offset is offset 0");
+        assert_eq!(implicit[0]["id"], "a");
+
+        let second = hits(json!({"query": [1, 0, 0], "top_k": 2, "offset": 2})).await;
+        assert_eq!(second[0]["id"], "c");
+        assert_eq!(second[1]["id"], "d");
+
+        let past_the_end = hits(json!({"query": [1, 0, 0], "top_k": 2, "offset": 99})).await;
+        assert_eq!(
+            past_the_end,
+            json!([]),
+            "an offset past the end is an empty page"
+        );
     }
 
     /// Before the store opens — a standby awaiting promotion — liveness must answer while
