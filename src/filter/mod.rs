@@ -1,7 +1,12 @@
 //! Filter evaluation against a record's attributes. Contract: see the root `SPEC.md` §7, §7.1.
 
+mod pattern;
+mod text;
+
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+
+use anyhow::{Context, Result, bail};
 
 use crate::model::{Filter, Predicate, Value};
 
@@ -108,6 +113,39 @@ fn matches_one(predicate: &Predicate, attrs: &BTreeMap<String, Value>) -> bool {
         Predicate::All(preds) => preds.iter().all(|p| matches_one(p, attrs)),
         Predicate::Any(preds) => preds.iter().any(|p| matches_one(p, attrs)),
         Predicate::Not(pred) => !matches_one(pred, attrs),
+        Predicate::Fuzzy(key, needle, max_edits) => text::fuzzy(attrs.get(key), needle, *max_edits),
+        Predicate::ContainsAllTokens(key, query) => {
+            text::contains_all_tokens(attrs.get(key), query)
+        }
+        Predicate::ContainsAnyToken(key, query) => text::contains_any_token(attrs.get(key), query),
+        Predicate::ContainsTokenSequence(key, query) => {
+            text::contains_token_sequence(attrs.get(key), query)
+        }
+        Predicate::Regex(key, p) => pattern::regex_matches(attrs.get(key), p),
+    }
+}
+
+/// Prepare a filter once per query, before any row is scanned: reject what cannot be honoured
+/// as written, and compile every `Regex` into the pattern cache so the per-record path never
+/// pays a compile. Every public `Nidus` query method calls this first.
+pub(crate) fn validate(filter: &Filter) -> Result<()> {
+    filter.0.iter().try_for_each(validate_one)
+}
+
+/// Recurses through the boolean groups exactly as `matches_one` does, so a nested predicate
+/// is prepared too. Depth is bounded by the same serde_json nesting cap.
+fn validate_one(predicate: &Predicate) -> Result<()> {
+    match predicate {
+        Predicate::Fuzzy(key, _, max_edits) if *max_edits > text::MAX_FUZZY_EDITS => bail!(
+            "Fuzzy on `{key}` allows {max_edits} edits, above the maximum of {}",
+            text::MAX_FUZZY_EDITS
+        ),
+        Predicate::Regex(key, p) => pattern::compile(p)
+            .map(|_| ())
+            .with_context(|| format!("Regex on `{key}`")),
+        Predicate::All(preds) | Predicate::Any(preds) => preds.iter().try_for_each(validate_one),
+        Predicate::Not(pred) => validate_one(pred),
+        _ => Ok(()),
     }
 }
 
@@ -1195,5 +1233,432 @@ mod tests {
         ]);
         let bytes = bincode::serialize(&f).unwrap();
         assert_eq!(bincode::deserialize::<Filter>(&bytes).unwrap(), f);
+    }
+
+    // ── Fuzzy (nidus-m50.9) ──────────────────────────────────────────────────────
+
+    fn fuzzy(key: &str, needle: &str, n: usize) -> Filter {
+        filter(vec![Predicate::Fuzzy(key.into(), needle.into(), n)])
+    }
+
+    #[test]
+    fn fuzzy_zero_edits_is_exact_equality() {
+        let a = attrs(&[("id", Value::Str("nidus".into()))]);
+        assert!(matches(&fuzzy("id", "nidus", 0), &a));
+        assert!(!matches(&fuzzy("id", "nidua", 0), &a));
+    }
+
+    #[test]
+    fn fuzzy_substitution_at_the_budget_boundary() {
+        let a = attrs(&[("id", Value::Str("nidus".into()))]);
+        assert!(!matches(&fuzzy("id", "nidux", 0), &a));
+        assert!(matches(&fuzzy("id", "nidux", 1), &a));
+    }
+
+    #[test]
+    fn fuzzy_insertion_at_the_budget_boundary() {
+        let a = attrs(&[("id", Value::Str("colour".into()))]);
+        assert!(!matches(&fuzzy("id", "color", 0), &a));
+        assert!(matches(&fuzzy("id", "color", 1), &a));
+    }
+
+    #[test]
+    fn fuzzy_deletion_at_the_budget_boundary() {
+        let a = attrs(&[("id", Value::Str("color".into()))]);
+        assert!(!matches(&fuzzy("id", "colour", 0), &a));
+        assert!(matches(&fuzzy("id", "colour", 1), &a));
+    }
+
+    #[test]
+    fn fuzzy_transposition_needs_two_edits() {
+        // Plain Levenshtein, not Damerau — a swap is a delete plus an insert.
+        let a = attrs(&[("word", Value::Str("form".into()))]);
+        assert!(!matches(&fuzzy("word", "from", 1), &a));
+        assert!(matches(&fuzzy("word", "from", 2), &a));
+    }
+
+    #[test]
+    fn fuzzy_folds_ascii_case_on_both_sides() {
+        let a = attrs(&[("id", Value::Str("NidusStore".into()))]);
+        assert!(matches(&fuzzy("id", "nidusstore", 0), &a));
+        assert!(matches(&fuzzy("id", "NIDUSSTORF", 1), &a));
+    }
+
+    #[test]
+    fn fuzzy_does_not_fold_non_ascii() {
+        let a = attrs(&[("id", Value::Str("café".into()))]);
+        assert!(matches(&fuzzy("id", "CAFé", 0), &a));
+        assert!(!matches(&fuzzy("id", "CAFÉ", 0), &a));
+    }
+
+    #[test]
+    fn fuzzy_looks_inside_a_list_and_matches_any_element() {
+        let a = attrs(&[("tags", Value::List(vec!["rust".into(), "postgres".into()]))]);
+        assert!(matches(&fuzzy("tags", "postgre", 1), &a));
+        assert!(!matches(&fuzzy("tags", "postgre", 0), &a));
+        assert!(!matches(&fuzzy("tags", "elixir", 1), &a));
+    }
+
+    #[test]
+    fn fuzzy_absent_key_and_wrong_types_never_match() {
+        let a = attrs(&[
+            ("n", Value::Int(5)),
+            ("b", Value::Bool(true)),
+            ("nul", Value::Null),
+        ]);
+        assert!(!matches(&fuzzy("missing", "", 8), &a));
+        assert!(!matches(&fuzzy("n", "5", 8), &a));
+        assert!(!matches(&fuzzy("b", "true", 8), &a));
+        assert!(!matches(&fuzzy("nul", "", 8), &a));
+    }
+
+    #[test]
+    fn fuzzy_length_gap_beyond_the_budget_fails() {
+        let a = attrs(&[("id", Value::Str("ab".into()))]);
+        assert!(!matches(&fuzzy("id", "abcdefgh", 3), &a));
+        assert!(matches(&fuzzy("id", "abcdefgh", 6), &a));
+    }
+
+    // ── Token predicates (nidus-m50.9) ───────────────────────────────────────────
+
+    #[test]
+    fn contains_all_tokens_is_order_free() {
+        let a = attrs(&[("body", Value::Str("the quick brown fox".into()))]);
+        assert!(matches(
+            &filter(vec![Predicate::ContainsAllTokens(
+                "body".into(),
+                "fox quick".into()
+            )]),
+            &a
+        ));
+        assert!(!matches(
+            &filter(vec![Predicate::ContainsAllTokens(
+                "body".into(),
+                "fox hound".into()
+            )]),
+            &a
+        ));
+    }
+
+    #[test]
+    fn contains_all_tokens_folds_case_and_ignores_punctuation() {
+        let a = attrs(&[("body", Value::Str("Hello, World!".into()))]);
+        assert!(matches(
+            &filter(vec![Predicate::ContainsAllTokens(
+                "body".into(),
+                "world HELLO".into()
+            )]),
+            &a
+        ));
+    }
+
+    #[test]
+    fn contains_all_tokens_matches_whole_tokens_not_substrings() {
+        let a = attrs(&[("body", Value::Str("rustacean".into()))]);
+        assert!(!matches(
+            &filter(vec![Predicate::ContainsAllTokens(
+                "body".into(),
+                "rust".into()
+            )]),
+            &a
+        ));
+    }
+
+    #[test]
+    fn contains_all_tokens_with_an_empty_query_matches_any_present_text() {
+        let a = attrs(&[
+            ("body", Value::Str("anything".into())),
+            ("n", Value::Int(1)),
+        ]);
+        assert!(matches(
+            &filter(vec![Predicate::ContainsAllTokens("body".into(), "".into())]),
+            &a
+        ));
+        // Still a leaf: the key must be present and text-bearing.
+        assert!(!matches(
+            &filter(vec![Predicate::ContainsAllTokens("n".into(), "".into())]),
+            &a
+        ));
+        assert!(!matches(
+            &filter(vec![Predicate::ContainsAllTokens(
+                "missing".into(),
+                "".into()
+            )]),
+            &a
+        ));
+    }
+
+    #[test]
+    fn contains_any_token_needs_one_hit_and_an_empty_query_never_matches() {
+        let a = attrs(&[("body", Value::Str("the quick brown fox".into()))]);
+        assert!(matches(
+            &filter(vec![Predicate::ContainsAnyToken(
+                "body".into(),
+                "hound fox".into()
+            )]),
+            &a
+        ));
+        assert!(!matches(
+            &filter(vec![Predicate::ContainsAnyToken(
+                "body".into(),
+                "hound wolf".into()
+            )]),
+            &a
+        ));
+        assert!(!matches(
+            &filter(vec![Predicate::ContainsAnyToken("body".into(), "".into())]),
+            &a
+        ));
+    }
+
+    #[test]
+    fn contains_token_sequence_requires_order_and_adjacency() {
+        let a = attrs(&[("body", Value::Str("the quick brown fox".into()))]);
+        assert!(matches(
+            &filter(vec![Predicate::ContainsTokenSequence(
+                "body".into(),
+                "quick brown".into()
+            )]),
+            &a
+        ));
+        // Same tokens, wrong order.
+        assert!(!matches(
+            &filter(vec![Predicate::ContainsTokenSequence(
+                "body".into(),
+                "brown quick".into()
+            )]),
+            &a
+        ));
+        // In order but not adjacent.
+        assert!(!matches(
+            &filter(vec![Predicate::ContainsTokenSequence(
+                "body".into(),
+                "quick fox".into()
+            )]),
+            &a
+        ));
+    }
+
+    #[test]
+    fn contains_token_sequence_longer_than_the_text_fails() {
+        let a = attrs(&[("body", Value::Str("quick fox".into()))]);
+        assert!(!matches(
+            &filter(vec![Predicate::ContainsTokenSequence(
+                "body".into(),
+                "the quick brown fox".into()
+            )]),
+            &a
+        ));
+    }
+
+    #[test]
+    fn token_predicates_look_inside_a_list_element_wise() {
+        let a = attrs(&[(
+            "notes",
+            Value::List(vec!["quick brown".into(), "lazy dog".into()]),
+        )]);
+        // One element carries the whole phrase.
+        assert!(matches(
+            &filter(vec![Predicate::ContainsTokenSequence(
+                "notes".into(),
+                "quick brown".into()
+            )]),
+            &a
+        ));
+        // A phrase never spans two elements, and neither does "all tokens".
+        assert!(!matches(
+            &filter(vec![Predicate::ContainsTokenSequence(
+                "notes".into(),
+                "brown lazy".into()
+            )]),
+            &a
+        ));
+        assert!(!matches(
+            &filter(vec![Predicate::ContainsAllTokens(
+                "notes".into(),
+                "brown dog".into()
+            )]),
+            &a
+        ));
+        assert!(matches(
+            &filter(vec![Predicate::ContainsAnyToken(
+                "notes".into(),
+                "dog".into()
+            )]),
+            &a
+        ));
+    }
+
+    #[test]
+    fn token_predicates_reject_absent_keys_and_non_text_values() {
+        let a = attrs(&[("n", Value::Int(42)), ("nul", Value::Null)]);
+        for p in [
+            Predicate::ContainsAllTokens("n".into(), "42".into()),
+            Predicate::ContainsAnyToken("n".into(), "42".into()),
+            Predicate::ContainsTokenSequence("n".into(), "42".into()),
+            Predicate::ContainsAllTokens("nul".into(), "x".into()),
+            Predicate::ContainsAnyToken("missing".into(), "x".into()),
+            Predicate::ContainsTokenSequence("missing".into(), "x".into()),
+        ] {
+            assert!(!matches(&filter(vec![p.clone()]), &a), "{p:?} matched");
+        }
+    }
+
+    #[test]
+    fn the_text_predicates_compose_with_not() {
+        // `Not` negates a truth value, so it flips an absent key to true — the leaf
+        // predicates stay false there. Same asymmetry as §7.3, retested for the new leaves.
+        let a = attrs(&[("other", Value::Int(1))]);
+        assert!(!matches(&fuzzy("id", "nidus", 1), &a));
+        assert!(matches(
+            &filter(vec![Predicate::Not(Box::new(Predicate::Fuzzy(
+                "id".into(),
+                "nidus".into(),
+                1
+            )))]),
+            &a
+        ));
+    }
+
+    // ── Validation: the fuzzy edit ceiling (nidus-m50.9) ─────────────────────────
+
+    #[test]
+    fn a_fuzzy_budget_at_the_ceiling_validates() {
+        let f = fuzzy("id", "nidus", super::text::MAX_FUZZY_EDITS);
+        assert!(super::validate(&f).is_ok());
+    }
+
+    #[test]
+    fn a_fuzzy_budget_over_the_ceiling_is_an_error_not_a_clamp() {
+        let f = fuzzy("id", "nidus", super::text::MAX_FUZZY_EDITS + 1);
+        let err = super::validate(&f).unwrap_err().to_string();
+        assert!(err.contains("Fuzzy"), "{err}");
+        assert!(err.contains("id"), "{err}");
+    }
+
+    #[test]
+    fn an_over_budget_fuzzy_nested_in_a_group_is_still_caught() {
+        let bad = Predicate::Fuzzy("id".into(), "nidus".into(), 99);
+        let f = filter(vec![Predicate::Not(Box::new(Predicate::Any(vec![
+            Predicate::Eq("k".into(), Value::Int(1)),
+            Predicate::All(vec![bad]),
+        ])))]);
+        assert!(super::validate(&f).is_err());
+    }
+
+    #[test]
+    fn validation_passes_a_filter_with_no_fuzzy_predicate() {
+        let f = filter(vec![
+            Predicate::ContainsAllTokens("body".into(), "a b".into()),
+            Predicate::Eq("k".into(), Value::Int(1)),
+        ]);
+        assert!(super::validate(&f).is_ok());
+    }
+
+    // ── Predicate variant indices (the bincode back-compat contract) ─────────────
+
+    #[test]
+    fn appending_predicates_did_not_renumber_the_existing_ones() {
+        // bincode tags an enum by its declaration index, and clients hard-code filters, so
+        // a new Predicate must only ever be appended. Inserting one silently reinterprets
+        // every filter already in flight.
+        for (want_index, predicate) in [
+            (0u32, Predicate::Eq("k".into(), Value::Null)),
+            (1, Predicate::Ne("k".into(), Value::Null)),
+            (2, Predicate::Glob("k".into(), "*".into())),
+            (3, Predicate::IGlob("k".into(), "*".into())),
+            (4, Predicate::In("k".into(), vec![])),
+            (5, Predicate::NotIn("k".into(), vec![])),
+            (6, Predicate::Lt("k".into(), Value::Int(0))),
+            (7, Predicate::Le("k".into(), Value::Int(0))),
+            (8, Predicate::Gt("k".into(), Value::Int(0))),
+            (9, Predicate::Ge("k".into(), Value::Int(0))),
+            (10, Predicate::Contains("k".into(), Value::Null)),
+            (11, Predicate::NotContains("k".into(), Value::Null)),
+            (12, Predicate::ContainsAny("k".into(), vec![])),
+            (13, Predicate::All(vec![])),
+            (14, Predicate::Any(vec![])),
+            (15, Predicate::Not(Box::new(Predicate::All(vec![])))),
+            (16, Predicate::Fuzzy("k".into(), "s".into(), 1)),
+            (17, Predicate::ContainsAllTokens("k".into(), "s".into())),
+            (18, Predicate::ContainsAnyToken("k".into(), "s".into())),
+            (19, Predicate::ContainsTokenSequence("k".into(), "s".into())),
+            (20, Predicate::Regex("k".into(), "s".into())),
+        ] {
+            let bytes = bincode::serialize(&predicate).unwrap();
+            let tag = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            assert_eq!(tag, want_index, "variant index moved for {predicate:?}");
+        }
+    }
+
+    #[test]
+    fn the_text_predicates_round_trip_through_serde() {
+        let f = filter(vec![
+            Predicate::Fuzzy("a".into(), "nidus".into(), 2),
+            Predicate::ContainsAllTokens("b".into(), "quick brown".into()),
+            Predicate::ContainsAnyToken("c".into(), "fox hound".into()),
+            Predicate::ContainsTokenSequence("d".into(), "lazy dog".into()),
+            Predicate::Regex("e".into(), "(?i)^v[0-9]+$".into()),
+        ]);
+        let bytes = bincode::serialize(&f).unwrap();
+        assert_eq!(bincode::deserialize::<Filter>(&bytes).unwrap(), f);
+    }
+
+    // ── Regex (nidus-m50.9) ──────────────────────────────────────────────────────
+
+    fn regex(key: &str, p: &str) -> Filter {
+        filter(vec![Predicate::Regex(key.into(), p.into())])
+    }
+
+    #[test]
+    fn regex_is_anchored_at_both_ends_like_glob() {
+        let a = attrs(&[("path", Value::Str("src/store/read.rs".into()))]);
+        assert!(matches(&regex("path", "src/.*\\.rs"), &a));
+        // A bare substring does not match; `.*` opts back in.
+        assert!(!matches(&regex("path", "store"), &a));
+        assert!(matches(&regex("path", ".*store.*"), &a));
+    }
+
+    #[test]
+    fn regex_case_sensitivity_is_the_patterns_own_flag() {
+        let a = attrs(&[("file", Value::Str("README.md".into()))]);
+        assert!(!matches(&regex("file", "readme\\.md"), &a));
+        assert!(matches(&regex("file", "(?i)readme\\.md"), &a));
+    }
+
+    #[test]
+    fn regex_looks_inside_a_list() {
+        let a = attrs(&[("tags", Value::List(vec!["v1".into(), "beta".into()]))]);
+        assert!(matches(&regex("tags", "v[0-9]+"), &a));
+        assert!(!matches(&regex("tags", "v[0-9]{2}"), &a));
+    }
+
+    #[test]
+    fn regex_absent_key_and_non_text_values_never_match() {
+        let a = attrs(&[("n", Value::Int(42)), ("nul", Value::Null)]);
+        assert!(!matches(&regex("missing", ".*"), &a));
+        assert!(!matches(&regex("n", ".*"), &a));
+        assert!(!matches(&regex("nul", ".*"), &a));
+    }
+
+    #[test]
+    fn an_invalid_regex_is_a_validation_error() {
+        let err = super::validate(&regex("path", "(unclosed"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Regex on `path`"), "{err}");
+    }
+
+    #[test]
+    fn an_invalid_regex_nested_in_a_group_is_still_caught() {
+        let f = filter(vec![Predicate::Not(Box::new(Predicate::Any(vec![
+            Predicate::Regex("k".into(), "[".into()),
+        ])))]);
+        assert!(super::validate(&f).is_err());
+    }
+
+    #[test]
+    fn a_valid_regex_validates() {
+        assert!(super::validate(&regex("path", "src/[a-z_]+\\.rs")).is_ok());
     }
 }

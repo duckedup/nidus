@@ -292,6 +292,24 @@ pub enum Predicate {
     /// predicates on an absent key: `Not(Eq(k, v))` is true when `k` is missing, whereas
     /// `Ne(k, v)` is false. Use `Ne`/`NotIn`/`NotContains` to require presence.
     Not(Box<Predicate>),
+    /// `attrs[key]` is within N Levenshtein edits of the string, ASCII-case-folded on both
+    /// sides. A `List` matches if any element does. An N above `MAX_FUZZY_EDITS` (8) is an
+    /// error, not a clamp.
+    Fuzzy(String, String, usize),
+    /// Every token of the query text appears among `attrs[key]`'s tokens, in any order. A
+    /// `List` matches if any single element does. Tokens are ASCII-case-folded runs of
+    /// alphanumerics — see `SPEC.md` §7.4.
+    ContainsAllTokens(String, String),
+    /// At least one token of the query text appears among `attrs[key]`'s tokens. An empty
+    /// query never matches, the identity [`Predicate::Any`] and `In` already take.
+    ContainsAnyToken(String, String),
+    /// The query's tokens appear consecutively and in order in `attrs[key]` — a phrase
+    /// match. A `List` matches if any single element carries the whole phrase.
+    ContainsTokenSequence(String, String),
+    /// `attrs[key]` matches the regular expression, **anchored at both ends** like `Glob`
+    /// (`.*` opts back into a substring search). Case folding is the pattern's own `(?i)`.
+    /// An unparseable pattern is a caller-facing error — see `SPEC.md` §7.5.
+    Regex(String, String),
 }
 
 /// A conjunction (AND) of predicates. An empty filter matches everything. Arbitrary

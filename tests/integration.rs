@@ -521,3 +521,119 @@ fn search_pagination_walks_the_ranking_once() {
         .collect();
     assert_eq!(default_page, ["d0", "d1", "d2"]);
 }
+
+#[test]
+fn text_predicates_through_the_store() {
+    fn doc(id: &str, title: &str, tags: &[&str]) -> Record {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("title".to_string(), Value::Str(title.to_string()));
+        attrs.insert(
+            "tags".to_string(),
+            Value::List(tags.iter().map(|s| s.to_string()).collect()),
+        );
+        Record::new(id, vec![1.0, 0.0, 0.0], attrs)
+    }
+
+    let mut db = Nidus::open_in_memory(3).unwrap();
+    db.create_collection("c").unwrap();
+    db.upsert(
+        "c",
+        &[
+            doc("a", "The quick brown fox", &["rust", "search"]),
+            doc("b", "A brown quick hound", &["golang"]),
+            doc("c", "Postgres vector notes", &["postgres"]),
+        ],
+    )
+    .unwrap();
+
+    let listed = |f: Filter| {
+        db.list(
+            "c",
+            &ListOpts {
+                filter: f,
+                ..Default::default()
+            },
+        )
+        .map(|hits| {
+            let mut v: Vec<String> = hits.into_iter().map(|h| h.id).collect();
+            v.sort();
+            v
+        })
+    };
+    let ids = |f: Filter| listed(f).unwrap();
+
+    // Fuzzy reaches a half-remembered word, and looks inside the tag list.
+    assert_eq!(
+        ids(Filter(vec![Predicate::Fuzzy(
+            "tags".into(),
+            "postgre".into(),
+            1
+        )])),
+        ["c"]
+    );
+    assert!(
+        ids(Filter(vec![Predicate::Fuzzy(
+            "tags".into(),
+            "postgre".into(),
+            0
+        )]))
+        .is_empty()
+    );
+
+    // Token order is free for ContainsAllTokens, mandatory for the sequence.
+    assert_eq!(
+        ids(Filter(vec![Predicate::ContainsAllTokens(
+            "title".into(),
+            "brown quick".into()
+        )])),
+        ["a", "b"]
+    );
+    assert_eq!(
+        ids(Filter(vec![Predicate::ContainsTokenSequence(
+            "title".into(),
+            "quick brown".into()
+        )])),
+        ["a"]
+    );
+    assert_eq!(
+        ids(Filter(vec![Predicate::ContainsAnyToken(
+            "title".into(),
+            "hound postgres".into()
+        )])),
+        ["b", "c"]
+    );
+
+    // Regex is anchored, so the whole attribute must match; `(?i)` is the case switch.
+    assert_eq!(
+        ids(Filter(vec![Predicate::Regex(
+            "title".into(),
+            "(?i)the quick .* fox".into()
+        )])),
+        ["a"]
+    );
+    assert!(
+        ids(Filter(vec![Predicate::Regex(
+            "title".into(),
+            "quick brown".into()
+        )]))
+        .is_empty()
+    );
+
+    // An edit budget above the ceiling, and an unparseable pattern, are both errors.
+    let over = Filter(vec![Predicate::Fuzzy("title".into(), "fox".into(), 9)]);
+    assert!(listed(over.clone()).is_err());
+    assert!(listed(Filter(vec![Predicate::Regex("title".into(), "(".into())])).is_err());
+    assert!(
+        db.search(
+            "c",
+            &[1.0, 0.0, 0.0],
+            &SearchOpts {
+                top_k: 10,
+                filter: over.clone(),
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+    assert!(db.delete_where("c", &over).is_err());
+}
