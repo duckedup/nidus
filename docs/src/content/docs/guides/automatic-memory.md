@@ -121,16 +121,21 @@ hits=$(curl -sS --max-time 5 \
       }')" 2>/dev/null) || exit 0
 
 echo "$hits" | jq -r '
-  if (.hits | length) == 0 then empty else
+  if length == 0 then empty else
   "## Remembered context\n",
-  (.hits[] | "- [\(.attrs["kind"].Str // "note")] \(.attrs["nidus.text"].Str)")
-  end'
+  (.[] | "- [\(.attrs["kind"].Str // "note")] \(.attrs["nidus.text"].Str)")
+  end' || exit 0
 ```
 
-Two deliberate choices. It **fails open** — `|| exit 0` — because a memory store being
-down should degrade a session, never block one. And it sets a `min_score` floor, since
-recall always returns *something*; without a floor a fresh store pours unrelated text
-into every session.
+Note the response is a **bare JSON array**, not an object — `/recall` returns
+`[{ "collection", "id", "score", "attrs" }, …]` with no `hits` wrapper, the same shape
+as `/search` and `/text-search`. Indexing it as `.hits` is a jq type error, which under
+`set -euo pipefail` kills the hook on every run.
+
+Two deliberate choices. It **fails open** — note the `|| exit 0` on *both* the curl and
+the jq — because a memory store being down should degrade a session, never block one.
+And it sets a `min_score` floor, since recall always returns *something*; without a
+floor a fresh store pours unrelated text into every session.
 
 Register it:
 
@@ -176,12 +181,19 @@ curl -sS --max-time 5 -o /dev/null \
   -d "$(jq -nc --arg id "session-$session" --arg t "$text" --arg p "$(basename "$PWD")" '{
         id: $id,
         text: $t,
-        mode: "summarize",
+        mode: "raw",
         attrs: { project: { Str: $p }, kind: { Str: "session" } },
         ttl_seconds: 7776000,
         dedupe_threshold: 0.95
       }')" || true
 ```
+
+`mode: "raw"` embeds the text as given. `"summarize"` summarizes first and embeds the
+summary — better for a long transcript, but it **requires the server to have been
+started with `--summarize-provider`** (anthropic or openai, plus that provider's key).
+The `nidus serve` command above configures only an embedder, so a `"summarize"` write
+against it fails with *"nidus serve was started without a summarizer"*. Add the flag
+before switching the mode.
 
 The last two arguments are what keep the store from rotting:
 
@@ -223,7 +235,7 @@ curl -sS http://127.0.0.1:7700/collections/memories/recall \
       { "Eq": ["project", { "Str": "nidus" }] },
       { "Eq": ["kind",    { "Str": "decision" }] }
     ]
-  }' | jq '.hits[] | {score, id, text: .attrs["nidus.text"].Str}'
+  }' | jq '.[] | {score, id, text: .attrs["nidus.text"].Str}'
 ```
 
 ```json
