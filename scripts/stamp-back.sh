@@ -43,6 +43,10 @@ readonly MAX_ATTEMPTS=3
 # because the codes are not guaranteed to appear on every rejection path.
 readonly PROTECTION_RE='GH006|GH013|protected branch|Repository rule violations|required status check|Changes must be made through a pull request'
 
+# A rebase content conflict is NOT the race the retry loop exists for: `rebase --abort`
+# restores the same pre-conflict state, so every later attempt reproduces it identically.
+readonly CONFLICT_RE='CONFLICT|could not apply|Automatic merge failed|Resolve all conflicts'
+
 note() { echo "stamp-back($label): $*"; }
 
 summary() {
@@ -76,7 +80,8 @@ for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
 
     echo "$push_output"
 
-    if grep -qE "$PROTECTION_RE" <<<"$push_output"; then
+    if grep -qEi "$PROTECTION_RE" <<<"$push_output" || grep -qEi "$CONFLICT_RE" <<<"$push_output"; then
+        git rebase --abort 2>/dev/null || true
         break
     fi
 
@@ -95,7 +100,7 @@ done
 printf -v file_list '`%s`, ' "${files[@]}"
 file_list=${file_list%, }
 
-if grep -qE "$PROTECTION_RE" <<<"$push_output"; then
+if grep -qEi "$PROTECTION_RE" <<<"$push_output"; then
     echo "::error title=Stamp-back rejected by branch protection::main still holds a stale $label version. Published $version, but ${files[*]} was not updated. This is a repo-settings problem, not a race — it will fail identically on every release until fixed."
 
     summary <<EOF
@@ -129,6 +134,30 @@ EOF
     exit 0
 fi
 
+if grep -qEi "$CONFLICT_RE" <<<"$push_output"; then
+    echo "::error title=Stamp-back hit a rebase conflict::main still holds a stale $label version. Published $version, but ${files[*]} conflicts with main. Retrying cannot resolve this — re-run the job, or stamp by hand."
+
+    summary <<EOF
+### ⚠️ Stamp-back to \`main\` conflicted — $label
+
+**Published \`$version\` successfully.** The repository was *not* updated to match.
+
+$file_list conflicts with \`main\`, so the rebase could not replay the stamp commit.
+The published artifact is correct; only the repo is stale.
+
+Unlike a push race, **retrying in-place cannot fix this** — \`rebase --abort\` restores
+the same state, so every attempt reproduces the same conflict. Most likely two releases
+overlapped and both stamped the same file. Re-running the whole job (fresh checkout of
+the now-updated \`main\`) usually clears it; otherwise stamp the file by hand.
+EOF
+
+    if [[ "${STAMP_BACK_STRICT:-}" == "1" ]]; then
+        note "STAMP_BACK_STRICT=1 — failing the job"
+        exit 1
+    fi
+    exit 0
+fi
+
 echo "::warning title=Stamp-back failed::$label $version published, but ${files[*]} could not be pushed to main after $MAX_ATTEMPTS attempts. main holds a stale version."
 
 summary <<EOF
@@ -137,8 +166,9 @@ summary <<EOF
 Published \`$version\`, but could not push the stamp after $MAX_ATTEMPTS attempts.
 $file_list on \`main\` is stale. The published artifact is correct.
 
-This did not match a branch-protection rejection, so it is most likely a persistent
-race with concurrent pushes to \`main\`. Re-running the job should clear it.
+This matched neither a branch-protection rejection nor a rebase conflict, so it is most
+likely a transient race with concurrent pushes to \`main\`. Re-running the job should
+clear it.
 EOF
 
 exit 0
