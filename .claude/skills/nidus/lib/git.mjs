@@ -17,7 +17,7 @@ export function sh(cmd, { allowFail = false } = {}) {
 // and how to read a file's full text at that head.
 export function resolveTarget({ base, head, pr, path } = {}) {
   if (pr) {
-    const meta = JSON.parse(sh(`gh pr view ${pr} --json baseRefName,headRefOid,number,title,state,isDraft,url`))
+    const meta = JSON.parse(sh(`gh pr view ${pr} --json baseRefName,headRefOid,number,title,body,state,isDraft,url`))
     sh(`git fetch --quiet origin pull/${pr}/head`)
     const headOid = meta.headRefOid
     sh(`git fetch --quiet origin ${meta.baseRefName}`, { allowFail: true })
@@ -105,23 +105,37 @@ export function diffFor(t, path) {
 // Issue ids this change claims to ship — from the branch name, its commit subjects,
 // and the PR title/body. Lets the ticket check tell "close this before merge" apart
 // from "unrelated backlog rot".
+// A branch is austin/<n>-<slug>, so its leading number is an issue ref too.
 export function mentionedIssues(t) {
-  let text = sh('git branch --show-current', { allowFail: true })
+  const branch = sh('git branch --show-current', { allowFail: true })
+  let text = branch.replace(/(?:^|\/)(\d+)-/g, ' #$1 ')
   if (t.base) {
     const range = t.head ? `${t.base}..${t.head}` : `${t.base}..HEAD`
     text += '\n' + sh(`git log --format=%s%n%b ${range}`, { allowFail: true })
   }
-  if (t.pr) text += `\n${t.pr.title || ''}`
-  return new Set(text.match(/\bnidus-[a-z0-9]+(?:\.\d+)?\b/gi) || [])
+  if (t.pr) text += `\n${t.pr.title || ''}\n${t.pr.body || ''}`
+  return new Set(text.match(/#\d+/g) || [])
 }
 
-export function inProgressIssues() {
-  const raw = sh('bd list --status in_progress --json', { allowFail: true })
-  try {
-    const parsed = JSON.parse(raw)
-    const list = Array.isArray(parsed) ? parsed : parsed.issues || []
-    return list.map(i => ({ id: i.id, title: i.title, type: i.issue_type }))
-  } catch {
-    return []
+// GitHub's own closing keywords; anything else is a mention that will NOT close.
+export function closingIssues(t) {
+  let text = t.pr ? t.pr.body || '' : ''
+  if (t.base) {
+    const range = t.head ? `${t.base}..${t.head}` : `${t.base}..HEAD`
+    text += '\n' + sh(`git log --format=%b ${range}`, { allowFail: true })
   }
+  const re = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)/gi
+  return new Set(Array.from(text.matchAll(re), m => `#${m[1]}`))
+}
+
+export function issueTitles(refs) {
+  const out = {}
+  for (const r of refs) {
+    const raw = sh(`gh issue view ${r.slice(1)} --json title,state`, { allowFail: true })
+    try {
+      const j = JSON.parse(raw)
+      if (j.state === 'OPEN') out[r] = j.title
+    } catch { /* closed, missing, or gh unavailable — not a finding */ }
+  }
+  return out
 }

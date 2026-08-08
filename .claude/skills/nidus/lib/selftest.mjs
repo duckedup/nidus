@@ -212,24 +212,19 @@ test('gating: ungated mod declaration flagged', () => {
 
 // ── stale tickets ──────────────────────────────────────────────────────────
 
-test('tickets: in_progress issues surface as warnings', () => {
-  const found = laws.inProgressTickets([{ id: 'nidus-abc', title: 'a thing' }])
+test('tickets: a mentioned issue with no Closes line warns', () => {
+  const found = laws.unclosedTickets(new Set(['#42']), new Set(), { '#42': 'a thing' })
   eq(ids(found), ['stale-ticket'], 'findings')
   eq(found[0].severity, 'warn', 'severity')
 })
 
-// Caught on merged main: #75 legitimately left the nidus-m50 epic in_progress with two
-// open children, and the check flagged it — noise that would fire on every epic PR.
-test('tickets: an epic is not stale merely for being in_progress', () => {
-  eq(ids(laws.inProgressTickets([{ id: 'nidus-m50', title: 'an epic', type: 'epic' }])), [], 'findings')
-  eq(ids(laws.inProgressTickets([{ id: 'nidus-abc', title: 'a task', type: 'task' }])), ['stale-ticket'], 'findings')
+test('tickets: a Closes line clears the warning', () => {
+  eq(ids(laws.unclosedTickets(new Set(['#42']), new Set(['#42']), { '#42': 'a thing' })), [], 'findings')
 })
 
-test('tickets: a ticket this change ships reads differently from backlog rot', () => {
-  const mine = laws.inProgressTickets([{ id: 'nidus-abc', title: 'a thing' }], new Set(['nidus-abc']))
-  eq(/shipped by this change/.test(mine[0].summary), true, 'shipped wording')
-  const rot = laws.inProgressTickets([{ id: 'nidus-xyz', title: 'other' }], new Set(['nidus-abc']))
-  eq(/unrelated/.test(rot[0].summary), true, 'unrelated wording')
+// Only OPEN issues reach titles, so an already-closed or cross-repo ref is not noise.
+test('tickets: an issue with no resolvable open title is not flagged', () => {
+  eq(ids(laws.unclosedTickets(new Set(['#7']), new Set(), {})), [], 'findings')
 })
 
 // ── lanes ──────────────────────────────────────────────────────────────────

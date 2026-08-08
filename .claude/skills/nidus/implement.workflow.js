@@ -65,7 +65,7 @@ Rules:
 - This worktree is a complete checkout — your verification commands genuinely work here, so a
   failure is a real failure. Run each of ${JSON.stringify(spec.verify || [])} and tee it:
       <command> 2>&1 | tee -a ${logFile}
-- Track work with bd, never with markdown checklists.
+- Track work in GitHub Issues, never with markdown checklists.
 ${prior ? `\nYOUR PRIOR ATTEMPT FAILED — fix exactly this, do not start over:\n${prior}\n` : ''}
 When the blueprint is implemented and its lanes pass, write your patch:
     git add -A && git diff --cached > ${patchFile}

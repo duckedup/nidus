@@ -1,7 +1,7 @@
 ---
 name: nidus
-description: Carry work from a thought to a shipped PR — research and blueprint it, implement it with parallel agents, review it, ship it. Use when the user invokes /nidus with a subcommand (spec, implement, review, ship) or with a bd ticket id or description.
-argument-hint: "[spec|implement|review|ship] <bd-id | description | PR number>"
+description: Carry work from a thought to a shipped PR — research and blueprint it, implement it with parallel agents, review it, ship it. Use when the user invokes /nidus with a subcommand (spec, implement, review, ship) or with a GitHub issue number or description.
+argument-hint: "[spec|implement|review|ship] <issue number | description | PR number>"
 model: opus
 allowed-tools: [Read, Write, Edit, Bash, Grep, Glob, Agent, Workflow, AskUserQuestion, ReportFindings, TodoWrite]
 ---
@@ -30,19 +30,19 @@ Read the first word of `$ARGUMENTS`:
 | `ship` | **Ship** |
 | anything else | **Full pipeline**: Spec → gate → Implement → Review → offer Ship |
 
-The rest of `$ARGUMENTS` is the target: a bd id (`nidus-abc`), a PR number (review only),
+The rest of `$ARGUMENTS` is the target: an issue number (`#42`), a PR number (review only),
 a path, or a freeform description. With no arguments at all, run **Review** on the working
 tree — that is the cheapest useful thing.
 
 ## Preflight (every subcommand except `review`)
 
 1. `git branch --show-current`. Never work on `main`.
-2. Resolve the target. If it matches `nidus-[a-z0-9.]+`, `bd show <id>`; read the title,
-   description, notes, and design. If `bd show` cannot find it, say so and ask whether to
-   proceed from the description alone — do not invent the ticket's contents.
-3. If the target is a description with no ticket, file one before writing code
-   (`bd create --title=… --description=… --type=… --priority=…`) and `bd update <id> --claim`.
-4. If not already on a branch for this work, create `austin/<id>-<slug>` (3–5 word kebab
+2. Resolve the target. If it matches `#?\d+`, `gh issue view <n>`; read the title, body,
+   labels, and comments. If `gh issue view` cannot find it, say so and ask whether to
+   proceed from the description alone — do not invent the issue's contents.
+3. If the target is a description with no issue, file one before writing code
+   (`gh issue create --title=… --body=… --label=…`) and `gh issue edit <n> --add-assignee @me`.
+4. If not already on a branch for this work, create `austin/<n>-<slug>` (3–5 word kebab
    slug) from an up-to-date `main`. If the tree is dirty, ask before touching it: stash and
    branch, commit here first, or stop.
 
@@ -122,19 +122,20 @@ against `main`; a path → those files; nothing → the working tree.
    If `major.minor` changed, update the `nidus = "M.m"` snippet in `README.md` and
    `docs/src/content/docs/getting-started.md`. Never touch `charts/nidus/Chart.yaml` or the
    SDK version files — CI stamps those and commits them back.
-3. **Close the bead in this PR** (`bd close <id>`), not in a later pass. Check
-   `bd list --status in_progress` explicitly; `bd ready` and `bd list --status open` both hide
-   in_progress, which is how ten tickets once went stale.
-4. **Commit.** Subject `🪺 <area>: <terse description> (<bead-id>)` — an emoji prefix, the
-   area, and the bead id in parens; no PR number (the squash merge appends it). The body
+3. **Close the issue in this PR** — put `Closes #<n>` in the PR body so the merge closes
+   it, not a later pass. `Closes` fires on merge whether or not the work survived review,
+   so re-read every such line against the diff first and downgrade it to `Refs #<n>` if
+   this change does not actually finish the issue.
+4. **Commit.** Subject `🪺 <area>: <terse description>` — an emoji prefix and the area, no
+   issue or PR number (the squash merge appends `(#<pr>)`; a second `(#<n>)` for the issue
+   would be unreadable next to it). The issue ref belongs in the PR body. The commit body
    explains why, not what. This repo does keep `Co-Authored-By` and `Claude-Session`
    trailers — match `git log`, do not assume.
-5. **Push.** `git pull --rebase` then `git push -u origin <branch>`. There is no
-   `bd dolt push` in this repo: no Dolt remote is configured, and beads travels in-repo via
-   the committed `.beads/issues.jsonl` and its git hooks.
+5. **Push.** `git pull --rebase` then `git push -u origin <branch>`. Issue state lives on
+   GitHub, so nothing tracker-related ships with the commit.
 6. **Offer the PR** with `AskUserQuestion` — open it, or stop with the branch pushed. When
    opening: `gh pr create --assignee @me`, title = the commit subject verbatim, body = what
-   changed and why plus the bd id. Print the URL.
+   changed and why plus `Closes #<n>`. Print the URL.
 
 Ask before the commit. Never commit or push without the user choosing to.
 
@@ -143,8 +144,8 @@ Ask before the commit. Never commit or push without the user choosing to.
 - Blueprints are `BLUEPRINT-<id>.md`; they are transient, gitignored, and deleted once
   implemented. `SPEC.md` is the product spec and is never touched by this skill.
 - Never cross a gate the user has not approved, and never commit to `main`.
-- Track work with bd. No TodoWrite lists, no markdown checklists, no MEMORY.md — durable
-  knowledge goes to `bd remember`.
+- Track work in GitHub Issues. No TodoWrite lists, no markdown checklists, no MEMORY.md —
+  durable knowledge goes in the issue that owns it, or in `SPEC.md`.
 - Implementation agents are sonnet in worktrees; merging, verifying, and reviewing stay on
   the main thread so one context has seen the whole change.
 - `nidus-check` is the source of truth for lanes and laws. If it is wrong, fix the checker and

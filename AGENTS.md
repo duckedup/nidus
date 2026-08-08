@@ -1,27 +1,29 @@
 # Agent Instructions
 
-This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
+This project tracks work in **GitHub Issues** on `duckedup/nidus`, via the `gh` CLI.
 
-> **Architecture in one line, as this repo actually runs it:** issues live in a
-> local embedded Dolt database (`.beads/embeddeddolt/nidus/`), and **no Dolt
-> remote is configured** — so `bd dolt push/pull` does not apply here. Sync is
-> plain git: `.beads/issues.jsonl` is committed, and the `.beads/hooks/*` git
-> hooks export and import it around commit, merge, and checkout.
+> **Architecture in one line:** issue state lives on GitHub, not in the repo, so a
+> checkout carries no tracker data and there is nothing to sync, export, or import.
+> `gh` is the only interface.
 >
-> Beads' upstream [SYNC_CONCEPTS.md](https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md)
-> describes the Dolt-remote setup instead; read it for background, not as the
-> workflow here. `bd import` IS the recovery path in this repo — it is how a
-> checkout with an empty database gets its issues back.
+> This replaced an embedded beads/Dolt tracker whose exporter rewrote the whole of
+> `.beads/issues.jsonl` from each branch's local database — so any branch could
+> silently revert another's closes, and one did. That file is retained as a **frozen,
+> read-only archive** of the pre-migration issues; never write to it, and never
+> reinstall the `bd` git hooks.
 
 ## Quick Reference
 
 ```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work atomically
-bd close <id>         # Complete work
-git push              # Beads data ships with the commit; there is no dolt remote
+gh issue list --state open            # Find available work
+gh issue view <n>                     # View issue details
+gh issue edit <n> --add-assignee @me  # Claim work
+gh issue close <n>                    # Complete work
+gh issue create --title=… --body=…    # File new work
 ```
+
+Priority is a `p0`–`p4` label; type is an `epic`/`bug`/`feature`/`task`/`decision`
+label. A child of an epic names its parent in the body (`Part of #12`).
 
 ## Non-Interactive Shell Commands
 
@@ -49,37 +51,23 @@ cp -rf source dest          # NOT: cp -r source dest
 
 ## Close the ticket in the PR that ships it
 
-`bd close <id>` belongs in the same PR as the work — never a later cleanup pass, and
-never parked in `in_progress` "pending PR review". If the PR ships the fix, close it
-there; reopen if review changes the outcome.
+`Closes #<n>` belongs in the PR body that ships the work — never a later cleanup pass.
+If the PR ships the fix, close it there; reopen if review changes the outcome.
 
-This matters more than it sounds: `bd ready` and `bd list --status open` both **hide**
-`in_progress`, so a forgotten ticket is invisible to every routine check. It does not
-nag — it silently misrepresents the backlog, in both directions. When auditing, run
-`bd list --status in_progress` explicitly and verify each claim against the tree rather
-than trusting the note on the issue.
+The hazard runs the opposite way from the one that made this a law. The old tracker
+hid finished-but-open tickets from every routine check; GitHub hides nothing, so that
+direction nags on its own. What `Closes` adds is the reverse lie — it fires on merge
+whether or not the work survived review, so a gutted PR still closes its issue. Both
+are the tracker asserting what the tree does not support. Before opening a PR, re-read
+every `Closes` line and confirm the diff actually finishes that issue; downgrade it to
+`Refs #<n>` if it does not.
 
 (Full rationale, with the incident that prompted it, is in `CLAUDE.md` §Conventions.)
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
-## Beads Issue Tracker
+## Rules
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
-
-### Quick Reference
-
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
-```
-
-### Rules
-
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+- Use GitHub Issues for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Durable knowledge goes in the issue that owns it, or in `SPEC.md` — do NOT use MEMORY.md files
 
 ## Session Completion
 
@@ -96,9 +84,9 @@ bd close <id>         # Complete work
    git push
    git status  # MUST show "up to date with origin"
    ```
-   No `bd dolt push` — this repo has no Dolt remote configured. Beads data travels
-   in-repo: `.beads/issues.jsonl` is committed and the `.beads/hooks/*` git hooks
-   export/import it around commit and merge.
+   Issue state lives on GitHub, not in the repo, so nothing extra ships with the
+   commit — but a `Closes #<n>` line only fires when the PR merges, so close
+   anything the PR does not itself close.
 5. **Clean up** - Clear stashes, prune remote branches
 6. **Verify** - All changes committed AND pushed
 7. **Hand off** - Provide context for next session
@@ -108,4 +96,3 @@ bd close <id>         # Complete work
 - NEVER stop before pushing - that leaves work stranded locally
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
-<!-- END BEADS INTEGRATION -->

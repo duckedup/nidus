@@ -358,8 +358,3 @@ bench-crit *ARGS:
 
 # ── Project setup ────────────────────────────────────────────────────────────
 
-# Initialize beads issue tracking for this project
-bd-init:
-    bd init --reinit-local --prefix nidus
-    git config beads.role contributor
-    chmod 700 .beads

@@ -2,25 +2,31 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
-## Beads Issue Tracker
+## GitHub Issues
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+This project tracks work in **GitHub Issues** on `duckedup/nidus`, via the `gh` CLI.
 
 ### Quick Reference
 
 ```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
+gh issue list --state open            # Find available work
+gh issue view <n>                     # View issue details
+gh issue edit <n> --add-assignee @me  # Claim work
+gh issue close <n>                    # Complete work
+gh issue create --title=… --body=…    # File new work
 ```
+
+Labels carry what beads encoded in fields: `p0`–`p4` for priority, and
+`epic`/`bug`/`feature`/`task`/`decision` for type. A child of an epic names its
+parent in the body (`Part of #12`); GitHub renders the backlink automatically.
 
 ### Rules
 
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+- Use GitHub Issues for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Durable knowledge goes in the issue that owns it, or in `SPEC.md` — do NOT use MEMORY.md files
+- `.beads/issues.jsonl` is a **frozen archive** of the pre-migration tracker. It is read-only
+  history: never write to it, and never install the `bd` hooks again (see `nidus-sfa` in the
+  archive for why — the exporter silently reverted other branches' closes).
 
 ## Session Completion
 
@@ -37,9 +43,9 @@ bd close <id>         # Complete work
    git push
    git status  # MUST show "up to date with origin"
    ```
-   No `bd dolt push` — this repo has no Dolt remote configured. Beads data travels
-   in-repo: `.beads/issues.jsonl` is committed and the `.beads/hooks/*` git hooks
-   export/import it around commit and merge.
+   Issue state lives on GitHub, not in the repo, so nothing extra ships with the
+   commit — but a `Closes #<n>` line only fires when the PR merges, so close
+   anything the PR does not itself close.
 5. **Clean up** - Clear stashes, prune remote branches
 6. **Verify** - All changes committed AND pushed
 7. **Hand off** - Provide context for next session
@@ -49,7 +55,6 @@ bd close <id>         # Complete work
 - NEVER stop before pushing - that leaves work stranded locally
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
-<!-- END BEADS INTEGRATION -->
 
 
 ## Build & Test
@@ -252,21 +257,22 @@ each.
   fence) is test code, not commentary, so it does not count toward the cap — the prose
   around it still does.
 - **Commit style**: emoji prefix + short description (e.g. `🪺 op-log codec`).
-- **Issue tracking**: `bd` (beads) — run `bd ready` for available work.
+- **Issue tracking**: GitHub Issues — run `gh issue list --state open` for available work.
 - **Branch workflow**: one branch per issue or bundled epic, push for PR review.
-- **CLOSE THE TICKET IN THE PR THAT SHIPS IT.** `bd close <id>` belongs in the same
-  PR as the work, not a later cleanup pass. Never park a finished issue in
-  `in_progress` "pending PR review" — that phrasing has produced a standing pile of
-  stale tickets more than once. If the PR ships the fix, close it in that PR; if
-  review later changes the outcome, reopen it. **Why this bites harder than it
-  looks:** `bd ready` and `bd list --status open` both *hide* `in_progress`, so a
-  forgotten ticket is invisible to every routine check — it does not nag, it just
-  quietly misrepresents the backlog. A sweep in PR #63 found ten such tickets,
-  three of them P1 bugs that had actually been fixed weeks earlier, alongside two
-  marked in-progress whose work had never landed at all. Both directions of lie
-  come from the same habit. When auditing, check `bd list --status in_progress`
-  explicitly, and verify each claim against the tree rather than trusting the note
-  on the issue.
+- **CLOSE THE TICKET IN THE PR THAT SHIPS IT.** Put `Closes #<n>` in the PR body so
+  the merge closes it, not a later cleanup pass. If the PR ships the fix, close it in
+  that PR; if review later changes the outcome, reopen it. **The hazard here is the
+  reverse of the one that made this a law.** Under the old tracker a finished ticket
+  was left silently *open* and no routine check surfaced it — a sweep in PR #63 found
+  ten such tickets, three of them P1 bugs fixed weeks earlier, alongside two whose
+  work had never landed at all. GitHub hides nothing, so that direction now nags on
+  its own. What it introduces instead is the opposite lie: `Closes #<n>` fires on
+  merge whether or not the work survived review, so an issue can be closed by a PR
+  that was gutted down to a fraction of it. **Both directions are the same failure —
+  the tracker asserting something the tree does not support.** So the constant
+  survives the move: verify the claim against the tree, never against the note on
+  the issue. Before opening a PR, re-read every `Closes` line in it and confirm the
+  diff actually finishes that issue; drop the trailer to a `Refs #<n>` if it does not.
 - **Tests**: pure-logic unit tests live inline per module; file-backed behavior in
   `tests/` against temp dirs (and `#[cfg_attr(miri, ignore)]` where they fsync).
   **End-to-end tests that drive the real binary** live in `tests/e2e/`
