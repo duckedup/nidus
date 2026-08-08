@@ -153,9 +153,23 @@ reach (and their unit tests — presigned-URL/request construction — are pure 
 under Miri; the localhost-mock round-trips are `#[cfg_attr(miri, ignore)]`). Miri runs
 with `-Zmiri-disable-isolation` so file-backed tests can touch a temp dir.
 
-**When to add `#[cfg_attr(miri, ignore)]`** to a test:
-- It calls `File::sync_all`/`sync_data` (fsync) or other filesystem syscalls Miri
-  does not implement. Keep these in the file-backed integration tests.
+**When to add `#[cfg_attr(miri, ignore)]`** to a test — and **always say which reason
+applies**, either trailing the attribute (`#[cfg_attr(miri, ignore)] // <why>`) or on the
+line directly above it, both of which the checker reads. There are only three:
+- **Syscalls Miri does not implement** — `File::sync_all`/`sync_data` (fsync) and friends.
+  Keep these in the file-backed integration tests.
+- **Runtime cost.** The interpreter is orders of magnitude slower, so an N=2000 ANN build
+  or a threaded scan will not finish. Say so; do not leave it looking like reason one.
+- **Float ULP.** Miri's libm differs from the host in the last bit, so a test asserting
+  *exact* `f32` score bits through a transcendental (BM25's IDF uses `ln`) fails under
+  Miri while the ranking is identical. Compare ranks, or ignore with this reason named.
+
+The comment is load-bearing, not decoration: `nidus-check laws` treats a bare ignore as
+unresolved and a documented one as settled, so an undocumented ignore nags forever and a
+documented one stops. That is the whole difference between an actionable check and
+ambient noise. It also cuts the other way — the reason is the only thing standing between
+a correct ignore and someone deleting it, which is exactly what happened to two float-ULP
+tests here when the checker read only one of the two comment positions.
 
 **Do NOT ignore** pure-logic tests (cosine math, glob matching, filter evaluation,
 the op-log/value codec round-trips). These operate on in-memory byte buffers, are
