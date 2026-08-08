@@ -29,3 +29,8 @@
 
 # Agent worktrees (created inside the repo by isolated subagent runs)
 .claude/worktrees/
+
+# ── /nidus skill artifacts ───────────────────────────────────────────────────
+# Blueprints are transient planning files, deleted once implemented. Ignored so a
+# skipped cleanup can never land one in a commit.
+BLUEPRINT-*.md
