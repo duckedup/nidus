@@ -305,7 +305,10 @@ impl Store {
 
         let mut topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
         for (_, (row, col_name, id)) in candidates {
-            let score = score_fn(q, self.data.row(*row));
+            let base = score_fn(q, self.data.row(*row));
+            // The first pass selected on the base score alone, so decay over a quantized
+            // result set inherits quantization's approximation (nidus-m50.15 #9).
+            let score = self.ranked_score(opts.rank_by.as_ref(), base, col_name, id);
             if let Some(min) = opts.min_score
                 && score < min
             {

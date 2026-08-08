@@ -24,8 +24,9 @@ use tokio::net::TcpListener;
 
 use crate::{FtsField, FtsQuery, HybridOpts, ListOpts, Nidus, Record, Scope, SearchOpts};
 use dto::{
-    AnnDto, DeleteRequest, FootprintDto, FtsSchemaRequest, HitDto, HybridSearchRequest,
-    ListRequest, MAX_TOP_K, SearchRequest, TextSearchRequest, UpsertRequest,
+    AggregateRequest, AggregationDto, AnnDto, DeleteRequest, FootprintDto, FtsSchemaRequest,
+    HitDto, HybridSearchRequest, ListRequest, MAX_TOP_K, SearchRequest, TextSearchRequest,
+    UpsertRequest,
 };
 
 // ── AI-ingest (memory) imports: only under the `memory` feature (pulled by the
@@ -386,6 +387,7 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/text-search", post(text_search))
         .route("/hybrid-search", post(hybrid_search))
         .route("/list", post(list))
+        .route("/aggregate", post(aggregate))
         .route("/flush", post(flush))
         .route("/compact", post(compact))
         .route("/refresh", post(refresh));
@@ -668,6 +670,8 @@ async fn search(
         exact,
         include_attributes,
         exclude_attributes,
+        rank_by,
+        limit_per,
     } = req;
     let projection = check_projection(include_attributes, exclude_attributes)?;
     let hits = run_read(st, move |db| {
@@ -680,11 +684,25 @@ async fn search(
             projection,
             // Vector search has one score to report; annotations are a text/hybrid surface.
             explain: false,
+            rank_by,
+            limit_per,
         };
         scoped(&scope, |s| db.search(s, &query, &opts))
     })
     .await?;
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+}
+
+/// `POST /aggregate`: count the filter-matching records and sum the named attributes,
+/// without materializing any of them.
+async fn aggregate(
+    State(st): State<AppState>,
+    Json(req): Json<AggregateRequest>,
+) -> Result<Json<AggregationDto>, ApiError> {
+    let AggregateRequest { scope, filter, sum } = req;
+    let opts = crate::AggregateOpts { filter, sum };
+    let out = run_read(st, move |db| scoped(&scope, |s| db.aggregate(s, &opts))).await?;
+    Ok(Json(AggregationDto::from(out)))
 }
 
 /// Resolve a wire `scope` (an empty list means "every collection") and run `f` with the
@@ -710,6 +728,7 @@ async fn list(
         filter,
         include_attributes,
         exclude_attributes,
+        order_by,
     } = req;
     let projection = check_projection(include_attributes, exclude_attributes)?;
     let hits = run_read(st, move |db| {
@@ -718,6 +737,7 @@ async fn list(
             limit,
             filter,
             projection,
+            order_by,
         };
         scoped(&scope, |s| db.list(s, &opts))
     })
@@ -757,6 +777,8 @@ async fn text_search(
         highlight,
         include_attributes,
         exclude_attributes,
+        rank_by,
+        limit_per,
     } = req;
     let clauses = check_clauses(field, query, clauses)?;
     let projection = check_projection(include_attributes, exclude_attributes)?;
@@ -768,6 +790,8 @@ async fn text_search(
             filter,
             explain,
             projection,
+            rank_by,
+            limit_per,
             ..Default::default()
         };
         let q = FtsQuery {
@@ -800,6 +824,8 @@ async fn hybrid_search(
         candidates,
         explain,
         highlight,
+        vector_weight,
+        text_weight,
     } = req;
     let clauses = check_clauses(field, text, clauses)?;
     let hits = run_read(st, move |db| {
@@ -810,6 +836,8 @@ async fn hybrid_search(
             rrf_k,
             candidates,
             explain,
+            vector_weight,
+            text_weight,
         };
         let q = FtsQuery {
             clauses,
@@ -1094,9 +1122,10 @@ fn classify(err: &anyhow::Error) -> StatusCode {
     } else if msg.contains("does not match store dimension")
         || msg.contains("fts field")
         || msg.contains("full-text query")
+        || msg.contains(crate::store::BAD_QUERY)
     {
-        // The last two are a rejected FTS schema (an out-of-range k1/b, an empty field name)
-        // and a clause-less text query — malformed request bodies, not server faults.
+        // A rejected FTS schema, a clause-less text query, or a malformed ranking knob:
+        // bad request bodies, not server faults.
         StatusCode::BAD_REQUEST
     } else if msg.contains("read-only store") {
         StatusCode::FORBIDDEN
@@ -1499,6 +1528,143 @@ mod tests {
         let forced = hits(json!({"query": [1, 0, 0], "top_k": 2, "exact": true})).await;
         assert_eq!(implicit, forced);
         assert_eq!(implicit[0]["id"], "a");
+    }
+
+    /// Two docs at the same base score, one a week older, in one file. Enough to drive decay,
+    /// `limit_per`, `order_by`, and `/aggregate` over the wire.
+    async fn ranked_router() -> Router {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "fresh", "vector": [1, 0, 0],
+                     "attrs": {"ts": {"DateTime": 1_000_000_000_000i64},
+                               "file": {"Str": "a.rs"}, "bytes": {"Int": 10}}},
+                    {"id": "stale", "vector": [1, 0, 0],
+                     "attrs": {"ts": {"DateTime": 999_395_200_000i64},
+                               "file": {"Str": "a.rs"}, "bytes": {"Int": 32}}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        app
+    }
+
+    #[tokio::test]
+    async fn rank_by_decay_reorders_over_http() {
+        let app = ranked_router().await;
+        let body = json!({
+            "query": [1, 0, 0], "top_k": 2,
+            "rank_by": {"Decay": {"field": "ts", "origin": 1_000_000_000_000i64,
+                                  "scale": 604_800_000i64, "lambda": 0.4}}
+        });
+        let resp = app.clone().oneshot(post("/search", body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        assert_eq!(hits[0]["id"], "fresh");
+        assert_eq!(hits[1]["id"], "stale");
+        // base 1.0 − 0.4 × (1 − 0.5) at exactly one half-life.
+        let stale = hits[1]["score"].as_f64().unwrap();
+        assert!((stale - 0.8).abs() < 1e-5, "{stale}");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_rank_by_is_a_bad_request() {
+        let app = ranked_router().await;
+        let body = json!({
+            "query": [1, 0, 0],
+            "rank_by": {"Decay": {"field": "ts", "origin": 0, "scale": 0}}
+        });
+        let resp = app.oneshot(post("/search", body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn limit_per_caps_hits_over_http() {
+        let app = ranked_router().await;
+        let body =
+            json!({"query": [1, 0, 0], "top_k": 2, "limit_per": {"field": "file", "max": 1}});
+        let resp = app.oneshot(post("/search", body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        assert_eq!(hits.as_array().unwrap().len(), 1, "both share one file");
+    }
+
+    #[tokio::test]
+    async fn order_by_sorts_a_list_over_http() {
+        let app = ranked_router().await;
+        let ids = |descending: bool| {
+            let app = app.clone();
+            async move {
+                let body = json!({"order_by": {"field": "bytes", "descending": descending}});
+                let resp = app.oneshot(post("/list", body)).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                json_body(resp).await
+            }
+        };
+        assert_eq!(ids(false).await[0]["id"], "fresh");
+        assert_eq!(ids(true).await[0]["id"], "stale");
+    }
+
+    #[tokio::test]
+    async fn aggregate_counts_and_sums_over_http() {
+        let app = ranked_router().await;
+        let resp = app
+            .clone()
+            .oneshot(post("/aggregate", json!({"sum": ["bytes"]})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out = json_body(resp).await;
+        assert_eq!(out["count"], 2);
+        assert_eq!(out["sums"]["bytes"], json!({"Int": 42}));
+
+        // A filter that matches nothing still answers, with a zero count.
+        let body = json!({"filter": [{"Eq": ["file", {"Str": "nope"}]}], "sum": ["bytes"]});
+        let resp = app.oneshot(post("/aggregate", body)).await.unwrap();
+        let out = json_body(resp).await;
+        assert_eq!(out["count"], 0);
+        assert_eq!(out["sums"]["bytes"], json!({"Int": 0}));
+    }
+
+    #[tokio::test]
+    async fn hybrid_leg_weights_default_to_the_unweighted_fusion() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/fts-schema",
+                json!({"fields": ["body"]}),
+            ))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "v", "vector": [1, 0, 0], "attrs": {"body": {"Str": "nothing"}}},
+                    {"id": "t", "attrs": {"body": {"Str": "quantum physics"}}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        let fused = |body: JsonValue| {
+            let app = app.clone();
+            async move {
+                let resp = app.oneshot(post("/hybrid-search", body)).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                json_body(resp).await
+            }
+        };
+        let base = json!({"vector": [1, 0, 0], "field": "body", "text": "quantum", "top_k": 2});
+        let mut explicit = base.clone();
+        explicit["vector_weight"] = json!(1.0);
+        explicit["text_weight"] = json!(1.0);
+        assert_eq!(fused(base.clone()).await, fused(explicit).await);
+
+        let mut heavy = base;
+        heavy["vector_weight"] = json!(8.0);
+        assert_eq!(fused(heavy).await[0]["id"], "v");
     }
 
     /// Before the store opens — a standby awaiting promotion — liveness must answer while

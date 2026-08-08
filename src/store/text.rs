@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use super::Store;
-use super::read::paginate;
+use super::rank;
+use super::read::{check_query_opts, check_weight, depth, paginate};
 use crate::annotate::{Annotations, ClauseScore, Highlight, HighlightOpts, LegScore};
 use crate::filter;
 use crate::fts::Analyzer;
@@ -57,11 +58,12 @@ impl Store {
         opts: &SearchOpts,
     ) -> Result<Vec<Hit>> {
         query.validate()?;
+        check_query_opts(opts)?;
         if opts.top_k == 0 {
             return Ok(Vec::new());
         }
-        // Same shape as `search`: rank `offset + top_k` deep, cut the page in one place at the end.
-        let mut topk: TopK<(&str, &str)> = TopK::new(opts.offset.saturating_add(opts.top_k));
+        // Same shape as `search`: rank `depth` deep, then hand the ranking to the one tail.
+        let mut topk: TopK<(&str, &str)> = TopK::new(depth(opts));
         // Analyze each clause once per distinct field analyzer across the scope (collections
         // usually share one), not once per collection.
         let mut analyzed: HashMap<(usize, Analyzer), Vec<String>> = HashMap::new();
@@ -88,18 +90,21 @@ impl Store {
                 }
             }
             for (id, per_clause) in acc {
-                let score = combine(&per_clause, query.combine);
-                if let Some(min) = opts.min_score
-                    && score < min
-                {
-                    continue;
-                }
+                let base = combine(&per_clause, query.combine);
                 // Hint-verify the id against the live index and apply the metadata filter (the
                 // FTS index can lag a delete until the next rebuild).
                 let Some(entry) = col.docs.get(id) else {
                     continue;
                 };
                 if !filter::matches(&opts.filter, &entry.attrs) {
+                    continue;
+                }
+                // A subtracted penalty is metric-agnostic, so the same expression applies to a
+                // folded BM25 score as to a cosine one. `min_score` gates the final number.
+                let score = rank::adjust(opts.rank_by.as_ref(), base, &entry.attrs);
+                if let Some(min) = opts.min_score
+                    && score < min
+                {
                     continue;
                 }
                 topk.offer(score, (col_name, id));
@@ -112,7 +117,7 @@ impl Store {
             }
         }
         // `TopK` already resolves ties on `(collection, id)`, so no re-sort is needed here.
-        let mut hits = paginate(self.hits_from_topk(topk, &opts.projection), opts.offset);
+        let mut hits = self.finish(self.hits_from_topk(topk, &opts.projection), opts);
         self.annotate(&mut hits, query, opts.explain.then_some(&mut breakdown));
         Ok(hits)
     }
@@ -132,6 +137,8 @@ impl Store {
         // verdict based on `top_k`.
         self.check_query_dim(vector)?;
         text.validate()?;
+        check_weight("vector_weight", opts.vector_weight)?;
+        check_weight("text_weight", opts.text_weight)?;
 
         if opts.top_k == 0 {
             return Ok(Vec::new());
@@ -166,7 +173,10 @@ impl Store {
         // The page is cut on the *fused* ranking, never per leg — a leg's rank is an input to
         // the fused score, so paginating a leg would change which documents fuse at all.
         let fused = rrf_fuse(
-            vec![FusionLeg::new(vector_leg), FusionLeg::new(text_leg)],
+            vec![
+                FusionLeg::new(vector_leg).weight(opts.vector_weight),
+                FusionLeg::new(text_leg).weight(opts.text_weight),
+            ],
             opts.rrf_k,
         );
         let mut page = paginate(fused, opts.offset);

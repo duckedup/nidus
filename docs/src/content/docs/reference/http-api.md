@@ -33,6 +33,7 @@ so the same id appears in your logs and the server's.
 | `POST /text-search` | BM25 full-text search | `text_search` |
 | `POST /hybrid-search` | fused vector + BM25 (RRF) | `hybrid_search` |
 | `POST /list` | metadata-only query (no vector) | `list` |
+| `POST /aggregate` | count + sum over a filter, no records materialized | `aggregate` |
 | `POST /flush` | flush buffered writes to disk | `flush` |
 | `POST /compact` | reclaim dead rows and superseded log records | `compact` |
 | `POST /refresh` | adopt another instance's newer committed state | `refresh` |
@@ -329,6 +330,8 @@ curl -s localhost:7700/search \
 | `exact` | `false` | force the exact scan, bypassing any index and quantization |
 | `include_attributes` | all attrs | return only these attrs |
 | `exclude_attributes` | all attrs | return every attr but these |
+| `rank_by` | none | a [ranking expression](/guides/search/#ranking-by-recency) over the metric |
+| `limit_per` | none | cap hits per distinct value of an attribute |
 
 Returns hits ordered by `(score desc, collection, id)` — the tie-break is a guarantee,
 which is what makes paging coherent:
@@ -352,12 +355,57 @@ both for every attr, exactly as before. Sending **both** in one request is a `40
 precedence rule. The projection is applied where the hit is built, so an excluded attr is
 never serialized — which is the point on a collection of long text bodies.
 
+#### Ranking by recency
+
+`rank_by` layers a recency decay over the metric: an age penalty **subtracted** from each
+hit's score, so it works for every distance metric and for BM25 alike.
+
+```bash
+curl -s localhost:7700/search \
+  -H 'content-type: application/json' \
+  -d '{
+        "query": [1, 0, 0],
+        "rank_by": {"Decay": {"field": "updated_at",
+                              "origin": 1770000000000,
+                              "scale": 604800000,
+                              "lambda": 0.2}}
+      }'
+```
+
+| `Decay` field | Default | Meaning |
+| --- | --- | --- |
+| `field` | — (required) | timestamp attr: a `DateTime` or an `Int`, epoch milliseconds |
+| `origin` | — (required) | "now" in epoch ms; ages are measured back from here |
+| `scale` | `604800000` (7 days) | the age at which the factor equals `decay` |
+| `decay` | `0.5` | the factor at one `scale` of age — `0.5` makes `scale` a half-life |
+| `lambda` | `1.0` | score a fully-decayed hit gives up |
+| `missing` | `1.0` | factor for a record with no usable timestamp — **no penalty** |
+
+The score is `base − lambda × (1 − decay^(age / scale))`. `missing` defaults to `1.0`, so
+enabling decay never buries records written before the field existed. `rank_by` does not
+force an exact scan — over an ANN or quantized result set it reorders within an approximate
+candidate set. A malformed expression (a non-positive `scale`, a `decay` outside `(0, 1)`, a
+negative `lambda`) is a `400`.
+
+#### Capping hits per attribute value
+
+```bash
+curl -s localhost:7700/search \
+  -H 'content-type: application/json' \
+  -d '{"query": [1, 0, 0], "top_k": 20, "limit_per": {"field": "path", "max": 2}}'
+```
+
+Records **missing** the attribute share one group, and the value is read from the stored
+record, so `exclude_attributes` cannot lift the cap. The cap is exact only within an
+over-fetch window, so a capped page may come back shorter than `top_k`; what is guaranteed
+is that no page carries more than `max` hits for one value.
+
 ### `POST /text-search`
 
 BM25 full-text search of declared fields. Returns the same hit shape as `/search`.
-Takes `scope`, `top_k`, `offset`, `filter`, `min_score` — here a **raw BM25** floor (not
-cosine) — the `include_attributes`/`exclude_attributes` projection, and the query itself in
-one of two spellings.
+Takes `scope`, `top_k`, `offset`, `filter`, `rank_by`, `limit_per`, `min_score` — here a
+**raw BM25** floor (not cosine) — the `include_attributes`/`exclude_attributes` projection,
+and the query itself in one of two spellings.
 
 ```bash
 curl -s localhost:7700/text-search \
@@ -404,6 +452,16 @@ Returns the same hit shape as `/search`.
 curl -s localhost:7700/hybrid-search \
   -H 'content-type: application/json' \
   -d '{"vector": [1,0,0], "field": "body", "text": "vector database", "top_k": 5}'
+```
+
+`vector_weight` and `text_weight` (both default `1.0`) scale each leg's contribution to the
+fused score. Leaving them out — or sending `1.0` for both — reproduces the unweighted fusion
+exactly. A non-finite or negative weight is a `400`.
+
+```bash
+curl -s localhost:7700/hybrid-search \
+  -H 'content-type: application/json' \
+  -d '{"vector": [1,0,0], "field": "body", "text": "CVE-2026-1234", "text_weight": 3.0}'
 ```
 
 ### Annotations: why a hit matched
@@ -455,9 +513,47 @@ curl -s localhost:7700/list \
 when both are sent. The response shape matches search (hits with a `score` of `0`, since
 nothing is scored).
 
+`order_by` sorts by an attribute instead of storage order — ORDER BY with no vector query.
+Sorting runs over the whole match set before the page is cut, so `offset`/`limit` walk the
+sorted order.
+
+```bash
+curl -s localhost:7700/list \
+  -H 'content-type: application/json' \
+  -d '{"order_by": {"field": "updated_at", "descending": true}, "limit": 20}'
+```
+
+`descending` defaults to `false`. Values that do not order against the first orderable one —
+a different `Value` variant, an unorderable `Null`/`List`, or a record missing the attribute
+— sort into one trailing bucket, which stays trailing when reversed.
+
 The `filter` in both `/search` and `/list` is an AND of predicates: `Eq`, `Ne`,
 `Glob`, `IGlob`, `In`, `NotIn`, `Lt`, `Le`, `Gt`, `Ge`. See
 [Search & filters](/guides/search/) for the full predicate grammar.
+
+### `POST /aggregate`
+
+Count the filter-matching records and total numeric attributes, without materializing any
+of them. Same `scope` and `filter` as `/list`.
+
+```bash
+curl -s localhost:7700/aggregate \
+  -H 'content-type: application/json' \
+  -d '{
+        "scope": ["docs"],
+        "filter": [{"Eq": ["lang", {"Str": "rust"}]}],
+        "sum": ["bytes"]
+      }'
+```
+
+```json
+{"count": 12, "sums": {"bytes": {"Int": 40960}}}
+```
+
+`count` is always reported; `sum` names attributes to total. Each total is a tagged value —
+`Int` while every addend was an `Int`, `Float` once any `Float` joined. A missing or
+non-numeric value is skipped rather than counted as zero. A filter matching nothing answers
+`{"count": 0, ...}` rather than erroring.
 
 ## Maintenance
 

@@ -5825,3 +5825,722 @@ fn highlighting_covers_every_matched_clause_and_survives_fusion() {
         .unwrap();
     assert_eq!(hits[0].annotations.as_ref().unwrap().highlights.len(), 2);
 }
+
+// ── Ranking expressions (nidus-m50.3) ─────────────────────────────────────
+
+use crate::model::{AggregateOpts, Aggregation, Decay, LimitPer, OrderBy, RankBy};
+
+const DAY: i64 = 86_400_000;
+
+/// `n` days before `origin`, as an epoch-millis `DateTime`.
+fn days_ago(origin: i64, n: i64) -> Value {
+    Value::DateTime(origin - n * DAY)
+}
+
+fn stamped(id: &str, vector: Vec<f32>, ts: Value) -> Record {
+    rec_with(id, vector, BTreeMap::from([("ts".to_string(), ts)]))
+}
+
+/// A store where every doc shares one vector, so the base score is identical and any
+/// reordering can only have come from the ranking expression.
+fn decay_store(origin: i64) -> Store {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                stamped("fresh", vec![1.0, 0.0, 0.0], days_ago(origin, 0)),
+                stamped("week", vec![1.0, 0.0, 0.0], days_ago(origin, 7)),
+                stamped("year", vec![1.0, 0.0, 0.0], days_ago(origin, 365)),
+            ],
+        )
+        .unwrap();
+    store
+}
+
+fn decayed(origin: i64, lambda: f32) -> SearchOpts {
+    SearchOpts {
+        top_k: 10,
+        rank_by: Some(RankBy::Decay(
+            Decay::new("ts", origin, 7 * DAY).lambda(lambda),
+        )),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn decay_reorders_by_age_and_subtracts_lambda_times_one_minus_factor() {
+    let origin = 2_000 * DAY;
+    let store = decay_store(origin);
+    let hits = store
+        .search(&["docs"], &[1.0, 0.0, 0.0], &decayed(origin, 0.4))
+        .unwrap();
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, vec!["fresh", "week", "year"], "newest first");
+
+    // base = 1.0 (identical unit vectors), and the formula is
+    // base − lambda × (1 − decay^(age/scale)): age 0 → factor 1 → no penalty,
+    // age == scale → factor 0.5 → penalty lambda/2.
+    assert!((hits[0].score - 1.0).abs() < 1e-5, "{}", hits[0].score);
+    assert!(
+        (hits[1].score - (1.0 - 0.4 * 0.5)).abs() < 1e-5,
+        "{}",
+        hits[1].score
+    );
+    let year_factor = 0.5f32.powf(365.0 / 7.0);
+    assert!(
+        (hits[2].score - (1.0 - 0.4 * (1.0 - year_factor))).abs() < 1e-5,
+        "{}",
+        hits[2].score
+    );
+}
+
+#[test]
+fn decay_off_by_default_leaves_the_ranking_and_the_scores_alone() {
+    let origin = 2_000 * DAY;
+    let store = decay_store(origin);
+    let plain = store
+        .search(&["docs"], &[1.0, 0.0, 0.0], &default_opts(10))
+        .unwrap();
+    assert_eq!(plain.len(), 3);
+    for hit in &plain {
+        assert!((hit.score - 1.0).abs() < 1e-6, "base score untouched");
+    }
+    let ids: Vec<&str> = plain.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, vec!["fresh", "week", "year"], "tie-break unchanged");
+}
+
+#[test]
+fn a_record_with_no_timestamp_is_not_penalized() {
+    let origin = 2_000 * DAY;
+    let mut store = decay_store(origin);
+    store
+        .upsert("docs", &[rec("undated", vec![1.0, 0.0, 0.0])])
+        .unwrap();
+    let hits = store
+        .search(&["docs"], &[1.0, 0.0, 0.0], &decayed(origin, 0.9))
+        .unwrap();
+    let undated = hits.iter().find(|h| h.id == "undated").unwrap();
+    assert!((undated.score - 1.0).abs() < 1e-5, "{}", undated.score);
+    // It therefore outranks the aged docs instead of being buried beneath them.
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids[..2], ["fresh", "undated"], "{ids:?}");
+}
+
+#[test]
+fn a_missing_timestamp_can_be_opted_into_a_penalty() {
+    let origin = 2_000 * DAY;
+    let mut store = decay_store(origin);
+    store
+        .upsert("docs", &[rec("undated", vec![1.0, 0.0, 0.0])])
+        .unwrap();
+    let opts = SearchOpts {
+        top_k: 10,
+        rank_by: Some(RankBy::Decay(
+            Decay::new("ts", origin, 7 * DAY).lambda(0.5).missing(0.0),
+        )),
+        ..Default::default()
+    };
+    let hits = store.search(&["docs"], &[1.0, 0.0, 0.0], &opts).unwrap();
+    let undated = hits.iter().find(|h| h.id == "undated").unwrap();
+    assert!((undated.score - 0.5).abs() < 1e-5, "{}", undated.score);
+}
+
+/// The whole point of subtracting: Euclidean scores in (−∞, 0] and dot product anywhere at
+/// all, and one penalty is valid for both. A multiplied factor would need a Cosine-only clamp.
+#[test]
+fn decay_works_under_euclidean_and_dot_product() {
+    let origin = 2_000 * DAY;
+    for distance in [Distance::Euclidean, Distance::DotProduct] {
+        let mut store = Store::in_memory_with(3, distance).unwrap();
+        store
+            .upsert(
+                "docs",
+                &[
+                    stamped("fresh", vec![2.0, 0.0, 0.0], days_ago(origin, 0)),
+                    stamped("week", vec![2.0, 0.0, 0.0], days_ago(origin, 7)),
+                ],
+            )
+            .unwrap();
+        let base = store
+            .search(&["docs"], &[2.0, 0.0, 0.0], &default_opts(10))
+            .unwrap();
+        assert!(
+            (base[0].score - base[1].score).abs() < 1e-6,
+            "{distance:?}: identical vectors must tie before decay"
+        );
+        let hits = store
+            .search(&["docs"], &[2.0, 0.0, 0.0], &decayed(origin, 1.0))
+            .unwrap();
+        assert_eq!(hits[0].id, "fresh", "{distance:?}");
+        assert!(
+            (hits[1].score - (base[1].score - 0.5)).abs() < 1e-4,
+            "{distance:?}: one half-life costs lambda/2, got {}",
+            hits[1].score
+        );
+    }
+}
+
+/// nidus-m50.15 #9: `rank_by` does not force the exact path — it applies over an ANN result
+/// set, inheriting that path's approximation rather than silently disabling the index.
+#[test]
+fn decay_applies_over_an_ann_result_set_without_forcing_exact() {
+    let origin = 2_000 * DAY;
+    let mut store = Store::in_memory_cfg(
+        Config::new("/dev/null/in-memory", 3)
+            .auto_compact(None)
+            .ann(Some(AnnConfig::hnsw())),
+    )
+    .unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                stamped("fresh", vec![1.0, 0.0, 0.0], days_ago(origin, 0)),
+                stamped("week", vec![1.0, 0.0, 0.0], days_ago(origin, 7)),
+            ],
+        )
+        .unwrap();
+    let hits = store
+        .search(&["docs"], &[1.0, 0.0, 0.0], &decayed(origin, 0.4))
+        .unwrap();
+    assert_eq!(hits[0].id, "fresh");
+    assert!((hits[1].score - (1.0 - 0.4 * 0.5)).abs() < 1e-5, "{hits:?}");
+}
+
+#[test]
+fn decay_applies_over_the_quantized_two_pass_search() {
+    let origin = 2_000 * DAY;
+    let mut store = Store::in_memory_cfg(
+        Config::new("/dev/null/in-memory", 3)
+            .auto_compact(None)
+            .quantization(Some(Quantization::default())),
+    )
+    .unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                stamped("fresh", vec![1.0, 0.0, 0.0], days_ago(origin, 0)),
+                stamped("week", vec![1.0, 0.0, 0.0], days_ago(origin, 7)),
+            ],
+        )
+        .unwrap();
+    let hits = store
+        .search(&["docs"], &[1.0, 0.0, 0.0], &decayed(origin, 0.4))
+        .unwrap();
+    assert_eq!(hits[0].id, "fresh");
+    assert!((hits[1].score - (1.0 - 0.4 * 0.5)).abs() < 1e-5, "{hits:?}");
+}
+
+#[test]
+fn min_score_gates_the_decayed_score_not_the_base_one() {
+    let origin = 2_000 * DAY;
+    let store = decay_store(origin);
+    let opts = SearchOpts {
+        min_score: Some(0.9),
+        ..decayed(origin, 0.4)
+    };
+    let ids: Vec<String> = store
+        .search(&["docs"], &[1.0, 0.0, 0.0], &opts)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    // Every base score is 1.0; only `fresh` still clears 0.9 once the penalty lands.
+    assert_eq!(ids, vec!["fresh"]);
+}
+
+#[test]
+fn a_degenerate_ranking_expression_is_refused() {
+    let store = decay_store(0);
+    for bad in [
+        Decay::new("ts", 0, 0),
+        Decay::new("ts", 0, DAY).decay(1.0),
+        Decay::new("ts", 0, DAY).lambda(f32::NAN),
+        Decay::new("", 0, DAY),
+    ] {
+        let opts = SearchOpts {
+            top_k: 3,
+            rank_by: Some(RankBy::Decay(bad.clone())),
+            ..Default::default()
+        };
+        assert!(
+            store.search(&["docs"], &[1.0, 0.0, 0.0], &opts).is_err(),
+            "{bad:?} must be refused"
+        );
+    }
+}
+
+// ── ORDER BY with no vector query (nidus-m50.3) ───────────────────────────
+
+fn ordered_store() -> Store {
+    let mut store = Store::in_memory(2).unwrap();
+    let with_n = |id: &str, n: i64| {
+        rec_with(
+            id,
+            vec![1.0, 0.0],
+            BTreeMap::from([("n".to_string(), Value::Int(n))]),
+        )
+    };
+    store
+        .upsert("docs", &[with_n("b", 2), with_n("c", 3), with_n("a", 1)])
+        .unwrap();
+    store
+}
+
+fn listed(store: &Store, order: Option<OrderBy>) -> Vec<String> {
+    store
+        .list(
+            &["docs"],
+            &ListOpts {
+                order_by: order,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect()
+}
+
+#[test]
+fn order_by_sorts_a_plain_attribute_both_ways() {
+    let store = ordered_store();
+    assert_eq!(listed(&store, Some(OrderBy::asc("n"))), ["a", "b", "c"]);
+    assert_eq!(listed(&store, Some(OrderBy::desc("n"))), ["c", "b", "a"]);
+    // No `order_by` keeps the storage order the upsert produced.
+    assert_eq!(listed(&store, None), ["b", "c", "a"]);
+}
+
+#[test]
+fn order_by_sorts_strings_and_datetimes_too() {
+    let mut store = Store::in_memory(2).unwrap();
+    let with =
+        |id: &str, v: Value| rec_with(id, vec![1.0, 0.0], BTreeMap::from([("k".to_string(), v)]));
+    store
+        .upsert(
+            "docs",
+            &[
+                with("mid", Value::Str("m".into())),
+                with("low", Value::Str("a".into())),
+                with("high", Value::Str("z".into())),
+                with("older", Value::DateTime(1)),
+            ],
+        )
+        .unwrap();
+    let asc = listed(&store, Some(OrderBy::asc("k")));
+    assert_eq!(&asc[..3], ["low", "mid", "high"], "{asc:?}");
+    assert_eq!(asc[3], "older", "a DateTime does not order against a Str");
+}
+
+/// nidus-m50.15 #10: values that do not order against the witness type — a different
+/// variant, an unorderable one, or an absent attribute — land in ONE trailing bucket, and
+/// stay trailing when the sort is reversed.
+#[test]
+fn order_by_puts_cross_type_and_missing_values_in_a_trailing_bucket() {
+    let mut store = ordered_store();
+    store
+        .upsert(
+            "docs",
+            &[
+                rec_with(
+                    "str",
+                    vec![1.0, 0.0],
+                    BTreeMap::from([("n".to_string(), Value::Str("zzz".into()))]),
+                ),
+                rec_with(
+                    "null",
+                    vec![1.0, 0.0],
+                    BTreeMap::from([("n".to_string(), Value::Null)]),
+                ),
+                rec("absent", vec![1.0, 0.0]),
+            ],
+        )
+        .unwrap();
+    let trailing = ["str", "null", "absent"];
+    let asc = listed(&store, Some(OrderBy::asc("n")));
+    assert_eq!(&asc[..3], ["a", "b", "c"], "{asc:?}");
+    for id in trailing {
+        assert!(asc[3..].contains(&id.to_string()), "{asc:?}");
+    }
+    let desc = listed(&store, Some(OrderBy::desc("n")));
+    assert_eq!(&desc[..3], ["c", "b", "a"], "{desc:?}");
+    for id in trailing {
+        assert!(
+            desc[3..].contains(&id.to_string()),
+            "reversing must not promote the trailing bucket: {desc:?}"
+        );
+    }
+}
+
+#[test]
+fn order_by_an_attribute_nobody_has_keeps_the_storage_order() {
+    let store = ordered_store();
+    assert_eq!(listed(&store, Some(OrderBy::asc("nope"))), ["b", "c", "a"]);
+}
+
+#[test]
+fn order_by_runs_before_the_page_is_cut() {
+    let store = ordered_store();
+    let page = store
+        .list(
+            &["docs"],
+            &ListOpts {
+                offset: 1,
+                limit: 1,
+                order_by: Some(OrderBy::asc("n")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].id, "b", "the second row of the SORTED set");
+}
+
+// ── Per-leg hybrid weights (nidus-m50.3) ──────────────────────────────────
+
+fn weighted_hybrid_store() -> Store {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    // One doc per leg and nothing in both, so a weight decides the winner outright.
+    let mut vecdoc = Record::new("vecdoc", vec![1.0, 0.0, 0.0], BTreeMap::new());
+    vecdoc
+        .attrs
+        .insert("body".to_string(), Value::Str("nothing here".to_string()));
+    store
+        .upsert("docs", &[vecdoc, doc("textdoc", "quantum physics")])
+        .unwrap();
+    store
+}
+
+fn fused(store: &Store, opts: HybridOpts) -> Vec<Hit> {
+    store
+        .hybrid_search(
+            &["docs"],
+            &[1.0, 0.0, 0.0],
+            &FtsQuery::new("body", "quantum physics"),
+            &opts,
+        )
+        .unwrap()
+}
+
+fn weighted(vector_weight: f32, text_weight: f32) -> HybridOpts {
+    HybridOpts {
+        top_k: 10,
+        vector_weight,
+        text_weight,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn both_leg_weights_at_one_are_identical_to_the_unweighted_fusion() {
+    let store = weighted_hybrid_store();
+    let default = fused(
+        &store,
+        HybridOpts {
+            top_k: 10,
+            ..Default::default()
+        },
+    );
+    // Bit-identical, not approximately equal: multiplying by 1.0 is exact.
+    assert_eq!(fused(&store, weighted(1.0, 1.0)), default);
+}
+
+#[test]
+fn a_leg_weight_shifts_which_leg_wins_the_fusion() {
+    let store = weighted_hybrid_store();
+    assert_eq!(fused(&store, weighted(4.0, 1.0))[0].id, "vecdoc");
+    assert_eq!(fused(&store, weighted(1.0, 4.0))[0].id, "textdoc");
+    // The winner's score is exactly the weighted reciprocal rank of its leading leg.
+    let heavy = fused(&store, weighted(4.0, 1.0));
+    assert!(
+        (heavy[0].score - 4.0 / 61.0).abs() < 1e-6,
+        "{}",
+        heavy[0].score
+    );
+}
+
+#[test]
+fn a_poisonous_leg_weight_is_refused() {
+    let store = weighted_hybrid_store();
+    for (v, t) in [(f32::NAN, 1.0), (1.0, -1.0), (f32::INFINITY, 1.0)] {
+        assert!(
+            store
+                .hybrid_search(
+                    &["docs"],
+                    &[1.0, 0.0, 0.0],
+                    &FtsQuery::new("body", "quantum"),
+                    &weighted(v, t)
+                )
+                .is_err(),
+            "({v}, {t}) must be refused"
+        );
+    }
+}
+
+// ── Aggregation (nidus-m50.6) ─────────────────────────────────────────────
+
+fn agg_store() -> Store {
+    let mut store = Store::in_memory(2).unwrap();
+    let doc = |id: &str, kind: &str, bytes: Value| {
+        rec_with(
+            id,
+            vec![1.0, 0.0],
+            BTreeMap::from([
+                ("kind".to_string(), Value::Str(kind.to_string())),
+                ("bytes".to_string(), bytes),
+            ]),
+        )
+    };
+    store
+        .upsert(
+            "docs",
+            &[
+                doc("a", "note", Value::Int(10)),
+                doc("b", "note", Value::Int(32)),
+                doc("c", "code", Value::Int(5)),
+                rec("d", vec![0.0, 1.0]),
+            ],
+        )
+        .unwrap();
+    store
+}
+
+fn agg(store: &Store, filter: Filter, sum: &[&str]) -> Aggregation {
+    store.aggregate(
+        &["docs"],
+        &AggregateOpts {
+            filter,
+            sum: sum.iter().map(|s| s.to_string()).collect(),
+        },
+    )
+}
+
+#[test]
+fn count_and_sum_over_a_filter() {
+    let store = agg_store();
+    let all = agg(&store, Filter::default(), &["bytes"]);
+    assert_eq!(all.count, 4);
+    assert_eq!(all.sums["bytes"], Value::Int(47));
+
+    let notes = agg(
+        &store,
+        Filter(vec![Predicate::Eq(
+            "kind".into(),
+            Value::Str("note".into()),
+        )]),
+        &["bytes"],
+    );
+    assert_eq!(notes.count, 2);
+    assert_eq!(notes.sums["bytes"], Value::Int(42));
+}
+
+#[test]
+fn an_empty_match_counts_zero_and_sums_zero() {
+    let store = agg_store();
+    let none = agg(
+        &store,
+        Filter(vec![Predicate::Eq(
+            "kind".into(),
+            Value::Str("nope".into()),
+        )]),
+        &["bytes"],
+    );
+    assert_eq!(none.count, 0);
+    assert_eq!(none.sums["bytes"], Value::Int(0));
+    // An unknown collection answers the same way rather than erroring.
+    let empty = Store::in_memory(2).unwrap();
+    let out = empty.aggregate(&["missing"], &AggregateOpts::default());
+    assert_eq!(out.count, 0);
+    assert!(out.sums.is_empty());
+}
+
+#[test]
+fn a_sum_reports_a_tagged_value_and_promotes_to_float() {
+    let mut store = Store::in_memory(2).unwrap();
+    let with =
+        |id: &str, v: Value| rec_with(id, vec![1.0, 0.0], BTreeMap::from([("x".to_string(), v)]));
+    store
+        .upsert(
+            "docs",
+            &[
+                with("i", Value::Int(2)),
+                with("f", Value::Float(0.5)),
+                with("s", Value::Str("nope".into())),
+                rec("none", vec![1.0, 0.0]),
+            ],
+        )
+        .unwrap();
+    // Non-numeric and missing values are skipped, not zeroed; one Float promotes the total.
+    assert_eq!(
+        agg(&store, Filter::default(), &["x"]).sums["x"],
+        Value::Float(2.5)
+    );
+}
+
+#[test]
+fn aggregate_sums_several_fields_in_one_pass() {
+    let store = agg_store();
+    let out = agg(&store, Filter::default(), &["bytes", "kind"]);
+    assert_eq!(out.sums["bytes"], Value::Int(47));
+    // A field with no numeric value anywhere sums to Int(0), not an error.
+    assert_eq!(out.sums["kind"], Value::Int(0));
+}
+
+// ── Result diversity: limit_per (nidus-m50.6) ─────────────────────────────
+
+/// Six docs over two files, each at a distinct score so the ranking is unambiguous.
+fn diverse_store() -> Store {
+    let mut store = Store::in_memory(2).unwrap();
+    let recs: Vec<Record> = (0..6)
+        .map(|i| {
+            let file = if i % 2 == 0 { "a.rs" } else { "b.rs" };
+            let angle = 0.02 * i as f32;
+            rec_with(
+                &format!("d{i}"),
+                vec![1.0 - angle, angle],
+                BTreeMap::from([("file".to_string(), Value::Str(file.to_string()))]),
+            )
+        })
+        .collect();
+    store.upsert("docs", &recs).unwrap();
+    store
+}
+
+fn capped(store: &Store, cap: Option<LimitPer>, top_k: usize) -> Vec<String> {
+    store
+        .search(
+            &["docs"],
+            &[1.0, 0.0],
+            &SearchOpts {
+                top_k,
+                limit_per: cap,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect()
+}
+
+#[test]
+fn limit_per_caps_the_hits_carrying_one_value() {
+    let store = diverse_store();
+    assert_eq!(capped(&store, None, 6).len(), 6);
+    let ids = capped(&store, Some(LimitPer::new("file", 2)), 6);
+    // The best two of each group survive, in rank order.
+    assert_eq!(ids, ["d0", "d1", "d2", "d3"], "{ids:?}");
+    assert_eq!(capped(&store, Some(LimitPer::new("file", 1)), 6).len(), 2);
+}
+
+/// nidus-m50.15 #14: without a shared group for the absent value, dropping the attribute
+/// from a doc would be a way to opt out of the cap entirely.
+#[test]
+fn records_missing_the_group_attribute_share_one_group() {
+    let mut store = Store::in_memory(2).unwrap();
+    let recs: Vec<Record> = (0..4)
+        .map(|i| {
+            rec(
+                &format!("d{i}"),
+                vec![1.0 - 0.02 * i as f32, 0.02 * i as f32],
+            )
+        })
+        .collect();
+    store.upsert("docs", &recs).unwrap();
+    let ids = capped(&store, Some(LimitPer::new("file", 2)), 4);
+    assert_eq!(ids, ["d0", "d1"], "all four share one group: {ids:?}");
+}
+
+#[test]
+fn limit_per_reads_the_live_record_not_the_projected_hit() {
+    let store = diverse_store();
+    let ids: Vec<String> = store
+        .search(
+            &["docs"],
+            &[1.0, 0.0],
+            &SearchOpts {
+                top_k: 6,
+                limit_per: Some(LimitPer::new("file", 1)),
+                projection: Projection::exclude(["file"]),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(
+        ids,
+        ["d0", "d1"],
+        "excluding the attr must not lift the cap"
+    );
+}
+
+#[test]
+fn limit_per_composes_with_pagination() {
+    let store = diverse_store();
+    let page = store
+        .search(
+            &["docs"],
+            &[1.0, 0.0],
+            &SearchOpts {
+                top_k: 2,
+                offset: 2,
+                limit_per: Some(LimitPer::new("file", 2)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let ids: Vec<&str> = page.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, ["d2", "d3"], "the page is cut AFTER the cap");
+}
+
+#[test]
+fn limit_per_caps_a_text_search_too() {
+    let mut store = Store::in_memory(2).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    let docs: Vec<Record> = (0..4)
+        .map(|i| {
+            let mut r = doc(&format!("d{i}"), "quantum physics");
+            r.attrs
+                .insert("file".to_string(), Value::Str("a.rs".to_string()));
+            r
+        })
+        .collect();
+    store.upsert("docs", &docs).unwrap();
+    let hits = store
+        .text_search(
+            &["docs"],
+            &FtsQuery::new("body", "quantum"),
+            &SearchOpts {
+                top_k: 4,
+                limit_per: Some(LimitPer::new("file", 2)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 2);
+}
+
+#[test]
+fn a_degenerate_cap_is_refused() {
+    let store = diverse_store();
+    for bad in [LimitPer::new("file", 0), LimitPer::new("", 2)] {
+        let opts = SearchOpts {
+            top_k: 3,
+            limit_per: Some(bad.clone()),
+            ..Default::default()
+        };
+        assert!(
+            store.search(&["docs"], &[1.0, 0.0], &opts).is_err(),
+            "{bad:?} must be refused"
+        );
+    }
+}

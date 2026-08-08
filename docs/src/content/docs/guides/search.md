@@ -175,6 +175,90 @@ It bypasses the ANN walk, the per-segment index fan-out, and the quantized first
 alike. The default is `false`, so the store's configured path is unchanged for anyone who
 does not ask.
 
+## Ranking by recency
+
+On pure similarity a two-year-old note beats a fresh one that says the same thing.
+`SearchOpts::rank_by` layers a **recency decay** over the store's metric: an age penalty
+computed from a timestamp attribute and subtracted from each hit's score.
+
+```rust
+use nidus::{Decay, RankBy, SearchOpts};
+
+let now = 1_770_000_000_000_i64; // epoch milliseconds
+let week = 7 * 24 * 60 * 60 * 1000;
+
+let hits = db.search(
+    "notes",
+    &query,
+    &SearchOpts {
+        top_k: 10,
+        // Halve the decay factor every week; a fully-decayed hit gives up 0.2 of score.
+        rank_by: Some(RankBy::Decay(Decay::new("updated_at", now, week).lambda(0.2))),
+        ..Default::default()
+    },
+)?;
+# anyhow::Ok(())
+```
+
+The timestamp attribute may be a `Value::DateTime` or a `Value::Int`, both **epoch
+milliseconds**. `origin` is "now" as *you* supply it, not the wall clock, so the same query
+against an unchanged store ranks the same way twice. The score is:
+
+```text
+age    = max(0, origin − attrs[field])   // a future timestamp is simply un-aged
+factor = decay ^ (age / scale)           // `decay` (default 0.5) at exactly one `scale`
+score  = base − lambda × (1 − factor)
+```
+
+The penalty **subtracts** rather than multiplying. That is what makes it valid for
+`Euclidean` (which scores in (−∞, 0]) and `DotProduct` (which scores anywhere at all), not
+just cosine — and for the unbounded BM25 scores of `text_search`, where `rank_by` works
+identically. The cost is that `lambda` is in score units, so pick it against the metric in
+use.
+
+Two behaviours worth knowing:
+
+- **A record with no usable timestamp is not penalized** (`missing` defaults to `1.0`), so
+  switching decay on never silently buries data written before the field existed. Pass
+  `.missing(0.0)` for the opposite.
+- **`rank_by` does not force an exact search.** [`exact`](#forcing-an-exact-search) is the
+  knob for that. Over an ANN or quantized result set the candidates were selected on the
+  base score, so decay reorders within an approximate set. A ranked scan also runs
+  single-threaded — it needs each record's attrs, which the parallel scan kernels do not
+  see — so a `rank_by` query gives up `query_threads`.
+
+`min_score` is compared against the final, decayed score on every path.
+
+## Capping hits per attribute value
+
+One verbose document can fill an entire recall window. `limit_per` caps how many hits may
+carry any one value of an attribute:
+
+```rust
+use nidus::{LimitPer, SearchOpts};
+
+let hits = db.search(
+    "code",
+    &query,
+    &SearchOpts {
+        top_k: 20,
+        limit_per: Some(LimitPer::new("path", 2)), // at most 2 hits per file
+        ..Default::default()
+    },
+)?;
+# anyhow::Ok(())
+```
+
+The group value is read from the stored record, so excluding the field with a
+[projection](#choosing-the-attrs-a-hit-carries) does not lift the cap, and records
+**missing** the attribute all share one group — otherwise dropping the attribute would be a
+way to opt out.
+
+It is a deliberately **approximate** cap. A capped search ranks eight pages deep, applies the
+cap in rank order, then cuts the page, so a page can come back shorter than `top_k` even
+though more uncapped matches exist further down. What is guaranteed is the upper bound: a
+returned page never carries more than `max` hits for one value.
+
 ## Typed metadata
 
 Each record carries an open map of typed [`Value`](/reference/api/#value)s:
@@ -310,6 +394,50 @@ let page2 = db.list("code", &ListOpts { offset: 100, filter, ..Default::default(
 `list` accepts a [`Scope`](/reference/api/#scope) just like `search`, so you can
 list across multiple collections or the whole store. It also takes the same
 [`projection`](#choosing-the-attrs-a-hit-carries), so a listing can return ids alone.
+
+### Ordering by an attribute
+
+`ListOpts::order_by` sorts by an attribute instead of storage order — ORDER BY with no
+vector query at all. Sorting happens over the whole match set *before* the page is cut, so
+`offset`/`limit` walk the sorted order.
+
+```rust
+use nidus::{ListOpts, OrderBy};
+
+let newest = db.list(
+    "notes",
+    &ListOpts { order_by: Some(OrderBy::desc("updated_at")), limit: 20, ..Default::default() },
+)?;
+# anyhow::Ok(())
+```
+
+Cross-type ordering mirrors the filter's same-type rule: the first orderable value found
+fixes the sort's type, and everything that does not order against it — a different `Value`
+variant, an unorderable `Null` or `List`, or a record missing the attribute entirely — lands
+in one **trailing bucket**. The bucket stays trailing under `descending` too.
+
+## Aggregation
+
+`aggregate` counts matching records and totals numeric attributes straight off the in-memory
+index — no record is materialized and no vector is read.
+
+```rust
+use nidus::{AggregateOpts, Filter, Predicate, Scope, Value};
+
+let stats = db.aggregate(
+    Scope::All,
+    &AggregateOpts {
+        filter: Filter(vec![Predicate::Eq("lang".into(), Value::Str("rust".into()))]),
+        sum: vec!["bytes".into()],
+    },
+)?;
+println!("{} records, {:?} bytes", stats.count, stats.sums["bytes"]);
+# anyhow::Ok(())
+```
+
+`count` is always reported. Each entry in `sums` is a tagged `Value`: `Int` while every
+addend was an `Int`, `Float` once any `Float` joined. A missing or non-numeric value is
+skipped rather than counted as zero, so `sum` and `count` stay independently meaningful.
 
 ## int8 scalar quantization
 
@@ -591,6 +719,28 @@ a floor.
 The text leg takes the same multi-clause `FtsQuery` as `text_search`: the clauses are
 combined into one BM25 leg first, then fused with the vector leg, so a single-clause hybrid
 query produces exactly the numbers it always did.
+
+### Weighting the legs
+
+`vector_weight` and `text_weight` scale each leg's contribution, so a document scores
+`Σ wᵢ / (rrf_k + rankᵢ)`. Both default to `1.0`, which reproduces the unweighted fusion
+exactly.
+
+```rust
+use nidus::{FtsQuery, HybridOpts};
+
+// Lean on the keyword leg: exact terms matter more than semantic neighbourhood here.
+let hits = db.hybrid_search(
+    "docs",
+    &query_vector,
+    &FtsQuery::new("body", "CVE-2026-1234"),
+    &HybridOpts { top_k: 10, text_weight: 3.0, ..Default::default() },
+)?;
+# anyhow::Ok(())
+```
+
+A weight must be finite and non-negative — a `NaN` would poison the sort and a negative
+weight would invert a leg rather than de-emphasize it, so both are refused.
 
 ## Explaining a hit
 

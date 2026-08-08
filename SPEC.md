@@ -194,6 +194,9 @@ impl Nidus {
     // `scope` accepts `impl Into<Scope>`, so a bare &str / &[&str] also works.
     pub fn search(&self, scope: Scope, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>;
 
+    // count + sum over a filter, straight off the in-RAM index — no Record built (§7.7)
+    pub fn aggregate(&self, scope: Scope, opts: &AggregateOpts) -> Result<Aggregation>;
+
     pub fn flush(&mut self) -> Result<()>;     // fsync both files
     pub fn compact(&mut self) -> Result<()>;   // reclaim dead rows / log churn
     pub fn refresh(&mut self) -> Result<bool>; // ReadOnly: adopt a writer's newer state (§14.6)
@@ -210,10 +213,26 @@ pub enum Scope<'a> {
 
 // `offset` skips that many top-ranked hits (§7 pagination); 0 is the whole first page.
 // `exact` forces the brute-force scan for one query; `projection` picks the attrs (§7).
-pub struct SearchOpts { pub top_k: usize, pub offset: usize, pub filter: Filter, pub min_score: Option<f32>, pub exact: bool, pub projection: Projection }
+// `rank_by`/`limit_per` are the opt-in ranking expression and per-value hit cap (§7.6, §7.7).
+pub struct SearchOpts { pub top_k: usize, pub offset: usize, pub filter: Filter, pub min_score: Option<f32>, pub exact: bool, pub projection: Projection, pub rank_by: Option<RankBy>, pub limit_per: Option<LimitPer> }
 
 // Which attrs a Hit carries. An enum, so "include and exclude at once" cannot be built.
 pub enum Projection { All, Include(Vec<String>), Exclude(Vec<String>) }
+
+// A ranking expression layered over the metric. The penalty SUBTRACTS (§7.6).
+pub enum RankBy { Decay(Decay) }
+pub struct Decay { pub field: String, pub origin: i64, pub scale: i64,
+                   pub decay: f32, pub lambda: f32, pub missing: f32 }   // missing defaults to 1.0
+
+// "At most `max` hits per distinct value of `field`" — approximate; see §7.7.
+pub struct LimitPer { pub field: String, pub max: usize }
+
+// ORDER BY for `list`. Cross-type and missing values sort into a trailing bucket (§7.6).
+pub struct OrderBy { pub field: String, pub descending: bool }
+
+// count is always reported; `sum` names attributes to total, each a tagged Value (§7.7).
+pub struct AggregateOpts { pub filter: Filter, pub sum: Vec<String> }
+pub struct Aggregation { pub count: u64, pub sums: BTreeMap<String, Value> }
 
 // `collection` identifies the source namespace — required when a query spans more
 // than one, and (id) is only unique within a collection.
@@ -586,7 +605,7 @@ reliable guard there is to refuse work *before* allocating:
   wire form carries `include_attributes`/`exclude_attributes` and answers `400` when both
   are sent, rather than inventing a precedence rule (nidus-m50.15). Ranking is untouched:
   projection changes the payload, never the order or the scores. **Highlighting is
-  independent of it** (§7.6): fragments are cut from the *stored* text, so projecting a long
+  independent of it** (§7.8): fragments are cut from the *stored* text, so projecting a long
   body away and keeping only its snippet is the supported combination, not a silent no-op.
   `RecallOpts` has neither knob, for the same reason it has no `offset` — the memory API
   stays lean.
@@ -604,6 +623,13 @@ reliable guard there is to refuse work *before* allocating:
   folded score. `hybrid_search` fuses one vector leg with the *combined* text leg, so the RRF
   numbers for a single-clause query are unchanged and per-clause weights stay out of scope
   (they belong to the ranking ticket).
+- **Ranking expressions are additive and off by default** (§7.6): `SearchOpts::rank_by`
+  layers a recency decay over the metric (subtracting an age penalty, so it holds for every
+  `Distance` and for BM25), `HybridOpts::vector_weight`/`text_weight` weight the fused legs,
+  and `ListOpts::order_by` is a plain ORDER BY with no vector query at all. A query that sets
+  none of them returns exactly what it returned before they existed. **Result diversity** is
+  `SearchOpts::limit_per` — a cap on hits per attribute value, exact only within an over-fetch
+  window (§7.7). Aggregation (`count`/`sum`) is answered without materializing a record.
 - **Filters** (`Filter` = AND of `Predicate`s) are evaluated against `attrs` before
   scoring: `Eq` (typed equality), `Ne` (typed inequality), `Glob` / `IGlob` (pattern
   match on a `Str` attr, case-sensitive and ASCII-case-insensitive, §7.1), `In` /
@@ -747,7 +773,104 @@ pattern into a process-wide cache keyed by the pattern text; the per-record path
 read-locked lookup. The cache is capped (256 distinct patterns) and cleared wholesale on
 overflow, since patterns arrive from untrusted request bodies.
 
-### 7.6 Result annotations — why a hit matched
+### 7.6 Ranking expressions: recency decay, leg weights, ORDER BY
+
+Until nidus-m50.3 there were exactly three rankings: cosine (or the store's metric), BM25,
+and an RRF fusion of the two at fixed leg weights. Three additive knobs widen that, and
+**every one of them is off by default** — an untouched query returns byte-identical results.
+
+**Recency decay** (`SearchOpts::rank_by = Some(RankBy::Decay(…))`) is the one that most
+changes result quality for a memory store: on pure cosine a two-year-old note beats a fresh
+one that says the same thing. A `Decay` names a timestamp attribute (`Value::DateTime` or a
+`Value::Int`, both epoch milliseconds), an `origin` ("now", supplied by the caller so a
+ranking is reproducible rather than clock-dependent), a `scale`, and three tuning knobs.
+The factor is
+
+```
+age    = max(0, origin − attrs[field])          # milliseconds; a future stamp is un-aged
+factor = decay ^ (age / scale)                  # `decay` at exactly one `scale` of age
+score  = base − lambda × (1 − factor)
+```
+
+**The penalty SUBTRACTS; it does not multiply.** This is the load-bearing decision. A
+multiplicative factor (`base × factor`) is only meaningful when scores are non-negative and
+larger-is-better on a fixed scale — i.e. Cosine, and only after a clamp, because multiplying
+a *negative* cosine score by a decayed factor makes it larger. nidus has three metrics:
+`Euclidean` scores in (−∞, 0] and `DotProduct` scores anywhere at all. A subtraction is a
+translation, and a translation preserves order under every one of them and for both signs.
+It also composes with the raw BM25 scores of `text_search`, which have no bounded range
+either. The cost is that `lambda` is expressed in *score units* rather than as a fraction,
+so it must be chosen against the metric in use — a real trade, and the right one.
+
+Three defaults matter:
+
+- `decay` defaults to `0.5`, which makes `scale` a **half-life**.
+- `lambda` defaults to `1.0` — one full unit of score for a fully-decayed record.
+- **`missing` defaults to `1.0`: a record with no usable timestamp is not penalized at all.**
+  The alternative (treating absent as infinitely old) would mean that switching decay on
+  silently buries every document written before the field existed. Callers who want the
+  opposite set `missing: 0.0` explicitly.
+
+`rank_by` **does not force the exact path.** `SearchOpts::exact` is the explicit opt-in for
+that, and conflating the two would mean enabling decay silently disabled the index. The
+expression is applied where each candidate's final score is decided, which every path
+already reaches with the record's attrs in hand: the brute-force scan, the ANN walk's
+post-filter rerank, the per-segment IVF fan-out, and the quantized two-pass rerank. Over an
+approximate result set decay therefore **inherits that path's approximation** — the
+candidate *set* was chosen on the base score, and only the ordering within it is decayed.
+`min_score` is compared against the final, decayed number on every path, not the base one.
+
+One performance note, stated rather than hidden: a ranked scan runs **serial**. The chunk
+kernels that feed `parallel_topk` see only the vector matrix, never the attrs, so the
+expression path takes a separate loop that does a per-row index lookup. Generalizing the
+parallel engine to carry attrs is deliberately deferred; a query with `rank_by` set gives up
+`Config::query_threads` and pays an index lookup per scanned row.
+
+**Per-leg hybrid weights** (`HybridOpts::vector_weight` / `text_weight`) scale each leg's
+contribution to the fused score: a document scores `Σ wᵢ / (rrf_k + rankᵢ + 1)`. Both at the
+default `1.0` reproduces unweighted RRF **bit for bit** — multiplying by `1.0` is exact, not
+approximately exact — so the default fusion is unchanged. A non-finite or negative weight is
+refused: `NaN` makes every comparison in the sort false, and a negative weight inverts a leg
+rather than de-emphasizing it.
+
+**ORDER BY with no vector query** is `ListOpts::order_by`. Sorting runs over the whole match
+set *before* the page is cut, so `offset`/`limit` walk the sorted order. Cross-type ordering
+mirrors the filter's same-type rule (§7): the **witness** — the first value in the incoming
+stable order that compares against itself — fixes the sort's type, and every value that does
+not order against it (a different variant, an unorderable `Null`/`List`/`NaN`, or an absent
+attribute) falls into one **trailing bucket**, in the order `list` built it. The bucket stays
+trailing under `descending`, which is why direction is applied to the value comparison only
+and never to the bucket split.
+
+### 7.7 Aggregation and result diversity
+
+**`count` and `sum`** (`Nidus::aggregate`, `POST /aggregate`) answer from the in-RAM index in
+one pass: no `Record` is built, no vector row is read. `count` is always reported;
+`AggregateOpts::sum` names attributes to total. A sum reports a **tagged `Value`**, like the
+rest of the API — `Int` while every addend was an `Int`, `Float` once any `Float` joined (the
+integer part is accumulated in `i128`, so a long `i64` run cannot wrap, and a total past
+`i64` is reported as `Float` rather than silently truncated). A missing or non-numeric value
+is **skipped, not counted as zero**, which is the only reading that keeps `sum` and `count`
+independently meaningful.
+
+**`limit_per`** caps how many hits may carry any one value of an attribute — "at most 2 hits
+per file". For a memory store this is the highest-value piece here: it stops one verbose
+document from filling the whole recall window. The group value is read from the **live
+record**, not from the returned hit, so a `Projection` that excludes the field cannot lift
+the cap. Records **missing** the attribute form ONE shared group (`MAX_GROUPS`, currently
+10 000, bounds the distinct values tracked; past it further values pass uncapped). Without
+that shared group, deleting the attribute from a document would be a way to opt out of the
+cap entirely.
+
+**`limit_per` is exact only within the over-fetch window, and that trade is deliberate.** A
+capped search ranks `(offset + top_k) × 8` deep, applies the cap in rank order, then cuts the
+page. Documents past that window were never scored into the ranking, so a page can come back
+**shorter than `top_k`** even though more matching, uncapped documents exist further down.
+Making it exact would mean ranking the entire match set for every capped query — an unbounded
+scan to satisfy a diversity knob. The cap that *is* guaranteed is the upper bound: no
+returned page ever carries more than `max` hits for one value.
+
+### 7.8 Result annotations — why a hit matched
 
 A `Hit` carries one score and an attrs map, which does not answer "which clause fired, and
 what part of the text matched". `Hit::annotations` does, and is `None` unless the query asked
@@ -896,7 +1019,7 @@ build until a real need exists.
   over several fields, folded by `Sum` or `Max` (§7). `hybrid_search` fuses a vector
   and a BM25 query with **Reciprocal Rank Fusion** (rank-based, so the incomparable
   cosine/BM25 scales need no normalization), and either surface can annotate its hits with
-  per-leg sub-scores and highlighted fragments (§7.6). The analyzer is pure-Rust, zero-FFI
+  per-leg sub-scores and highlighted fragments (§7.8). The analyzer is pure-Rust, zero-FFI
   (lowercase → Unicode tokenize → optional ASCII folding + token-length cap → English
   stopwords → Porter stem) behind a `Language` enum (US English today; the seam is open
   for more).
@@ -1014,9 +1137,9 @@ src/
 ├── ann/          opt-in ANN index (Config::ann): hnsw.rs (graph) + ivf.rs (lists) +
 │                 persist.rs (cache round-trip)
 ├── fts/          opt-in full-text (BM25) index: mod.rs + analyzer.rs (tokenize/stem/
-│                 span) + fold.rs + schema.rs (FtsField) + highlight.rs (fragments, §7.6)
+│                 span) + fold.rs + schema.rs (FtsField) + highlight.rs (fragments, §7.8)
 ├── annotate.rs   opt-in result annotations: LegScore/ClauseScore/Highlight/Fragment
-│                 + HighlightOpts (§7.6)
+│                 + HighlightOpts (§7.8)
 ├── backend/      pluggable storage & memory (§13): mod.rs (Persistence/Appender/
 │                 MemoryTier/BackendLock traits + URL routing), local.rs (LocalFs +
 │                 FileAppender), ram.rs (LocalRam + MemAppender), object.rs
@@ -1026,8 +1149,10 @@ src/
                   ANN lifecycle glue), scoring.rs (scan kernels + parallel engine),
                   quant.rs (int8/binary state + quantized two-pass search), read.rs
                   (accessors, exact + ANN search), text.rs (multi-clause BM25, hybrid
-                  fusion, annotations), write.rs (upsert/delete/flush/compact),
-                  memtier.rs (working-set publish/adopt), tests.rs
+                  fusion, annotations, §7.8), rank.rs (recency decay + ORDER BY,
+                  §7.6), aggregate.rs (count/sum + limit_per, §7.7), write.rs
+                  (upsert/delete/flush/compact), memtier.rs (working-set publish/
+                  adopt), tests.rs
 
 # ── `cli` feature only (the `nidus` binary, --features cli) ──
 ├── bin/nidus.rs  thin entry point: parse args → cli::run
