@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use nidus::{
-    AnnConfig, Config, Distance, Filter, ListOpts, Nidus, OpenMode, Predicate, Quantization,
-    Record, Scope, SearchOpts, Value,
+    AggregateOpts, AnnConfig, Config, Decay, Distance, Filter, LimitPer, ListOpts, Nidus, OpenMode,
+    OrderBy, Predicate, Quantization, RankBy, Record, Scope, SearchOpts, Value,
 };
 
 fn rec(id: &str, vector: Vec<f32>, kind: &str) -> Record {
@@ -636,4 +636,68 @@ fn text_predicates_through_the_store() {
         .is_err()
     );
     assert!(db.delete_where("c", &over).is_err());
+}
+
+/// The ranking-expression and aggregation surface through the public API, on a file-backed
+/// store reopened between writing and querying (nidus-m50.3, nidus-m50.6).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn ranking_and_aggregation_survive_a_reopen() {
+    const DAY: i64 = 86_400_000;
+    let origin = 2_000 * DAY;
+    let dir = tempfile::tempdir().unwrap();
+    let stamped = |id: &str, days: i64, bytes: i64| {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("ts".to_string(), Value::DateTime(origin - days * DAY));
+        attrs.insert("bytes".to_string(), Value::Int(bytes));
+        attrs.insert("file".to_string(), Value::Str("a.rs".to_string()));
+        Record::new(id, vec![1.0, 0.0, 0.0], attrs)
+    };
+    {
+        let mut db = Nidus::open_dir(dir.path(), 3).unwrap();
+        db.upsert("c", &[stamped("fresh", 0, 10), stamped("week", 7, 32)])
+            .unwrap();
+        db.flush().unwrap();
+    }
+
+    let db = Nidus::open_dir(dir.path(), 3).unwrap();
+    let decayed = SearchOpts {
+        top_k: 10,
+        rank_by: Some(RankBy::Decay(Decay::new("ts", origin, 7 * DAY).lambda(0.4))),
+        ..Default::default()
+    };
+    let hits = db.search("c", &[1.0, 0.0, 0.0], &decayed).unwrap();
+    assert_eq!(hits[0].id, "fresh");
+    assert!((hits[1].score - 0.8).abs() < 1e-5, "{}", hits[1].score);
+
+    // Both docs share one file, so a cap of one leaves exactly one hit.
+    let capped = SearchOpts {
+        top_k: 10,
+        limit_per: Some(LimitPer::new("file", 1)),
+        ..Default::default()
+    };
+    assert_eq!(db.search("c", &[1.0, 0.0, 0.0], &capped).unwrap().len(), 1);
+
+    let ordered = db
+        .list(
+            "c",
+            &ListOpts {
+                order_by: Some(OrderBy::desc("bytes")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(ordered[0].id, "week");
+
+    let stats = db
+        .aggregate(
+            Scope::All,
+            &AggregateOpts {
+                sum: vec!["bytes".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(stats.count, 2);
+    assert_eq!(stats.sums["bytes"], Value::Int(42));
 }

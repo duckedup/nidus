@@ -4,8 +4,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
+use super::aggregate::LIMIT_PER_OVERFETCH;
+use super::rank;
 use super::scoring::{PARALLEL_SCAN_WORK_FLOOR, parallel_topk, score_chunk};
 use super::{ScanOrder, Store, oom};
 use crate::ann::Walk;
@@ -19,14 +21,45 @@ use crate::model::{
 };
 use crate::search::{TopK, dot, euclidean_neg_sq, normalize};
 
-/// The options a search *path* runs with: rank `offset + top_k` deep, then let the caller's
-/// single tail drop `offset`. `offset` is zeroed so no inner path can paginate a second time.
+/// How deep a search path must rank: one page (`offset + top_k`), multiplied by the over-fetch
+/// factor when a per-value cap is going to thin the ranking (nidus-m50.6).
+fn depth(opts: &SearchOpts) -> usize {
+    let page = opts.offset.saturating_add(opts.top_k);
+    match opts.limit_per {
+        None => page,
+        Some(_) => page.saturating_mul(LIMIT_PER_OVERFETCH),
+    }
+}
+
+/// The options a search *path* runs with: rank [`depth`] deep, then let the caller's single
+/// tail cap and paginate. `offset` is zeroed so no inner path can paginate a second time.
 fn deepened(opts: &SearchOpts) -> SearchOpts {
     SearchOpts {
-        top_k: opts.offset.saturating_add(opts.top_k),
+        top_k: depth(opts),
         offset: 0,
         ..opts.clone()
     }
+}
+
+/// The marker every caller-fault query rejection carries, so the HTTP layer answers `400`
+/// rather than `500` for a malformed knob (`server::classify` keys off it).
+pub(crate) const BAD_QUERY: &str = "invalid query option";
+
+/// Refuse the knobs that shape a ranking, once per query rather than once per record. Beside
+/// `filter::validate`, which the `Nidus` entry points already run.
+fn check_query_opts(opts: &SearchOpts) -> Result<()> {
+    rank::validate(opts.rank_by.as_ref())
+        .and_then(|()| super::aggregate::validate(opts.limit_per.as_ref()))
+        .context(BAD_QUERY)
+}
+
+/// Refuse a fusion weight that would poison the fused score. A `NaN` weight makes every
+/// comparison in the sort false and a negative one inverts a leg rather than de-emphasizing it.
+fn check_weight(name: &str, w: f32) -> Result<()> {
+    if !w.is_finite() || w < 0.0 {
+        bail!("{BAD_QUERY}: {name} must be finite and non-negative, got {w}");
+    }
+    Ok(())
 }
 
 /// Drop the first `offset` ranked hits — the ONE place a page boundary is cut. An offset past
@@ -43,6 +76,19 @@ fn paginate(mut hits: Vec<Hit>, offset: usize) -> Vec<Hit> {
 }
 
 impl Store {
+    /// The ONE tail every ranked surface funnels through: thin the over-fetched ranking by the
+    /// per-value cap, cut the page, hold `top_k`. Capping must precede pagination — capping a
+    /// page would move the boundary rather than diversify what crosses it.
+    fn finish(&self, ranked: Vec<Hit>, opts: &SearchOpts) -> Vec<Hit> {
+        let capped = match &opts.limit_per {
+            Some(cap) => self.cap_per_value(ranked, cap),
+            None => ranked,
+        };
+        let mut hits = paginate(capped, opts.offset);
+        hits.truncate(opts.top_k);
+        hits
+    }
+
     // ── Cheap accessors ─────────────────────────────────────────────────────────
 
     pub fn dimension(&self) -> usize {
@@ -132,6 +178,11 @@ impl Store {
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => a.2.cmp(b.2),
         });
+        // ORDER BY runs over the whole match set, before the page is cut — sorting a page
+        // would only reorder rows storage order had already chosen (nidus-m50.3).
+        if let Some(order) = &opts.order_by {
+            self.order_scan(&mut scan, order);
+        }
         let results = scan
             .iter()
             .skip(opts.offset)
@@ -315,6 +366,7 @@ impl Store {
         // Before the metric: a request the store refuses is not a query it served, so
         // counting it would overstate `search_queries` and skew every ratio built on it.
         self.check_query_dim(query)?;
+        check_query_opts(opts)?;
 
         // Which path served a query is the difference between "queries are slow" and
         // "queries are slow BECAUSE the index is not being used" (nidus-abx.4). One relaxed
@@ -332,13 +384,12 @@ impl Store {
             Distance::Euclidean => euclidean_neg_sq,
         };
 
-        // Each branch ranks `offset + top_k` deep and hands the ranking to ONE tail that drops
-        // `offset`. Single-tail on purpose: a branch that paginated itself — or that applied the
-        // offset before the top-k cap — still compiles and is silently wrong (nidus-m50.8).
-        // `opts.exact` gates every approximate branch (nidus-m50.12): the ANN walk, the segment
-        // indexes, and the quantized first pass below. Store-level config still decides what
-        // exists; this decides, per query, whether to use it.
+        // Each branch ranks `depth` deep and hands the ranking to ONE tail that caps and cuts the
+        // page. Single-tail on purpose: a branch that paginated itself — or that applied the offset
+        // before the top-k cap — still compiles and is silently wrong (nidus-m50.8).
         let deep = deepened(opts);
+        // `opts.exact` gates every approximate branch below (nidus-m50.12). Store-level config
+        // decides what exists; this decides, per query, whether to use it.
         let ranked = if self.ann.is_some() && !deep.exact {
             // ANN: walk the index for an over-fetched candidate set, then post-filter and rerank —
             // recall traded for speed. A selective filter/scope can starve the walk, so `search_ann`
@@ -377,7 +428,7 @@ impl Store {
                 self.rank_scan(&q, scan, score_fn, &deep)
             })?
         };
-        Ok(paginate(ranked, opts.offset))
+        Ok(self.finish(ranked, opts))
     }
 
     /// Full-text (BM25) search over `collections`, reusing the same `Hit`/`Filter`/top-k
@@ -389,11 +440,12 @@ impl Store {
         query: &FtsQuery,
         opts: &SearchOpts,
     ) -> Result<Vec<Hit>> {
+        check_query_opts(opts)?;
         if opts.top_k == 0 {
             return Ok(Vec::new());
         }
-        // Same shape as `search`: rank `offset + top_k` deep, cut the page in one place at the end.
-        let mut topk: TopK<(&str, &str)> = TopK::new(opts.offset.saturating_add(opts.top_k));
+        // Same shape as `search`: rank `depth` deep, then hand the ranking to the one tail.
+        let mut topk: TopK<(&str, &str)> = TopK::new(depth(opts));
         // Analyze the query text once per distinct field analyzer across the scope
         // (collections usually share one), not once per collection.
         let mut analyzed: HashMap<Analyzer, Vec<String>> = HashMap::new();
@@ -408,12 +460,7 @@ impl Store {
                 .entry(cfg)
                 .or_insert_with(|| crate::fts::analyze(&query.text, cfg));
             let terms = &analyzed[&cfg];
-            for (id, score) in self.fts.score(col_name, &query.field, terms) {
-                if let Some(min) = opts.min_score
-                    && score < min
-                {
-                    continue;
-                }
+            for (id, base) in self.fts.score(col_name, &query.field, terms) {
                 // Hint-verify the id against the live index and apply the metadata
                 // filter (the FTS index can lag a delete until the next rebuild).
                 let Some(entry) = col.docs.get(id) else {
@@ -422,14 +469,19 @@ impl Store {
                 if !filter::matches(&opts.filter, &entry.attrs) {
                     continue;
                 }
+                // A subtracted penalty is metric-agnostic, so the same expression applies to a
+                // raw BM25 score as to a cosine one. `min_score` gates the final number.
+                let score = rank::adjust(opts.rank_by.as_ref(), base, &entry.attrs);
+                if let Some(min) = opts.min_score
+                    && score < min
+                {
+                    continue;
+                }
                 topk.offer(score, (col_name, id));
             }
         }
         // `TopK` already resolves ties on `(collection, id)`, so no re-sort is needed here.
-        Ok(paginate(
-            self.hits_from_topk(topk, &opts.projection),
-            opts.offset,
-        ))
+        Ok(self.finish(self.hits_from_topk(topk, &opts.projection), opts))
     }
 
     /// Hybrid search: fuse a vector and a BM25 leg with Reciprocal Rank Fusion. Each leg runs
@@ -446,6 +498,8 @@ impl Store {
         // shortcut returns before the leg runs. Validating here means a bad query does not change
         // verdict based on `top_k`.
         self.check_query_dim(vector)?;
+        check_weight("vector_weight", opts.vector_weight)?;
+        check_weight("text_weight", opts.text_weight)?;
 
         if opts.top_k == 0 {
             return Ok(Vec::new());
@@ -462,7 +516,10 @@ impl Store {
 
         // The per-leg detail is dropped here; `hybrid_search` reports only the fused score.
         let fused = rrf_fuse(
-            vec![FusionLeg::new(vector_leg), FusionLeg::new(text_leg)],
+            vec![
+                FusionLeg::new(vector_leg).weight(opts.vector_weight),
+                FusionLeg::new(text_leg).weight(opts.text_weight),
+            ],
             opts.rrf_k,
         );
         let hits: Vec<Hit> = fused.into_iter().map(|(hit, _per_leg)| hit).collect();
@@ -483,6 +540,11 @@ impl Store {
         score_fn: fn(&[f32], &[f32]) -> f32,
         opts: &SearchOpts,
     ) -> Result<Vec<Hit>> {
+        // A ranking expression needs each record's attrs, which the chunk kernels never see:
+        // that path scans serially (nidus-m50.15 #11).
+        if opts.rank_by.is_some() {
+            return self.rank_scan_expr(q, scan, score_fn, opts);
+        }
         let workers = self.parallel_workers(scan.len());
         let topk = if workers > 1 {
             parallel_topk(scan, workers, opts.top_k, |chunk| {
@@ -594,7 +656,10 @@ impl Store {
             if !filter::matches(&opts.filter, &entry.attrs) {
                 continue;
             }
-            let score = score_fn(q, self.data.row(*row));
+            // The entry is already in hand, so the ranking expression costs nothing extra here —
+            // which is what lets decay apply over an ANN result set without forcing exact.
+            let base = score_fn(q, self.data.row(*row));
+            let score = rank::adjust(opts.rank_by.as_ref(), base, &entry.attrs);
             if let Some(min) = opts.min_score
                 && score < min
             {

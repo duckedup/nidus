@@ -103,10 +103,22 @@ echo '[1,0,0]' | nidus search --dir ./store docs --exact
 echo '[1,0,0]' | nidus search --dir ./store docs --include-attr path --include-attr lang
 echo '[1,0,0]' | nidus search --dir ./store docs --exclude-attr body
 
+# Rank by recency: subtract an age penalty from each hit's score
+echo '[1,0,0]' | nidus search --dir ./store docs \
+  --rank-by '{"Decay":{"field":"updated_at","origin":1770000000000,"lambda":0.2}}'
+
+# Diversify: at most 2 hits per distinct value of an attribute
+echo '[1,0,0]' | nidus search --dir ./store docs --limit-per path --limit-per-max 2
+
 # List records by metadata filter (no vector query); --offset/-n paginate
 nidus list --dir ./store docs --where '[{"Eq":["lang",{"Str":"rust"}]}]'
 nidus list --dir ./store docs --offset 100 -n 100   # next page
 nidus list --dir ./store docs --include-attr path   # ids and one attr only
+nidus list --dir ./store docs --order-by updated_at --desc  # ORDER BY, no vector
+
+# Count matches and total numeric attrs without listing anything
+nidus aggregate --dir ./store docs --sum bytes \
+  --where '[{"Eq":["lang",{"Str":"rust"}]}]'
 
 # Full-text search (BM25): declare which fields are indexed, then query by text
 nidus set-fts-schema --dir ./store docs --field body --field title
@@ -118,6 +130,8 @@ nidus text-search --dir ./store body "rust" --in docs \
 
 # Hybrid search: fuse a vector (stdin) and a BM25 text query with RRF
 echo '[1,0,0]' | nidus hybrid-search --dir ./store body "vector database" -k 5
+# …leaning on the keyword leg (both weights default to 1.0)
+echo '[1,0,0]' | nidus hybrid-search --dir ./store body "CVE-2026-1234" --text-weight 3
 
 # Inspect, maintain
 nidus collections --dir ./store

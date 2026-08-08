@@ -11,8 +11,9 @@ use serde::Serialize;
 
 use crate::server::dto::{AnnDto, FootprintDto, HitDto};
 use crate::{
-    AnnConfig, Config, Distance, Filter, Fsync, FtsField, FtsQuery, HybridOpts, LeaseWait,
-    ListOpts, Nidus, OpenMode, Projection, Quantization, Record, Scope, SearchOpts,
+    AggregateOpts, AnnConfig, Config, Distance, Filter, Fsync, FtsField, FtsQuery, HybridOpts,
+    LeaseWait, LimitPer, ListOpts, Nidus, OpenMode, OrderBy, Projection, Quantization, Record,
+    Scope, SearchOpts,
 };
 
 // AI-ingest (memory) wiring for `serve`: only under the `memory` feature (pulled
@@ -571,6 +572,28 @@ enum Command {
         /// Return every attr but this one (repeatable). Mutually exclusive with --include-attr.
         #[arg(long = "exclude-attr")]
         exclude_attributes: Vec<String>,
+        /// Ranking expression as JSON, e.g. '{"Decay":{"field":"ts","origin":1700000000000,"scale":604800000,"lambda":0.2}}'.
+        #[arg(long = "rank-by")]
+        rank_by: Option<String>,
+        /// Cap hits per distinct value of this attribute (needs --limit-per-max).
+        #[arg(long = "limit-per", requires = "limit_per_max")]
+        limit_per: Option<String>,
+        /// Maximum hits kept per distinct --limit-per value.
+        #[arg(long = "limit-per-max", requires = "limit_per")]
+        limit_per_max: Option<usize>,
+    },
+    /// Count records matching a filter, and sum numeric attributes, without listing them.
+    Aggregate {
+        #[command(flatten)]
+        store: StoreArgs,
+        /// Collections to aggregate over; omit for every collection.
+        collections: Vec<String>,
+        /// AND-filter as JSON (same form as `search --where`).
+        #[arg(long = "where")]
+        filter: Option<String>,
+        /// Attribute to sum (repeatable). Missing and non-numeric values are skipped.
+        #[arg(long = "sum")]
+        sum: Vec<String>,
     },
     /// List records by metadata filter (no vector query).
     List {
@@ -594,6 +617,12 @@ enum Command {
         /// Return every attr but this one (repeatable). Mutually exclusive with --include-attr.
         #[arg(long = "exclude-attr")]
         exclude_attributes: Vec<String>,
+        /// Sort by this attribute instead of storage order.
+        #[arg(long = "order-by")]
+        order_by: Option<String>,
+        /// Sort --order-by descending.
+        #[arg(long, requires = "order_by")]
+        desc: bool,
     },
     /// Declare a collection's full-text-indexed fields (BM25). The tuning flags apply to
     /// every `--field` in the invocation. Re-running rebuilds the affected field indexes.
@@ -668,6 +697,12 @@ enum Command {
         /// Candidates pulled per leg before fusing.
         #[arg(long, default_value_t = 100)]
         candidates: usize,
+        /// Weight on the vector leg's fused contribution.
+        #[arg(long, default_value_t = 1.0)]
+        vector_weight: f32,
+        /// Weight on the BM25 leg's fused contribution.
+        #[arg(long, default_value_t = 1.0)]
+        text_weight: f32,
     },
     /// Print every record in a collection (JSON).
     Get {
@@ -796,6 +831,9 @@ pub fn run(cli: Cli) -> Result<()> {
             exact,
             include_attributes,
             exclude_attributes,
+            rank_by,
+            limit_per,
+            limit_per_max,
         } => {
             let db = open(&store, false)?;
             let query: Vec<f32> = serde_json::from_str(&read_input(query_file.as_ref())?)?;
@@ -810,6 +848,11 @@ pub fn run(cli: Cli) -> Result<()> {
                 filter,
                 exact,
                 projection: projection(include_attributes, exclude_attributes)?,
+                rank_by: rank_by.map(|s| serde_json::from_str(&s)).transpose()?,
+                // clap's `requires` pairing means either both flags are present or neither is.
+                limit_per: limit_per
+                    .zip(limit_per_max)
+                    .map(|(f, m)| LimitPer::new(f, m)),
             };
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
             let hits = if refs.is_empty() {
@@ -828,6 +871,8 @@ pub fn run(cli: Cli) -> Result<()> {
             filter,
             include_attributes,
             exclude_attributes,
+            order_by,
+            desc,
         } => {
             let db = open(&store, false)?;
             let filter = match filter {
@@ -839,6 +884,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 limit,
                 filter,
                 projection: projection(include_attributes, exclude_attributes)?,
+                order_by: order_by.map(|f| OrderBy {
+                    field: f,
+                    descending: desc,
+                }),
             };
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
             let hits = if refs.is_empty() {
@@ -847,6 +896,26 @@ pub fn run(cli: Cli) -> Result<()> {
                 db.list(Scope::Collections(&refs), &opts)?
             };
             let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
+            print_json(&out)
+        }
+        Command::Aggregate {
+            store,
+            collections,
+            filter,
+            sum,
+        } => {
+            let db = open(&store, false)?;
+            let filter = match filter {
+                Some(s) => serde_json::from_str(&s)?,
+                None => Filter::default(),
+            };
+            let opts = AggregateOpts { filter, sum };
+            let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
+            let out = if refs.is_empty() {
+                db.aggregate(Scope::All, &opts)?
+            } else {
+                db.aggregate(Scope::Collections(&refs), &opts)?
+            };
             print_json(&out)
         }
         Command::SetFtsSchema {
@@ -920,6 +989,8 @@ pub fn run(cli: Cli) -> Result<()> {
             filter,
             rrf_k,
             candidates,
+            vector_weight,
+            text_weight,
         } => {
             let db = open(&store, false)?;
             let vector: Vec<f32> = serde_json::from_str(&read_input(query_file.as_ref())?)?;
@@ -933,6 +1004,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 filter,
                 rrf_k,
                 candidates,
+                vector_weight,
+                text_weight,
             };
             let q = FtsQuery::new(field, text);
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
@@ -1242,6 +1315,114 @@ mod tests {
                 assert_eq!(min_score, Some(0.2));
             }
             _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn search_parses_the_ranking_knobs() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "search",
+            "--dir",
+            "/tmp/s",
+            "docs",
+            "--rank-by",
+            r#"{"Decay":{"field":"ts","origin":0}}"#,
+            "--limit-per",
+            "file",
+            "--limit-per-max",
+            "2",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Search {
+                rank_by,
+                limit_per,
+                limit_per_max,
+                ..
+            } => {
+                assert!(rank_by.is_some());
+                assert_eq!(limit_per.as_deref(), Some("file"));
+                assert_eq!(limit_per_max, Some(2));
+            }
+            _ => panic!("expected Search"),
+        }
+        // The cap's two halves are useless apart, so clap requires them together.
+        assert!(
+            Cli::try_parse_from([
+                "nidus",
+                "search",
+                "--dir",
+                "/tmp/s",
+                "docs",
+                "--limit-per",
+                "file"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn list_parses_order_by_and_aggregate_parses_sums() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "list",
+            "--dir",
+            "/tmp/s",
+            "--order-by",
+            "ts",
+            "--desc",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::List { order_by, desc, .. } => {
+                assert_eq!(order_by.as_deref(), Some("ts"));
+                assert!(desc);
+            }
+            _ => panic!("expected List"),
+        }
+        // `--desc` alone has nothing to reverse.
+        assert!(Cli::try_parse_from(["nidus", "list", "--dir", "/tmp/s", "--desc"]).is_err());
+
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "aggregate",
+            "--dir",
+            "/tmp/s",
+            "docs",
+            "--sum",
+            "bytes",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Aggregate {
+                collections, sum, ..
+            } => {
+                assert_eq!(collections, vec!["docs"]);
+                assert_eq!(sum, vec!["bytes"]);
+            }
+            _ => panic!("expected Aggregate"),
+        }
+    }
+
+    #[test]
+    fn hybrid_search_leg_weights_default_to_one() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "hybrid-search",
+            "--dir",
+            "/tmp/s",
+            "body",
+            "quantum",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::HybridSearch {
+                vector_weight,
+                text_weight,
+                ..
+            } => assert_eq!((vector_weight, text_weight), (1.0, 1.0)),
+            _ => panic!("expected HybridSearch"),
         }
     }
 

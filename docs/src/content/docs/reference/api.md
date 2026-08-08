@@ -58,6 +58,7 @@ searchers plus one writer (see
 | `search` | `fn search<'a>(&self, scope: impl Into<Scope<'a>>, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>` | Ranked search over a scope using the store's distance metric; `SearchOpts`'s `offset`/`top_k` paginate. |
 | `text_search` | `fn text_search<'a>(&self, scope: impl Into<Scope<'a>>, query: &FtsQuery, opts: &SearchOpts) -> Result<Vec<Hit>>` | [BM25 full-text search](/guides/search/#full-text-search-bm25); `min_score` is a raw BM25 floor. |
 | `hybrid_search` | `fn hybrid_search<'a>(&self, scope: impl Into<Scope<'a>>, vector: &[f32], text: &FtsQuery, opts: &HybridOpts) -> Result<Vec<Hit>>` | [Hybrid vector + BM25](/guides/search/#hybrid-search-rrf), fused with Reciprocal Rank Fusion. |
+| `aggregate` | `fn aggregate<'a>(&self, scope: impl Into<Scope<'a>>, opts: &AggregateOpts) -> Result<Aggregation>` | [Count and sum](/guides/search/#aggregation) over a filter, straight off the in-memory index — no record is materialized. |
 | `flush` | `fn flush(&mut self) -> Result<()>` | Force an fsync (relevant under `Fsync::OnFlush`). |
 | `deferred` | `fn deferred<T>(&mut self, f: impl FnOnce(&mut Nidus) -> Result<T>) -> Result<T>` | Run `f`'s mutations with their durable barrier deferred, so several can share one — see [group commit](/guides/how-it-works/#group-commit). **Report nothing successful until `commit` returns `Ok`**: until then the bytes are appended but not durable. |
 | `commit` | `fn commit(&mut self) -> Result<()>` | Take one barrier covering everything appended by `deferred` (fsync `data`, then `log`). A no-op when no barrier is owed, so the ordinary path pays nothing. Narrower than `flush` — no segment seal, no working-set publish. |
@@ -190,10 +191,13 @@ pub struct SearchOpts {
     pub min_score: Option<f32>,  // drop results below this score
     pub exact: bool,             // force the exact scan for this query
     pub projection: Projection,  // which attrs the hits carry
+    pub rank_by: Option<RankBy>, // a ranking expression over the metric
+    pub limit_per: Option<LimitPer>, // cap hits per attribute value
 }
 ```
 
-Implements `Default` (`offset: 0`, `exact: false`, `projection: Projection::All`) —
+Implements `Default` (`offset: 0`, `exact: false`, `projection: Projection::All`,
+`rank_by: None`, `limit_per: None`) —
 `SearchOpts { top_k: 5, ..Default::default() }` is the idiomatic call. Reused by
 `text_search`, where `min_score` is a raw BM25 floor.
 
@@ -205,6 +209,87 @@ result is an empty `Vec`, not an error. See
 `exact: true` bypasses the ANN walk, the per-segment index, and the quantized first
 pass, running the exact brute-force scan for that one query — the index stays in place
 for every other. See [forcing an exact search](/guides/search/#forcing-an-exact-search).
+
+## `RankBy` & `Decay`
+
+An opt-in [ranking expression](/guides/search/#ranking-by-recency) layered over the
+store's distance metric. `None` (the default) is the bare metric.
+
+```rust
+pub enum RankBy {
+    Decay(Decay),   // subtract a recency penalty from every base score
+}
+
+pub struct Decay {
+    pub field: String,  // timestamp attr: Value::DateTime or Value::Int, epoch millis
+    pub origin: i64,    // "now", supplied by the caller so a ranking is reproducible
+    pub scale: i64,     // the age (ms) at which the factor equals `decay`
+    pub decay: f32,     // factor at one `scale` of age — default 0.5 (a half-life)
+    pub lambda: f32,    // score a fully-decayed hit gives up — default 1.0
+    pub missing: f32,   // factor when the attr is absent/unusable — default 1.0
+}
+```
+
+Build one with `Decay::new(field, origin, scale)` plus `.decay(_)` / `.lambda(_)` /
+`.missing(_)`. The score is `base − lambda × (1 − decay^(age / scale))` — the penalty
+**subtracts**, which is what keeps it valid for `Euclidean` and `DotProduct` scores and
+for raw BM25, not just cosine.
+
+`missing` defaults to `1.0`, so a record with no timestamp is **not** penalized —
+enabling decay never buries data that predates the field. `rank_by` does not force the
+exact path; over an ANN or quantized result set it reorders within an approximate
+candidate set. A ranked scan runs single-threaded.
+
+## `LimitPer`
+
+A cap on how many hits may carry any one value of an attribute — see
+[capping hits per attribute value](/guides/search/#capping-hits-per-attribute-value).
+
+```rust
+pub struct LimitPer {
+    pub field: String,  // the attribute whose distinct values define the groups
+    pub max: usize,     // maximum hits per distinct value (at least 1)
+}
+```
+
+Build with `LimitPer::new(field, max)`. Records **missing** the attribute form one shared
+group, and the value is read from the stored record, so a `Projection` cannot lift the cap.
+Deliberately approximate: exact only within the over-fetch window, so a capped page may come
+back shorter than `top_k`.
+
+## `OrderBy`
+
+Sort a `list` by an attribute instead of storage order.
+
+```rust
+pub struct OrderBy {
+    pub field: String,
+    pub descending: bool,
+}
+```
+
+Build with `OrderBy::asc(field)` / `OrderBy::desc(field)`. Values that do not order against
+the first orderable one — a different variant, an unorderable `Null`/`List`, or an absent
+attribute — sort into one trailing bucket, which stays trailing when reversed.
+
+## `AggregateOpts` & `Aggregation`
+
+[Count and sum](/guides/search/#aggregation) over a filter, answered from the in-memory
+index without materializing a record.
+
+```rust
+pub struct AggregateOpts {
+    pub filter: Filter,   // default matches every record
+    pub sum: Vec<String>, // attributes to total
+}
+
+pub struct Aggregation {
+    pub count: u64,
+    pub sums: BTreeMap<String, Value>,  // Int while every addend was Int, else Float
+}
+```
+
+A missing or non-numeric value is skipped, not counted as zero.
 
 ## `Projection`
 
@@ -252,11 +337,15 @@ pub struct HybridOpts {
     pub filter: Filter,    // applied to both legs
     pub rrf_k: f32,        // RRF rank-bias constant (default 60)
     pub candidates: usize, // depth pulled per leg before fusing (default 100)
+    pub vector_weight: f32, // weight on the vector leg (default 1.0)
+    pub text_weight: f32,   // weight on the BM25 leg (default 1.0)
 }
 ```
 
-Implements `Default` (`top_k: 10`, `offset: 0`). `offset` pages the **fused** ranking,
-never a leg. There is no `min_score` — a fused RRF score has no absolute scale.
+Implements `Default` (`top_k: 10`, `offset: 0`, both weights `1.0`). `offset` pages the
+**fused** ranking, never a leg. There is no `min_score` — a fused RRF score has no absolute
+scale. Both weights at `1.0` reproduce the unweighted fusion exactly; a non-finite or
+negative weight is refused. See [weighting the legs](/guides/search/#weighting-the-legs).
 
 ## `ListOpts`
 
@@ -268,11 +357,13 @@ pub struct ListOpts {
     pub limit: usize,           // maximum records returned (default 100)
     pub filter: Filter,         // metadata filter; default matches everything
     pub projection: Projection, // which attrs the hits carry
+    pub order_by: Option<OrderBy>, // sort by an attribute instead of storage order
 }
 ```
 
-Implements `Default` — `ListOpts { limit: 20, ..Default::default() }` is the
-idiomatic call.
+Implements `Default` (`order_by: None`) — `ListOpts { limit: 20, ..Default::default() }`
+is the idiomatic call. Sorting runs over the whole match set before the page is cut, so
+`offset`/`limit` walk the sorted order.
 
 ## `Hit`
 

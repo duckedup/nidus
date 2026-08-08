@@ -88,8 +88,9 @@ pub use cancel::Cancel;
 pub use config::{Config, Fsync, LeaseWait, OpenMode};
 pub use fts::{Analyzer, FtsField, Language};
 pub use model::{
-    AnnConfig, AnnKind, ClusterStatus, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts,
-    ListOpts, Predicate, Projection, QuantKind, Quantization, Record, Role, SearchOpts, Value,
+    AggregateOpts, Aggregation, AnnConfig, AnnKind, ClusterStatus, Decay, Distance, Filter,
+    Footprint, FtsQuery, Hit, HybridOpts, LimitPer, ListOpts, OrderBy, Predicate, Projection,
+    QuantKind, Quantization, RankBy, Record, Role, SearchOpts, Value,
 };
 pub use store::Readiness;
 
@@ -263,12 +264,38 @@ impl Nidus {
         }
     }
 
-    /// List records matching `opts.filter` across a [`Scope`], without vector scoring.
+    /// List records matching `opts.filter` across a [`Scope`], without vector scoring. With
+    /// [`ListOpts::order_by`] set this is a plain ORDER BY over an attribute.
     pub fn list<'a>(&self, scope: impl Into<Scope<'a>>, opts: &ListOpts) -> Result<Vec<Hit>> {
         filter::validate(&opts.filter)?;
         let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.list(&refs, opts)
+    }
+
+    /// Count the records matching `opts.filter` across a [`Scope`] and sum the attributes named
+    /// in [`AggregateOpts::sum`], without materializing a single [`Record`].
+    ///
+    /// ```
+    /// # use nidus::{AggregateOpts, Nidus, Scope};
+    /// # fn main() -> nidus::Result<()> {
+    /// # let db = Nidus::open_in_memory(3)?;
+    /// let stats = db.aggregate(Scope::All, &AggregateOpts {
+    ///     sum: vec!["bytes".into()],
+    ///     ..Default::default()
+    /// })?;
+    /// assert_eq!(stats.count, 0);
+    /// # Ok(()) }
+    /// ```
+    pub fn aggregate<'a>(
+        &self,
+        scope: impl Into<Scope<'a>>,
+        opts: &AggregateOpts,
+    ) -> Result<Aggregation> {
+        filter::validate(&opts.filter)?;
+        let names = self.scope_names(scope);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        Ok(self.store.aggregate(&refs, opts))
     }
 
     /// Search a [`Scope`] — one collection, a subset, or the whole store — for the

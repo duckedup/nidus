@@ -20,8 +20,10 @@ use crate::log::OpLog;
 use crate::manifest::{MANIFEST_KEY, Manifest};
 use crate::model::{AnnConfig, ClusterStatus, Distance, Op, Role};
 
+mod aggregate;
 mod memtier;
 mod quant;
+mod rank;
 mod read;
 mod scoring;
 mod write;
@@ -30,6 +32,9 @@ mod write;
 mod tests;
 
 use quant::Quant;
+/// The HTTP layer's only reader — `server::classify` maps it to a `400`.
+#[cfg(feature = "cli")]
+pub(crate) use read::BAD_QUERY;
 
 // ── In-RAM types ─────────────────────────────────────────────────────────────
 

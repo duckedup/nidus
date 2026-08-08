@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AnnConfig, AnnKind, Filter, Footprint, FtsField, Hit, Language, ListOpts, Projection, Record,
-    Value,
+    Aggregation, AnnConfig, AnnKind, Filter, Footprint, FtsField, Hit, Language, LimitPer,
+    ListOpts, OrderBy, Projection, RankBy, Record, Value,
 };
 
 /// Body of `POST /collections/{name}/upsert`.
@@ -58,6 +58,12 @@ pub struct SearchRequest {
     pub include_attributes: Option<Vec<String>>,
     #[serde(default)]
     pub exclude_attributes: Option<Vec<String>>,
+    /// A ranking expression over the metric, e.g. `{"Decay": {"field": "ts", "origin": …}}`.
+    #[serde(default)]
+    pub rank_by: Option<RankBy>,
+    /// Cap hits per distinct value of an attribute: `{"field": "path", "max": 2}`.
+    #[serde(default)]
+    pub limit_per: Option<LimitPer>,
 }
 
 /// Resolve a request's projection fields. The two are spelled out on each request rather than
@@ -106,6 +112,10 @@ pub struct TextSearchRequest {
     pub min_score: Option<f32>,
     #[serde(default)]
     pub filter: Filter,
+    #[serde(default)]
+    pub rank_by: Option<RankBy>,
+    #[serde(default)]
+    pub limit_per: Option<LimitPer>,
 }
 
 /// Body of `POST /hybrid-search`: fuse a vector query and a BM25 text query (RRF).
@@ -126,6 +136,17 @@ pub struct HybridSearchRequest {
     pub rrf_k: f32,
     #[serde(default = "default_candidates")]
     pub candidates: usize,
+    /// Weight on the vector leg's RRF contribution. Both weights at `1.0` (the default)
+    /// reproduces the unweighted fusion exactly.
+    #[serde(default = "default_weight")]
+    pub vector_weight: f32,
+    /// Weight on the BM25 leg's RRF contribution.
+    #[serde(default = "default_weight")]
+    pub text_weight: f32,
+}
+
+fn default_weight() -> f32 {
+    1.0
 }
 
 /// One entry of [`FtsSchemaRequest::fields`]: either a bare field name (everything
@@ -201,6 +222,37 @@ pub struct ListRequest {
     pub include_attributes: Option<Vec<String>>,
     #[serde(default)]
     pub exclude_attributes: Option<Vec<String>>,
+    /// Sort by an attribute: `{"field": "updated_at", "descending": true}`.
+    #[serde(default)]
+    pub order_by: Option<OrderBy>,
+}
+
+/// Body of `POST /aggregate`. An empty `scope` aggregates over every collection.
+#[derive(Debug, Default, Deserialize)]
+pub struct AggregateRequest {
+    #[serde(default)]
+    pub scope: Vec<String>,
+    #[serde(default)]
+    pub filter: Filter,
+    /// Attributes to sum alongside the always-reported count.
+    #[serde(default)]
+    pub sum: Vec<String>,
+}
+
+/// Serializable mirror of [`crate::Aggregation`]: `{"count": 12, "sums": {"bytes": {"Int": 40}}}`.
+#[derive(Debug, Serialize)]
+pub struct AggregationDto {
+    pub count: u64,
+    pub sums: BTreeMap<String, Value>,
+}
+
+impl From<Aggregation> for AggregationDto {
+    fn from(a: Aggregation) -> Self {
+        Self {
+            count: a.count,
+            sums: a.sums,
+        }
+    }
 }
 
 /// Body of `POST /collections/{name}/remember` (the `memory` feature).
@@ -423,6 +475,65 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&json).unwrap(),
             Value::Float(1.0)
+        );
+    }
+
+    /// A `rank_by` body names only what it changes; the rest of `Decay` defaults, and
+    /// `missing` defaults to `1.0` so an undated record is not penalized (nidus-m50.15 #8).
+    #[test]
+    fn a_rank_by_body_defaults_every_knob_it_omits() {
+        let req: SearchRequest = serde_json::from_value(json!({
+            "query": [1.0],
+            "rank_by": {"Decay": {"field": "ts", "origin": 1_700_000_000_000i64}}
+        }))
+        .unwrap();
+        let Some(crate::RankBy::Decay(d)) = req.rank_by else {
+            panic!("expected a Decay expression");
+        };
+        assert_eq!(d.field, "ts");
+        assert_eq!(d.scale, 7 * 86_400_000);
+        assert_eq!((d.decay, d.lambda, d.missing), (0.5, 1.0, 1.0));
+    }
+
+    #[test]
+    fn the_new_ranking_knobs_are_absent_by_default() {
+        let req: SearchRequest = serde_json::from_value(json!({"query": [1.0]})).unwrap();
+        assert!(req.rank_by.is_none());
+        assert!(req.limit_per.is_none());
+        let req: ListRequest = serde_json::from_value(json!({})).unwrap();
+        assert!(req.order_by.is_none());
+        let req: HybridSearchRequest =
+            serde_json::from_value(json!({"vector": [1.0], "field": "b", "text": "x"})).unwrap();
+        assert_eq!((req.vector_weight, req.text_weight), (1.0, 1.0));
+    }
+
+    #[test]
+    fn limit_per_and_order_by_wire_spellings_are_stable() {
+        let req: SearchRequest = serde_json::from_value(json!({
+            "query": [1.0], "limit_per": {"field": "path", "max": 2}
+        }))
+        .unwrap();
+        assert_eq!(req.limit_per, Some(crate::LimitPer::new("path", 2)));
+
+        let req: ListRequest =
+            serde_json::from_value(json!({"order_by": {"field": "ts", "descending": true}}))
+                .unwrap();
+        assert_eq!(req.order_by, Some(crate::OrderBy::desc("ts")));
+        // `descending` defaults to ascending.
+        let req: ListRequest =
+            serde_json::from_value(json!({"order_by": {"field": "ts"}})).unwrap();
+        assert_eq!(req.order_by, Some(crate::OrderBy::asc("ts")));
+    }
+
+    #[test]
+    fn an_aggregation_serializes_count_and_tagged_sums() {
+        let out = AggregationDto::from(crate::Aggregation {
+            count: 3,
+            sums: BTreeMap::from([("bytes".to_string(), Value::Int(42))]),
+        });
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            json!({"count": 3, "sums": {"bytes": {"Int": 42}}})
         );
     }
 

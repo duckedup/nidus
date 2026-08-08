@@ -24,6 +24,12 @@ impl FusionLeg {
     pub(crate) fn new(hits: Vec<Hit>) -> Self {
         Self { hits, weight: 1.0 }
     }
+
+    /// Scale this leg's contribution to the fused score.
+    pub(crate) fn weight(mut self, weight: f32) -> Self {
+        self.weight = weight;
+        self
+    }
 }
 
 /// Fuse `legs` by reciprocal rank: a document scores `Σ wᵢ / (rrf_k + rankᵢ + 1)` over the legs

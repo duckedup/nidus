@@ -383,6 +383,161 @@ impl Projection {
     }
 }
 
+fn default_scale() -> i64 {
+    7 * 24 * 60 * 60 * 1000
+}
+
+fn default_decay() -> f32 {
+    0.5
+}
+
+fn default_lambda() -> f32 {
+    1.0
+}
+
+/// A record with no usable timestamp is **not** penalized, so switching decay on never
+/// silently buries data that predates the field (nidus-m50.15 #8).
+fn default_missing() -> f32 {
+    1.0
+}
+
+/// Recency decay over a timestamp attribute. The penalty is **subtracted** from the base
+/// score, never multiplied, so it is valid for every [`Distance`] metric and for negative
+/// scores alike (nidus-m50.15 #7). See `SPEC.md` §7.6.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Decay {
+    /// The timestamp attribute: a [`Value::DateTime`] or a [`Value::Int`], epoch milliseconds.
+    pub field: String,
+    /// "Now", in epoch milliseconds. Ages are measured back from here rather than from the
+    /// wall clock, so the same query against an unchanged store ranks the same way twice.
+    pub origin: i64,
+    /// The age in milliseconds at which the factor equals `decay`. Must be positive.
+    #[serde(default = "default_scale")]
+    pub scale: i64,
+    /// The factor reached at exactly `scale` old — the default `0.5` makes `scale` a
+    /// half-life. Must be in `(0, 1)`.
+    #[serde(default = "default_decay")]
+    pub decay: f32,
+    /// Score a fully-decayed hit gives up: the penalty is `lambda * (1 - factor)`.
+    #[serde(default = "default_lambda")]
+    pub lambda: f32,
+    /// The factor for a record whose `field` is missing or not a timestamp. Defaults to
+    /// `1.0` — no penalty. Must be in `[0, 1]`.
+    #[serde(default = "default_missing")]
+    pub missing: f32,
+}
+
+impl Decay {
+    /// Decay over `field`, aged from `origin` (epoch ms), halving every `scale` ms.
+    pub fn new(field: impl Into<String>, origin: i64, scale: i64) -> Self {
+        Self {
+            field: field.into(),
+            origin,
+            scale,
+            decay: default_decay(),
+            lambda: default_lambda(),
+            missing: default_missing(),
+        }
+    }
+
+    /// Set the factor reached at exactly `scale` old (must be in `(0, 1)`).
+    pub fn decay(mut self, decay: f32) -> Self {
+        self.decay = decay;
+        self
+    }
+
+    /// Set how much score a fully-decayed hit gives up.
+    pub fn lambda(mut self, lambda: f32) -> Self {
+        self.lambda = lambda;
+        self
+    }
+
+    /// Set the factor used when the timestamp attribute is missing or unusable.
+    pub fn missing(mut self, missing: f32) -> Self {
+        self.missing = missing;
+        self
+    }
+}
+
+/// A ranking expression layered over the store's distance metric. `None` on
+/// [`SearchOpts::rank_by`] is the bare metric — the ranking nidus has always returned.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum RankBy {
+    /// Subtract a recency penalty from every base score. See [`Decay`].
+    Decay(Decay),
+}
+
+/// Sort a [`crate::Nidus::list`] by an attribute instead of storage order. Values of a
+/// different type than the first orderable one, unorderable values (`Null`/`List`/`NaN`), and
+/// records missing the attribute sort into one trailing bucket (nidus-m50.15 #10).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderBy {
+    /// The attribute to sort on.
+    pub field: String,
+    /// Sort descending. The trailing bucket stays trailing either way.
+    #[serde(default)]
+    pub descending: bool,
+}
+
+impl OrderBy {
+    /// Ascending order over `field`.
+    pub fn asc(field: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            descending: false,
+        }
+    }
+
+    /// Descending order over `field`.
+    pub fn desc(field: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            descending: true,
+        }
+    }
+}
+
+/// Cap how many hits may carry any one value of an attribute — "at most 2 hits per file".
+/// Records **missing** the attribute form one shared group, so an absent value cannot
+/// bypass the cap (nidus-m50.15 #14). Approximate; see `SPEC.md` §7.7.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitPer {
+    /// The attribute whose distinct values define the groups.
+    pub field: String,
+    /// Maximum hits kept per distinct value. Must be at least 1.
+    pub max: usize,
+}
+
+impl LimitPer {
+    /// At most `max` hits per distinct value of `field`.
+    pub fn new(field: impl Into<String>, max: usize) -> Self {
+        Self {
+            field: field.into(),
+            max,
+        }
+    }
+}
+
+/// What [`crate::Nidus::aggregate`] computes over the filter-matching records. Answered from
+/// the in-RAM index alone: no [`Record`] is built and no vector is read.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AggregateOpts {
+    /// Metadata filter; the default matches every record.
+    pub filter: Filter,
+    /// Attributes to sum. A missing or non-numeric value is skipped, not counted as zero.
+    pub sum: Vec<String>,
+}
+
+/// The answer to an [`AggregateOpts`]: how many records matched, plus one tagged [`Value`]
+/// per requested sum — `Int` while every addend was an `Int`, else `Float` (nidus-m50.15 #15).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Aggregation {
+    /// Records matching the filter across the scope.
+    pub count: u64,
+    /// One entry per [`AggregateOpts::sum`] field, in the same set.
+    pub sums: BTreeMap<String, Value>,
+}
+
 /// Query parameters for a search.
 #[derive(Clone, Debug, Default)]
 pub struct SearchOpts {
@@ -402,6 +557,12 @@ pub struct SearchOpts {
     pub exact: bool,
     /// Which attrs the returned hits carry. Default: all of them.
     pub projection: Projection,
+    /// A ranking expression layered over the distance metric. Deliberately does **not** force
+    /// the exact path (that is [`SearchOpts::exact`]): over an ANN or quantized result set it
+    /// inherits that path's approximation (nidus-m50.15 #9).
+    pub rank_by: Option<RankBy>,
+    /// Cap the hits carrying any one value of an attribute. `None` (the default) is uncapped.
+    pub limit_per: Option<LimitPer>,
 }
 
 /// Query parameters for a metadata-only listing (no vector scoring).
@@ -415,6 +576,9 @@ pub struct ListOpts {
     pub filter: Filter,
     /// Which attrs the returned hits carry. Default: all of them.
     pub projection: Projection,
+    /// Sort by an attribute rather than storage order — ORDER BY with no vector query.
+    /// `None` (the default) keeps the stable row-then-id order.
+    pub order_by: Option<OrderBy>,
 }
 
 impl Default for ListOpts {
@@ -424,6 +588,7 @@ impl Default for ListOpts {
             limit: 100,
             filter: Filter::default(),
             projection: Projection::default(),
+            order_by: None,
         }
     }
 }
@@ -443,6 +608,11 @@ pub struct HybridOpts {
     /// How deep to pull each leg before fusing (clamped up to at least `top_k`). Larger
     /// improves fusion recall at linear cost. Default 100.
     pub candidates: usize,
+    /// Weight on the vector leg's RRF contribution. Default `1.0`; both legs at `1.0`
+    /// reproduces unweighted RRF bit for bit.
+    pub vector_weight: f32,
+    /// Weight on the BM25 leg's RRF contribution. Default `1.0`.
+    pub text_weight: f32,
 }
 
 impl Default for HybridOpts {
@@ -453,6 +623,8 @@ impl Default for HybridOpts {
             filter: Filter::default(),
             rrf_k: 60.0,
             candidates: 100,
+            vector_weight: 1.0,
+            text_weight: 1.0,
         }
     }
 }
