@@ -321,6 +321,50 @@ impl FtsQuery {
     }
 }
 
+/// Which attrs a [`Hit`] carries. An enum, not a pair of lists, so "include *and* exclude"
+/// is unrepresentable rather than a precedence rule nobody remembers (nidus-m50.15); the
+/// HTTP layer answers `400` for the wire form that sends both.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Projection {
+    /// Every attr the record has — the default, and byte-identical to pre-projection nidus.
+    #[default]
+    All,
+    /// Only the named attrs. A named attr the record lacks is simply absent from the hit.
+    Include(Vec<String>),
+    /// Every attr except the named ones.
+    Exclude(Vec<String>),
+}
+
+impl Projection {
+    /// Carry only these attrs.
+    pub fn include<S: Into<String>>(keys: impl IntoIterator<Item = S>) -> Self {
+        Self::Include(keys.into_iter().map(Into::into).collect())
+    }
+
+    /// Carry every attr but these.
+    pub fn exclude<S: Into<String>>(keys: impl IntoIterator<Item = S>) -> Self {
+        Self::Exclude(keys.into_iter().map(Into::into).collect())
+    }
+
+    /// Materialize a hit's attrs from the live record's map. Clones only the values that
+    /// survive the projection, so an excluded 10 KB body is never copied (nidus-m50.7).
+    pub(crate) fn apply(&self, attrs: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+        match self {
+            Self::All => attrs.clone(),
+            Self::Include(keys) => keys
+                .iter()
+                .filter_map(|k| attrs.get_key_value(k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            Self::Exclude(keys) => attrs
+                .iter()
+                .filter(|(k, _)| !keys.iter().any(|drop| drop == *k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        }
+    }
+}
+
 /// Query parameters for a search.
 #[derive(Clone, Debug, Default)]
 pub struct SearchOpts {
@@ -334,6 +378,12 @@ pub struct SearchOpts {
     pub filter: Filter,
     /// Drop results scoring below this cosine similarity.
     pub min_score: Option<f32>,
+    /// Force the exact brute-force scan for *this* query, bypassing the ANN walk, the segment
+    /// indexes, and the quantized first pass. A guaranteed-exact answer over a narrow subset
+    /// without giving up the index for everything else (nidus-m50.12).
+    pub exact: bool,
+    /// Which attrs the returned hits carry. Default: all of them.
+    pub projection: Projection,
 }
 
 /// Query parameters for a metadata-only listing (no vector scoring).
@@ -345,6 +395,8 @@ pub struct ListOpts {
     pub limit: usize,
     /// Metadata filter; the default matches every record.
     pub filter: Filter,
+    /// Which attrs the returned hits carry. Default: all of them.
+    pub projection: Projection,
 }
 
 impl Default for ListOpts {
@@ -353,6 +405,7 @@ impl Default for ListOpts {
             offset: 0,
             limit: 100,
             filter: Filter::default(),
+            projection: Projection::default(),
         }
     }
 }

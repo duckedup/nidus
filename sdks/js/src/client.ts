@@ -193,6 +193,9 @@ export class NidusClient {
       offset: opts.offset,
       min_score: opts.minScore,
       filter: opts.filter ?? [],
+      exact: opts.exact,
+      include_attributes: opts.includeAttributes,
+      exclude_attributes: opts.excludeAttributes,
     });
   }
 
@@ -231,6 +234,8 @@ export class NidusClient {
       offset: opts.offset,
       limit: opts.limit,
       filter: opts.filter ?? [],
+      include_attributes: opts.includeAttributes,
+      exclude_attributes: opts.excludeAttributes,
     });
   }
 

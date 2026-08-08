@@ -131,8 +131,19 @@ export interface Stats {
   footprint: Footprint;
 }
 
+/**
+ * Which attrs the returned hits carry. Omit both for every attr (the default).
+ * Sending both is a `400` — the server refuses rather than picking one.
+ */
+export interface ProjectionOptions {
+  /** Return only these attrs. A named attr the record lacks is simply absent. */
+  includeAttributes?: string[];
+  /** Return every attr but these. */
+  excludeAttributes?: string[];
+}
+
 /** Options for {@link NidusClient.search}. An empty/omitted `scope` searches every collection. */
-export interface SearchOptions {
+export interface SearchOptions extends ProjectionOptions {
   query: number[];
   scope?: string[];
   topK?: number;
@@ -140,6 +151,11 @@ export interface SearchOptions {
   offset?: number;
   minScore?: number;
   filter?: Filter;
+  /**
+   * Force the exact scan for this query, bypassing any ANN index and the
+   * quantized first pass. The index stays in place for every other query.
+   */
+  exact?: boolean;
 }
 
 /** Options for {@link NidusClient.textSearch} (BM25). */
@@ -191,7 +207,7 @@ export interface HybridSearchOptions {
 }
 
 /** Options for {@link NidusClient.list} (metadata-only, paginated). */
-export interface ListOptions {
+export interface ListOptions extends ProjectionOptions {
   scope?: string[];
   offset?: number;
   limit?: number;

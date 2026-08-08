@@ -116,6 +116,10 @@ type Stats struct {
 // A SearchRequest is a vector (cosine) nearest-neighbour query. An empty Scope
 // searches every collection, merged into one ranking — sound because all
 // collections share one embedding space.
+// Exact forces the exact brute-force scan for this one query, bypassing any ANN index
+// and the quantized first pass — a guaranteed-exact answer without giving up the index
+// for every other query. IncludeAttributes/ExcludeAttributes project the returned attrs;
+// see [Projection].
 type SearchRequest struct {
 	Query    []float32 `json:"query"`
 	Scope    []string  `json:"scope,omitempty"`
@@ -123,6 +127,21 @@ type SearchRequest struct {
 	Offset   int       `json:"offset,omitempty"`    // skip this many top-ranked hits
 	MinScore *float32  `json:"min_score,omitempty"` // nil is "no floor"; &0 is a floor of zero
 	Filter   Filter    `json:"filter,omitempty"`
+	Exact    bool      `json:"exact,omitempty"`
+	Projection
+}
+
+// A Projection selects which attrs the returned hits carry. Leave both nil for every attr
+// — the default, and what every pre-projection request already sends.
+//
+// Setting both is a 400 from the server rather than a precedence rule, so pick one. Both
+// are embedded (not flattened by a tag Go does not have) into SearchRequest and
+// ListRequest, which is why the fields land at the top level of the JSON body.
+type Projection struct {
+	// Return only these attrs. A named attr the record lacks is simply absent.
+	IncludeAttributes []string `json:"include_attributes,omitempty"`
+	// Return every attr but these.
+	ExcludeAttributes []string `json:"exclude_attributes,omitempty"`
 }
 
 // An FtsField is one entry of a [Client.SetFtsFields] schema: the attribute to
@@ -186,6 +205,7 @@ type ListRequest struct {
 	Offset int      `json:"offset,omitempty"`
 	Limit  int      `json:"limit,omitempty"`
 	Filter Filter   `json:"filter,omitempty"`
+	Projection
 }
 
 // RememberOptions tunes a text-native ingest: the server embeds the text and upserts

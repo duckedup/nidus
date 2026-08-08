@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AnnConfig, AnnKind, Filter, Footprint, FtsField, Hit, Language, ListOpts, Record, Value,
+    AnnConfig, AnnKind, Filter, Footprint, FtsField, Hit, Language, ListOpts, Projection, Record,
+    Value,
 };
 
 /// Body of `POST /collections/{name}/upsert`.
@@ -50,6 +51,30 @@ pub struct SearchRequest {
     pub min_score: Option<f32>,
     #[serde(default)]
     pub filter: Filter,
+    /// Force the exact scan for this query, bypassing any index and the quantized first pass.
+    #[serde(default)]
+    pub exact: bool,
+    #[serde(default)]
+    pub include_attributes: Option<Vec<String>>,
+    #[serde(default)]
+    pub exclude_attributes: Option<Vec<String>>,
+}
+
+/// Resolve a request's projection fields. The two are spelled out on each request rather than
+/// `#[serde(flatten)]`ed from a shared struct, because flatten buffers the *whole* body — the
+/// query vector included — through `Content` on every search.
+pub(super) fn resolve_projection(
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+) -> Result<Projection, &'static str> {
+    match (include, exclude) {
+        (None, None) => Ok(Projection::All),
+        (Some(keys), None) => Ok(Projection::Include(keys)),
+        (None, Some(keys)) => Ok(Projection::Exclude(keys)),
+        (Some(_), Some(_)) => Err(
+            "include_attributes and exclude_attributes are mutually exclusive; send at most one",
+        ),
+    }
 }
 
 /// Derived from [`ListOpts`] so the wire default and the library default cannot drift.
@@ -172,6 +197,10 @@ pub struct ListRequest {
     pub limit: usize,
     #[serde(default)]
     pub filter: Filter,
+    #[serde(default)]
+    pub include_attributes: Option<Vec<String>>,
+    #[serde(default)]
+    pub exclude_attributes: Option<Vec<String>>,
 }
 
 /// Body of `POST /collections/{name}/remember` (the `memory` feature).

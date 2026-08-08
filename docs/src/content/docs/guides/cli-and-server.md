@@ -96,9 +96,17 @@ echo '[1,0,0]' | nidus search --dir ./store
 echo '[1,0,0]' | nidus search --dir ./store docs \
   --where '[{"Eq":["lang",{"Str":"rust"}]}]'
 
+# Force the exact scan, even on a store with an ANN index or quantization
+echo '[1,0,0]' | nidus search --dir ./store docs --exact
+
+# Trim the attrs each hit carries (repeatable; the two flags are mutually exclusive)
+echo '[1,0,0]' | nidus search --dir ./store docs --include-attr path --include-attr lang
+echo '[1,0,0]' | nidus search --dir ./store docs --exclude-attr body
+
 # List records by metadata filter (no vector query); --offset/-n paginate
 nidus list --dir ./store docs --where '[{"Eq":["lang",{"Str":"rust"}]}]'
 nidus list --dir ./store docs --offset 100 -n 100   # next page
+nidus list --dir ./store docs --include-attr path   # ids and one attr only
 
 # Full-text search (BM25): declare which fields are indexed, then query by text
 nidus set-fts-schema --dir ./store docs --field body --field title

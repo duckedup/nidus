@@ -405,6 +405,46 @@ func TestSearchPaginationOffsetIsAdditive(t *testing.T) {
 	}
 	if body := fake.sentBody(t); body != `{"vector":[1,0,0],"field":"body","text":"fox","offset":3}` {
 		t.Errorf("body = %s, want offset:3", body)
+	}
+}
+
+// TestExactAndProjectionAreAdditive — both knobs must be invisible until asked for, so a
+// client that never sets them keeps sending byte-identical bodies, and must travel in the
+// server's spelling when set. The embedded Projection's fields promote to the top level.
+func TestExactAndProjectionAreAdditive(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}, TopK: 5}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"query":[1,0,0],"top_k":5}` {
+		t.Errorf("body = %s, want no exact/projection keys", body)
+	}
+
+	if _, err := db.Search(ctx, SearchRequest{
+		Query:      []float32{1, 0, 0},
+		Exact:      true,
+		Projection: Projection{IncludeAttributes: []string{"title"}},
+	}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"query":[1,0,0],"exact":true,"include_attributes":["title"]}` {
+		t.Errorf("body = %s, want exact + include_attributes", body)
+	}
+
+	if _, err := db.List(ctx, ListRequest{
+		Limit:      5,
+		Projection: Projection{ExcludeAttributes: []string{"body"}},
+	}); err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"limit":5,"exclude_attributes":["body"]}` {
+		t.Errorf("body = %s, want exclude_attributes", body)
+	}
+}
+
 // TestSetFtsFieldsOmitsUnsetKnobs — an FtsField carrying only a name must marshal to
 // the same defaults the bare-string form gets, and an explicit zero must survive
 // `omitempty` (which is why the knobs are pointers).

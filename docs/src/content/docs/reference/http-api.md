@@ -326,6 +326,9 @@ curl -s localhost:7700/search \
 | `offset` | `0` | top-ranked hits to skip, for pagination |
 | `min_score` | none | drop hits scoring below this similarity |
 | `filter` | none | AND of predicates applied before scoring |
+| `exact` | `false` | force the exact scan, bypassing any index and quantization |
+| `include_attributes` | all attrs | return only these attrs |
+| `exclude_attributes` | all attrs | return every attr but these |
 
 Returns hits ordered by `(score desc, collection, id)` — the tie-break is a guarantee,
 which is what makes paging coherent:
@@ -339,6 +342,15 @@ with no gap and no overlap. An `offset` past the last hit returns `[]` rather th
 error. `offset + top_k` may not exceed **10 000** — beyond that the request is a `400`,
 never a silently shortened page. A page is stable only against an unchanging store;
 concurrent writes shift the ranking under a paged walk.
+
+`exact: true` runs the exact brute-force scan for that one request, bypassing the ANN
+walk, the per-segment index, and the quantized first pass — the store keeps its index for
+every other query.
+
+`include_attributes` and `exclude_attributes` choose which attrs the hits carry; omit
+both for every attr, exactly as before. Sending **both** in one request is a `400`, not a
+precedence rule. The projection is applied where the hit is built, so an excluded attr is
+never serialized — which is the point on a collection of long text bodies.
 
 ### `POST /text-search`
 
@@ -381,8 +393,10 @@ curl -s localhost:7700/list \
       }'
 ```
 
-`limit` defaults to `100`, `offset` to `0`. The response shape matches search
-(hits with a `score` of `0`, since nothing is scored).
+`limit` defaults to `100`, `offset` to `0`. `/list` takes the same
+`include_attributes`/`exclude_attributes` projection as `/search`, with the same `400`
+when both are sent. The response shape matches search (hits with a `score` of `0`, since
+nothing is scored).
 
 The `filter` in both `/search` and `/list` is an AND of predicates: `Eq`, `Ne`,
 `Glob`, `IGlob`, `In`, `NotIn`, `Lt`, `Le`, `Gt`, `Ge`. See

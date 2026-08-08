@@ -14,7 +14,8 @@ use crate::filter;
 use crate::fts::Analyzer;
 use crate::fuse::{FusionLeg, rrf_fuse};
 use crate::model::{
-    AnnConfig, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts, ListOpts, SearchOpts,
+    AnnConfig, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts, ListOpts, Projection,
+    SearchOpts,
 };
 use crate::search::{TopK, dot, euclidean_neg_sq, normalize};
 
@@ -140,7 +141,7 @@ impl Store {
                     .collections
                     .get(collection)
                     .and_then(|c| c.docs.get(id))
-                    .map(|e| e.attrs.clone())
+                    .map(|e| opts.projection.apply(&e.attrs))
                     .unwrap_or_default();
                 Hit::new(collection, id, 0.0, attrs)
             })
@@ -334,14 +335,17 @@ impl Store {
         // Each branch ranks `offset + top_k` deep and hands the ranking to ONE tail that drops
         // `offset`. Single-tail on purpose: a branch that paginated itself — or that applied the
         // offset before the top-k cap — still compiles and is silently wrong (nidus-m50.8).
+        // `opts.exact` gates every approximate branch (nidus-m50.12): the ANN walk, the segment
+        // indexes, and the quantized first pass below. Store-level config still decides what
+        // exists; this decides, per query, whether to use it.
         let deep = deepened(opts);
-        let ranked = if self.ann.is_some() {
+        let ranked = if self.ann.is_some() && !deep.exact {
             // ANN: walk the index for an over-fetched candidate set, then post-filter and rerank —
             // recall traded for speed. A selective filter/scope can starve the walk, so `search_ann`
             // falls back to an exact prefilter when survivors are few (nidus-0ou).
             m.search_ann.inc();
             self.search_ann(collections, &q, &deep, score_fn)?
-        } else if self.seg_indexes.iter().any(Option::is_some) {
+        } else if self.seg_indexes.iter().any(Option::is_some) && !deep.exact {
             // Per-segment fan-out: walk each cold segment's IVF index and brute-force the tail (the
             // active segment plus any sub-threshold sealed one), merged into one ranking (SPEC
             // §14.3). Engaged only once a sealed segment has crossed `segment_index_min_rows`.
@@ -363,7 +367,9 @@ impl Store {
 
                 // Two-pass quantized search if enabled and the quantized matrix is populated;
                 // otherwise the standard exact f32 brute-force path.
-                if let Some(res) = self.search_quantized(&q, scan, &deep, score_fn, workers) {
+                if !deep.exact
+                    && let Some(res) = self.search_quantized(&q, scan, &deep, score_fn, workers)
+                {
                     m.search_quantized.inc();
                     return res;
                 }
@@ -420,7 +426,10 @@ impl Store {
             }
         }
         // `TopK` already resolves ties on `(collection, id)`, so no re-sort is needed here.
-        Ok(paginate(self.hits_from_topk(topk), opts.offset))
+        Ok(paginate(
+            self.hits_from_topk(topk, &opts.projection),
+            opts.offset,
+        ))
     }
 
     /// Hybrid search: fuse a vector and a BM25 leg with Reciprocal Rank Fusion. Each leg runs
@@ -482,12 +491,17 @@ impl Store {
         } else {
             score_chunk(&self.data, scan, q, score_fn, opts.top_k, opts.min_score)?
         };
-        Ok(self.hits_from_topk(topk))
+        Ok(self.hits_from_topk(topk, &opts.projection))
     }
 
-    /// Resolve a bounded top-k of `(collection, id)` into ranked [`Hit`]s, cloning each
-    /// winner's attrs from the live index. Shared by every search path.
-    pub(super) fn hits_from_topk<'b>(&self, topk: TopK<(&'b str, &'b str)>) -> Vec<Hit> {
+    /// Resolve a bounded top-k of `(collection, id)` into ranked [`Hit`]s, materializing each
+    /// winner's projected attrs from the live index. Shared by every search path — the one
+    /// place a hit is built, so projection is applied instead of a full map being trimmed.
+    pub(super) fn hits_from_topk<'b>(
+        &self,
+        topk: TopK<(&'b str, &'b str)>,
+        projection: &Projection,
+    ) -> Vec<Hit> {
         topk.into_sorted_desc()
             .into_iter()
             .map(|(score, (collection, id))| {
@@ -495,7 +509,7 @@ impl Store {
                     .collections
                     .get(collection)
                     .and_then(|c| c.docs.get(id))
-                    .map(|e| e.attrs.clone())
+                    .map(|e| projection.apply(&e.attrs))
                     .unwrap_or_default();
                 Hit::new(collection, id, score, attrs)
             })
@@ -546,7 +560,7 @@ impl Store {
 
         let mut topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
         self.offer_candidates(&candidates, &scope, q, score_fn, opts, &mut topk);
-        Ok(self.hits_from_topk(topk))
+        Ok(self.hits_from_topk(topk, &opts.projection))
     }
 
     /// Resolve walked candidates to their docs, drop the out-of-scope/filtered/stale ones,
@@ -646,7 +660,7 @@ impl Store {
             let candidates = ix.search(&walk, q, n_candidates);
             self.offer_candidates(&candidates, &scope, q, score_fn, opts, &mut ivf_topk);
         }
-        hits.extend(self.hits_from_topk(ivf_topk));
+        hits.extend(self.hits_from_topk(ivf_topk, &opts.projection));
 
         // Merge the two legs into one ranking: highest exact score first, deterministic
         // tie-break, then keep `top_k`.

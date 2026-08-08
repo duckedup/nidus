@@ -191,6 +191,24 @@ describe("NidusClient request shaping", () => {
     expect(calls[3]!.json).toMatchObject({ offset: 3 });
   });
 
+  it("omits the projection and exact knobs unless asked, and maps them to snake_case", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    // Unset: byte-identical to a client that predates projection.
+    await db.search({ query: [1, 0, 0], topK: 5 });
+    expect(calls[0]!.json).toEqual({ query: [1, 0, 0], scope: [], top_k: 5, filter: [] });
+    await db.list({ limit: 5 });
+    expect(calls[1]!.json).toEqual({ scope: [], limit: 5, filter: [] });
+
+    await db.search({ query: [1, 0, 0], exact: true, includeAttributes: ["title"] });
+    expect(calls[2]!.json).toMatchObject({ exact: true, include_attributes: ["title"] });
+    await db.search({ query: [1, 0, 0], excludeAttributes: ["body"] });
+    expect(calls[3]!.json).toMatchObject({ exclude_attributes: ["body"] });
+    await db.list({ includeAttributes: ["lang"] });
+    expect(calls[4]!.json).toMatchObject({ include_attributes: ["lang"] });
+  });
+
   it("sends search with camelCase mapped to snake_case and decodes hit attrs", async () => {
     const { fn, calls } = mockFetch([
       { collection: "docs", id: "a", score: 0.9, attrs: { lang: { Str: "rust" } } },

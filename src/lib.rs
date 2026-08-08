@@ -89,7 +89,7 @@ pub use config::{Config, Fsync, LeaseWait, OpenMode};
 pub use fts::{Analyzer, FtsField, Language};
 pub use model::{
     AnnConfig, AnnKind, ClusterStatus, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts,
-    ListOpts, Predicate, QuantKind, Quantization, Record, Role, SearchOpts, Value,
+    ListOpts, Predicate, Projection, QuantKind, Quantization, Record, Role, SearchOpts, Value,
 };
 pub use store::Readiness;
 

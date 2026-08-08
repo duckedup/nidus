@@ -209,7 +209,11 @@ pub enum Scope<'a> {
 // impl From<&str> / From<&[&str]> for Scope — ergonomic single- and multi-collection calls.
 
 // `offset` skips that many top-ranked hits (§7 pagination); 0 is the whole first page.
-pub struct SearchOpts { pub top_k: usize, pub offset: usize, pub filter: Filter, pub min_score: Option<f32> }
+// `exact` forces the brute-force scan for one query; `projection` picks the attrs (§7).
+pub struct SearchOpts { pub top_k: usize, pub offset: usize, pub filter: Filter, pub min_score: Option<f32>, pub exact: bool, pub projection: Projection }
+
+// Which attrs a Hit carries. An enum, so "include and exclude at once" cannot be built.
+pub enum Projection { All, Include(Vec<String>), Exclude(Vec<String>) }
 
 // `collection` identifies the source namespace — required when a query spans more
 // than one, and (id) is only unique within a collection.
@@ -566,6 +570,23 @@ reliable guard there is to refuse work *before* allocating:
   > upserts and deletes shift the ranking, so a document can move between pages or be
   > seen twice across a paged walk. Offset/limit cannot deliver more than that, and
   > pretending otherwise with a cursor would only hide where the guarantee ends.
+- **The exact/approximate choice is per query, not per store** (`SearchOpts::exact`,
+  nidus-m50.12). `Config::ann` and `Config::quantization` decide what an instance *has*;
+  `exact: true` decides, for one query, not to use it — the ANN walk, the per-segment IVF
+  fan-out, and the quantized first pass are all bypassed and the query runs the exact f32
+  brute-force scan. The case it exists for is a caller who wants a guaranteed-exact answer
+  over a small filtered subset while keeping the index for everything else. Default `false`,
+  so an instance's configured path is unchanged for every caller who does not ask.
+- **Projection selects the attrs a `Hit` carries** (`SearchOpts::projection`,
+  `ListOpts::projection`, nidus-m50.7). `Projection::All` (the default) is every attr;
+  `Include`/`Exclude` name a subset. It is applied where a hit is *materialized* — one
+  place, `hits_from_topk`, plus the `list` tail — so an excluded attr is never cloned and
+  the saving on a long-body collection is real rather than cosmetic. It is an enum, not a
+  pair of lists, so "include and exclude at once" is unrepresentable in the library; the
+  wire form carries `include_attributes`/`exclude_attributes` and answers `400` when both
+  are sent, rather than inventing a precedence rule (nidus-m50.15). Ranking is untouched:
+  projection changes the payload, never the order or the scores. `RecallOpts` has neither
+  knob, for the same reason it has no `offset` — the memory API stays lean.
 - **Filters** (`Filter` = AND of `Predicate`s) are evaluated against `attrs` before
   scoring: `Eq` (typed equality), `Ne` (typed inequality), `Glob` / `IGlob` (pattern
   match on a `Str` attr, case-sensitive and ASCII-case-insensitive, §7.1), `In` /
@@ -813,6 +834,32 @@ build until a real need exists.
   small/recent tail; an IVF index covers the cold bulk. **Phases 1–5 (the segment format +
   manifest + WAL→segment sealing, per-segment IVF, per-segment mmap, manifest-versioned reader
   refresh, and cooperating-instances cluster mode) are built — see §14.**
+
+#### Exotic vector types — DECIDED, 2026-08 (nidus-m50.14)
+
+One dense vector per record, one dimension per store, stays the model. Three variants
+were evaluated against turbopuffer's surface and answered separately:
+
+- **`f16` storage — rejected, not deferred.** It buys ~2× on the vector matrix, which
+  int8 quantization (shipped, `Config::quantization`) already beats at 4× with a rerank
+  pass that restores accuracy. Adding a third storage width would multiply the codec,
+  scan-kernel, and quantization matrix for a strictly worse trade. Nothing is waiting on
+  this; the branch is closed.
+- **Multi-vector late interaction (ColBERT-style) — deferred as a rerank-only feature.**
+  The useful form scores a candidate set produced by ordinary dense retrieval, so it
+  belongs on the rerank seam, not in the segment format. It needs no format change if
+  scoped that way, and it should not be built until a caller wants it.
+- **Sparse vectors (`SparseKNN`) — deferred, and deliberately not built now.** The byte
+  format could carry them additively, but the surrounding cost is out of proportion to
+  demand: a breaking `Record` change, a second `Op` append, a working-set key bump that
+  discards every deployed memory-tier snapshot, the sparse payload held twice in RAM
+  outside `max_vector_bytes`, and no worst-case bound on a query over a common dimension.
+  No user has asked for SPLADE-style retrieval. Revisit when one does — the decision is
+  "not yet", not "never", and nothing in the format forecloses it.
+
+The general rule this encodes: a change to the *segment format* needs a named caller,
+because it is the one layer where being wrong is expensive to walk back. Query-path
+features do not carry that burden and are judged on their own merits.
 
 ---
 

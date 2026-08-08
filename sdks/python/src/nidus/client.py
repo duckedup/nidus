@@ -184,11 +184,15 @@ class NidusClient:
         offset: Optional[int] = None,
         min_score: Optional[float] = None,
         filter: Optional[Filter] = None,  # noqa: A002
+        exact: Optional[bool] = None,
+        include_attributes: Optional[Sequence[str]] = None,
+        exclude_attributes: Optional[Sequence[str]] = None,
     ) -> Hits:
         """Vector (cosine) nearest-neighbour search. An empty ``scope`` searches everything.
 
         ``offset`` skips that many top-ranked hits, so successive pages tile one ranking;
-        the server refuses ``offset + top_k`` above 10000.
+        the server refuses ``offset + top_k`` above 10000. ``exact=True`` forces the exact
+        scan past any index; the projection arguments are mutually exclusive.
         """
         return self._search(
             _wire.SEARCH,
@@ -199,6 +203,9 @@ class NidusClient:
                 offset=offset,
                 min_score=min_score,
                 filter=filter,
+                exact=exact,
+                include_attributes=include_attributes,
+                exclude_attributes=exclude_attributes,
             ),
         )
 
@@ -267,10 +274,20 @@ class NidusClient:
         offset: Optional[int] = None,
         limit: Optional[int] = None,
         filter: Optional[Filter] = None,  # noqa: A002
+        include_attributes: Optional[Sequence[str]] = None,
+        exclude_attributes: Optional[Sequence[str]] = None,
     ) -> Hits:
         """Metadata-only listing (no vector query), paginated by ``offset``/``limit``."""
         return self._search(
-            _wire.LIST, _wire.list_body(scope=scope, offset=offset, limit=limit, filter=filter)
+            _wire.LIST,
+            _wire.list_body(
+                scope=scope,
+                offset=offset,
+                limit=limit,
+                filter=filter,
+                include_attributes=include_attributes,
+                exclude_attributes=exclude_attributes,
+            ),
         )
 
     # ── Memory (text-native) ─────────────────────────────────────────────────────────

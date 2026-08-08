@@ -313,6 +313,6 @@ impl Store {
             }
             topk.offer(score, (*col_name, *id));
         }
-        self.hits_from_topk(topk)
+        self.hits_from_topk(topk, &opts.projection)
     }
 }

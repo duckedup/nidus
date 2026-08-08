@@ -8,7 +8,9 @@ use super::quant::{BinState, Int8State, Quant};
 use super::scoring::PARALLEL_SCAN_WORK_FLOOR;
 use super::*;
 use crate::Fsync;
-use crate::model::{Filter, ListOpts, Predicate, Quantization, Record, SearchOpts, Value};
+use crate::model::{
+    Filter, Hit, ListOpts, Predicate, Projection, Quantization, Record, SearchOpts, Value,
+};
 use crate::search::normalize;
 
 /// Extract the int8 state from a store's quant slot, panicking if it is off or binary.
@@ -5204,4 +5206,274 @@ fn a_page_past_the_first_is_not_starved_by_the_top_k_cap() {
         .search(&["docs"], &[1.0, 0.0, 0.0], &page(2, 6))
         .unwrap();
     assert_eq!(ids(&hits), vec!["d6", "d7"]);
+}
+
+// ── Per-query exact search (nidus-m50.12) ───────────────────────────────────
+
+/// `exact: true` on an ANN store must answer exactly what a store with no index answers —
+/// same ids, same scores, same order — while leaving the index in place for other queries.
+#[test]
+#[cfg_attr(miri, ignore)] // N=2000 HNSW build is too slow under Miri.
+fn exact_bypasses_the_ann_walk_and_matches_brute_force() {
+    let (n, dim, k) = (2000, 32, 10);
+    let data = random_unit_vectors(n, dim, 21);
+    let queries = random_unit_vectors(20, dim, 22);
+    let ann = ann_store(dim, AnnConfig::hnsw(), &data);
+    let truth = exact_store(dim, &data);
+
+    let forced = SearchOpts {
+        top_k: k,
+        exact: true,
+        ..Default::default()
+    };
+    let mut approximate_ever_differed = false;
+    for q in &queries {
+        let want = truth.search(&["col"], q, &default_opts(k)).unwrap();
+        assert_eq!(
+            ann.search(&["col"], q, &forced).unwrap(),
+            want,
+            "exact: true must reproduce brute force"
+        );
+        approximate_ever_differed |= ann.search(&["col"], q, &default_opts(k)).unwrap() != want;
+    }
+    assert!(
+        approximate_ever_differed,
+        "the ANN path should differ somewhere, else this proves nothing"
+    );
+}
+
+/// The quantized first pass is an approximation too, so `exact` must bypass it as well —
+/// with a coarse binary code and no over-fetch, the default path visibly loses hits.
+#[test]
+fn exact_bypasses_the_quantized_first_pass() {
+    let (dim, k) = (32, 10);
+    let data = random_unit_vectors(120, dim, 23);
+    let mut quantized = Store::in_memory_cfg(
+        Config::new("/dev/null/in-memory", dim)
+            .auto_compact(None)
+            .quantization(Some(Quantization::binary().rescore(1))),
+    )
+    .unwrap();
+    let recs: Vec<Record> = data
+        .iter()
+        .enumerate()
+        .map(|(i, v)| rec(&format!("d{i}"), v.clone()))
+        .collect();
+    quantized.upsert("col", &recs).unwrap();
+    let truth = exact_store(dim, &data);
+
+    let q = &random_unit_vectors(1, dim, 24)[0];
+    let want = truth.search(&["col"], q, &default_opts(k)).unwrap();
+    let forced = SearchOpts {
+        top_k: k,
+        exact: true,
+        ..Default::default()
+    };
+    assert_eq!(quantized.search(&["col"], q, &forced).unwrap(), want);
+    assert_ne!(
+        quantized.search(&["col"], q, &default_opts(k)).unwrap(),
+        want,
+        "rescore(1) binary should be lossy, else the bypass proves nothing"
+    );
+}
+
+/// `exact: false` is the default and must leave an indexed store on the index — asserted by
+/// the ANN path answering identically whether the flag is omitted or spelled out.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn exact_false_is_the_untouched_approximate_path() {
+    let (n, dim, k) = (600, 16, 5);
+    let data = random_unit_vectors(n, dim, 25);
+    let ann = ann_store(dim, AnnConfig::hnsw(), &data);
+    let q = &random_unit_vectors(1, dim, 26)[0];
+    let spelled_out = SearchOpts {
+        top_k: k,
+        exact: false,
+        ..Default::default()
+    };
+    assert_eq!(
+        ann.search(&["col"], q, &default_opts(k)).unwrap(),
+        ann.search(&["col"], q, &spelled_out).unwrap()
+    );
+}
+
+// ── Projection (nidus-m50.7) ────────────────────────────────────────────────
+
+/// Three attrs, one of them a long body — the payload projection exists to leave behind.
+fn projected_store() -> Store {
+    let mut store = Store::in_memory(2).unwrap();
+    let attrs = |id: &str| {
+        BTreeMap::from([
+            ("title".to_string(), Value::Str(format!("title of {id}"))),
+            ("body".to_string(), Value::Str("x".repeat(4096))),
+            ("lang".to_string(), Value::Str("rust".to_string())),
+        ])
+    };
+    let recs: Vec<Record> = ["a", "b"]
+        .iter()
+        .enumerate()
+        .map(|(i, id)| rec_with(id, vec![1.0, i as f32 * 0.1], attrs(id)))
+        .collect();
+    store.upsert("col", &recs).unwrap();
+    store
+}
+
+fn attr_keys(hit: &Hit) -> Vec<&str> {
+    hit.attrs.keys().map(String::as_str).collect()
+}
+
+#[test]
+fn the_default_projection_returns_every_attr() {
+    let store = projected_store();
+    let hits = store
+        .search(&["col"], &[1.0, 0.0], &default_opts(2))
+        .unwrap();
+    assert_eq!(attr_keys(&hits[0]), vec!["body", "lang", "title"]);
+}
+
+#[test]
+fn include_returns_only_the_named_attrs() {
+    let store = projected_store();
+    let opts = SearchOpts {
+        top_k: 2,
+        projection: Projection::include(["title", "missing"]),
+        ..Default::default()
+    };
+    let hits = store.search(&["col"], &[1.0, 0.0], &opts).unwrap();
+    assert_eq!(hits.len(), 2);
+    for hit in &hits {
+        // A named attr the record lacks is simply absent — not an error, not a Null.
+        assert_eq!(attr_keys(hit), vec!["title"]);
+    }
+}
+
+#[test]
+fn exclude_removes_only_the_named_attrs() {
+    let store = projected_store();
+    let opts = SearchOpts {
+        top_k: 2,
+        projection: Projection::exclude(["body"]),
+        ..Default::default()
+    };
+    let hits = store.search(&["col"], &[1.0, 0.0], &opts).unwrap();
+    assert_eq!(attr_keys(&hits[0]), vec!["lang", "title"]);
+}
+
+#[test]
+fn projection_leaves_the_ranking_alone() {
+    let store = projected_store();
+    let ranked = |projection: Projection| {
+        let opts = SearchOpts {
+            top_k: 2,
+            projection,
+            ..Default::default()
+        };
+        let hits = store.search(&["col"], &[1.0, 0.0], &opts).unwrap();
+        hits.into_iter()
+            .map(|h| (h.id, h.score))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ranked(Projection::All),
+        ranked(Projection::include(["lang"]))
+    );
+    assert_eq!(
+        ranked(Projection::All),
+        ranked(Projection::exclude(["lang"]))
+    );
+}
+
+#[test]
+fn list_projects_attrs() {
+    let store = projected_store();
+    let listed = |projection: Projection| {
+        store
+            .list(
+                &["col"],
+                &ListOpts {
+                    projection,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        attr_keys(&listed(Projection::All)[0]),
+        vec!["body", "lang", "title"]
+    );
+    assert_eq!(
+        attr_keys(&listed(Projection::include(["lang"]))[0]),
+        vec!["lang"]
+    );
+    assert_eq!(
+        attr_keys(&listed(Projection::exclude(["body", "lang"]))[0]),
+        vec!["title"]
+    );
+}
+
+#[test]
+fn text_search_projects_attrs() {
+    let mut store = projected_store();
+    store
+        .set_fts_schema("col", &[crate::FtsField::new("title")])
+        .unwrap();
+    let opts = SearchOpts {
+        top_k: 2,
+        projection: Projection::include(["lang"]),
+        ..Default::default()
+    };
+    let hits = store
+        .text_search(&["col"], &FtsQuery::new("title", "title"), &opts)
+        .unwrap();
+    assert!(!hits.is_empty());
+    assert_eq!(attr_keys(&hits[0]), vec!["lang"]);
+}
+
+/// Hits materialize on the index paths too, so projection has to reach the ANN walk's rerank
+/// and the quantized two-pass tail — not only the brute-force scan.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn projection_applies_on_the_ann_and_quantized_paths() {
+    let dim = 16;
+    let data = random_unit_vectors(300, dim, 27);
+    let attrs = BTreeMap::from([
+        ("keep".to_string(), Value::Int(1)),
+        ("drop".to_string(), Value::Str("x".repeat(1024))),
+    ]);
+    let build = |store: &mut Store| {
+        let recs: Vec<Record> = data
+            .iter()
+            .enumerate()
+            .map(|(i, v)| rec_with(&format!("d{i}"), v.clone(), attrs.clone()))
+            .collect();
+        store.upsert("col", &recs).unwrap();
+    };
+    let mut ann = Store::in_memory_cfg(
+        Config::new("/dev/null/in-memory", dim)
+            .auto_compact(None)
+            .ann(Some(AnnConfig::hnsw())),
+    )
+    .unwrap();
+    build(&mut ann);
+    let mut quantized = Store::in_memory_cfg(
+        Config::new("/dev/null/in-memory", dim)
+            .auto_compact(None)
+            .quantization(Some(Quantization::default())),
+    )
+    .unwrap();
+    build(&mut quantized);
+
+    let q = &random_unit_vectors(1, dim, 28)[0];
+    let opts = SearchOpts {
+        top_k: 5,
+        projection: Projection::exclude(["drop"]),
+        ..Default::default()
+    };
+    for store in [&ann, &quantized] {
+        let hits = store.search(&["col"], q, &opts).unwrap();
+        assert_eq!(hits.len(), 5);
+        for hit in &hits {
+            assert_eq!(attr_keys(hit), vec!["keep"]);
+        }
+    }
 }

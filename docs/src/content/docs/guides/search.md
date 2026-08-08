@@ -110,6 +110,71 @@ Things worth knowing:
 - A page is stable only against an **unchanging** store. Concurrent upserts and deletes
   shift the ranking, so a document can move between pages during a paged walk.
 
+## Choosing the attrs a hit carries
+
+By default a `Hit` carries every attr of the matched record. When the records hold long
+text bodies, a top-50 search ships fifty full documents to answer a question about ids
+and scores. `SearchOpts::projection` (and `ListOpts::projection`) trims that:
+
+```rust
+use nidus::{Projection, SearchOpts};
+
+let query = vec![0.1_f32; 384];
+// Only these attrs come back — nothing else is even cloned.
+let lean = db.search(
+    "code",
+    &query,
+    &SearchOpts {
+        top_k: 10,
+        projection: Projection::include(["path", "lang"]),
+        ..Default::default()
+    },
+)?;
+
+// Or: everything except the expensive one.
+let no_body = db.search(
+    "code",
+    &query,
+    &SearchOpts {
+        top_k: 10,
+        projection: Projection::exclude(["body"]),
+        ..Default::default()
+    },
+)?;
+# anyhow::Ok(())
+```
+
+- The default is `Projection::All` — every attr, exactly as before.
+- Projection is applied where the hit is built, so an excluded attr is never copied.
+- An included attr the record does not have is simply absent from the hit.
+- Ranking, scores, and `top_k` are unaffected: this changes the payload, not the answer.
+- Over HTTP the two are `include_attributes` and `exclude_attributes`. Sending both in
+  one request is a `400` — there is no precedence rule to remember.
+
+## Forcing an exact search
+
+A store configured with an [ANN index](#approximate-search-ann) or
+[quantization](#int8-scalar-quantization) answers every query approximately. `exact: true` opts one
+query out of that, running the exact brute-force scan instead — useful when a caller
+needs a guaranteed-exact answer over a small filtered subset but wants to keep the index
+for everything else.
+
+```rust
+use nidus::SearchOpts;
+
+let query = vec![0.1_f32; 384];
+let certain = db.search(
+    "code",
+    &query,
+    &SearchOpts { top_k: 10, exact: true, ..Default::default() },
+)?;
+# anyhow::Ok(())
+```
+
+It bypasses the ANN walk, the per-segment index fan-out, and the quantized first pass
+alike. The default is `false`, so the store's configured path is unchanged for anyone who
+does not ask.
+
 ## Typed metadata
 
 Each record carries an open map of typed [`Value`](/reference/api/#value)s:
@@ -243,7 +308,8 @@ let page2 = db.list("code", &ListOpts { offset: 100, filter, ..Default::default(
 ```
 
 `list` accepts a [`Scope`](/reference/api/#scope) just like `search`, so you can
-list across multiple collections or the whole store.
+list across multiple collections or the whole store. It also takes the same
+[`projection`](#choosing-the-attrs-a-hit-carries), so a listing can return ids alone.
 
 ## int8 scalar quantization
 

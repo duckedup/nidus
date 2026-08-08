@@ -188,16 +188,41 @@ pub struct SearchOpts {
     pub offset: usize,           // top-ranked results to skip, for pagination
     pub filter: Filter,          // pre-scoring metadata filter
     pub min_score: Option<f32>,  // drop results below this score
+    pub exact: bool,             // force the exact scan for this query
+    pub projection: Projection,  // which attrs the hits carry
 }
 ```
 
-Implements `Default` (`offset: 0`) — `SearchOpts { top_k: 5, ..Default::default() }`
-is the idiomatic call. Reused by `text_search`, where `min_score` is a raw BM25 floor.
+Implements `Default` (`offset: 0`, `exact: false`, `projection: Projection::All`) —
+`SearchOpts { top_k: 5, ..Default::default() }` is the idiomatic call. Reused by
+`text_search`, where `min_score` is a raw BM25 floor.
 
 Results are ordered by `(score desc, collection, id)`. The ranking is computed
 `offset + top_k` deep and the page cut once, at the end; an `offset` past the last
 result is an empty `Vec`, not an error. See
 [paginating a search](/guides/search/#paginating-a-search).
+
+`exact: true` bypasses the ANN walk, the per-segment index, and the quantized first
+pass, running the exact brute-force scan for that one query — the index stays in place
+for every other. See [forcing an exact search](/guides/search/#forcing-an-exact-search).
+
+## `Projection`
+
+Which attrs a returned [`Hit`](#hit) carries. Default `All`.
+
+```rust
+pub enum Projection {
+    All,                    // every attr (the default)
+    Include(Vec<String>),   // only these
+    Exclude(Vec<String>),   // everything but these
+}
+```
+
+Build one with `Projection::include([...])` / `Projection::exclude([...])`. It is
+applied where a hit is materialized, so an excluded attr is never cloned — the payload
+saving on a long-body collection is real. Ranking and scores are unaffected. An enum
+rather than two lists, so "include and exclude at once" cannot be expressed; the HTTP
+surface answers `400` for the wire form that sends both.
 
 ## `FtsQuery` & `Language`
 
@@ -239,9 +264,10 @@ Options for the metadata-only `list` query.
 
 ```rust
 pub struct ListOpts {
-    pub offset: usize,   // matches to skip, for pagination
-    pub limit: usize,    // maximum records returned (default 100)
-    pub filter: Filter,  // metadata filter; default matches everything
+    pub offset: usize,          // matches to skip, for pagination
+    pub limit: usize,           // maximum records returned (default 100)
+    pub filter: Filter,         // metadata filter; default matches everything
+    pub projection: Projection, // which attrs the hits carry
 }
 ```
 

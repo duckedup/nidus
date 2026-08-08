@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::server::dto::{AnnDto, FootprintDto, HitDto};
 use crate::{
     AnnConfig, Config, Distance, Filter, Fsync, FtsField, FtsQuery, HybridOpts, LeaseWait,
-    ListOpts, Nidus, OpenMode, Quantization, Record, Scope, SearchOpts,
+    ListOpts, Nidus, OpenMode, Projection, Quantization, Record, Scope, SearchOpts,
 };
 
 // AI-ingest (memory) wiring for `serve`: only under the `memory` feature (pulled
@@ -562,6 +562,15 @@ enum Command {
         /// E.g. '[{"Ge":["ts",{"Int":1700000000}]},{"Ne":["status",{"Str":"archived"}]}]'.
         #[arg(long = "where")]
         filter: Option<String>,
+        /// Force the exact scan, bypassing any ANN index and the quantized first pass.
+        #[arg(long)]
+        exact: bool,
+        /// Return only this attr (repeatable). Mutually exclusive with --exclude-attr.
+        #[arg(long = "include-attr")]
+        include_attributes: Vec<String>,
+        /// Return every attr but this one (repeatable). Mutually exclusive with --include-attr.
+        #[arg(long = "exclude-attr")]
+        exclude_attributes: Vec<String>,
     },
     /// List records by metadata filter (no vector query).
     List {
@@ -579,6 +588,12 @@ enum Command {
         /// E.g. '[{"Ge":["ts",{"Int":1700000000}]},{"Ne":["status",{"Str":"archived"}]}]'.
         #[arg(long = "where")]
         filter: Option<String>,
+        /// Return only this attr (repeatable). Mutually exclusive with --exclude-attr.
+        #[arg(long = "include-attr")]
+        include_attributes: Vec<String>,
+        /// Return every attr but this one (repeatable). Mutually exclusive with --include-attr.
+        #[arg(long = "exclude-attr")]
+        exclude_attributes: Vec<String>,
     },
     /// Declare a collection's full-text-indexed fields (BM25). The tuning flags apply to
     /// every `--field` in the invocation. Re-running rebuilds the affected field indexes.
@@ -778,6 +793,9 @@ pub fn run(cli: Cli) -> Result<()> {
             offset,
             min_score,
             filter,
+            exact,
+            include_attributes,
+            exclude_attributes,
         } => {
             let db = open(&store, false)?;
             let query: Vec<f32> = serde_json::from_str(&read_input(query_file.as_ref())?)?;
@@ -790,6 +808,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 offset,
                 min_score,
                 filter,
+                exact,
+                projection: projection(include_attributes, exclude_attributes)?,
             };
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
             let hits = if refs.is_empty() {
@@ -806,6 +826,8 @@ pub fn run(cli: Cli) -> Result<()> {
             offset,
             limit,
             filter,
+            include_attributes,
+            exclude_attributes,
         } => {
             let db = open(&store, false)?;
             let filter = match filter {
@@ -816,6 +838,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 offset,
                 limit,
                 filter,
+                projection: projection(include_attributes, exclude_attributes)?,
             };
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
             let hits = if refs.is_empty() {
@@ -874,6 +897,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 offset,
                 min_score,
                 filter,
+                ..Default::default()
             };
             let q = FtsQuery::new(field, query);
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
@@ -1085,6 +1109,17 @@ fn serve(
         summarizer,
     };
     rt.block_on(crate::server::serve(move || Nidus::open(open_config), cfg))
+}
+
+/// Resolve `--include-attr`/`--exclude-attr` into a [`Projection`]. Both given is an error,
+/// not a precedence rule — the same refusal the HTTP surface makes (nidus-m50.15).
+fn projection(include: Vec<String>, exclude: Vec<String>) -> Result<Projection> {
+    match (include.is_empty(), exclude.is_empty()) {
+        (true, true) => Ok(Projection::All),
+        (false, true) => Ok(Projection::Include(include)),
+        (true, false) => Ok(Projection::Exclude(exclude)),
+        (false, false) => anyhow::bail!("--include-attr and --exclude-attr are mutually exclusive"),
+    }
 }
 
 /// Read JSON from `file`, or from stdin when absent.

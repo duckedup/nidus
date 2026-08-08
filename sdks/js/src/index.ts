@@ -21,6 +21,7 @@ export type {
   ListOptions,
   NidusRecord,
   Predicate,
+  ProjectionOptions,
   RecallOptions,
   RecordInput,
   RememberOptions,

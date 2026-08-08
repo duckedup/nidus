@@ -216,13 +216,16 @@ def search_body(
     offset: Optional[int] = None,
     min_score: Optional[float] = None,
     filter: Optional[Filter] = None,  # noqa: A002
+    exact: Optional[bool] = None,
+    include_attributes: Optional[Sequence[str]] = None,
+    exclude_attributes: Optional[Sequence[str]] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /search`` (vector nearest-neighbour).
 
     ``scope`` and ``filter`` are always sent, as ``[]`` when unset — an empty scope means
     "every collection" and an empty filter means "match everything", so the empty array is
-    the real value, not a missing one. ``top_k``/``offset``/``min_score`` are pruned when
-    unset, so an omitted ``offset`` is byte-identical to the pre-pagination request.
+    the real value, not a missing one. Every other knob is pruned when unset, so an omitted
+    ``offset`` (or projection) is byte-identical to the request before it existed.
     """
     return prune(
         {
@@ -232,6 +235,8 @@ def search_body(
             "offset": offset,
             "min_score": min_score,
             "filter": list(filter) if filter is not None else [],
+            "exact": exact,
+            **_projection(include_attributes, exclude_attributes),
         }
     )
 
@@ -295,6 +300,8 @@ def list_body(
     offset: Optional[int] = None,
     limit: Optional[int] = None,
     filter: Optional[Filter] = None,  # noqa: A002
+    include_attributes: Optional[Sequence[str]] = None,
+    exclude_attributes: Optional[Sequence[str]] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /list`` (metadata-only, paginated)."""
     return prune(
@@ -303,6 +310,7 @@ def list_body(
             "offset": offset,
             "limit": limit,
             "filter": list(filter) if filter is not None else [],
+            **_projection(include_attributes, exclude_attributes),
         }
     )
 
@@ -562,6 +570,26 @@ def request_headers(
 def _scope(scope: Optional[Sequence[str]]) -> list[str]:
     """A ``scope`` argument as it goes on the wire: ``[]`` for unset, meaning "everywhere"."""
     return [] if scope is None else _guards.str_sequence(scope, "scope")
+
+
+def _projection(
+    include: Optional[Sequence[str]], exclude: Optional[Sequence[str]]
+) -> dict[str, Any]:
+    """The projection keys, unset (``None``) unless asked for — pruned by the caller.
+
+    Both at once is refused here rather than sent, so the mistake names the argument
+    instead of arriving as a 400 from the server.
+    """
+    if include is not None and exclude is not None:
+        raise ValueError("include_attributes and exclude_attributes are mutually exclusive")
+    return {
+        "include_attributes": (
+            None if include is None else _guards.str_sequence(include, "include_attributes")
+        ),
+        "exclude_attributes": (
+            None if exclude is None else _guards.str_sequence(exclude, "exclude_attributes")
+        ),
+    }
 
 
 def _count(payload: Any, key: str) -> int:

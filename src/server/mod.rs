@@ -658,20 +658,26 @@ async fn search(
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
     check_page(req.offset, req.top_k)?;
+    let SearchRequest {
+        query,
+        scope,
+        top_k,
+        offset,
+        min_score,
+        filter,
+        exact,
+        include_attributes,
+        exclude_attributes,
+    } = req;
+    let projection = check_projection(include_attributes, exclude_attributes)?;
     let hits = run_read(st, move |db| {
-        let SearchRequest {
-            query,
-            scope,
-            top_k,
-            offset,
-            min_score,
-            filter,
-        } = req;
         let opts = SearchOpts {
             top_k,
             offset,
             min_score,
             filter,
+            exact,
+            projection,
         };
         scoped(&scope, |s| db.search(s, &query, &opts))
     })
@@ -695,17 +701,21 @@ async fn list(
     State(st): State<AppState>,
     Json(req): Json<ListRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
+    let ListRequest {
+        scope,
+        offset,
+        limit,
+        filter,
+        include_attributes,
+        exclude_attributes,
+    } = req;
+    let projection = check_projection(include_attributes, exclude_attributes)?;
     let hits = run_read(st, move |db| {
-        let ListRequest {
-            scope,
-            offset,
-            limit,
-            filter,
-        } = req;
         let opts = ListOpts {
             offset,
             limit,
             filter,
+            projection,
         };
         scoped(&scope, |s| db.list(s, &opts))
     })
@@ -746,6 +756,7 @@ async fn text_search(
             offset,
             min_score,
             filter,
+            ..Default::default()
         };
         let q = FtsQuery::new(field, query);
         scoped(&scope, |s| db.text_search(s, &q, &opts))
@@ -1017,6 +1028,17 @@ fn check_page(offset: usize, top_k: usize) -> Result<(), ApiError> {
         )));
     }
     Ok(())
+}
+
+/// Resolve a request's projection, refusing a body that names both an include and an exclude
+/// list. A `400`, not a precedence rule: silently honouring one of two contradictory
+/// instructions returns a payload the caller did not ask for (nidus-m50.15).
+fn check_projection(
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+) -> Result<crate::Projection, ApiError> {
+    dto::resolve_projection(include, exclude)
+        .map_err(|msg| ApiError::bad_request(anyhow::anyhow!(msg)))
 }
 
 /// Map a store error to an HTTP status. Defaults to `500`; recognises the
@@ -1326,6 +1348,117 @@ mod tests {
             json!([]),
             "an offset past the end is an empty page"
         );
+    }
+
+    /// Projection is opt-in over the wire: an omitted pair is every attr, `include_attributes`
+    /// narrows to the named ones, `exclude_attributes` drops them — on `/search` and `/list` alike.
+    #[tokio::test]
+    async fn projection_narrows_the_attrs_over_http() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [{"id": "a", "vector": [1, 0, 0], "attrs": {
+                    "title": {"Str": "t"}, "body": {"Str": "long"}, "lang": {"Str": "rust"}
+                }}]}),
+            ))
+            .await
+            .unwrap();
+        let attrs = |path: &'static str, body: JsonValue| {
+            let app = app.clone();
+            async move {
+                let resp = app.oneshot(post(path, body)).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let hits = json_body(resp).await;
+                hits[0]["attrs"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<String>>()
+            }
+        };
+        let query = json!({"query": [1, 0, 0], "top_k": 1});
+        assert_eq!(
+            attrs("/search", query.clone()).await,
+            vec!["body", "lang", "title"],
+            "an omitted projection is every attr"
+        );
+        assert_eq!(
+            attrs(
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": 1, "include_attributes": ["title"]})
+            )
+            .await,
+            vec!["title"]
+        );
+        assert_eq!(
+            attrs(
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": 1, "exclude_attributes": ["body"]})
+            )
+            .await,
+            vec!["lang", "title"]
+        );
+        assert_eq!(
+            attrs("/list", json!({"include_attributes": ["lang"]})).await,
+            vec!["lang"]
+        );
+        assert_eq!(
+            attrs("/list", json!({"exclude_attributes": ["body", "lang"]})).await,
+            vec!["title"]
+        );
+    }
+
+    /// Both projection lists in one body is a `400`, not a precedence rule (nidus-m50.15):
+    /// honouring one of two contradictory instructions ships a payload nobody asked for.
+    #[tokio::test]
+    async fn both_projection_lists_at_once_is_a_bad_request() {
+        let app = test_router(3);
+        for (path, body) in [
+            (
+                "/search",
+                json!({"query": [1, 0, 0], "include_attributes": ["a"], "exclude_attributes": ["b"]}),
+            ),
+            (
+                "/list",
+                json!({"include_attributes": ["a"], "exclude_attributes": ["b"]}),
+            ),
+        ] {
+            let resp = app.clone().oneshot(post(path, body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+            let err = json_body(resp).await["error"].as_str().unwrap().to_string();
+            assert!(err.contains("mutually exclusive"), "{path}: {err}");
+        }
+    }
+
+    /// `exact` is additive: omitting it is the store's configured path, and asking for it
+    /// answers the same ranking (this store has no index, so both are the brute-force scan).
+    #[tokio::test]
+    async fn exact_is_an_additive_search_knob() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "a", "vector": [1, 0, 0], "attrs": {}},
+                    {"id": "b", "vector": [0, 1, 0], "attrs": {}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        let hits = |body: JsonValue| {
+            let app = app.clone();
+            async move {
+                let resp = app.oneshot(post("/search", body)).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                json_body(resp).await
+            }
+        };
+        let implicit = hits(json!({"query": [1, 0, 0], "top_k": 2})).await;
+        let forced = hits(json!({"query": [1, 0, 0], "top_k": 2, "exact": true})).await;
+        assert_eq!(implicit, forced);
+        assert_eq!(implicit[0]["id"], "a");
     }
 
     /// Before the store opens — a standby awaiting promotion — liveness must answer while

@@ -232,6 +232,35 @@ def test_search_body_full() -> None:
     }
 
 
+def test_projection_and_exact_are_omitted_unless_asked_for() -> None:
+    """Both knobs are additive: unset, the body is what a pre-projection client sent."""
+    body = _wire.search_body([1.0], top_k=5)
+    assert "exact" not in body
+    assert "include_attributes" not in body
+    assert "exclude_attributes" not in body
+    assert _wire.search_body([1.0], exact=True)["exact"] is True
+    assert _wire.search_body([1.0], include_attributes=["title"])["include_attributes"] == ["title"]
+    assert _wire.search_body([1.0], exclude_attributes=["body"])["exclude_attributes"] == ["body"]
+
+    assert "include_attributes" not in _wire.list_body()
+    assert _wire.list_body(include_attributes=["lang"])["include_attributes"] == ["lang"]
+    assert _wire.list_body(exclude_attributes=["body"])["exclude_attributes"] == ["body"]
+
+
+def test_both_projection_lists_at_once_is_refused_client_side() -> None:
+    """The server answers 400; failing here instead names the argument at the call site."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _wire.search_body([1.0], include_attributes=["a"], exclude_attributes=["b"])
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _wire.list_body(include_attributes=["a"], exclude_attributes=["b"])
+
+
+def test_a_bare_string_projection_is_refused() -> None:
+    """A ``str`` is a ``Sequence[str]``; unguarded it would project one attr per character."""
+    with pytest.raises(TypeError, match="include_attributes"):
+        _wire.search_body([1.0], include_attributes="title")  # type: ignore[arg-type]
+
+
 def test_text_search_body() -> None:
     """BM25 over one field; ``min_score`` here is a raw BM25 floor, still optional."""
     assert _wire.text_search_body("body", "fox") == {
