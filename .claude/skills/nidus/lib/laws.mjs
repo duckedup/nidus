@@ -5,11 +5,14 @@
 const finding = (id, severity, file, line, summary, detail) => ({ id, severity, file, line, summary, detail })
 
 // ── 1. The 3-line comment cap ───────────────────────────────────────────────
-// Counts a whole block: //, ///, //! and the /// blank separators between them.
+// Counts a whole block: // and /// plus the /// blank separators between them.
 // A ``` doc-example fence is test code, not commentary, so its lines do not count.
+// `//!` is exempt: a module/crate doc is the published rustdoc landing page, not
+// commentary on code (CLAUDE.md §Conventions).
 
 const COMMENT = /^\s*\/\/(\/|!)?/
 const FENCE = /^\s*\/\/[\/!]?\s*```/
+const INNER_DOC = /^\s*\/\/!/
 
 export function commentCap(text, addedLines = null, file = '') {
   const lines = text.split('\n')
@@ -19,7 +22,7 @@ export function commentCap(text, addedLines = null, file = '') {
     if (block && block.counted > 3) {
       const touches = !addedLines || block.lines.some(n => addedLines.has(n))
       if (touches) {
-        out.push(finding('comment-cap', 'error', file, block.start,
+        out.push(finding('comment-cap', 'error', file, block.firstCounted ?? block.start,
           `comment block is ${block.counted} lines — the cap is 3`,
           'CLAUDE.md: a comment earns its place by saying what the code cannot. Rationale longer than three lines belongs in the commit message, the PR, SPEC.md, or a GitHub issue.'))
       }
@@ -31,10 +34,15 @@ export function commentCap(text, addedLines = null, file = '') {
     const raw = lines[i]
     const lineNo = i + 1
     if (!COMMENT.test(raw)) { inFence = false; flush(); continue }
-    if (!block) block = { start: lineNo, counted: 0, lines: [] }
+    if (!block) block = { start: lineNo, counted: 0, lines: [], firstCounted: null }
     block.lines.push(lineNo)
     if (FENCE.test(raw)) { inFence = !inFence; continue }
-    if (!inFence) block.counted++
+    if (inFence) continue
+    // Exempt per LINE, never per block: blocks break only on a blank/code line, so
+    // tainting the block would let one `//!` carry an adjacent `///` over the cap.
+    if (INNER_DOC.test(raw)) continue
+    if (block.firstCounted === null) block.firstCounted = lineNo
+    block.counted++
   }
   flush()
   return out

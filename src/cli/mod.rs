@@ -1213,8 +1213,6 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 }
 
-/// Open the store. `mutating` commands take the writer lock; read commands open
-/// read-only so they never contend with a running `nidus serve` writer.
 /// The invocation-wide `set-fts-schema` tuning flags, which every declared field starts from
 /// and a `--field-spec` may then override key by key.
 struct FieldDefaults {
@@ -1274,6 +1272,8 @@ fn first_duplicate(decl: &[FtsField]) -> Option<&str> {
         .map(|f| f.field.as_str())
 }
 
+/// Open the store. `mutating` commands take the writer lock; read commands open
+/// read-only so they never contend with a running `nidus serve` writer.
 fn open(store: &StoreArgs, mutating: bool) -> Result<Nidus> {
     if mutating && store.read_only {
         bail!("--read-only was set, but this command mutates the store");
