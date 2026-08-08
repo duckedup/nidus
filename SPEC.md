@@ -47,7 +47,7 @@ DuckDB and LanceDB was a *multi-minute* build (a large C/C++ tree, a whole SQL e
 stays under a minute** (it is ~seconds today).
 
 1. **Pure-Rust-first, fast to build.** Prefer well-established pure-Rust crates
-   (`anyhow`, `serde`/`bincode`, `crc32fast`, …). A C-compiling/native-linking dep is
+   (`anyhow`, `serde`/`bincode`, `crc32fast`, `regex`, …). A C-compiling/native-linking dep is
    acceptable **only** when it stays small and fast (e.g. `ring`'s TLS for the storage
    backends, §13) — **never** a crate that compiles a *large* C tree (DuckDB's C++,
    `aws-lc-sys`, vendored OpenSSL). `just deps` stays short; CI asserts the build-time
@@ -569,8 +569,10 @@ reliable guard there is to refuse work *before* allocating:
 - **Filters** (`Filter` = AND of `Predicate`s) are evaluated against `attrs` before
   scoring: `Eq` (typed equality), `Ne` (typed inequality), `Glob` / `IGlob` (pattern
   match on a `Str` attr, case-sensitive and ASCII-case-insensitive, §7.1), `In` /
-  `NotIn` (set membership), and `Lt`/`Le`/`Gt`/`Ge` (ordered
-  range comparison). This covers typical needs: path-prefix scoping (`Glob "path*"`),
+  `NotIn` (set membership), `Lt`/`Le`/`Gt`/`Ge` (ordered
+  range comparison), and the text predicates `Fuzzy` / `ContainsAllTokens` /
+  `ContainsAnyToken` / `ContainsTokenSequence` (§7.4) and `Regex` (§7.5).
+  This covers typical needs: path-prefix scoping (`Glob "path*"`),
   type/language/kind equality, exact-path matches, glob-based bulk deletes, presence
   sweeps, numeric/date ranges (`Ge "ts" 1700000000`), and exclusions (`Ne "status"
   "archived"`). The range predicates are **same-type and orderable only**: `Int`
@@ -636,6 +638,76 @@ Nesting depth is bounded before evaluation: filters reach the store only through
 serde_json (HTTP body, CLI `--where`), which caps nesting at 128, and no op-log `Op`
 carries a filter — `delete_where` resolves to ids before logging. So a filter can be
 neither deep enough to exhaust the stack nor persisted to blow up on replay.
+
+### 7.4 Fuzzy and token text predicates
+
+`Fuzzy(key, needle, n)` matches when the attribute is within `n` **Levenshtein** edits of
+`needle` — the memory-store case of an agent recalling a half-remembered identifier. The
+distance is the plain three-operation one (substitution, insertion, deletion), computed by
+a two-row DP with no dependency, so a **transposition costs 2**, not 1: `Fuzzy("word",
+"from", 1)` does not match `"form"`. Both sides are **ASCII-case-folded**, following `IGlob`
+(§7.1) and for the same reason — a locale-dependent fold would make one query mean different
+things on different machines, so `É` is still not `é`. Distance counts *characters*, not
+bytes. `n` is capped by `MAX_FUZZY_EDITS` (**8**); a larger budget is an **error surfaced to
+the caller, never a silent clamp**, because a clamped budget quietly answers a different
+question than the one that was asked.
+
+The token family — `ContainsAllTokens` (every query token present, in any order),
+`ContainsAnyToken` (at least one), `ContainsTokenSequence` (the query tokens consecutive and
+in order: a phrase) — tokenizes the attribute **at query time**. That tokenizer is
+deliberately **simpler than the FTS analyzer** (§9): a token is a maximal run of
+alphanumerics, ASCII-case-folded, with **no stemming and no stopword removal**. These are
+*filter* predicates, where a term either is or is not present; stemming belongs to ranking,
+where a partial-credit match is meaningful. Consequence to know: `ContainsAllTokens("body",
+"run")` does not match `"running"`, and `text_search` for the same word does.
+
+All four read **any text the attribute carries**: a `Str` offers itself, a `List` offers each
+element and matches if **any single element** satisfies the predicate (consistent with
+`Contains`, §7.2). A phrase therefore never spans two list elements, and "all tokens" is not
+the union across elements. Every other `Value` variant offers nothing, so — like every leaf
+(§7.1) — an absent or wrong-type attribute never matches. Empty queries take the standard
+identities: `ContainsAllTokens` with no tokens is `true` for any present text attribute
+(as `All([])` is), `ContainsAnyToken` with none is `false` (as `Any([])` is).
+
+**Cost, stated plainly: there is no index behind any of this.** Every predicate here
+re-tokenizes or re-scans the attribute for **each record the scan visits** — O(attribute
+length) per row for the token predicates, and O(needle × attribute) for the `Fuzzy` DP
+(skipped outright when the two lengths differ by more than the budget). That is fine at the
+scale nidus targets and it is *not* fine as a substitute for full-text search over a large
+corpus; reach for `text_search` when the field is a document. Indexing them is future work.
+
+### 7.5 Regular expressions
+
+`Regex(key, pattern)` matches the attribute against a regular expression, over the same
+"any text the attribute carries" rule as §7.4. The engine is the `regex` crate — pure Rust,
+no C, no native linking, and adding it moved the whole-crate clean build by under a second
+(11.4s → 11.6s for the library, 14.5s → 15.1s with `--features cli`), well inside the
+build-cost bar of §1.
+
+**There is no ReDoS mitigation because there is no ReDoS.** `regex` is a finite-automata
+engine with a documented linear-time guarantee in the length of the input and does not
+backtrack, so a pathological pattern cannot blow up. Adding a timeout or a complexity
+heuristic would buy nothing and would make the predicate's behaviour depend on machine
+speed. Nesting/repetition is bounded instead by the engine's own compile-time size limit,
+which surfaces as an ordinary invalid-pattern error.
+
+Two decisions worth stating because they will otherwise bite someone:
+
+- **Anchored at both ends**, matching `Glob`/`IGlob` rather than the unanchored default of
+  most regex APIs. The whole attribute must match; `.*` on either side opts back into a
+  substring search. Consistency inside one filter language wins here — a caller choosing
+  between `Glob "src/*"` and `Regex "src/.*"` should get the same *shape* of answer.
+  Implemented by wrapping the caller's pattern as `^(?:…)$`, so an alternation is anchored
+  as a whole and a caller's own `^`/`$` remain harmless.
+- **Case sensitivity is the pattern's own `(?i)` flag**, not a second predicate variant.
+  `Glob`/`IGlob` are a pair because a glob has nowhere to put a flag; a regex does.
+
+An unparseable pattern is a **caller-facing error**, never a panic and never a silently
+non-matching filter. Compilation happens **once per query**, not once per record: every
+public query method prepares its filter first (`filter::validate`), which compiles each
+pattern into a process-wide cache keyed by the pattern text; the per-record path is then a
+read-locked lookup. The cache is capped (256 distinct patterns) and cleared wholesale on
+overflow, since patterns arrive from untrusted request bodies.
 
 ---
 
@@ -831,7 +903,9 @@ src/
 │                 Distance, Quantization, AnnConfig, FtsQuery (pure defs + serde)
 ├── crc.rs        table CRC32 (zero-dep)
 ├── glob/         minimal * ? [..] matcher (§7.1)
-├── filter/       Filter/Predicate evaluation against a record's attrs
+├── filter/       Filter/Predicate evaluation against a record's attrs: mod.rs
+│                 (dispatch + per-query validate/prepare), text.rs (Levenshtein +
+│                 the filter tokenizer, §7.4), pattern.rs (regex + compile cache, §7.5)
 ├── search/       distance kernels (cosine/dot/euclidean; f32/int8/binary Hamming) +
 │                 bounded top-k heap + min_score; SearchOpts, Hit
 ├── data/         segment store: mod.rs (DataSegment — header, append, row accessor;

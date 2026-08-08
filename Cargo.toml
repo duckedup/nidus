@@ -130,6 +130,11 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1"
 crc32fast = "1"
 
+# `Predicate::Regex` (SPEC §7.5), in the DEFAULT build. A finite-automata engine with a
+# documented linear-time guarantee — no backtracking, so there is no ReDoS class to
+# defend against. Pure Rust, no C, no native linking.
+regex = "1"
+
 # Storage-backend deps (SPEC §13), in the DEFAULT build. The cloud clients are
 # sans-IO (build + sign requests; no transport, no async) — `rusty-s3` (Sigv4 = pure
 # RustCrypto HMAC) and `tame-gcs`/`tame-oauth` (GCS + OAuth2 service-account JWT) —

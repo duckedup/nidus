@@ -244,6 +244,7 @@ impl Nidus {
     }
 
     pub fn delete_where(&mut self, collection: &str, filter: &Filter) -> Result<usize> {
+        filter::validate(filter)?;
         self.store.delete_where(collection, filter)
     }
 
@@ -264,6 +265,7 @@ impl Nidus {
 
     /// List records matching `opts.filter` across a [`Scope`], without vector scoring.
     pub fn list<'a>(&self, scope: impl Into<Scope<'a>>, opts: &ListOpts) -> Result<Vec<Hit>> {
+        filter::validate(&opts.filter)?;
         let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.list(&refs, opts)
@@ -277,6 +279,7 @@ impl Nidus {
         query: &[f32],
         opts: &SearchOpts,
     ) -> Result<Vec<Hit>> {
+        filter::validate(&opts.filter)?;
         let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.search(&refs, query, opts)
@@ -291,6 +294,7 @@ impl Nidus {
         query: &FtsQuery,
         opts: &SearchOpts,
     ) -> Result<Vec<Hit>> {
+        filter::validate(&opts.filter)?;
         let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.text_search(&refs, query, opts)
@@ -306,6 +310,7 @@ impl Nidus {
         text: &FtsQuery,
         opts: &HybridOpts,
     ) -> Result<Vec<Hit>> {
+        filter::validate(&opts.filter)?;
         let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.hybrid_search(&refs, vector, text, opts)

@@ -3989,6 +3989,7 @@ dependencies = [
  "http-body",
  "memmap2",
  "redis",
+ "regex",
  "reqwest",
  "rmcp",
  "rusty-s3",
