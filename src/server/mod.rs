@@ -22,7 +22,7 @@ use axum::{
 use serde_json::{Value as JsonValue, json};
 use tokio::net::TcpListener;
 
-use crate::{FtsQuery, HybridOpts, Language, ListOpts, Nidus, Record, Scope, SearchOpts};
+use crate::{FtsField, FtsQuery, HybridOpts, ListOpts, Nidus, Record, Scope, SearchOpts};
 use dto::{
     AnnDto, DeleteRequest, FootprintDto, FtsSchemaRequest, HitDto, HybridSearchRequest,
     ListRequest, MAX_TOP_K, SearchRequest, TextSearchRequest, UpsertRequest,
@@ -719,11 +719,7 @@ async fn set_fts_schema(
     Json(req): Json<FtsSchemaRequest>,
 ) -> Result<Json<JsonValue>, ApiError> {
     run_write(st, move |db| {
-        let decl: Vec<(String, Language)> = req
-            .fields
-            .iter()
-            .map(|f| (f.clone(), Language::English))
-            .collect();
+        let decl: Vec<FtsField> = req.fields.into_iter().map(FtsField::from).collect();
         db.set_fts_schema(&name, &decl)
     })
     .await?;
@@ -1036,7 +1032,9 @@ fn classify(err: &anyhow::Error) -> StatusCode {
     let msg = format!("{err:#}").to_lowercase();
     if msg.contains("store is not open yet") {
         StatusCode::SERVICE_UNAVAILABLE
-    } else if msg.contains("does not match store dimension") {
+    } else if msg.contains("does not match store dimension") || msg.contains("fts field") {
+        // The second is a rejected FTS schema (an out-of-range k1/b, an empty field name) —
+        // a malformed request body, not a server fault.
         StatusCode::BAD_REQUEST
     } else if msg.contains("read-only store") {
         StatusCode::FORBIDDEN
@@ -1681,6 +1679,61 @@ mod tests {
             .map(|h| h["id"].as_str().unwrap().to_string())
             .collect();
         assert!(ids.contains(&"a".to_string()) && ids.contains(&"b".to_string()));
+    }
+
+    /// The tuned form of the FTS schema body: per-field `k1`/`b`/analyzer, mixed with the
+    /// bare-name form in one request, and visible in the ranking it produces.
+    #[tokio::test]
+    async fn fts_schema_accepts_per_field_tuning() {
+        let app = test_router(3);
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/docs/fts-schema",
+                json!({"fields": ["title", {"field": "body", "b": 0.0, "ascii_folding": true}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "short", "attrs": {"body": {"Str": "café"}}},
+                    {"id": "long", "attrs": {"body": {"Str": "cafe cafe plus assorted padding words"}}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Folding made both spellings one term, and `b = 0` lets the longer doc win.
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/text-search",
+                json!({"field": "body", "query": "cafe", "top_k": 5}),
+            ))
+            .await
+            .unwrap();
+        let hits = json_body(resp).await;
+        assert_eq!(hits.as_array().unwrap().len(), 2);
+        assert_eq!(hits[0]["id"], "long");
+    }
+
+    /// An out-of-range BM25 parameter is a 400, not a store that scores nonsense forever.
+    #[tokio::test]
+    async fn fts_schema_rejects_an_impossible_parameter() {
+        let resp = test_router(3)
+            .oneshot(post(
+                "/collections/docs/fts-schema",
+                json!({"fields": [{"field": "body", "b": 4.0}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     // ── Backpressure (nidus-abx.2) ──────────────────────────────────────────

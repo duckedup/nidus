@@ -128,3 +128,25 @@ class RecordInput(_RecordRequired, total=False):
 
     vector: Sequence[float]
     attrs: Mapping[str, AttrInput]
+
+
+class _FtsFieldRequired(TypedDict):
+    """The one key every FTS field must carry (split out so the rest can be optional)."""
+
+    field: str
+
+
+class FtsField(_FtsFieldRequired, total=False):
+    """One entry of a :meth:`~nidus.NidusClient.set_fts_schema` schema: the attribute to
+    full-text index, plus any BM25 or analyzer knobs to override for it.
+
+    Every knob is optional and omitted when unset, so ``{"field": "body"}`` means exactly
+    what the bare string ``"body"`` means: the server's defaults (``k1 = 1.2``,
+    ``b = 0.75``, US English, no ASCII folding, no token-length cap).
+    """
+
+    k1: float
+    b: float
+    language: str
+    ascii_folding: bool
+    max_token_len: int

@@ -155,6 +155,27 @@ export interface TextSearchOptions {
   filter?: Filter;
 }
 
+/**
+ * One entry of {@link NidusClient.setFtsSchema}'s `fields`: the attribute to index
+ * plus any BM25/analyzer knobs to override. Every knob is optional — omit them all
+ * (or pass the bare field name instead) for the server's defaults, `k1 = 1.2`,
+ * `b = 0.75`, US English, no folding, no token-length cap.
+ */
+export interface FtsField {
+  /** The attribute to full-text index. */
+  field: string;
+  /** BM25 term-frequency saturation (default `1.2`). */
+  k1?: number;
+  /** BM25 length normalization, `0`–`1` (default `0.75`). */
+  b?: number;
+  /** Analyzer language; `"english"` is the only one today. */
+  language?: string;
+  /** Fold Latin diacritics to ASCII, so `café` and `cafe` share a term. */
+  asciiFolding?: boolean;
+  /** Drop tokens longer than this many characters (default: no cap). */
+  maxTokenLen?: number;
+}
+
 /** Options for {@link NidusClient.hybridSearch} (vector + BM25 fused via RRF). */
 export interface HybridSearchOptions {
   vector: number[];

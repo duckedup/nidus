@@ -217,6 +217,29 @@ describe("NidusClient request shaping", () => {
     });
   });
 
+  it("sends a bare fts field name unchanged", async () => {
+    const { fn, calls } = mockFetch({ ok: true });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.setFtsSchema("docs", ["body"]);
+    expect(calls[0]!.url).toBe("http://x/collections/docs/fts-schema");
+    expect(calls[0]!.json).toEqual({ fields: ["body"] });
+  });
+
+  it("maps fts field tuning to snake_case and omits the unset knobs", async () => {
+    const { fn, calls } = mockFetch({ ok: true });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.setFtsSchema("docs", [
+      "title",
+      { field: "body", k1: 1.5, asciiFolding: true, maxTokenLen: 40 },
+    ]);
+    expect(calls[0]!.json).toEqual({
+      fields: [
+        "title",
+        { field: "body", k1: 1.5, ascii_folding: true, max_token_len: 40 },
+      ],
+    });
+  });
+
   it("attaches a bearer token when configured", async () => {
     const { fn, calls } = mockFetch([]);
     const db = new NidusClient({ baseUrl: "http://x", fetch: fn, token: "sekret" });

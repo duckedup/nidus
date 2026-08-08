@@ -189,6 +189,9 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 		{"SetFtsSchema", `{"ok":true}`, http.MethodPost, "/collections/docs/fts-schema", func(c *Client) error {
 			return c.SetFtsSchema(ctx, "docs", []string{"body"})
 		}},
+		{"SetFtsFields", `{"ok":true}`, http.MethodPost, "/collections/docs/fts-schema", func(c *Client) error {
+			return c.SetFtsFields(ctx, "docs", []FtsField{{Field: "body"}})
+		}},
 		{"Search", `[]`, http.MethodPost, "/search", func(c *Client) error {
 			_, err := c.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}})
 			return err
@@ -402,6 +405,41 @@ func TestSearchPaginationOffsetIsAdditive(t *testing.T) {
 	}
 	if body := fake.sentBody(t); body != `{"vector":[1,0,0],"field":"body","text":"fox","offset":3}` {
 		t.Errorf("body = %s, want offset:3", body)
+// TestSetFtsFieldsOmitsUnsetKnobs — an FtsField carrying only a name must marshal to
+// the same defaults the bare-string form gets, and an explicit zero must survive
+// `omitempty` (which is why the knobs are pointers).
+func TestSetFtsFieldsOmitsUnsetKnobs(t *testing.T) {
+	fake := &capture{reply: `{"ok":true}`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if err := db.SetFtsFields(ctx, "docs", []FtsField{{Field: "body"}}); err != nil {
+		t.Fatalf("SetFtsFields failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"fields":[{"field":"body"}]}` {
+		t.Errorf("body = %s, want only the field name", body)
+	}
+
+	zero := float32(0)
+	folding := true
+	cap40 := 40
+	err := db.SetFtsFields(ctx, "docs", []FtsField{
+		{Field: "body", B: &zero, AsciiFolding: &folding, MaxTokenLen: &cap40},
+	})
+	if err != nil {
+		t.Fatalf("SetFtsFields failed: %v", err)
+	}
+	want := `{"fields":[{"field":"body","b":0,"ascii_folding":true,"max_token_len":40}]}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+
+	// A nil slice is the lawful empty schema, as for SetFtsSchema.
+	if err := db.SetFtsFields(ctx, "docs", nil); err != nil {
+		t.Fatalf("SetFtsFields failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"fields":[]}` {
+		t.Errorf("body = %s, want an empty fields array", body)
 	}
 }
 
@@ -643,6 +681,9 @@ func TestNilSlicesAndMapsBecomeEmptyCollections(t *testing.T) {
 		}},
 		{"SetFtsSchema", `{"fields":[]}`, func(ctx context.Context, c *Client) error {
 			return c.SetFtsSchema(ctx, "docs", nil)
+		}},
+		{"SetFtsFields", `{"fields":[]}`, func(ctx context.Context, c *Client) error {
+			return c.SetFtsFields(ctx, "docs", nil)
 		}},
 		// A bodyless POST still sends {}, so the request is well-formed JSON all the
 		// way through whatever sits between the client and the server.

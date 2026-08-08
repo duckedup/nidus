@@ -172,6 +172,7 @@ matches nothing, which is the usual reason a filter mysteriously returns no rows
 
 ```python
 db.set_fts_schema("docs", ["body"])
+# Per-field tuning: db.set_fts_schema("docs", [{"field": "body", "k1": 1.5}])
 
 # BM25 text search over one indexed field
 text_hits = db.text_search(field="body", query="vector store", top_k=10)

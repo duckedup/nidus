@@ -387,21 +387,20 @@ queried by keyword with [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) ranking
 reuses the same `Hit` results, `Filter`, scope, and `top_k` heap as vector search —
 only the scoring differs.
 
-Declare which attribute fields are full-text indexed (each with an analyzer
-`Language`). You can do it up front at collection creation (the recommended path —
-indexing is incremental from the first upsert) or any time afterward (it indexes the
-docs already stored):
+Declare which attribute fields are full-text indexed. You can do it up front at
+collection creation (the recommended path — indexing is incremental from the first
+upsert) or any time afterward (it indexes the docs already stored):
 
 ```rust
-use nidus::{Config, Nidus, Language};
+use nidus::{Config, FtsField, Nidus};
 
 let mut db = Nidus::open(Config::new("./store", 384))?;
 
 // Up front (recommended):
-db.create_collection_with_fts("docs", &[("body".into(), Language::English)])?;
+db.create_collection_with_fts("docs", &[FtsField::new("body")])?;
 
 // …or declare/redeclare later on an existing collection:
-db.set_fts_schema("docs", &[("title".into(), Language::English)])?;
+db.set_fts_schema("docs", &[FtsField::new("title")])?;
 # anyhow::Ok(())
 ```
 
@@ -426,6 +425,41 @@ let hits = db.text_search(
   per element. A document only lives in a field's index while it has text there.
 - **`SearchOpts`.** `top_k`, `offset`, and `filter` work exactly as for vector search;
   here `min_score` is a **raw BM25** floor (not a cosine one). Results are tie-broken by
+
+### Tuning a field
+
+Each declared field is an `FtsField`, and every knob has a default that reproduces
+nidus's original scoring exactly — `FtsField::new("body")` is the untuned field:
+
+```rust
+use nidus::{Analyzer, FtsField, Language};
+
+db.set_fts_schema("docs", &[
+    // BM25: k1 is term-frequency saturation (default 1.2), b is length
+    // normalization from 0 (off) to 1 (full; default 0.75).
+    FtsField::new("body").k1(1.5).b(0.3),
+    // Analyzer: fold Latin diacritics so "café" and "cafe" are one term, and drop
+    // absurd tokens (a base64 blob, a minified bundle) before they reach the index.
+    FtsField::new("title").ascii_folding(true).max_token_len(40),
+    // The whole analyzer at once, if you prefer.
+    FtsField::new("tags").analyzer(Analyzer::default().language(Language::English)),
+])?;
+# anyhow::Ok(())
+```
+
+Tuning is **per field**, not per store: `body` and `title` can score differently in the
+same collection. Redeclaring a schema rebuilds the affected field indexes under the new
+parameters — the parameters are part of the index cache's validity key, so a reopened
+store never serves results scored under a schema you have since changed.
+
+Over HTTP (and in the SDKs) the same knobs ride in the `fts-schema` body, where a bare
+field name still means "all defaults":
+
+```json
+{"fields": ["title", {"field": "body", "k1": 1.5, "b": 0.3, "ascii_folding": true}]}
+```
+- **`SearchOpts`.** `top_k` and `filter` work exactly as for vector search; here
+  `min_score` is a **raw BM25** floor (not a cosine one). Results are tie-broken by
   `(collection, id)` for determinism.
 - **Text-only documents.** A `Record` may carry no vector (`Record::text_only`) — a
   pure full-text document. It is found by `text_search` and never by vector `search`.

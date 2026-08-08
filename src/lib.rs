@@ -86,7 +86,7 @@ pub use backend::{
 };
 pub use cancel::Cancel;
 pub use config::{Config, Fsync, LeaseWait, OpenMode};
-pub use fts::Language;
+pub use fts::{Analyzer, FtsField, Language};
 pub use model::{
     AnnConfig, AnnKind, ClusterStatus, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts,
     ListOpts, Predicate, QuantKind, Quantization, Record, Role, SearchOpts, Value,
@@ -187,25 +187,27 @@ impl Nidus {
         self.store.create_collection(name)
     }
 
-    /// Create `collection` and declare its full-text-indexed fields up front (each a
-    /// `(field, language)` pair). The recommended way to enable [BM25 full-text
-    /// search](Self::text_search): indexing is fully incremental from the first upsert.
-    pub fn create_collection_with_fts(
-        &mut self,
-        name: &str,
-        fields: &[(String, Language)],
-    ) -> Result<()> {
+    /// Create `collection` and declare its full-text-indexed fields up front. The recommended
+    /// way to enable [BM25 full-text search](Self::text_search): indexing is fully incremental
+    /// from the first upsert.
+    pub fn create_collection_with_fts(&mut self, name: &str, fields: &[FtsField]) -> Result<()> {
         self.store.create_collection_with_fts(name, fields)
     }
 
-    /// Declare which attribute fields of `collection` are full-text indexed for BM25, each with its
-    /// analyzer [`Language`]. Callable before or after upserting — on a collection that already holds
-    /// docs it builds the index once. Redeclaring rebuilds the affected fields.
-    pub fn set_fts_schema(
-        &mut self,
-        collection: &str,
-        fields: &[(String, Language)],
-    ) -> Result<()> {
+    /// Declare which attribute fields of `collection` are full-text indexed, each with its own
+    /// [`FtsField`] tuning (`k1`, `b`, [`Analyzer`]). Redeclaring rebuilds the affected fields.
+    ///
+    /// ```
+    /// # use nidus::{FtsField, Nidus};
+    /// # fn main() -> nidus::Result<()> {
+    /// # let mut db = Nidus::open_in_memory(3)?;
+    /// db.set_fts_schema("docs", &[
+    ///     FtsField::new("title").k1(1.5),
+    ///     FtsField::new("body").ascii_folding(true).max_token_len(40),
+    /// ])?;
+    /// # Ok(()) }
+    /// ```
+    pub fn set_fts_schema(&mut self, collection: &str, fields: &[FtsField]) -> Result<()> {
         self.store.set_fts_schema(collection, fields)
     }
 

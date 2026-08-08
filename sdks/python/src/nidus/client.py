@@ -32,13 +32,13 @@ from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from http.client import HTTPException
 from types import TracebackType
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from . import _wire
 from .filter import Filter
-from .types import Hits, Record, RecordInput, Stats
+from .types import FtsField, Hits, Record, RecordInput, Stats
 from .values import AttrInput
 
 # `Optional[X]` rather than `X | None` everywhere in this package, deliberately: see the
@@ -159,8 +159,12 @@ class NidusClient:
         """Fetch every record in a collection, with ``attrs`` decoded to plain values."""
         return _wire.decode_records(self._request("GET", _wire.records_path(name)))
 
-    def set_fts_schema(self, name: str, fields: Sequence[str]) -> None:
-        """Declare which attribute fields are full-text indexed for a collection."""
+    def set_fts_schema(self, name: str, fields: Sequence[Union[str, FtsField]]) -> None:
+        """Declare which attribute fields are full-text indexed for a collection.
+
+        A bare name takes the server's BM25/analyzer defaults; an :class:`~nidus.FtsField`
+        mapping tunes ``k1``, ``b``, or the analyzer for that field alone.
+        """
         self._request("POST", _wire.fts_schema_path(name), _wire.fts_schema_body(fields))
 
     # ── Search ───────────────────────────────────────────────────────────────────────

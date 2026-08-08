@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from types import TracebackType
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 try:
     import httpx
@@ -35,7 +35,7 @@ except ModuleNotFoundError as err:  # pragma: no cover - depends on the install 
 
 from . import _wire
 from .filter import Filter
-from .types import Hits, Record, RecordInput, Stats
+from .types import FtsField, Hits, Record, RecordInput, Stats
 from .values import AttrInput
 
 # `Optional[X]` rather than `X | None`, as everywhere else here: on the 3.9 floor a PEP 604
@@ -139,8 +139,12 @@ class AsyncNidusClient:
         """Fetch every record in a collection, with ``attrs`` decoded to plain values."""
         return _wire.decode_records(await self._request("GET", _wire.records_path(name)))
 
-    async def set_fts_schema(self, name: str, fields: Sequence[str]) -> None:
-        """Declare which attribute fields are full-text indexed for a collection."""
+    async def set_fts_schema(self, name: str, fields: Sequence[Union[str, FtsField]]) -> None:
+        """Declare which attribute fields are full-text indexed for a collection.
+
+        A bare name takes the server's BM25/analyzer defaults; an :class:`~nidus.FtsField`
+        mapping tunes ``k1``, ``b``, or the analyzer for that field alone.
+        """
         await self._request("POST", _wire.fts_schema_path(name), _wire.fts_schema_body(fields))
 
     # ── Search ───────────────────────────────────────────────────────────────────────

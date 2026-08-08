@@ -228,14 +228,26 @@ curl -s -X PUT localhost:7700/collections/docs/meta \
 
 ### `POST /collections/{name}/fts-schema`
 
-Declare which attribute fields of a collection are full-text indexed for BM25 (US
-English analyzer). Run it once before (or after) upserting; see
+Declare which attribute fields of a collection are full-text indexed for BM25. Run it
+once before (or after) upserting; see
 [Full-text search](/guides/search/#full-text-search-bm25) for the ranking model.
 
 ```bash
 curl -s -X POST localhost:7700/collections/docs/fts-schema \
   -H 'content-type: application/json' \
   -d '{"fields": ["body"]}'
+# → {"ok": true}
+```
+
+A field entry may also be an object, tuning BM25 and the analyzer for that field alone.
+Every key but `field` is optional and defaults to what the bare-name form gets — `k1`
+1.2, `b` 0.75, `language` `"english"`, no ASCII folding, no token-length cap
+([details](/guides/search/#tuning-a-field)):
+
+```bash
+curl -s -X POST localhost:7700/collections/docs/fts-schema \
+  -H 'content-type: application/json' \
+  -d '{"fields": ["title", {"field": "body", "k1": 1.5, "b": 0.3, "ascii_folding": true}]}'
 # → {"ok": true}
 ```
 

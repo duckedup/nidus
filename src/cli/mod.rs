@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::server::dto::{AnnDto, FootprintDto, HitDto};
 use crate::{
-    AnnConfig, Config, Distance, Filter, Fsync, FtsQuery, HybridOpts, Language, LeaseWait,
+    AnnConfig, Config, Distance, Filter, Fsync, FtsField, FtsQuery, HybridOpts, LeaseWait,
     ListOpts, Nidus, OpenMode, Quantization, Record, Scope, SearchOpts,
 };
 
@@ -580,8 +580,8 @@ enum Command {
         #[arg(long = "where")]
         filter: Option<String>,
     },
-    /// Declare a collection's full-text-indexed fields (BM25). Fields use the US
-    /// English analyzer. Re-running rebuilds the affected field indexes.
+    /// Declare a collection's full-text-indexed fields (BM25). The tuning flags apply to
+    /// every `--field` in the invocation. Re-running rebuilds the affected field indexes.
     SetFtsSchema {
         #[command(flatten)]
         store: StoreArgs,
@@ -589,6 +589,18 @@ enum Command {
         /// Attribute field to full-text index (repeatable).
         #[arg(long = "field", required = true)]
         fields: Vec<String>,
+        /// BM25 term-frequency saturation (default 1.2).
+        #[arg(long)]
+        k1: Option<f32>,
+        /// BM25 length normalization, 0..=1 (default 0.75).
+        #[arg(long)]
+        b: Option<f32>,
+        /// Fold Latin diacritics to ASCII, so "café" and "cafe" share a term.
+        #[arg(long)]
+        ascii_folding: bool,
+        /// Drop tokens longer than this many characters (default: no limit).
+        #[arg(long)]
+        max_token_len: Option<usize>,
     },
     /// Full-text (BM25) search of a field declared via `set-fts-schema`.
     TextSearch {
@@ -818,14 +830,29 @@ pub fn run(cli: Cli) -> Result<()> {
             store,
             collection,
             fields,
+            k1,
+            b,
+            ascii_folding,
+            max_token_len,
         } => {
             let mut db = open(&store, true)?;
-            let decl: Vec<(String, Language)> = fields
+            let decl: Vec<FtsField> = fields
                 .iter()
-                .map(|f| (f.clone(), Language::English))
+                .map(|name| {
+                    let mut f = FtsField::new(name).ascii_folding(ascii_folding);
+                    f.k1 = k1.unwrap_or(f.k1);
+                    f.b = b.unwrap_or(f.b);
+                    f.analyzer.max_token_len = max_token_len;
+                    f
+                })
                 .collect();
             db.set_fts_schema(&collection, &decl)?;
-            print_json(&serde_json::json!({ "collection": collection, "fts_fields": fields }))
+            print_json(&serde_json::json!({
+                "collection": collection,
+                "fts_fields": fields,
+                "k1": decl[0].k1,
+                "b": decl[0].b,
+            }))
         }
         Command::TextSearch {
             store,

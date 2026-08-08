@@ -165,6 +165,7 @@ attribute was written with — `Ge("score", 0.5)` for a `Float`, `Ge("year", 202
 
 ```go
 if err := db.SetFtsSchema(ctx, "docs", []string{"body"}); err != nil { /* … */ }
+// SetFtsFields is the same call with per-field BM25/analyzer tuning.
 
 // BM25 text search. Scores are raw BM25 — unbounded, not comparable across queries.
 text, err := db.TextSearch(ctx, nidus.TextSearchRequest{

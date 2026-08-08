@@ -102,6 +102,8 @@ nidus list --dir ./store docs --offset 100 -n 100   # next page
 
 # Full-text search (BM25): declare which fields are indexed, then query by text
 nidus set-fts-schema --dir ./store docs --field body --field title
+# …with BM25/analyzer tuning applied to every --field in the call
+nidus set-fts-schema --dir ./store docs --field body --k1 1.5 --b 0.3 --ascii-folding
 nidus text-search --dir ./store body "running quickly" -k 5
 nidus text-search --dir ./store body "rust" --in docs \
   --where '[{"Eq":["lang",{"Str":"rust"}]}]'

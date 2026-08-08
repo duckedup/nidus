@@ -15,6 +15,7 @@ export type {
   DecodedValue,
   Filter,
   Footprint,
+  FtsField,
   Hit,
   HybridSearchOptions,
   ListOptions,

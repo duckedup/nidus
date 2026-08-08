@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AnnConfig, AnnKind, Filter, Footprint, Hit, ListOpts, Record, Value};
+use crate::{
+    AnnConfig, AnnKind, Filter, Footprint, FtsField, Hit, Language, ListOpts, Record, Value,
+};
 
 /// Body of `POST /collections/{name}/upsert`.
 #[derive(Debug, Deserialize)]
@@ -101,11 +103,61 @@ pub struct HybridSearchRequest {
     pub candidates: usize,
 }
 
+/// One entry of [`FtsSchemaRequest::fields`]: either a bare field name (everything
+/// defaulted) or an object naming the field plus the params to override. The two forms
+/// are why this is `untagged` — `{"fields": ["body"]}` must keep working verbatim.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum FtsFieldDto {
+    /// `"body"` — default BM25 params, default analyzer.
+    Name(String),
+    /// `{"field": "body", "k1": 1.5, "ascii_folding": true}` — any subset of the knobs.
+    Spec {
+        field: String,
+        #[serde(default)]
+        k1: Option<f32>,
+        #[serde(default)]
+        b: Option<f32>,
+        #[serde(default)]
+        language: Option<Language>,
+        #[serde(default)]
+        ascii_folding: Option<bool>,
+        #[serde(default)]
+        max_token_len: Option<usize>,
+    },
+}
+
+impl From<FtsFieldDto> for FtsField {
+    fn from(dto: FtsFieldDto) -> Self {
+        match dto {
+            FtsFieldDto::Name(field) => FtsField::new(field),
+            FtsFieldDto::Spec {
+                field,
+                k1,
+                b,
+                language,
+                ascii_folding,
+                max_token_len,
+            } => {
+                let mut f = FtsField::new(field);
+                // Each knob is independent: an absent one keeps the default rather than
+                // resetting a sibling, so a partial body means "change only this".
+                f.k1 = k1.unwrap_or(f.k1);
+                f.b = b.unwrap_or(f.b);
+                f.analyzer.language = language.unwrap_or(f.analyzer.language);
+                f.analyzer.ascii_folding = ascii_folding.unwrap_or(f.analyzer.ascii_folding);
+                f.analyzer.max_token_len = max_token_len.or(f.analyzer.max_token_len);
+                f
+            }
+        }
+    }
+}
+
 /// Body of `POST /collections/{name}/fts-schema`: the attribute fields to full-text
-/// index. Every field uses the US English analyzer — the only [`Language`] today.
+/// index, each a name or a `{field, k1, b, language, ascii_folding, max_token_len}` object.
 #[derive(Debug, Deserialize)]
 pub struct FtsSchemaRequest {
-    pub fields: Vec<String>,
+    pub fields: Vec<FtsFieldDto>,
 }
 
 /// Body of `POST /list`. Metadata-only query (no vector). An empty `scope`
@@ -232,8 +284,58 @@ impl From<AnnConfig> for AnnDto {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::Predicate;
+
+    /// Decode one `fields` entry exactly as the handler does.
+    fn field(json: serde_json::Value) -> FtsField {
+        serde_json::from_value::<FtsFieldDto>(json).unwrap().into()
+    }
+
+    #[test]
+    fn a_bare_field_name_still_means_todays_defaults() {
+        // The compatibility contract: `{"fields": ["body"]}` must not change meaning.
+        let req: FtsSchemaRequest = serde_json::from_str(r#"{"fields":["body"]}"#).unwrap();
+        let decoded: Vec<FtsField> = req.fields.into_iter().map(FtsField::from).collect();
+        assert_eq!(decoded, vec![FtsField::new("body")]);
+    }
+
+    #[test]
+    fn a_field_object_overrides_only_what_it_names() {
+        let f = field(json!({"field": "body", "k1": 1.5}));
+        assert_eq!(f.k1, 1.5);
+        assert_eq!(f.b, 0.75, "an absent knob keeps its default");
+        assert_eq!(f.analyzer, crate::Analyzer::default());
+
+        let f = field(json!({"field": "body", "ascii_folding": true, "max_token_len": 40}));
+        assert_eq!((f.k1, f.b), (1.2, 0.75));
+        assert!(f.analyzer.ascii_folding);
+        assert_eq!(f.analyzer.max_token_len, Some(40));
+
+        // `{"field": "body"}` is the object spelling of the bare name.
+        assert_eq!(field(json!({"field": "body"})), FtsField::new("body"));
+    }
+
+    #[test]
+    fn the_language_accepts_both_json_spellings() {
+        for form in ["English", "english", "en"] {
+            let f = field(json!({"field": "body", "language": form}));
+            assert_eq!(f.analyzer.language, Language::English);
+        }
+    }
+
+    #[test]
+    fn the_two_field_forms_mix_within_one_request() {
+        let req: FtsSchemaRequest =
+            serde_json::from_str(r#"{"fields":["title",{"field":"body","b":0.4}]}"#).unwrap();
+        let decoded: Vec<FtsField> = req.fields.into_iter().map(FtsField::from).collect();
+        assert_eq!(
+            decoded,
+            vec![FtsField::new("title"), FtsField::new("body").b(0.4)]
+        );
+    }
 
     #[test]
     fn ann_dto_hnsw_emits_only_hnsw_knobs() {

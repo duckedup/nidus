@@ -15,7 +15,7 @@ use crate::backend::{
 };
 use crate::config::{Config, LeaseWait, OpenMode};
 use crate::data::Segments;
-use crate::fts::Fts;
+use crate::fts::{Fts, FtsField};
 use crate::log::OpLog;
 use crate::manifest::{MANIFEST_KEY, Manifest};
 use crate::model::{AnnConfig, ClusterStatus, Distance, Op, Role};
@@ -842,7 +842,19 @@ impl Store {
                         dead_rows += 1;
                     }
                 }
+                // Legacy shape: a language per field, no BM25/analyzer params. Adopting the
+                // defaults here is what makes a pre-nidus-m50.13 log open unchanged.
                 Op::SetFtsSchema { collection, fields } => {
+                    let fields: Vec<FtsField> = fields
+                        .into_iter()
+                        .map(|(field, lang)| FtsField::new(field).language(lang))
+                        .collect();
+                    collections
+                        .entry(collection.clone())
+                        .or_insert_with(Collection::new);
+                    fts.set_schema(&collection, &fields);
+                }
+                Op::SetFtsFields { collection, fields } => {
                     // The collection exists implicitly (matches SetMeta leniency); the
                     // field indexes are (re)built from the live docs once replay finishes.
                     collections

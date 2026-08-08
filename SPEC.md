@@ -753,13 +753,23 @@ build until a real need exists.
   Incremental `upsert` stays serial. IVF build is already cheap and stays serial.
 - **Full-text search (BM25) + hybrid + optional vectors.** A collection can declare
   full-text-indexed attribute fields (`create_collection_with_fts` / `set_fts_schema`,
-  persisted as a `SetFtsSchema` op). nidus then maintains an in-RAM inverted index per
+  persisted as a `SetFtsFields` op). nidus then maintains an in-RAM inverted index per
   `(collection, field)` and answers `text_search(FtsQuery)` by BM25, reusing the same
   `Hit`/`Filter`/scope/top-k machinery as vector search. `hybrid_search` fuses a vector
   and a BM25 query with **Reciprocal Rank Fusion** (rank-based, so the incomparable
   cosine/BM25 scales need no normalization). The analyzer is pure-Rust, zero-FFI
-  (lowercase → Unicode tokenize → English stopwords → Porter stem) behind a `Language`
-  enum (US English today; the seam is open for more). To support pure-text corpora,
+  (lowercase → Unicode tokenize → optional ASCII folding + token-length cap → English
+  stopwords → Porter stem) behind a `Language` enum (US English today; the seam is open
+  for more).
+  **Per-field tuning.** Each declared field is an `FtsField { field, k1, b, analyzer }`
+  (`Analyzer { language, ascii_folding, max_token_len }`), defaulting to BM25's textbook
+  `k1 = 1.2` / `b = 0.75` over the US English analyzer with no folding and no token-length
+  cap — bit-identical to the store-wide constants these replaced. The parameters are part
+  of the persisted schema (`SetFtsFields`) **and** of the `fts` cache's validity key, so a
+  redeclared schema rebuilds the index rather than serving postings scored under the old
+  parameters. The superseded `SetFtsSchema` op (a language per field, no params) is still
+  replayed — with the defaults — so a store written before this opens unchanged. To support
+  pure-text corpora,
   `Record.vector` is now `Option`: a **text-only** doc (`Record::text_only`) carries no
   embedding, occupies no data row, and is found by full-text/metadata queries but never
   by vector search — coexisting with vector-bearing docs in one collection (a new

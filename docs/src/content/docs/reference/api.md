@@ -38,8 +38,8 @@ searchers plus one writer (see
 | `collections` | `fn collections(&self) -> Vec<String>` | All collection names. |
 | `get_meta` | `fn get_meta(&self, collection: &str) -> BTreeMap<String, String>` | Per-collection metadata. |
 | `set_meta` | `fn set_meta(&mut self, collection: &str, meta: BTreeMap<String, String>) -> Result<()>` | |
-| `create_collection_with_fts` | `fn create_collection_with_fts(&mut self, name: &str, fields: &[(String, Language)]) -> Result<()>` | Create + declare [full-text fields](/guides/search/#full-text-search-bm25) up front (incremental from the first upsert). |
-| `set_fts_schema` | `fn set_fts_schema(&mut self, collection: &str, fields: &[(String, Language)]) -> Result<()>` | Declare/redeclare full-text fields any time; indexes existing docs once. |
+| `create_collection_with_fts` | `fn create_collection_with_fts(&mut self, name: &str, fields: &[FtsField]) -> Result<()>` | Create + declare [full-text fields](/guides/search/#full-text-search-bm25) up front (incremental from the first upsert). |
+| `set_fts_schema` | `fn set_fts_schema(&mut self, collection: &str, fields: &[FtsField]) -> Result<()>` | Declare/redeclare full-text fields any time; indexes existing docs once. Each [`FtsField`](/guides/search/#tuning-a-field) carries its own `k1`, `b`, and `Analyzer`. |
 
 ### Records
 

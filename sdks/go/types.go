@@ -125,6 +125,23 @@ type SearchRequest struct {
 	Filter   Filter    `json:"filter,omitempty"`
 }
 
+// An FtsField is one entry of a [Client.SetFtsFields] schema: the attribute to
+// full-text index, plus the BM25 and analyzer knobs to override for it.
+//
+// Every knob is a pointer for the omit-vs-zero reason described at the top of this
+// file: the server's zero is meaningful for all four. K1 &0 saturates term frequency
+// immediately, B &0 disables length normalization, and AsciiFolding &false is the
+// default spelled out. Leave one nil to take the server's default (k1 = 1.2,
+// b = 0.75, US English, no folding, no token-length cap).
+type FtsField struct {
+	Field        string   `json:"field"`
+	K1           *float32 `json:"k1,omitempty"`
+	B            *float32 `json:"b,omitempty"`
+	Language     string   `json:"language,omitempty"`
+	AsciiFolding *bool    `json:"ascii_folding,omitempty"`
+	MaxTokenLen  *int     `json:"max_token_len,omitempty"`
+}
+
 // A TextSearchRequest is a BM25 full-text query over one indexed field. MinScore is
 // a raw BM25 floor, not a cosine one — BM25 scores are unbounded above and not
 // comparable across queries, so a floor that works for one query may drop

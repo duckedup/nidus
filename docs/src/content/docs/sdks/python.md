@@ -173,6 +173,9 @@ everything.
 ```python
 db.set_fts_schema("docs", ["body"])
 
+# …or tune BM25 / the analyzer per field; an omitted knob keeps the server default
+db.set_fts_schema("docs", ["title", {"field": "body", "k1": 1.5, "ascii_folding": True}])
+
 # BM25 text search over one indexed field
 text_hits = db.text_search(field="body", query="vector store", top_k=10)
 
