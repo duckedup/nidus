@@ -360,3 +360,15 @@ release time, and the release job commits the stamp back (nidus-yap). A PR that 
 the crate should leave the chart alone — editing it just creates a conflict with the
 bot commit. This used to be a hand-edit enforced by a CI assertion; that fired on
 essentially every PR, which is why it is derived now.
+
+**Known caveat: the stamp-back has never actually landed (#82).** `main`'s ruleset
+rejects the `github-actions[bot]` push with `GH013`, so `charts/nidus/Chart.yaml`,
+`sdks/js/package.json` and `sdks/python/src/nidus/_version.py` on `main` lag what was
+really published. **Only the repo is wrong — the stamp is applied before publish, so
+npm/PyPI/the OCI chart all received correct versions.** Do not "fix" the drift by hand:
+a hand-stamp asserts a version that may never have been published (the JS manifest is
+the live example — #81 has blocked every npm publish since 0.2.0, so stamping it to the
+crate version would claim a release that does not exist). The mechanism is right; it
+needs a one-time bypass on `main`'s ruleset. Until then `scripts/stamp-back.sh` makes
+each failure loud in the release run instead of silently green, and setting
+`STAMP_BACK_STRICT=1` turns it into a hard job failure once the bypass is in place.

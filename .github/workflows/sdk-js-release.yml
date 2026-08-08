@@ -173,19 +173,9 @@ jobs:
       # disagree with what was published, and a clone would report a stale version.
       # Pushed with GITHUB_TOKEN, which cannot trigger another workflow, so no loop.
       #
-      # Best-effort on purpose: the package is already published by this point, and a
-      # race with a concurrent push to main must not fail a release that succeeded.
+      # Tolerant of the race, LOUD about branch protection — the script distinguishes
+      # them. No continue-on-error: swallowing every failure is what hid #82.
       - name: Persist the stamp back to main
-        continue-on-error: true
         run: |
-          set -euo pipefail
-          if git diff --quiet -- sdks/js/package.json sdks/js/package-lock.json; then
-            echo "manifest already at the released version — nothing to commit"
-            exit 0
-          fi
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add sdks/js/package.json sdks/js/package-lock.json
-          git commit -m "🪺 sdk-js: stamp version ${{ inputs.version }} [skip ci]"
-          git pull --rebase origin main
-          git push origin HEAD:main
+          ./scripts/stamp-back.sh sdk-js "${{ inputs.version }}" \
+            sdks/js/package.json sdks/js/package-lock.json
