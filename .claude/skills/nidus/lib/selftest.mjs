@@ -60,6 +60,37 @@ test('comment cap: prose around a fence still counts', () => {
   eq(ids(laws.commentCap(src, null, 'src/x.rs')), ['comment-cap'], 'findings')
 })
 
+test('comment cap: //! module docs are exempt at any length', () => {
+  const src = [
+    '//! # thing',
+    '//!',
+    '//! A long module doc that would blow the cap as `///` but is the published',
+    '//! rustdoc landing page, not commentary on code.',
+    '//!',
+    '//! More prose still.',
+    'use std::fmt;',
+  ].join('\n')
+  eq(ids(laws.commentCap(src, null, 'src/x.rs')), [], 'findings')
+})
+
+test('comment cap: a //! line exempts only its own block', () => {
+  const src = [
+    '//! module doc',
+    '//! second line',
+    '//! third line',
+    '//! fourth line',
+    '',
+    '/// one',
+    '/// two',
+    '/// three',
+    '/// four',
+    'pub fn f() {}',
+  ].join('\n')
+  const found = laws.commentCap(src, null, 'src/x.rs')
+  eq(ids(found), ['comment-cap'], 'findings')
+  eq(found[0].line, 6, 'line')
+})
+
 test('comment cap: separate blocks are counted separately', () => {
   const src = `// a\n// b\nfn f() {}\n\n// c\n// d\nfn g() {}\n`
   eq(ids(laws.commentCap(src, null, 'src/x.rs')), [], 'findings')

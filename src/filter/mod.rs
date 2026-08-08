@@ -11,9 +11,8 @@ use anyhow::{Context, Result, bail};
 use crate::model::{Filter, Predicate, Value};
 
 /// Same-type ordering of two [`Value`]s for the range predicates: `Int` numeric, `Str` lexical,
-/// `Bool` as `false < true`, `Float` by IEEE partial order, `DateTime` chronological. `None` for
-/// different or non-orderable variants, which is what makes a range predicate fail on an absent or
-/// wrong-type attribute rather than match spuriously.
+/// `Bool` `false < true`, `Float` by IEEE partial order, `DateTime` chronological. `None` for
+/// mismatched or non-orderable variants, so a range predicate fails rather than matches spuriously.
 pub(crate) fn value_cmp(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),

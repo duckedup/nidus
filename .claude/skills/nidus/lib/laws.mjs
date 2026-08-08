@@ -5,18 +5,21 @@
 const finding = (id, severity, file, line, summary, detail) => ({ id, severity, file, line, summary, detail })
 
 // ── 1. The 3-line comment cap ───────────────────────────────────────────────
-// Counts a whole block: //, ///, //! and the /// blank separators between them.
+// Counts a whole block: // and /// plus the /// blank separators between them.
 // A ``` doc-example fence is test code, not commentary, so its lines do not count.
+// `//!` is exempt: a module/crate doc is the published rustdoc landing page, not
+// commentary on code (CLAUDE.md §Conventions).
 
 const COMMENT = /^\s*\/\/(\/|!)?/
 const FENCE = /^\s*\/\/[\/!]?\s*```/
+const INNER_DOC = /^\s*\/\/!/
 
 export function commentCap(text, addedLines = null, file = '') {
   const lines = text.split('\n')
   const out = []
   let block = null
   const flush = () => {
-    if (block && block.counted > 3) {
+    if (block && !block.innerDoc && block.counted > 3) {
       const touches = !addedLines || block.lines.some(n => addedLines.has(n))
       if (touches) {
         out.push(finding('comment-cap', 'error', file, block.start,
@@ -31,8 +34,9 @@ export function commentCap(text, addedLines = null, file = '') {
     const raw = lines[i]
     const lineNo = i + 1
     if (!COMMENT.test(raw)) { inFence = false; flush(); continue }
-    if (!block) block = { start: lineNo, counted: 0, lines: [] }
+    if (!block) block = { start: lineNo, counted: 0, lines: [], innerDoc: false }
     block.lines.push(lineNo)
+    if (INNER_DOC.test(raw)) block.innerDoc = true
     if (FENCE.test(raw)) { inFence = !inFence; continue }
     if (!inFence) block.counted++
   }
