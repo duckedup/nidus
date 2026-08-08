@@ -16,7 +16,7 @@ gh issue close <n>                    # Complete work
 gh issue create --title=… --body=…    # File new work
 ```
 
-Labels carry what beads encoded in fields: `p0`–`p4` for priority, and
+Labels carry priority and type: `p0`–`p4`, and
 `epic`/`bug`/`feature`/`task`/`decision` for type. A child of an epic names its
 parent in the body (`Part of #12`); GitHub renders the backlink automatically.
 
@@ -24,9 +24,9 @@ parent in the body (`Part of #12`); GitHub renders the backlink automatically.
 
 - Use GitHub Issues for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
 - Durable knowledge goes in the issue that owns it, or in `SPEC.md` — do NOT use MEMORY.md files
-- `.beads/issues.jsonl` is a **frozen archive** of the pre-migration tracker. It is read-only
-  history: never write to it, and never install the `bd` hooks again (see `nidus-sfa` in the
-  archive for why — the exporter silently reverted other branches' closes).
+- The pre-migration `bd`/Dolt tracker is **fully retired** — never reinstall it or its git
+  hooks. Its exporter rewrote the whole issue file from each branch's local database, so any
+  branch could silently revert another's closes (#83).
 
 ## Session Completion
 
