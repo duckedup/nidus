@@ -231,8 +231,12 @@ pub struct LimitPer { pub field: String, pub max: usize }
 pub struct OrderBy { pub field: String, pub descending: bool }
 
 // count is always reported; `sum` names attributes to total, each a tagged Value (§7.7).
-pub struct AggregateOpts { pub filter: Filter, pub sum: Vec<String> }
-pub struct Aggregation { pub count: u64, pub sums: BTreeMap<String, Value> }
+// `group_by` adds one Group per distinct value of that attribute, beside the totals.
+pub struct AggregateOpts { pub filter: Filter, pub sum: Vec<String>, pub group_by: Option<String> }
+pub struct Aggregation { pub count: u64, pub sums: BTreeMap<String, Value>,
+                         pub groups: Vec<Group>, pub groups_truncated: bool }
+// `value` is None for the records missing the attribute — not the same as Value::Null (§7.7).
+pub struct Group { pub value: Option<Value>, pub count: u64, pub sums: BTreeMap<String, Value> }
 
 // `collection` identifies the source namespace — required when a query spans more
 // than one, and (id) is only unique within a collection.
@@ -853,6 +857,17 @@ integer part is accumulated in `i128`, so a long `i64` run cannot wrap, and a to
 is **skipped, not counted as zero**, which is the only reading that keeps `sum` and `count`
 independently meaningful.
 
+**`group_by`** (`AggregateOpts::group_by`) reports the same `count`/`sum` per **distinct value
+of one attribute** rather than only over the whole scope — turbopuffer's `ForEachUnique`. It
+rides the same single pass, and the whole-scope totals are still reported beside the groups, so
+"how many per language, and how many overall" is one query rather than two. Rows come back
+ordered by `count` descending, ties broken by the group key, because a `HashMap` has no order
+and an answer that reshuffles between identical calls is not reportable. Records **missing**
+the attribute form one group with a `null` value — distinct from those holding `Value::Null`,
+mirroring the absent-vs-`Null` rule the filter predicates already follow. Distinct values are
+bounded by the same `MAX_GROUPS`; past it new values are dropped and **`groups_truncated` says
+so**, since a silently short list of groups reads exactly like a complete one.
+
 **`limit_per`** caps how many hits may carry any one value of an attribute — "at most 2 hits
 per file". For a memory store this is the highest-value piece here: it stops one verbose
 document from filling the whole recall window. The group value is read from the **live
@@ -898,6 +913,27 @@ Both run on the **final page**, after pagination and after the fused truncate, s
 bounded by `top_k` rather than by the candidate set.
 
 ---
+
+### 7.9 Multi-query batching
+
+`POST /search/batch` answers up to **16** vector queries in one request (nidus-m50.11). Each
+entry is an ordinary search body with its own scope, filter, and `top_k`, and each is validated
+by the same code the single-query route runs — **all of it before any leg executes**, so a
+malformed leg fails the request rather than returning a partial answer a caller cannot tell
+apart from a complete one.
+
+The batch runs under **one** lock acquisition, one blocking task, and one request deadline. That
+is the whole point (an agent fanning one question into several phrasings pays one round-trip and
+one queueing delay), and it is also why the count is capped: a request that holds one concurrency
+permit must not be able to buy unbounded scan.
+
+Optional `fuse` merges the legs into a single ranking with the **same RRF** `/hybrid-search`
+uses — N query legs instead of a vector leg and a text leg — with optional per-leg weights. A
+weights list that is neither empty nor exactly as long as `queries` is a `400`, not a
+zero-filled shorter list, because the silent version re-weights the wrong leg.
+
+This is a **transport** concern, not a storage one: there is no library counterpart, since an
+embedding caller already has the loop and the fusion is `rrf_fuse` either way.
 
 ## 8. Compaction
 

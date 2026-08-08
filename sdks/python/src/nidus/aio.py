@@ -38,6 +38,7 @@ from .filter import Filter
 from .ranking import RankBy
 from .types import (
     Aggregation,
+    Batch,
     FtsClause,
     FtsField,
     HighlightOpts,
@@ -330,14 +331,43 @@ class AsyncNidusClient:
         scope: Optional[Sequence[str]] = None,
         filter: Optional[Filter] = None,  # noqa: A002
         sum: Optional[Sequence[str]] = None,  # noqa: A002
+        group_by: Optional[str] = None,
     ) -> Aggregation:
         """Count the records a filter matches, and sum the attributes named in ``sum``.
 
         Answered from the in-RAM index alone — no record is built and no vector is read.
+        ``group_by`` adds one :class:`~nidus.Group` per distinct value beside the totals.
         """
         return _wire.decode_aggregation(
             await self._request(
-                "POST", _wire.AGGREGATE, _wire.aggregate_body(scope=scope, filter=filter, sum=sum)
+                "POST",
+                _wire.AGGREGATE,
+                _wire.aggregate_body(scope=scope, filter=filter, sum=sum, group_by=group_by),
+            )
+        )
+
+    async def batch_search(
+        self,
+        queries: Sequence[Mapping[str, Any]],
+        *,
+        fuse: bool = False,
+        rrf_k: Optional[float] = None,
+        weights: Optional[Sequence[float]] = None,
+        top_k: Optional[int] = None,
+    ) -> Batch:
+        """Answer several vector queries in one round-trip (16 max).
+
+        Returns one ranking per query in request order, or — with ``fuse=True`` — a
+        one-element list holding the single RRF-fused ranking.
+        """
+        bodies = [_wire.search_body(**dict(q)) for q in queries]
+        return _wire.decode_batch(
+            await self._request(
+                "POST",
+                _wire.SEARCH_BATCH,
+                _wire.batch_search_body(
+                    bodies, rrf_k=rrf_k, weights=weights, top_k=top_k, fuse=fuse
+                ),
             )
         )
 

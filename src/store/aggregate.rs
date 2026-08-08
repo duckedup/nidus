@@ -8,7 +8,10 @@ use anyhow::{Result, bail};
 
 use super::Store;
 use crate::filter;
-use crate::model::{AggregateOpts, Aggregation, Hit, LimitPer, Value};
+use crate::model::{AggregateOpts, Aggregation, Group, Hit, LimitPer, Value};
+
+/// Attributes as the index holds them, so the accumulator reads a record without building one.
+type Attrs = std::collections::BTreeMap<String, Value>;
 
 /// How much deeper than a page a capped search ranks, so hits behind a capped group still have
 /// room to surface. Larger costs a proportionally deeper scan (nidus-m50.15 #16).
@@ -31,6 +34,16 @@ pub(super) fn validate(limit_per: Option<&LimitPer>) -> Result<()> {
     Ok(())
 }
 
+/// Reject a `group_by` naming no attribute. Every record would land in the one "missing"
+/// group, which reads as a working query returning a meaningless answer. Marked inline
+/// because this one runs from `Nidus`, outside `check_query_opts`'s blanket `.context`.
+pub(crate) fn validate_group_by(group_by: Option<&String>) -> Result<()> {
+    if group_by.is_some_and(String::is_empty) {
+        bail!("{}: group_by needs a field name", super::BAD_QUERY);
+    }
+    Ok(())
+}
+
 /// A collision-free string key for one group value — the variant prefix is what keeps
 /// `Int(1)` and `Str("1")` apart. Every record **missing** the attribute maps to the same
 /// key, so an absent value cannot slip past the cap (nidus-m50.15 #14).
@@ -47,41 +60,42 @@ fn group_key(v: Option<&Value>) -> String {
     }
 }
 
-impl Store {
-    /// Count the filter-matching records across `collections` and sum the requested attributes
-    /// in ONE pass over the in-RAM index — no `Record` is built and no vector row is read.
-    pub fn aggregate(&self, collections: &[&str], opts: &AggregateOpts) -> Aggregation {
-        // Per field: the integer part in `i128` so a long `i64` run cannot wrap, the float
-        // part separately, and whether any float was seen (which decides the reported type).
-        let mut acc: Vec<(i128, f64, bool)> = vec![(0, 0.0, false); opts.sum.len()];
-        let mut count = 0u64;
-        for &col_name in collections {
-            let Some(col) = self.collections.get(col_name) else {
-                continue;
-            };
-            for entry in col.docs.values() {
-                if !filter::matches(&opts.filter, &entry.attrs) {
-                    continue;
+/// Running totals over one bucket of records — the whole scope, or one `group_by` value.
+struct Acc {
+    count: u64,
+    /// Per sum field: the integer part in `i128` so a long `i64` run cannot wrap, the float
+    /// part separately, and whether any float was seen (which decides the reported type).
+    sums: Vec<(i128, f64, bool)>,
+}
+
+impl Acc {
+    fn new(fields: usize) -> Self {
+        Self {
+            count: 0,
+            sums: vec![(0, 0.0, false); fields],
+        }
+    }
+
+    fn add(&mut self, attrs: &Attrs, fields: &[String]) {
+        self.count += 1;
+        for (slot, field) in self.sums.iter_mut().zip(fields) {
+            match attrs.get(field) {
+                Some(Value::Int(n)) => slot.0 += *n as i128,
+                Some(Value::Float(f)) => {
+                    slot.1 += *f;
+                    slot.2 = true;
                 }
-                count += 1;
-                for (slot, field) in acc.iter_mut().zip(&opts.sum) {
-                    match entry.attrs.get(field) {
-                        Some(Value::Int(n)) => slot.0 += *n as i128,
-                        Some(Value::Float(f)) => {
-                            slot.1 += *f;
-                            slot.2 = true;
-                        }
-                        // A missing or non-numeric value is skipped, never counted as zero.
-                        _ => {}
-                    }
-                }
+                // A missing or non-numeric value is skipped, never counted as zero.
+                _ => {}
             }
         }
-        let sums = opts
-            .sum
+    }
+
+    fn finish(self, fields: &[String]) -> std::collections::BTreeMap<String, Value> {
+        fields
             .iter()
             .cloned()
-            .zip(acc)
+            .zip(self.sums)
             .map(|(field, (ints, floats, saw_float))| {
                 let total = if saw_float {
                     Value::Float(ints as f64 + floats)
@@ -90,8 +104,66 @@ impl Store {
                 };
                 (field, total)
             })
+            .collect()
+    }
+}
+
+impl Store {
+    /// Count the filter-matching records across `collections` and sum the requested attributes
+    /// in ONE pass over the in-RAM index — no `Record` is built and no vector row is read.
+    /// A `group_by` splits the same pass into one [`Group`] per distinct value.
+    pub fn aggregate(&self, collections: &[&str], opts: &AggregateOpts) -> Aggregation {
+        let fields = opts.sum.len();
+        let mut total = Acc::new(fields);
+        let mut groups: HashMap<String, (Option<Value>, Acc)> = HashMap::new();
+        let mut truncated = false;
+        for &col_name in collections {
+            let Some(col) = self.collections.get(col_name) else {
+                continue;
+            };
+            for entry in col.docs.values() {
+                if !filter::matches(&opts.filter, &entry.attrs) {
+                    continue;
+                }
+                total.add(&entry.attrs, &opts.sum);
+                let Some(group_field) = &opts.group_by else {
+                    continue;
+                };
+                let value = entry.attrs.get(group_field);
+                let key = group_key(value);
+                if let Some((_, acc)) = groups.get_mut(&key) {
+                    acc.add(&entry.attrs, &opts.sum);
+                } else if groups.len() >= MAX_GROUPS {
+                    // Past the cap a NEW value is dropped rather than growing the map without
+                    // bound; values already tracked keep accumulating, so their rows stay exact.
+                    truncated = true;
+                } else {
+                    let mut acc = Acc::new(fields);
+                    acc.add(&entry.attrs, &opts.sum);
+                    groups.insert(key, (value.cloned(), acc));
+                }
+            }
+        }
+        // Ordered by size, ties broken by the collision-free key: a `HashMap` has no order of
+        // its own, and an answer that reshuffles between identical calls is not reportable.
+        let mut keyed: Vec<(String, Group)> = groups
+            .into_iter()
+            .map(|(key, (value, acc))| {
+                let group = Group {
+                    value,
+                    count: acc.count,
+                    sums: acc.finish(&opts.sum),
+                };
+                (key, group)
+            })
             .collect();
-        Aggregation { count, sums }
+        keyed.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(&b.0)));
+        Aggregation {
+            count: total.count,
+            sums: total.finish(&opts.sum),
+            groups: keyed.into_iter().map(|(_, g)| g).collect(),
+            groups_truncated: truncated,
+        }
     }
 
     /// Drop hits past the per-value cap, walking the ranking in order so the best hits of each

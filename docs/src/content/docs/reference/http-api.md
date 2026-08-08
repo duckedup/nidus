@@ -30,6 +30,7 @@ so the same id appears in your logs and the server's.
 | `GET /collections/{name}/records` | every record in a collection | `get_all` |
 | `POST /collections/{name}/fts-schema` | declare full-text-indexed fields | `set_fts_schema` |
 | `POST /search` | nearest-neighbour search | `search` |
+| `POST /search/batch` | several queries in one round-trip, optionally RRF-fused | — |
 | `POST /text-search` | BM25 full-text search | `text_search` |
 | `POST /hybrid-search` | fused vector + BM25 (RRF) | `hybrid_search` |
 | `POST /list` | metadata-only query (no vector) | `list` |
@@ -533,6 +534,53 @@ curl -s localhost:7700/list \
 a different `Value` variant, an unorderable `Null`/`List`, or a record missing the attribute
 — sort into one trailing bucket, which stays trailing when reversed.
 
+### `POST /search/batch`
+
+Answer up to **16** vector queries in one round-trip. Each entry of `queries` takes exactly
+the fields `/search` does, with its own scope, filter and `top_k`.
+
+```bash
+curl -s localhost:7700/search/batch \
+  -H 'content-type: application/json' \
+  -d '{
+        "queries": [
+          {"query": [1, 0, 0], "top_k": 5},
+          {"query": [0, 1, 0], "top_k": 5, "filter": [{"Eq": ["lang", {"Str": "rust"}]}]}
+        ]
+      }'
+```
+
+```json
+{"results": [[{"collection": "docs", "id": "a", "score": 0.98, "attrs": {}}], []]}
+```
+
+`results` holds one ranking per query, **in request order**. The whole batch is validated
+before any query runs, so a malformed leg answers `400` rather than returning a partial
+result that cannot be told apart from a complete one.
+
+Add `fuse` to merge the legs into a single ranking with the same RRF `/hybrid-search` uses —
+the response then carries `fused` instead of `results`:
+
+```bash
+curl -s localhost:7700/search/batch \
+  -H 'content-type: application/json' \
+  -d '{
+        "queries": [{"query": [1, 0, 0]}, {"query": [0, 1, 0]}],
+        "fuse": {"rrf_k": 60, "weights": [1.0, 0.5], "top_k": 10}
+      }'
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `queries` | — (required) | 1–16 search bodies, each shaped exactly like `/search` |
+| `fuse` | none | merge the legs into one ranking instead of returning them side by side |
+| `fuse.rrf_k` | `60` | RRF smoothing constant |
+| `fuse.weights` | all `1.0` | per-leg weights; must be empty or exactly as long as `queries` |
+| `fuse.top_k` | `10` | how many fused hits to return |
+
+A `weights` list of the wrong length is a `400` rather than a zero-filled short list, which
+would silently re-weight the wrong query.
+
 ### `POST /aggregate`
 
 Count the filter-matching records and total numeric attributes, without materializing any
@@ -556,6 +604,32 @@ curl -s localhost:7700/aggregate \
 `Int` while every addend was an `Int`, `Float` once any `Float` joined. A missing or
 non-numeric value is skipped rather than counted as zero. A filter matching nothing answers
 `{"count": 0, ...}` rather than erroring.
+
+Add `group_by` to get the same figures **per distinct value** of an attribute, in the same
+pass and beside the unchanged totals:
+
+```bash
+curl -s localhost:7700/aggregate \
+  -H 'content-type: application/json' \
+  -d '{"sum": ["bytes"], "group_by": "lang"}'
+```
+
+```json
+{
+  "count": 12,
+  "sums": {"bytes": {"Int": 40960}},
+  "groups": [
+    {"value": {"Str": "rust"}, "count": 9, "sums": {"bytes": {"Int": 38000}}},
+    {"value": null, "count": 3, "sums": {"bytes": {"Int": 2960}}}
+  ]
+}
+```
+
+Groups come back **largest first**, with ties broken deterministically so repeating a query
+repeats the order. A `null` `value` is the group of records **missing** the attribute — not
+the same as records holding a `Null`. `groups` is omitted entirely when no `group_by` was
+asked for, so an existing client sees the response it always saw. If the distinct values
+exceed the server's cap (10 000), later ones are dropped and `groups_truncated` is `true`.
 
 ### The `filter` grammar
 

@@ -31,9 +31,11 @@ const ROUTES: &[&str] = &[
     "/collections/{name}/remember",
     "/collections/{name}/recall",
     "/search",
+    "/search/batch",
     "/text-search",
     "/hybrid-search",
     "/list",
+    "/aggregate",
     "/flush",
     "/compact",
     "/refresh",
@@ -460,9 +462,11 @@ mod tests {
             "/collections/docs/remember",
             "/collections/docs/recall",
             "/search",
+            "/search/batch",
             "/text-search",
             "/hybrid-search",
             "/list",
+            "/aggregate",
             "/flush",
             "/compact",
             "/refresh",
@@ -476,6 +480,37 @@ mod tests {
             assert!(
                 ROUTES.contains(&label),
                 "{p} produced {label}, which is not a known route"
+            );
+        }
+    }
+
+    /// A route the server serves must get its OWN label, not fall into the shared `other`
+    /// bucket — which is silent, since `other` is itself a valid label. `/aggregate` sat there
+    /// from the day it shipped for exactly that reason, so the invariant is asserted directly.
+    #[test]
+    fn every_served_route_has_its_own_label() {
+        let served = [
+            "/health",
+            "/ready",
+            "/metrics",
+            "/cluster",
+            "/stats",
+            "/collections",
+            "/search",
+            "/search/batch",
+            "/text-search",
+            "/hybrid-search",
+            "/list",
+            "/aggregate",
+            "/flush",
+            "/compact",
+            "/refresh",
+        ];
+        for path in served {
+            assert_eq!(
+                route_label(path),
+                path,
+                "{path} collapsed into a shared bucket instead of getting its own series"
             );
         }
     }

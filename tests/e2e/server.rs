@@ -578,3 +578,84 @@ fn multi_clause_text_search_and_annotations_over_http() {
     assert_eq!(status, 200);
     assert!(hits[0]["annotations"]["text"]["rank"].is_number(), "{hits}");
 }
+
+/// A batch and a grouped aggregate over the REAL binary: both are new routes, and a route
+/// that is wired in-process can still be missing from the built router (nidus-m50.11,
+/// nidus-bmh).
+#[test]
+fn batch_search_and_grouped_aggregate_over_real_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/upsert",
+                &json!({"records": [
+                    {"id": "a", "vector": [1, 0, 0],
+                     "attrs": {"lang": {"Str": "rust"}, "bytes": {"Int": 10}}},
+                    {"id": "b", "vector": [0, 1, 0],
+                     "attrs": {"lang": {"Str": "rust"}, "bytes": {"Int": 32}}},
+                    {"id": "c", "vector": [0, 0, 1], "attrs": {"bytes": {"Int": 5}}}
+                ]}),
+            )
+            .0,
+        200
+    );
+
+    // Two queries, one round-trip: each leg answers its own vector, in request order.
+    let (status, out) = server.post(
+        "/search/batch",
+        &json!({"queries": [
+            {"query": [1, 0, 0], "top_k": 1},
+            {"query": [0, 1, 0], "top_k": 1}
+        ]}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(out["results"][0][0]["id"], "a", "{out}");
+    assert_eq!(out["results"][1][0]["id"], "b", "{out}");
+
+    // Fusing returns one merged ranking under `fused`, never both keys.
+    let (status, out) = server.post(
+        "/search/batch",
+        &json!({
+            "queries": [{"query": [1, 0, 0], "top_k": 2}, {"query": [0, 1, 0], "top_k": 2}],
+            "fuse": {"top_k": 5}
+        }),
+    );
+    assert_eq!(status, 200);
+    assert!(out.get("results").is_none(), "{out}");
+    // Both legs return a and b at top_k 2, and the fusion deduplicates them into one list.
+    let fused = out["fused"].as_array().unwrap();
+    assert_eq!(fused.len(), 2, "{out}");
+    let ids: Vec<&str> = fused.iter().map(|h| h["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"a") && ids.contains(&"b"), "{out}");
+
+    // A weights list that does not line up with the queries is refused, not zero-filled.
+    let (status, _) = server.post(
+        "/search/batch",
+        &json!({"queries": [{"query": [1, 0, 0]}, {"query": [0, 1, 0]}],
+                "fuse": {"weights": [1.0]}}),
+    );
+    assert_eq!(status, 400);
+
+    // Grouping: two rows, and the record with no `lang` is its own null-valued group.
+    let (status, agg) = server.post("/aggregate", &json!({"sum": ["bytes"], "group_by": "lang"}));
+    assert_eq!(status, 200);
+    assert_eq!(agg["count"], 3, "totals stay whole-scope: {agg}");
+    assert_eq!(agg["sums"]["bytes"], json!({"Int": 47}), "{agg}");
+    let groups = agg["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2, "{agg}");
+    assert_eq!(groups[0]["value"], json!({"Str": "rust"}), "{agg}");
+    assert_eq!(groups[0]["count"], 2, "{agg}");
+    assert_eq!(
+        groups[1]["value"],
+        json!(null),
+        "missing is its own group: {agg}"
+    );
+
+    // Ungrouped keeps the response shape it had before grouping existed.
+    let (status, agg) = server.post("/aggregate", &json!({"sum": ["bytes"]}));
+    assert_eq!(status, 200);
+    assert!(agg.get("groups").is_none(), "{agg}");
+}

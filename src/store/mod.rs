@@ -20,7 +20,7 @@ use crate::log::OpLog;
 use crate::manifest::{MANIFEST_KEY, Manifest};
 use crate::model::{AnnConfig, ClusterStatus, Distance, Op, Role};
 
-mod aggregate;
+pub(crate) mod aggregate;
 mod memtier;
 mod quant;
 mod rank;

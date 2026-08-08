@@ -24,9 +24,9 @@ use tokio::net::TcpListener;
 
 use crate::{FtsField, FtsQuery, HybridOpts, ListOpts, Nidus, Record, Scope, SearchOpts};
 use dto::{
-    AggregateRequest, AggregationDto, AnnDto, DeleteRequest, FootprintDto, FtsSchemaRequest,
-    HitDto, HybridSearchRequest, ListRequest, MAX_TOP_K, SearchRequest, TextSearchRequest,
-    UpsertRequest,
+    AggregateRequest, AggregationDto, AnnDto, BatchFuse, BatchSearchRequest, BatchSearchResponse,
+    DeleteRequest, FootprintDto, FtsSchemaRequest, HitDto, HybridSearchRequest, ListRequest,
+    MAX_BATCH_QUERIES, MAX_TOP_K, SearchRequest, TextSearchRequest, UpsertRequest,
 };
 
 // ── AI-ingest (memory) imports: only under the `memory` feature (pulled by the
@@ -384,6 +384,7 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/collections/{name}/records", get(records))
         .route("/collections/{name}/fts-schema", post(set_fts_schema))
         .route("/search", post(search))
+        .route("/search/batch", post(search_batch))
         .route("/text-search", post(text_search))
         .route("/hybrid-search", post(hybrid_search))
         .route("/list", post(list))
@@ -659,38 +660,129 @@ async fn search(
     State(st): State<AppState>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
-    check_page(req.offset, req.top_k)?;
-    let SearchRequest {
-        query,
-        scope,
-        top_k,
-        offset,
-        min_score,
-        filter,
-        exact,
-        include_attributes,
-        exclude_attributes,
-        rank_by,
-        limit_per,
-    } = req;
-    let projection = check_projection(include_attributes, exclude_attributes)?;
+    let (scope, query, opts) = plan_search(req)?;
     let hits = run_read(st, move |db| {
-        let opts = SearchOpts {
-            top_k,
-            offset,
-            min_score,
-            filter,
-            exact,
-            projection,
-            // Vector search has one score to report; annotations are a text/hybrid surface.
-            explain: false,
-            rank_by,
-            limit_per,
-        };
         scoped(&scope, |s| db.search(s, &query, &opts))
     })
     .await?;
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+}
+
+/// Turn one wire `SearchRequest` into the pieces `db.search` needs, running every check that
+/// can 400 **before** any query executes — a batch must not half-run and then reject leg 7.
+fn plan_search(req: SearchRequest) -> Result<(Vec<String>, Vec<f32>, SearchOpts), ApiError> {
+    check_page(req.offset, req.top_k)?;
+    let projection = check_projection(req.include_attributes, req.exclude_attributes)?;
+    let opts = SearchOpts {
+        top_k: req.top_k,
+        offset: req.offset,
+        min_score: req.min_score,
+        filter: req.filter,
+        exact: req.exact,
+        projection,
+        // Vector search has one score to report; annotations are a text/hybrid surface.
+        explain: false,
+        rank_by: req.rank_by,
+        limit_per: req.limit_per,
+    };
+    Ok((req.scope, req.query, opts))
+}
+
+/// `POST /search/batch`: answer up to [`MAX_BATCH_QUERIES`] vector queries in one round-trip,
+/// optionally fusing them into a single ranking with RRF (nidus-m50.11).
+async fn search_batch(
+    State(st): State<AppState>,
+    Json(req): Json<BatchSearchRequest>,
+) -> Result<Json<BatchSearchResponse>, ApiError> {
+    let BatchSearchRequest { queries, fuse } = req;
+    if queries.is_empty() {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "queries must not be empty"
+        )));
+    }
+    if queries.len() > MAX_BATCH_QUERIES {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "{} queries exceeds the maximum batch of {MAX_BATCH_QUERIES}",
+            queries.len()
+        )));
+    }
+    if let Some(f) = &fuse {
+        check_fuse(f, queries.len())?;
+    }
+    let plans = queries
+        .into_iter()
+        .map(plan_search)
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    // One `run_read`, so the whole batch takes one lock, one blocking task, and lives under
+    // the one request deadline — the batch cap above is what bounds the work that buys.
+    let legs = run_read(st, move |db| {
+        plans
+            .iter()
+            .map(|(scope, query, opts)| scoped(scope, |s| db.search(s, query, opts)))
+            .collect::<anyhow::Result<Vec<_>>>()
+    })
+    .await?;
+
+    let Some(f) = fuse else {
+        let results = legs
+            .into_iter()
+            .map(|hits| hits.into_iter().map(HitDto::from).collect())
+            .collect();
+        return Ok(Json(BatchSearchResponse {
+            results: Some(results),
+            fused: None,
+        }));
+    };
+    let weighted = legs
+        .into_iter()
+        .enumerate()
+        .map(|(i, hits)| {
+            let leg = crate::fuse::FusionLeg::new(hits);
+            match f.weights.get(i) {
+                Some(&w) => leg.weight(w),
+                None => leg,
+            }
+        })
+        .collect();
+    let fused = crate::fuse::rrf_fuse(weighted, f.rrf_k)
+        .into_iter()
+        .take(f.top_k)
+        .map(|(hit, _)| HitDto::from(hit))
+        .collect();
+    Ok(Json(BatchSearchResponse {
+        results: None,
+        fused: Some(fused),
+    }))
+}
+
+/// Refuse a fusion the server cannot honour as written. A weights list that does not line up
+/// with the queries would re-weight the wrong leg, which is worse than refusing.
+fn check_fuse(f: &BatchFuse, queries: usize) -> Result<(), ApiError> {
+    if f.top_k > MAX_TOP_K {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "fuse.top_k {} exceeds the maximum of {MAX_TOP_K}",
+            f.top_k
+        )));
+    }
+    if !f.weights.is_empty() && f.weights.len() != queries {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "fuse.weights has {} entries but there are {queries} queries",
+            f.weights.len()
+        )));
+    }
+    if let Some(w) = f.weights.iter().find(|w| !w.is_finite() || **w < 0.0) {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "fuse.weights must be finite and non-negative, got {w}"
+        )));
+    }
+    if !f.rrf_k.is_finite() || f.rrf_k < 0.0 {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "fuse.rrf_k must be finite and non-negative, got {}",
+            f.rrf_k
+        )));
+    }
+    Ok(())
 }
 
 /// `POST /aggregate`: count the filter-matching records and sum the named attributes,
@@ -699,8 +791,17 @@ async fn aggregate(
     State(st): State<AppState>,
     Json(req): Json<AggregateRequest>,
 ) -> Result<Json<AggregationDto>, ApiError> {
-    let AggregateRequest { scope, filter, sum } = req;
-    let opts = crate::AggregateOpts { filter, sum };
+    let AggregateRequest {
+        scope,
+        filter,
+        sum,
+        group_by,
+    } = req;
+    let opts = crate::AggregateOpts {
+        filter,
+        sum,
+        group_by,
+    };
     let out = run_read(st, move |db| scoped(&scope, |s| db.aggregate(s, &opts))).await?;
     Ok(Json(AggregationDto::from(out)))
 }
@@ -1661,6 +1762,133 @@ mod tests {
         let out = json_body(resp).await;
         assert_eq!(out["count"], 0);
         assert_eq!(out["sums"]["bytes"], json!({"Int": 0}));
+    }
+
+    /// A batch answers each query independently and in request order — the point of the
+    /// endpoint is saving round-trips, not changing any single query's answer (nidus-m50.11).
+    #[tokio::test]
+    async fn a_batch_answers_every_query_in_order() {
+        let app = ranked_router().await;
+        let body = json!({"queries": [
+            {"query": [1, 0, 0], "top_k": 1},
+            {"query": [1, 0, 0], "top_k": 2, "filter": [{"Eq": ["bytes", {"Int": 32}]}]}
+        ]});
+        let resp = app
+            .clone()
+            .oneshot(post("/search/batch", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out = json_body(resp).await;
+        assert!(out.get("fused").is_none(), "unfused batch must not fuse");
+        let results = out["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_array().unwrap().len(), 1);
+        assert_eq!(results[1].as_array().unwrap().len(), 1);
+        assert_eq!(results[1][0]["id"], "stale", "leg 2's filter still applies");
+
+        // Each leg must match what the same query returns on its own.
+        let solo = app
+            .oneshot(post("/search", json!({"query": [1, 0, 0], "top_k": 1})))
+            .await
+            .unwrap();
+        assert_eq!(json_body(solo).await[0]["id"], results[0][0]["id"]);
+    }
+
+    /// Fusing collapses the legs into one ranking, so a document both legs return appears once.
+    #[tokio::test]
+    async fn a_fused_batch_returns_one_merged_ranking() {
+        let app = ranked_router().await;
+        let body = json!({
+            "queries": [{"query": [1, 0, 0], "top_k": 2}, {"query": [1, 0, 0], "top_k": 2}],
+            "fuse": {"top_k": 10}
+        });
+        let resp = app.oneshot(post("/search/batch", body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out = json_body(resp).await;
+        assert!(out.get("results").is_none(), "fused batch returns one list");
+        let fused = out["fused"].as_array().unwrap();
+        assert_eq!(fused.len(), 2, "two documents, deduplicated across legs");
+        let ids: Vec<&str> = fused.iter().map(|h| h["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids.len(),
+            std::collections::HashSet::<&&str>::from_iter(ids.iter()).len()
+        );
+    }
+
+    /// The bounds that keep one request from buying unbounded scan, and the weights list that
+    /// would otherwise silently re-weight the wrong leg. Each is a caller mistake, so each 400s.
+    #[tokio::test]
+    async fn a_batch_refuses_what_it_cannot_honour() {
+        let app = ranked_router().await;
+        let one = json!({"query": [1, 0, 0], "top_k": 1});
+        let cases = [
+            json!({"queries": []}),
+            json!({"queries": (0..MAX_BATCH_QUERIES + 1).map(|_| one.clone()).collect::<Vec<_>>()}),
+            json!({"queries": [one.clone(), one.clone()], "fuse": {"weights": [1.0]}}),
+            json!({"queries": [one.clone()], "fuse": {"weights": [-1.0]}}),
+            json!({"queries": [one.clone()], "fuse": {"top_k": MAX_TOP_K + 1}}),
+            // A per-query page cap still applies inside a batch.
+            json!({"queries": [{"query": [1, 0, 0], "top_k": MAX_TOP_K + 1}]}),
+        ];
+        for body in cases {
+            let resp = app
+                .clone()
+                .oneshot(post("/search/batch", body.clone()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "accepted {body}");
+        }
+    }
+
+    /// A batch is rejected as a whole before ANY leg runs, so a bad leg cannot leave the store
+    /// half-queried and the caller holding a partial answer they cannot tell apart.
+    #[tokio::test]
+    async fn one_bad_leg_rejects_the_whole_batch() {
+        let app = ranked_router().await;
+        let body = json!({"queries": [
+            {"query": [1, 0, 0], "top_k": 1},
+            {"query": [1, 0, 0], "include_attributes": ["a"], "exclude_attributes": ["b"]}
+        ]});
+        let resp = app.oneshot(post("/search/batch", body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// `group_by` adds per-value rows without disturbing the totals, and the two records here
+    /// share one `file` — so the grouped answer is one row, not two (nidus-bmh).
+    #[tokio::test]
+    async fn aggregate_group_by_returns_per_value_rows() {
+        let app = ranked_router().await;
+        let body = json!({"sum": ["bytes"], "group_by": "file"});
+        let resp = app.clone().oneshot(post("/aggregate", body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out = json_body(resp).await;
+        assert_eq!(out["count"], 2);
+        assert_eq!(out["sums"]["bytes"], json!({"Int": 42}));
+        assert_eq!(out["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(out["groups"][0]["value"], json!({"Str": "a.rs"}));
+        assert_eq!(out["groups"][0]["count"], 2);
+        assert_eq!(out["groups"][0]["sums"]["bytes"], json!({"Int": 42}));
+
+        // An ungrouped request keeps the exact shape it had before grouping existed, so a
+        // client written against the old response cannot trip over an empty `groups`.
+        let resp = app
+            .oneshot(post("/aggregate", json!({"sum": ["bytes"]})))
+            .await
+            .unwrap();
+        let out = json_body(resp).await;
+        assert!(out.get("groups").is_none(), "got {out}");
+        assert!(out.get("groups_truncated").is_none(), "got {out}");
+    }
+
+    /// An empty `group_by` would put every record in the "missing" group and read as a working
+    /// query, so it is a caller mistake — and a caller mistake is a 400, not a 500.
+    #[tokio::test]
+    async fn an_empty_group_by_is_a_bad_request() {
+        let app = ranked_router().await;
+        let body = json!({"sum": ["bytes"], "group_by": ""});
+        let resp = app.oneshot(post("/aggregate", body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

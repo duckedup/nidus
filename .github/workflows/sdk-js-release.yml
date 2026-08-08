@@ -106,26 +106,40 @@ jobs:
       # repo: nidus). Provenance is emitted automatically.
       #
       # The configured workflow MUST be `release.yml`, not this file (nidus-bkt). npm
-      # validates the *calling* workflow's name under `workflow_call`, not the one holding
-      # the publish, so keying it here 404'd every release from #66 to 0.43.0.
+      # validates the *entry-point* workflow under `workflow_call`, not the one holding the
+      # publish, so keying it here 404'd every release from #66 to 0.52.0.
+      #
+      # NPM_TOKEN is the fallback for exactly that misconfiguration: a release that would
+      # otherwise ship nothing still publishes, at the cost of provenance (which needs the
+      # OIDC exchange that just failed). Absent the secret, behaviour is unchanged.
       - name: Publish
         working-directory: sdks/js
         env:
           VERSION: ${{ inputs.version }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           if npm view "@duckedup/nidus@${VERSION}" version >/dev/null 2>&1; then
             echo "@duckedup/nidus ${VERSION} is already published — nothing to do"
             exit 0
           fi
+          if npm publish; then
+            exit 0
+          fi
           # npm reports an unauthorized write as 404, not 403, which reads as "package
-          # missing" and cost nidus-bkt four silent releases. Name the real cause.
-          if ! npm publish; then
-            echo "::error::npm publish failed. A 404 on PUT means UNAUTHORIZED, not missing:" \
-                 "check npmjs.com → @duckedup/nidus → Trusted Publishing names the CALLING" \
-                 "workflow (release.yml), not sdk-js-release.yml. See nidus-bkt."
+          # missing" and cost nidus-bkt five silent releases. Name the real cause.
+          echo "::warning::trusted publishing failed. A 404 on PUT means UNAUTHORIZED, not" \
+               "missing: npmjs.com → @duckedup/nidus → Trusted Publishing must name the" \
+               "ENTRY-POINT workflow (release.yml), not sdk-js-release.yml. See nidus-bkt."
+          if [ -z "${NPM_TOKEN}" ]; then
+            echo "::error::no NPM_TOKEN fallback configured — nothing was published."
             exit 1
           fi
+          # Unset the OIDC handles so npm cannot retry the exchange that just failed, and drop
+          # provenance with them: attestation is not available on the token path.
+          echo "::warning::falling back to NPM_TOKEN; this release publishes WITHOUT provenance"
+          env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+            NODE_AUTH_TOKEN="${NPM_TOKEN}" npm publish --provenance=false
 
       - name: Create tag and GitHub release
         env:

@@ -424,6 +424,77 @@ def test_aggregate_sends_its_scope_and_sums_and_decodes_the_answer() -> None:
     assert isinstance(out.sums["bytes"], int)
 
 
+def test_aggregate_group_by_sends_the_field_and_decodes_the_rows() -> None:
+    """One row per distinct value, and a ``null`` value means "missing", not a present Null."""
+    stub = StubTransport(
+        {
+            "count": 3,
+            "sums": {"bytes": {"Int": 8}},
+            "groups": [
+                {"value": {"Str": "rust"}, "count": 2, "sums": {"bytes": {"Int": 8}}},
+                {"value": None, "count": 1, "sums": {"bytes": {"Int": 0}}},
+            ],
+        }
+    )
+    out = client(stub).aggregate(sum=["bytes"], group_by="lang")
+    assert stub.last.json == {"scope": [], "filter": [], "sum": ["bytes"], "group_by": "lang"}
+    assert [g.count for g in out.groups] == [2, 1]
+    assert out.groups[0].value == "rust"
+    assert out.groups[1].value is None
+    assert out.groups[0].sums == {"bytes": 8}
+    assert out.groups_truncated is False
+
+
+def test_an_ungrouped_aggregate_body_is_unchanged() -> None:
+    """No ``group_by`` key at all, so the request is byte-identical to the pre-grouping one."""
+    stub = StubTransport({"count": 0, "sums": {}})
+    out = client(stub).aggregate()
+    assert stub.last.json == {"scope": [], "filter": []}
+    assert out.groups == []
+
+
+def test_batch_search_sends_every_query_and_returns_one_ranking_each() -> None:
+    """Each leg is built by the same ``search_body``, so a batched query is shaped as a solo one."""
+    stub = StubTransport(
+        {"results": [[{"collection": "docs", "id": "a", "score": 1.0, "attrs": {}}], []]}
+    )
+    out = client(stub).batch_search(
+        [{"query": [1.0, 0.0], "top_k": 1}, {"query": [0.0, 1.0], "filter": [f.eq("k", "v")]}]
+    )
+    assert stub.last.url.endswith("/search/batch")
+    assert stub.last.json == {
+        "queries": [
+            {"query": [1.0, 0.0], "scope": [], "top_k": 1, "filter": []},
+            {"query": [0.0, 1.0], "scope": [], "filter": [{"Eq": ["k", {"Str": "v"}]}]},
+        ]
+    }
+    assert len(out) == 2
+    assert out[0][0].id == "a"
+    assert out[1] == []
+
+
+def test_a_fused_batch_returns_one_ranking_in_a_one_element_list() -> None:
+    """The shape does not change with ``fuse``: still a list of rankings, just one of them."""
+    stub = StubTransport({"fused": [{"collection": "docs", "id": "a", "score": 0.5, "attrs": {}}]})
+    out = client(stub).batch_search(
+        [{"query": [1.0, 0.0]}, {"query": [0.0, 1.0]}],
+        fuse=True,
+        rrf_k=60.0,
+        weights=[1.0, 0.5],
+        top_k=5,
+    )
+    assert stub.last.json["fuse"] == {"rrf_k": 60.0, "weights": [1.0, 0.5], "top_k": 5}
+    assert len(out) == 1
+    assert [h.id for h in out[0]] == ["a"]
+
+
+def test_a_fused_batch_sends_fuse_even_with_no_knobs() -> None:
+    """``fuse`` is what picks the response shape, so it must survive the usual pruning."""
+    stub = StubTransport({"fused": []})
+    client(stub).batch_search([{"query": [1.0, 0.0]}], fuse=True)
+    assert stub.last.json["fuse"] == {}
+
+
 def test_set_meta_sends_the_map_as_the_whole_body() -> None:
     """The handler deserializes a bare ``BTreeMap``, not an object wrapping one."""
     stub = StubTransport({"ok": True})

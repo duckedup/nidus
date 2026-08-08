@@ -41,6 +41,7 @@ from .filter import Filter
 from .ranking import RankBy
 from .types import (
     Aggregation,
+    Batch,
     FtsClause,
     FtsField,
     HighlightOpts,
@@ -371,16 +372,53 @@ class NidusClient:
         scope: Optional[Sequence[str]] = None,
         filter: Optional[Filter] = None,  # noqa: A002
         sum: Optional[Sequence[str]] = None,  # noqa: A002
+        group_by: Optional[str] = None,
     ) -> Aggregation:
         """Count the records a filter matches, and sum the attributes named in ``sum``.
 
         Answered from the in-RAM index alone — no record is built and no vector is read — so
         it is the cheap way to ask "how many, and how big" without paging through
         :meth:`list`. A missing or non-numeric value is skipped rather than counted as zero.
+
+        ``group_by`` additionally reports one :class:`~nidus.Group` per distinct value of that
+        attribute, in the same pass and beside the unchanged whole-scope totals.
         """
         return _wire.decode_aggregation(
             self._request(
-                "POST", _wire.AGGREGATE, _wire.aggregate_body(scope=scope, filter=filter, sum=sum)
+                "POST",
+                _wire.AGGREGATE,
+                _wire.aggregate_body(scope=scope, filter=filter, sum=sum, group_by=group_by),
+            )
+        )
+
+    def batch_search(
+        self,
+        queries: Sequence[Mapping[str, Any]],
+        *,
+        fuse: bool = False,
+        rrf_k: Optional[float] = None,
+        weights: Optional[Sequence[float]] = None,
+        top_k: Optional[int] = None,
+    ) -> Batch:
+        """Answer several vector queries in one round-trip (16 max), saving a hop per query.
+
+        Each entry of ``queries`` takes the same keys as :meth:`search` and is validated the
+        same way; the server checks the whole batch before running any leg, so a malformed
+        query fails the call rather than returning a partial answer.
+
+        Returns one ranking per query, in request order. With ``fuse=True`` the legs are
+        merged by Reciprocal Rank Fusion and the result is a **one-element** list holding
+        that single ranking, so indexing does not change shape with the flag. ``weights``
+        must be empty or exactly as long as ``queries``.
+        """
+        bodies = [_wire.search_body(**dict(q)) for q in queries]
+        return _wire.decode_batch(
+            self._request(
+                "POST",
+                _wire.SEARCH_BATCH,
+                _wire.batch_search_body(
+                    bodies, rrf_k=rrf_k, weights=weights, top_k=top_k, fuse=fuse
+                ),
             )
         )
 

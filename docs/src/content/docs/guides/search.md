@@ -502,6 +502,7 @@ let stats = db.aggregate(
     &AggregateOpts {
         filter: Filter(vec![Predicate::Eq("lang".into(), Value::Str("rust".into()))]),
         sum: vec!["bytes".into()],
+        ..Default::default()
     },
 )?;
 println!("{} records, {:?} bytes", stats.count, stats.sums["bytes"]);
@@ -511,6 +512,34 @@ println!("{} records, {:?} bytes", stats.count, stats.sums["bytes"]);
 `count` is always reported. Each entry in `sums` is a tagged `Value`: `Int` while every
 addend was an `Int`, `Float` once any `Float` joined. A missing or non-numeric value is
 skipped rather than counted as zero, so `sum` and `count` stay independently meaningful.
+
+### Grouping
+
+`group_by` reports the same figures per **distinct value** of an attribute, in the same
+single pass, alongside the unchanged whole-scope totals.
+
+```rust
+use nidus::{AggregateOpts, Scope};
+
+let by_lang = db.aggregate(
+    Scope::All,
+    &AggregateOpts {
+        sum: vec!["bytes".into()],
+        group_by: Some("lang".into()),
+        ..Default::default()
+    },
+)?;
+for g in &by_lang.groups {
+    // `value` is None for the records with no `lang` attribute at all.
+    println!("{:?}: {} records", g.value, g.count);
+}
+# anyhow::Ok(())
+```
+
+Groups arrive largest first, with a deterministic tie-break so repeating the query repeats
+the order. Records missing the attribute form one group with a `None` value — distinct from
+records holding `Value::Null`, the same absent-versus-null rule the filters follow. Past
+10 000 distinct values further ones are dropped and `groups_truncated` is set.
 
 ## Quantization
 

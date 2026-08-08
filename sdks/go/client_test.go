@@ -121,6 +121,95 @@ func (c *capture) sentBody(t *testing.T) string {
 func f32(v float32) *float32 { return &v }
 func iptr(v int) *int        { return &v }
 
+// ── Batch search and grouped aggregation ────────────────────────────────────
+
+// TestBatchSearchFusedReturnsTheMergedList pins the one place BatchSearch's return shape
+// depends on the request: the server answers a fused batch with "fused", not "results", so
+// reading the wrong key would hand the caller an empty slice and no error.
+func TestBatchSearchFusedReturnsTheMergedList(t *testing.T) {
+	cap := &capture{reply: `{"fused":[{"collection":"docs","id":"a","score":0.5}]}`}
+	db := serve(t, cap)
+
+	out, err := db.BatchSearch(context.Background(), BatchSearchRequest{
+		Queries: []SearchRequest{{Query: []float32{1, 0, 0}}, {Query: []float32{0, 1, 0}}},
+		Fuse:    &BatchFuse{TopK: 5},
+	})
+	if err != nil {
+		t.Fatalf("BatchSearch: %v", err)
+	}
+	if len(out) != 1 || len(out[0]) != 1 || out[0][0].ID != "a" {
+		t.Fatalf("a fused batch must return one merged ranking, got %#v", out)
+	}
+	body := cap.sentBody(t)
+	if !strings.Contains(body, `"fuse"`) || !strings.Contains(body, `"queries"`) {
+		t.Fatalf("body must carry queries and fuse, got %s", body)
+	}
+}
+
+// TestBatchSearchUnfusedReturnsOneListPerQuery is the other half: without Fuse the server
+// answers with "results", one ranking per query, in request order.
+func TestBatchSearchUnfusedReturnsOneListPerQuery(t *testing.T) {
+	cap := &capture{reply: `{"results":[[{"collection":"docs","id":"a","score":1}],[]]}`}
+	db := serve(t, cap)
+
+	out, err := db.BatchSearch(context.Background(), BatchSearchRequest{
+		Queries: []SearchRequest{{Query: []float32{1, 0, 0}}, {Query: []float32{0, 1, 0}}},
+	})
+	if err != nil {
+		t.Fatalf("BatchSearch: %v", err)
+	}
+	if len(out) != 2 || len(out[0]) != 1 || len(out[1]) != 0 {
+		t.Fatalf("want one list per query in order, got %#v", out)
+	}
+	if body := cap.sentBody(t); strings.Contains(body, "fuse") {
+		t.Fatalf("an unfused batch must not send fuse, got %s", body)
+	}
+}
+
+// TestAggregateGroupBySendsAndDecodesGroups covers the round trip: group_by is only sent
+// when set (so an ungrouped call keeps the body it always had), and a null group Value
+// decodes as nil — the records missing the attribute, distinct from a present null.
+func TestAggregateGroupBySendsAndDecodesGroups(t *testing.T) {
+	cap := &capture{reply: `{"count":3,"sums":{},"groups":[` +
+		`{"value":{"Str":"rust"},"count":2,"sums":{"bytes":{"Int":8}}},` +
+		`{"value":null,"count":1,"sums":{"bytes":{"Int":0}}}]}`}
+	db := serve(t, cap)
+
+	out, err := db.Aggregate(context.Background(), AggregateRequest{GroupBy: "lang"})
+	if err != nil {
+		t.Fatalf("Aggregate: %v", err)
+	}
+	if body := cap.sentBody(t); !strings.Contains(body, `"group_by":"lang"`) {
+		t.Fatalf("group_by must reach the wire, got %s", body)
+	}
+	if len(out.Groups) != 2 {
+		t.Fatalf("want 2 groups, got %#v", out.Groups)
+	}
+	if out.Groups[0].Value == nil {
+		t.Fatal("first group must carry its value")
+	}
+	if got, ok := out.Groups[0].Value.Str(); !ok || got != "rust" {
+		t.Fatalf("want Str(rust), got %v", out.Groups[0].Value)
+	}
+	if out.Groups[1].Value != nil {
+		t.Fatalf("the attribute-less group must decode as nil, got %#v", out.Groups[1].Value)
+	}
+}
+
+// TestAggregateWithoutGroupByOmitsIt keeps the ungrouped body byte-identical to what every
+// pre-grouping release sent.
+func TestAggregateWithoutGroupByOmitsIt(t *testing.T) {
+	cap := &capture{reply: `{"count":0,"sums":{}}`}
+	db := serve(t, cap)
+
+	if _, err := db.Aggregate(context.Background(), AggregateRequest{}); err != nil {
+		t.Fatalf("Aggregate: %v", err)
+	}
+	if body := cap.sentBody(t); strings.Contains(body, "group_by") {
+		t.Fatalf("an ungrouped request must not send group_by, got %s", body)
+	}
+}
+
 // ── Routing ─────────────────────────────────────────────────────────────────
 
 // TestClientMethodsHitTheRightRoute drives every public method against the fake
@@ -194,6 +283,12 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 		}},
 		{"Search", `[]`, http.MethodPost, "/search", func(c *Client) error {
 			_, err := c.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}})
+			return err
+		}},
+		{"BatchSearch", `{"results":[[]]}`, http.MethodPost, "/search/batch", func(c *Client) error {
+			_, err := c.BatchSearch(ctx, BatchSearchRequest{
+				Queries: []SearchRequest{{Query: []float32{1, 0, 0}}},
+			})
 			return err
 		}},
 		{"TextSearch", `[]`, http.MethodPost, "/text-search", func(c *Client) error {

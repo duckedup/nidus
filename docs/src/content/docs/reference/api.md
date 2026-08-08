@@ -299,17 +299,34 @@ index without materializing a record.
 
 ```rust
 pub struct AggregateOpts {
-    pub filter: Filter,   // default matches every record
-    pub sum: Vec<String>, // attributes to total
+    pub filter: Filter,            // default matches every record
+    pub sum: Vec<String>,          // attributes to total
+    pub group_by: Option<String>,  // one Group per distinct value of this attribute
 }
 
 pub struct Aggregation {
     pub count: u64,
     pub sums: BTreeMap<String, Value>,  // Int while every addend was Int, else Float
+    pub groups: Vec<Group>,             // empty unless group_by was set
+    pub groups_truncated: bool,         // distinct values outran the cap
+}
+
+pub struct Group {
+    pub value: Option<Value>,           // None = the records missing the attribute
+    pub count: u64,
+    pub sums: BTreeMap<String, Value>,
 }
 ```
 
 A missing or non-numeric value is skipped, not counted as zero.
+
+`group_by` splits the same single pass into one `Group` per distinct value while still
+reporting the whole-scope totals, so "how many per language, and how many overall" is one
+query. Groups are ordered by `count` descending with a deterministic tie-break. A `None`
+`value` is the group of records **missing** the attribute — distinct from those holding
+`Value::Null`, matching how the filter predicates treat absent versus null. Distinct values
+are capped at 10 000; past that, new values are dropped and `groups_truncated` is set rather
+than letting a short list pass for a complete one.
 
 ## `Projection`
 

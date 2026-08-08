@@ -371,6 +371,26 @@ func (c *Client) List(ctx context.Context, req ListRequest) ([]Hit, error) {
 	return c.hits(ctx, "/list", req)
 }
 
+// BatchSearch answers up to 16 vector queries in one request. Without req.Fuse it returns
+// one ranking per query in request order; with it, a single fused ranking (and the outer
+// slice has exactly one entry).
+//
+// The whole batch is validated before any leg runs, so a malformed query fails the request
+// rather than returning a partial answer the caller cannot tell apart from a complete one.
+func (c *Client) BatchSearch(ctx context.Context, req BatchSearchRequest) ([][]Hit, error) {
+	var out struct {
+		Results [][]Hit `json:"results"`
+		Fused   []Hit   `json:"fused"`
+	}
+	if err := c.request(ctx, http.MethodPost, "/search/batch", req, &out); err != nil {
+		return nil, err
+	}
+	if req.Fuse != nil {
+		return [][]Hit{out.Fused}, nil
+	}
+	return out.Results, nil
+}
+
 // Aggregate counts the records a filter matches and sums the attributes named in
 // AggregateRequest.Sum. It is answered from the server's in-RAM index alone — no
 // record is materialized and no vector is read — so it stays cheap over a whole store.

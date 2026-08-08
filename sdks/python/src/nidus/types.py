@@ -119,6 +119,23 @@ class Aggregation:
 
     count: int
     sums: dict[str, DecodedValue] = field(default_factory=dict)
+    #: One row per distinct ``group_by`` value, largest first. Empty when none was asked for.
+    groups: list[Group] = field(default_factory=list)
+    #: Distinct values outran the server's cap and later ones were dropped.
+    groups_truncated: bool = False
+
+
+@dataclass(frozen=True)
+class Group:
+    """One distinct ``group_by`` value with the aggregates over just its records.
+
+    ``value`` is ``None`` for the records missing the attribute entirely — a different group
+    from those holding a present ``Null``, matching how the filter predicates treat the two.
+    """
+
+    value: Optional[DecodedValue]
+    count: int
+    sums: dict[str, DecodedValue] = field(default_factory=dict)
 
 
 #: What every search-family call returns. It has a name because both clients carry a
@@ -127,6 +144,11 @@ class Aggregation:
 #: resolve to the method rather than to the type. Naming the type once is cheaper than
 #: renaming a method the other SDKs also call ``list``.
 Hits = list[Hit]
+
+#: What :meth:`~nidus.NidusClient.batch_search` returns: one :data:`Hits` per query. Named for
+#: the same reason as :data:`Hits` — a bare ``list[Hits]`` inside a client class body would
+#: resolve to that class's own ``list()`` method rather than to the builtin.
+Batch = list[Hits]
 
 
 @dataclass(frozen=True)
