@@ -2,16 +2,16 @@
 
 This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
 
-> **Architecture in one line:** Issues live in a local Dolt database
-> (`.beads/dolt/`); cross-machine sync uses `bd dolt push/pull` (a
-> git-compatible protocol), stored under `refs/dolt/data` on your git
-> remote — separate from `refs/heads/*` where your code lives.
-> `.beads/issues.jsonl` is a passive export, not the wire protocol.
+> **Architecture in one line, as this repo actually runs it:** issues live in a
+> local embedded Dolt database (`.beads/embeddeddolt/nidus/`), and **no Dolt
+> remote is configured** — so `bd dolt push/pull` does not apply here. Sync is
+> plain git: `.beads/issues.jsonl` is committed, and the `.beads/hooks/*` git
+> hooks export and import it around commit, merge, and checkout.
 >
-> See [SYNC_CONCEPTS.md](https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md)
-> for the one-screen overview and anti-patterns (don't treat JSONL as the
-> source of truth; don't `bd import` during normal operation; don't
-> reach for third-party Dolt hosting before trying the default).
+> Beads' upstream [SYNC_CONCEPTS.md](https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md)
+> describes the Dolt-remote setup instead; read it for background, not as the
+> workflow here. `bd import` IS the recovery path in this repo — it is how a
+> checkout with an empty database gets its issues back.
 
 ## Quick Reference
 
@@ -20,7 +20,7 @@ bd ready              # Find available work
 bd show <id>          # View issue details
 bd update <id> --claim  # Claim work atomically
 bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
+git push              # Beads data ships with the commit; there is no dolt remote
 ```
 
 ## Non-Interactive Shell Commands
@@ -93,10 +93,12 @@ bd close <id>         # Complete work
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   bd dolt push
    git push
    git status  # MUST show "up to date with origin"
    ```
+   No `bd dolt push` — this repo has no Dolt remote configured. Beads data travels
+   in-repo: `.beads/issues.jsonl` is committed and the `.beads/hooks/*` git hooks
+   export/import it around commit and merge.
 5. **Clean up** - Clear stashes, prune remote branches
 6. **Verify** - All changes committed AND pushed
 7. **Hand off** - Provide context for next session
