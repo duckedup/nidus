@@ -10,6 +10,7 @@ import { NidusError } from "./errors.js";
 import type {
   AggregateOptions,
   Aggregation,
+  BatchSearchOptions,
   DecodedRecord,
   Filter,
   FtsField,
@@ -27,7 +28,7 @@ import type {
   TextSearchOptions,
   Value,
 } from "./types.js";
-import { decodeAttrs, encodeAttrs } from "./values.js";
+import { decodeAttrs, decodeValue, encodeAttrs } from "./values.js";
 
 /** Minimal `fetch` signature the client needs — satisfied by the platform global. */
 export type FetchLike = (
@@ -270,16 +271,73 @@ export class NidusClient {
    * in-RAM index alone — no record is built and no vector is read.
    */
   async aggregate(opts: AggregateOptions = {}): Promise<Aggregation> {
-    const res = await this.request<RawAggregation>("POST", "/aggregate", {
-      scope: opts.scope ?? [],
-      filter: opts.filter ?? [],
-      sum: opts.sum ?? [],
-    });
+    const res = await this.request<RawAggregation>(
+      "POST",
+      "/aggregate",
+      prune({
+        scope: opts.scope ?? [],
+        filter: opts.filter ?? [],
+        sum: opts.sum ?? [],
+        group_by: opts.groupBy,
+      }),
+    );
     // Every sum is an `Int` or a `Float`, both of which decode to a JS number.
     return {
       count: res.count,
       sums: decodeAttrs(res.sums) as Record<string, number>,
+      // Kept absent, not `undefined`, so an ungrouped answer is the shape it always was.
+      ...(res.groups
+        ? {
+            groups: res.groups.map((g) => ({
+              value: g.value === null ? null : decodeValue(g.value),
+              count: g.count,
+              sums: decodeAttrs(g.sums) as Record<string, number>,
+            })),
+          }
+        : {}),
+      ...(res.groups_truncated ? { groupsTruncated: true } : {}),
     };
+  }
+
+  /**
+   * Answer several vector queries in one round-trip (16 max). Returns one ranking per
+   * query in request order, or — with `opts.fuse` — a single array holding the one fused
+   * ranking, so the return shape is uniform either way.
+   *
+   * The server validates the whole batch before running any leg, so a malformed query
+   * fails the call rather than returning a partial answer that cannot be told apart.
+   */
+  async batchSearch(opts: BatchSearchOptions): Promise<Hit[][]> {
+    const body = prune({
+      queries: opts.queries.map((q) => ({
+        query: q.query,
+        scope: q.scope ?? [],
+        top_k: q.topK,
+        offset: q.offset,
+        min_score: q.minScore,
+        filter: q.filter ?? [],
+        exact: q.exact,
+        include_attributes: q.includeAttributes,
+        exclude_attributes: q.excludeAttributes,
+        rank_by: encodeRankBy(q.rankBy),
+        limit_per: q.limitPer,
+      })),
+      fuse: opts.fuse
+        ? prune({
+            rrf_k: opts.fuse.rrfK,
+            weights: opts.fuse.weights,
+            top_k: opts.fuse.topK,
+          })
+        : undefined,
+    });
+    const res = await this.request<RawBatchSearch>(
+      "POST",
+      "/search/batch",
+      body,
+    );
+    return (res.fused ? [res.fused] : (res.results ?? [])).map((hits) =>
+      hits.map((h) => this.decodeHit(h)),
+    );
   }
 
   // ── Memory (text-native) ──────────────────────────────────────────────────
@@ -351,7 +409,12 @@ export class NidusClient {
     body: Record<string, unknown>,
   ): Promise<Hit[]> {
     const hits = await this.request<RawHit[]>("POST", path, prune(body));
-    return hits.map((h) => ({
+    return hits.map((h) => this.decodeHit(h));
+  }
+
+  /** One wire hit into a {@link Hit}. Shared so every search surface decodes identically. */
+  private decodeHit(h: RawHit): Hit {
+    return {
       collection: h.collection,
       id: h.id,
       score: h.score,
@@ -360,7 +423,7 @@ export class NidusClient {
       ...(h.annotations
         ? { annotations: decodeAnnotations(h.annotations) }
         : {}),
-    }));
+    };
   }
 
   /** Issue a request and parse a JSON body, mapping a non-2xx to {@link NidusError}. */
@@ -391,8 +454,7 @@ export class NidusClient {
       payload = JSON.stringify(body);
     }
 
-    const controller =
-      this.timeoutMs > 0 ? new AbortController() : undefined;
+    const controller = this.timeoutMs > 0 ? new AbortController() : undefined;
     const timer =
       controller && this.timeoutMs > 0
         ? setTimeout(() => controller.abort(), this.timeoutMs)
@@ -406,7 +468,7 @@ export class NidusClient {
       });
     } catch (err) {
       const reason =
-        controller?.signal.aborted ?? false
+        (controller?.signal.aborted ?? false)
           ? `request to ${path} timed out after ${this.timeoutMs}ms`
           : `request to ${path} failed: ${(err as Error).message}`;
       throw new NidusError(reason, 0);
@@ -429,6 +491,18 @@ interface RawHit {
 interface RawAggregation {
   count: number;
   sums: Record<string, Value>;
+  groups?: {
+    value: Value | null;
+    count: number;
+    sums: Record<string, Value>;
+  }[];
+  groups_truncated?: boolean;
+}
+
+/** A `/search/batch` response: exactly one of the two fields is present. */
+interface RawBatchSearch {
+  results?: RawHit[][];
+  fused?: RawHit[];
 }
 
 /** Encode `rankBy` to its externally-tagged wire form, dropping the knobs left unset. */

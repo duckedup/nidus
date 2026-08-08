@@ -669,6 +669,9 @@ enum Command {
         /// Attribute to sum (repeatable). Missing and non-numeric values are skipped.
         #[arg(long = "sum")]
         sum: Vec<String>,
+        /// Report one row per distinct value of this attribute, alongside the totals.
+        #[arg(long = "group-by")]
+        group_by: Option<String>,
     },
     /// List records by metadata filter (no vector query).
     List {
@@ -699,15 +702,20 @@ enum Command {
         #[arg(long, requires = "order_by")]
         desc: bool,
     },
-    /// Declare a collection's full-text-indexed fields (BM25). The tuning flags apply to
-    /// every `--field` in the invocation. Re-running rebuilds the affected field indexes.
+    /// Declare a collection's full-text-indexed fields (BM25). The tuning flags below apply to
+    /// every `--field`; use `--field-spec` to tune one field on its own. Re-running rebuilds
+    /// the affected field indexes.
     SetFtsSchema {
         #[command(flatten)]
         store: StoreArgs,
         collection: String,
-        /// Attribute field to full-text index (repeatable).
-        #[arg(long = "field", required = true)]
+        /// Attribute field to full-text index, taking the tuning flags below (repeatable).
+        #[arg(long = "field")]
         fields: Vec<String>,
+        /// One field with its own tuning, e.g. `--field-spec 'body:k1=1.5,b=0.3'`. Keys:
+        /// k1, b, ascii_folding, max_token_len. Unnamed keys keep the flag defaults.
+        #[arg(long = "field-spec")]
+        field_specs: Vec<String>,
         /// BM25 term-frequency saturation (default 1.2).
         #[arg(long)]
         k1: Option<f32>,
@@ -983,13 +991,18 @@ pub fn run(cli: Cli) -> Result<()> {
             collections,
             filter,
             sum,
+            group_by,
         } => {
             let db = open(&store, false)?;
             let filter = match filter {
                 Some(s) => serde_json::from_str(&s)?,
                 None => Filter::default(),
             };
-            let opts = AggregateOpts { filter, sum };
+            let opts = AggregateOpts {
+                filter,
+                sum,
+                group_by,
+            };
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
             let out = if refs.is_empty() {
                 db.aggregate(Scope::All, &opts)?
@@ -1002,28 +1015,49 @@ pub fn run(cli: Cli) -> Result<()> {
             store,
             collection,
             fields,
+            field_specs,
             k1,
             b,
             ascii_folding,
             max_token_len,
         } => {
-            let mut db = open(&store, true)?;
-            let decl: Vec<FtsField> = fields
+            let defaults = FieldDefaults {
+                k1,
+                b,
+                ascii_folding,
+                max_token_len,
+            };
+            let mut decl: Vec<FtsField> = fields
                 .iter()
-                .map(|name| {
-                    let mut f = FtsField::new(name).ascii_folding(ascii_folding);
-                    f.k1 = k1.unwrap_or(f.k1);
-                    f.b = b.unwrap_or(f.b);
-                    f.analyzer.max_token_len = max_token_len;
-                    f
+                .map(|name| defaults.apply(FtsField::new(name)))
+                .collect();
+            for spec in &field_specs {
+                decl.push(parse_field_spec(spec, &defaults)?);
+            }
+            if decl.is_empty() {
+                bail!("set-fts-schema needs at least one --field or --field-spec");
+            }
+            if let Some(dupe) = first_duplicate(&decl) {
+                bail!("field '{dupe}' is declared twice; give it one --field or --field-spec");
+            }
+            let mut db = open(&store, true)?;
+            db.set_fts_schema(&collection, &decl)?;
+            // Per field, not one summary: the whole point of --field-spec is that they differ.
+            let reported: Vec<serde_json::Value> = decl
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "field": f.field,
+                        "k1": f.k1,
+                        "b": f.b,
+                        "ascii_folding": f.analyzer.ascii_folding,
+                        "max_token_len": f.analyzer.max_token_len,
+                    })
                 })
                 .collect();
-            db.set_fts_schema(&collection, &decl)?;
             print_json(&serde_json::json!({
                 "collection": collection,
-                "fts_fields": fields,
-                "k1": decl[0].k1,
-                "b": decl[0].b,
+                "fts_fields": reported,
             }))
         }
         Command::TextSearch {
@@ -1162,6 +1196,65 @@ pub fn run(cli: Cli) -> Result<()> {
 
 /// Open the store. `mutating` commands take the writer lock; read commands open
 /// read-only so they never contend with a running `nidus serve` writer.
+/// The invocation-wide `set-fts-schema` tuning flags, which every declared field starts from
+/// and a `--field-spec` may then override key by key.
+struct FieldDefaults {
+    k1: Option<f32>,
+    b: Option<f32>,
+    ascii_folding: bool,
+    max_token_len: Option<usize>,
+}
+
+impl FieldDefaults {
+    fn apply(&self, mut f: FtsField) -> FtsField {
+        f.k1 = self.k1.unwrap_or(f.k1);
+        f.b = self.b.unwrap_or(f.b);
+        f.analyzer.ascii_folding = self.ascii_folding;
+        f.analyzer.max_token_len = self.max_token_len;
+        f
+    }
+}
+
+/// Parse `body:k1=1.5,b=0.3,ascii_folding=true,max_token_len=40` (nidus-9jp). An unknown or
+/// unparseable key is refused rather than ignored — a silently dropped knob leaves the field
+/// indexed differently than the caller asked, and nothing downstream would say so.
+fn parse_field_spec(spec: &str, defaults: &FieldDefaults) -> Result<FtsField> {
+    let (name, rest) = spec.split_once(':').unwrap_or((spec, ""));
+    if name.is_empty() {
+        bail!("--field-spec '{spec}' has no field name; want 'field:key=value,…'");
+    }
+    let mut f = defaults.apply(FtsField::new(name));
+    for pair in rest.split(',').filter(|p| !p.trim().is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, "true"));
+        let (key, value) = (key.trim(), value.trim());
+        let bad =
+            |what: &str| anyhow::anyhow!("--field-spec '{spec}': {key}={value} is not {what}");
+        match key {
+            "k1" => f.k1 = value.parse().map_err(|_| bad("a number"))?,
+            "b" => f.b = value.parse().map_err(|_| bad("a number"))?,
+            "ascii_folding" => {
+                f.analyzer.ascii_folding = value.parse().map_err(|_| bad("a bool"))?
+            }
+            "max_token_len" => {
+                f.analyzer.max_token_len = Some(value.parse().map_err(|_| bad("a whole number"))?);
+            }
+            _ => bail!(
+                "--field-spec '{spec}': unknown key '{key}'; want k1, b, ascii_folding, or max_token_len"
+            ),
+        }
+    }
+    Ok(f)
+}
+
+/// The first field name declared twice, whether across `--field` or `--field-spec`. Two
+/// declarations of one field would leave which tuning won up to ordering.
+fn first_duplicate(decl: &[FtsField]) -> Option<&str> {
+    let mut seen = std::collections::HashSet::new();
+    decl.iter()
+        .find(|f| !seen.insert(f.field.as_str()))
+        .map(|f| f.field.as_str())
+}
+
 fn open(store: &StoreArgs, mutating: bool) -> Result<Nidus> {
     if mutating && store.read_only {
         bail!("--read-only was set, but this command mutates the store");
@@ -1444,6 +1537,99 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    /// A `--field-spec` tunes ONE field, starting from the invocation-wide flags and
+    /// overriding only the keys it names (nidus-9jp).
+    #[test]
+    fn a_field_spec_overrides_the_invocation_wide_flags_per_field() {
+        let defaults = FieldDefaults {
+            k1: Some(1.1),
+            b: None,
+            ascii_folding: false,
+            max_token_len: Some(20),
+        };
+        let f = parse_field_spec("body:k1=1.5,ascii_folding,max_token_len=40", &defaults).unwrap();
+        assert_eq!(f.field, "body");
+        assert_eq!(f.k1, 1.5, "the spec wins over --k1");
+        assert_eq!(
+            f.b,
+            FtsField::new("x").b,
+            "an unnamed key keeps its default"
+        );
+        assert!(f.analyzer.ascii_folding, "a bare key means true");
+        assert_eq!(f.analyzer.max_token_len, Some(40));
+
+        // A spec naming no keys is just the field at the invocation-wide defaults.
+        let bare = parse_field_spec("title", &defaults).unwrap();
+        assert_eq!(bare.field, "title");
+        assert_eq!(bare.k1, 1.1);
+        assert_eq!(bare.analyzer.max_token_len, Some(20));
+    }
+
+    /// Each of these would otherwise index a field differently than asked, with nothing
+    /// downstream to say so — so each is refused rather than ignored.
+    #[test]
+    fn a_malformed_field_spec_is_refused_not_ignored() {
+        let defaults = FieldDefaults {
+            k1: None,
+            b: None,
+            ascii_folding: false,
+            max_token_len: None,
+        };
+        for spec in [
+            "body:nope=1",            // unknown key
+            "body:k1=fast",           // unparseable float
+            "body:max_token_len=-1",  // unparseable usize
+            "body:ascii_folding=yes", // unparseable bool
+            ":k1=1.5",                // no field name
+        ] {
+            assert!(
+                parse_field_spec(spec, &defaults).is_err(),
+                "accepted '{spec}'"
+            );
+        }
+    }
+
+    /// Two declarations of one field would leave the winning tuning up to argument order.
+    #[test]
+    fn a_field_declared_twice_is_refused() {
+        let decl = [
+            FtsField::new("title"),
+            FtsField::new("body"),
+            FtsField::new("title"),
+        ];
+        assert_eq!(first_duplicate(&decl), Some("title"));
+        assert_eq!(first_duplicate(&decl[..2]), None);
+    }
+
+    #[test]
+    fn set_fts_schema_takes_field_specs_alongside_plain_fields() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "set-fts-schema",
+            "--dir",
+            "/tmp/s",
+            "--dim",
+            "3",
+            "docs",
+            "--field",
+            "title",
+            "--field-spec",
+            "body:k1=1.5",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::SetFtsSchema {
+                fields,
+                field_specs,
+                ..
+            } => {
+                assert_eq!(fields, ["title"]);
+                assert_eq!(field_specs, ["body:k1=1.5"]);
+            }
+            _ => panic!("expected SetFtsSchema"),
+        }
     }
 
     #[test]

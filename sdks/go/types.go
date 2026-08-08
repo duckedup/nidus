@@ -417,6 +417,9 @@ type AggregateRequest struct {
 	Scope  []string `json:"scope,omitempty"`
 	Filter Filter   `json:"filter,omitempty"`
 	Sum    []string `json:"sum,omitempty"`
+	// GroupBy splits the answer into one [Group] per distinct value of this attribute,
+	// alongside the whole-scope totals. Empty reports the totals alone.
+	GroupBy string `json:"group_by,omitempty"`
 }
 
 // An Aggregation is the answer to an [AggregateRequest].
@@ -428,6 +431,44 @@ type AggregateRequest struct {
 type Aggregation struct {
 	Count uint64 `json:"count"`
 	Sums  Attrs  `json:"sums"`
+	// Groups is one row per distinct AggregateRequest.GroupBy value, ordered by Count
+	// descending. Nil when no grouping was asked for.
+	Groups []Group `json:"groups,omitempty"`
+	// GroupsTruncated reports that distinct values outran the server's group cap and later
+	// ones were dropped, so a partial answer is never mistaken for a complete one.
+	GroupsTruncated bool `json:"groups_truncated,omitempty"`
+}
+
+// A Group is one distinct GroupBy value with the aggregates over just its records.
+//
+// Value is nil for the records missing the attribute entirely — which is a different group
+// from those holding a present null, exactly as the filter predicates treat absent vs Null.
+type Group struct {
+	Value *Value `json:"value"`
+	Count uint64 `json:"count"`
+	Sums  Attrs  `json:"sums"`
+}
+
+// A BatchSearchRequest answers several vector queries in one round-trip, saving a network
+// hop per query when one question is fanned into several phrasings.
+//
+// Each entry is an ordinary [SearchRequest] with its own scope, filter and top_k. Set Fuse
+// to merge the per-query rankings into a single list instead of getting them side by side;
+// the server caps a batch at 16 queries.
+type BatchSearchRequest struct {
+	Queries []SearchRequest `json:"queries"`
+	Fuse    *BatchFuse      `json:"fuse,omitempty"`
+}
+
+// A BatchFuse merges a batch's per-query rankings with Reciprocal Rank Fusion — the same
+// fusion [Client.HybridSearch] runs, over N query legs rather than a vector and a text leg.
+//
+// Weights must be either empty (every leg neutral) or exactly as long as Queries: the
+// server refuses a short list rather than silently re-weighting the wrong leg.
+type BatchFuse struct {
+	RRFK    float32   `json:"rrf_k,omitempty"`
+	Weights []float32 `json:"weights,omitempty"`
+	TopK    int       `json:"top_k,omitempty"`
 }
 
 // RememberOptions tunes a text-native ingest: the server embeds the text and upserts

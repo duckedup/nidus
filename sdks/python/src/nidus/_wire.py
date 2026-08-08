@@ -53,11 +53,13 @@ from .types import (
     Aggregation,
     AnnInfo,
     Annotations,
+    Batch,
     ClauseScore,
     Footprint,
     Fragment,
     FtsClause,
     FtsField,
+    Group,
     Highlight,
     HighlightOpts,
     Hit,
@@ -81,6 +83,7 @@ HEALTH = "/health"
 STATS = "/stats"
 COLLECTIONS = "/collections"
 SEARCH = "/search"
+SEARCH_BATCH = "/search/batch"
 TEXT_SEARCH = "/text-search"
 HYBRID_SEARCH = "/hybrid-search"
 LIST = "/list"
@@ -376,19 +379,46 @@ def aggregate_body(
     scope: Optional[Sequence[str]] = None,
     filter: Optional[Filter] = None,  # noqa: A002
     sum: Optional[Sequence[str]] = None,  # noqa: A002
+    group_by: Optional[str] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /aggregate`` (count, plus one sum per named attribute).
 
     ``sum`` is pruned when unset, which is the same request as ``[]``: a count of everything
-    the filter matched.
+    the filter matched. ``group_by`` is pruned too, so an ungrouped request is byte-identical
+    to the one this SDK sent before grouping existed.
     """
     return prune(
         {
             "scope": _scope(scope),
             "filter": list(filter) if filter is not None else [],
             "sum": None if sum is None else _guards.str_sequence(sum, "aggregate(sum=...)"),
+            "group_by": group_by,
         }
     )
+
+
+def batch_search_body(
+    queries: Sequence[Mapping[str, Any]],
+    rrf_k: Optional[float] = None,
+    weights: Optional[Sequence[float]] = None,
+    top_k: Optional[int] = None,
+    fuse: bool = False,
+) -> dict[str, Any]:
+    """Body for ``POST /search/batch`` — several queries in one round-trip (16 max).
+
+    ``fuse`` is what decides the response shape, so it is sent whenever asked for even
+    with every knob left at its default; the fusion knobs themselves are pruned as usual.
+    """
+    body: dict[str, Any] = {"queries": list(queries)}
+    if fuse:
+        body["fuse"] = prune(
+            {
+                "rrf_k": rrf_k,
+                "weights": None if weights is None else list(weights),
+                "top_k": top_k,
+            }
+        )
+    return body
 
 
 def remember_body(
@@ -511,7 +541,34 @@ def decode_aggregation(payload: Any) -> Aggregation:
     return Aggregation(
         count=int(payload["count"]),
         sums={str(k): decode_value(val) for k, val in sums.items()},
+        groups=[_group_of(g) for g in payload.get("groups") or ()],
+        groups_truncated=bool(payload.get("groups_truncated")),
     )
+
+
+def _group_of(payload: Mapping[str, Any]) -> Group:
+    """One ``group_by`` row. A ``null`` value means the records missing the attribute, which
+    is why it is not run through ``decode_value`` — that would read it as a present ``Null``.
+    """
+    raw = payload.get("value")
+    return Group(
+        value=None if raw is None else decode_value(raw),
+        count=int(payload["count"]),
+        sums={str(k): decode_value(v) for k, v in (payload.get("sums") or {}).items()},
+    )
+
+
+def decode_batch(payload: Any) -> Batch:
+    """Decode ``POST /search/batch``: one ranking per query, or the single fused ranking.
+
+    A fused answer comes back as a one-element list rather than a bare list of hits, so a
+    caller's indexing does not change with the presence of ``fuse``.
+    """
+    if not isinstance(payload, Mapping):
+        raise NidusError(f"/search/batch returned no JSON object (got {payload!r})", 0)
+    if payload.get("fused") is not None:
+        return [decode_hits(payload["fused"])]
+    return [decode_hits(leg) for leg in payload.get("results") or ()]
 
 
 def decode_records(payload: Any) -> list[Record]:

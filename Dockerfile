@@ -48,8 +48,11 @@ WORKDIR /build
 # TARGETARCH is provided by buildx (amd64 | arm64).
 ARG TARGETARCH
 COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
+# Cache mounts are keyed per-arch: docker.yml builds both platforms in ONE concurrent buildx
+# call, and an unnamed mount ids by target path alone — so two cargo processes unpacked the
+# same crate into one registry and the loser died on `.cargo-ok: File exists` (nidus-dyc).
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-$TARGETARCH,sharing=locked \
+    --mount=type=cache,target=/build/target,id=cargo-target-$TARGETARCH,sharing=locked \
     set -eux; \
     case "$TARGETARCH" in \
       amd64) target=x86_64-unknown-linux-gnu; cc=x86_64-linux-gnu-gcc ;; \

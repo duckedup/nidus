@@ -67,6 +67,45 @@ pub struct SearchRequest {
     pub limit_per: Option<LimitPer>,
 }
 
+/// Most queries one batch may carry. Matches turbopuffer's documented cap; the point is that
+/// ONE request, holding one concurrency permit under one deadline, cannot buy unbounded scan.
+pub(super) const MAX_BATCH_QUERIES: usize = 16;
+
+/// Body of `POST /search/batch` (nidus-m50.11): several vector queries answered in one
+/// round-trip. Each entry is an ordinary [`SearchRequest`], with its own scope and filter.
+#[derive(Debug, Deserialize)]
+pub struct BatchSearchRequest {
+    pub queries: Vec<SearchRequest>,
+    /// Merge the per-query rankings into ONE list instead of returning them side by side.
+    #[serde(default)]
+    pub fuse: Option<BatchFuse>,
+}
+
+/// Cross-query RRF: the same fusion `/hybrid-search` runs, over N query legs rather than a
+/// vector leg and a text leg.
+#[derive(Debug, Deserialize)]
+pub struct BatchFuse {
+    #[serde(default = "default_rrf_k")]
+    pub rrf_k: f32,
+    /// Per-query weights in request order. Empty leaves every leg neutral; otherwise the
+    /// length must equal `queries`, since a short list would silently re-weight the wrong leg.
+    #[serde(default)]
+    pub weights: Vec<f32>,
+    /// How many fused hits to return. Each leg is still ranked to its own `top_k`.
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+}
+
+/// The answer to a [`BatchSearchRequest`]: one ranking per query, or the single fused ranking
+/// when `fuse` was asked for. Exactly one of the two fields is present.
+#[derive(Debug, Serialize)]
+pub struct BatchSearchResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub results: Option<Vec<Vec<HitDto>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fused: Option<Vec<HitDto>>,
+}
+
 /// Resolve a request's projection fields. The two are spelled out on each request rather than
 /// `#[serde(flatten)]`ed from a shared struct, because flatten buffers the *whole* body — the
 /// query vector included — through `Content` on every search.
@@ -297,11 +336,30 @@ pub struct AggregateRequest {
     /// Attributes to sum alongside the always-reported count.
     #[serde(default)]
     pub sum: Vec<String>,
+    /// Split the answer into one row per distinct value of this attribute.
+    #[serde(default)]
+    pub group_by: Option<String>,
 }
 
-/// Serializable mirror of [`crate::Aggregation`]: `{"count": 12, "sums": {"bytes": {"Int": 40}}}`.
+/// Serializable mirror of [`crate::Aggregation`]: `{"count": 12, "sums": {"bytes": {"Int": 40}}}`,
+/// plus `groups` when the request asked for a `group_by`.
 #[derive(Debug, Serialize)]
 pub struct AggregationDto {
+    pub count: u64,
+    pub sums: BTreeMap<String, Value>,
+    /// Omitted entirely when no `group_by` was requested, so an ungrouped answer keeps the
+    /// shape it had before grouping existed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<GroupDto>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub groups_truncated: bool,
+}
+
+/// One `group_by` row. `value` is `null` for the records missing the attribute — distinct from
+/// a present `{"Null": null}`, which groups on its own.
+#[derive(Debug, Serialize)]
+pub struct GroupDto {
+    pub value: Option<Value>,
     pub count: u64,
     pub sums: BTreeMap<String, Value>,
 }
@@ -311,6 +369,16 @@ impl From<Aggregation> for AggregationDto {
         Self {
             count: a.count,
             sums: a.sums,
+            groups: a
+                .groups
+                .into_iter()
+                .map(|g| GroupDto {
+                    value: g.value,
+                    count: g.count,
+                    sums: g.sums,
+                })
+                .collect(),
+            groups_truncated: a.groups_truncated,
         }
     }
 }
@@ -718,6 +786,8 @@ mod tests {
         let out = AggregationDto::from(crate::Aggregation {
             count: 3,
             sums: BTreeMap::from([("bytes".to_string(), Value::Int(42))]),
+            groups: Vec::new(),
+            groups_truncated: false,
         });
         assert_eq!(
             serde_json::to_value(&out).unwrap(),

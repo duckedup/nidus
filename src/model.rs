@@ -592,6 +592,9 @@ pub struct AggregateOpts {
     pub filter: Filter,
     /// Attributes to sum. A missing or non-numeric value is skipped, not counted as zero.
     pub sum: Vec<String>,
+    /// Split the answer into one [`Group`] per distinct value of this attribute, alongside the
+    /// whole-scope totals. `None` reports the totals alone.
+    pub group_by: Option<String>,
 }
 
 /// The answer to an [`AggregateOpts`]: how many records matched, plus one tagged [`Value`]
@@ -601,6 +604,24 @@ pub struct Aggregation {
     /// Records matching the filter across the scope.
     pub count: u64,
     /// One entry per [`AggregateOpts::sum`] field, in the same set.
+    pub sums: BTreeMap<String, Value>,
+    /// One row per distinct [`AggregateOpts::group_by`] value; empty when none was asked for.
+    /// Ordered by `count` descending, ties broken by the value for a deterministic answer.
+    pub groups: Vec<Group>,
+    /// Set when distinct values outran the group cap and later ones were dropped — so a
+    /// truncated answer is never mistaken for a complete one.
+    pub groups_truncated: bool,
+}
+
+/// One distinct value of [`AggregateOpts::group_by`] and the aggregates over just its records.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Group {
+    /// The distinct value, or `None` for the records missing the attribute entirely — which
+    /// is a different group from those holding [`Value::Null`].
+    pub value: Option<Value>,
+    /// Records in this group.
+    pub count: u64,
+    /// The same sum fields as [`Aggregation::sums`], over this group's records alone.
     pub sums: BTreeMap<String, Value>,
 }
 

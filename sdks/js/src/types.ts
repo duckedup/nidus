@@ -31,13 +31,7 @@ export type Value =
  * {@link v.float} to pin a whole-numbered field to `Float`).
  */
 export type AttrInput =
-  | Value
-  | string
-  | number
-  | boolean
-  | string[]
-  | Date
-  | null;
+  Value | string | number | boolean | string[] | Date | null;
 
 /** A document: caller-supplied `id`, an optional embedding, and typed metadata. */
 export interface NidusRecord {
@@ -308,9 +302,7 @@ export type TextQuerySpelling =
 
 /** The knobs of {@link TextSearchOptions} that do not name what to search. */
 export interface TextSearchBase
-  extends ProjectionOptions,
-    RankingOptions,
-    AnnotationOptions {
+  extends ProjectionOptions, RankingOptions, AnnotationOptions {
   scope?: string[];
   topK?: number;
   /** Skip this many top-ranked hits, for pagination. */
@@ -389,6 +381,11 @@ export interface AggregateOptions {
   filter?: Filter;
   /** Attributes to sum. A missing or non-numeric value is skipped, not counted as zero. */
   sum?: string[];
+  /**
+   * Report one {@link Group} per distinct value of this attribute, alongside the
+   * whole-scope totals. An empty string is a `400`, not "no grouping" — omit it instead.
+   */
+  groupBy?: string;
 }
 
 /** What {@link NidusClient.aggregate} answers: the match count plus one sum per named field. */
@@ -396,6 +393,41 @@ export interface Aggregation {
   count: number;
   /** One entry per requested `sum` field, decoded from its tagged `Int`/`Float`. */
   sums: Record<string, number>;
+  /** One row per distinct `groupBy` value, largest first. Absent when none was asked for. */
+  groups?: Group[];
+  /** Distinct values outran the server's cap and later ones were dropped. */
+  groupsTruncated?: boolean;
+}
+
+/**
+ * One distinct `groupBy` value with the aggregates over just its records. `value` is `null`
+ * for the records missing the attribute — a different group from those holding a `null`.
+ */
+export interface Group {
+  value: DecodedValue | null;
+  count: number;
+  sums: Record<string, number>;
+}
+
+/**
+ * Options for {@link NidusClient.batchSearch}: several vector queries answered in one
+ * round-trip, capped at 16 by the server. Each entry is an ordinary {@link SearchOptions}.
+ */
+export interface BatchSearchOptions {
+  queries: SearchOptions[];
+  /** Merge the per-query rankings into ONE list instead of returning them side by side. */
+  fuse?: BatchFuse;
+}
+
+/**
+ * Cross-query Reciprocal Rank Fusion — the same fusion `hybridSearch` runs, over N query
+ * legs. `weights` must be empty or exactly as long as `queries`; the server refuses a short
+ * list rather than silently re-weighting the wrong leg.
+ */
+export interface BatchFuse {
+  rrfK?: number;
+  weights?: number[];
+  topK?: number;
 }
 
 /**

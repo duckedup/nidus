@@ -6320,8 +6320,126 @@ fn agg(store: &Store, filter: Filter, sum: &[&str]) -> Aggregation {
         &AggregateOpts {
             filter,
             sum: sum.iter().map(|s| s.to_string()).collect(),
+            group_by: None,
         },
     )
+}
+
+fn agg_by(store: &Store, field: &str, sum: &[&str]) -> Aggregation {
+    store.aggregate(
+        &["docs"],
+        &AggregateOpts {
+            filter: Filter::default(),
+            sum: sum.iter().map(|s| s.to_string()).collect(),
+            group_by: Some(field.to_string()),
+        },
+    )
+}
+
+/// `group_by` splits the same pass into per-value rows while the whole-scope totals stay put,
+/// so a caller gets both without a second query (nidus-bmh).
+#[test]
+fn group_by_reports_a_row_per_distinct_value_beside_the_totals() {
+    let store = agg_store();
+    let out = agg_by(&store, "kind", &["bytes"]);
+
+    assert_eq!(out.count, 4, "the totals still cover every record");
+    assert_eq!(out.sums["bytes"], Value::Int(47));
+
+    // Ordered by count descending; `note` holds two of the four records.
+    let kinds: Vec<Option<&Value>> = out.groups.iter().map(|g| g.value.as_ref()).collect();
+    assert_eq!(kinds[0], Some(&Value::Str("note".into())));
+    assert_eq!(out.groups[0].count, 2);
+    assert_eq!(out.groups[0].sums["bytes"], Value::Int(42));
+
+    // Every group's sum covers only its own records, and they add back up to the total.
+    let regrouped: i64 = out
+        .groups
+        .iter()
+        .map(|g| match g.sums["bytes"] {
+            Value::Int(n) => n,
+            ref other => panic!("expected Int, got {other:?}"),
+        })
+        .sum();
+    assert_eq!(regrouped, 47);
+    assert!(!out.groups_truncated);
+}
+
+/// A record with no `kind` at all forms its own group with a `None` value — it is not folded
+/// into `Null` and not silently dropped, so the group counts still sum to the total.
+#[test]
+fn a_record_missing_the_group_attribute_forms_its_own_group() {
+    let store = agg_store();
+    let out = agg_by(&store, "kind", &["bytes"]);
+
+    let missing = out
+        .groups
+        .iter()
+        .find(|g| g.value.is_none())
+        .expect("the attribute-less record must be represented");
+    assert_eq!(missing.count, 1);
+    // It carries no `bytes` either, and a skipped addend is not a zero addend.
+    assert_eq!(missing.sums["bytes"], Value::Int(0));
+
+    let total: u64 = out.groups.iter().map(|g| g.count).sum();
+    assert_eq!(total, out.count, "every record lands in exactly one group");
+}
+
+/// Grouping on an attribute nothing carries is answerable, not an error: one group holding
+/// everything. The empty *name* is the caller mistake, and that is rejected in `Nidus`.
+#[test]
+fn grouping_on_an_unknown_attribute_yields_one_missing_group() {
+    let store = agg_store();
+    let out = agg_by(&store, "nope", &[]);
+    assert_eq!(out.groups.len(), 1);
+    assert_eq!(out.groups[0].value, None);
+    assert_eq!(out.groups[0].count, 4);
+}
+
+/// Past MAX_GROUPS the answer says so. A short list of groups is indistinguishable from a
+/// complete one, which is the whole reason the flag exists rather than a silent truncation.
+/// Ignored under Miri only for its size — 10k records is minutes there, milliseconds natively.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn outrunning_the_group_cap_is_reported_not_hidden() {
+    let mut store = Store::in_memory(2).unwrap();
+    store.create_collection("docs").unwrap();
+    let recs: Vec<Record> = (0..super::aggregate::MAX_GROUPS + 1)
+        .map(|i| {
+            Record::new(
+                format!("r{i}"),
+                vec![1.0, 0.0],
+                BTreeMap::from([("k".to_string(), Value::Int(i as i64))]),
+            )
+        })
+        .collect();
+    store.upsert("docs", &recs).unwrap();
+
+    let out = store.aggregate(
+        &["docs"],
+        &AggregateOpts {
+            filter: Filter::default(),
+            sum: Vec::new(),
+            group_by: Some("k".to_string()),
+        },
+    );
+    assert!(out.groups_truncated, "the cap was hit and must be reported");
+    assert_eq!(out.groups.len(), super::aggregate::MAX_GROUPS);
+    // The totals are still exact: truncation drops GROUPS, never records from the count.
+    assert_eq!(out.count as usize, super::aggregate::MAX_GROUPS + 1);
+}
+
+/// Two calls over one store must agree exactly. `HashMap` iteration order is deliberately
+/// unspecified, so without the sort the tied rows would swap between otherwise identical calls.
+#[test]
+fn group_order_is_stable_across_calls() {
+    let store = agg_store();
+    let a = agg_by(&store, "kind", &["bytes"]);
+    let b = agg_by(&store, "kind", &["bytes"]);
+    let values = |x: &Aggregation| -> Vec<Option<Value>> {
+        x.groups.iter().map(|g| g.value.clone()).collect()
+    };
+    assert_eq!(values(&a), values(&b));
 }
 
 #[test]

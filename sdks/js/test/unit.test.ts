@@ -481,6 +481,81 @@ describe("NidusClient request shaping", () => {
     expect(calls[0]!.json).toEqual({ scope: [], filter: [], sum: [] });
   });
 
+  it("groups an aggregate, decoding each group's value and sums", async () => {
+    const { fn, calls } = mockFetch({
+      count: 3,
+      sums: { bytes: { Int: 8 } },
+      groups: [
+        { value: { Str: "rust" }, count: 2, sums: { bytes: { Int: 8 } } },
+        { value: null, count: 1, sums: { bytes: { Int: 0 } } },
+      ],
+    });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const out = await db.aggregate({ sum: ["bytes"], groupBy: "lang" });
+    expect(calls[0]!.json).toEqual({
+      scope: [],
+      filter: [],
+      sum: ["bytes"],
+      group_by: "lang",
+    });
+    expect(out.groups).toEqual([
+      { value: "rust", count: 2, sums: { bytes: 8 } },
+      // The records missing `lang` entirely — a different group from a present null.
+      { value: null, count: 1, sums: { bytes: 0 } },
+    ]);
+    expect(out.groupsTruncated).toBeUndefined();
+  });
+
+  it("leaves an ungrouped aggregate exactly the shape it always was", async () => {
+    const { fn, calls } = mockFetch({ count: 3, sums: {} });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const out = await db.aggregate({ sum: [] });
+    expect(calls[0]!.json).toEqual({ scope: [], filter: [], sum: [] });
+    expect("groups" in out).toBe(false);
+  });
+
+  it("batches several queries into one request, one ranking per query", async () => {
+    const { fn, calls } = mockFetch({
+      results: [[{ collection: "docs", id: "a", score: 1, attrs: {} }], []],
+    });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const out = await db.batchSearch({
+      queries: [{ query: [1, 0, 0], topK: 1 }, { query: [0, 1, 0] }],
+    });
+    expect(calls[0]!.url).toBe("http://x/search/batch");
+    expect(calls[0]!.json).toEqual({
+      queries: [
+        { query: [1, 0, 0], scope: [], top_k: 1, filter: [] },
+        { query: [0, 1, 0], scope: [], filter: [] },
+      ],
+    });
+    expect(out).toHaveLength(2);
+    expect(out[0]![0]!.id).toBe("a");
+    expect(out[1]).toEqual([]);
+  });
+
+  it("returns a fused batch as a single ranking, so the shape is uniform", async () => {
+    const { fn, calls } = mockFetch({
+      fused: [{ collection: "docs", id: "a", score: 0.5, attrs: {} }],
+    });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const out = await db.batchSearch({
+      queries: [{ query: [1, 0, 0] }, { query: [0, 1, 0] }],
+      fuse: { rrfK: 60, weights: [1, 0.5], topK: 5 },
+    });
+    const sent = calls[0]!.json as { fuse: unknown };
+    expect(sent.fuse).toEqual({ rrf_k: 60, weights: [1, 0.5], top_k: 5 });
+    expect(out).toHaveLength(1);
+    expect(out[0]!.map((h) => h.id)).toEqual(["a"]);
+  });
+
+  it("sends fuse even with no knobs, since fuse is what picks the response shape", async () => {
+    const { fn, calls } = mockFetch({ fused: [] });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.batchSearch({ queries: [{ query: [1, 0, 0] }], fuse: {} });
+    expect((calls[0]!.json as { fuse: unknown }).fuse).toEqual({});
+  });
+
   it("attaches a bearer token when configured", async () => {
     const { fn, calls } = mockFetch([]);
     const db = new NidusClient({ baseUrl: "http://x", fetch: fn, token: "sekret" });

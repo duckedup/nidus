@@ -92,8 +92,9 @@ pub use config::{Config, Fsync, LeaseWait, OpenMode};
 pub use fts::{Analyzer, FtsField, Language};
 pub use model::{
     AggregateOpts, Aggregation, AnnConfig, AnnKind, ClusterStatus, Decay, Distance, Filter,
-    Footprint, FtsClause, FtsCombine, FtsQuery, Hit, HybridOpts, LimitPer, ListOpts, OrderBy,
-    Predicate, Projection, QuantKind, Quantization, RankBy, Record, Role, SearchOpts, Value,
+    Footprint, FtsClause, FtsCombine, FtsQuery, Group, Hit, HybridOpts, LimitPer, ListOpts,
+    OrderBy, Predicate, Projection, QuantKind, Quantization, RankBy, Record, Role, SearchOpts,
+    Value,
 };
 pub use store::Readiness;
 
@@ -296,6 +297,7 @@ impl Nidus {
         opts: &AggregateOpts,
     ) -> Result<Aggregation> {
         filter::validate(&opts.filter)?;
+        store::aggregate::validate_group_by(opts.group_by.as_ref())?;
         let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         Ok(self.store.aggregate(&refs, opts))
