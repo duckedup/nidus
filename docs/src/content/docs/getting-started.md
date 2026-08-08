@@ -24,7 +24,7 @@ toolchain required — and stand up a working local store in four commands. See
 ```toml
 # Cargo.toml
 [dependencies]
-nidus = "0.46"
+nidus = "0.47"
 anyhow = "1"     # nidus returns anyhow::Result
 ```
 
