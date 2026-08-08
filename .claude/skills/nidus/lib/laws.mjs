@@ -207,10 +207,11 @@ const SYSCALLY = new RegExp([
   'spawn', 'Command::', 'thread::', 'SystemTime', 'Instant::', 'env::', 'sleep',
 ].join('|'))
 
-// The documented form: `#[cfg_attr(miri, ignore)] // <why>`. Without this the rule's own
-// remedy ("say so in a comment") could never clear the warning, so a resolved ignore kept
-// nagging and the whole check read as ambient noise (nidus #92).
+// A reason may sit after the attribute or on the line directly above it. Recognising only
+// the trailing form reported already-documented ignores as bare, which is how #99 came to
+// delete two whose reason was written above them (nidus #92).
 const DOCUMENTED_IGNORE = /#\[cfg_attr\(miri,\s*ignore\)\]\s*\/\/\s*\S/
+const REASON_ABOVE = /^\s*\/\/\/?\s*\S/
 
 export function miriIgnore(text, addedLines, file) {
   const lines = text.split('\n')
@@ -219,6 +220,7 @@ export function miriIgnore(text, addedLines, file) {
     if (!/#\[cfg_attr\(miri,\s*ignore\)\]/.test(lines[i])) continue
     if (addedLines && !addedLines.has(i + 1)) continue
     if (DOCUMENTED_IGNORE.test(lines[i])) continue
+    if (i > 0 && REASON_ABOVE.test(lines[i - 1])) continue
     const body = lines.slice(i, i + 40).join('\n')
     if (SYSCALLY.test(body)) continue
     out.push(finding('miri-ignore', 'warn', file, i + 1,
