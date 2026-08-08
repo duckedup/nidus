@@ -641,7 +641,6 @@ mod tests {
         assert_eq!(replayed, vec![new_op]);
     }
 
-    #[cfg_attr(miri, ignore)]
     #[test]
     fn in_memory_append_and_rewrite() {
         let mut log = OpLog::in_memory();
