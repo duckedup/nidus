@@ -5561,6 +5561,10 @@ fn sum_and_max_rank_the_same_corpus_differently() {
 }
 
 #[test]
+// The bit-exactness this asserts is the point, so it is not loosened to a tolerance.
+// BM25's `idf` calls `ln`, which Miri evaluates non-deterministically; real float
+// semantics make these exact, so the guarantee is enforced on the native run.
+#[cfg_attr(miri, ignore)]
 fn a_single_clause_scores_exactly_as_the_one_field_query_always_did() {
     let store = two_field_store(&[
         titled("d1", "t", "the cat sat on the mat"),

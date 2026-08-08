@@ -212,7 +212,10 @@ mod tests {
         let rank = RankBy::Decay(Decay::new("ts", 2_000, 1_000).lambda(1.0));
         let as_int = adjust(Some(&rank), 1.0, &attrs(&[("ts", Value::Int(1_000))]));
         let as_dt = adjust(Some(&rank), 1.0, &attrs(&[("ts", Value::DateTime(1_000))]));
-        assert_eq!(as_int, as_dt);
+        // Tolerance, not equality: the claim is that both variants take the same code
+        // path, and Miri rounds `powf` non-deterministically per call, so two identical
+        // inputs can differ by an ULP there while agreeing bit-for-bit natively.
+        assert!((as_int - as_dt).abs() < 1e-6, "{as_int} vs {as_dt}");
     }
 
     #[test]
