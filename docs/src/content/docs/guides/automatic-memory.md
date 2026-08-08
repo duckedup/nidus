@@ -167,12 +167,14 @@ set -euo pipefail
 
 NIDUS=${NIDUS_URL:-http://127.0.0.1:7700}
 input=$(cat)
-transcript=$(jq -r '.transcript_path // empty' <<<"$input")
-session=$(jq -r '.session_id // "unknown"' <<<"$input")
+# `|| exit 0` on every jq: under `set -e` a malformed payload would otherwise kill the
+# hook here, before the guard below that exists to handle exactly that.
+transcript=$(jq -r '.transcript_path // empty' <<<"$input") || exit 0
+session=$(jq -r '.session_id // "unknown"' <<<"$input") || exit 0
 [ -n "$transcript" ] && [ -f "$transcript" ] || exit 0
 
 # Whatever you choose to persist. Keep it small and factual.
-text=$(tail -n 200 "$transcript" | jq -rs 'map(select(.type=="assistant")) | last.message.content[0].text // empty' 2>/dev/null)
+text=$(tail -n 200 "$transcript" | jq -rs 'map(select(.type=="assistant")) | last.message.content[0].text // empty' 2>/dev/null) || exit 0
 [ -n "$text" ] || exit 0
 
 curl -sS --max-time 5 -o /dev/null \
@@ -268,11 +270,20 @@ curl -sS http://127.0.0.1:7700/text-search \
 time. nidus runs no background threads, so nothing sweeps expired entries on its own
 and the bytes stay on disk until you reclaim them deliberately:
 
+Reclaim through the **running server**, not the CLI — `nidus delete` and `nidus
+compact` open the store read-write and would block on the writer lock `nidus serve`
+already holds, for exactly the reason the stdio transport does:
+
 ```bash
 NOW=$(( $(date +%s) * 1000 ))
-nidus delete --dir ~/.nidus memories --where "[{\"Le\":[\"nidus.expires_at\",{\"DateTime\":$NOW}]}]"
-nidus compact --dir ~/.nidus
+curl -sS http://127.0.0.1:7700/collections/memories/delete \
+  -H 'content-type: application/json' \
+  -d "{\"filter\":[{\"Le\":[\"nidus.expires_at\",{\"DateTime\":$NOW}]}]}"
+curl -sS -X POST http://127.0.0.1:7700/compact
 ```
+
+The CLI forms (`nidus delete … --where`, `nidus compact`) are the same operations for
+a store with no server running.
 
 **TTL is enforced on the MCP tools, not the raw HTTP search routes.** `recall`,
 `text_search`, `hybrid_search`, `browse` and `get` over MCP filter expired entries for
