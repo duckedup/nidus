@@ -237,8 +237,7 @@ is `compact()`, which collapses the live set and **rewrites the base segment in
 place** (`Segments::rewrite`), leaving the sealed ones unreferenced for deletion.
 `open` reads the manifest, loads the live segments into one global row space, and
 replays `log` into an in-RAM index (`collection → { id → (row, attrs) }`). Search is
-brute-force
-cosine over a `Scope` — one collection, a subset, or the whole store — merged into
+brute-force cosine over a `Scope` — one collection, a subset, or the whole store — merged into
 one ranking (sound because all collections share one embedding space); vectors are
 unit-normalized on insert so `score = dot(v, q)`.
 
