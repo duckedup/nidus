@@ -315,7 +315,10 @@ mmap (`src/data/mmap.rs`) — so check §9 rather than trusting a list here.
   the crate's published rustdoc landing page (what a reader meets on docs.rs), not
   commentary sitting between a reader and the code, so the reason for the cap — keeping
   code on screen — does not apply. `//!` earns no licence to ramble; it is just reviewed
-  as documentation rather than counted. `lib/laws.mjs` `commentCap` implements both.
+  as documentation rather than counted. The exemption is **per line, not per block**: a
+  `///` doc that happens to abut a `//!` one — no blank line between, which is ordinary
+  Rust — is still counted, or a stray `//!` would be a one-line way to dodge the cap.
+  `lib/laws.mjs` `commentCap` implements both exceptions.
 - **Commit style**: emoji prefix + short description (e.g. `🪺 op-log codec`).
 - **Issue tracking**: GitHub Issues — run `gh issue list --state open` for available work.
 - **Branch workflow**: one branch per issue or bundled epic, push for PR review.
