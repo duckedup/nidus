@@ -105,7 +105,7 @@ or the SDKs need a matching change. Quote the CLAUDE.md lines that apply.`,
   },
   {
     key: 'prior-art',
-    prompt: `Find prior art. Search bd for related issues and memories (\`bd search\`, \`bd memories\`),
+    prompt: `Find prior art. Search GitHub for related issues (\`gh issue list --search\`, \`gh issue list --state closed\`),
 read SPEC.md for the relevant section (especially §9's deferred seams), and read git history
 (\`git log --oneline\`, then \`git show\`) for earlier attempts or decisions about this area.
 Report what was already decided and why, so this change does not relitigate it.`,

@@ -22,10 +22,13 @@
 .idea/
 .vscode/
 
-# ── Beads / Dolt files (added by bd init) ────────────────────────────────────
+# ── Retired beads/Dolt tracker ───────────────────────────────────────────────
+# .beads/issues.jsonl is kept as a frozen archive; everything else was local state.
 .dolt/
 *.db
 .beads-credential-key
+.beads/*
+!.beads/issues.jsonl
 
 # Agent worktrees (created inside the repo by isolated subagent runs)
 .claude/worktrees/

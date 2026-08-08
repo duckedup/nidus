@@ -21,7 +21,7 @@ export function commentCap(text, addedLines = null, file = '') {
       if (touches) {
         out.push(finding('comment-cap', 'error', file, block.start,
           `comment block is ${block.counted} lines — the cap is 3`,
-          'CLAUDE.md: a comment earns its place by saying what the code cannot. Rationale longer than three lines belongs in the commit message, the PR, SPEC.md, or a bd issue.'))
+          'CLAUDE.md: a comment earns its place by saying what the code cannot. Rationale longer than three lines belongs in the commit message, the PR, SPEC.md, or a GitHub issue.'))
       }
     }
     block = null
@@ -243,20 +243,15 @@ export function modGating(libText) {
   return out
 }
 
-// ── 10. Tickets left in_progress ───────────────────────────────────────────
-// `bd ready` and `bd list --status open` both HIDE in_progress, so a forgotten
-// ticket is invisible to every routine check (PR #63 found ten of them).
-
-// An epic spans several PRs by design, so in_progress is its correct resting state —
-// flagging it would fire on every PR of the epic and train the reader to ignore this.
-export function inProgressTickets(issues, mentioned = new Set()) {
-  return (issues || []).filter(i => i.type !== 'epic').map(i => mentioned.has(i.id)
-    ? finding('stale-ticket', 'warn', '.beads', 1,
-      `${i.id} is shipped by this change but still in_progress`,
-      `"${i.title}". CLAUDE.md: close the ticket in the PR that ships it, not in a later cleanup pass.`)
-    : finding('stale-ticket', 'warn', '.beads', 1,
-      `${i.id} is parked in_progress and unrelated to this change`,
-      `"${i.title}". bd ready and bd list --status open both HIDE in_progress, so this is invisible to every routine check (PR #63 found ten of them).`))
+// ── 10. Issues this change ships but does not close ────────────────────────
+// A bare mention does not close on merge, so the issue silently outlives the work
+// that finished it (PR #63 found ten such tickets under the previous tracker).
+export function unclosedTickets(mentioned = new Set(), closing = new Set(), titles = {}) {
+  return Array.from(mentioned)
+    .filter(ref => !closing.has(ref) && titles[ref])
+    .map(ref => finding('stale-ticket', 'warn', 'PR body', 1,
+      `${ref} is worked by this change but no Closes line will close it`,
+      `"${titles[ref]}". CLAUDE.md: close the ticket in the PR that ships it. Add "Closes ${ref}" to the PR body, or leave it as Refs if this change does not finish it.`))
 }
 
 export const LAW_IDS = [
