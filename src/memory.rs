@@ -1,11 +1,12 @@
 //! Text-native memory API (epic nidus-54l, tickets .4 + .10).
 
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 
 use crate::embed::{AnyEmbedder, Embedder, embedder_identity};
-use crate::{Filter, Hit, Nidus, Record, SearchOpts, Value};
+use crate::{Filter, FtsField, Hit, Nidus, Predicate, Record, SearchOpts, Value};
 
 #[cfg(feature = "summarize")]
 use crate::summarize::{AnySummarizer, SummarizeOpts, Summarizer};
@@ -19,10 +20,22 @@ pub const META_DIM: &str = "nidus.dim";
 /// (the text that was actually embedded).
 #[cfg(feature = "summarize")]
 pub const META_SUMMARY: &str = "nidus.summary";
-/// Attr key under which [`RememberMode::Summarize`] stores the original source
-/// text, so a recall hit is explainable back to what was ingested.
+/// Attr key under which [`RememberMode::Summarize`] stored the original source
+/// text before `nidus.text` existed. No longer stamped, kept so legacy records
+/// (written before nidus-k28) remain readable.
 #[cfg(feature = "summarize")]
 pub const META_SOURCE: &str = "nidus.source";
+/// Attr key holding the raw remembered text, stamped on every `remember` write
+/// regardless of mode (nidus-k28.7).
+pub const META_TEXT: &str = "nidus.text";
+/// Attr key holding the `Value::DateTime` (UTC epoch ms) an entry was first written.
+/// Carries forward unchanged on a dedup update-in-place.
+pub const META_CREATED_AT: &str = "nidus.created_at";
+/// Attr key holding the `Value::DateTime` (UTC epoch ms) an entry was last written.
+pub const META_UPDATED_AT: &str = "nidus.updated_at";
+/// Attr key holding the `Value::DateTime` (UTC epoch ms) after which an entry is
+/// expired. Absent means the entry never expires.
+pub const META_EXPIRES_AT: &str = "nidus.expires_at";
 
 /// Default `top_k` used by [`recall`](Memory::recall) when [`RecallOpts::top_k`]
 /// is left at its `0` default.
@@ -150,6 +163,66 @@ impl Memory {
 // ── Internals (generic over `impl Embedder` so unit tests can drive them with a
 // fake embedder, and so the borrow of `self.db` / `self.embedder` splits cleanly) ──
 
+/// The default full-text schema every `remember`-provisioned collection declares: the raw
+/// remembered text, all-default tuning (English analyzer, `k1=1.2`, `b=0.75`).
+pub(crate) fn default_fts_fields() -> Vec<FtsField> {
+    vec![FtsField::new(META_TEXT)]
+}
+
+/// The current time as `Value::DateTime`'s representation: UTC epoch milliseconds.
+/// Callers land in a later unit of nidus-k28 (the `remember`/HTTP write paths).
+#[allow(dead_code)]
+pub(crate) fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Drop caller-supplied recency keys before stamping. `created_at`/`updated_at` would be
+/// overwritten anyway, but `expires_at` survives when no TTL is passed — letting a caller
+/// set an expiry that never went through `ttl_seconds`.
+#[allow(dead_code)]
+pub(crate) fn strip_reserved_recency(attrs: &mut BTreeMap<String, Value>) {
+    for key in [META_CREATED_AT, META_UPDATED_AT, META_EXPIRES_AT] {
+        attrs.remove(key);
+    }
+}
+
+/// Stamp recency attrs in place: `updated_at` always moves to `now_ms`; `created_at`
+/// carries forward from `prior_created` (an update-in-place) or is set to `now_ms` (a
+/// fresh entry); `expires_at` is set only when `ttl_seconds` is given.
+#[allow(dead_code)]
+pub(crate) fn stamp_recency(
+    attrs: &mut BTreeMap<String, Value>,
+    now_ms: i64,
+    prior_created: Option<i64>,
+    ttl_seconds: Option<i64>,
+) {
+    let created = prior_created.unwrap_or(now_ms);
+    attrs.insert(META_CREATED_AT.to_string(), Value::DateTime(created));
+    attrs.insert(META_UPDATED_AT.to_string(), Value::DateTime(now_ms));
+    if let Some(ttl) = ttl_seconds {
+        attrs.insert(
+            META_EXPIRES_AT.to_string(),
+            // Saturating: `ttl_seconds` is unvalidated caller input over the wire, and a
+            // plain multiply-add would panic in debug and wrap in release.
+            Value::DateTime(now_ms.saturating_add(ttl.saturating_mul(1000))),
+        );
+    }
+}
+
+/// The true-complement "not expired" predicate: true when `nidus.expires_at` is in the
+/// future *and* true when it is absent (never TTL'd). A bare `Gt`/`Ge` would be false on
+/// an absent key (`range_matches`), silently hiding every memory that never got a TTL.
+#[allow(dead_code)]
+pub(crate) fn not_expired_predicate(now_ms: i64) -> Predicate {
+    Predicate::Not(Box::new(Predicate::Le(
+        META_EXPIRES_AT.to_string(),
+        Value::DateTime(now_ms),
+    )))
+}
+
 /// Ensure `collection` exists and its embedding space matches `embedder`, pinning the identity +
 /// dimension on first use. Errors on a dimension mismatch with the store, or on an embedder
 /// identity that differs from what the collection was first written with.
@@ -179,6 +252,12 @@ pub(crate) fn ensure_collection_and_pin<E: Embedder>(
             meta.insert(META_DIM.to_string(), store_dim.to_string());
             db.set_meta(collection, meta)?;
         }
+    }
+
+    // Gated on the real schema, not a meta flag: `set_fts_schema` rebuilds the field
+    // index from every live doc, so calling it per-write would be O(collection size).
+    if !db.has_fts_schema(collection) {
+        db.set_fts_schema(collection, &default_fts_fields())?;
     }
     Ok(())
 }
@@ -384,6 +463,103 @@ mod tests {
         let meta = db.get_meta("notes");
         assert_eq!(meta.get(META_EMBEDDER).map(String::as_str), Some("fake/v1"));
         assert_eq!(meta.get(META_DIM).map(String::as_str), Some("8"));
+    }
+
+    #[test]
+    fn stamp_recency_fresh_entry_sets_created_and_updated() {
+        let mut attrs = BTreeMap::new();
+        stamp_recency(&mut attrs, 1_000, None, None);
+        assert_eq!(attrs.get(META_CREATED_AT), Some(&Value::DateTime(1_000)));
+        assert_eq!(attrs.get(META_UPDATED_AT), Some(&Value::DateTime(1_000)));
+        assert!(!attrs.contains_key(META_EXPIRES_AT));
+    }
+
+    #[test]
+    fn stamp_recency_preserves_prior_created_and_sets_ttl() {
+        let mut attrs = BTreeMap::new();
+        stamp_recency(&mut attrs, 2_000, Some(500), Some(60));
+        assert_eq!(attrs.get(META_CREATED_AT), Some(&Value::DateTime(500)));
+        assert_eq!(attrs.get(META_UPDATED_AT), Some(&Value::DateTime(2_000)));
+        assert_eq!(
+            attrs.get(META_EXPIRES_AT),
+            Some(&Value::DateTime(2_000 + 60_000))
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    fn not_expired_predicate_matches_absent_and_unexpired_not_expired() {
+        let (_dir, mut db) = open_tmp(3);
+        db.create_collection("col").unwrap();
+        let now = 1_700_000_000_000i64;
+
+        let unexpired =
+            BTreeMap::from([(META_EXPIRES_AT.to_string(), Value::DateTime(now + 60_000))]);
+        let expired = BTreeMap::from([(META_EXPIRES_AT.to_string(), Value::DateTime(now - 1))]);
+
+        db.upsert(
+            "col",
+            &[
+                Record::new("never_ttld", vec![1.0, 0.0, 0.0], BTreeMap::new()),
+                Record::new("unexpired", vec![1.0, 0.0, 0.0], unexpired),
+                Record::new("expired", vec![1.0, 0.0, 0.0], expired),
+            ],
+        )
+        .unwrap();
+
+        let opts = SearchOpts {
+            top_k: 10,
+            filter: Filter(vec![not_expired_predicate(now)]),
+            ..Default::default()
+        };
+        let hits = db.search("col", &[1.0, 0.0, 0.0], &opts).unwrap();
+        let mut ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["never_ttld", "unexpired"]);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn first_write_declares_default_fts_schema_and_is_gated() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+
+        assert!(!db.has_fts_schema("notes"));
+        embed_and_store(&mut db, &emb, "notes", "a", "hello world", BTreeMap::new())
+            .await
+            .unwrap();
+        assert!(db.has_fts_schema("notes"));
+
+        // Simulate a schema declared directly (not through `remember`). If the second
+        // write below is not gated on `has_fts_schema`, it clobbers this back to the
+        // default schema — the O(collection size) rebuild the gate exists to avoid.
+        db.set_fts_schema("notes", &[crate::FtsField::new("custom_field")])
+            .unwrap();
+
+        let mut attrs = BTreeMap::new();
+        attrs.insert(
+            "custom_field".to_string(),
+            Value::Str("bananas".to_string()),
+        );
+        embed_and_store(&mut db, &emb, "notes", "b", "more text", attrs)
+            .await
+            .unwrap();
+
+        let hits = db
+            .text_search(
+                "notes",
+                &crate::FtsQuery::new("custom_field", "bananas"),
+                &SearchOpts {
+                    top_k: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "a gated second write must not redeclare the default schema over the custom one"
+        );
     }
 
     #[tokio::test]

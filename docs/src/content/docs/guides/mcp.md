@@ -107,6 +107,49 @@ JSON array of metadata predicates, AND-combined, with `Any`/`Not` for OR and
 negation. It narrows a search to the records that match before scoring — the
 same filters `forget` and `browse` use to scope which records they touch.
 
+### No setup step
+
+`remember` provisions what it needs on first write: it creates the collection if
+it is missing and declares a full-text schema over the stored text, so
+`text_search` and `hybrid_search` work on a collection that a client created
+purely over MCP. Going from an empty store to a working hybrid search takes no
+CLI invocation and no HTTP call.
+
+### Reserved attrs
+
+`remember` stamps a few keys of its own alongside whatever `attrs` you pass.
+They are ordinary attrs — filterable, and usable as the timestamp field for
+recency-decay ranking — so they are worth knowing by name:
+
+| Key | What it holds |
+| --- | --- |
+| `nidus.text` | The text you remembered, verbatim. This is the field the default full-text schema indexes. |
+| `nidus.created_at` | When the entry was first written, as a `DateTime` (UTC epoch ms). Preserved when you re-remember the same id. |
+| `nidus.updated_at` | When the entry was last written. |
+| `nidus.expires_at` | Set only when you pass `ttl_seconds`; after this instant the entry stops surfacing. |
+
+Reserved keys win a collision, so an attr you pass under one of these names is
+overwritten rather than silently changing what the store relies on. In summarize
+mode `nidus.summary` holds the generated summary — the text that was actually
+embedded — while `nidus.text` still holds your original.
+
+### Expiry and duplicates
+
+`remember` takes two optional arguments that shape what accumulates:
+
+- **`ttl_seconds`** gives the entry a lifetime. Past it, the entry stops coming
+  back from `recall`, `text_search`, `hybrid_search`, `browse`, and `get`.
+- **`dedupe_threshold`** (0–1) turns on a similarity check at write time. If an
+  existing entry in the collection scores above the threshold against the new
+  text, that entry is updated in place instead of a competing near-duplicate
+  being inserted, and the response tells you which happened. Attrs already on the
+  matched entry that your call did not supply are **kept**, not dropped; the
+  attrs you do supply win. Expired entries are never dedupe candidates, so a
+  write is never merged onto a record that has already lapsed. Leave it out and
+  the check never runs — which is worth knowing, because the check costs a scan
+  of the collection while the write lock is held, so on a large collection an
+  opted-in `remember` is meaningfully slower than one without it.
+
 Correcting or removing what you stored is `forget`'s job: pass `ids` to
 remove specific memories, or `filter` to remove every match at once. At least
 one of them is required — a call with neither is refused rather than treated
@@ -120,10 +163,22 @@ can spot a near-duplicate before adding one.
 The surface is deliberately small. There are no MCP resources, prompts,
 subscriptions, or tasks: every nidus operation is a fast synchronous call, so
 there is nothing to subscribe to and nothing long-running to hand back a task
-handle for. Record-level hygiene is exposed (`forget`, `get`, `browse`), but
-collection-level lifecycle — creating, configuring, or dropping a collection —
-and store maintenance (`compact`, `flush`) are not: those remain operator
-actions, deliberately out of an agent's reach.
+handle for. Record-level hygiene is exposed (`forget`, `get`, `browse`), and
+`remember` provisions a collection on first write, but the rest of
+collection-level lifecycle — reconfiguring or dropping one — and store
+maintenance (`compact`, `flush`) are not: those remain operator actions,
+deliberately out of an agent's reach.
+
+**A TTL hides an entry; it does not reclaim its row.** Expiry is applied when
+you read, by excluding expired entries from results. The underlying row stays
+until something explicitly deletes it and compacts the store, and nidus runs no
+background threads — so nothing sweeps on a timer. A long-lived store with heavy
+TTL churn grows until an operator compacts it.
+
+**Expiry applies to the MCP tools, not to the raw HTTP search routes.**
+`POST /search`, `/recall`, and `/list` are a general-purpose store API whose
+callers pass their own filters; they return expired entries unless you filter
+`nidus.expires_at` yourself.
 
 Authorization is the server's existing bearer token rather than MCP's OAuth
 flows. For a store you run yourself, a token over loopback is the honest security

@@ -113,6 +113,13 @@ impl Store {
         self.collections.contains_key(name)
     }
 
+    /// Whether `collection` already has a declared FTS schema. The truthful gate for
+    /// callers that must call `set_fts_schema` at most once per collection, since that
+    /// call rebuilds the field index from every live doc (`store/write.rs`).
+    pub fn has_fts_schema(&self, collection: &str) -> bool {
+        self.fts.schema_for(collection).is_some()
+    }
+
     /// Returns collection names sorted alphabetically.
     pub fn collections(&self) -> Vec<String> {
         let mut names: Vec<String> = self.collections.keys().cloned().collect();

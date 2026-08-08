@@ -438,7 +438,8 @@ export interface BatchFuse {
 export interface RememberOptions {
   /**
    * `"raw"` (embed the text as given, the default) or `"summarize"` (summarize
-   * first, then embed the summary — stamps `nidus.summary`/`nidus.source` attrs).
+   * first, then embed the summary — stamps a `nidus.summary` attr). The raw text
+   * is always stored under `nidus.text`.
    */
   mode?: "raw" | "summarize";
   /** Typed metadata to stamp on the stored record (plain JS values auto-normalized). */

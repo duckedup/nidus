@@ -441,7 +441,8 @@ class NidusClient:
         """Embed ``text`` and upsert it under ``id`` (idempotent on ``id``).
 
         With ``mode="summarize"`` the server summarizes first, embeds the summary, and
-        stamps ``nidus.summary``/``nidus.source`` attrs (needs a summarizer configured).
+        stamps a ``nidus.summary`` attr (needs a summarizer configured). The raw text is
+        always stored under ``nidus.text``, whichever mode is used.
         """
         self._request(
             "POST", _wire.remember_path(collection), _wire.remember_body(id, text, mode, attrs)

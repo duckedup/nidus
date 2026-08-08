@@ -299,10 +299,13 @@ fn summarize_mode_preserves_caller_attrs_alongside_meta() {
         json!({"Str": "A dense summary."}),
         "the summarizer's own stamped attr must still be present: {hit}"
     );
+    // The raw text rides in `nidus.text` on every write now (nidus-k28.7); `nidus.source`
+    // is no longer stamped, since it carried exactly this value.
     assert_eq!(
-        hit["attrs"]["nidus.source"],
+        hit["attrs"]["nidus.text"],
         json!({"Str": "a very long document worth summarizing"})
     );
+    assert_eq!(hit["attrs"]["nidus.source"], json!(null));
 }
 
 /// A malformed attrs map is a caller fault (`-32602`), the same classification

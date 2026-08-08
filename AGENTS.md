@@ -6,11 +6,10 @@ This project tracks work in **GitHub Issues** on `duckedup/nidus`, via the `gh` 
 > checkout carries no tracker data and there is nothing to sync, export, or import.
 > `gh` is the only interface.
 >
-> This replaced an embedded beads/Dolt tracker whose exporter rewrote the whole of
-> `.beads/issues.jsonl` from each branch's local database — so any branch could
-> silently revert another's closes, and one did. That file is retained as a **frozen,
-> read-only archive** of the pre-migration issues; never write to it, and never
-> reinstall the `bd` git hooks.
+> This replaced an embedded beads/Dolt tracker whose exporter rewrote the whole issue
+> file from each branch's local database — so any branch could silently revert
+> another's closes, and one did (#83). It is fully retired: never reinstall it or its
+> git hooks. The pre-migration issues remain in this repository's git history.
 
 ## Quick Reference
 

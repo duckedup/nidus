@@ -104,7 +104,7 @@ const RULES = [
 
 // Paths that need no build lane at all — reported so the caller can say why
 // nothing ran, instead of silently returning an empty set.
-const INERT = [/^\.claude\//, /^\.github\//, /^\.beads\//, /^[^/]*\.md$/, /^LICENSE$/, /^\.gitignore$/, /LICENSE$/, /^sdks\/[^/]+\/.*\.md$/]
+const INERT = [/^\.claude\//, /^\.github\//, /^[^/]*\.md$/, /^LICENSE$/, /^\.gitignore$/, /LICENSE$/, /^sdks\/[^/]+\/.*\.md$/]
 
 const covers = (rule, f) => rule.match.some(re => re.test(f)) && !(rule.exclude || []).some(re => re.test(f))
 

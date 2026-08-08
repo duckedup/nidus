@@ -238,6 +238,52 @@ fn delete_where_by_attr() {
 }
 
 #[test]
+fn not_expired_predicate_is_a_true_complement() {
+    // Mirrors `memory::not_expired_predicate`, which is behind the `memory` feature and
+    // so unimportable here: true when unexpired *and* when the key is absent, where a
+    // bare `Gt`/`Ge` would be false and hide every never-TTL'd memory.
+    const EXPIRES_AT: &str = "nidus.expires_at";
+    let not_expired = |now: i64| -> Predicate {
+        Predicate::Not(Box::new(Predicate::Le(
+            EXPIRES_AT.to_string(),
+            Value::DateTime(now),
+        )))
+    };
+
+    let mut store = Store::in_memory(3).unwrap();
+    store.create_collection("col").unwrap();
+    let now = 1_700_000_000_000i64;
+
+    let unexpired = BTreeMap::from([(EXPIRES_AT.to_string(), Value::DateTime(now + 60_000))]);
+    let expired = BTreeMap::from([(EXPIRES_AT.to_string(), Value::DateTime(now - 1))]);
+
+    store
+        .upsert(
+            "col",
+            &[
+                rec_with("never_ttld", vec![1.0, 0.0, 0.0], BTreeMap::new()),
+                rec_with("unexpired", vec![1.0, 0.0, 0.0], unexpired),
+                rec_with("expired", vec![1.0, 0.0, 0.0], expired),
+            ],
+        )
+        .unwrap();
+
+    let opts = SearchOpts {
+        top_k: 10,
+        filter: Filter(vec![not_expired(now)]),
+        ..Default::default()
+    };
+    let hits = store.search(&["col"], &[1.0, 0.0, 0.0], &opts).unwrap();
+    let mut ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["never_ttld", "unexpired"],
+        "absent-key and unexpired must match; expired must not"
+    );
+}
+
+#[test]
 fn min_score_filters_low_results() {
     let mut store = Store::in_memory(3).unwrap();
     store.create_collection("col").unwrap();

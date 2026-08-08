@@ -9,7 +9,7 @@ default-members = ["."]
 
 [package]
 name = "nidus"
-version = "0.54.0"
+version = "0.55.0"
 edition = "2024"
 rust-version = "1.96"
 description = "A small, pure-Rust embeddable vector store: brute-force or ANN cosine search over a single append-only directory, with pluggable persistence (local files, S3, GCS). No SQL, no query engine; builds in seconds."
@@ -21,7 +21,7 @@ categories = ["database-implementations", "data-structures"]
 # `docs/` and `sdks/` are excluded for the same reason — an Astro site and the
 # client SDKs are separately-published artifacts (GitHub Pages, npm, PyPI, the Go
 # module proxy), so shipping their sources to every `cargo add nidus` is pure weight.
-exclude = [".beads/", ".claude/", ".github/", "AGENTS.md", "justfile", "benchmarks/", "charts/", "Dockerfile", ".dockerignore", "docs/", "sdks/"]
+exclude = [".claude/", ".github/", "AGENTS.md", "justfile", "benchmarks/", "charts/", "Dockerfile", ".dockerignore", "docs/", "sdks/"]
 
 [lib]
 name = "nidus"
