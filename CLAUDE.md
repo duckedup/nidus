@@ -68,7 +68,7 @@ just fmt           # format code
 just build         # debug build
 just release       # optimized release build
 just doc           # build + open API docs
-just deps          # assert the dependency tree is empty
+just deps          # print the dependency tree (cargo tree -p nidus)
 ```
 
 Rust 1.96+ required (pinned via `rust-toolchain.toml`). Edition 2024.
@@ -78,10 +78,20 @@ Rust 1.96+ required (pinned via `rust-toolchain.toml`). Edition 2024.
 The crate ships an optional binary — the CLI plus `nidus serve` (an axum/tokio HTTP
 wrapper, SPEC.md §9). It is gated behind the **non-default `cli` feature**, exactly
 like the benchmarks are a separate member: the core recipes above (`just test`,
-`ci`, `lint`, and Miri) build ONLY the pure library, so `cargo add nidus` and `just
-deps` pull nothing beyond the four core crates and the FFI-free, seconds-long build
-path stays intact. The binary's deps (`clap`, `tokio`, `axum`, `tower`,
-`serde_json` — all still pure Rust, zero FFI) compile only under `--features cli`.
+`ci`, `lint`, and Miri) build ONLY the pure library, so `cargo add nidus` keeps the
+seconds-long build path intact. The binary's deps (`clap`, `tokio`, `axum`, `tower`,
+`serde_json`, `tar`, `flate2` — all pure Rust, zero FFI) compile only under
+`--features cli`; the AI ingest layer (`embed`/`summarize`/`memory`/`mcp`, which add
+`reqwest` + `rmcp`) is likewise off by default.
+
+The default build is **not** the four-crate core any more, and CI does not claim it
+is: alongside `anyhow`/`serde`/`bincode`/`crc32fast` it carries `regex` (§7.5), the
+S3/GCS/redis backend stack (`rusty-s3`, `tame-gcs`, `tame-oauth`, `ureq`, `url`,
+`http`, `redis` — deliberately un-gated so `file://`→`s3://` is a runtime switch, not
+a recompile), and `memmap2` + `bytemuck` for the mmap seam. So the default build is
+not FFI-free either — `ring` (ureq's TLS) and `memmap2` are the two conscious
+opt-ins. What is enforced is the *budget*, not the crate count: whole-crate clean
+build well under a minute (see the dependency bar below).
 
 ```bash
 just ci-cli        # fmt-check + clippy + test, all with --features cli
@@ -93,12 +103,12 @@ just install       # cargo install --path . --features cli
 
 `nidus serve` also answers **MCP `2026-07-28`** at `/mcp` behind the `mcp` feature
 (folded into `serve`), so any MCP client can use the memory layer as agent memory.
-`src/server/mcp.rs` is an *adapter*: every tool routes through the same
+`src/server/mcp/` is an *adapter*: every tool routes through the same
 `run_read`/`run_write` helpers the HTTP handlers use, and the service is
 `nest_service`'d **inside** the middleware stack so it inherits the body limit,
 backpressure, bearer auth, and metrics rather than reimplementing any of them. Two
 things there are load-bearing and easy to break: the tool surface is **text-native**
-(no tool may take a raw `vector` — a model cannot emit one, and `tests/e2e/mcp.rs`
+(no tool may take a raw `vector` — a model cannot emit one, and `tests/e2e/mcp/`
 asserts it), and tool schemas are **hand-written JSON**, never `schemars`-derived,
 because the descriptions drive tool-selection quality. Verify with
 `cargo clippy --all-targets --features mcp -- -D warnings` and `just test-e2e`.
@@ -120,12 +130,16 @@ pure-Rust crates** (`anyhow`, `serde`/`bincode`, `crc32fast`, …); the S3/GCS
 persistence backends add sans-IO clients (`rusty-s3`/`tame-gcs`) over `ureq`, whose
 default TLS is rustls + **`ring`** — a *small* C+asm compile. `ring` is **allowed**
 (in the default build, not feature-gated, so `file://`→`s3://` is a runtime switch).
-Our own code still carries `#![forbid(unsafe_code)]`.
+Our own code still carries `#![deny(unsafe_code)]` (see "Safe Rust" below for why
+`deny` and not `forbid`).
 
 **FORBIDDEN — the multi-minute C trees nidus exists to avoid:** bundled C/C++
 (DuckDB's `libduckdb-sys`), vendored OpenSSL, `aws-lc-sys`, or a transitively-huge
 graph (Arrow + DataFusion). The guardrail is empirical: **the whole-crate clean build
-stays well under a minute** (measured ~7s; CI asserts it). Adding a dependency that
+stays well under a minute** (measured ~7s). Note this is a *reviewer's* guardrail, not
+an automated one — no CI job times the build today, so nothing will fail the PR that
+blows the budget; SPEC §1 and the `Cargo.toml` comment both still claim CI asserts it
+(#95). Adding a dependency that
 blows that budget — or a bundled-C / native-linking crate — is a design change, not
 an implementation detail: raise it as an issue first. Judge a dep by "does it blow up
 compile time / require a heavy toolchain / bloat the binary," not "is it pure Rust."
@@ -158,45 +172,83 @@ no query engine, no network, no background threads.
 
 ```
 src/
-├── lib.rs       # Public API: Nidus::{open, upsert, delete, delete_where, get_all, list, search, flush, compact}
-├── value.rs     # Value (Null|Str|Int|Bool|List) + binary encode/decode
-├── record.rs    # Record { id, vector, attrs }
-├── filter.rs    # Predicate (Eq|Ne|Glob|In|NotIn|Lt|Le|Gt|Ge) / Filter + matching
-├── glob.rs      # minimal * ? [..] matcher (covers the GLOB subset callers use)
-├── search.rs    # distance kernels (cosine/dot/euclidean, f32 + int8 + binary Hamming) + bounded top-k heap + min_score
-├── ann/         # opt-in ANN index (Config::ann): hnsw.rs graph + ivf.rs lists; seeded PRNG, no deps
-├── data.rs      # flat f32 segment: header, append, row accessor (the future mmap seam)
-├── log.rs       # op-log codec: len + payload + crc32, replay, torn-tail recovery
-├── lock.rs      # writer exclusion via O_EXCL lock file (pure std, no flock/FFI)
-├── crc.rs       # ~15-line table CRC32 (zero-dep checksum)
-├── store/       # the integrator, split by concern (see "Keep files focused"):
-│   ├── mod.rs    #   Store type + open/in_memory constructors + ANN index lifecycle glue
+├── lib.rs        # Public API: Nidus::{open, upsert, delete, delete_where, get_all, list, search, flush, compact}
+├── config.rs     # Config: Fsync, OpenMode, ann/quant/memory/persistence settings (SPEC §4.1)
+├── model.rs      # the shared type vocabulary — Value, Record, Predicate/Filter, Op, Distance,
+│                 #   Quantization, AnnConfig, FtsQuery/FtsClause/… (pure defs + serde)
+├── glob/         # minimal * ? [..] matcher (covers the GLOB subset callers use, SPEC §7.1)
+├── filter/       # filter evaluation: mod.rs (dispatch + per-query validate/prepare),
+│                 #   text.rs (Levenshtein + the filter tokenizer, §7.4), pattern.rs (regex, §7.5)
+├── search/       # distance kernels (cosine/dot/euclidean, f32 + int8 + binary Hamming)
+│                 #   + bounded top-k heap + min_score
+├── data/         # the vector segments: mod.rs (DataSegment — header, append, row accessor),
+│                 #   segments.rs (the live set as one global row space), mmap.rs (the ONE
+│                 #   memory-map seam — the crate's only scoped `allow(unsafe_code)`)
+├── manifest/     # the atomic commit point naming the live segments (SPEC §14.2)
+├── log/          # op-log codec (the WAL): len + payload + crc32, replay, torn-tail recovery
+├── lock/         # writer exclusion via O_EXCL lock file (pure std, no flock/FFI)
+├── index_cache.rs# shared codec for derived caches (ann/fts); a stale/torn load rebuilds, never fatal
+├── ann/          # opt-in ANN index (Config::ann): hnsw.rs graph + ivf.rs lists + persist.rs
+├── fts/          # opt-in BM25 index: analyzer.rs, fold.rs, schema.rs, highlight.rs
+├── annotate.rs   # opt-in result annotations — why a hit matched (SPEC §7.8)
+├── fuse.rs       # Reciprocal Rank Fusion: merge several ranked legs into one ranking
+├── backend/      # pluggable storage & memory tiers (SPEC §13): local, ram, object, s3, gcs, redis
+├── embed/        # embedding providers: voyage, openai, ollama, cohere, gemini, mistral,
+│                 #   jina, openai_compat
+├── summarize/    # single-shot text summarization (anthropic, openai)
+├── memory.rs     # the text-native memory API the MCP surface is built on
+├── providers.rs  # provider capability registry
+├── http.rs       # shared HTTP retry infrastructure for the reqwest-based adapters
+├── cancel.rs     # cooperative cancellation for long scans
+├── diag.rs       # levelled logfmt diagnostics on stderr
+├── metrics.rs    # process-wide counters, exported as Prometheus text by GET /metrics
+├── store/        # the integrator, split by concern (see "Keep files focused"):
+│   ├── mod.rs    #   Store type + open/in_memory constructors + lock/ANN lifecycle glue
 │   ├── scoring.rs#   scan kernels (f32/int8/binary chunk scorers) + parallel-scan engine
 │   ├── quant.rs  #   int8/binary quant state + the quantized two-pass search
 │   ├── read.rs   #   accessors, scan plumbing, exact + ANN search
+│   ├── text.rs   #   multi-clause BM25 + the hybrid RRF fusion + annotations (§7.8)
+│   ├── rank.rs   #   ranking expressions: recency decay, leg weights, ORDER BY (§7.6)
+│   ├── aggregate.rs # count/sum from the in-RAM index + result diversity via limit_per (§7.7)
 │   ├── write.rs  #   upsert/delete/flush/compact + collection lifecycle
+│   ├── memtier.rs#   publish/adopt the in-RAM working set against the memory tier (§13.3)
 │   └── tests.rs  #   store tests (pure-logic + file-backed + quant/ANN)
 │
 │   # ── `cli` feature only (the `nidus` binary) — compiled with --features cli ──
-├── bin/nidus.rs # thin entry point: parse args → cli::run
-├── cli/         # clap subcommands over a store dir (serve, upsert, search, …)
-└── server/      # axum/tokio HTTP wrapper over one Nidus; server/dto.rs = wire types
-                 #   server/mcp.rs = the MCP 2026-07-28 surface at /mcp (`mcp` feature)
+├── bin/nidus.rs  # thin entry point: parse args → cli::run
+├── cli/          # clap subcommands over a store dir (serve, upsert, search, …) + backup.rs
+└── server/       # axum/tokio HTTP wrapper over one Nidus; dto.rs = wire types, alongside
+                  #   auth.rs, limits.rs, commit.rs, metrics.rs
+                  # server/mcp/ = the MCP 2026-07-28 surface at /mcp (`mcp` feature):
+                  #   mod.rs, remember.rs, search.rs, admin.rs, hygiene.rs, args.rs,
+                  #   stdio.rs (the stdio transport)
 ```
 
-**Storage model.** A store is a directory: `data` (append-only flat `f32` matrix,
-fixed stride, never rewritten in place), `log` (append-only op stream — the commit
-record), and `lock`. `open` reads `data` into RAM and replays `log` into an in-RAM
-index (`collection → { id → (row, attrs) }`). Search is brute-force cosine over a
-`Scope` — one collection, a subset, or the whole store — merged into one ranking
-(sound because all collections share one embedding space); vectors are
+SPEC.md §10 carries the same map with more detail on each module's contract; when the
+two disagree, the tree wins and both are stale.
+
+**Storage model.** A store is a set of objects behind a `Persistence` backend (SPEC
+§13) — a local directory by default, an `s3://`/`gs://` prefix by URL: `manifest`
+(the live-segment set + the pinned dimension/distance — the atomic commit point,
+§14.2), one or more fixed-stride `f32` segments (the base segment is still named
+`data`; sealing mints `seg-NNNNNNNN`), `log` (append-only op stream — the commit
+record), and `lock`. Segments are append-only in normal operation; the one exception
+is `compact()`, which collapses the live set and **rewrites the base segment in
+place** (`Segments::rewrite`), leaving the sealed ones unreferenced for deletion.
+`open` reads the manifest, loads the live segments into one global row space, and
+replays `log` into an in-RAM index (`collection → { id → (row, attrs) }`). Search is
+brute-force cosine over a `Scope` — one collection, a subset, or the whole store — merged into
+one ranking (sound because all collections share one embedding space); vectors are
 unit-normalized on insert so `score = dot(v, q)`.
 
-**Durability.** Per-batch fsync: append vectors → fsync `data` → append committing
-log records → fsync `log`. A crash loses at most the in-flight batch (the index is
-reproducible). Cross-process readers are lock-free: read `data` to size S, replay
-`log`, ignore any record referencing a row ≥ S/dim — a consistent, possibly-stale
-snapshot, never torn.
+**Durability.** Per-batch fsync, and the write order is load-bearing: append vectors
+to the active segment → fsync it → append committing log records → fsync `log`. So a
+committed `Upsert`'s row is already durable before anything references it, and a crash
+loses at most the in-flight batch (the index is reproducible). Cross-process readers
+are lock-free: read the manifest, open the segments it names for a total of N rows,
+replay `log`, and ignore any record referencing a row ≥ N — a consistent,
+possibly-stale snapshot, never torn. `Nidus::refresh()` advances that snapshot in place
+by re-applying the same rule at a newer manifest version (SPEC §6.2, §14.6).
 
 **Graceful failure (SPEC §6.6).** Appends are atomic (a partial write rolls back to
 the row/frame boundary) and `upsert` is all-or-nothing (rolls `data`+`log` back to
@@ -204,18 +256,22 @@ entry marks on any failure), so a caught ENOSPC never corrupts the store. RAM gr
 uses `try_reserve` (OOM → `Err`, not an abort) — except `attrs`/`id` clones, which
 std gives no `try_reserve` for. The overcommit-proof guard is
 `Config::max_vector_bytes` (refuse before allocating); `Nidus::footprint()` is the
-introspection hook. Still in-RAM brute-force — not spill-to-disk/mmap (deferred).
+introspection hook.
 
 **Deferred-but-seamed** (do NOT build until needed; each is additive over the same
-file format): mmap (swap the one row accessor). (int8 *and* binary quantization,
-opt-in parallel scan via `Config::query_threads`, the HTTP server, and the opt-in
-ANN index — `Config::ann`, HNSW + IVF in `src/ann/` — have since shipped; they were
-once on this list.) See `SPEC.md` §9 for the full rationale and the decisions behind
-each.
+file format): see `SPEC.md` §9 "Still deferred" for the current list and the
+reasoning behind each. Much of what this section used to name has since shipped —
+int8 *and* binary quantization, opt-in parallel scan via `Config::query_threads`,
+the HTTP server, the opt-in ANN index (`Config::ann`, HNSW + IVF in `src/ann/`), and
+mmap (`src/data/mmap.rs`) — so check §9 rather than trusting a list here.
 
 ## Conventions & Patterns
 
-- **Safe Rust, fast builds**: `#![forbid(unsafe_code)]` in our code; deps judged by
+- **Safe Rust, fast builds**: `#![deny(unsafe_code)]` in our code — `deny`, not
+  `forbid`, because the single memory-map call in `src/data/mmap.rs` (SPEC §9/§14.6)
+  carries a scoped `#[allow(unsafe_code)]`. That module is the **only** place the
+  allow appears; every other `unsafe` in the crate stays a hard compile error, and a
+  second scoped allow is a design change, not an implementation detail. Deps judged by
   build-and-ship cost, not purity (`ring`'s small TLS compile is allowed for the
   S3/GCS backends; multi-minute C/C++ trees are not — see above). Non-negotiable: the
   whole-crate clean build stays well under a minute.
