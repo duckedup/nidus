@@ -591,6 +591,15 @@ enum Command {
         #[command(flatten)]
         ingest: IngestArgs,
     },
+    /// Speak MCP over stdio, for `claude mcp add nidus -- nidus mcp --dir ~/.nidus`.
+    #[cfg(feature = "mcp")]
+    Mcp {
+        #[command(flatten)]
+        store: StoreArgs,
+        #[cfg(feature = "memory")]
+        #[command(flatten)]
+        ingest: IngestArgs,
+    },
     /// List collections.
     Collections {
         #[command(flatten)]
@@ -879,6 +888,16 @@ pub fn run(cli: Cli) -> Result<()> {
                 refresh_interval,
                 require_remote,
             },
+            store,
+            #[cfg(feature = "memory")]
+            ingest,
+        ),
+        #[cfg(feature = "mcp")]
+        Command::Mcp {
+            store,
+            #[cfg(feature = "memory")]
+            ingest,
+        } => mcp(
             store,
             #[cfg(feature = "memory")]
             ingest,
@@ -1359,6 +1378,41 @@ fn serve(
         summarizer,
     };
     rt.block_on(crate::server::serve(move || Nidus::open(open_config), cfg))
+}
+
+/// `nidus mcp`: speak MCP over stdio. Always opens read-write — there is exactly one
+/// client and no reason to run a memory server it cannot write to.
+#[cfg(feature = "mcp")]
+fn mcp(store: StoreArgs, #[cfg(feature = "memory")] ingest: IngestArgs) -> Result<()> {
+    // Honour `--read-only` as `serve` does: a reader that never takes the writer lock is a
+    // legitimate way to run this alongside a writer. `remember`/`forget` then fail honestly.
+    let mode = if store.read_only {
+        OpenMode::ReadOnly
+    } else {
+        OpenMode::ReadWrite
+    };
+    let open_config = store.config(mode)?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    #[cfg(feature = "memory")]
+    let embedder = rt.block_on(ingest.embedder())?;
+    #[cfg(all(feature = "memory", feature = "summarize"))]
+    let summarizer = rt.block_on(ingest.summarizer())?;
+
+    let cfg = crate::server::StdioConfig {
+        #[cfg(feature = "memory")]
+        embedder,
+        #[cfg(all(feature = "memory", feature = "summarize"))]
+        summarizer,
+        // A third of the lease TTL, as in `serve`.
+        lease_renew_interval: open_config.lock_ttl / 3,
+    };
+    rt.block_on(crate::server::serve_stdio(
+        move || Nidus::open(open_config),
+        cfg,
+    ))
 }
 
 /// Resolve `--include-attr`/`--exclude-attr` into a [`Projection`]. Both given is an error,

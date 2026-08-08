@@ -9,7 +9,7 @@ default-members = ["."]
 
 [package]
 name = "nidus"
-version = "0.53.1"
+version = "0.54.0"
 edition = "2024"
 rust-version = "1.96"
 description = "A small, pure-Rust embeddable vector store: brute-force or ANN cosine search over a single append-only directory, with pluggable persistence (local files, S3, GCS). No SQL, no query engine; builds in seconds."
@@ -205,12 +205,13 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"],
 # today — or reimplementing the sessions and SSE that 2.0 removed from the spec but
 # not from reality. Pinned tight: four releases in the nine days after the spec landed.
 #
-# Only the server half is compiled: no client, no reqwest, no OAuth, no child-process
-# transport. `schemars` rides along as a hard dependency of `rmcp` but we do NOT derive
-# with it — tool schemas are hand-written JSON literals (see `server/mcp.rs`).
+# Only the server half is compiled: no client, no reqwest, no OAuth. "No child-process
+# transport" means rmcp's client-side spawn transport, not compiled here — the two server
+# transports below are streamable-HTTP and stdio; schemas stay hand-written (`server/mcp/`).
 rmcp = { version = "=3.1.1", default-features = false, features = [
     "server",
     "transport-streamable-http-server",
+    "transport-io",
 ], optional = true }
 
 # AI-ingest-only dep — compiled ONLY under the `embed`/`summarize` features,

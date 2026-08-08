@@ -380,6 +380,69 @@ fn get_all_includes_vector() {
 }
 
 #[test]
+fn get_hits_returns_record_with_attrs() {
+    let mut store = Store::in_memory(3).unwrap();
+    store.create_collection("col").unwrap();
+    store
+        .upsert(
+            "col",
+            &[rec_with(
+                "doc1",
+                vec![1.0, 0.0, 0.0],
+                attrs_one("kind", "note"),
+            )],
+        )
+        .unwrap();
+    let record = store.get("col", "doc1").expect("doc1 should exist");
+    assert_eq!(record.id, "doc1");
+    assert_eq!(record.attrs.get("kind"), Some(&Value::Str("note".into())));
+}
+
+#[test]
+fn get_unknown_id_in_real_collection_is_none() {
+    let mut store = Store::in_memory(3).unwrap();
+    store.create_collection("col").unwrap();
+    store
+        .upsert("col", &[rec("doc1", vec![1.0, 0.0, 0.0])])
+        .unwrap();
+    assert!(store.get("col", "nope").is_none());
+}
+
+#[test]
+fn get_unknown_collection_is_none() {
+    let store = Store::in_memory(3).unwrap();
+    assert!(store.get("nope", "doc1").is_none());
+}
+
+#[test]
+fn get_text_only_doc_has_no_vector() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert("col", &[text_rec("t1", attrs_one("kind", "note"))])
+        .unwrap();
+    let record = store.get("col", "t1").expect("t1 should exist");
+    assert_eq!(record.vector, None);
+}
+
+#[test]
+fn get_agrees_with_get_all() {
+    let mut store = Store::in_memory(3).unwrap();
+    store.create_collection("col").unwrap();
+    store
+        .upsert("col", &[rec("doc1", vec![1.0, 0.0, 0.0])])
+        .unwrap();
+    let via_get = store.get("col", "doc1").unwrap();
+    let via_get_all = store
+        .get_all("col")
+        .into_iter()
+        .find(|r| r.id == "doc1")
+        .unwrap();
+    assert_eq!(via_get.id, via_get_all.id);
+    assert_eq!(via_get.vector, via_get_all.vector);
+    assert_eq!(via_get.attrs, via_get_all.attrs);
+}
+
+#[test]
 fn compact_in_memory_preserves_live_docs() {
     let mut store = Store::in_memory(3).unwrap();
     store.create_collection("col").unwrap();

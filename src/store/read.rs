@@ -146,6 +146,17 @@ impl Store {
             .collect()
     }
 
+    /// O(1) id-keyed lookup; a missing collection or id is `None`, not an error.
+    pub fn get(&self, collection: &str, id: &str) -> Option<crate::model::Record> {
+        let entry = self.collections.get(collection)?.docs.get(id)?;
+        Some(crate::model::Record {
+            id: id.to_string(),
+            // Text-only docs (row None) have no embedding.
+            vector: entry.row.map(|r| self.data.row(r).to_vec()),
+            attrs: entry.attrs.clone(),
+        })
+    }
+
     /// List records matching `opts.filter` across `collections`, without vector scoring.
     pub fn list(&self, collections: &[&str], opts: &ListOpts) -> Result<Vec<Hit>> {
         let cap: usize = collections

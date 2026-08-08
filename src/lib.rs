@@ -257,6 +257,10 @@ impl Nidus {
         self.store.get_all(collection)
     }
 
+    pub fn get(&self, collection: &str, id: &str) -> Option<Record> {
+        self.store.get(collection, id)
+    }
+
     /// Resolve a [`Scope`] to the concrete collection names it covers — shared by
     /// `list`/`search`/`text_search`/`hybrid_search` so the resolution lives in one
     /// place.

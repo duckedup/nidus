@@ -1,7 +1,12 @@
-//! Spawn a real `nidus serve` and talk to it over HTTP.
+//! Spawn a real `nidus serve` and talk to it over HTTP, or a real `nidus mcp` and talk to
+//! it over stdio.
 
+#[cfg(feature = "mcp")]
+use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
+#[cfg(feature = "mcp")]
+use std::process::{ChildStdin, ChildStdout};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -396,4 +401,158 @@ fn read(res: ureq::http::Response<ureq::Body>, path: &str, stderr: &str) -> (u16
         .read_to_vec()
         .unwrap_or_else(|e| panic!("read body of {path}: {e}\n--- server stderr ---\n{stderr}"));
     (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+// ── `nidus mcp` over stdio ──────────────────────────────────────────────────
+
+/// Build a `nidus mcp` invocation. Distinct from [`Server`]: there is no address to bind
+/// and no `/health` to poll, so readiness is whatever the first JSON-RPC round trip proves.
+#[cfg(feature = "mcp")]
+pub struct StdioServer {
+    dir: std::path::PathBuf,
+    dim: usize,
+    args: Vec<String>,
+}
+
+/// A running `nidus mcp` child, talking newline-delimited JSON-RPC over its stdin/stdout —
+/// the same robustness bar as [`RunningServer`]: stderr drains continuously, and the child
+/// is reaped on `Drop` so a panicking test never strands a lock-holding process.
+#[cfg(feature = "mcp")]
+pub struct RunningStdioServer {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    stderr: Arc<Mutex<Vec<String>>>,
+}
+
+#[cfg(feature = "mcp")]
+impl StdioServer {
+    /// An MCP-over-stdio server over `dir` with the given embedding dimension.
+    pub fn new(dir: impl Into<std::path::PathBuf>, dim: usize) -> Self {
+        StdioServer {
+            dir: dir.into(),
+            dim,
+            args: Vec::new(),
+        }
+    }
+
+    /// Extra `nidus mcp` flags (`--embed-provider ollama`, …). Only exercised by the
+    /// `embed-ollama`-gated round-trip test today (`test-e2e`'s default build has no
+    /// `embed-*` feature at all), hence the `allow` under every other build.
+    #[cfg_attr(not(feature = "embed-ollama"), allow(dead_code))]
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.args
+            .extend(args.into_iter().map(|a| a.as_ref().to_string()));
+        self
+    }
+
+    /// Spawn `nidus mcp`, piping stdin/stdout/stderr.
+    pub fn spawn(self) -> RunningStdioServer {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nidus"));
+        cmd.arg("mcp")
+            .arg("--dir")
+            .arg(&self.dir)
+            .arg("--dim")
+            .arg(self.dim.to_string())
+            .args(&self.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Inherited NIDUS_* vars would silently override the flags under test.
+            .env_clear()
+            .envs(std::env::vars().filter(|(k, _)| !k.starts_with("NIDUS_")));
+
+        let mut child = cmd.spawn().expect("spawn nidus mcp");
+        let stdin = child.stdin.take().expect("stdin piped");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let pipe = child.stderr.take().expect("stderr piped");
+
+        // Drained on a thread for the same reason as the HTTP harness: unread stderr would
+        // eventually block a chatty child.
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&stderr);
+        std::thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                log.lock().expect("stderr log").push(line);
+            }
+        });
+
+        RunningStdioServer {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            stderr,
+        }
+    }
+}
+
+#[cfg(feature = "mcp")]
+impl RunningStdioServer {
+    /// Write one newline-delimited JSON-RPC message (a request or a notification).
+    pub fn send(&mut self, msg: &Value) {
+        let mut line = serde_json::to_vec(msg).expect("serialise JSON-RPC message");
+        line.push(b'\n');
+        self.stdin.write_all(&line).unwrap_or_else(|e| {
+            panic!(
+                "write to nidus mcp stdin: {e}\n--- stderr ---\n{}",
+                self.stderr()
+            )
+        });
+        self.stdin.flush().expect("flush nidus mcp stdin");
+    }
+
+    /// Read one newline-delimited JSON-RPC message, panicking with the child's stderr if
+    /// the pipe closes before a full line arrives.
+    pub fn recv(&mut self) -> Value {
+        let mut line = String::new();
+        let n = self.stdout.read_line(&mut line).unwrap_or_else(|e| {
+            panic!(
+                "read from nidus mcp stdout: {e}\n--- stderr ---\n{}",
+                self.stderr()
+            )
+        });
+        assert!(
+            n > 0,
+            "nidus mcp closed stdout before answering\n--- stderr ---\n{}",
+            self.stderr()
+        );
+        serde_json::from_str(&line).unwrap_or_else(|e| {
+            panic!(
+                "parse JSON-RPC line {line:?}: {e}\n--- stderr ---\n{}",
+                self.stderr()
+            )
+        })
+    }
+
+    /// `send` then `recv` — one request/response round trip.
+    pub fn request(&mut self, msg: &Value) -> Value {
+        self.send(msg);
+        self.recv()
+    }
+
+    /// Everything the child has written to stderr so far.
+    pub fn stderr(&self) -> String {
+        self.stderr.lock().expect("stderr log").join("\n")
+    }
+
+    /// Wait for the child to exit, returning its status and everything it wrote to stderr —
+    /// the assertion form for a process expected to fail fast (e.g. a locked store).
+    pub fn wait(mut self) -> (std::process::ExitStatus, String) {
+        let status = self.child.wait().expect("wait for nidus mcp to exit");
+        (status, self.stderr())
+    }
+}
+
+#[cfg(feature = "mcp")]
+impl Drop for RunningStdioServer {
+    fn drop(&mut self) {
+        // Best-effort, same as `RunningServer`: an orphaned child would hold the writer
+        // lock and fail every later test.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }

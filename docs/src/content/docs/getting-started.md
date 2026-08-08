@@ -19,12 +19,18 @@ toolchain required — and stand up a working local store in four commands. See
 [Quickstart: local search in four commands](/guides/cli-and-server/#quickstart-local-search-in-four-commands).
 :::
 
+:::tip[Want it as agent memory instead?]
+`claude mcp add nidus -- nidus mcp --dir ~/.nidus` registers a store as an MCP
+server over stdio in one line. See [MCP](/guides/mcp/) for the tool surface and
+the HTTP alternative.
+:::
+
 ## Add the dependency
 
 ```toml
 # Cargo.toml
 [dependencies]
-nidus = "0.53"
+nidus = "0.54"
 anyhow = "1"     # nidus returns anyhow::Result
 ```
 

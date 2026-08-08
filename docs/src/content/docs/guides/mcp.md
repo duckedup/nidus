@@ -1,19 +1,41 @@
 ---
 title: MCP (agent memory)
-description: nidus serve answers the Model Context Protocol at /mcp, so any MCP client can use a store as long-term memory — remember text, recall it by meaning, with no glue code.
+description: nidus speaks the Model Context Protocol over stdio or at nidus serve's /mcp, so any MCP client can use a store as long-term memory — remember text, recall it by meaning, with no glue code.
 ---
 
-`nidus serve` speaks the [Model Context Protocol](https://modelcontextprotocol.io)
-at `/mcp`. Point an MCP client at it and the store becomes long-term memory for
-an agent: it can `remember` text worth keeping and `recall` it later by meaning,
-without you writing any integration code.
+nidus speaks the [Model Context Protocol](https://modelcontextprotocol.io) over
+two transports: standalone over **stdio** (`nidus mcp`), for a client that spawns
+its own server process, or nested inside `nidus serve`'s HTTP stack at **`/mcp`**,
+for a client that talks to a long-lived server. Either way, an MCP client sees the
+store as long-term memory: it can `remember` text worth keeping and `recall` it
+later by meaning, without you writing any integration code.
 
 This is the [memory layer](/guides/remember-and-recall/) with a different front
 door. Everything MCP exposes goes through the same store, the same embedder, and
-the same locking as the [HTTP API](/reference/http-api/) — write over HTTP and
-read over MCP, or the reverse, and you are talking to one store.
+the same locking that the [HTTP API](/reference/http-api/) uses — write over
+HTTP and read over MCP, or the reverse, and you are talking to one store.
 
-## Turning it on
+## Over stdio
+
+The `mcp` subcommand speaks MCP on stdin/stdout — no address, no token, nothing
+to bind. This is the shape most local clients expect:
+
+```bash
+claude mcp add nidus -- nidus mcp --dir ~/.nidus --dim 1024 \
+  --embed-provider voyage --embed-model voyage-3
+```
+
+A stdio session opens the store and **holds the writer lock for its lifetime** —
+there is no listener standing by to keep answering while a second client waits,
+so another `nidus mcp` (or `nidus serve`) pointed at the same directory fails
+immediately, naming the lock. Run one stdio session per store, or use `nidus
+serve` below when several clients need to share one.
+
+Pass `--read-only` to open without taking that lock — any number of read-only
+sessions can run alongside a writer. `recall`, `text_search`, `hybrid_search`,
+`get`, and `browse` all work; `remember` and `forget` fail, since they write.
+
+## Over HTTP (`nidus serve`)
 
 The endpoint ships in the `mcp` feature, which is part of the `serve` umbrella —
 so a binary built for the memory layer already has it:
@@ -48,7 +70,9 @@ config shape:
 
 `/mcp` sits behind the same bearer token as every other route, so if you started
 the server with `--token` the client has to send it. Drop the `headers` block if
-you did not.
+you did not. Unlike stdio, several clients can share one `nidus serve` process —
+there is one writer lock either way, but the server holds it and applies every
+client's writes rather than each client racing for its own.
 
 ## The tools
 
@@ -60,6 +84,9 @@ you did not.
 | `hybrid_search` | Both at once, fused — semantic intent plus a term that must appear. |
 | `list_collections` | List the collections in the store. |
 | `stats` | Dimension, distance metric, collections, and memory footprint. |
+| `forget` | Remove memories by id or by metadata filter. Irreversible. |
+| `get` | Fetch one memory by id — its id and attrs, never its vector. |
+| `browse` | List a collection's contents, bounded and optionally filtered, without a query. |
 
 Every one of them takes **natural language, never vectors**. That is deliberate:
 a model cannot write a 1024-float array as a tool argument, so the raw
@@ -70,16 +97,33 @@ embed your query text server-side to get there instead.
 `remember` derives a content-based id when you do not pass one, which makes it
 idempotent — remembering the same sentence twice replaces the entry rather than
 accumulating near-duplicates that then compete for the same results. Pass an
-explicit `id` when you want to update a specific memory later.
+explicit `id` when you want to update a specific memory later. It also takes an
+optional `attrs` object — structured metadata stored alongside the text (e.g.
+`{"project": {"Str": "nidus"}, "tags": {"List": ["mcp"]}}`), each value tagged
+by type, so a memory can later be found by filter as well as by meaning.
+
+`recall`, `text_search`, and `hybrid_search` all take an optional `filter`: a
+JSON array of metadata predicates, AND-combined, with `Any`/`Not` for OR and
+negation. It narrows a search to the records that match before scoring — the
+same filters `forget` and `browse` use to scope which records they touch.
+
+Correcting or removing what you stored is `forget`'s job: pass `ids` to
+remove specific memories, or `filter` to remove every match at once. At least
+one of them is required — a call with neither is refused rather than treated
+as "remove everything in the collection". Before writing, `get` and `browse`
+let an agent check what is already there: `get` looks up one id directly,
+and `browse` lists a collection's contents (optionally filtered) so a model
+can spot a near-duplicate before adding one.
 
 ## What it does not do
 
 The surface is deliberately small. There are no MCP resources, prompts,
 subscriptions, or tasks: every nidus operation is a fast synchronous call, so
 there is nothing to subscribe to and nothing long-running to hand back a task
-handle for. Store maintenance (`compact`, `flush`, collection deletion) is not
-exposed either — those are operator actions, and an agent should not be reaching
-for them.
+handle for. Record-level hygiene is exposed (`forget`, `get`, `browse`), but
+collection-level lifecycle — creating, configuring, or dropping a collection —
+and store maintenance (`compact`, `flush`) are not: those remain operator
+actions, deliberately out of an agent's reach.
 
 Authorization is the server's existing bearer token rather than MCP's OAuth
 flows. For a store you run yourself, a token over loopback is the honest security
@@ -88,12 +132,16 @@ no token set.
 
 ## Protocol version
 
-nidus implements the `2026-07-28` revision, which is stateless: no
-`initialize` handshake, no session ids, and method and tool names carried in the
-`Mcp-Method` and `Mcp-Name` headers so a gateway can route without reading the
-body. Statelessness is what lets `/mcp` sit behind an ordinary round-robin load
-balancer alongside [multi-box deployments](/guides/multi-box/) — there is no
-session to pin a client to an instance.
+nidus implements the `2026-07-28` revision. Over stdio that means the ordinary
+session-based handshake — a client sends `initialize`, nidus answers with its
+negotiated version and server info, the client confirms with
+`notifications/initialized`, and the session proceeds. Over HTTP the same
+revision is used statelessly instead: no `initialize` handshake, no session ids,
+and method and tool names carried in the `Mcp-Method` and `Mcp-Name` headers so a
+gateway can route without reading the body. Statelessness is what lets `/mcp` sit
+behind an ordinary round-robin load balancer alongside
+[multi-box deployments](/guides/multi-box/) — there is no session to pin a client
+to an instance, which stdio (one process, one client) never needed anyway.
 
 Older clients still work. The server negotiates down, and `server/discover`
 reports every revision it supports:

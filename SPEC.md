@@ -1004,6 +1004,18 @@ build until a real need exists.
   one store. The core API stayed operation-centric, with no process-wide assumptions.
   Its deps (`clap`, `tokio`, `axum`, `tower`, `serde_json` — all pure Rust, zero FFI)
   compile only under `--features cli`, so `cargo add nidus` stays lean.
+- **MCP surface, two transports.** Behind the opt-in `mcp` feature (folds `cli` +
+  `memory`), one `NidusMcp` adapter (`src/server/mcp/`) speaks MCP 2026-07-28 both
+  nested inside `nidus serve`'s HTTP stack at `/mcp` (inheriting its auth, body
+  limits, backpressure, and metrics) and standalone over stdio via `nidus mcp
+  --dir …`, for a client that spawns its own server process (e.g. `claude mcp add
+  nidus -- nidus mcp --dir ~/.nidus`). Both hand the same tool list to rmcp's
+  `ServerHandler` blanket impl, so nothing forks by transport. Unlike `serve`,
+  `nidus mcp` opens the store eagerly and fails fast — there is no listener to
+  keep answering health probes while a standby waits — so a second process on the
+  same directory exits immediately, naming the lock conflict. A stdio session
+  skips `limits.rs`/`metrics.rs` entirely (both are axum `.layer()`-only): one
+  local client needs neither an admission cap nor a scrape endpoint.
 - **ANN index (HNSW/IVF).** `Config::ann` opts a store into an in-RAM approximate
   index over the same `data` rows; `search` walks it instead of scanning. Two
   algorithms, selected by `AnnKind`: **HNSW** (`AnnConfig::hnsw`, the default — a
