@@ -101,19 +101,9 @@ jobs:
       # relocated. Pushed with GITHUB_TOKEN, which cannot trigger another workflow, so
       # there is no loop.
       #
-      # Best-effort on purpose: the chart is already published by this point, and a race
-      # with a concurrent push to main must not fail a release that actually succeeded.
+      # Tolerant of the race, LOUD about branch protection — the script distinguishes
+      # them. No continue-on-error: swallowing every failure is what hid #82.
       - name: Persist the stamp back to main
-        continue-on-error: true
         run: |
-          set -euo pipefail
-          if git diff --quiet -- charts/nidus/Chart.yaml; then
-            echo "chart already at the released version — nothing to commit"
-            exit 0
-          fi
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add charts/nidus/Chart.yaml
-          git commit -m "🪺 chart: stamp version ${{ inputs.version }} [skip ci]"
-          git pull --rebase origin main
-          git push origin HEAD:main
+          ./scripts/stamp-back.sh chart "${{ inputs.version }}" \
+            charts/nidus/Chart.yaml
