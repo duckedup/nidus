@@ -4,7 +4,33 @@
 
 use serde_json::{Value, json};
 
-use crate::harness::Server;
+use crate::harness::{RunningServer, Server};
+
+/// `PUT` and `DELETE` against a running server. The harness wraps GET and POST; these two
+/// verbs reach only the collection admin routes, so they live beside their tests.
+fn send(server: &RunningServer, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let url = format!("{}{path}", server.base_url());
+    let res = match (method, body) {
+        ("PUT", Some(b)) => agent
+            .put(&url)
+            .header("content-type", "application/json")
+            .send(&serde_json::to_vec(b).expect("serialise body")),
+        ("DELETE", None) => agent.delete(&url).call(),
+        _ => panic!("unsupported {method} {path}"),
+    }
+    .unwrap_or_else(|e| panic!("{method} {path}: {e}\n--- stderr ---\n{}", server.stderr()));
+    let status = res.status().as_u16();
+    let bytes = res.into_body().read_to_vec().expect("read body");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
 
 /// Two orthogonal unit vectors plus attrs, the shape the other suites reuse.
 fn records() -> Value {
@@ -658,4 +684,250 @@ fn batch_search_and_grouped_aggregate_over_real_http() {
     let (status, agg) = server.post("/aggregate", &json!({"sum": ["bytes"]}));
     assert_eq!(status, 200);
     assert!(agg.get("groups").is_none(), "{agg}");
+}
+
+/// The six admin routes with no test at any level in CI: collection meta (get/put), the
+/// records dump, delete by ids and by filter, flush, compact, and dropping a collection.
+/// Wired in-process is not the same as reachable through the built router over a socket.
+#[test]
+fn admin_lifecycle_over_real_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(server.post("/collections/docs/upsert", &records()).0, 200);
+
+    // Meta round-trips as a plain string map, and an unset collection reports an empty one.
+    let (status, body) = send(
+        &server,
+        "PUT",
+        "/collections/docs/meta",
+        Some(&json!({"owner": "search-team", "embedder": "voyage/voyage-3"})),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (status, meta) = server.get("/collections/docs/meta");
+    assert_eq!(status, 200);
+    assert_eq!(meta["owner"], "search-team", "{meta}");
+    assert_eq!(meta["embedder"], "voyage/voyage-3", "{meta}");
+
+    // The records dump returns whole records — vectors included, unlike a search hit.
+    let (status, recs) = server.get("/collections/docs/records");
+    assert_eq!(status, 200);
+    let recs = recs.as_array().expect("records array");
+    assert_eq!(recs.len(), 2, "{recs:?}");
+    let mut ids: Vec<&str> = recs.iter().map(|r| r["id"].as_str().expect("id")).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["a", "b"]);
+    assert_eq!(recs[0]["vector"].as_array().map(Vec::len), Some(3));
+
+    // Delete by id, then by filter — the two arms of the same route.
+    let (status, body) = server.post("/collections/docs/delete", &json!({"ids": ["a"]}));
+    assert_eq!(status, 200);
+    assert_eq!(body["deleted"], 1, "{body}");
+    let (status, body) = server.post(
+        "/collections/docs/delete",
+        &json!({"filter": [{"Eq": ["lang", {"Str": "go"}]}]}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body["deleted"], 1, "delete by filter: {body}");
+
+    let (status, body) = server.post("/flush", &json!({}));
+    assert_eq!(status, 200);
+    assert_eq!(body["ok"], true, "{body}");
+
+    // Both deletes left dead rows; compaction is what actually reclaims them.
+    let (_, stats) = server.get("/stats");
+    assert_eq!(stats["footprint"]["dead_rows"], 2, "{stats}");
+    let (status, body) = server.post("/compact", &json!({}));
+    assert_eq!(status, 200);
+    assert_eq!(body["ok"], true, "{body}");
+    let (_, stats) = server.get("/stats");
+    assert_eq!(
+        stats["footprint"]["dead_rows"], 0,
+        "compact should reclaim the dead rows: {stats}"
+    );
+
+    // Dropping the collection removes it from the listing, and its meta with it.
+    let (status, body) = send(&server, "DELETE", "/collections/docs", None);
+    assert_eq!(status, 200);
+    assert_eq!(body["dropped"], "docs", "{body}");
+    let (status, collections) = server.get("/collections");
+    assert_eq!(status, 200);
+    assert_eq!(collections, json!([]), "{collections}");
+    let (_, meta) = server.get("/collections/docs/meta");
+    assert_eq!(meta, json!({}), "dropped collection keeps no meta: {meta}");
+}
+
+/// `--max-vector-bytes` is the overcommit guard (SPEC §6.6): an over-budget upsert is
+/// refused cleanly — with `507`, the status `classify` maps it to — and the store is
+/// left whole and serving, not half-written.
+#[test]
+fn max_vector_bytes_refuses_cleanly_and_the_server_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    // 24 bytes = exactly two rows at dim 3, so the seed batch fits and a third row cannot.
+    let server = Server::new(dir.path(), 3)
+        .args(["--max-vector-bytes", "24"])
+        .start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(server.post("/collections/docs/upsert", &records()).0, 200);
+
+    let (status, body) = server.post(
+        "/collections/docs/upsert",
+        &json!({"records": [{"id": "over", "vector": [0, 0, 1], "attrs": {}}]}),
+    );
+    assert_eq!(status, 507, "over-budget upsert should be refused: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("max_vector_bytes"),
+        "the refusal should name the cap: {body}"
+    );
+
+    // Still whole: the rejected row landed nowhere, and the store keeps serving.
+    assert_eq!(server.get("/health").0, 200);
+    let (_, stats) = server.get("/stats");
+    assert_eq!(stats["footprint"]["rows"], 2, "no partial row: {stats}");
+    let (status, hits) = server.post("/search", &json!({"query": [1, 0, 0], "top_k": 1}));
+    assert_eq!(status, 200);
+    assert_eq!(hits[0]["id"], "a", "{hits}");
+
+    // Deleting frees no headroom (dead rows still occupy the matrix) but compacting does,
+    // which is exactly what the refusal message tells the caller to do.
+    assert_eq!(
+        server
+            .post("/collections/docs/delete", &json!({"ids": ["b"]}))
+            .0,
+        200
+    );
+    assert_eq!(server.post("/compact", &json!({})).0, 200);
+    let (status, body) = server.post(
+        "/collections/docs/upsert",
+        &json!({"records": [{"id": "now-fits", "vector": [0, 0, 1], "attrs": {}}]}),
+    );
+    assert_eq!(status, 200, "compaction should reclaim headroom: {body}");
+}
+
+/// `--fsync on-flush` trades per-batch durability for speed, so `POST /flush` becomes the
+/// durability barrier. A flushed write must survive SIGKILL — the flag is only safe to
+/// offer if the barrier it leaves behind actually holds.
+#[test]
+fn fsync_on_flush_makes_flushed_writes_survive_a_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let flags = ["--fsync", "on-flush", "--lock-ttl", "1"];
+
+    let server = Server::new(dir.path(), 3).args(flags).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(server.post("/collections/docs/upsert", &records()).0, 200);
+    let (status, body) = server.post("/flush", &json!({}));
+    assert_eq!(status, 200, "{body}");
+
+    // SIGKILL: nothing runs on the way out, so only what `/flush` made durable survives.
+    server.kill();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let restarted = Server::new(dir.path(), 3).args(flags).start();
+    let (status, stats) = restarted.get("/stats");
+    assert_eq!(status, 200);
+    assert_eq!(
+        stats["footprint"]["doc_count"], 2,
+        "an explicitly flushed batch must outlive the crash: {stats}"
+    );
+    let (_, hits) = restarted.post("/search", &json!({"query": [0, 1, 0], "top_k": 1}));
+    assert_eq!(hits[0]["id"], "b", "vectors and attrs replayed: {hits}");
+}
+
+/// `--auto-compact` reaches the served store. Auto-compaction is evaluated when the store
+/// *opens*, so the assertion is that a restart past the threshold reclaims the dead rows
+/// with no `/compact` call — and that `--no-auto-compact` leaves them alone.
+#[test]
+fn auto_compact_threshold_reaches_the_served_store() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Build up dead rows with auto-compaction off, so they are still there to observe.
+    let server = Server::new(dir.path(), 3)
+        .args(["--no-auto-compact", "--lock-ttl", "1"])
+        .start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(server.post("/collections/docs/upsert", &records()).0, 200);
+    assert_eq!(
+        server
+            .post("/collections/docs/delete", &json!({"ids": ["a"]}))
+            .0,
+        200
+    );
+    let (_, stats) = server.get("/stats");
+    assert_eq!(
+        stats["footprint"]["dead_rows"], 1,
+        "--no-auto-compact should leave the dead row: {stats}"
+    );
+    assert!(server.shutdown(), "clean shutdown");
+
+    // One dead row of two is a 0.5 ratio, over a 0.3 threshold — so this open compacts.
+    let restarted = Server::new(dir.path(), 3)
+        .args(["--auto-compact", "0.3", "--lock-ttl", "1"])
+        .start();
+    let (status, stats) = restarted.get("/stats");
+    assert_eq!(status, 200);
+    assert_eq!(
+        stats["footprint"]["dead_rows"], 0,
+        "--auto-compact should have reclaimed on open, with no /compact call: {stats}"
+    );
+    assert_eq!(stats["footprint"]["rows"], 1, "{stats}");
+    assert_eq!(
+        stats["footprint"]["doc_count"], 1,
+        "compaction must not lose the live record: {stats}"
+    );
+    let (_, hits) = restarted.post("/search", &json!({"query": [0, 1, 0], "top_k": 1}));
+    assert_eq!(
+        hits[0]["id"], "b",
+        "the survivor is still searchable: {hits}"
+    );
+}
+
+/// `--segment-max-rows` seals segments and `--mmap` maps the sealed ones instead of
+/// loading them into RAM. Both fall back silently when conditions are wrong, so the only
+/// way to catch a regression is to assert the ranking is unchanged across a restart.
+#[test]
+fn sealed_segments_and_mmap_survive_a_restart_with_identical_ranking() {
+    let dir = tempfile::tempdir().unwrap();
+    let flags = ["--segment-max-rows", "100", "--mmap"];
+
+    // 350 rows at 100 per segment: three sealed segments plus a live one.
+    let rows: Vec<Value> = (0..350)
+        .map(|i| {
+            json!({
+                "id": format!("d{i}"),
+                "vector": [(i % 7) as f64 + 1.0, (i % 11) as f64, (i % 13) as f64],
+                "attrs": {"n": {"Int": i}},
+            })
+        })
+        .collect();
+
+    let server = Server::new(dir.path(), 3).args(flags).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    let (status, body) = server.post("/collections/docs/upsert", &json!({"records": rows}));
+    assert_eq!(status, 200, "{body}");
+
+    let query = json!({"query": [3, 5, 7], "top_k": 20});
+    let (status, before) = server.post("/search", &query);
+    assert_eq!(status, 200);
+    assert_eq!(before.as_array().map(Vec::len), Some(20), "{before}");
+    let (_, stats_before) = server.get("/stats");
+    assert_eq!(stats_before["footprint"]["rows"], 350, "{stats_before}");
+    assert!(server.shutdown(), "clean shutdown");
+
+    // Reopening reads the sealed segments back through the manifest — and, where the
+    // platform allows it, maps rather than loads them.
+    let restarted = Server::new(dir.path(), 3).args(flags).start();
+    let (status, after) = restarted.post("/search", &query);
+    assert_eq!(status, 200);
+    assert_eq!(
+        after, before,
+        "ranking must be identical across the seal + restart"
+    );
+    let (_, stats_after) = restarted.get("/stats");
+    assert_eq!(
+        stats_after["footprint"], stats_before["footprint"],
+        "footprint must match across the restart"
+    );
 }
