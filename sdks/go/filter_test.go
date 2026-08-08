@@ -3,9 +3,10 @@
 // These assert on marshalled bytes throughout. A filter that encodes to the wrong
 // shape does not fail loudly — the server answers 400 with a serde message about a
 // tuple variant, which tells a caller nothing about which builder was wrong — so the
-// shape is worth pinning exactly. Two shapes in particular have no symmetry to fall
-// back on: Glob's second element is a bare string where every other predicate's is a
-// tagged Value, and a Filter is a bare array rather than an object wrapping one.
+// shape is worth pinning exactly. Three shapes in particular have no symmetry to fall
+// back on: the text predicates' second element is a bare string where every other
+// predicate's is a tagged Value, Fuzzy is a 3-tuple where every other leaf is a pair,
+// and a Filter is a bare array rather than an object wrapping one.
 package nidus
 
 import (
@@ -17,8 +18,8 @@ import (
 )
 
 // TestPredicateWireShapes pins every variant's encoding. The key is always the first
-// tuple element and the operand the second, matching serde's externally-tagged
-// 2-tuple form for the crate's Predicate enum.
+// tuple element and the operand the second, matching serde's externally-tagged tuple
+// form for the crate's Predicate enum — Fuzzy adds a third, the combinators none.
 func TestPredicateWireShapes(t *testing.T) {
 	cases := []struct {
 		name string
@@ -68,6 +69,27 @@ func TestPredicateWireShapes(t *testing.T) {
 			`{"ContainsAny":["tags",[{"Str":"rust"},{"Str":"go"}]]}`,
 		},
 		{"ContainsAny with no values", ContainsAny("tags"), `{"ContainsAny":["tags",[]]}`},
+		// The token predicates take the query text as a bare string, exactly as Glob
+		// takes its pattern — the operand is text to analyze, never a tagged Value.
+		{
+			"ContainsAllTokens",
+			ContainsAllTokens("body", "async runtime"),
+			`{"ContainsAllTokens":["body","async runtime"]}`,
+		},
+		{
+			"ContainsAnyToken",
+			ContainsAnyToken("body", "async runtime"),
+			`{"ContainsAnyToken":["body","async runtime"]}`,
+		},
+		{
+			"ContainsTokenSequence",
+			ContainsTokenSequence("body", "async runtime"),
+			`{"ContainsTokenSequence":["body","async runtime"]}`,
+		},
+		{"Regex", Regex("path", "^src/.*"), `{"Regex":["path","^src/.*"]}`},
+		// Fuzzy is the one leaf predicate with three tuple elements.
+		{"Fuzzy", Fuzzy("title", "serach", 2), `{"Fuzzy":["title","serach",2]}`},
+		{"Fuzzy with no edits", Fuzzy("title", "search", 0), `{"Fuzzy":["title","search",0]}`},
 		// The combinators break the key/value tuple shape entirely.
 		{
 			"Any",
@@ -316,5 +338,96 @@ func TestGlobNeedsNoNormalization(t *testing.T) {
 	}
 	if want := `{"Glob":["path",""]}`; string(got) != want {
 		t.Errorf("Marshal = %s, want %s", got, want)
+	}
+}
+
+// TestFuzzyIsAThreeElementTuple states Fuzzy's arity on its own, the way
+// TestGlobSecondElementIsABareString states Glob's. Every other leaf predicate is a
+// [key, operand] pair, and a Fuzzy encoded as one is a serde error about a tuple
+// variant that names neither the builder nor the field.
+func TestFuzzyIsAThreeElementTuple(t *testing.T) {
+	encoded, err := json.Marshal(Fuzzy("title", "serach", 2))
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	var tuple map[string][]json.RawMessage
+	if err := json.Unmarshal(encoded, &tuple); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	got := tuple["Fuzzy"]
+	if len(got) != 3 {
+		t.Fatalf("Fuzzy encoded %d tuple elements, want 3: %s", len(got), encoded)
+	}
+	// The edit budget is a bare number, not a tagged Value and not a string: it is a
+	// usize on the server, so anything else fails to deserialize.
+	if third := string(got[2]); third != "2" {
+		t.Errorf("Fuzzy's third element = %s, want the bare number 2", third)
+	}
+	// The contrast: a sibling text predicate is a 2-tuple.
+	if err := json.Unmarshal([]byte(`{"Regex":["p","x"]}`), &tuple); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	if len(tuple["Regex"]) != 2 {
+		t.Errorf("Regex encoded %d tuple elements, want 2", len(tuple["Regex"]))
+	}
+}
+
+// TestFuzzyRejectsAnUnusableEditBudget — the edit count is a usize on the wire, so a
+// negative one cannot travel at all, and the server refuses anything above 8 rather
+// than clamping it. Both are carried on the predicate like any other normalization
+// failure, so they surface from the call that used the filter.
+func TestFuzzyRejectsAnUnusableEditBudget(t *testing.T) {
+	for _, edits := range []int{-1, 9, 1 << 40} {
+		p := Fuzzy("title", "serach", edits)
+		err := p.Err()
+		if err == nil {
+			t.Fatalf("Fuzzy(…, %d).Err() = nil, want the range failure", edits)
+		}
+		if !strings.Contains(err.Error(), `Fuzzy("title")`) {
+			t.Errorf("error = %q, want it to name the builder and key", err)
+		}
+		if _, err := json.Marshal(p); err == nil {
+			t.Errorf("Fuzzy(…, %d) encoded successfully; it must not", edits)
+		}
+	}
+
+	// The whole accepted range still builds, boundary included.
+	for _, edits := range []int{0, 1, 8} {
+		if err := Fuzzy("title", "serach", edits).Err(); err != nil {
+			t.Errorf("Fuzzy(…, %d).Err() = %v, want nil", edits, err)
+		}
+	}
+
+	// And a broken Fuzzy cannot hide inside a group, like any other broken leaf.
+	if err := Not(Any(Fuzzy("title", "x", -1))).Err(); err == nil {
+		t.Error("a nested Fuzzy error did not propagate out of the group")
+	}
+}
+
+// TestTextPredicatesNeedNoNormalization — like [Glob], the token predicates and Regex
+// take typed strings, so they can never carry a normalization error and an empty
+// operand is a legitimate request rather than something to reject client-side.
+func TestTextPredicatesNeedNoNormalization(t *testing.T) {
+	cases := []struct {
+		pred Predicate
+		want string
+	}{
+		{ContainsAllTokens("body", ""), `{"ContainsAllTokens":["body",""]}`},
+		{ContainsAnyToken("body", ""), `{"ContainsAnyToken":["body",""]}`},
+		{ContainsTokenSequence("body", ""), `{"ContainsTokenSequence":["body",""]}`},
+		{Regex("path", ""), `{"Regex":["path",""]}`},
+	}
+	for _, tc := range cases {
+		if err := tc.pred.Err(); err != nil {
+			t.Errorf("Err() = %v, want nil", err)
+			continue
+		}
+		got, err := json.Marshal(tc.pred)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		if string(got) != tc.want {
+			t.Errorf("Marshal = %s, want %s", got, tc.want)
+		}
 	}
 }

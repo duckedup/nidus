@@ -24,7 +24,7 @@ toolchain required — and stand up a working local store in four commands. See
 ```toml
 # Cargo.toml
 [dependencies]
-nidus = "0.51"
+nidus = "0.52"
 anyhow = "1"     # nidus returns anyhow::Result
 ```
 
@@ -113,6 +113,7 @@ let opts = SearchOpts {
     top_k: 10,
     filter: Filter(vec![Predicate::Glob("path".into(), "src/auth/*".into())]),
     min_score: Some(0.5),
+    ..Default::default()
 };
 let hits = db.search(Scope::All, &query, &opts)?;
 # anyhow::Ok(())

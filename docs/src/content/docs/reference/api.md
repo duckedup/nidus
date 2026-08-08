@@ -1,6 +1,6 @@
 ---
 title: API reference
-description: The full nidus public surface — Nidus, Config, Record, Value, Filter, Predicate, Scope, SearchOpts, FtsQuery, HybridOpts, ListOpts, Hit, Annotations, Footprint.
+description: The full nidus public surface — Nidus, Config, Record, Value, Filter, Predicate, Scope, SearchOpts, Projection, RankBy, Decay, LimitPer, OrderBy, AggregateOpts, FtsQuery, HybridOpts, ListOpts, Hit, Annotations, Footprint.
 ---
 
 The complete public API. All fallible methods return `anyhow::Result`. For the
@@ -27,6 +27,7 @@ searchers plus one writer (see
 | `dimension` | `fn dimension(&self) -> usize` | The pinned embedding dimension. |
 | `config` | `fn config(&self) -> &Config` | The config the store was opened with. |
 | `footprint` | `fn footprint(&self) -> Footprint` | A cheap snapshot of the vector footprint. |
+| `cluster_status` | `fn cluster_status(&self) -> ClusterStatus` | Role, writer-handle state, fencing token, commit counter, staleness — what [`GET /cluster`](/reference/http-api/#get-cluster) reports. |
 
 ### Collections
 
@@ -54,7 +55,7 @@ searchers plus one writer (see
 
 | Method | Signature | Notes |
 | ------ | --------- | ----- |
-| `list` | `fn list<'a>(&self, scope: impl Into<Scope<'a>>, opts: &ListOpts) -> Result<Vec<Hit>>` | Metadata-only query — no vector, returns filter-matched records in insertion order; `ListOpts`'s `offset`/`limit` paginate. |
+| `list` | `fn list<'a>(&self, scope: impl Into<Scope<'a>>, opts: &ListOpts) -> Result<Vec<Hit>>` | Metadata-only query — no vector, returns filter-matched records in insertion order (or by [`ListOpts::order_by`](#orderby)); `offset`/`limit` paginate. |
 | `search` | `fn search<'a>(&self, scope: impl Into<Scope<'a>>, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>` | Ranked search over a scope using the store's distance metric; `SearchOpts`'s `offset`/`top_k` paginate. |
 | `text_search` | `fn text_search<'a>(&self, scope: impl Into<Scope<'a>>, query: &FtsQuery, opts: &SearchOpts) -> Result<Vec<Hit>>` | [BM25 full-text search](/guides/search/#full-text-search-bm25) over one or more field clauses; `min_score` is a raw BM25 floor. |
 | `hybrid_search` | `fn hybrid_search<'a>(&self, scope: impl Into<Scope<'a>>, vector: &[f32], text: &FtsQuery, opts: &HybridOpts) -> Result<Vec<Hit>>` | [Hybrid vector + BM25](/guides/search/#hybrid-search-rrf), fused with Reciprocal Rank Fusion. |
@@ -149,6 +150,12 @@ pub enum Predicate {
     All(Vec<Predicate>),    // every sub-predicate holds  (empty = true)
     Any(Vec<Predicate>),    // some sub-predicate holds   (empty = false)
     Not(Box<Predicate>),    // the sub-predicate does not hold
+
+    Fuzzy(String, String, usize),        // within N Levenshtein edits (N ≤ 8)
+    ContainsAllTokens(String, String),   // every query token present, any order
+    ContainsAnyToken(String, String),    // at least one query token present
+    ContainsTokenSequence(String, String), // the tokens consecutive, in order
+    Regex(String, String),               // anchored at both ends, like Glob
 }
 
 pub struct Filter(pub Vec<Predicate>);
@@ -165,6 +172,18 @@ rather than substrings — `Contains("tags", "rust")` does not match `["rustacea
 without `Filter` itself changing. Note `Not` differs from `Ne` on a **missing**
 attribute: `Ne(k, v)` is false (it requires `k` present), while `Not(Eq(k, v))` is
 true. Use `Ne`/`NotIn`/`NotContains` to require presence, `Not` for set complement.
+
+The [text predicates](/guides/search/#text-predicates) read any text the attribute
+carries — a `Str` directly, a `List` element by element, matching when any *single*
+element does. `Fuzzy` counts characters, not bytes, over the plain three-operation
+Levenshtein distance (so a transposition costs 2) with both sides ASCII-case-folded; a
+budget above **8** is an error, not a clamp. The token family tokenizes at query time on a
+deliberately simpler rule than the FTS analyzer — maximal alphanumeric runs, ASCII-folded,
+**no stemming or stopword removal** — so `ContainsAllTokens("body", "run")` does not match
+`"running"` while `text_search` does. `Regex` is anchored at both ends like `Glob` (`.*`
+opts back into a substring search), takes case-insensitivity from its own `(?i)` flag, and
+runs on a linear-time non-backtracking engine; an unparseable pattern is a caller-facing
+error. None of them is indexed — every one re-scans the attribute per row.
 
 ## `Distance`
 
@@ -353,18 +372,27 @@ pub struct Annotations {
     pub highlights: Vec<Highlight>,   // fragments, one entry per matched field
 }
 
-pub struct LegScore    { pub rank: usize, pub score: f32 }
+pub struct LegScore    { pub rank: usize, pub score: f32 }  // rank is 0-based
 pub struct ClauseScore { pub field: String, pub score: f32 }
 pub struct Highlight   { pub field: String, pub fragments: Vec<Fragment> }
 pub struct Fragment {
     pub text: String,                 // an excerpt of the stored text
     pub spans: Vec<(usize, usize)>,   // matched byte ranges *within* `text`
 }
+
+// Builders: HighlightOpts::default().max_fragments(n).fragment_chars(n)
 ```
 
 Fragment offsets index the **original** text, not the analyzed tokens — a query for `run`
 highlights a document's `running`. Highlighting reads the stored value, so it is unaffected
-by [`Projection`](#projection).
+by [`Projection`](#projection). Note the two units differ: `fragment_chars` budgets
+**characters** (an excerpt is never cut mid-codepoint), while `spans` are **byte** offsets
+into the fragment.
+
+A `ClauseScore` carries a score but no rank — clauses are folded into one text score by
+[`FtsCombine`](#ftsquery-ftsclause-ftscombine--language), so there is no per-clause ranking
+for a rank to name. A `LegScore` does carry one, because the fusion legs *are* ranked
+independently; only `hybrid_search` produces them.
 
 ## `HybridOpts`
 
@@ -449,16 +477,31 @@ pub struct Footprint {
 }
 ```
 
-## `Quantization`
+## `Quantization` & `QuantKind`
 
-Configuration for int8 scalar quantization. Pass to `Config::quantization` to
-enable two-pass search (int8 first-pass → f32 rerank).
+Configuration for vector quantization. Pass to `Config::quantization` to enable two-pass
+search (quantized first pass → exact f32 rerank). See
+[quantization](/guides/search/#quantization).
 
 ```rust
-pub struct Quantization {
-    pub rescore: usize,  // overscan factor (default 4)
+pub enum QuantKind {
+    Int8,    // 4× smaller than f32; valid for any distance metric
+    Binary,  // 32× smaller, Hamming first pass; COSINE ONLY
 }
+
+pub struct Quantization {
+    pub kind: QuantKind,
+    pub rescore: usize,  // overscan factor: int8 defaults to 4, binary to 16
+}
+
+// Builders: Quantization::int8() (also Default), Quantization::binary()
+// Setter:   .rescore(n)
 ```
+
+`Binary` keeps only each dimension's sign bit, which approximates *angular* similarity and
+discards magnitude — so it is not a sound ranking proxy for `DotProduct` or `Euclidean`,
+and is rejected for those metrics. Being the coarser proxy, it defaults to a larger
+overscan than int8.
 
 ## `AnnConfig` & `AnnKind`
 

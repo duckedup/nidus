@@ -5,15 +5,20 @@
 // platform-global `fetch`, so it runs unchanged on Node 18+, Deno, Bun, Cloudflare
 // Workers, and browsers — with no runtime dependencies.
 
+import { decodeAnnotations, type WireAnnotations } from "./annotations.js";
 import { NidusError } from "./errors.js";
 import type {
+  AggregateOptions,
+  Aggregation,
   DecodedRecord,
   Filter,
   FtsField,
+  HighlightOptions,
   Hit,
   HybridSearchOptions,
   ListOptions,
   NidusRecord,
+  RankBy,
   RecallOptions,
   RecordInput,
   RememberOptions,
@@ -196,34 +201,54 @@ export class NidusClient {
       exact: opts.exact,
       include_attributes: opts.includeAttributes,
       exclude_attributes: opts.excludeAttributes,
+      rank_by: encodeRankBy(opts.rankBy),
+      limit_per: opts.limitPer,
     });
   }
 
-  /** BM25 full-text search over one indexed field. */
+  /**
+   * BM25 full-text search over one indexed field, or over a `clauses` list folded by
+   * `combine` (`"Sum"` unless said otherwise). Naming the fields both ways is a `400`.
+   */
   textSearch(opts: TextSearchOptions): Promise<Hit[]> {
     return this.searchRequest("/text-search", {
-      field: opts.field,
-      query: opts.query,
+      ...(opts.clauses
+        ? { clauses: opts.clauses, combine: opts.combine }
+        : { field: opts.field, query: opts.query }),
       scope: opts.scope ?? [],
       top_k: opts.topK,
       offset: opts.offset,
       min_score: opts.minScore,
       filter: opts.filter ?? [],
+      explain: opts.explain,
+      highlight: encodeHighlight(opts.highlight),
+      include_attributes: opts.includeAttributes,
+      exclude_attributes: opts.excludeAttributes,
+      rank_by: encodeRankBy(opts.rankBy),
+      limit_per: opts.limitPer,
     });
   }
 
-  /** Hybrid search: fuse a vector query and a BM25 text query via RRF. */
+  /**
+   * Hybrid search: fuse a vector query and a BM25 text query via RRF. The text leg takes
+   * the same single-field / `clauses` choice as {@link NidusClient.textSearch}.
+   */
   hybridSearch(opts: HybridSearchOptions): Promise<Hit[]> {
     return this.searchRequest("/hybrid-search", {
       vector: opts.vector,
-      field: opts.field,
-      text: opts.text,
+      ...(opts.clauses
+        ? { clauses: opts.clauses, combine: opts.combine }
+        : { field: opts.field, text: opts.text }),
       scope: opts.scope ?? [],
       top_k: opts.topK,
       offset: opts.offset,
       filter: opts.filter ?? [],
       rrf_k: opts.rrfK,
       candidates: opts.candidates,
+      explain: opts.explain,
+      highlight: encodeHighlight(opts.highlight),
+      vector_weight: opts.vectorWeight,
+      text_weight: opts.textWeight,
     });
   }
 
@@ -236,7 +261,25 @@ export class NidusClient {
       filter: opts.filter ?? [],
       include_attributes: opts.includeAttributes,
       exclude_attributes: opts.excludeAttributes,
+      order_by: opts.orderBy,
     });
+  }
+
+  /**
+   * Count the records matching a filter and sum the named attributes. Answered from the
+   * in-RAM index alone — no record is built and no vector is read.
+   */
+  async aggregate(opts: AggregateOptions = {}): Promise<Aggregation> {
+    const res = await this.request<RawAggregation>("POST", "/aggregate", {
+      scope: opts.scope ?? [],
+      filter: opts.filter ?? [],
+      sum: opts.sum ?? [],
+    });
+    // Every sum is an `Int` or a `Float`, both of which decode to a JS number.
+    return {
+      count: res.count,
+      sums: decodeAttrs(res.sums) as Record<string, number>,
+    };
   }
 
   // ── Memory (text-native) ──────────────────────────────────────────────────
@@ -313,6 +356,10 @@ export class NidusClient {
       id: h.id,
       score: h.score,
       attrs: decodeAttrs(h.attrs),
+      // Kept absent, not `undefined`, so an unannotated hit is the shape it always was.
+      ...(h.annotations
+        ? { annotations: decodeAnnotations(h.annotations) }
+        : {}),
     }));
   }
 
@@ -375,6 +422,39 @@ interface RawHit {
   id: string;
   score: number;
   attrs: Record<string, Value>;
+  annotations?: WireAnnotations;
+}
+
+/** An `/aggregate` response, whose sums arrive as tagged {@link Value}s. */
+interface RawAggregation {
+  count: number;
+  sums: Record<string, Value>;
+}
+
+/** Encode `rankBy` to its externally-tagged wire form, dropping the knobs left unset. */
+function encodeRankBy(rank: RankBy | undefined): unknown {
+  if (!rank) return undefined;
+  const d = rank.decay;
+  return {
+    Decay: prune({
+      field: d.field,
+      origin: d.origin instanceof Date ? d.origin.getTime() : d.origin,
+      scale: d.scale,
+      decay: d.decay,
+      lambda: d.lambda,
+      missing: d.missing,
+    }),
+  };
+}
+
+/** Encode `highlight`: `true` is the empty object the server reads as "all defaults". */
+function encodeHighlight(h: boolean | HighlightOptions | undefined): unknown {
+  if (h === undefined || h === false) return undefined;
+  if (h === true) return {};
+  return prune({
+    max_fragments: h.maxFragments,
+    fragment_chars: h.fragmentChars,
+  });
 }
 
 /** Path-segment encode a collection name (allows slashes/spaces in names). */

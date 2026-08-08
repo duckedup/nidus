@@ -19,7 +19,7 @@ let cfg = Config::new("/path/to/store", 768)
     .auto_compact(Some(0.5))         // compact on open above this dead-row ratio
     .lock_ttl(Duration::from_secs(60))
     .max_vector_bytes(None)          // no ceiling (default)
-    .quantization(None)              // int8 two-pass search (default: off)
+    .quantization(None)              // quantized two-pass search (default: off)
     .ann(None)                       // approximate-nearest-neighbour index (default: off)
     .query_threads(1)                // worker threads per exact search (default: 1)
     .segment_max_rows(None)          // seal the active segment past N rows (default: off)
@@ -89,10 +89,11 @@ never fires. It counts physical rows including not-yet-compacted dead rows, so
 
 ### `quantization`
 
-`Option<Quantization>` — default `None` (disabled). When set, the store
-maintains an in-memory int8 copy of all vectors and uses a two-pass search:
-int8 first-pass → f32 rerank. See
-[int8 scalar quantization](/guides/search/#int8-scalar-quantization) for details.
+`Option<Quantization>` — default `None` (disabled). When set, the store maintains an
+in-memory compressed copy of all vectors and uses a two-pass search: quantized
+first-pass → f32 rerank. `Quantization::int8()` (4× smaller, any distance metric) or
+`Quantization::binary()` (32× smaller, **cosine only**), each with a `rescore` overscan
+factor. See [quantization](/guides/search/#quantization) for details.
 
 ### `ann`
 
@@ -110,7 +111,7 @@ default) and `AnnConfig::ivf()` (k-means inverted lists). May be combined with
 `usize` — default `1` (single-threaded; no behavior change). When `> 1`, a single
 large search is split across this many `std::thread::scope` workers to cut one
 query's latency — both the exact f32 scan and, when
-[int8 quantization](/guides/search/#int8-scalar-quantization) is on, its int8 first
+[int8 quantization](/guides/search/#quantization) is on, its int8 first
 pass. The f32 scan is memory-bandwidth-bound (sublinear speedup); the int8 first
 pass is compute-bound and scales better with threads. Leave it at `1` if you already
 run concurrent searches under `Arc<RwLock<Nidus>>` — see
@@ -189,7 +190,7 @@ See [Memory stores](/guides/memory-stores/).
 `bool` — default `false` (single-node). When `true`, several nidus processes cooperate over
 one **shared** backend: a single [`ReadWrite`](#openmode) writer holds a renewing **lease** and
 advances the store on every commit, while any number of [`ReadOnly`](#openmode) readers pick up
-its writes with [`refresh()`](/reference/api/#refresh). It is rejected unless **both**
+its writes with [`refresh()`](/reference/api/#search--maintenance). It is rejected unless **both**
 [`persistence`](#persistence) is a shared object store (`s3://…`/`gs://…`) **and**
 [`memory`](#memory) is a shared tier (`redis://…`) — local files / process RAM are single-node
 by definition. There is no coordinator, replication, or rebalancing; the object store plus the

@@ -106,6 +106,20 @@ const hits = await db.search({
 });
 ```
 
+Beyond the comparisons there are text predicates — approximate, token-wise, and
+regular-expression matching over a plain attribute (no full-text index required):
+
+```ts
+f.fuzzy("title", "vecter store", 2);      // within 2 Levenshtein edits (max 8)
+f.containsAllTokens("body", "vector store"); // both tokens, any order
+f.containsAnyToken("body", "vector store");
+f.containsTokenSequence("body", "vector store"); // as a phrase, in order
+f.regex("path", "src/.*\\.rs");           // anchored at both ends, like f.glob
+```
+
+`f.regex` uses Rust's `regex` syntax, not JavaScript's: no backreferences and no
+lookaround. Prefix it with `(?i)` for case-insensitive matching.
+
 ## Full-text and hybrid search
 
 ```ts
@@ -123,6 +137,80 @@ const hybrid = await db.hybridSearch({
   topK: 10,
 });
 ```
+
+A query can search several fields at once, each with its own text, by sending `clauses`
+instead of the single field — folded by `combine`, `"Sum"` (a doc hitting title *and*
+body outranks one hitting either) or `"Max"` (a long body cannot out-accumulate a
+precise title match). Weight the two hybrid legs with `vectorWeight`/`textWeight`.
+
+```ts
+const hits = await db.textSearch({
+  clauses: [
+    { field: "title", query: "rust" },
+    { field: "body", query: "async runtime" },
+  ],
+  combine: "Max",
+  topK: 10,
+});
+```
+
+## Explaining and highlighting a hit
+
+`explain` reports what each leg and each matched clause contributed; `highlight` returns
+excerpts of the stored text (so it works even on a field the projection dropped). Both
+land on `hit.annotations`, which is absent unless you asked for one of them.
+
+```ts
+const hits = await db.hybridSearch({
+  vector: [0.1, 0.2, 0.3],
+  field: "body",
+  text: "vector store",
+  explain: true,
+  highlight: true, // or { maxFragments: 3, fragmentChars: 120 }
+});
+
+for (const { field, fragments } of hits[0]?.annotations?.highlights ?? []) {
+  for (const fragment of fragments) {
+    for (const span of fragment.spans) {
+      console.log(field, fragment.text.slice(...span));
+    }
+  }
+}
+```
+
+nidus reports a span as a **UTF-8 byte** range, but a JS string is indexed in UTF-16
+code units — so a raw span slices the wrong text out of any non-ASCII excerpt. This SDK
+converts them for you: `fragment.spans` are JS string indices, and `fragment.text.slice`
+is the matched term. If you compare them against the raw HTTP response, expect the
+numbers to differ wherever the excerpt is not ASCII.
+
+## Ranking, grouping, ordering, and aggregating
+
+```ts
+// Prefer recent hits: subtract a penalty that halves every `scale` ms of age.
+const recent = await db.search({
+  query: [0.1, 0.2, 0.3],
+  rankBy: {
+    decay: { field: "updated_at", origin: Date.now(), scale: 7 * 86_400_000 },
+  },
+  // …and keep at most 2 hits from any one file
+  limitPer: { field: "path", max: 2 },
+});
+
+// Sort a listing by an attribute instead of storage order
+await db.list({ orderBy: { field: "updated_at", descending: true } });
+
+// Count matches and sum attributes, without reading a single vector
+const { count, sums } = await db.aggregate({
+  filter: f.and(f.eq("lang", "rust")),
+  sum: ["bytes"],
+});
+```
+
+Ages are measured back from `origin`, never the wall clock, so the same query against an
+unchanged store ranks the same way twice. The penalty is *subtracted* from the score, so
+it stays meaningful for a metric whose scores are negative or unbounded, and a record
+with no usable timestamp is not penalized at all (`missing` defaults to `1`).
 
 ## Remembering and recalling (text-native)
 

@@ -127,7 +127,51 @@ class f:
         An empty set matches nothing. "Contains all of" is :meth:`all_` over several
         :meth:`contains`.
         """
+        _guards.reject_bare_string(values, "f.contains_any(key, values)")
         return {"ContainsAny": [key, [encode_value(v) for v in values]]}
+
+    # The text predicates below take a **bare string** as their second element, like
+    # `glob`/`iglob` and unlike every other leaf: the server's variants hold a `String`. Each
+    # reads any text the attribute carries, so a `List` matches when a single element does.
+
+    @staticmethod
+    def fuzzy(key: str, text: str, max_edits: int) -> Predicate:
+        """``attrs[key]`` is within ``max_edits`` Levenshtein edits of ``text``.
+
+        The only **3**-element predicate — ``{"Fuzzy": ["k", "text", 2]}`` — because the
+        edit budget is part of the operand. Above 8 edits the server errors rather than
+        clamping, since that far out the predicate matches most of the store.
+        """
+        return {"Fuzzy": [key, text, max_edits]}
+
+    @staticmethod
+    def contains_all_tokens(key: str, text: str) -> Predicate:
+        """Every token of ``text`` appears among ``attrs[key]``'s tokens, in any order.
+
+        Tokens are ASCII-case-folded runs of alphanumerics here and in the two below, so
+        case and punctuation do not count — unlike :meth:`glob`, which is character-literal.
+        """
+        return {"ContainsAllTokens": [key, text]}
+
+    @staticmethod
+    def contains_any_token(key: str, text: str) -> Predicate:
+        """At least one token of ``text`` appears in ``attrs[key]``. Empty text matches nothing."""
+        return {"ContainsAnyToken": [key, text]}
+
+    @staticmethod
+    def contains_token_sequence(key: str, text: str) -> Predicate:
+        """``text``'s tokens appear consecutively and in order in ``attrs[key]`` — a phrase."""
+        return {"ContainsTokenSequence": [key, text]}
+
+    @staticmethod
+    def regex(key: str, pattern: str) -> Predicate:
+        """``attrs[key]`` matches the regular expression, **anchored at both ends**.
+
+        Anchored like :meth:`glob`, so ``"src"`` matches only the whole value and
+        ``".*src.*"`` is the substring search. Case folding is the pattern's own ``(?i)``,
+        and an unparseable pattern comes back as a server-side error.
+        """
+        return {"Regex": [key, pattern]}
 
     @staticmethod
     def all_(*preds: Predicate) -> Predicate:

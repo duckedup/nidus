@@ -78,6 +78,35 @@ export const f = {
    * `not(eq(k, v))` matches a record with no `k`, `ne(k, v)` does not.
    */
   not: (pred: Predicate): Predicate => ({ Not: pred }),
+  /**
+   * `attrs[key]` is within `maxEdits` Levenshtein edits of `text`, ASCII-case-folded on
+   * both sides; a `List` matches if any element does. The only three-element predicate.
+   * A `maxEdits` above 8 is refused by the server, not clamped.
+   */
+  fuzzy: (key: string, text: string, maxEdits: number): Predicate => ({
+    Fuzzy: [key, text, maxEdits],
+  }),
+  /**
+   * Every token of `text` appears among `attrs[key]`'s tokens, in any order. Tokens are
+   * ASCII-case-folded runs of alphanumerics; a `List` matches if any single element does.
+   */
+  containsAllTokens: (key: string, text: string): Predicate => ({
+    ContainsAllTokens: [key, text],
+  }),
+  /** At least one token of `text` appears among `attrs[key]`'s tokens. Empty never matches. */
+  containsAnyToken: (key: string, text: string): Predicate => ({
+    ContainsAnyToken: [key, text],
+  }),
+  /** `text`'s tokens appear consecutively and in order — a phrase match. */
+  containsTokenSequence: (key: string, text: string): Predicate => ({
+    ContainsTokenSequence: [key, text],
+  }),
+  /**
+   * `attrs[key]` matches the regular expression, **anchored at both ends** like
+   * {@link f.glob} — `.*` opts back into a substring search, and `(?i)` into case folding.
+   * The syntax is Rust's `regex`, not JS's: no backreferences and no lookaround.
+   */
+  regex: (key: string, pattern: string): Predicate => ({ Regex: [key, pattern] }),
   /** Collect predicates into a {@link Filter} (purely sugar — they already AND). */
   and: (...preds: Predicate[]): Filter => preds,
 } as const;

@@ -35,7 +35,19 @@ except ModuleNotFoundError as err:  # pragma: no cover - depends on the install 
 
 from . import _wire
 from .filter import Filter
-from .types import FtsField, Hits, Record, RecordInput, Stats
+from .ranking import RankBy
+from .types import (
+    Aggregation,
+    FtsClause,
+    FtsField,
+    HighlightOpts,
+    Hits,
+    LimitPer,
+    OrderBy,
+    Record,
+    RecordInput,
+    Stats,
+)
 from .values import AttrInput
 
 # `Optional[X]` rather than `X | None`, as everywhere else here: on the 3.9 floor a PEP 604
@@ -164,12 +176,15 @@ class AsyncNidusClient:
         exact: Optional[bool] = None,
         include_attributes: Optional[Sequence[str]] = None,
         exclude_attributes: Optional[Sequence[str]] = None,
+        rank_by: Optional[RankBy] = None,
+        limit_per: Optional[LimitPer] = None,
     ) -> Hits:
         """Vector (cosine) nearest-neighbour search. An empty ``scope`` searches everything.
 
         ``offset`` skips that many top-ranked hits, so successive pages tile one ranking;
         the server refuses ``offset + top_k`` above 10000. ``exact=True`` forces the exact
-        scan past any index; the projection arguments are mutually exclusive.
+        scan past any index; the projection arguments are mutually exclusive. ``rank_by``
+        and ``limit_per`` are as in :meth:`nidus.client.NidusClient.search`.
         """
         return await self._search(
             _wire.SEARCH,
@@ -183,21 +198,36 @@ class AsyncNidusClient:
                 exact=exact,
                 include_attributes=include_attributes,
                 exclude_attributes=exclude_attributes,
+                rank_by=rank_by,
+                limit_per=limit_per,
             ),
         )
 
     async def text_search(
         self,
         *,
-        field: str,
-        query: str,
+        field: Optional[str] = None,
+        query: Optional[str] = None,
         scope: Optional[Sequence[str]] = None,
         top_k: Optional[int] = None,
         offset: Optional[int] = None,
         min_score: Optional[float] = None,
         filter: Optional[Filter] = None,  # noqa: A002
+        clauses: Optional[Sequence[FtsClause]] = None,
+        combine: Optional[str] = None,
+        explain: Optional[bool] = None,
+        highlight: Optional[Union[bool, HighlightOpts]] = None,
+        include_attributes: Optional[Sequence[str]] = None,
+        exclude_attributes: Optional[Sequence[str]] = None,
+        rank_by: Optional[RankBy] = None,
+        limit_per: Optional[LimitPer] = None,
     ) -> Hits:
-        """BM25 full-text search over one indexed field, paginated by ``offset``."""
+        """BM25 full-text search, paginated by ``offset``.
+
+        One field (``field`` + ``query``) or several (``clauses`` + ``combine``), never
+        both; ``explain``/``highlight`` fill ``hit.annotations``. Same rules as
+        :meth:`nidus.client.NidusClient.text_search`.
+        """
         return await self._search(
             _wire.TEXT_SEARCH,
             _wire.text_search_body(
@@ -208,6 +238,14 @@ class AsyncNidusClient:
                 offset=offset,
                 min_score=min_score,
                 filter=filter,
+                clauses=clauses,
+                combine=combine,
+                explain=explain,
+                highlight=highlight,
+                include_attributes=include_attributes,
+                exclude_attributes=exclude_attributes,
+                rank_by=rank_by,
+                limit_per=limit_per,
             ),
         )
 
@@ -215,19 +253,26 @@ class AsyncNidusClient:
         self,
         *,
         vector: Sequence[float],
-        field: str,
-        text: str,
+        field: Optional[str] = None,
+        text: Optional[str] = None,
         scope: Optional[Sequence[str]] = None,
         top_k: Optional[int] = None,
         offset: Optional[int] = None,
         filter: Optional[Filter] = None,  # noqa: A002
         rrf_k: Optional[float] = None,
         candidates: Optional[int] = None,
+        clauses: Optional[Sequence[FtsClause]] = None,
+        combine: Optional[str] = None,
+        explain: Optional[bool] = None,
+        highlight: Optional[Union[bool, HighlightOpts]] = None,
+        vector_weight: Optional[float] = None,
+        text_weight: Optional[float] = None,
     ) -> Hits:
         """Hybrid search: fuse a vector query and a BM25 text query via RRF.
 
         ``offset`` pages the *fused* ranking, never a leg — a leg's rank is an input to
-        the fused score.
+        the fused score. The text leg, the weights, and ``explain`` behave exactly as in
+        :meth:`nidus.client.NidusClient.hybrid_search`.
         """
         return await self._search(
             _wire.HYBRID_SEARCH,
@@ -241,6 +286,12 @@ class AsyncNidusClient:
                 filter=filter,
                 rrf_k=rrf_k,
                 candidates=candidates,
+                clauses=clauses,
+                combine=combine,
+                explain=explain,
+                highlight=highlight,
+                vector_weight=vector_weight,
+                text_weight=text_weight,
             ),
         )
 
@@ -253,8 +304,13 @@ class AsyncNidusClient:
         filter: Optional[Filter] = None,  # noqa: A002
         include_attributes: Optional[Sequence[str]] = None,
         exclude_attributes: Optional[Sequence[str]] = None,
+        order_by: Optional[OrderBy] = None,
     ) -> Hits:
-        """Metadata-only listing (no vector query), paginated by ``offset``/``limit``."""
+        """Metadata-only listing (no vector query), paginated by ``offset``/``limit``.
+
+        ``order_by`` sorts by an attribute instead of storage order, with the unorderable
+        and the absent in one trailing bucket.
+        """
         return await self._search(
             _wire.LIST,
             _wire.list_body(
@@ -264,7 +320,25 @@ class AsyncNidusClient:
                 filter=filter,
                 include_attributes=include_attributes,
                 exclude_attributes=exclude_attributes,
+                order_by=order_by,
             ),
+        )
+
+    async def aggregate(
+        self,
+        *,
+        scope: Optional[Sequence[str]] = None,
+        filter: Optional[Filter] = None,  # noqa: A002
+        sum: Optional[Sequence[str]] = None,  # noqa: A002
+    ) -> Aggregation:
+        """Count the records a filter matches, and sum the attributes named in ``sum``.
+
+        Answered from the in-RAM index alone — no record is built and no vector is read.
+        """
+        return _wire.decode_aggregation(
+            await self._request(
+                "POST", _wire.AGGREGATE, _wire.aggregate_body(scope=scope, filter=filter, sum=sum)
+            )
         )
 
     # ── Memory (text-native) ─────────────────────────────────────────────────────────

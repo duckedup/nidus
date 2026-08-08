@@ -257,8 +257,14 @@ curl -s -X POST localhost:7700/collections/docs/fts-schema \
 ### `POST /collections/{name}/upsert`
 
 Insert or overwrite records by id. Each record is `{id, vector, attrs}`; `vector`
-length must match the store dimension. `attrs` values are tagged
-(`{"Str": …}`, `{"Int": …}`, `{"Bool": …}`, `{"List": […]}`, `{"Null": null}`).
+length must match the store dimension, and may be **omitted** for a text-only document.
+`attrs` values are tagged: `{"Str": …}`, `{"Int": …}`, `{"Bool": …}`, `{"List": […]}`,
+`{"Float": …}`, `{"DateTime": …}` (epoch milliseconds) — and the unit variant `Null` is
+the bare string `"Null"`, not an object.
+
+`Float` and `Int` are distinct types and never cross-compare in a filter, so a whole
+number sent as `{"Float": 1.0}` stays a `Float` on the way back out. Pick one spelling per
+attribute and keep to it.
 
 ```bash
 curl -s localhost:7700/collections/docs/upsert \
@@ -527,10 +533,6 @@ curl -s localhost:7700/list \
 a different `Value` variant, an unorderable `Null`/`List`, or a record missing the attribute
 — sort into one trailing bucket, which stays trailing when reversed.
 
-The `filter` in both `/search` and `/list` is an AND of predicates: `Eq`, `Ne`,
-`Glob`, `IGlob`, `In`, `NotIn`, `Lt`, `Le`, `Gt`, `Ge`. See
-[Search & filters](/guides/search/) for the full predicate grammar.
-
 ### `POST /aggregate`
 
 Count the filter-matching records and total numeric attributes, without materializing any
@@ -554,6 +556,38 @@ curl -s localhost:7700/aggregate \
 `Int` while every addend was an `Int`, `Float` once any `Float` joined. A missing or
 non-numeric value is skipped rather than counted as zero. A filter matching nothing answers
 `{"count": 0, ...}` rather than erroring.
+
+### The `filter` grammar
+
+Every route that takes a `filter` — `/search`, `/text-search`, `/hybrid-search`, `/list`,
+`/aggregate`, and `/collections/{name}/delete` — takes the same one: a JSON array of
+predicates, AND-combined. Each predicate is a single-key object naming the variant.
+
+| Group | Predicates |
+| --- | --- |
+| Equality & sets | `Eq`, `Ne`, `In`, `NotIn` |
+| Ranges (same-type, orderable) | `Lt`, `Le`, `Gt`, `Ge` |
+| Patterns | `Glob`, `IGlob` (ASCII-case-insensitive), `Regex` |
+| List containment | `Contains`, `NotContains`, `ContainsAny` |
+| Text | `Fuzzy`, `ContainsAllTokens`, `ContainsAnyToken`, `ContainsTokenSequence` |
+| Boolean groups | `All`, `Any`, `Not` |
+
+```json
+[
+  {"Any": [{"Eq": ["lang", {"Str": "rust"}]}, {"Eq": ["lang", {"Str": "go"}]}]},
+  {"Not": {"Contains": ["tags", {"Str": "generated"}]}},
+  {"Ge": ["updated_at", {"DateTime": 1770000000000}]},
+  {"Fuzzy": ["name", "nidus", 2]},
+  {"Regex": ["path", "src/[a-z]+/mod\\.rs"]}
+]
+```
+
+`All`/`Any`/`Not` take predicates rather than values, so any boolean shape nests inside
+the outer AND. `Not` and `Ne` differ on a **missing** attribute: `Ne` requires the key
+present, `Not` is a true complement. A filter is validated once per query, before any row
+is scanned, so an unparseable `Regex` or a `Fuzzy` budget above 8 is **refused with an
+error** rather than quietly matching nothing. See
+[Search & filters](/guides/search/#filters) for the full semantics.
 
 ## Maintenance
 

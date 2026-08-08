@@ -651,6 +651,244 @@ func TestLifecycleAgainstARealServer(t *testing.T) {
 	})
 }
 
+// TestRankingAndAnnotationsAgainstARealServer covers the surface the unit tests can
+// only pin the *bytes* of: the text predicates, multi-clause text queries, the
+// explain/highlight annotations, the ranking knobs, and /aggregate.
+//
+// Every one of these is a body the SDK believes the server will accept — a wrong field
+// name or a wrong tuple arity is a 400 nothing else in this suite would see, and the
+// annotations in particular only exist on a response a real query produced.
+func TestRankingAndAnnotationsAgainstARealServer(t *testing.T) {
+	db := startServer(t)
+	ctx := context.Background()
+
+	if err := db.CreateCollection(ctx, "docs"); err != nil {
+		t.Fatalf("CreateCollection failed: %v", err)
+	}
+	if err := db.SetFtsSchema(ctx, "docs", []string{"title", "body"}); err != nil {
+		t.Fatalf("SetFtsSchema failed: %v", err)
+	}
+	// Two epoch-ms timestamps a fixed distance apart, so the decay test needs no clock.
+	const now = int64(1_700_000_000_000)
+	const week = int64(7 * 24 * 60 * 60 * 1000)
+	_, err := db.Upsert(ctx, "docs", []Record{
+		{ID: "a", Vector: []float32{1, 0, 0}, Attrs: Attrs{
+			"title": Str("rust async runtime"), "body": Str("we were running the executor"),
+			"path": Str("src/main.rs"), "ts": DateTimeMillis(now), "bytes": Int(40960),
+		}},
+		{ID: "b", Vector: []float32{0.99, 0.14, 0}, Attrs: Attrs{
+			"title": Str("go scheduler"), "body": Str("the runtime schedules goroutines"),
+			"path": Str("src/main.rs"), "ts": DateTimeMillis(now - 52*week), "bytes": Int(1024),
+		}},
+		{ID: "c", Vector: []float32{0.98, 0.2, 0}, Attrs: Attrs{
+			"title": Str("notes"), "body": Str("nothing to see"), "path": Str("docs/notes.md"),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Upsert failed: %v", err)
+	}
+
+	t.Run("the text predicates filter on a plain attribute", func(t *testing.T) {
+		cases := []struct {
+			name string
+			pred Predicate
+			want []string
+		}{
+			{"Fuzzy", Fuzzy("path", "src/mian.rs", 2), []string{"a", "b"}},
+			{"ContainsAllTokens", ContainsAllTokens("title", "runtime rust"), []string{"a"}},
+			{"ContainsAnyToken", ContainsAnyToken("title", "rust scheduler"), []string{"a", "b"}},
+			{"ContainsTokenSequence", ContainsTokenSequence("title", "async runtime"), []string{"a"}},
+			{"Regex", Regex("path", "src/.*"), []string{"a", "b"}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				rows, err := db.List(ctx, ListRequest{Filter: And(tc.pred)})
+				if err != nil {
+					t.Fatalf("List failed: %v", err)
+				}
+				if !sameSet(ids(rows), tc.want) {
+					t.Errorf("matched %v, want %v", ids(rows), tc.want)
+				}
+			})
+		}
+
+		// The server owns the edit ceiling; the SDK refuses before sending so the
+		// mistake names the builder rather than arriving as a 400.
+		if _, err := db.List(ctx, ListRequest{Filter: And(Fuzzy("path", "x", 99))}); err == nil {
+			t.Error("an out-of-range Fuzzy reached the server")
+		}
+	})
+
+	t.Run("a multi-clause query scores every clause", func(t *testing.T) {
+		hits, err := db.TextSearch(ctx, TextSearchRequest{
+			Clauses: []FtsClause{
+				{Field: "title", Query: "runtime"},
+				{Field: "body", Query: "runtime"},
+			},
+			Explain: true,
+		})
+		if err != nil {
+			t.Fatalf("TextSearch failed: %v", err)
+		}
+		if !sameSet(ids(hits), []string{"a", "b"}) {
+			t.Fatalf("hits = %v, want a and b", ids(hits))
+		}
+		// Sum is the default, so the doc matching on both fields must report both
+		// clauses — which is the whole observable difference from a single-field query.
+		for _, h := range hits {
+			if h.Annotations == nil || len(h.Annotations.Clauses) == 0 {
+				t.Fatalf("hit %s carries no clause scores; Explain did not arrive", h.ID)
+			}
+		}
+
+		// Max cannot exceed Sum for the same query, and both must actually differ from
+		// each other when a doc matches two clauses.
+		maxed, err := db.TextSearch(ctx, TextSearchRequest{
+			Clauses: []FtsClause{{Field: "title", Query: "runtime"}, {Field: "body", Query: "runtime"}},
+			Combine: CombineMax,
+		})
+		if err != nil {
+			t.Fatalf("TextSearch failed: %v", err)
+		}
+		summed := map[string]float32{}
+		for _, h := range hits {
+			summed[h.ID] = h.Score
+		}
+		for _, h := range maxed {
+			if h.Score > summed[h.ID] {
+				t.Errorf("hit %s scored %v under Max but %v under Sum", h.ID, h.Score, summed[h.ID])
+			}
+		}
+	})
+
+	t.Run("highlight returns fragments with usable spans", func(t *testing.T) {
+		hits, err := db.TextSearch(ctx, TextSearchRequest{
+			Field: "body", Query: "running", Highlight: &HighlightOpts{},
+		})
+		if err != nil {
+			t.Fatalf("TextSearch failed: %v", err)
+		}
+		if len(hits) == 0 || hits[0].Annotations == nil {
+			t.Fatalf("hits = %v with no annotations; Highlight did not arrive", ids(hits))
+		}
+		hl := hits[0].Annotations.Highlights
+		if len(hl) != 1 || hl[0].Field != "body" || len(hl[0].Fragments) == 0 {
+			t.Fatalf("highlights = %+v, want one over body", hl)
+		}
+		frag := hl[0].Fragments[0]
+		if len(frag.Spans) == 0 {
+			t.Fatalf("fragment %q carries no spans", frag.Text)
+		}
+		// The spans are byte offsets into the fragment's own text, so this slice is the
+		// claim: a span that decoded wrong panics or produces the wrong word.
+		if got := frag.Text[frag.Spans[0].Start:frag.Spans[0].End]; got != "running" {
+			t.Errorf("span %v covers %q, want %q", frag.Spans[0], got, "running")
+		}
+	})
+
+	t.Run("hybrid explain reports each leg, and a zero weight drops one", func(t *testing.T) {
+		hits, err := db.HybridSearch(ctx, HybridSearchRequest{
+			Vector: []float32{1, 0, 0}, Field: "title", Text: "rust", Explain: true,
+		})
+		if err != nil {
+			t.Fatalf("HybridSearch failed: %v", err)
+		}
+		var sawVector, sawText bool
+		for _, h := range hits {
+			if h.Annotations == nil {
+				t.Fatalf("hit %s carries no annotations; Explain did not arrive", h.ID)
+			}
+			sawVector = sawVector || h.Annotations.Vector != nil
+			sawText = sawText || h.Annotations.Text != nil
+		}
+		if !sawVector || !sawText {
+			t.Errorf("legs reported: vector=%v text=%v, want both", sawVector, sawText)
+		}
+
+		// A weight of zero must actually travel: the fused scores have to change.
+		weighted, err := db.HybridSearch(ctx, HybridSearchRequest{
+			Vector: []float32{1, 0, 0}, Field: "title", Text: "rust",
+			VectorWeight: f32(0), TextWeight: f32(1),
+		})
+		if err != nil {
+			t.Fatalf("HybridSearch failed: %v", err)
+		}
+		if len(weighted) == 0 {
+			t.Fatal("a zero vector weight returned nothing")
+		}
+		if weighted[0].Score >= hits[0].Score {
+			t.Errorf("top score = %v with the vector leg dropped, want below the unweighted %v",
+				weighted[0].Score, hits[0].Score)
+		}
+	})
+
+	t.Run("decay, limit_per and order_by reshape the ranking", func(t *testing.T) {
+		// Undecayed, b outranks c on cosine. A year of decay with a week-long half-life
+		// buries b — and must leave c, which has no ts at all, exactly where it was.
+		plain, err := db.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}})
+		if err != nil {
+			t.Fatalf("Search failed: %v", err)
+		}
+		if got := ids(plain); len(got) != 3 || got[0] != "a" {
+			t.Fatalf("undecayed ranking = %v, want a first", got)
+		}
+		decayed, err := db.Search(ctx, SearchRequest{
+			Query:  []float32{1, 0, 0},
+			RankBy: DecayRank(Decay{Field: "ts", Origin: now, Scale: week}),
+		})
+		if err != nil {
+			t.Fatalf("Search failed: %v", err)
+		}
+		if got := ids(decayed); got[len(got)-1] != "b" {
+			t.Errorf("decayed ranking = %v, want the year-old b last", got)
+		}
+
+		// Two records share src/main.rs; a cap of one keeps a single one of them.
+		capped, err := db.Search(ctx, SearchRequest{
+			Query: []float32{1, 0, 0}, LimitPer: &LimitPer{Field: "path", Max: 1},
+		})
+		if err != nil {
+			t.Fatalf("Search failed: %v", err)
+		}
+		if len(capped) != 2 {
+			t.Errorf("limit_per 1 per path returned %v, want two hits", ids(capped))
+		}
+
+		rows, err := db.List(ctx, ListRequest{OrderBy: &OrderBy{Field: "bytes", Descending: true}})
+		if err != nil {
+			t.Fatalf("List failed: %v", err)
+		}
+		// c has no `bytes` at all, so it sorts into the trailing bucket either way.
+		if got := ids(rows); len(got) < 2 || got[0] != "a" || got[1] != "b" {
+			t.Errorf("descending order_by = %v, want a then b", got)
+		}
+	})
+
+	t.Run("aggregate counts and sums", func(t *testing.T) {
+		out, err := db.Aggregate(ctx, AggregateRequest{Sum: []string{"bytes"}})
+		if err != nil {
+			t.Fatalf("Aggregate failed: %v", err)
+		}
+		if out.Count != 3 {
+			t.Errorf("count = %d, want 3", out.Count)
+		}
+		if n, ok := out.Sums["bytes"].Int(); !ok || n != 41984 {
+			t.Errorf("sums[bytes] = %v, want Int(41984)", out.Sums["bytes"])
+		}
+
+		// A filter narrows both halves of the answer at once.
+		out, err = db.Aggregate(ctx, AggregateRequest{
+			Filter: And(Glob("path", "src/*")), Sum: []string{"bytes"},
+		})
+		if err != nil {
+			t.Fatalf("Aggregate failed: %v", err)
+		}
+		if out.Count != 2 {
+			t.Errorf("filtered count = %d, want 2", out.Count)
+		}
+	})
+}
+
 // TestServerErrorsCarryTheirStatus checks the error surface against the real
 // classifier in src/server/mod.rs rather than a canned httptest reply. The status is
 // the part a caller acts on, so it has to be the status the server actually chose.

@@ -40,7 +40,7 @@ from decimal import Decimal
 
 import pytest
 
-from nidus import NidusError, _wire, f, v
+from nidus import NidusError, _wire, f, rank, v
 
 # A `/stats` payload for a store doing exact brute-force search: `ann` is null.
 EXACT_STATS = {
@@ -303,6 +303,191 @@ def test_hybrid_search_body_has_no_min_score() -> None:
     assert tuned["candidates"] == 200
 
 
+def test_ranking_knobs_are_omitted_unless_asked_for() -> None:
+    """``rank_by``/``limit_per`` are additive: unset, the body is the pre-ranking one."""
+    body = _wire.search_body([1.0], top_k=5)
+    assert "rank_by" not in body
+    assert "limit_per" not in body
+    assert _wire.search_body([1.0], rank_by=rank.decay("ts", 1700000000000))["rank_by"] == {
+        "Decay": {"field": "ts", "origin": 1700000000000}
+    }
+    assert _wire.search_body([1.0], limit_per={"field": "path", "max": 2})["limit_per"] == {
+        "field": "path",
+        "max": 2,
+    }
+    # And on the text route, which takes the same two.
+    assert "rank_by" not in _wire.text_search_body("body", "fox")
+    assert _wire.text_search_body("body", "fox", limit_per={"field": "path", "max": 1})[
+        "limit_per"
+    ] == {"field": "path", "max": 1}
+
+
+def test_a_limit_per_must_name_both_keys_and_no_others() -> None:
+    """A missing ``max`` is a 400; a misspelled key would be *ignored* by serde instead."""
+    with pytest.raises(TypeError, match="missing required key"):
+        _wire.search_body([1.0], limit_per={"field": "path"})  # type: ignore[typeddict-item]
+    with pytest.raises(TypeError, match="unknown key"):
+        _wire.search_body([1.0], limit_per={"field": "path", "maximum": 2})  # type: ignore[typeddict-unknown-key]
+    with pytest.raises(TypeError, match="limit_per"):
+        _wire.search_body([1.0], limit_per="path")  # type: ignore[arg-type]
+
+
+def test_text_search_body_takes_several_clauses_with_a_combine_rule() -> None:
+    """The multi-field spelling: one text per field, folded by ``combine``."""
+    assert _wire.text_search_body(
+        clauses=[{"field": "title", "query": "rust"}, {"field": "body", "query": "async runtime"}],
+        combine="Max",
+    ) == {
+        "clauses": [
+            {"field": "title", "query": "rust"},
+            {"field": "body", "query": "async runtime"},
+        ],
+        "combine": "Max",
+        "scope": [],
+        "filter": [],
+    }
+    # `combine` is the server's when unset, and a clause's text key is `query` on both routes.
+    assert "combine" not in _wire.text_search_body(clauses=[{"field": "t", "query": "x"}])
+    assert _wire.hybrid_search_body([1.0], clauses=[{"field": "t", "query": "x"}])["clauses"] == [
+        {"field": "t", "query": "x"}
+    ]
+
+
+def test_the_single_field_spelling_is_byte_identical_to_the_one_before_clauses() -> None:
+    """The compatibility contract: an existing call must not change what it sends."""
+    assert _wire.text_search_body("body", "fox") == {
+        "field": "body",
+        "query": "fox",
+        "scope": [],
+        "filter": [],
+    }
+    assert _wire.hybrid_search_body([1.0], "body", "fox") == {
+        "vector": [1.0],
+        "field": "body",
+        "text": "fox",
+        "scope": [],
+        "filter": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda **kw: _wire.text_search_body(**kw),
+        lambda **kw: _wire.hybrid_search_body([1.0], **kw),
+    ],
+    ids=["text_search", "hybrid_search"],
+)
+def test_a_text_query_must_use_exactly_one_of_the_two_spellings(
+    build: Callable[..., object],
+) -> None:
+    """Both, neither, half of one, or an empty list are refused before the request.
+
+    The server refuses them too — it must, since it answers other clients — but an empty
+    result would otherwise read as "no matches" when it means "no query", and failing here
+    names the argument at the call site instead of returning a 400 about the body.
+    """
+    one = [{"field": "t", "query": "x"}]
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        build(field="body", clauses=one)
+    with pytest.raises(ValueError, match="must not be empty"):
+        build(clauses=[])
+    with pytest.raises(ValueError, match="clauses list"):
+        build()
+    with pytest.raises(ValueError, match="sent together"):
+        build(field="body")
+
+
+def test_a_clause_must_be_a_mapping_naming_a_field_and_its_query() -> None:
+    """``text`` is the *single-field* key on the hybrid route; a clause always says ``query``."""
+    with pytest.raises(TypeError, match="unknown key"):
+        _wire.hybrid_search_body([1.0], clauses=[{"field": "t", "text": "x"}])  # type: ignore[typeddict-unknown-key]
+    with pytest.raises(TypeError, match="missing required key"):
+        _wire.text_search_body(clauses=[{"field": "t"}])  # type: ignore[typeddict-item]
+    with pytest.raises(TypeError, match="expects a mapping"):
+        _wire.text_search_body(clauses=["body"])  # type: ignore[list-item]
+
+
+def test_explain_and_highlight_are_omitted_unless_asked_for() -> None:
+    """Both are additive, and ``highlight=True`` is the empty object that means "defaults"."""
+    body = _wire.text_search_body("body", "fox")
+    assert "explain" not in body
+    assert "highlight" not in body
+    assert _wire.text_search_body("body", "fox", explain=True)["explain"] is True
+    assert _wire.text_search_body("body", "fox", highlight=True)["highlight"] == {}
+    assert _wire.text_search_body("body", "fox", highlight={"max_fragments": 3})["highlight"] == {
+        "max_fragments": 3
+    }
+    # `False` means the same as unset — no annotations were asked for.
+    assert "highlight" not in _wire.text_search_body("body", "fox", highlight=False)
+    assert _wire.hybrid_search_body([1.0], "body", "fox", explain=True, highlight=True) == {
+        "vector": [1.0],
+        "field": "body",
+        "text": "fox",
+        "scope": [],
+        "filter": [],
+        "explain": True,
+        "highlight": {},
+    }
+
+
+def test_a_misspelled_highlight_knob_is_refused() -> None:
+    """The server ignores unknown keys, so a typo would silently return default fragments."""
+    with pytest.raises(TypeError, match="unknown key"):
+        _wire.text_search_body("body", "fox", highlight={"maxFragments": 3})  # type: ignore[typeddict-unknown-key]
+
+
+def test_hybrid_search_body_weights_each_leg_only_when_asked() -> None:
+    """Both weights default to 1.0 server-side, which is the unweighted fusion exactly."""
+    body = _wire.hybrid_search_body([1.0], "body", "fox")
+    assert "vector_weight" not in body
+    assert "text_weight" not in body
+    weighted = _wire.hybrid_search_body([1.0], "body", "fox", vector_weight=2.0, text_weight=0.0)
+    assert weighted["vector_weight"] == 2.0
+    # An explicit zero mutes the leg, and is a real value rather than "unset".
+    assert weighted["text_weight"] == 0.0
+
+
+def test_text_search_body_projects_attributes_like_search_does() -> None:
+    """``/text-search`` grew the same two projection lists, with the same exclusivity rule."""
+    assert _wire.text_search_body("body", "fox", include_attributes=["title"])[
+        "include_attributes"
+    ] == ["title"]
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _wire.text_search_body("body", "fox", include_attributes=["a"], exclude_attributes=["b"])
+
+
+def test_list_body_orders_by_an_attribute_only_when_asked() -> None:
+    """``descending`` is optional (ascending by default) and must survive as ``False``."""
+    assert "order_by" not in _wire.list_body()
+    assert _wire.list_body(order_by={"field": "ts"})["order_by"] == {"field": "ts"}
+    assert _wire.list_body(order_by={"field": "ts", "descending": True})["order_by"] == {
+        "field": "ts",
+        "descending": True,
+    }
+    assert _wire.list_body(order_by={"field": "ts", "descending": False})["order_by"] == {
+        "field": "ts",
+        "descending": False,
+    }
+    # `desc` would be ignored by serde and sort ascending with a 200.
+    with pytest.raises(TypeError, match="unknown key"):
+        _wire.list_body(order_by={"field": "ts", "desc": True})  # type: ignore[typeddict-unknown-key]
+
+
+def test_aggregate_body() -> None:
+    """``scope`` and ``filter`` are always sent; ``sum`` is pruned, which means "count only"."""
+    assert _wire.aggregate_body() == {"scope": [], "filter": []}
+    assert _wire.aggregate_body(
+        scope=["docs"], filter=[f.eq("lang", "rust")], sum=["bytes", "lines"]
+    ) == {
+        "scope": ["docs"],
+        "filter": [{"Eq": ["lang", {"Str": "rust"}]}],
+        "sum": ["bytes", "lines"],
+    }
+    # An explicitly empty sum list is a real (if inert) value and is sent.
+    assert _wire.aggregate_body(sum=[])["sum"] == []
+
+
 def test_list_body_omits_an_unset_limit_and_sends_an_explicit_zero() -> None:
     """Same omit-vs-zero rule as ``top_k``, for ``limit`` and ``offset``."""
     assert _wire.list_body() == {"scope": [], "filter": []}
@@ -411,6 +596,8 @@ def test_meta_body_is_the_bare_map() -> None:
         (lambda: _wire.text_search_body("body", "q", scope="docs"), "scope"),
         (lambda: _wire.hybrid_search_body([1.0], "body", "q", scope="docs"), "scope"),
         (lambda: _wire.list_body(scope="docs"), "scope"),
+        (lambda: _wire.aggregate_body(scope="docs"), "scope"),
+        (lambda: _wire.aggregate_body(sum="bytes"), "aggregate(sum=...)"),
     ],
 )
 def test_a_bare_string_is_refused_where_a_sequence_is_meant(
@@ -546,6 +733,101 @@ def test_decode_hits_tolerates_an_empty_or_missing_payload() -> None:
     assert _wire.decode_hits(None) == []
     # A hit with no attrs map at all decodes to an empty one rather than raising.
     assert _wire.decode_hits([{"collection": "d", "id": "a", "score": 1.0}])[0].attrs == {}
+
+
+def test_decode_hits_leaves_annotations_none_when_the_server_sent_none() -> None:
+    """The default response has no ``annotations`` key at all, and must decode to ``None``.
+
+    ``None`` rather than an empty :class:`~nidus.Annotations`, because "nothing was
+    explained" and "explained, and every part came back empty" are different facts.
+    """
+    hits = _wire.decode_hits([{"collection": "d", "id": "a", "score": 1.0, "attrs": {}}])
+    assert hits[0].annotations is None
+    assert _wire.decode_annotations(None) is None
+
+
+def test_decode_hits_reads_every_part_of_an_annotation() -> None:
+    """The whole annotated shape, spelled as ``src/annotate.rs`` serializes it."""
+    hits = _wire.decode_hits(
+        [
+            {
+                "collection": "docs",
+                "id": "a",
+                "score": 0.5,
+                "attrs": {},
+                "annotations": {
+                    "vector": {"rank": 0, "score": 0.98},
+                    "text": {"rank": 2, "score": 1.5},
+                    "clauses": [{"field": "title", "score": 0.49}],
+                    "highlights": [
+                        {
+                            "field": "body",
+                            "fragments": [{"text": "we were running", "spans": [[8, 15]]}],
+                        }
+                    ],
+                },
+            }
+        ]
+    )
+    annotations = hits[0].annotations
+    assert annotations is not None
+    assert annotations.vector is not None
+    assert (annotations.vector.rank, annotations.vector.score) == (0, pytest.approx(0.98))
+    assert annotations.text is not None
+    assert annotations.text.rank == 2
+    assert annotations.clauses[0].field == "title"
+    assert annotations.clauses[0].score == pytest.approx(0.49)
+    fragment = annotations.highlights[0].fragments[0]
+    assert annotations.highlights[0].field == "body"
+    assert fragment.text == "we were running"
+    # Tuples, and byte offsets into `text` — so this is how the matched run is recovered.
+    assert fragment.spans == [(8, 15)]
+    assert fragment.text.encode()[8:15] == b"running"
+
+
+def test_decode_annotations_tolerates_a_partial_object() -> None:
+    """A text search has one leg and may have no highlights; the absent parts stay empty.
+
+    The server skips ``clauses``/``highlights`` when empty and both legs unless the query
+    was hybrid, so every part has to survive being missing rather than raising.
+    """
+    annotations = _wire.decode_annotations({"clauses": [{"field": "body", "score": 1.25}]})
+    assert annotations is not None
+    assert annotations.vector is None
+    assert annotations.text is None
+    assert annotations.highlights == []
+    assert annotations.clauses[0].score == pytest.approx(1.25)
+    # And a highlight with no fragments is a field that matched nothing, not an error.
+    empty = _wire.decode_annotations({"highlights": [{"field": "body"}]})
+    assert empty is not None
+    assert empty.highlights[0].fragments == []
+
+
+def test_decode_aggregation_keeps_the_servers_int_versus_float() -> None:
+    """A sum is a tagged ``Value``, so the Python type it decodes to is the server's own."""
+    out = _wire.decode_aggregation(
+        {"count": 12, "sums": {"bytes": {"Int": 40960}, "seconds": {"Float": 1.5}}}
+    )
+    assert out.count == 12
+    assert out.sums == {"bytes": 40960, "seconds": 1.5}
+    assert isinstance(out.sums["bytes"], int)
+    # `2.0` must stay a float: `Int` and `Float` are separate types the store compares apart.
+    whole = _wire.decode_aggregation({"count": 1, "sums": {"x": {"Float": 2.0}}})
+    assert isinstance(whole.sums["x"], float)
+
+
+def test_decode_aggregation_without_sums_is_just_a_count() -> None:
+    """``sum: []`` (or no ``sum`` at all) still answers with the count."""
+    assert _wire.decode_aggregation({"count": 0, "sums": {}}) == _wire.decode_aggregation(
+        {"count": 0}
+    )
+
+
+def test_decode_aggregation_names_a_missing_body_instead_of_raising_a_key_error() -> None:
+    """Same rule as ``/stats``: a count of nothing and "no answer" are different facts."""
+    with pytest.raises(NidusError, match="/aggregate") as caught:
+        _wire.decode_aggregation(None)
+    assert caught.value.is_transport_error
 
 
 def test_decode_records_keeps_an_absent_vector_as_none() -> None:

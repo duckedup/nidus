@@ -42,7 +42,7 @@ loop over a contiguous `f32` matrix that is already resident in RAM.
 Two opt-in knobs trade a little for more speed when the exact single-threaded
 sweep isn't enough. Both stay pure-safe-Rust and are off by default:
 
-- **[int8 quantization](/guides/search/#int8-scalar-quantization)** — a two-pass
+- **[int8 quantization](/guides/search/#quantization)** — a two-pass
   search (int8 first-pass → f32 rerank) returns essentially the exact neighbours
   (**~100% recall@10 at `rescore` ≥ 2**) for a **~1.4× speedup** at 1M × 768, at
   the cost of ~25% more RAM. Reproduce: `just bench-quant`.

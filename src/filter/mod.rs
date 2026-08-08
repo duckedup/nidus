@@ -129,7 +129,13 @@ fn matches_one(predicate: &Predicate, attrs: &BTreeMap<String, Value>) -> bool {
 /// as written, and compile every `Regex` into the pattern cache so the per-record path never
 /// pays a compile. Every public `Nidus` query method calls this first.
 pub(crate) fn validate(filter: &Filter) -> Result<()> {
-    filter.0.iter().try_for_each(validate_one)
+    // Marker INLINE rather than via `.context`, which would become the outermost message
+    // and hide which predicate was wrong. Tags it 400 (a caller mistake, not a 5xx).
+    filter
+        .0
+        .iter()
+        .try_for_each(validate_one)
+        .map_err(|e| anyhow::anyhow!("{}: {e:#}", crate::store::BAD_QUERY))
 }
 
 /// Recurses through the boolean groups exactly as `matches_one` does, so a nested predicate

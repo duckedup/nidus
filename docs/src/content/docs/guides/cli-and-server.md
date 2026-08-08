@@ -123,15 +123,28 @@ nidus aggregate --dir ./store docs --sum bytes \
 # Full-text search (BM25): declare which fields are indexed, then query by text
 nidus set-fts-schema --dir ./store docs --field body --field title
 # …with BM25/analyzer tuning applied to every --field in the call
-nidus set-fts-schema --dir ./store docs --field body --k1 1.5 --b 0.3 --ascii-folding
+nidus set-fts-schema --dir ./store docs --field body \
+  --k1 1.5 --b 0.3 --ascii-folding --max-token-len 40
 nidus text-search --dir ./store body "running quickly" -k 5
 nidus text-search --dir ./store body "rust" --in docs \
   --where '[{"Eq":["lang",{"Str":"rust"}]}]'
+
+# Search several fields at once: --clause field=text, repeatable. Use it instead of
+# the positional field/text pair, never alongside. --combine sum (default) or max.
+nidus text-search --dir ./store --clause title=rust --clause body="async runtime" \
+  --combine max -k 5
+
+# Ask why a hit matched: per-clause BM25 scores, and highlighted fragments
+nidus text-search --dir ./store body "running" --explain --highlight \
+  --max-fragments 2 --fragment-chars 120
 
 # Hybrid search: fuse a vector (stdin) and a BM25 text query with RRF
 echo '[1,0,0]' | nidus hybrid-search --dir ./store body "vector database" -k 5
 # …leaning on the keyword leg (both weights default to 1.0)
 echo '[1,0,0]' | nidus hybrid-search --dir ./store body "CVE-2026-1234" --text-weight 3
+# --clause/--combine/--explain/--highlight work here too; --explain additionally
+# reports each fusion leg's own rank and score.
+echo '[1,0,0]' | nidus hybrid-search --dir ./store body "vector database" --explain
 
 # Inspect, maintain
 nidus collections --dir ./store

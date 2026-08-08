@@ -150,6 +150,30 @@ describe("filter builder", () => {
     });
   });
 
+  it("encodes fuzzy as the one three-element predicate", () => {
+    // Every other leaf is a [key, operand] pair; Fuzzy carries the edit budget too.
+    const pred = f.fuzzy("title", "nidus", 2) as { Fuzzy: [string, string, number] };
+    expect(pred).toEqual({ Fuzzy: ["title", "nidus", 2] });
+    expect(pred.Fuzzy).toHaveLength(3);
+    expect(typeof pred.Fuzzy[2]).toBe("number");
+  });
+
+  it("encodes the token and regex predicates with a bare-string operand", () => {
+    // The query text is raw, not a tagged Value — the server tokenizes it itself.
+    expect(f.containsAllTokens("body", "quick fox")).toEqual({
+      ContainsAllTokens: ["body", "quick fox"],
+    });
+    expect(f.containsAnyToken("body", "quick fox")).toEqual({
+      ContainsAnyToken: ["body", "quick fox"],
+    });
+    expect(f.containsTokenSequence("body", "quick brown fox")).toEqual({
+      ContainsTokenSequence: ["body", "quick brown fox"],
+    });
+    expect(f.regex("path", "^src/.*\\.rs$")).toEqual({
+      Regex: ["path", "^src/.*\\.rs$"],
+    });
+  });
+
   it("distinguishes f.all (a predicate) from f.and (a filter)", () => {
     // Only f.all nests: f.and returns the top-level array.
     expect(Array.isArray(f.and(f.eq("a", 1)))).toBe(true);
@@ -258,6 +282,205 @@ describe("NidusClient request shaping", () => {
     });
   });
 
+  it("omits the ranking knobs unless asked, and maps them to snake_case", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    // Unset: byte-identical to a client that predates ranking.
+    await db.search({ query: [1, 0, 0] });
+    expect(calls[0]!.json).toEqual({ query: [1, 0, 0], scope: [], filter: [] });
+    await db.list();
+    expect(calls[1]!.json).toEqual({ scope: [], filter: [] });
+
+    await db.search({
+      query: [1, 0, 0],
+      rankBy: { decay: { field: "ts", origin: new Date(1700000000000) } },
+      limitPer: { field: "path", max: 2 },
+    });
+    expect(calls[2]!.json).toMatchObject({
+      // A Date origin becomes epoch ms, and the knobs left unset keep the server's.
+      rank_by: { Decay: { field: "ts", origin: 1700000000000 } },
+      limit_per: { field: "path", max: 2 },
+    });
+    expect(
+      Object.keys(
+        (calls[2]!.json as { rank_by: { Decay: object } }).rank_by.Decay,
+      ),
+    ).toEqual(["field", "origin"]);
+
+    await db.search({
+      query: [1, 0, 0],
+      rankBy: {
+        decay: {
+          field: "ts",
+          origin: 1700000000000,
+          scale: 86400000,
+          decay: 0.9,
+          lambda: 0.5,
+          missing: 0.2,
+        },
+      },
+    });
+    expect(calls[3]!.json).toMatchObject({
+      rank_by: {
+        Decay: {
+          field: "ts",
+          origin: 1700000000000,
+          scale: 86400000,
+          decay: 0.9,
+          lambda: 0.5,
+          missing: 0.2,
+        },
+      },
+    });
+
+    await db.list({ orderBy: { field: "ts", descending: true } });
+    expect(calls[4]!.json).toMatchObject({
+      order_by: { field: "ts", descending: true },
+    });
+  });
+
+  it("keeps the single-field text query spelling and adds the clause list", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    // The compatibility contract: one field plus its query, exactly as before.
+    await db.textSearch({ field: "body", query: "fox" });
+    expect(calls[0]!.json).toEqual({
+      field: "body",
+      query: "fox",
+      scope: [],
+      filter: [],
+    });
+
+    await db.textSearch({
+      clauses: [
+        { field: "title", query: "rust" },
+        { field: "body", query: "async runtime" },
+      ],
+      combine: "Max",
+    });
+    expect(calls[1]!.json).toEqual({
+      clauses: [
+        { field: "title", query: "rust" },
+        { field: "body", query: "async runtime" },
+      ],
+      combine: "Max",
+      scope: [],
+      filter: [],
+    });
+
+    // `combine` unset leaves the server's "Sum", and never names a `field` alongside.
+    await db.textSearch({ clauses: [{ field: "title", query: "rust" }] });
+    expect(calls[2]!.json).toEqual({
+      clauses: [{ field: "title", query: "rust" }],
+      scope: [],
+      filter: [],
+    });
+  });
+
+  it("spells the hybrid text leg as field+text or clauses, and weights each leg", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    await db.hybridSearch({ vector: [1, 0, 0], field: "body", text: "fox" });
+    expect(calls[0]!.json).toEqual({
+      vector: [1, 0, 0],
+      field: "body",
+      text: "fox",
+      scope: [],
+      filter: [],
+    });
+
+    // The clause form spells the text `query`, matching /text-search.
+    await db.hybridSearch({
+      vector: [1, 0, 0],
+      clauses: [{ field: "title", query: "rust" }],
+      combine: "Sum",
+    });
+    expect(calls[1]!.json).toEqual({
+      vector: [1, 0, 0],
+      clauses: [{ field: "title", query: "rust" }],
+      combine: "Sum",
+      scope: [],
+      filter: [],
+    });
+
+    await db.hybridSearch({
+      vector: [1, 0, 0],
+      field: "body",
+      text: "fox",
+      vectorWeight: 2,
+      textWeight: 0.5,
+    });
+    expect(calls[2]!.json).toMatchObject({ vector_weight: 2, text_weight: 0.5 });
+  });
+
+  it("omits explain and highlight unless asked, sending `true` as the defaults object", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    await db.textSearch({ field: "body", query: "fox", highlight: false });
+    expect(calls[0]!.json).toEqual({
+      field: "body",
+      query: "fox",
+      scope: [],
+      filter: [],
+    });
+
+    // `true` is `{}` — the wire spelling for "highlight with every default".
+    await db.textSearch({ field: "body", query: "fox", explain: true, highlight: true });
+    expect(calls[1]!.json).toMatchObject({ explain: true, highlight: {} });
+
+    await db.textSearch({
+      field: "body",
+      query: "fox",
+      highlight: { maxFragments: 3, fragmentChars: 40 },
+    });
+    expect(calls[2]!.json).toMatchObject({
+      highlight: { max_fragments: 3, fragment_chars: 40 },
+    });
+
+    // Only the named knob travels; the other keeps the server's default.
+    await db.hybridSearch({
+      vector: [1, 0, 0],
+      field: "body",
+      text: "fox",
+      highlight: { maxFragments: 2 },
+    });
+    expect(calls[3]!.json).toMatchObject({ highlight: { max_fragments: 2 } });
+    expect(
+      (calls[3]!.json as { highlight: object }).highlight,
+    ).not.toHaveProperty("fragment_chars");
+  });
+
+  it("aggregates a count and tagged sums, decoding the sums to numbers", async () => {
+    const { fn, calls } = mockFetch({
+      count: 12,
+      sums: { bytes: { Int: 40960 }, ratio: { Float: 1.5 } },
+    });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const out = await db.aggregate({
+      scope: ["docs"],
+      sum: ["bytes", "ratio"],
+      filter: f.and(f.eq("lang", "rust")),
+    });
+    expect(calls[0]!.url).toBe("http://x/aggregate");
+    expect(calls[0]!.json).toEqual({
+      scope: ["docs"],
+      filter: [{ Eq: ["lang", { Str: "rust" }] }],
+      sum: ["bytes", "ratio"],
+    });
+    expect(out).toEqual({ count: 12, sums: { bytes: 40960, ratio: 1.5 } });
+  });
+
+  it("aggregates store-wide with no options at all", async () => {
+    const { fn, calls } = mockFetch({ count: 3, sums: {} });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    expect(await db.aggregate()).toEqual({ count: 3, sums: {} });
+    expect(calls[0]!.json).toEqual({ scope: [], filter: [], sum: [] });
+  });
+
   it("attaches a bearer token when configured", async () => {
     const { fn, calls } = mockFetch([]);
     const db = new NidusClient({ baseUrl: "http://x", fetch: fn, token: "sekret" });
@@ -272,6 +495,103 @@ describe("NidusClient request shaping", () => {
     const db = new NidusClient({ baseUrl: "http://x/", fetch: fn });
     await db.collections();
     expect(calls[0]!.url).toBe("http://x/collections");
+  });
+});
+
+describe("hit annotations", () => {
+  /** A one-hit response carrying whatever annotations the case is about. */
+  function annotated(annotations?: unknown) {
+    return mockFetch([
+      {
+        collection: "docs",
+        id: "a",
+        score: 0.5,
+        attrs: { lang: { Str: "rust" } },
+        ...(annotations ? { annotations } : {}),
+      },
+    ]);
+  }
+
+  it("leaves the key absent on an unannotated hit", async () => {
+    const { fn } = annotated();
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const [hit] = await db.textSearch({ field: "body", query: "fox" });
+    expect(hit).toEqual({
+      collection: "docs",
+      id: "a",
+      score: 0.5,
+      attrs: { lang: "rust" },
+    });
+    expect("annotations" in hit!).toBe(false);
+  });
+
+  it("decodes every leg, clause, and highlight the server sent", async () => {
+    const { fn } = annotated({
+      vector: { rank: 0, score: 0.98 },
+      text: { rank: 1, score: 1.1 },
+      clauses: [{ field: "title", score: 0.49 }],
+      highlights: [
+        { field: "body", fragments: [{ text: "we were running", spans: [[8, 15]] }] },
+      ],
+    });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const [hit] = await db.hybridSearch({
+      vector: [1, 0, 0],
+      field: "body",
+      text: "run",
+      explain: true,
+      highlight: true,
+    });
+    expect(hit!.annotations).toEqual({
+      vector: { rank: 0, score: 0.98 },
+      text: { rank: 1, score: 1.1 },
+      clauses: [{ field: "title", score: 0.49 }],
+      highlights: [
+        { field: "body", fragments: [{ text: "we were running", spans: [[8, 15]] }] },
+      ],
+    });
+    // The parts the server omitted stay omitted rather than becoming empty arrays.
+    const { fn: fn2 } = annotated({ clauses: [{ field: "title", score: 0.49 }] });
+    const db2 = new NidusClient({ baseUrl: "http://x", fetch: fn2 });
+    const [only] = await db2.textSearch({ field: "title", query: "run", explain: true });
+    expect(only!.annotations).toEqual({ clauses: [{ field: "title", score: 0.49 }] });
+  });
+
+  it("converts highlight spans from UTF-8 bytes to JS string indices", async () => {
+    // The trap this guards: the server counts bytes, a JS string counts UTF-16 code
+    // units, so an unconverted span slices the wrong text out of any non-ASCII excerpt.
+    const { fn } = annotated({
+      highlights: [
+        {
+          field: "body",
+          fragments: [
+            { text: "café au lait", spans: [[9, 13]] },
+            { text: "🦆 duck", spans: [[5, 9]] },
+          ],
+        },
+      ],
+    });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const [hit] = await db.textSearch({ field: "body", query: "lait", highlight: true });
+    const [latin, emoji] = hit!.annotations!.highlights![0]!.fragments;
+    expect(latin!.spans).toEqual([[8, 12]]);
+    expect(latin!.text.slice(...latin!.spans[0]!)).toBe("lait");
+    // A 4-byte codepoint is 2 UTF-16 units, so the shift is 2, not 3.
+    expect(emoji!.spans).toEqual([[3, 7]]);
+    expect(emoji!.text.slice(...emoji!.spans[0]!)).toBe("duck");
+  });
+
+  it("passes an all-ASCII fragment's spans through untouched", async () => {
+    const { fn } = annotated({
+      highlights: [
+        { field: "body", fragments: [{ text: "the quick fox", spans: [[4, 9]] }] },
+      ],
+    });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const [hit] = await db.textSearch({ field: "body", query: "quick", highlight: true });
+    const fragment = hit!.annotations!.highlights![0]!.fragments[0]!;
+    expect(fragment.spans).toEqual([[4, 9]]);
+    expect(fragment.text.slice(...fragment.spans[0]!)).toBe("quick");
   });
 });
 

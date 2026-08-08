@@ -38,7 +38,19 @@ from urllib.request import Request, urlopen
 
 from . import _wire
 from .filter import Filter
-from .types import FtsField, Hits, Record, RecordInput, Stats
+from .ranking import RankBy
+from .types import (
+    Aggregation,
+    FtsClause,
+    FtsField,
+    HighlightOpts,
+    Hits,
+    LimitPer,
+    OrderBy,
+    Record,
+    RecordInput,
+    Stats,
+)
 from .values import AttrInput
 
 # `Optional[X]` rather than `X | None` everywhere in this package, deliberately: see the
@@ -187,12 +199,19 @@ class NidusClient:
         exact: Optional[bool] = None,
         include_attributes: Optional[Sequence[str]] = None,
         exclude_attributes: Optional[Sequence[str]] = None,
+        rank_by: Optional[RankBy] = None,
+        limit_per: Optional[LimitPer] = None,
     ) -> Hits:
         """Vector (cosine) nearest-neighbour search. An empty ``scope`` searches everything.
 
         ``offset`` skips that many top-ranked hits, so successive pages tile one ranking;
         the server refuses ``offset + top_k`` above 10000. ``exact=True`` forces the exact
         scan past any index; the projection arguments are mutually exclusive.
+
+        ``rank_by`` layers a ranking expression over the metric (``rank.decay(...)``), and
+        ``limit_per={"field": "path", "max": 2}`` caps how many hits share one attribute
+        value — the cap is applied to the ranking, so it thins results rather than deepening
+        the search.
         """
         return self._search(
             _wire.SEARCH,
@@ -206,21 +225,43 @@ class NidusClient:
                 exact=exact,
                 include_attributes=include_attributes,
                 exclude_attributes=exclude_attributes,
+                rank_by=rank_by,
+                limit_per=limit_per,
             ),
         )
 
     def text_search(
         self,
         *,
-        field: str,
-        query: str,
+        field: Optional[str] = None,
+        query: Optional[str] = None,
         scope: Optional[Sequence[str]] = None,
         top_k: Optional[int] = None,
         offset: Optional[int] = None,
         min_score: Optional[float] = None,
         filter: Optional[Filter] = None,  # noqa: A002
+        clauses: Optional[Sequence[FtsClause]] = None,
+        combine: Optional[str] = None,
+        explain: Optional[bool] = None,
+        highlight: Optional[Union[bool, HighlightOpts]] = None,
+        include_attributes: Optional[Sequence[str]] = None,
+        exclude_attributes: Optional[Sequence[str]] = None,
+        rank_by: Optional[RankBy] = None,
+        limit_per: Optional[LimitPer] = None,
     ) -> Hits:
-        """BM25 full-text search over one indexed field, paginated by ``offset``."""
+        """BM25 full-text search, paginated by ``offset``.
+
+        Name the query either as ``field`` + ``query`` (one field) or as ``clauses``, a list
+        of ``{"field": …, "query": …}`` each carrying its own text — never both, and never
+        an empty list. ``combine`` folds several clauses into one score: ``"Sum"`` (the
+        default) rewards a document matching in two fields, ``"Max"`` takes the strongest
+        clause so a long body cannot out-accumulate a precise title match.
+
+        ``explain=True`` reports each matched clause's own score, and ``highlight=True``
+        (or a ``{"max_fragments": …, "fragment_chars": …}`` mapping) returns fragments of
+        the stored text; both land on ``hit.annotations``. Highlighting reads the stored
+        text, so it still works on a field the projection dropped.
+        """
         return self._search(
             _wire.TEXT_SEARCH,
             _wire.text_search_body(
@@ -231,6 +272,14 @@ class NidusClient:
                 offset=offset,
                 min_score=min_score,
                 filter=filter,
+                clauses=clauses,
+                combine=combine,
+                explain=explain,
+                highlight=highlight,
+                include_attributes=include_attributes,
+                exclude_attributes=exclude_attributes,
+                rank_by=rank_by,
+                limit_per=limit_per,
             ),
         )
 
@@ -238,19 +287,32 @@ class NidusClient:
         self,
         *,
         vector: Sequence[float],
-        field: str,
-        text: str,
+        field: Optional[str] = None,
+        text: Optional[str] = None,
         scope: Optional[Sequence[str]] = None,
         top_k: Optional[int] = None,
         offset: Optional[int] = None,
         filter: Optional[Filter] = None,  # noqa: A002
         rrf_k: Optional[float] = None,
         candidates: Optional[int] = None,
+        clauses: Optional[Sequence[FtsClause]] = None,
+        combine: Optional[str] = None,
+        explain: Optional[bool] = None,
+        highlight: Optional[Union[bool, HighlightOpts]] = None,
+        vector_weight: Optional[float] = None,
+        text_weight: Optional[float] = None,
     ) -> Hits:
         """Hybrid search: fuse a vector query and a BM25 text query via RRF.
 
         ``offset`` pages the *fused* ranking, never a leg — a leg's rank is an input to
-        the fused score.
+        the fused score. The text leg takes ``field`` + ``text`` or a ``clauses`` list, on
+        the same either/or rule as :meth:`text_search`; a clause spells its text ``query``
+        on both routes.
+
+        ``vector_weight``/``text_weight`` scale each leg's contribution to the fused score
+        (both default to 1.0, which is the unweighted fusion exactly). With ``explain=True``
+        each hit reports both legs' own rank and score in ``hit.annotations``, which is the
+        only way to see a leg's rank — the returned score is the fused one.
         """
         return self._search(
             _wire.HYBRID_SEARCH,
@@ -264,6 +326,12 @@ class NidusClient:
                 filter=filter,
                 rrf_k=rrf_k,
                 candidates=candidates,
+                clauses=clauses,
+                combine=combine,
+                explain=explain,
+                highlight=highlight,
+                vector_weight=vector_weight,
+                text_weight=text_weight,
             ),
         )
 
@@ -276,8 +344,14 @@ class NidusClient:
         filter: Optional[Filter] = None,  # noqa: A002
         include_attributes: Optional[Sequence[str]] = None,
         exclude_attributes: Optional[Sequence[str]] = None,
+        order_by: Optional[OrderBy] = None,
     ) -> Hits:
-        """Metadata-only listing (no vector query), paginated by ``offset``/``limit``."""
+        """Metadata-only listing (no vector query), paginated by ``offset``/``limit``.
+
+        ``order_by={"field": "updated_at", "descending": True}`` sorts by an attribute
+        instead of storage order; records missing it — or holding an unorderable value —
+        sort into one bucket that stays trailing in either direction.
+        """
         return self._search(
             _wire.LIST,
             _wire.list_body(
@@ -287,7 +361,27 @@ class NidusClient:
                 filter=filter,
                 include_attributes=include_attributes,
                 exclude_attributes=exclude_attributes,
+                order_by=order_by,
             ),
+        )
+
+    def aggregate(
+        self,
+        *,
+        scope: Optional[Sequence[str]] = None,
+        filter: Optional[Filter] = None,  # noqa: A002
+        sum: Optional[Sequence[str]] = None,  # noqa: A002
+    ) -> Aggregation:
+        """Count the records a filter matches, and sum the attributes named in ``sum``.
+
+        Answered from the in-RAM index alone — no record is built and no vector is read — so
+        it is the cheap way to ask "how many, and how big" without paging through
+        :meth:`list`. A missing or non-numeric value is skipped rather than counted as zero.
+        """
+        return _wire.decode_aggregation(
+            self._request(
+                "POST", _wire.AGGREGATE, _wire.aggregate_body(scope=scope, filter=filter, sum=sum)
+            )
         )
 
     # ── Memory (text-native) ─────────────────────────────────────────────────────────

@@ -16,6 +16,7 @@ the rest of the suite.
 
 from __future__ import annotations
 
+import inspect
 import json
 from typing import Any, Callable
 
@@ -23,7 +24,7 @@ import pytest
 
 httpx = pytest.importorskip("httpx", reason="the async client needs the nidus[async] extra")
 
-from nidus import NidusError, f, v  # noqa: E402 - must follow the importorskip guard
+from nidus import NidusError, f, rank, v  # noqa: E402 - must follow the importorskip guard
 from nidus.aio import AsyncNidusClient  # noqa: E402 - same
 
 STATS_PAYLOAD = {
@@ -142,6 +143,7 @@ ENDPOINTS: list[tuple[str, Callable[[AsyncNidusClient], Any], str, str, Any]] = 
         [],
     ),
     ("list", lambda db: db.list(), "POST", "/list", []),
+    ("aggregate", lambda db: db.aggregate(), "POST", "/aggregate", {"count": 0, "sums": {}}),
     (
         "remember",
         lambda db: db.remember("notes", "a", "hello"),
@@ -188,6 +190,24 @@ def test_the_async_surface_matches_the_sync_one() -> None:
     # The lifetime hooks are the one deliberate difference: `close` versus `aclose`.
     assert sync_only == {"close"}
     assert async_only == {"aclose"}
+
+
+def test_the_async_methods_take_the_same_arguments() -> None:
+    """Same *names* is not enough — a knob added to one client only is the same drift.
+
+    Every optional is keyword-only on both, so the parameter list is the whole call
+    contract: if ``search`` grows a ``rank_by`` here and not there, the two clients can no
+    longer send the same request, which no other test in either file would notice.
+    """
+    from nidus import NidusClient
+
+    shared = {n for n in vars(NidusClient) if not n.startswith("_")} & {
+        n for n in vars(AsyncNidusClient) if not n.startswith("_")
+    }
+    for name in sorted(shared):
+        sync = inspect.signature(getattr(NidusClient, name))
+        asynchronous = inspect.signature(getattr(AsyncNidusClient, name))
+        assert list(sync.parameters) == list(asynchronous.parameters), name
 
 
 # ── Request bodies as they land on the wire ──────────────────────────────────────────
@@ -269,6 +289,77 @@ async def test_search_sends_snake_case_and_decodes_hit_attrs() -> None:
     }
     assert hits[0].id == "a"
     assert hits[0].attrs == {"lang": "rust"}
+
+
+async def test_the_multi_clause_and_ranking_knobs_reach_the_same_wire() -> None:
+    """The awaited path sends the m50 knobs byte for byte with the sync client's.
+
+    Asserted here rather than trusted: the shared ``_wire`` layer is what makes it true, and
+    a client that forgot to forward one argument would still compile and still return hits.
+    """
+    mock = MockServer([])
+    async with client(mock) as db:
+        await db.text_search(
+            clauses=[{"field": "title", "query": "rust"}, {"field": "body", "query": "async"}],
+            combine="Max",
+            explain=True,
+            highlight={"max_fragments": 2},
+        )
+        assert mock.json == {
+            "clauses": [
+                {"field": "title", "query": "rust"},
+                {"field": "body", "query": "async"},
+            ],
+            "combine": "Max",
+            "scope": [],
+            "filter": [],
+            "explain": True,
+            "highlight": {"max_fragments": 2},
+        }
+        await db.search(
+            query=[1.0],
+            rank_by=rank.decay("ts", 1700000000000),
+            limit_per={"field": "path", "max": 2},
+        )
+        assert mock.json["rank_by"] == {"Decay": {"field": "ts", "origin": 1700000000000}}
+        assert mock.json["limit_per"] == {"field": "path", "max": 2}
+        await db.list(order_by={"field": "ts"})
+        assert mock.json["order_by"] == {"field": "ts"}
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            await db.hybrid_search(
+                vector=[1.0], field="body", clauses=[{"field": "t", "query": "x"}]
+            )
+
+
+async def test_aggregate_and_annotations_decode_on_the_async_path_too() -> None:
+    """The two new response shapes, reached through the awaited client."""
+    mock = MockServer({"count": 2, "sums": {"bytes": {"Int": 40}, "cost": {"Float": 1.5}}})
+    async with client(mock) as db:
+        out = await db.aggregate(scope=["docs"], sum=["bytes", "cost"])
+    assert mock.json == {"scope": ["docs"], "filter": [], "sum": ["bytes", "cost"]}
+    assert (out.count, out.sums) == (2, {"bytes": 40, "cost": 1.5})
+
+    mock = MockServer(
+        [
+            {
+                "collection": "docs",
+                "id": "a",
+                "score": 1.0,
+                "attrs": {},
+                "annotations": {
+                    "vector": {"rank": 0, "score": 0.9},
+                    "text": {"rank": 1, "score": 2.0},
+                },
+            }
+        ]
+    )
+    async with client(mock) as db:
+        hits = await db.hybrid_search(vector=[1.0], field="body", text="fox", explain=True)
+    assert hits[0].annotations is not None
+    assert hits[0].annotations.vector is not None
+    assert hits[0].annotations.vector.rank == 0
+    assert hits[0].annotations.text is not None
+    assert hits[0].annotations.text.score == pytest.approx(2.0)
 
 
 async def test_remember_and_recall_bodies() -> None:

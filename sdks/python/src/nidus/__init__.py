@@ -34,7 +34,27 @@ from ._version import __version__
 from .client import NidusClient, Transport
 from .errors import NidusError
 from .filter import Filter, Predicate, f
-from .types import AnnInfo, Footprint, FtsField, Hit, Hits, Record, RecordInput, Stats
+from .ranking import RankBy, rank
+from .types import (
+    Aggregation,
+    AnnInfo,
+    Annotations,
+    ClauseScore,
+    Footprint,
+    Fragment,
+    FtsClause,
+    FtsField,
+    Highlight,
+    HighlightOpts,
+    Hit,
+    Hits,
+    LegScore,
+    LimitPer,
+    OrderBy,
+    Record,
+    RecordInput,
+    Stats,
+)
 from .values import (
     AttrInput,
     DecodedValue,
@@ -60,17 +80,28 @@ if TYPE_CHECKING:
 # `pip install nidus`, turning the optional dependency into a de facto hard one. The name
 # still works as `nidus.AsyncNidusClient` and as `from nidus.aio import AsyncNidusClient`.
 __all__ = [
+    "Aggregation",
     "AnnInfo",
+    "Annotations",
     "AttrInput",
+    "ClauseScore",
     "DecodedValue",
     "Filter",
     "Footprint",
+    "Fragment",
+    "FtsClause",
     "FtsField",
+    "Highlight",
+    "HighlightOpts",
     "Hit",
     "Hits",
+    "LegScore",
+    "LimitPer",
     "NidusClient",
     "NidusError",
+    "OrderBy",
     "Predicate",
+    "RankBy",
     "Record",
     "RecordInput",
     "Stats",
@@ -82,6 +113,7 @@ __all__ = [
     "encode_attrs",
     "encode_value",
     "f",
+    "rank",
     "v",
 ]
 

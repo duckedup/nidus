@@ -30,11 +30,12 @@ import re
 import subprocess
 import time
 from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from nidus import NidusClient, NidusError, f, v
+from nidus import NidusClient, NidusError, f, rank, v
 
 # tests → python → sdks → repo root.
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -271,6 +272,127 @@ def test_the_guarded_slips_never_reach_the_server(server: str) -> None:
         # A non-empty filter still deletes exactly what it matches.
         assert db.delete_where("docs", [f.eq("lang", "go")]) == 1
         assert [r.id for r in db.records("docs")] == ["x1"]
+
+
+def test_the_ranking_and_annotation_surface(server: str) -> None:
+    """Multi-clause text, annotations, the text predicates, ranking, and ``/aggregate``.
+
+    Every one of these is a *new key on an existing body*, and serde ignores what it does not
+    recognise — so a misspelled ``limit_per`` returns a perfectly good unfiltered ranking, and
+    a clause list under the wrong key returns "no matches". Only a real server tells those
+    apart from working, which is why this tier exists at all.
+    """
+    now = datetime.now(timezone.utc)
+    with NidusClient(server, timeout=10.0) as db:
+        db.set_fts_schema("posts", ["title", "body"])
+        # Same vector on every doc, so the base ranking is a tie and each knob below is the
+        # only thing deciding the order it produces.
+        assert (
+            db.upsert(
+                "posts",
+                [
+                    {
+                        "id": "a",
+                        "vector": [1.0, 0.0, 0.0],
+                        "attrs": {
+                            "title": v.str("rust in anger"),
+                            "body": v.str("we were running an async runtime"),
+                            "path": "src/a.rs",
+                            "bytes": 100,
+                            "ts": v.datetime(now),
+                        },
+                    },
+                    {
+                        "id": "b",
+                        "vector": [1.0, 0.0, 0.0],
+                        "attrs": {
+                            "title": v.str("rust revisited"),
+                            "body": v.str("async runtime internals"),
+                            "path": "src/a.rs",
+                            "bytes": 250,
+                            "ts": v.datetime(now - timedelta(days=30)),
+                        },
+                    },
+                    {
+                        "id": "c",
+                        "vector": [1.0, 0.0, 0.0],
+                        "attrs": {
+                            "title": v.str("go concurrency"),
+                            "body": v.str("goroutines and channels"),
+                            "path": "src/c.rs",
+                            "bytes": 40,
+                            "ts": v.datetime(now),
+                        },
+                    },
+                ],
+            )
+            == 3
+        )
+
+        # ── multi-clause text, explained and highlighted ──────────────────────────────
+        hits = db.text_search(
+            scope=["posts"],
+            clauses=[{"field": "title", "query": "rust"}, {"field": "body", "query": "run"}],
+            combine="Sum",
+            explain=True,
+            highlight=True,
+            top_k=5,
+        )
+        assert {h.id for h in hits} == {"a", "b"}
+        # "Sum" rewards the doc matching in both fields, so it must lead.
+        assert hits[0].id == "a"
+        annotations = hits[0].annotations
+        assert annotations is not None
+        assert {c.field for c in annotations.clauses} == {"title", "body"}
+        fragment = annotations.highlights[0].fragments[0]
+        # The span is a byte range into the fragment's own text, pointing at the *surface*
+        # form — "running" for the stemmed query "run".
+        start, end = fragment.spans[0]
+        assert fragment.text.encode()[start:end] in {b"rust", b"running"}
+        # Unannotated by default: the same query without the two knobs carries nothing.
+        assert db.text_search(scope=["posts"], field="title", query="rust")[0].annotations is None
+
+        # ── the text predicates, against the real matchers ────────────────────────────
+        def ids(*filter_: object) -> list[str]:
+            return sorted(h.id for h in db.list(scope=["posts"], filter=list(filter_)))
+
+        assert ids(f.regex("path", "src/.*[.]rs")) == ["a", "b", "c"]
+        assert ids(f.regex("path", "src/a[.]rs")) == ["a", "b"]
+        assert ids(f.fuzzy("title", "go concurrancy", 1)) == ["c"]
+        assert ids(f.contains_token_sequence("body", "async runtime")) == ["a", "b"]
+        assert ids(f.contains_all_tokens("body", "runtime async")) == ["a", "b"]
+        assert ids(f.contains_any_token("body", "goroutines running")) == ["a", "c"]
+
+        # ── ordering, capping, and decay ──────────────────────────────────────────────
+        assert [h.id for h in db.list(scope=["posts"], order_by={"field": "bytes"})] == [
+            "c",
+            "a",
+            "b",
+        ]
+        assert [
+            h.id for h in db.list(scope=["posts"], order_by={"field": "bytes", "descending": True})
+        ] == ["b", "a", "c"]
+        # At most one hit per path collapses a and b, which share one.
+        capped = db.search(
+            query=[1.0, 0.0, 0.0], scope=["posts"], limit_per={"field": "path", "max": 1}
+        )
+        assert len(capped) == 2
+        assert {h.id for h in capped} <= {"a", "b", "c"}
+        # Decay breaks the tie: b is a month old and gives up a full point of score.
+        aged = db.search(
+            query=[1.0, 0.0, 0.0],
+            scope=["posts"],
+            rank_by=rank.decay("ts", now, scale=timedelta(days=7), lambda_=1.0),
+        )
+        assert [h.id for h in aged][-1] == "b"
+
+        # ── aggregate ─────────────────────────────────────────────────────────────────
+        totals = db.aggregate(scope=["posts"], sum=["bytes"])
+        assert totals.count == 3
+        assert totals.sums == {"bytes": 390}
+        assert db.aggregate(scope=["posts"], filter=[f.gt("bytes", 50)]).count == 2
+        # A field nothing carries still answers, and the count alone needs no `sum` at all.
+        assert db.aggregate(scope=["posts"], sum=["absent"]).sums == {"absent": 0}
 
 
 def test_a_collection_name_with_a_slash_and_a_space_round_trips(server: str) -> None:

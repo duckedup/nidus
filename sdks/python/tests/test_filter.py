@@ -30,9 +30,10 @@ from nidus import AttrInput, Filter, Predicate, f, v
 
 
 def test_every_leaf_predicate_variant_has_the_two_tuple_shape() -> None:
-    """Thirteen leaf variants, each externally tagged over ``[key, operand]``.
+    """Seventeen leaf variants, each externally tagged over ``[key, operand]``.
 
-    The combinators deliberately break this shape; see the group tests below.
+    The combinators deliberately break this shape, and so does ``fuzzy`` — see the group
+    tests and the three-element test below.
     """
     assert f.eq("lang", "rust") == {"Eq": ["lang", {"Str": "rust"}]}
     assert f.ne("lang", "go") == {"Ne": ["lang", {"Str": "go"}]}
@@ -51,6 +52,53 @@ def test_every_leaf_predicate_variant_has_the_two_tuple_shape() -> None:
     assert f.contains_any("tags", ["rust", "go"]) == {
         "ContainsAny": ["tags", [{"Str": "rust"}, {"Str": "go"}]]
     }
+    assert f.contains_all_tokens("body", "async runtime") == {
+        "ContainsAllTokens": ["body", "async runtime"]
+    }
+    assert f.contains_any_token("body", "async runtime") == {
+        "ContainsAnyToken": ["body", "async runtime"]
+    }
+    assert f.contains_token_sequence("body", "async runtime") == {
+        "ContainsTokenSequence": ["body", "async runtime"]
+    }
+    assert f.regex("path", "src/.*[.]rs") == {"Regex": ["path", "src/.*[.]rs"]}
+
+
+def test_fuzzy_is_the_one_predicate_with_a_three_element_operand() -> None:
+    """The edit budget is part of the operand, so ``Fuzzy`` breaks the 2-tuple shape.
+
+    Asserted on the serialized form as well: the server's ``Fuzzy(String, String, usize)``
+    deserializes from a 3-element array and from nothing else, so a client that dropped the
+    budget (or nested it) would fail every fuzzy query with a deserialization error.
+    """
+    predicate = f.fuzzy("title", "levenshtein", 2)
+    assert predicate == {"Fuzzy": ["title", "levenshtein", 2]}
+    (operand,) = predicate.values()
+    assert len(operand) == 3
+    assert json.dumps(predicate, separators=(",", ":")) == '{"Fuzzy":["title","levenshtein",2]}'
+
+
+def test_the_text_predicates_take_a_bare_string_like_glob_does() -> None:
+    """Five more variants holding a ``String``, not a tagged ``Value`` — the ``glob`` shape."""
+    for predicate in (
+        f.fuzzy("k", "s", 1),
+        f.contains_all_tokens("k", "s"),
+        f.contains_any_token("k", "s"),
+        f.contains_token_sequence("k", "s"),
+        f.regex("k", "s"),
+    ):
+        (operand,) = predicate.values()
+        assert operand[0] == "k"
+        assert operand[1] == "s"
+        assert isinstance(operand[1], str)
+
+
+def test_contains_any_refuses_a_bare_string() -> None:
+    """A `str` is a `Sequence[str]`, so this type-checks and would encode one predicate
+    per CHARACTER and match nothing — the same trap `in_`/`not_in` already guard."""
+    with pytest.raises(TypeError, match="expects a sequence"):
+        f.contains_any("tags", "rust")
+    assert f.contains_any("tags", ["rust"]) == {"ContainsAny": ["tags", [{"Str": "rust"}]]}
 
 
 def test_the_combinators_are_not_key_value_tuples() -> None:

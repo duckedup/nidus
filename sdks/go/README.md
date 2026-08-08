@@ -90,7 +90,7 @@ Leave `TopK` at zero to take the server's default (10) — a zero is omitted fro
 request rather than sent, because `"top_k": 0` would be a request for no results. The
 knobs whose zero the server *does* treat as a real value are pointers instead, so an
 explicit zero can travel: `MinScore` (`nil` is "no floor", `&0` is a floor of exactly
-zero), and hybrid search's `RRFK` and `Candidates`.
+zero), and hybrid search's `RRFK`, `Candidates`, `VectorWeight` and `TextWeight`.
 
 A `Record` with a `nil` `Vector` is a text-only document. A non-nil but *empty* Vector is
 refused by `Upsert` rather than sent: an empty slice encodes identically to an absent one
@@ -161,6 +161,25 @@ from the call that used the filter. Check it earlier with `Predicate.Err()` /
 attribute was written with — `Ge("score", 0.5)` for a `Float`, `Ge("year", 2020)` for an
 `Int`, `Ge("seen", t)` for a `DateTime`.
 
+Lists: `Contains`, `NotContains`, `ContainsAny`. Groups: `All`, `Any`, `Not` — `Not` is
+genuine complement, so `Not(Eq(k, v))` matches a record with no `k` at all where
+`Ne(k, v)` does not.
+
+Text, over any string attribute (no full-text schema needed):
+
+```go
+nidus.Fuzzy("title", "serach", 2)              // within 2 edits, ASCII case folded
+nidus.ContainsAllTokens("body", "async runtime") // both words, any order
+nidus.ContainsAnyToken("body", "async runtime")  // either word
+nidus.ContainsTokenSequence("body", "async runtime") // the phrase, in order
+nidus.Regex("path", "^src/.*\\.rs")            // anchored BOTH ends, like Glob
+```
+
+`Fuzzy`'s edit budget is `0..8`; anything outside that is carried as a predicate error
+like an unnormalizable value. `Regex` is compiled server-side and anchored at both ends,
+so use `.*` to opt into a substring search — and an unparseable pattern comes back as a
+request error, not a Go one.
+
 ## Full-text and hybrid search
 
 ```go
@@ -184,7 +203,70 @@ hybrid, err := db.HybridSearch(ctx, nidus.HybridSearchRequest{
 `RRFK` and `Candidates` are `*float32` / `*int`: leave them `nil` for the server's
 defaults (60 and 100). They are pointers because zero is a real request for both — the
 server fuses with `1/(rrf_k + rank + 1)`, so `RRFK: &zero` is the maximally top-heavy
-weighting, and `Candidates: &zero` fuses exactly `TopK` deep with no over-fetch.
+weighting, and `Candidates: &zero` fuses exactly `TopK` deep with no over-fetch. So are
+`VectorWeight` and `TextWeight`, which scale each leg's contribution and default to
+`1.0`: a weight of `&zero` drops that leg entirely, which a plain `float32` could not
+tell apart from "unset".
+
+Query several fields at once with `Clauses` instead of `Field`+`Query` (or `Field`+`Text`
+on hybrid) — one or the other, never both:
+
+```go
+hits, err := db.TextSearch(ctx, nidus.TextSearchRequest{
+    Clauses: []nidus.FtsClause{
+        {Field: "title", Query: "rust"},
+        {Field: "body", Query: "async runtime"},
+    },
+    Combine:   nidus.CombineMax, // or CombineSum, the default: add every matched clause
+    Explain:   true,
+    Highlight: &nidus.HighlightOpts{}, // zero value = the server's defaults
+})
+
+for _, hit := range hits {
+    for _, c := range hit.Annotations.Clauses {
+        fmt.Println(c.Field, c.Score)
+    }
+    for _, h := range hit.Annotations.Highlights {
+        for _, f := range h.Fragments {
+            for _, s := range f.Spans {
+                fmt.Println(h.Field, f.Text[s.Start:s.End]) // spans are byte offsets
+            }
+        }
+    }
+}
+```
+
+`Hit.Annotations` is `nil` unless you asked for `Explain` or `Highlight`. On a hybrid
+search `Explain` additionally fills `Annotations.Vector` and `Annotations.Text` with each
+leg's own rank and score, before fusion flattened them into one number.
+
+## Reshaping the ranking
+
+```go
+// Prefer recent documents: subtract a penalty that grows with age, halving every week.
+hits, err := db.Search(ctx, nidus.SearchRequest{
+    Query: []float32{0.1, 0.2, 0.3},
+    RankBy: nidus.DecayRank(nidus.Decay{
+        Field:  "updated_at",              // a DateTime or Int attr, epoch ms
+        Origin: time.Now().UnixMilli(),    // "now"; ages are measured back from here
+        Scale:  7 * 24 * 60 * 60 * 1000,   // 0 takes the server's default of a week
+    }),
+    LimitPer: &nidus.LimitPer{Field: "path", Max: 2}, // at most 2 hits per file
+})
+
+// Sort a metadata query by an attribute instead of storage order.
+rows, err := db.List(ctx, nidus.ListRequest{
+    OrderBy: &nidus.OrderBy{Field: "updated_at", Descending: true},
+})
+```
+
+The decay penalty is `Lambda * (1 - Decay^(age/Scale))` and is **subtracted** from the
+base score, never multiplied, so it stays meaningful where scores are negative or
+unbounded (Euclidean, DotProduct, BM25). Ages are measured from `Origin` rather than the
+wall clock, so the same query against an unchanged store ranks the same way twice. A
+record whose timestamp is missing or unusable is *not* penalized by default; set
+`Missing: &zero` to bury it instead. `RankBy` and `LimitPer` ride on `/search` and
+`/text-search`; `OrderBy` on `/list`.
 
 ## Remembering and recalling (text-native)
 
@@ -234,6 +316,10 @@ hits, err := db.List(ctx, nidus.ListRequest{
     Scope:  []string{"docs"},
     Filter: nidus.And(nidus.Eq("lang", "rust")),
 })                                          // metadata-only, paginated by Offset/Limit
+agg, err := db.Aggregate(ctx, nidus.AggregateRequest{
+    Scope: []string{"docs"},
+    Sum:   []string{"bytes"},
+})                                          // agg.Count, agg.Sums["bytes"].Int()
 recs, err := db.Records(ctx, "docs")       // every record; Vector is nil for text-only
 meta, err := db.GetMeta(ctx, "docs")
 err = db.SetMeta(ctx, "docs", map[string]string{"owner": "search-team"}) // replaces, not merges

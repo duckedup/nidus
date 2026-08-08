@@ -10,11 +10,12 @@
 // lexically, DateTime↔DateTime as instants — which is why the builders normalize
 // through [ValueOf] rather than coercing types to make a comparison "work".
 //
-// Two asymmetries to keep straight, because they are the wire format and not a choice:
-// Glob's and IGlob's second tuple element is a bare string (the pattern), while every
-// other leaf predicate's is a tagged Value, and In/NotIn/ContainsAny's is an array of
-// them. And the combinators are not key/value tuples at all — All and Any wrap a bare
-// array of predicates, Not wraps a single one.
+// Three asymmetries to keep straight, because they are the wire format and not a choice:
+// the text predicates' second tuple element is a bare string (Glob's and IGlob's pattern,
+// Regex's, and the token predicates' query text), while every other leaf predicate's is a
+// tagged Value and In/NotIn/ContainsAny's is an array of them. Fuzzy is a 3-tuple, key and
+// text and edit budget. And the combinators are not key/value tuples at all — All and Any
+// wrap a bare array of predicates, Not wraps a single one.
 
 package nidus
 
@@ -41,19 +42,31 @@ const (
 	opAll         = "All"
 	opAny         = "Any"
 	opNot         = "Not"
+
+	opFuzzy                 = "Fuzzy"
+	opContainsAllTokens     = "ContainsAllTokens"
+	opContainsAnyToken      = "ContainsAnyToken"
+	opContainsTokenSequence = "ContainsTokenSequence"
+	opRegex                 = "Regex"
 )
+
+// The server's edit-distance ceiling: an N above it is an error there, not a clamp.
+// Checked here so the mistake names the builder rather than arriving as a 400 about a
+// filter the caller has to go and find.
+const maxFuzzyEdits = 8
 
 // A Predicate is one attribute condition. Build it with [Eq], [Ne], [Glob], [IGlob],
 // [In], [NotIn], [Lt], [Le], [Gt], or [Ge]; the fields are unexported so a predicate
 // the server cannot parse cannot be constructed.
 type Predicate struct {
-	op   string
-	key  string
-	val  Value       // Eq, Ne, Lt, Le, Gt, Ge, Contains, NotContains
-	vals []Value     // In, NotIn, ContainsAny
-	pat  string      // Glob, IGlob
-	subs []Predicate // All, Any, Not (Not holds exactly one)
-	err  error       // a normalization failure, surfaced from MarshalJSON
+	op    string
+	key   string
+	val   Value       // Eq, Ne, Lt, Le, Gt, Ge, Contains, NotContains
+	vals  []Value     // In, NotIn, ContainsAny
+	pat   string      // Glob, IGlob, Regex, Fuzzy and the token predicates
+	edits int         // Fuzzy's edit budget, the third tuple element
+	subs  []Predicate // All, Any, Not (Not holds exactly one)
+	err   error       // a normalization failure, surfaced from MarshalJSON
 }
 
 // A Filter is a conjunction (AND) of predicates. The zero value — a nil Filter —
@@ -131,6 +144,53 @@ func Any(preds ...Predicate) Predicate { return group(opAny, preds) }
 // the attribute exist, and Not for genuine complement.
 func Not(pred Predicate) Predicate { return group(opNot, []Predicate{pred}) }
 
+// Fuzzy matches records where attrs[key] is within maxEdits Levenshtein edits of text,
+// ASCII-case-folded on both sides; a list attr matches if any element does. maxEdits is
+// a count, so a negative one — or one above the server's ceiling of 8 — is an error
+// carried on the predicate, exactly as an unnormalizable value is.
+//
+// It is the one leaf predicate that is a 3-tuple on the wire:
+// {"Fuzzy":["title","serach",2]}.
+func Fuzzy(key, text string, maxEdits int) Predicate {
+	if maxEdits < 0 || maxEdits > maxFuzzyEdits {
+		return Predicate{op: opFuzzy, key: key, err: fmt.Errorf(
+			"nidus: Fuzzy(%q): max edits %d is out of range; want 0..%d",
+			key, maxEdits, maxFuzzyEdits,
+		)}
+	}
+	return Predicate{op: opFuzzy, key: key, pat: text, edits: maxEdits}
+}
+
+// ContainsAllTokens matches records where every token of text appears among attrs[key]'s
+// tokens, in any order. Tokens are ASCII-case-folded runs of alphanumerics, so this is
+// word-level matching rather than the substring search [Glob] does.
+func ContainsAllTokens(key, text string) Predicate {
+	return Predicate{op: opContainsAllTokens, key: key, pat: text}
+}
+
+// ContainsAnyToken matches records where at least one token of text appears among
+// attrs[key]'s tokens. An empty text never matches.
+func ContainsAnyToken(key, text string) Predicate {
+	return Predicate{op: opContainsAnyToken, key: key, pat: text}
+}
+
+// ContainsTokenSequence matches records where text's tokens appear consecutively and in
+// order in attrs[key] — a phrase match. A list attr matches only if one element carries
+// the whole phrase.
+func ContainsTokenSequence(key, text string) Predicate {
+	return Predicate{op: opContainsTokenSequence, key: key, pat: text}
+}
+
+// Regex matches records where attrs[key] matches the pattern, anchored at both ends like
+// [Glob]: the pattern has to cover the whole value, so "^src/" alone matches nothing and
+// "^src/.*" is the prefix search you meant. Case folding is the pattern's own "(?i)".
+//
+// The pattern is the server's dialect, not Go's regexp: it is compiled there, and an
+// unparseable one comes back as a request error rather than being caught here.
+func Regex(key, pattern string) Predicate {
+	return Predicate{op: opRegex, key: key, pat: pattern}
+}
+
 // And collects predicates into a [Filter]. It is sugar — predicates already AND —
 // but it reads better at a call site than a slice literal. For a nested conjunction
 // *inside* another group, use [All], which is a Predicate rather than a Filter.
@@ -186,20 +246,22 @@ func (f Filter) Err() error {
 	return nil
 }
 
-// MarshalJSON writes the externally-tagged 2-tuple form, e.g.
-// {"Eq":["lang",{"Str":"rust"}]} or {"Glob":["path","src/*"]}.
+// MarshalJSON writes the externally-tagged tuple form, e.g.
+// {"Eq":["lang",{"Str":"rust"}]}, {"Glob":["path","src/*"]} or {"Fuzzy":["t","x",2]}.
 func (p Predicate) MarshalJSON() ([]byte, error) {
 	if p.err != nil {
 		return nil, p.err
 	}
 	if p.op == "" {
 		return nil, fmt.Errorf(
-			"nidus: zero-value Predicate; build one with Eq, Ne, Glob, IGlob, In, NotIn, " +
-				"Lt, Le, Gt, Ge, Contains, NotContains, ContainsAny, All, Any or Not",
+			"nidus: zero-value Predicate; build one with Eq, Ne, Glob, IGlob, Regex, In, " +
+				"NotIn, Lt, Le, Gt, Ge, Contains, NotContains, ContainsAny, Fuzzy, " +
+				"ContainsAllTokens, ContainsAnyToken, ContainsTokenSequence, All, Any or Not",
 		)
 	}
-	// The combinators are not [key, value] 2-tuples: All/Any wrap a bare array of
-	// predicates and Not wraps a single one, so they marshal before the tuple path.
+	// The variants that are not [key, value] 2-tuples: All/Any wrap a bare array of
+	// predicates, Not wraps a single one, and Fuzzy carries a third element. They marshal
+	// before the tuple path below.
 	switch p.op {
 	case opAll, opAny:
 		subs := p.subs
@@ -212,10 +274,13 @@ func (p Predicate) MarshalJSON() ([]byte, error) {
 			return nil, fmt.Errorf("nidus: Not takes exactly one predicate, got %d", len(p.subs))
 		}
 		return json.Marshal(map[string]Predicate{p.op: p.subs[0]})
+	case opFuzzy:
+		return json.Marshal(map[string][]any{p.op: {p.key, p.pat, p.edits}})
 	}
 	var second any
 	switch p.op {
-	case opGlob, opIGlob:
+	case opGlob, opIGlob, opRegex,
+		opContainsAllTokens, opContainsAnyToken, opContainsTokenSequence:
 		second = p.pat
 	case opIn, opNotIn, opContainsAny:
 		// A nil set must still be `[]`: the server's is a Vec, and `null` would fail

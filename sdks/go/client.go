@@ -365,9 +365,23 @@ func (c *Client) HybridSearch(ctx context.Context, req HybridSearchRequest) ([]H
 }
 
 // List returns records by metadata alone — no query vector — paginated by Offset and
-// Limit. Hit.Score is not meaningful here; there is nothing being scored.
+// Limit, in storage order unless ListRequest.OrderBy says otherwise. Hit.Score is not
+// meaningful here; there is nothing being scored.
 func (c *Client) List(ctx context.Context, req ListRequest) ([]Hit, error) {
 	return c.hits(ctx, "/list", req)
+}
+
+// Aggregate counts the records a filter matches and sums the attributes named in
+// AggregateRequest.Sum. It is answered from the server's in-RAM index alone — no
+// record is materialized and no vector is read — so it stays cheap over a whole store.
+//
+// The zero request counts every record in every collection.
+func (c *Client) Aggregate(ctx context.Context, req AggregateRequest) (*Aggregation, error) {
+	var out Aggregation
+	if err := c.request(ctx, http.MethodPost, "/aggregate", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // ── Memory (text in, text out) ──────────────────────────────────────────────

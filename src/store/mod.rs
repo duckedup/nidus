@@ -33,8 +33,8 @@ mod write;
 mod tests;
 
 use quant::Quant;
-/// The HTTP layer's only reader — `server::classify` maps it to a `400`.
-#[cfg(feature = "cli")]
+/// Marks a caller's mistake rather than a server fault; `server::classify` maps it to a
+/// `400`. Tagged in the library (not just the `cli` build) so `filter::validate` can use it.
 pub(crate) use read::BAD_QUERY;
 
 // ── In-RAM types ─────────────────────────────────────────────────────────────

@@ -28,11 +28,48 @@ from typing import Any
 import pytest
 
 import nidus
-from nidus import AnnInfo, Footprint, FtsField, Hit, NidusClient, Record, RecordInput, Stats
+from nidus import (
+    Aggregation,
+    AnnInfo,
+    Annotations,
+    ClauseScore,
+    Footprint,
+    Fragment,
+    FtsClause,
+    FtsField,
+    Highlight,
+    HighlightOpts,
+    Hit,
+    LegScore,
+    LimitPer,
+    NidusClient,
+    OrderBy,
+    Record,
+    RecordInput,
+    Stats,
+)
 
-# Every public response shape. `RecordInput` is a TypedDict, whose hints tools resolve the
-# same way.
-PUBLIC_SHAPES = [Hit, Record, Footprint, AnnInfo, Stats, RecordInput, FtsField]
+# Every public response shape, plus the TypedDicts callers pass in — whose hints the same
+# tools resolve the same way.
+PUBLIC_SHAPES = [
+    Hit,
+    Record,
+    Footprint,
+    AnnInfo,
+    Stats,
+    Aggregation,
+    Annotations,
+    LegScore,
+    ClauseScore,
+    Highlight,
+    Fragment,
+    RecordInput,
+    FtsField,
+    FtsClause,
+    HighlightOpts,
+    LimitPer,
+    OrderBy,
+]
 
 # Every method of the sync client — the whole documented call surface, plus the dunders a
 # `with` block goes through. The async twin's signatures are asserted to match it

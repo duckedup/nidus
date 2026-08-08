@@ -1,6 +1,6 @@
 ---
 title: Search & filters
-description: Scoped search across nidus collections with three distance metrics, exact or approximate (HNSW/IVF) indexing, int8 quantization, BM25 full-text and hybrid (RRF) search, metadata-only queries, and equality / glob / set / range filter predicates.
+description: Scoped search across nidus collections with three distance metrics, exact or approximate (HNSW/IVF) indexing, int8/binary quantization, BM25 full-text and hybrid (RRF) search, recency ranking, aggregation, and a filter language of equality, range, glob, set, containment, boolean, and text predicates.
 ---
 
 Search in nidus runs over a scope you choose, using one of three distance metrics,
@@ -154,7 +154,7 @@ let no_body = db.search(
 ## Forcing an exact search
 
 A store configured with an [ANN index](#approximate-search-ann) or
-[quantization](#int8-scalar-quantization) answers every query approximately. `exact: true` opts one
+[quantization](#quantization) answers every query approximately. `exact: true` opts one
 query out of that, running the exact brute-force scan instead — useful when a caller
 needs a guaranteed-exact answer over a small filtered subset but wants to keep the index
 for everything else.
@@ -184,6 +184,7 @@ computed from a timestamp attribute and subtracted from each hit's score.
 ```rust
 use nidus::{Decay, RankBy, SearchOpts};
 
+let query = vec![0.1_f32; 384];
 let now = 1_770_000_000_000_i64; // epoch milliseconds
 let week = 7 * 24 * 60 * 60 * 1000;
 
@@ -237,6 +238,7 @@ carry any one value of an attribute:
 ```rust
 use nidus::{LimitPer, SearchOpts};
 
+let query = vec![0.1_f32; 384];
 let hits = db.search(
     "code",
     &query,
@@ -269,16 +271,30 @@ Each record carries an open map of typed [`Value`](/reference/api/#value)s:
 | `Int(i64)`    | A signed 64-bit integer.                             |
 | `Bool(bool)`  | A boolean.                                           |
 | `List(Vec<String>)` | A list of strings (e.g. tags).                 |
+| `Float(f64)`  | A double, compared by IEEE rules.                    |
+| `DateTime(i64)` | A UTC instant as epoch **milliseconds**.           |
 | `Null`        | Set, but empty — **distinct from an absent key**.    |
 
 The `Null`-vs-absent distinction is deliberate: absence means "not computed / not
 indexed", while `Null` means "computed, and empty". A host app uses it to tell an
 un-indexed field apart from a field that was indexed and found to be empty.
 
+Comparison is **same-type only**, which has two consequences worth knowing up front:
+
+- `Float` and `Int` do **not** cross-compare. `Ge("score", Float(0.5))` never matches a
+  record that stored `Int(1)`, so pick one spelling per attribute and keep to it.
+- A `Float` `NaN` is unordered and unequal to itself, so it matches *nothing* — `Eq("k",
+  Float(NAN))` included.
+
+`DateTime` is an absolute instant: there is no timezone and no local-time form, and
+rendering it is the caller's business. It is a distinct variant from `Int` so a filter or
+a [recency ranking](#ranking-by-recency) can tell a time from a number without relying on
+a naming convention.
+
 ## Filters
 
-A [`Filter`](/reference/api/#filter) is a conjunction (AND) of
-[`Predicate`](/reference/api/#predicate)s, applied **before scoring** — matching
+A [`Filter`](/reference/api/#predicate--filter) is a conjunction (AND) of
+[`Predicate`](/reference/api/#predicate--filter)s, applied **before scoring** — matching
 rows are scored, the rest are skipped. An empty filter matches everything.
 
 ```rust
@@ -329,6 +345,62 @@ that lacks `key` matches *nothing* — including `Ne` / `NotIn` / `NotContains` 
 range predicates. (So `Ne("status", "archived")` does not match a record with no
 `status` at all.)
 
+### Text predicates
+
+Five more leaf predicates match *inside* the text an attribute carries, for the cases a
+glob cannot express — a half-remembered identifier, a bag of words, a phrase, a pattern.
+All five read a `Str` directly and a `List` element by element, matching when **any single
+element** satisfies them (so a phrase never spans two elements).
+
+```rust
+use nidus::{Filter, Predicate};
+
+let filter = Filter(vec![
+    // Within 2 edits of "nidus" — ASCII-case-folded on both sides.
+    Predicate::Fuzzy("name".into(), "nidus".into(), 2),
+    // Every one of these tokens appears, in any order.
+    Predicate::ContainsAllTokens("body".into(), "vector store".into()),
+    // These tokens appear consecutively and in order — a phrase.
+    Predicate::ContainsTokenSequence("body".into(), "append only".into()),
+    // Anchored at both ends, like a glob.
+    Predicate::Regex("path".into(), r"src/[a-z]+/mod\.rs".into()),
+]);
+```
+
+- **`Fuzzy(key, needle, n)`** — within `n` **Levenshtein** edits of `needle`, counting
+  *characters* rather than bytes. It is the plain three-operation distance (substitute,
+  insert, delete), so a **transposition costs 2**: `Fuzzy("word", "from", 1)` does not
+  match `"form"`. Both sides are ASCII-case-folded, exactly as `IGlob` folds. `n` may not
+  exceed **8** — a larger budget is an **error**, never a silent clamp, because a clamped
+  budget quietly answers a different question than the one asked.
+- **`ContainsAllTokens(key, text)`** / **`ContainsAnyToken(key, text)`** /
+  **`ContainsTokenSequence(key, text)`** — every query token present in any order, at
+  least one present, or the tokens consecutive and in order (a phrase). A token is a
+  maximal run of alphanumerics, ASCII-case-folded, with **no stemming and no stopword
+  removal**: these are *filter* predicates, where a term either is or is not there. So
+  `ContainsAllTokens("body", "run")` does **not** match `"running"` — while
+  [`text_search`](#full-text-search-bm25) for the same word does, because stemming belongs
+  to ranking, where a partial-credit match means something.
+- **`Regex(key, pattern)`** — a regular expression, **anchored at both ends** like `Glob`,
+  so the whole attribute must match and `.*` on either side opts back into a substring
+  search. Case-insensitivity is the pattern's own `(?i)` flag rather than a second
+  variant, since a regex has somewhere to put a flag and a glob does not. An unparseable
+  pattern is a caller-facing error, never a silently non-matching filter. The engine is
+  finite-automata and **linear-time in the input** — it does not backtrack, so there is no
+  ReDoS to guard against and no timeout knob to tune.
+
+Empty queries take the usual identities: `ContainsAllTokens` with no tokens matches any
+present text attribute (as `All(vec![])` does), `ContainsAnyToken` with none matches
+nothing (as `Any(vec![])` does).
+
+:::caution[There is no index behind these]
+Every predicate here re-tokenizes or re-scans the attribute for **each record the scan
+visits** — O(attribute length) per row for the token family, and O(needle × attribute) for
+the `Fuzzy` DP. That is fine at the scale nidus targets, and it is *not* a substitute for
+full-text search over a large corpus. When the field is a document, reach for
+[`text_search`](#full-text-search-bm25), which does have an index.
+:::
+
 ### Combining predicates
 
 A `Filter` is a conjunction, but `All`, `Any`, and `Not` are themselves predicates that
@@ -373,9 +445,10 @@ db.delete_where("code", &Filter(vec![
 
 ## Metadata-only queries
 
-Use `list` to retrieve records by metadata filter without a vector query. Results
-come back in insertion order with `score: 0.0`. `ListOpts`'s `offset` and `limit`
-paginate a stable ordering — advance `offset` by `limit` to page through.
+Use `list` to retrieve records by metadata filter without a vector query. Results come
+back in insertion order with `score: 0.0` — unless [`order_by`](#ordering-by-an-attribute)
+says otherwise. `ListOpts`'s `offset` and `limit` paginate a stable ordering — advance
+`offset` by `limit` to page through.
 
 ```rust
 use nidus::{Filter, ListOpts, Predicate, Value};
@@ -439,30 +512,45 @@ println!("{} records, {:?} bytes", stats.count, stats.sums["bytes"]);
 addend was an `Int`, `Float` once any `Float` joined. A missing or non-numeric value is
 skipped rather than counted as zero, so `sum` and `count` stay independently meaningful.
 
-## int8 scalar quantization
+## Quantization
 
-For larger collections, enable int8 scalar quantization to speed up search.
-The store keeps an int8 copy of every vector in RAM (global **symmetric**
-quantization — one shared scale, no per-dimension offset, so the int8 score
-stays monotonic with the true score). Search then runs in two passes: a fast
-int8 first-pass selects candidates, overscanning by the `rescore` factor, then
-the original f32 vectors re-rank those candidates for an exact final ranking.
+For larger collections, enable quantization to speed up search. The store keeps a
+compressed copy of every vector in RAM and search runs in two passes: a fast quantized
+first pass selects candidates, overscanning by the `rescore` factor, then the original
+f32 vectors re-rank those candidates for an exact final ranking.
+
+Two schemes are available:
+
+| Scheme | Size vs f32 | Default `rescore` | Metrics |
+| --- | --- | --- | --- |
+| `Quantization::int8()` | 4× smaller | 4 | any |
+| `Quantization::binary()` | 32× smaller | 16 | **cosine only** |
+
+int8 is global **symmetric** scalar quantization — one shared scale, no per-dimension
+offset, so the int8 score stays monotonic with the true score. Binary keeps only each
+dimension's sign bit and scores a Hamming distance; sign codes approximate *angular*
+similarity and discard magnitude, which is why they are not a sound ranking proxy for
+`DotProduct` or `Euclidean`. Binary is the coarser proxy, hence its larger default
+overscan.
 
 ```rust
-use nidus::{Config, Quantization};
+use nidus::{Config, Nidus, Quantization};
 
-let db = Nidus::open(
-    Config::new("./store", 768)
-        .quantization(Some(Quantization { rescore: 4 }))
+// int8 — valid for any distance metric.
+let db = Nidus::open(Config::new("./store", 768).quantization(Some(Quantization::int8())))?;
+
+// Binary sign bits, with a wider candidate net (cosine stores only).
+let db2 = Nidus::open(
+    Config::new("./store2", 768).quantization(Some(Quantization::binary().rescore(24)))
 )?;
 # anyhow::Ok(())
 ```
 
-The `rescore` factor trades recall for speed: `rescore: 4` means the int8 pass
-keeps `top_k * 4` candidates before the f32 re-rank. Higher values widen the
-candidate net (better recall, more f32 work); the default is 4.
+The `rescore` factor trades recall for speed: `rescore: 4` means the first pass keeps
+`top_k * 4` candidates before the f32 re-rank. Higher values widen the candidate net
+(better recall, more f32 work).
 
-**What to expect.** In the `just bench-quant` sweep (uniform-random vectors,
+**What to expect (int8).** In the `just bench-quant` sweep (uniform-random vectors,
 a near-worst case for quantization recall), the two-pass search returns
 essentially the exact neighbours — **~100% recall@10 at `rescore` ≥ 2** — for a
 **~1.4× query speedup** at 1M × 768, in exchange for **~25% more RAM** (the int8
@@ -641,15 +729,6 @@ let q = q.combine(FtsCombine::Max);
 - `FtsQuery::new(field, text)` is the one-clause shorthand, and a single clause scores
   exactly the same under either combine mode. `min_score` applies to the combined score.
 
-- **Analyzer.** US English today (`Language::English`): lowercase → Unicode word
-  tokenization → English stopword removal → Porter stemming. Stemming means a query for
-  `run` matches documents containing `running`, `runs`, or `ran`. The same analysis runs
-  at index and query time. The `Language` enum is the seam for further languages.
-- **What gets indexed.** `Str` attrs are indexed directly; `List` attrs are indexed
-  per element. A document only lives in a field's index while it has text there.
-- **`SearchOpts`.** `top_k`, `offset`, and `filter` work exactly as for vector search;
-  here `min_score` is a **raw BM25** floor (not a cosine one). Results are tie-broken by
-
 ### Tuning a field
 
 Each declared field is an `FtsField`, and every knob has a default that reproduces
@@ -682,9 +761,20 @@ field name still means "all defaults":
 ```json
 {"fields": ["title", {"field": "body", "k1": 1.5, "b": 0.3, "ascii_folding": true}]}
 ```
-- **`SearchOpts`.** `top_k` and `filter` work exactly as for vector search; here
-  `min_score` is a **raw BM25** floor (not a cosine one). Results are tie-broken by
-  `(collection, id)` for determinism.
+
+### What gets indexed, and how a query behaves
+
+- **Analyzer.** US English today (`Language::English`): lowercase → Unicode word
+  tokenization → English stopword removal → Porter stemming. Stemming means a query for
+  `run` matches documents containing `running`, `runs`, or `ran`. The same analysis runs
+  at index and query time, per field, so a field's own tuning applies to both. The
+  `Language` enum is the seam for further languages.
+- **What gets indexed.** `Str` attrs are indexed directly; `List` attrs are indexed
+  per element. A document only lives in a field's index while it has text there.
+- **`SearchOpts`.** `top_k`, `offset`, `filter`, `projection`, `rank_by`, and `limit_per`
+  all work exactly as for vector search; only `min_score` differs, being a **raw BM25**
+  floor rather than a cosine one. Results are tie-broken by `(collection, id)` for
+  determinism, the same total order [pagination](#paginating-a-search) relies on.
 - **Text-only documents.** A `Record` may carry no vector (`Record::text_only`) — a
   pure full-text document. It is found by `text_search` and never by vector `search`.
   Vector-bearing and text-only docs coexist in one collection.
@@ -698,6 +788,7 @@ and a document's fused score is `Σ 1 / (rrf_k + rank)` over the legs it appears
 ```rust
 use nidus::{FtsQuery, HybridOpts};
 
+let query_vector = vec![0.1_f32; 384];
 let hits = db.hybrid_search(
     "docs",
     &query_vector,                       // the vector leg
@@ -712,9 +803,9 @@ RRF fuses by **rank position**, not raw score, so the incomparable scales of cos
 that surfaces in only one leg (a strong vector match with weak text, or a text-only
 doc) is still ranked. `HybridOpts` exposes `top_k`, `offset` (which pages the fused
 ranking, never a leg), a `filter` applied to both legs, `rrf_k` (the rank-bias constant,
-default 60), and `candidates` (how deep each leg is pulled before fusing, default 100). There is no `min_score` — a fused RRF score has no
-absolute scale; threshold the individual legs via `search` / `text_search` if you need
-a floor.
+default 60), and `candidates` (how deep each leg is pulled before fusing, default 100).
+There is no `min_score` — a fused RRF score has no absolute scale; threshold the
+individual legs via `search` / `text_search` if you need a floor.
 
 The text leg takes the same multi-clause `FtsQuery` as `text_search`: the clauses are
 combined into one BM25 leg first, then fused with the vector leg, so a single-clause hybrid
@@ -729,6 +820,7 @@ exactly.
 ```rust
 use nidus::{FtsQuery, HybridOpts};
 
+let query_vector = vec![0.1_f32; 384];
 // Lean on the keyword leg: exact terms matter more than semantic neighbourhood here.
 let hits = db.hybrid_search(
     "docs",
@@ -775,10 +867,12 @@ for hit in &hits {
 ```
 
 - **`explain: true`** reports each *matched* clause's own BM25 score, in query order (a
-  clause that did not match is absent, not a zero). On `hybrid_search`, `HybridOpts::explain`
-  additionally reports each fusion leg's own `(rank, score)`, so you can see whether a
-  document rode in on the vector leg, the text leg, or both. Vector `search` ignores it — it
-  has a single score to report.
+  clause that did not match is absent, not a zero). A clause carries a **score only, no
+  rank** — clauses are summed or maxed into one text score, so there is no separate ranking
+  per clause for a rank to refer to. On `hybrid_search`, `HybridOpts::explain` additionally
+  reports each fusion leg's own `(rank, score)` — the legs *are* ranked independently, which
+  is exactly what RRF fuses — so you can see whether a document rode in on the vector leg,
+  the text leg, or both. Vector `search` ignores `explain`: it has a single score to report.
 - **`highlight`** returns fragments of the field's stored text with the byte ranges that
   matched. The offsets index the **original** text, not the analyzed token stream: a query
   for `run` highlights the word a document spells `running`, which no substring search would

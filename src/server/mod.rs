@@ -1294,6 +1294,41 @@ mod tests {
         assert_eq!(stats["footprint"]["doc_count"], 2);
     }
 
+    /// A filter the caller wrote wrong is a bad request, not a server fault (nidus-oih).
+    /// Only the library `Err` was pinned before, so these fell through `classify` to a 500 —
+    /// which also books a client mistake against the 5xx health metric.
+    #[tokio::test]
+    async fn an_unusable_filter_is_a_bad_request_not_a_server_error() {
+        let app = test_router(3);
+        for (path, body) in [
+            (
+                "/search",
+                json!({"query": [1, 0, 0], "filter": [{"Regex": ["k", "("]}]}),
+            ),
+            (
+                "/search",
+                json!({"query": [1, 0, 0], "filter": [{"Fuzzy": ["k", "x", 99]}]}),
+            ),
+            // Nested inside a group: `validate` recurses, so the tag must survive the nesting.
+            (
+                "/search",
+                json!({"query": [1, 0, 0], "filter": [{"Not": {"Regex": ["k", "("]}}]}),
+            ),
+            ("/list", json!({"filter": [{"Regex": ["k", "("]}]})),
+        ] {
+            let resp = app.clone().oneshot(post(path, body.clone())).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{path} {body}: a caller's bad filter must not be a 5xx"
+            );
+            // The 400 must still say WHICH predicate was wrong. Tagging the error with
+            // `.context` instead of inline once reduced this to "invalid query option".
+            let err = json_body(resp).await["error"].as_str().unwrap().to_string();
+            assert!(err.contains('`'), "{path}: error names no predicate: {err}");
+        }
+    }
+
     /// A `top_k` nothing clamps used to reach the bounded top-k heap and abort the process
     /// on "capacity overflow" (nidus-m50.17). The edge must call it a bad request instead.
     #[tokio::test]
