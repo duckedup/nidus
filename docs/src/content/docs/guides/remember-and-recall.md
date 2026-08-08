@@ -15,6 +15,26 @@ synchronous core. The raw `Vec<f32>` API underneath never changes, so if you
 already have your own embeddings you can skip this entirely (see [the escape
 hatch](#the-escape-hatch-bring-your-own-vector) below).
 
+## What you have to provide
+
+**nidus does not embed text itself, and ships no built-in model.** It stores vectors
+and answers queries over them; turning text into a vector is delegated to a provider
+you choose. So before `remember`/`recall` will work, you need exactly one of:
+
+- **A hosted provider and its API key** — Voyage, OpenAI, Cohere, Gemini, Mistral,
+  Jina, or any OpenAI-compatible endpoint. Enable its `embed-<name>` feature and set
+  the key. See [the provider table](#embedding-providers-and-their-default-models).
+- **A local daemon** — [Ollama](#a-fully-local-keyless-setup-with-ollama). No API key
+  and nothing leaves your machine, at the cost of running a daemon.
+- **Your own vectors** — skip the memory layer and use the raw `Vec<f32>` API. See
+  [the escape hatch](#the-escape-hatch-bring-your-own-vector).
+
+There is deliberately no bundled local embedder. A model table worth using is 8–32 MB,
+which every `cargo add nidus` would carry whether or not it embeds anything, and static
+embeddings score meaningfully below a real model — so it would be both the heaviest and
+the weakest option on the list. Ollama already covers the fully-local case. The
+reasoning is recorded in `SPEC.md` §9.1.
+
 ## Turn it on
 
 The memory layer and its provider adapters are **off by default** — the plain
