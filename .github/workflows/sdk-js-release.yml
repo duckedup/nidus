@@ -30,6 +30,9 @@ on:
         description: Crate version to stamp and publish (no leading v)
         required: true
         type: string
+  # Manual dispatch makes THIS file the entry point, so npm validates it against a trusted
+  # publisher named `sdk-js-release.yml` — not the `release.yml` the normal path needs.
+  # Publishing this way needs a second trusted-publisher entry naming this file (nidus-bkt).
   workflow_dispatch:
     inputs:
       version:
@@ -101,22 +104,20 @@ jobs:
       # Idempotent: a version already on the registry is a no-op success, not a failed
       # release — the crate's own publish step takes the same stance.
       #
-      # No NODE_AUTH_TOKEN: authentication is via OIDC trusted publishing, configured at
-      # npmjs.com → @duckedup/nidus → Settings → Trusted Publishing (org: duckedup,
-      # repo: nidus). Provenance is emitted automatically.
+      # Auth is OIDC trusted publishing, configured at npmjs.com → @duckedup/nidus →
+      # Settings → Trusted Publishing (org: duckedup, repo: nidus). No NODE_AUTH_TOKEN, and
+      # deliberately no token fallback: the package requires 2FA and disallows bypass
+      # tokens, under which npm refuses EVERY token publish with `EOTP` (it cannot prompt
+      # for an OTP in CI). A long-lived credential here could not publish and would only
+      # bury the real error — OIDC is the only path, so a failure must say so and stop.
       #
       # The configured workflow MUST be `release.yml`, not this file (nidus-bkt). npm
       # validates the *entry-point* workflow under `workflow_call`, not the one holding the
-      # publish, so keying it here 404'd every release from #66 to 0.52.0.
-      #
-      # NPM_TOKEN is the fallback for exactly that misconfiguration: a release that would
-      # otherwise ship nothing still publishes, at the cost of provenance (which needs the
-      # OIDC exchange that just failed). Absent the secret, behaviour is unchanged.
+      # publish, so keying it here 404'd every release from #66 to 0.53.0.
       - name: Publish
         working-directory: sdks/js
         env:
           VERSION: ${{ inputs.version }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           if npm view "@duckedup/nidus@${VERSION}" version >/dev/null 2>&1; then
@@ -128,18 +129,10 @@ jobs:
           fi
           # npm reports an unauthorized write as 404, not 403, which reads as "package
           # missing" and cost nidus-bkt five silent releases. Name the real cause.
-          echo "::warning::trusted publishing failed. A 404 on PUT means UNAUTHORIZED, not" \
+          echo "::error::trusted publishing failed. A 404 on PUT means UNAUTHORIZED, not" \
                "missing: npmjs.com → @duckedup/nidus → Trusted Publishing must name the" \
                "ENTRY-POINT workflow (release.yml), not sdk-js-release.yml. See nidus-bkt."
-          if [ -z "${NPM_TOKEN}" ]; then
-            echo "::error::no NPM_TOKEN fallback configured — nothing was published."
-            exit 1
-          fi
-          # Unset the OIDC handles so npm cannot retry the exchange that just failed, and drop
-          # provenance with them: attestation is not available on the token path.
-          echo "::warning::falling back to NPM_TOKEN; this release publishes WITHOUT provenance"
-          env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
-            NODE_AUTH_TOKEN="${NPM_TOKEN}" npm publish --provenance=false
+          exit 1
 
       - name: Create tag and GitHub release
         env:
