@@ -1016,6 +1016,31 @@ build until a real need exists.
   same directory exits immediately, naming the lock conflict. A stdio session
   skips `limits.rs`/`metrics.rs` entirely (both are axum `.layer()`-only): one
   local client needs neither an admission cap nor a scrape endpoint.
+- **Agent-memory write path (nidus-k28.7/.5/.6).** `remember` provisions on first
+  write (collection plus a default full-text schema over `nidus.text`, gated on
+  `Nidus::has_fts_schema` — `set_fts_schema` rebuilds the field index from every
+  live doc, so an ungated call would make each write O(collection size)), stamps a
+  reserved attr vocabulary, and optionally suppresses near-duplicates. The reserved
+  keys are `nidus.text` (the raw text, always stamped, and what the default schema
+  indexes), `nidus.created_at` / `nidus.updated_at` / `nidus.expires_at` (all
+  `Value::DateTime`, UTC epoch ms). `nidus.source` predates `nidus.text`, carried
+  exactly the same value, and is retained read-only so records written before this
+  change still resolve — nothing stamps it now. Because `upsert` replaces a doc's
+  attrs wholesale, both preserving `created_at` and merging a dedupe match's
+  untouched attrs require an explicit read-before-write, done inside the same
+  `run_write` closure so it is atomic against every other queued write.
+
+  **TTL is enforced at read time, and that is not one option of two.** nidus runs
+  no background threads and has no periodic sweep, so nothing else *can* hide an
+  expired entry: a compaction-only design would leave expired entries recallable
+  until whenever `compact` next ran, which is not expiry. The guard is a predicate
+  AND-ed into the caller's filter on every MCP read tool, in the true-complement
+  form `Not(Le(nidus.expires_at, now))` — a bare `Gt`/`Ge` is false on an absent
+  key (§7 range semantics) and would silently hide every entry that never got a
+  TTL. `get` bypasses `Filter` entirely, so it carries the same check by hand.
+  Physical reclaim stays a separate, caller-triggered concern reached through
+  `delete_where` + `compact` (§8); it is deliberately not new logic inside
+  `compact`'s per-doc re-emission loop.
 - **ANN index (HNSW/IVF).** `Config::ann` opts a store into an in-RAM approximate
   index over the same `data` rows; `search` walks it instead of scanning. Two
   algorithms, selected by `AnnKind`: **HNSW** (`AnnConfig::hnsw`, the default — a

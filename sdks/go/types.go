@@ -475,8 +475,8 @@ type BatchFuse struct {
 // it, so the client only ever sends strings.
 //
 // Mode is "raw" (embed the text as given, the default) or "summarize" (summarize
-// first, embed the summary, and stamp nidus.summary/nidus.source attrs — which needs
-// a server started with a summarizer). Attrs is metadata stamped on the record.
+// first, embed the summary, and stamp a nidus.summary attr — which needs
+// a server started with a summarizer). The raw text is always stored under nidus.text. Attrs is metadata stamped on the record.
 type RememberOptions struct {
 	Mode  string
 	Attrs Attrs

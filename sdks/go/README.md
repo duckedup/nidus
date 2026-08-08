@@ -281,7 +281,7 @@ err := db.Remember(ctx, "notes", "a", "the quick brown fox",
 
 // Summarize first, then embed the summary (the server also needs
 // --summarize-provider). The stored record additionally carries nidus.summary
-// and nidus.source attrs.
+// attr; the raw text is always stored under nidus.text.
 err = db.Remember(ctx, "notes", "b", longArticle,
     nidus.RememberOptions{Mode: "summarize"})
 

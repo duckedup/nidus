@@ -349,8 +349,8 @@ export class NidusClient {
   /**
    * Embed `text` and upsert it under `id` in `collection` (idempotent on `id`).
    * With `opts.mode === "summarize"` the server summarizes first, embeds the
-   * summary, and stamps `nidus.summary`/`nidus.source` attrs (requires the
-   * server to have a summarizer). `opts.attrs` accept plain JS values or `v.*`
+   * summary, and stamps a `nidus.summary` attr (requires the server to have a
+   * summarizer). The raw text is always stored under `nidus.text`. `opts.attrs` accept plain JS values or `v.*`
    * helpers; they are normalized for you.
    */
   async remember(

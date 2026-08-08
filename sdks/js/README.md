@@ -223,7 +223,8 @@ can send **text** and let the server embed it — no need to compute vectors cli
 await db.remember("notes", "a", "the quick brown fox", { attrs: { tag: "x" } });
 
 // Summarize first, then embed the summary (server also needs --summarize-provider).
-// The stored record additionally carries `nidus.summary` and `nidus.source` attrs.
+// The stored record additionally carries a `nidus.summary` attr; the raw text is
+// always stored under `nidus.text`.
 await db.remember("notes", "b", longArticle, { mode: "summarize" });
 
 // Embed the query text and search, best-first (attrs decoded to plain JS values)

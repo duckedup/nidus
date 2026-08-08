@@ -76,7 +76,10 @@ pub mod summarize;
 #[cfg(feature = "memory")]
 mod memory;
 #[cfg(feature = "memory")]
-pub use memory::{META_DIM, META_EMBEDDER, Memory, RecallOpts, RememberMode};
+pub use memory::{
+    META_CREATED_AT, META_DIM, META_EMBEDDER, META_EXPIRES_AT, META_TEXT, META_UPDATED_AT, Memory,
+    RecallOpts, RememberMode,
+};
 // The summarize-mode attr keys are only defined when summaries can be produced.
 #[cfg(all(feature = "memory", feature = "summarize"))]
 pub use memory::{META_SOURCE, META_SUMMARY};
@@ -222,6 +225,13 @@ impl Nidus {
 
     pub fn has_collection(&self, name: &str) -> bool {
         self.store.has_collection(name)
+    }
+
+    /// Whether `collection` already has a declared FTS schema, without rebuilding it.
+    /// The truthful gate for callers that must call [`set_fts_schema`](Self::set_fts_schema)
+    /// at most once per collection.
+    pub fn has_fts_schema(&self, collection: &str) -> bool {
+        self.store.has_fts_schema(collection)
     }
 
     pub fn collections(&self) -> Vec<String> {

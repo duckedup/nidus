@@ -9,6 +9,7 @@ use serde_json::{Map, Value as JsonValue, json};
 
 // Imported for its methods on `AnyEmbedder` — a trait method, not inherent.
 use crate::embed::Embedder;
+use crate::memory::{not_expired_predicate, now_ms};
 use crate::{Filter, HybridOpts, SearchOpts};
 
 use super::NidusMcp;
@@ -109,7 +110,9 @@ AND-combined (a record must satisfy every one). `Any` OR-groups a list of predic
 tagged \"wip\": [{\"Any\": [{\"Eq\": [\"project\", {\"Str\": \"nidus\"}]}, {\"Eq\": \
 [\"project\", {\"Str\": \"beads\"}]}]}, {\"Eq\": [\"kind\", {\"Str\": \"decision\"}]}, \
 {\"Not\": {\"Contains\": [\"tags\", {\"Str\": \"wip\"}]}}]. Values are tagged by type — see \
-the `value` schema. ABSENT-KEY TRAP: `Ne`, `NotIn`, and `ContainsAny`'s sibling `NotContains` \
+the `value` schema. Expired entries (a `remember` call's optional TTL) are already excluded \
+from every result — no need to filter on `nidus.expires_at` yourself. ABSENT-KEY TRAP: \
+`Ne`, `NotIn`, and `ContainsAny`'s sibling `NotContains` \
 (not exposed here, but the rule carries) all require the key present with a different value, \
 so they are FALSE when the key is simply missing. `Not` is a true complement instead: \
 `Not({\"Eq\": [\"kind\", {\"Str\": \"decision\"}]})` is TRUE for a record with no `kind` at \
@@ -145,6 +148,15 @@ pub(super) fn parse_filter(args: &Map<String, JsonValue>) -> Result<Option<Filte
             .map(Some)
             .map_err(|e| McpError::invalid_params(format!("`filter` is invalid: {e}"), None)),
     }
+}
+
+/// AND unit 1's not-expired guard into a caller's filter — never replacing it. Dropping
+/// either half while merging is an easy, silent bug: the caller's own predicates could
+/// vanish, or an expired entry could leak back into results (D4/D5, `nidus-k28`).
+pub(super) fn with_ttl_guard(filter: Option<Filter>) -> Filter {
+    let mut filter = filter.unwrap_or_default();
+    filter.0.push(not_expired_predicate(now_ms()));
+    filter
 }
 
 pub(super) fn tools() -> Vec<Tool> {
@@ -269,7 +281,7 @@ impl NidusMcp {
         let opts = SearchOpts {
             top_k,
             min_score,
-            filter: filter.unwrap_or_default(),
+            filter: with_ttl_guard(filter),
             ..Default::default()
         };
         let hits = crate::server::run_read(self.state.clone(), move |db| {
@@ -297,7 +309,7 @@ impl NidusMcp {
         let hits = crate::server::run_read(self.state.clone(), move |db| {
             let opts = SearchOpts {
                 top_k,
-                filter: filter.unwrap_or_default(),
+                filter: with_ttl_guard(filter),
                 ..Default::default()
             };
             let q = crate::FtsQuery::new(field, query);
@@ -333,7 +345,7 @@ impl NidusMcp {
             // exposing them adds ways to get worse results and none to get better ones.
             let opts = HybridOpts {
                 top_k,
-                filter: filter.unwrap_or_default(),
+                filter: with_ttl_guard(filter),
                 ..Default::default()
             };
             let q = crate::FtsQuery::new(field, query);

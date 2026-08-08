@@ -395,6 +395,15 @@ pub struct RememberRequest {
     pub mode: Option<String>,
     #[serde(default)]
     pub attrs: BTreeMap<String, Value>,
+    /// Seconds until this memory expires, from the moment it is written. `None`
+    /// (the default) never expires.
+    #[serde(default)]
+    pub ttl_seconds: Option<i64>,
+    /// Cosine-similarity floor above which this write updates the nearest existing
+    /// entry instead of inserting a competing near-duplicate. `None` (the default)
+    /// disables dedup — every write is a plain upsert by `id`.
+    #[serde(default)]
+    pub dedupe_threshold: Option<f32>,
 }
 
 /// Body of `POST /collections/{name}/recall` (the `memory` feature).

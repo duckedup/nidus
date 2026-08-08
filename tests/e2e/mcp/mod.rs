@@ -3,9 +3,13 @@
 //! neither. This file stays HTTP-only; `stdio`/`attrs`/`filters`/`hygiene` are siblings.
 
 mod attrs;
+mod dedupe;
 mod filters;
 mod hygiene;
+mod lifecycle;
+mod recency;
 mod stdio;
+mod support;
 
 use serde_json::{Value, json};
 

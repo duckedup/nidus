@@ -241,7 +241,8 @@ send **text** and let the server embed it — no need to compute vectors client-
 db.remember("notes", "a", "the quick brown fox", attrs={"tag": "x"})
 
 # Summarize first, then embed the summary (the server also needs --summarize-provider).
-# The stored record additionally carries `nidus.summary` and `nidus.source` attrs.
+# The stored record additionally carries a `nidus.summary` attr; the raw text is
+# always stored under `nidus.text`.
 db.remember("notes", "b", long_article, mode="summarize")
 
 # Embed the query text and search, best first

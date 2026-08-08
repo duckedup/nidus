@@ -12,7 +12,7 @@ use crate::{ListOpts, Projection, Scope};
 
 use super::NidusMcp;
 use super::args::{api_error, optional_usize, required_str, tool};
-use super::search::{filter_defs, filter_schema, parse_filter};
+use super::search::{filter_defs, filter_schema, parse_filter, with_ttl_guard};
 use super::{HitDto, hits_content};
 
 /// An optional string argument (as opposed to [`super::args::required_str`]'s required one).
@@ -191,6 +191,14 @@ impl NidusMcp {
                 .await
                 .map_err(api_error)?;
 
+        // `get` is a direct map lookup that bypasses `Filter`, so it cannot inherit the
+        // guard via `with_ttl_guard`; reusing `filter::matches` keeps the absent-key
+        // semantics in one place.
+        let guard = crate::Filter(vec![crate::memory::not_expired_predicate(
+            crate::memory::now_ms(),
+        )]);
+        let record = record.filter(|r| crate::filter::matches(&guard, &r.attrs));
+
         // Only `id`/`attrs`: `Record::vector` would flood the model's context with floats
         // and break the text-native contract every other tool here holds to.
         match record {
@@ -220,7 +228,7 @@ impl NidusMcp {
             ));
         }
         let offset = optional_usize(args, "offset")?.unwrap_or(0);
-        let filter = parse_filter(args)?.unwrap_or_default();
+        let filter = with_ttl_guard(parse_filter(args)?);
 
         let hits = crate::server::run_read(self.state.clone(), move |db| {
             let opts = ListOpts {

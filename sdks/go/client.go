@@ -424,8 +424,8 @@ func (c *Client) Aggregate(ctx context.Context, req AggregateRequest) (*Aggregat
 // client sends only strings; the embedding never crosses the wire.
 //
 // With opts.Mode == "summarize" the server summarizes first, embeds the summary, and
-// stamps nidus.summary/nidus.source attrs so a later recall is explainable back to the
-// source text — that path additionally needs a server started with a summarizer.
+// stamps a nidus.summary attr; the raw text is always stored under nidus.text, so a
+// recall stays explainable back to it — that path needs a server started with a summarizer.
 func (c *Client) Remember(
 	ctx context.Context, collection, id, text string, opts RememberOptions,
 ) error {

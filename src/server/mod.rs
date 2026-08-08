@@ -1072,10 +1072,14 @@ async fn remember(
         text,
         mode,
         attrs,
+        ttl_seconds,
+        dedupe_threshold,
     } = req;
-    // `mut` only when a summarizer can stamp META_SUMMARY/META_SOURCE into it.
+    // `mut` only when a summarizer can stamp META_SUMMARY into it.
     #[cfg_attr(not(all(feature = "memory", feature = "summarize")), allow(unused_mut))]
     let mut attrs = attrs;
+    crate::memory::strip_reserved_recency(&mut attrs);
+    let raw_text = text.clone();
 
     // 1) (Optional) summarize + 2) embed — all lock-free network IO.
     let embed_text: String = match mode.as_deref() {
@@ -1091,15 +1095,11 @@ async fn remember(
                     .summarize(&text, &SummarizeOpts::default())
                     .await
                     .map_err(anyhow::Error::new)?;
-                // Stamp the same attr keys the in-process `Memory` uses so a
+                // Stamp the same attr key the in-process `Memory` uses so a
                 // recall hit is explainable back to the source text.
                 attrs.insert(
                     crate::memory::META_SUMMARY.to_string(),
                     crate::Value::Str(summary.clone()),
-                );
-                attrs.insert(
-                    crate::memory::META_SOURCE.to_string(),
-                    crate::Value::Str(text.clone()),
                 );
                 summary
             }
@@ -1117,19 +1117,71 @@ async fn remember(
             )));
         }
     };
+    // Stamp the raw input on every call, both modes — the field the
+    // auto-provisioned FTS schema indexes (D1).
+    attrs.insert(
+        crate::memory::META_TEXT.to_string(),
+        crate::Value::Str(raw_text),
+    );
     let vector = embedder
         .embed(&embed_text)
         .await
         .map_err(anyhow::Error::new)?;
 
-    // 3) Store: pin the embedding-space identity (reused from `crate::memory`)
-    //    and upsert — the only step that takes the write lock.
-    let n = run_write(st, move |db| {
+    // 3) Store: pin the embedding-space identity (reused from `crate::memory`),
+    // resolve dedupe + recency, and upsert — the only step under the write lock.
+    let (n, resolved_id, deduped) = run_write(st, move |db| {
         crate::memory::ensure_collection_and_pin(db, embedder.as_ref(), &name)?;
-        db.upsert(&name, &[Record::new(id, vector, attrs)])
+
+        let mut target_id = id;
+        let mut deduped = false;
+        if let Some(threshold) = dedupe_threshold {
+            // Same expiry guard as the MCP tool: an expired entry is invisible to every
+            // read path, so merging onto one would inherit its past `expires_at` and land
+            // a write that reports success and is never visible.
+            let opts = SearchOpts {
+                top_k: 1,
+                min_score: Some(threshold),
+                filter: crate::Filter(vec![crate::memory::not_expired_predicate(
+                    crate::memory::now_ms(),
+                )]),
+                ..Default::default()
+            };
+            if let Some(hit) = db.search(name.as_str(), &vector, &opts)?.into_iter().next() {
+                // Merge onto the matched near-duplicate instead of inserting a
+                // competing entry (D6): new attrs win a key collision, and
+                // unsupplied keys survive.
+                target_id = hit.id;
+                deduped = true;
+                let mut merged = hit.attrs;
+                merged.extend(attrs.clone());
+                attrs = merged;
+            }
+        }
+        // Read `created_at` from the store, never from `attrs` — those are caller-supplied
+        // and would let a request forge its own birth date.
+        let prior_created = db.get(&name, &target_id).and_then(|existing| {
+            match existing.attrs.get(crate::memory::META_CREATED_AT) {
+                Some(crate::Value::DateTime(ts)) => Some(*ts),
+                _ => None,
+            }
+        });
+        crate::memory::stamp_recency(
+            &mut attrs,
+            crate::memory::now_ms(),
+            prior_created,
+            ttl_seconds,
+        );
+
+        let n = db.upsert(&name, &[Record::new(target_id.clone(), vector, attrs)])?;
+        Ok((n, target_id, deduped))
     })
     .await?;
-    Ok(Json(json!({ "ok": true, "upserted": n })))
+    // `id` and `deduped` are echoed because a dedupe match redirects the write to another
+    // entry: without them the caller cannot tell which record it just changed.
+    Ok(Json(
+        json!({ "ok": true, "upserted": n, "id": resolved_id, "deduped": deduped }),
+    ))
 }
 
 /// `POST /collections/{name}/recall` — query text in, ranked hits out. Embeds
