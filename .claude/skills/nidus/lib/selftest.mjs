@@ -195,6 +195,19 @@ test('miri: ignoring a localhost-mock round-trip is fine', () => {
   eq(ids(laws.miriIgnore(src, null, 'src/backend/s3.rs')), [], 'findings')
 })
 
+// Regression (nidus #92): the rule's own remedy is "say why in a comment", so a
+// documented ignore must stop warning — otherwise the check can never be resolved
+// and reads as ambient noise. Seven already-documented ignores were still firing.
+test('miri: a documented ignore is accepted', () => {
+  const src = '#[cfg_attr(miri, ignore)] // N=2000 build is too slow under Miri.\n#[test]\nfn hnsw_recall() {\n  assert!(recall > 0.9);\n}\n'
+  eq(ids(laws.miriIgnore(src, null, 'src/store/tests.rs')), [], 'findings')
+})
+
+test('miri: an empty trailing comment does not count as documentation', () => {
+  const src = '#[cfg_attr(miri, ignore)] //\n#[test]\nfn cosine_is_symmetric() {\n  assert_eq!(dot(&a, &b), dot(&b, &a));\n}\n'
+  eq(ids(laws.miriIgnore(src, null, 'src/search/mod.rs')), ['miri-ignore'], 'findings')
+})
+
 // ── feature gating ─────────────────────────────────────────────────────────
 
 test('gating: a library module importing tokio is an error', () => {

@@ -451,7 +451,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(miri, ignore)] // file-backed via open_tmp; also `memory` is off in the Miri lane.
     async fn first_write_pins_embedder_identity_and_dim() {
         let (_dir, mut db) = open_tmp(8);
         let emb = FakeEmbedder::new(8, "fake", "v1");
@@ -563,7 +563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(miri, ignore)] // file-backed via open_tmp; also `memory` is off in the Miri lane.
     async fn mismatched_embedder_is_refused() {
         let (_dir, mut db) = open_tmp(8);
         let emb_v1 = FakeEmbedder::new(8, "fake", "v1");
@@ -601,7 +601,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(miri, ignore)] // file-backed via open_tmp; also `memory` is off in the Miri lane.
     async fn recall_with_mismatched_embedder_is_refused() {
         let (_dir, mut db) = open_tmp(8);
         let emb_v1 = FakeEmbedder::new(8, "fake", "v1");
@@ -625,7 +625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(miri, ignore)] // file-backed via open_tmp; also `memory` is off in the Miri lane.
     async fn recall_defaults_top_k_when_zero() {
         let (_dir, mut db) = open_tmp(8);
         let emb = FakeEmbedder::new(8, "fake", "v1");
