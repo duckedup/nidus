@@ -170,8 +170,6 @@ pub(crate) fn default_fts_fields() -> Vec<FtsField> {
 }
 
 /// The current time as `Value::DateTime`'s representation: UTC epoch milliseconds.
-/// Callers land in a later unit of nidus-k28 (the `remember`/HTTP write paths).
-#[allow(dead_code)]
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -215,7 +213,6 @@ pub(crate) fn stamp_recency(
 /// The true-complement "not expired" predicate: true when `nidus.expires_at` is in the
 /// future *and* true when it is absent (never TTL'd). A bare `Gt`/`Ge` would be false on
 /// an absent key (`range_matches`), silently hiding every memory that never got a TTL.
-#[allow(dead_code)]
 pub(crate) fn not_expired_predicate(now_ms: i64) -> Predicate {
     Predicate::Not(Box::new(Predicate::Le(
         META_EXPIRES_AT.to_string(),
@@ -323,13 +320,17 @@ async fn recall_with<E: Embedder>(
         .embed_query(query_text)
         .await
         .with_context(|| format!("embedding recall query for '{collection}'"))?;
+    // Same TTL guard as every MCP read tool (D4/D5): AND-ed in, never replacing the
+    // caller's own predicates, so an expired entry cannot leak back into recall.
+    let mut filter = opts.filter.clone().unwrap_or_default();
+    filter.0.push(not_expired_predicate(now_ms()));
     let search_opts = SearchOpts {
         top_k: if opts.top_k == 0 {
             DEFAULT_TOP_K
         } else {
             opts.top_k
         },
-        filter: opts.filter.clone().unwrap_or_default(),
+        filter,
         min_score: (opts.min_score > 0.0).then_some(opts.min_score),
         // No `offset` on `RecallOpts` by design (nidus-m50.15): the memory API stays lean.
         ..Default::default()
@@ -653,5 +654,37 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(hits.len(), 3);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // file-backed via open_tmp; also `memory` is off in the Miri lane.
+    async fn recall_hides_expired_entries_and_keeps_untimed_ones() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        for (id, text) in [("kept", "durable note"), ("gone", "ephemeral note")] {
+            embed_and_store(&mut db, &emb, "notes", id, text, BTreeMap::new())
+                .await
+                .unwrap();
+        }
+        // Backdate one entry's expiry — recall must hide it from that moment on (#106).
+        let mut expired = db.get("notes", "gone").unwrap();
+        expired.attrs.insert(
+            META_EXPIRES_AT.to_string(),
+            Value::DateTime(now_ms() - 1_000),
+        );
+        db.upsert("notes", &[expired]).unwrap();
+
+        let hits = recall_with(&db, &emb, "notes", "durable note", &RecallOpts::default())
+            .await
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(
+            ids.contains(&"kept"),
+            "an entry with no expires_at must still surface (D5): {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"gone"),
+            "an expired entry must be hidden from recall: {ids:?}"
+        );
     }
 }

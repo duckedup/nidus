@@ -7,5 +7,7 @@ mod cluster;
 mod hardening;
 #[cfg(feature = "mcp")]
 mod mcp;
+#[cfg(feature = "mcp")]
+mod memory_http;
 mod scale;
 mod server;

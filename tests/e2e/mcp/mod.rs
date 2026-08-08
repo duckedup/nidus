@@ -9,7 +9,7 @@ mod hygiene;
 mod lifecycle;
 mod recency;
 mod stdio;
-mod support;
+pub(super) mod support;
 
 use serde_json::{Value, json};
 

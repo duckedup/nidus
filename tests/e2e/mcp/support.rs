@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 
 use crate::harness::Server;
 
-/// The dimension the mcp e2e suites use.
-pub(super) const DIM: usize = 3;
+/// The dimension the mcp e2e suites use (shared with `memory_http.rs`).
+pub(crate) const DIM: usize = 3;
 
 /// The per-text hash `src/memory.rs`'s inline `FakeEmbedder` uses: byte contributions spread
 /// across buckets, `+0.1` so an all-zero vector (unnormalizable by the store) never occurs.
@@ -127,7 +127,7 @@ pub(super) fn fixed_embedder_server(
 }
 
 /// A server with a [`mock_embedder_per_text`]-backed embedder, over a fresh store directory.
-pub(super) fn per_text_embedder_server(
+pub(crate) fn per_text_embedder_server(
     dir: &std::path::Path,
     dim: usize,
 ) -> crate::harness::RunningServer {

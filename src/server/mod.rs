@@ -1208,6 +1208,12 @@ async fn recall(
         .embed_query(&query)
         .await
         .map_err(anyhow::Error::new)?;
+    // Same TTL guard as every MCP read tool: AND-ed into the caller's filter so an
+    // expired memory is invisible here too, not just over MCP (#106).
+    let mut filter = filter;
+    filter
+        .0
+        .push(crate::memory::not_expired_predicate(crate::memory::now_ms()));
     let opts = SearchOpts {
         top_k,
         min_score,
@@ -3161,6 +3167,43 @@ mod memory_tests {
         let hits = json_body(resp).await;
         assert_eq!(hits[0]["id"], "a");
         assert_eq!(hits[0]["attrs"]["tag"]["Str"], "x");
+    }
+
+    /// `/recall` carries the same TTL guard as the MCP read tools (#106): an expired
+    /// entry is hidden, an entry that never got a TTL still surfaces (D5).
+    #[tokio::test]
+    async fn recall_hides_expired_entries_over_http() {
+        let app = router_with_mock_embedder().await;
+
+        for (id, ttl) in [("kept", json!(null)), ("gone", json!(0))] {
+            let resp = app
+                .clone()
+                .oneshot(post(
+                    "/collections/notes/remember",
+                    json!({"id": id, "text": "same text", "ttl_seconds": ttl}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let resp = app
+            .oneshot(post(
+                "/collections/notes/recall",
+                json!({"query": "same text", "top_k": 5}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        let ids: Vec<&str> = hits
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"kept"), "no-TTL entry must surface: {ids:?}");
+        assert!(!ids.contains(&"gone"), "expired entry leaked: {ids:?}");
     }
 
     /// A server started without an embedder rejects the memory routes with `400`
