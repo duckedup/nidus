@@ -42,6 +42,60 @@ from .values import AttrInput, DecodedValue
 
 
 @dataclass(frozen=True)
+class LegScore:
+    """One fusion leg's own view of a hit: its rank there (0-based) and its score there."""
+
+    rank: int
+    score: float
+
+
+@dataclass(frozen=True)
+class ClauseScore:
+    """One text clause's own BM25 contribution. Only clauses that matched are reported."""
+
+    field: str
+    score: float
+
+
+@dataclass(frozen=True)
+class Fragment:
+    """An excerpt of a field's stored text, plus the ranges within it that a term matched.
+
+    ``spans`` are ``(start, end)`` **byte** offsets into this fragment's ``text``, because
+    the server indexes Rust strings — so ``text.encode()[start:end]`` is the matched run,
+    while ``text[start:end]`` is only the same thing while the fragment stays ASCII. They
+    cover the *surface* form, so a stemmed match highlights "running" for the query "run".
+    """
+
+    text: str
+    spans: list[tuple[int, int]]
+
+
+@dataclass(frozen=True)
+class Highlight:
+    """The fragments found in one full-text field."""
+
+    field: str
+    fragments: list[Fragment]
+
+
+@dataclass(frozen=True)
+class Annotations:
+    """Why a hit matched, mirroring the server's ``Annotations``.
+
+    Every part is opt-in — ``explain=True`` for the scores, ``highlight=`` for the
+    fragments — and the server omits what was not asked for, so an absent part is an empty
+    list (or ``None``), never a zero score. ``vector``/``text`` are the two hybrid fusion
+    legs and stay ``None`` on a pure text search, which has only one leg to report.
+    """
+
+    vector: Optional[LegScore] = None
+    text: Optional[LegScore] = None
+    clauses: list[ClauseScore] = field(default_factory=list)
+    highlights: list[Highlight] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class Hit:
     """A search/list result row, with ``attrs`` decoded to plain Python values."""
 
@@ -49,6 +103,22 @@ class Hit:
     id: str
     score: float
     attrs: dict[str, DecodedValue] = field(default_factory=dict)
+    #: ``None`` unless the query asked to ``explain`` or to highlight; the server omits it.
+    annotations: Optional[Annotations] = None
+
+
+@dataclass(frozen=True)
+class Aggregation:
+    """The answer to :meth:`~nidus.NidusClient.aggregate`: a count plus one sum per field.
+
+    ``sums`` holds decoded plain values as ``attrs`` do, and the Python type carries the
+    server's own: a run of ``Int`` s sums to an ``int``, a run that met one ``Float`` sums
+    to a ``float``. Every requested field gets an entry — a missing or non-numeric value is
+    skipped rather than counted as zero, so a field nothing matched sums to ``0``.
+    """
+
+    count: int
+    sums: dict[str, DecodedValue] = field(default_factory=dict)
 
 
 #: What every search-family call returns. It has a name because both clients carry a
@@ -128,3 +198,74 @@ class RecordInput(_RecordRequired, total=False):
 
     vector: Sequence[float]
     attrs: Mapping[str, AttrInput]
+
+
+class _FtsFieldRequired(TypedDict):
+    """The one key every FTS field must carry (split out so the rest can be optional)."""
+
+    field: str
+
+
+class FtsField(_FtsFieldRequired, total=False):
+    """One entry of a :meth:`~nidus.NidusClient.set_fts_schema` schema: the attribute to
+    full-text index, plus any BM25 or analyzer knobs to override for it.
+
+    Every knob is optional and omitted when unset, so ``{"field": "body"}`` means exactly
+    what the bare string ``"body"`` means: the server's defaults (``k1 = 1.2``,
+    ``b = 0.75``, US English, no ASCII folding, no token-length cap).
+    """
+
+    k1: float
+    b: float
+    language: str
+    ascii_folding: bool
+    max_token_len: int
+
+
+class FtsClause(TypedDict):
+    """One clause of a multi-field text query: an indexed field and *its own* query text.
+
+    Both keys are required, and the text key is ``query`` in every clause — including
+    :meth:`~nidus.NidusClient.hybrid_search`, whose single-field spelling calls it ``text``.
+    """
+
+    field: str
+    query: str
+
+
+class HighlightOpts(TypedDict, total=False):
+    """How much text a highlight carries. ``{}`` (or ``True``) takes the server's defaults.
+
+    ``fragment_chars`` is a **character** budget per fragment, cut on char boundaries.
+    """
+
+    max_fragments: int
+    fragment_chars: int
+
+
+class LimitPer(TypedDict):
+    """Cap how many hits may carry any one value of an attribute — "2 hits per file".
+
+    Records *missing* the attribute form one shared group, so an absent value cannot bypass
+    the cap. Both keys are required; ``max`` must be at least 1.
+    """
+
+    field: str
+    max: int
+
+
+class _OrderByRequired(TypedDict):
+    """The one key every ``order_by`` must carry (split out so ``descending`` can default)."""
+
+    field: str
+
+
+class OrderBy(_OrderByRequired, total=False):
+    """Sort a :meth:`~nidus.NidusClient.list` by an attribute instead of storage order.
+
+    ``descending`` defaults to ascending. Values of a different type than the first
+    orderable one, unorderable values (``Null``/list/``nan``), and records missing the
+    attribute sort into one trailing bucket, which stays trailing in either direction.
+    """
+
+    descending: bool

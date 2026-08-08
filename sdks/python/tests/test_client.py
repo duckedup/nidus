@@ -28,11 +28,12 @@ import json
 import socket
 import sys
 from collections.abc import Iterator, Sequence
+from datetime import timedelta
 from typing import Any, Callable, NamedTuple
 
 import pytest
 
-from nidus import NidusClient, NidusError, f, v
+from nidus import NidusClient, NidusError, f, rank, v
 
 # Canned response payloads, one per shape the client has to decode. Kept beside the
 # endpoint table below so a row and its response read together.
@@ -165,6 +166,7 @@ ENDPOINTS: list[tuple[str, Callable[[NidusClient], Any], str, str, Any]] = [
         [],
     ),
     ("list", lambda db: db.list(), "POST", "/list", []),
+    ("aggregate", lambda db: db.aggregate(), "POST", "/aggregate", {"count": 0, "sums": {}}),
     (
         "remember",
         lambda db: db.remember("notes", "a", "hello"),
@@ -321,6 +323,105 @@ def test_search_sends_snake_case_and_decodes_hit_attrs() -> None:
     assert len(hits) == 1
     assert hits[0].id == "a"
     assert hits[0].attrs == {"lang": "rust"}
+
+
+def test_a_multi_clause_text_search_reaches_the_wire_with_its_combine_rule() -> None:
+    """The clause spelling, asserted on the bytes: one text per field, plus how they fold."""
+    stub = StubTransport([])
+    client(stub).text_search(
+        clauses=[{"field": "title", "query": "rust"}, {"field": "body", "query": "async"}],
+        combine="Max",
+        explain=True,
+        highlight={"max_fragments": 2},
+    )
+    assert stub.last.json == {
+        "clauses": [
+            {"field": "title", "query": "rust"},
+            {"field": "body", "query": "async"},
+        ],
+        "combine": "Max",
+        "scope": [],
+        "filter": [],
+        "explain": True,
+        "highlight": {"max_fragments": 2},
+    }
+
+
+def test_the_ranking_knobs_reach_the_wire() -> None:
+    """``rank_by``/``limit_per``/``order_by``/the hybrid weights, in the server's spelling."""
+    stub = StubTransport([])
+    db = client(stub)
+    db.search(
+        query=[1.0],
+        rank_by=rank.decay("updated_at", 1700000000000, scale=timedelta(days=7)),
+        limit_per={"field": "path", "max": 2},
+    )
+    assert stub.last.json["rank_by"] == {
+        "Decay": {"field": "updated_at", "origin": 1700000000000, "scale": 604800000}
+    }
+    assert stub.last.json["limit_per"] == {"field": "path", "max": 2}
+    db.list(order_by={"field": "updated_at", "descending": True})
+    assert stub.last.json["order_by"] == {"field": "updated_at", "descending": True}
+    db.hybrid_search(vector=[1.0], field="body", text="fox", vector_weight=2.0, text_weight=0.5)
+    assert stub.last.json["vector_weight"] == 2.0
+    assert stub.last.json["text_weight"] == 0.5
+
+
+def test_a_search_refuses_a_query_it_cannot_spell_unambiguously() -> None:
+    """Both text spellings at once, or an empty clause list, never reach the server."""
+    stub = StubTransport([])
+    db = client(stub)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        db.text_search(field="body", query="fox", clauses=[{"field": "t", "query": "x"}])
+    with pytest.raises(ValueError, match="must not be empty"):
+        db.hybrid_search(vector=[1.0], clauses=[])
+    assert stub.calls == []
+
+
+def test_annotations_decode_onto_the_hit_that_carries_them() -> None:
+    """``explain``/``highlight`` answer on the hit itself, and stay ``None`` when unasked."""
+    stub = StubTransport(
+        [
+            {
+                "collection": "docs",
+                "id": "a",
+                "score": 1.5,
+                "attrs": {},
+                "annotations": {
+                    "clauses": [{"field": "body", "score": 1.5}],
+                    "highlights": [
+                        {
+                            "field": "body",
+                            "fragments": [{"text": "a quick fox", "spans": [[8, 11]]}],
+                        }
+                    ],
+                },
+            },
+            {"collection": "docs", "id": "b", "score": 0.5, "attrs": {}},
+        ]
+    )
+    hits = client(stub).text_search(field="body", query="fox", explain=True, highlight=True)
+    assert stub.last.json["highlight"] == {}
+    assert hits[0].annotations is not None
+    assert hits[0].annotations.clauses[0].field == "body"
+    assert hits[0].annotations.highlights[0].fragments[0].spans == [(8, 11)]
+    assert hits[1].annotations is None
+
+
+def test_aggregate_sends_its_scope_and_sums_and_decodes_the_answer() -> None:
+    """A count plus one decoded sum per field — ``Int`` as ``int``, ``Float`` as ``float``."""
+    stub = StubTransport({"count": 3, "sums": {"bytes": {"Int": 4096}, "cost": {"Float": 1.5}}})
+    out = client(stub).aggregate(
+        scope=["docs"], filter=[f.eq("lang", "rust")], sum=["bytes", "cost"]
+    )
+    assert stub.last.json == {
+        "scope": ["docs"],
+        "filter": [{"Eq": ["lang", {"Str": "rust"}]}],
+        "sum": ["bytes", "cost"],
+    }
+    assert out.count == 3
+    assert out.sums == {"bytes": 4096, "cost": 1.5}
+    assert isinstance(out.sums["bytes"], int)
 
 
 def test_set_meta_sends_the_map_as_the_whole_body() -> None:

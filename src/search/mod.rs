@@ -267,49 +267,58 @@ impl Ord for OrdF32 {
 }
 
 // ── Entry stored in the min-heap ──────────────────────────────────────────────
-// `BinaryHeap` is a max-heap, so the ordering is reversed here: the smallest score sits at the top
-// and is the first candidate for eviction.
+// `BinaryHeap` is a max-heap, so the ordering is reversed here: the *worst*-ranked entry sits at
+// the top and is the first candidate for eviction.
 
 struct Entry<T> {
     score: OrdF32,
     item: T,
 }
 
-impl<T> PartialEq for Entry<T> {
+impl<T: Ord> PartialEq for Entry<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.score == other.score
+        self.cmp(other) == Ordering::Equal
     }
 }
 
-impl<T> Eq for Entry<T> {}
+impl<T: Ord> Eq for Entry<T> {}
 
-impl<T> PartialOrd for Entry<T> {
+impl<T: Ord> PartialOrd for Entry<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<T> Ord for Entry<T> {
+impl<T: Ord> Ord for Entry<T> {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse the score ordering: smallest score → largest in this Ord →
-        // floats to the top of BinaryHeap (which is a max-heap).
-        other.score.cmp(&self.score)
+        // Reversed rank order (worst first), so BinaryHeap's max is the eviction candidate:
+        // lower score is worse, and among equal scores the *larger* item ranks worse.
+        other
+            .score
+            .cmp(&self.score)
+            .then_with(|| self.item.cmp(&other.item))
     }
 }
 
-/// A bounded collector that retains the `k` highest-scoring items seen, in O(N log k)
-/// using a min-heap keyed by score. Ties may be broken arbitrarily.
+/// A bounded collector that retains the `k` highest-ranked items seen, in O(N log k) using a
+/// min-heap. Rank is the **total order** `(score desc, item asc)` — the tie-break is what makes
+/// a page boundary reproducible, so it is a contract (SPEC §7), not an implementation detail.
 pub struct TopK<T> {
     k: usize,
     heap: BinaryHeap<Entry<T>>,
 }
 
-impl<T> TopK<T> {
+/// Ceiling on [`TopK::new`]'s *up-front* reservation. The heap still grows on demand, so
+/// any `k` a store could plausibly fill behaves identically; this only stops an absurd
+/// caller-supplied `k` from aborting the process on "capacity overflow" (nidus-m50.17).
+const TOPK_RESERVE_CAP: usize = 8192;
+
+impl<T: Ord> TopK<T> {
     /// A collector that keeps the top `k` items.
     pub fn new(k: usize) -> Self {
         TopK {
             k,
-            heap: BinaryHeap::with_capacity(k.saturating_add(1)),
+            heap: BinaryHeap::with_capacity(k.saturating_add(1).min(TOPK_RESERVE_CAP)),
         }
     }
 
@@ -326,10 +335,15 @@ impl<T> TopK<T> {
                 item,
             });
         } else if let Some(worst) = self.heap.peek() {
-            // Heap is full. Replace the worst (smallest-score) entry if the new
-            // score is strictly better. Using total_cmp: NaN < everything finite,
-            // so NaN scores are never preferred over real results.
-            if ord_score > worst.score {
+            // Heap is full: displace the worst entry only if the candidate outranks it under the
+            // total order. On a tie the smaller item wins, so which of two equal-scoring docs
+            // survives does not depend on the order the scan happened to visit them in.
+            let better = match ord_score.cmp(&worst.score) {
+                Ordering::Greater => true,
+                Ordering::Equal => item < worst.item,
+                Ordering::Less => false,
+            };
+            if better {
                 self.heap.pop();
                 self.heap.push(Entry {
                     score: ord_score,
@@ -339,12 +353,11 @@ impl<T> TopK<T> {
         }
     }
 
-    /// Consume the collector, returning the kept items sorted by score descending.
+    /// Consume the collector, returning the kept items in rank order: score descending,
+    /// ties broken by `item` ascending. NaN sorts last (it is the lowest possible score).
     pub fn into_sorted_desc(self) -> Vec<(f32, T)> {
-        // Drain the heap into a Vec, then sort descending.
         let mut v: Vec<(f32, T)> = self.heap.into_iter().map(|e| (e.score.0, e.item)).collect();
-        // Sort highest first; NaN treated as lowest (sorted to end).
-        v.sort_by_key(|&(s, _)| std::cmp::Reverse(OrdF32(s)));
+        v.sort_by(|a, b| OrdF32(b.0).cmp(&OrdF32(a.0)).then_with(|| a.1.cmp(&b.1)));
         v
     }
 }
@@ -531,6 +544,28 @@ mod tests {
 
     // ── TopK ──────────────────────────────────────────────────────────────────
 
+    /// `with_capacity(k + 1)` on an unclamped `k` aborted the process on "capacity
+    /// overflow" (nidus-m50.17). The reservation is a hint; the heap still grows on demand.
+    #[test]
+    fn topk_survives_an_absurd_k() {
+        let mut tk: TopK<i32> = TopK::new(usize::MAX / 2);
+        tk.offer(1.0, 42);
+        tk.offer(2.0, 99);
+        assert_eq!(tk.into_sorted_desc(), vec![(2.0, 99), (1.0, 42)]);
+    }
+
+    /// A `k` past the reservation ceiling still *keeps* that many items — the clamp bounds
+    /// the up-front allocation only, never the result set.
+    #[test]
+    fn topk_keeps_more_than_it_reserves() {
+        let n = TOPK_RESERVE_CAP + 10;
+        let mut tk: TopK<usize> = TopK::new(n);
+        for i in 0..n {
+            tk.offer(i as f32, i);
+        }
+        assert_eq!(tk.into_sorted_desc().len(), n);
+    }
+
     #[test]
     fn topk_k_zero_keeps_nothing() {
         let mut tk: TopK<i32> = TopK::new(0);
@@ -700,6 +735,33 @@ mod tests {
             !rows.contains(&2),
             "row 2 (orthogonal) should not be in top-2"
         );
+    }
+
+    /// Pagination needs a *total* order. Keyed on score alone, which of two tied items
+    /// survived the heap depended on the order the scan happened to visit them in — so the
+    /// same document could land on two pages, or on none (nidus-m50.8).
+    #[test]
+    fn topk_tie_break_is_independent_of_offer_order() {
+        for order in [["b", "a", "c"], ["c", "b", "a"], ["a", "c", "b"]] {
+            let mut tk: TopK<&str> = TopK::new(2);
+            for item in order {
+                tk.offer(0.5, item);
+            }
+            let kept: Vec<&str> = tk.into_sorted_desc().into_iter().map(|(_, i)| i).collect();
+            assert_eq!(kept, vec!["a", "b"], "offered {order:?}");
+        }
+    }
+
+    /// The store's item is `(collection, id)`, so this is the `(score desc, collection, id)`
+    /// contract SPEC §7 states.
+    #[test]
+    fn topk_sorts_equal_scores_by_item_ascending() {
+        let mut tk: TopK<(&str, &str)> = TopK::new(4);
+        for item in [("z", "1"), ("a", "9"), ("a", "2")] {
+            tk.offer(1.0, item);
+        }
+        let kept: Vec<_> = tk.into_sorted_desc().into_iter().map(|(_, i)| i).collect();
+        assert_eq!(kept, vec![("a", "2"), ("a", "9"), ("z", "1")]);
     }
 
     #[test]

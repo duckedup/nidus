@@ -42,14 +42,33 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from urllib.parse import quote
 
 from . import _guards
 from .errors import NidusError
 from .filter import Filter
-from .types import AnnInfo, Footprint, Hit, Record, RecordInput, Stats
-from .values import AttrInput, Value, decode_attrs, encode_attrs
+from .ranking import RankBy
+from .types import (
+    Aggregation,
+    AnnInfo,
+    Annotations,
+    ClauseScore,
+    Footprint,
+    Fragment,
+    FtsClause,
+    FtsField,
+    Highlight,
+    HighlightOpts,
+    Hit,
+    LegScore,
+    LimitPer,
+    OrderBy,
+    Record,
+    RecordInput,
+    Stats,
+)
+from .values import AttrInput, Value, decode_attrs, decode_value, encode_attrs
 
 # ── Paths ────────────────────────────────────────────────────────────────────────────
 #
@@ -65,6 +84,7 @@ SEARCH = "/search"
 TEXT_SEARCH = "/text-search"
 HYBRID_SEARCH = "/hybrid-search"
 LIST = "/list"
+AGGREGATE = "/aggregate"
 FLUSH = "/flush"
 COMPACT = "/compact"
 
@@ -173,80 +193,159 @@ def delete_where_body(filter: Filter) -> dict[str, Any]:  # noqa: A002
     return {"filter": list(filter)}
 
 
-def fts_schema_body(fields: Sequence[str]) -> dict[str, Any]:
-    return {"fields": _guards.str_sequence(fields, "set_fts_schema(name, fields)")}
+#: The knobs an :class:`~nidus.FtsField` may carry, in the order the server documents them.
+_FTS_FIELD_KNOBS = ("k1", "b", "language", "ascii_folding", "max_token_len")
+
+
+def fts_schema_body(fields: Sequence[Union[str, FtsField]]) -> dict[str, Any]:
+    """Body for the FTS schema. A bare name and a knob-less mapping mean the same thing.
+
+    An unknown key is a ``TypeError`` rather than a silently dropped one: the server
+    ignores what it does not recognise, so a misspelled ``asciiFolding`` would otherwise
+    index the field with folding off and report success.
+    """
+    _guards.reject_bare_string(fields, "set_fts_schema(name, fields)")
+    return {"fields": [_fts_field(f) for f in fields]}
+
+
+def _fts_field(spec: Union[str, FtsField]) -> Union[str, dict[str, Any]]:
+    if isinstance(spec, str):
+        return spec
+    if not isinstance(spec, Mapping) or "field" not in spec:
+        raise TypeError(
+            "set_fts_schema(name, fields) expects each field to be a name or a mapping "
+            f"with a 'field' key, got {spec!r}"
+        )
+    # As a plain Mapping: a TypedDict cannot be indexed by a variable key.
+    knobs: Mapping[str, Any] = spec
+    unknown = set(knobs) - {"field", *_FTS_FIELD_KNOBS}
+    if unknown:
+        raise TypeError(
+            f"set_fts_schema(name, fields): unknown key(s) {sorted(unknown)} — "
+            f"expected any of {sorted(_FTS_FIELD_KNOBS)}"
+        )
+    body: dict[str, Any] = {"field": str(knobs["field"])}
+    body.update({k: knobs[k] for k in _FTS_FIELD_KNOBS if k in knobs})
+    return body
 
 
 def search_body(
     query: Sequence[float],
     scope: Optional[Sequence[str]] = None,
     top_k: Optional[int] = None,
+    offset: Optional[int] = None,
     min_score: Optional[float] = None,
     filter: Optional[Filter] = None,  # noqa: A002
+    exact: Optional[bool] = None,
+    include_attributes: Optional[Sequence[str]] = None,
+    exclude_attributes: Optional[Sequence[str]] = None,
+    rank_by: Optional[RankBy] = None,
+    limit_per: Optional[LimitPer] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /search`` (vector nearest-neighbour).
 
     ``scope`` and ``filter`` are always sent, as ``[]`` when unset — an empty scope means
     "every collection" and an empty filter means "match everything", so the empty array is
-    the real value, not a missing one. ``top_k``/``min_score`` are pruned when unset.
+    the real value, not a missing one. Every other knob is pruned when unset, so an omitted
+    ``offset`` (or projection, or ranking expression) is byte-identical to the request
+    before it existed.
     """
     return prune(
         {
             "query": _guards.float_sequence(query, "search(query=...)"),
             "scope": _scope(scope),
             "top_k": top_k,
+            "offset": offset,
             "min_score": min_score,
             "filter": list(filter) if filter is not None else [],
+            "exact": exact,
+            **_projection(include_attributes, exclude_attributes),
+            "rank_by": rank_by,
+            "limit_per": _limit_per(limit_per),
         }
     )
 
 
 def text_search_body(
-    field: str,
-    query: str,
+    field: Optional[str] = None,
+    query: Optional[str] = None,
     scope: Optional[Sequence[str]] = None,
     top_k: Optional[int] = None,
+    offset: Optional[int] = None,
     min_score: Optional[float] = None,
     filter: Optional[Filter] = None,  # noqa: A002
+    clauses: Optional[Sequence[FtsClause]] = None,
+    combine: Optional[str] = None,
+    explain: Optional[bool] = None,
+    highlight: Optional[Union[bool, HighlightOpts]] = None,
+    include_attributes: Optional[Sequence[str]] = None,
+    exclude_attributes: Optional[Sequence[str]] = None,
+    rank_by: Optional[RankBy] = None,
+    limit_per: Optional[LimitPer] = None,
 ) -> dict[str, Any]:
-    """Body for ``POST /text-search`` (BM25). ``min_score`` here is a raw BM25 floor."""
+    """Body for ``POST /text-search`` (BM25). ``min_score`` here is a raw BM25 floor.
+
+    The query is named either as ``field`` + ``query`` or as a ``clauses`` list, never both
+    — see :func:`_fts_query`. A single-field call is sent in exactly the spelling it always
+    was.
+    """
     return prune(
         {
-            "field": field,
-            "query": query,
+            **_fts_query("text_search", field, query, clauses, text_key="query"),
+            "combine": combine,
             "scope": _scope(scope),
             "top_k": top_k,
+            "offset": offset,
             "min_score": min_score,
             "filter": list(filter) if filter is not None else [],
+            "explain": explain,
+            "highlight": _highlight(highlight),
+            **_projection(include_attributes, exclude_attributes),
+            "rank_by": rank_by,
+            "limit_per": _limit_per(limit_per),
         }
     )
 
 
 def hybrid_search_body(
     vector: Sequence[float],
-    field: str,
-    text: str,
+    field: Optional[str] = None,
+    text: Optional[str] = None,
     scope: Optional[Sequence[str]] = None,
     top_k: Optional[int] = None,
+    offset: Optional[int] = None,
     filter: Optional[Filter] = None,  # noqa: A002
     rrf_k: Optional[float] = None,
     candidates: Optional[int] = None,
+    clauses: Optional[Sequence[FtsClause]] = None,
+    combine: Optional[str] = None,
+    explain: Optional[bool] = None,
+    highlight: Optional[Union[bool, HighlightOpts]] = None,
+    vector_weight: Optional[float] = None,
+    text_weight: Optional[float] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /hybrid-search`` (vector + BM25 fused via RRF).
 
     Note there is no ``min_score``: the score is a fused RRF rank, not a similarity, so
-    the server offers no floor for it.
+    the server offers no floor for it. ``offset`` pages the *fused* ranking. The text leg
+    takes the same two spellings as ``/text-search``, except that its single-field text is
+    called ``text``; a clause's is ``query`` on both routes.
     """
     return prune(
         {
             "vector": _guards.float_sequence(vector, "hybrid_search(vector=...)"),
-            "field": field,
-            "text": text,
+            **_fts_query("hybrid_search", field, text, clauses, text_key="text"),
+            "combine": combine,
             "scope": _scope(scope),
             "top_k": top_k,
+            "offset": offset,
             "filter": list(filter) if filter is not None else [],
             "rrf_k": rrf_k,
             "candidates": candidates,
+            "explain": explain,
+            "highlight": _highlight(highlight),
+            "vector_weight": vector_weight,
+            "text_weight": text_weight,
         }
     )
 
@@ -256,6 +355,9 @@ def list_body(
     offset: Optional[int] = None,
     limit: Optional[int] = None,
     filter: Optional[Filter] = None,  # noqa: A002
+    include_attributes: Optional[Sequence[str]] = None,
+    exclude_attributes: Optional[Sequence[str]] = None,
+    order_by: Optional[OrderBy] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /list`` (metadata-only, paginated)."""
     return prune(
@@ -264,6 +366,27 @@ def list_body(
             "offset": offset,
             "limit": limit,
             "filter": list(filter) if filter is not None else [],
+            **_projection(include_attributes, exclude_attributes),
+            "order_by": _order_by(order_by),
+        }
+    )
+
+
+def aggregate_body(
+    scope: Optional[Sequence[str]] = None,
+    filter: Optional[Filter] = None,  # noqa: A002
+    sum: Optional[Sequence[str]] = None,  # noqa: A002
+) -> dict[str, Any]:
+    """Body for ``POST /aggregate`` (count, plus one sum per named attribute).
+
+    ``sum`` is pruned when unset, which is the same request as ``[]``: a count of everything
+    the filter matched.
+    """
+    return prune(
+        {
+            "scope": _scope(scope),
+            "filter": list(filter) if filter is not None else [],
+            "sum": None if sum is None else _guards.str_sequence(sum, "aggregate(sum=...)"),
         }
     )
 
@@ -352,9 +475,43 @@ def decode_hits(payload: Any) -> list[Hit]:
             id=str(h["id"]),
             score=float(h["score"]),
             attrs=decode_attrs(_attrs_of(h)),
+            annotations=decode_annotations(h.get("annotations")),
         )
         for h in payload or ()
     ]
+
+
+def decode_annotations(payload: Any) -> Optional[Annotations]:
+    """Decode a hit's ``annotations``, or ``None`` when the query asked for none.
+
+    Absent is the default and the common case — the server omits the whole object unless
+    ``explain`` or ``highlight`` was requested — so anything that is not an object decodes
+    to ``None`` rather than to an :class:`~nidus.Annotations` full of empties.
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    return Annotations(
+        vector=_leg_score(payload.get("vector")),
+        text=_leg_score(payload.get("text")),
+        clauses=[_clause_score(c) for c in payload.get("clauses") or ()],
+        highlights=[_highlight_of(h) for h in payload.get("highlights") or ()],
+    )
+
+
+def decode_aggregation(payload: Any) -> Aggregation:
+    """Decode ``POST /aggregate``, with each sum decoded to a plain Python number.
+
+    Like :func:`decode_stats` this cannot fall back to an empty value — a count of nothing
+    and "no answer" are different facts — so a body that is not an object is reported as
+    the malformed response it is, under the status-``0`` "never got an answer" sentinel.
+    """
+    if not isinstance(payload, Mapping):
+        raise NidusError(f"/aggregate returned no JSON object (got {payload!r})", 0)
+    sums = payload.get("sums") or {}
+    return Aggregation(
+        count=int(payload["count"]),
+        sums={str(k): decode_value(val) for k, val in sums.items()},
+    )
 
 
 def decode_records(payload: Any) -> list[Record]:
@@ -525,9 +682,134 @@ def _scope(scope: Optional[Sequence[str]]) -> list[str]:
     return [] if scope is None else _guards.str_sequence(scope, "scope")
 
 
+def _fts_query(
+    who: str,
+    field: Optional[str],
+    text: Optional[str],
+    clauses: Optional[Sequence[FtsClause]],
+    *,
+    text_key: str,
+) -> dict[str, Any]:
+    """The keys naming a text query, from whichever of the two spellings the caller used.
+
+    Both spellings at once, neither, half of the single one, or an empty clause list are all
+    refused here rather than sent. The server refuses them too — and must, since it also
+    answers other clients — but an empty result would otherwise read as "no matches" when it
+    means "no query", and failing here names the argument at the call site.
+    """
+    if clauses is not None:
+        if field is not None or text is not None:
+            raise ValueError(
+                f"{who}: field/{text_key} and clauses are mutually exclusive; send one form"
+            )
+        _guards.reject_bare_string(clauses, f"{who}(clauses=...)")
+        if not clauses:
+            raise ValueError(f"{who}: clauses must not be empty — an empty query matches nothing")
+        return {"clauses": [_spec(c, f"{who}(clauses=...)", ("field", "query")) for c in clauses]}
+    if field is None and text is None:
+        raise ValueError(f"{who} needs a field plus its {text_key}, or a clauses list")
+    if field is None or text is None:
+        raise ValueError(f"{who}: field and {text_key} must be sent together")
+    return {"field": field, text_key: text}
+
+
+def _highlight(highlight: Optional[Union[bool, HighlightOpts]]) -> Optional[dict[str, Any]]:
+    """``highlight=`` as it goes on the wire; ``True`` (like ``{}``) takes the defaults.
+
+    ``None`` and ``False`` both mean no highlighting and omit the key, so a response is
+    byte-identical to one from before highlighting existed unless it was asked for.
+    """
+    if highlight is None:
+        return None
+    if isinstance(highlight, bool):
+        return {} if highlight else None
+    return _spec(highlight, "highlight", (), ("max_fragments", "fragment_chars"))
+
+
+def _limit_per(limit_per: Optional[LimitPer]) -> Optional[dict[str, Any]]:
+    return None if limit_per is None else _spec(limit_per, "limit_per", ("field", "max"))
+
+
+def _order_by(order_by: Optional[OrderBy]) -> Optional[dict[str, Any]]:
+    return None if order_by is None else _spec(order_by, "order_by", ("field",), ("descending",))
+
+
+def _spec(
+    spec: Any, who: str, required: tuple[str, ...], optional: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    """One small option mapping, checked key by key and rebuilt as a plain ``dict``.
+
+    An unknown key is refused rather than dropped for the same reason a misspelled FTS knob
+    is: serde ignores what it does not recognise, so ``{"field": "ts", "desc": True}`` would
+    sort ascending and report success. An absent optional key is left out, so the server's
+    own default applies.
+    """
+    if not isinstance(spec, Mapping):
+        raise TypeError(f"{who} expects a mapping with key(s) {list(required)}, got {spec!r}")
+    # As a plain Mapping: a TypedDict cannot be indexed by a variable key.
+    keys: Mapping[str, Any] = spec
+    # Unknown before missing: a misspelling shows up as both, and naming the key that *is*
+    # there ("unknown key 'maximum'") points at the fix, where "missing 'max'" only hints.
+    unknown = sorted(set(keys) - {*required, *optional})
+    if unknown:
+        raise TypeError(
+            f"{who}: unknown key(s) {unknown} — expected any of {sorted((*required, *optional))}"
+        )
+    missing = [k for k in required if k not in keys]
+    if missing:
+        raise TypeError(f"{who} is missing required key(s) {missing}")
+    return {k: keys[k] for k in (*required, *optional) if k in keys}
+
+
+def _projection(
+    include: Optional[Sequence[str]], exclude: Optional[Sequence[str]]
+) -> dict[str, Any]:
+    """The projection keys, unset (``None``) unless asked for — pruned by the caller.
+
+    Both at once is refused here rather than sent, so the mistake names the argument
+    instead of arriving as a 400 from the server.
+    """
+    if include is not None and exclude is not None:
+        raise ValueError("include_attributes and exclude_attributes are mutually exclusive")
+    return {
+        "include_attributes": (
+            None if include is None else _guards.str_sequence(include, "include_attributes")
+        ),
+        "exclude_attributes": (
+            None if exclude is None else _guards.str_sequence(exclude, "exclude_attributes")
+        ),
+    }
+
+
 def _count(payload: Any, key: str) -> int:
     """Pull a write endpoint's count out of its response body."""
     return int((payload or {}).get(key, 0))
+
+
+def _leg_score(payload: Any) -> Optional[LegScore]:
+    """One fusion leg's ``{"rank": …, "score": …}``; absent when that leg missed the hit."""
+    if not isinstance(payload, Mapping):
+        return None
+    return LegScore(rank=int(payload["rank"]), score=float(payload["score"]))
+
+
+def _clause_score(payload: Mapping[str, Any]) -> ClauseScore:
+    return ClauseScore(field=str(payload["field"]), score=float(payload["score"]))
+
+
+def _highlight_of(payload: Mapping[str, Any]) -> Highlight:
+    return Highlight(
+        field=str(payload["field"]),
+        fragments=[_fragment(fr) for fr in payload.get("fragments") or ()],
+    )
+
+
+def _fragment(payload: Mapping[str, Any]) -> Fragment:
+    """One excerpt; its spans become tuples, which is what a fixed-arity pair should be."""
+    return Fragment(
+        text=str(payload["text"]),
+        spans=[(int(span[0]), int(span[1])) for span in payload.get("spans") or ()],
+    )
 
 
 def _attrs_of(payload: Mapping[str, Any]) -> Mapping[str, Value]:

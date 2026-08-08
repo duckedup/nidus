@@ -1,6 +1,6 @@
 """Tests for the ``Value`` codec — the file where Python's type system fights the wire.
 
-Three of these tests exist because of a language quirk rather than a design choice, and
+Four of these tests exist because of a language quirk rather than a design choice, and
 each one guards a bug that would ship *silently*:
 
 * ``bool`` is a subclass of ``int``, so a reversed ``isinstance`` order turns every boolean
@@ -9,8 +9,11 @@ each one guards a bug that would ship *silently*:
   ``values.py``, so it gets its own named test rather than a line inside a round-trip.
 * Python integers are unbounded and the store's ``Int`` is an ``i64``, so the ceiling has
   to be enforced client-side or a caller learns about it as a puzzling 400.
-* There is no float attribute type at all, so a ``float`` must fail loudly here instead of
-  being truncated somewhere downstream.
+* ``Int`` and ``Float`` are distinct server types compared same-type-only, so the rule that
+  ``2`` is one and ``2.0`` is the other has to hold exactly; a value-based rule would give
+  one attribute two types and a range filter would quietly skip half the records.
+* A naive ``datetime`` names a wall clock, not an instant. Guessing UTC (or local) for one
+  shifts it by hours in valid-looking JSON, so it is refused rather than interpreted.
 
 The round-trip test covers every variant including the odd one out — ``Null`` is the bare
 JSON string ``"Null"``, not an object — and the unknown-tag test pins the forward-
@@ -23,6 +26,8 @@ No network, no server, no fixtures: this is pure function-in/value-out.
 from __future__ import annotations
 
 import json
+from datetime import date, datetime, timedelta, timezone
+from typing import cast
 
 import pytest
 
@@ -49,6 +54,12 @@ from nidus import (
         (False, {"Bool": False}),
         (["a", "b"], {"List": ["a", "b"]}),
         ([], {"List": []}),
+        (1.5, {"Float": 1.5}),
+        (2.0, {"Float": 2.0}),
+        (
+            datetime(2023, 11, 14, 22, 13, 20, tzinfo=timezone.utc),
+            {"DateTime": 1700000000000},
+        ),
         (None, "Null"),
     ],
 )
@@ -96,16 +107,73 @@ def test_v_int_refuses_a_bool() -> None:
         v.int(True)
 
 
-def test_float_is_rejected_at_encode_time() -> None:
-    """There is no float attribute type; a float fails here, not silently downstream."""
-    with pytest.raises(TypeError, match="no float attribute type"):
-        encode_value(1.5)
-    # A float that happens to be integral is rejected too: accepting 2.0 and refusing 2.5
-    # would make the rule depend on the value rather than the type.
-    with pytest.raises(TypeError, match="no float attribute type"):
-        encode_value(2.0)
+def test_the_python_type_decides_int_versus_float() -> None:
+    """``2`` is an ``Int`` and ``2.0`` is a ``Float``, whatever the value happens to be.
+
+    The rule is the *type*, not the number: deciding from the value would make one
+    attribute an ``Int`` in the records where it landed on a round number and a ``Float``
+    everywhere else, and the server compares same-type only.
+    """
+    assert encode_value(2) == {"Int": 2}
+    assert encode_value(2.0) == {"Float": 2.0}
+    assert encode_value(1.5) == {"Float": 1.5}
+    assert encode_value(-0.0) == {"Float": -0.0}
+    # The explicit constructors say the same thing, and `v.float` takes an int so a
+    # whole-numbered measurement can still be written as a Float.
+    assert v.int(2) == {"Int": 2}
+    assert v.float(2) == {"Float": 2.0}
+    assert v.float(2.5) == {"Float": 2.5}
     with pytest.raises(TypeError):
         v.int(1.5)
+    with pytest.raises(TypeError):
+        v.float(True)
+
+
+def test_a_non_finite_float_is_rejected() -> None:
+    """``json.dumps`` writes ``NaN``/``Infinity``, which is not JSON and which serde refuses."""
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="finite"):
+            encode_value(bad)
+        with pytest.raises(ValueError, match="finite"):
+            v.float(bad)
+
+
+def test_datetime_encodes_as_epoch_milliseconds_in_utc() -> None:
+    """An instant, not a wall clock: the same moment in any zone is the same number."""
+    utc = datetime(2023, 11, 14, 22, 13, 20, tzinfo=timezone.utc)
+    tokyo = utc.astimezone(timezone(timedelta(hours=9)))
+    assert encode_value(utc) == {"DateTime": 1700000000000}
+    assert encode_value(tokyo) == encode_value(utc)
+    assert v.datetime(utc) == {"DateTime": 1700000000000}
+    # The raw millisecond form is accepted too, for a caller who already holds one.
+    assert v.datetime(1700000000000) == {"DateTime": 1700000000000}
+    # Sub-millisecond precision is truncated: milliseconds is the wire type.
+    assert encode_value(utc.replace(microsecond=999)) == {"DateTime": 1700000000000}
+    # Before the epoch is an ordinary negative count, not an error.
+    assert encode_value(datetime(1969, 12, 31, 23, 59, 59, tzinfo=timezone.utc)) == {
+        "DateTime": -1000
+    }
+
+
+def test_a_naive_datetime_is_rejected() -> None:
+    """Refused rather than assumed to be UTC — the wrong guess is off by hours, silently."""
+    with pytest.raises(ValueError, match="aware datetime"):
+        encode_value(datetime(2023, 11, 14, 22, 13, 20))
+    with pytest.raises(ValueError, match="aware datetime"):
+        v.datetime(datetime(2023, 11, 14))
+    # A `date` has no time at all, so it is not a DateTime either — just an unknown type.
+    with pytest.raises(TypeError, match="date"):
+        encode_value(date(2023, 11, 14))  # type: ignore[arg-type]
+
+
+def test_datetime_round_trips_back_to_an_aware_datetime() -> None:
+    """Decoding to an ``int`` would demote every instant to an ``Int`` on re-encode."""
+    utc = datetime(2023, 11, 14, 22, 13, 20, 123000, tzinfo=timezone.utc)
+    wire = encode_value(utc)
+    back = decode_value(wire)
+    assert back == utc
+    assert isinstance(back, datetime) and back.tzinfo is timezone.utc
+    assert encode_value(cast(AttrInput, back)) == wire
 
 
 def test_non_integer_types_are_rejected() -> None:
@@ -185,6 +253,8 @@ def test_v_constructors_match_the_wire_shape() -> None:
     assert v.int(2024) == {"Int": 2024}
     assert v.bool(True) == {"Bool": True}
     assert v.list(["a", "b"]) == {"List": ["a", "b"]}
+    assert v.float(1.5) == {"Float": 1.5}
+    assert v.datetime(1700000000000) == {"DateTime": 1700000000000}
     assert v.nil() == "Null"
     # A tuple is accepted and copied to a list, since JSON has no tuple.
     assert v.list(("a", "b")) == {"List": ["a", "b"]}
@@ -208,6 +278,8 @@ def test_attrs_maps_round_trip_as_a_whole() -> None:
         "year": 2024,
         "draft": False,
         "tags": ["a", "b"],
+        "score": 0.75,
+        "seen": datetime(2023, 11, 14, 22, 13, 20, tzinfo=timezone.utc),
         "note": None,
     }
     wire = encode_attrs(plain)
@@ -216,6 +288,8 @@ def test_attrs_maps_round_trip_as_a_whole() -> None:
         "year": {"Int": 2024},
         "draft": {"Bool": False},
         "tags": {"List": ["a", "b"]},
+        "score": {"Float": 0.75},
+        "seen": {"DateTime": 1700000000000},
         "note": "Null",
     }
     assert decode_attrs(wire) == plain

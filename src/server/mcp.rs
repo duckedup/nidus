@@ -104,6 +104,19 @@ fn optional_usize(args: &Map<String, JsonValue>, key: &str) -> Result<Option<usi
     }
 }
 
+/// `top_k`, defaulted and bounded by [`super::dto::MAX_TOP_K`], so an absurd value is a
+/// tool-argument error here rather than an allocation the store has to survive.
+fn optional_top_k(args: &Map<String, JsonValue>) -> Result<usize, McpError> {
+    let k = optional_usize(args, "top_k")?.unwrap_or_else(super::dto::default_top_k);
+    if k > super::dto::MAX_TOP_K {
+        return Err(McpError::invalid_params(
+            format!("`top_k` must not exceed {}", super::dto::MAX_TOP_K),
+            None,
+        ));
+    }
+    Ok(k)
+}
+
 /// An optional float argument.
 fn optional_f32(args: &Map<String, JsonValue>, key: &str) -> Result<Option<f32>, McpError> {
     match args.get(key) {
@@ -391,7 +404,7 @@ impl NidusMcp {
         let embedder = self.embedder()?;
         let collection = required_str(args, "collection")?;
         let query = required_str(args, "query")?;
-        let top_k = optional_usize(args, "top_k")?;
+        let top_k = optional_top_k(args)?;
         let min_score = optional_f32(args, "min_score")?;
 
         let vector = embedder
@@ -400,7 +413,7 @@ impl NidusMcp {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let opts = crate::SearchOpts {
-            top_k: top_k.unwrap_or_else(super::dto::default_top_k),
+            top_k,
             min_score,
             ..Default::default()
         };
@@ -420,11 +433,11 @@ impl NidusMcp {
         let collection = required_str(args, "collection")?;
         let field = required_str(args, "field")?;
         let query = required_str(args, "query")?;
-        let top_k = optional_usize(args, "top_k")?;
+        let top_k = optional_top_k(args)?;
 
         let hits = super::run_read(self.state.clone(), move |db| {
             let opts = crate::SearchOpts {
-                top_k: top_k.unwrap_or_else(super::dto::default_top_k),
+                top_k,
                 ..Default::default()
             };
             let q = crate::FtsQuery::new(field, query);
@@ -444,7 +457,7 @@ impl NidusMcp {
         let collection = required_str(args, "collection")?;
         let field = required_str(args, "field")?;
         let query = required_str(args, "query")?;
-        let top_k = optional_usize(args, "top_k")?;
+        let top_k = optional_top_k(args)?;
 
         // The one divergence from `POST /hybrid-search`, which takes a caller-supplied
         // `vector`: embedding the query text gives the same fusion from an argument a model
@@ -458,7 +471,7 @@ impl NidusMcp {
             // `rrf_k`/`candidates` stay default: fusion knobs mean nothing to a model, so
             // exposing them adds ways to get worse results and none to get better ones.
             let opts = crate::HybridOpts {
-                top_k: top_k.unwrap_or_else(super::dto::default_top_k),
+                top_k,
                 ..Default::default()
             };
             let q = crate::FtsQuery::new(field, query);

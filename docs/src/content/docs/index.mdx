@@ -49,7 +49,7 @@ let hits = memory.recall("notes", "how do users sign in?", &RecallOpts {
   <article class="feature" data-reveal style="--reveal-delay:0.04s">
     <span class="twig" aria-hidden="true">❧</span>
     <h3>Search by similarity, filter as you go</h3>
-    <p>Hand nidus a query and get the closest records back, ranked with scores — exact by default (100% recall at the scale it targets) by cosine, dot, or Euclidean, or an approximate index (HNSW/IVF) and int8/binary quantization when you want more speed. Store typed metadata beside every vector and narrow results before they score: equality, ranges, globs, sets, negation.</p>
+    <p>Hand nidus a query and get the closest records back, ranked with scores — exact by default (100% recall at the scale it targets) by cosine, dot, or Euclidean, or an approximate index (HNSW/IVF) and int8/binary quantization when you want more speed. Store typed metadata beside every vector and narrow results before they score: equality, ranges, globs, sets, list containment, fuzzy and regex text matching, and boolean composition over all of them.</p>
   </article>
   <article class="feature" data-reveal style="--reveal-delay:0.08s">
     <span class="twig" aria-hidden="true">❧</span>

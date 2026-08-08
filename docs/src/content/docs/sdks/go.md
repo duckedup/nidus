@@ -63,10 +63,15 @@ proxy, TLS, retries, instrumentation); `WithHeader` adds a header sent on every 
 
 ## Upserting and searching
 
-Attributes are typed: `nidus.Str`, `nidus.Int`, `nidus.Bool`, `nidus.List`,
-`nidus.Null`. There is deliberately no float attribute — floats belong in the vector —
-so the constructors keep an unstorable attribute unrepresentable instead of turning it
-into a `400` at request time.
+Attributes are typed: `nidus.Str`, `nidus.Int`, `nidus.Float`, `nidus.Bool`,
+`nidus.List`, `nidus.DateTime`, `nidus.Null`. The constructors keep an unstorable
+attribute unrepresentable instead of turning it into a `400` at request time.
+
+Go decides `Int` vs `Float` from the **static type**, so `2.0` (a `float64`) is a
+`Float` and `2` is an `Int`. That matters because comparisons are same-type only: a
+`Float` range filter never matches a record whose value was stored as an `Int`.
+`nidus.DateTime` takes a `time.Time` and travels as UTC epoch milliseconds
+(`DateTimeMillis` if you already hold the number).
 
 ```go
 ctx := context.Background()
@@ -162,6 +167,12 @@ carried the filter. `Predicate.Err()` and `Filter.Err()` check it earlier.
 
 ```go
 err := db.SetFtsSchema(ctx, "docs", []string{"body"})
+
+// …or tune BM25 / the analyzer per field. Unset knobs take the server's defaults.
+k1, folding := float32(1.5), true
+err = db.SetFtsFields(ctx, "docs", []nidus.FtsField{
+    {Field: "body", K1: &k1, AsciiFolding: &folding},
+})
 
 // BM25 text search — scores are raw BM25, not comparable across queries
 text, err := db.TextSearch(ctx, nidus.TextSearchRequest{

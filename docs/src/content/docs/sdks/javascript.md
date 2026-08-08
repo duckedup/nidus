@@ -99,6 +99,12 @@ Predicates: `eq`, `ne`, `glob`, `iglob`, `in`, `notIn`, `lt`, `le`, `gt`, `ge`.
 ```ts
 await db.setFtsSchema("docs", ["body"]);
 
+// …or tune BM25 / the analyzer per field; an omitted knob keeps the server default
+await db.setFtsSchema("docs", [
+  "title",
+  { field: "body", k1: 1.5, asciiFolding: true },
+]);
+
 // BM25 text search
 const text = await db.textSearch({ field: "body", query: "vector store", topK: 10 });
 

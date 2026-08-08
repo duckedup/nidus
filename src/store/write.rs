@@ -10,7 +10,7 @@ use super::{Collection, DocEntry, Store, oom};
 use crate::backend::CasOutcome;
 use crate::config::{Fsync, OpenMode};
 use crate::filter;
-use crate::fts::Language;
+use crate::fts::FtsField;
 use crate::manifest::MANIFEST_KEY;
 use crate::model::{Distance, Filter, Op, Record, Value};
 use crate::search::normalize;
@@ -204,17 +204,16 @@ impl Store {
     /// Declare `collection`'s full-text-indexed fields, then build the field indexes from its
     /// live docs. Settable any time; `create_collection_with_fts` shares this code so a fresh
     /// collection indexes from its first upsert. Redeclaring rebuilds the affected indexes.
-    pub fn set_fts_schema(
-        &mut self,
-        collection: &str,
-        fields: &[(String, Language)],
-    ) -> Result<()> {
+    pub fn set_fts_schema(&mut self, collection: &str, fields: &[FtsField]) -> Result<()> {
         self.check_writable()?;
+        // Validate before the log append: an unusable k1/b persisted here would be replayed
+        // on every subsequent open.
+        crate::fts::validate(fields)?;
         // Implicitly create the collection if absent (matches set_meta / replay leniency).
         self.collections
             .entry(collection.to_string())
             .or_insert_with(Collection::new);
-        self.log.append(&Op::SetFtsSchema {
+        self.log.append(&Op::SetFtsFields {
             collection: collection.to_string(),
             fields: fields.to_vec(),
         })?;
@@ -235,11 +234,7 @@ impl Store {
 
     /// Create `collection` (idempotent) and declare its full-text fields up front. The
     /// recommended FTS path: indexing is fully incremental from the first upsert.
-    pub fn create_collection_with_fts(
-        &mut self,
-        name: &str,
-        fields: &[(String, Language)],
-    ) -> Result<()> {
+    pub fn create_collection_with_fts(&mut self, name: &str, fields: &[FtsField]) -> Result<()> {
         self.create_collection(name)?;
         self.set_fts_schema(name, fields)
     }
@@ -621,7 +616,7 @@ impl Store {
 
             // Re-emit the FTS schema so a post-compact replay restores it.
             if let Some(fields) = self.fts.schema_for(col_name) {
-                log_ops.push(Op::SetFtsSchema {
+                log_ops.push(Op::SetFtsFields {
                     collection: col_name.clone(),
                     fields: fields.to_vec(),
                 });

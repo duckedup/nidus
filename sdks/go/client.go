@@ -310,12 +310,28 @@ func (c *Client) Records(ctx context.Context, name string) ([]Record, error) {
 // SetFtsSchema declares which attribute fields are full-text indexed, which is what
 // makes [Client.TextSearch] and [Client.HybridSearch] able to see them. Fields already
 // written are indexed as part of applying the schema.
+//
+// Every field takes the server's BM25 and analyzer defaults. Use
+// [Client.SetFtsFields] to tune k1, b, or the analyzer per field.
 func (c *Client) SetFtsSchema(ctx context.Context, name string, fields []string) error {
 	if fields == nil {
 		fields = []string{}
 	}
 	body := struct {
 		Fields []string `json:"fields"`
+	}{fields}
+	return c.request(ctx, http.MethodPost, collPath(name, "/fts-schema"), body, nil)
+}
+
+// SetFtsFields is [Client.SetFtsSchema] with per-field BM25 and analyzer tuning. It
+// hits the same endpoint: the server accepts a bare field name or a field object, and
+// an [FtsField] whose knobs are all unset encodes to the same defaults.
+func (c *Client) SetFtsFields(ctx context.Context, name string, fields []FtsField) error {
+	if fields == nil {
+		fields = []FtsField{}
+	}
+	body := struct {
+		Fields []FtsField `json:"fields"`
 	}{fields}
 	return c.request(ctx, http.MethodPost, collPath(name, "/fts-schema"), body, nil)
 }
@@ -327,7 +343,8 @@ func (c *Client) SetFtsSchema(ctx context.Context, name string, fields []string)
 // An empty [SearchRequest.Scope] searches every collection and merges the results into
 // one ranking — sound because a store has a single embedding space. Leave TopK zero to
 // take the server's default rather than asking for zero results; see the note in
-// types.go on the omit-vs-zero trap.
+// types.go on the omit-vs-zero trap. Offset skips that many top-ranked hits, so
+// successive pages tile the ranking; Offset+TopK may not exceed 10000.
 func (c *Client) Search(ctx context.Context, req SearchRequest) ([]Hit, error) {
 	return c.hits(ctx, "/search", req)
 }
@@ -348,9 +365,23 @@ func (c *Client) HybridSearch(ctx context.Context, req HybridSearchRequest) ([]H
 }
 
 // List returns records by metadata alone — no query vector — paginated by Offset and
-// Limit. Hit.Score is not meaningful here; there is nothing being scored.
+// Limit, in storage order unless ListRequest.OrderBy says otherwise. Hit.Score is not
+// meaningful here; there is nothing being scored.
 func (c *Client) List(ctx context.Context, req ListRequest) ([]Hit, error) {
 	return c.hits(ctx, "/list", req)
+}
+
+// Aggregate counts the records a filter matches and sums the attributes named in
+// AggregateRequest.Sum. It is answered from the server's in-RAM index alone — no
+// record is materialized and no vector is read — so it stays cheap over a whole store.
+//
+// The zero request counts every record in every collection.
+func (c *Client) Aggregate(ctx context.Context, req AggregateRequest) (*Aggregation, error) {
+	var out Aggregation
+	if err := c.request(ctx, http.MethodPost, "/aggregate", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // ── Memory (text in, text out) ──────────────────────────────────────────────

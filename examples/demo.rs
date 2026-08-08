@@ -82,6 +82,7 @@ fn main() -> anyhow::Result<()> {
         top_k: 5,
         filter: nidus::Filter(vec![Predicate::Glob("path".into(), "src/auth/*".into())]),
         min_score: Some(0.5),
+        ..Default::default()
     };
     print_hits(
         "search(Scope::All) WHERE path GLOB 'src/auth/*' AND score>=0.5:",

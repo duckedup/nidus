@@ -13,9 +13,9 @@
 // "does the server treat a zero as a real value":
 //
 //   - TopK, Limit and Offset are plain ints. Asking for zero results is not a thing
-//     anyone means, so letting 0 stand for "unset" loses nothing — and sending
-//     "top_k": 0 would be the silent empty-result bug this whole scheme exists to
-//     prevent.
+//     anyone means, and a zero Offset is the server's own default, so letting 0 stand
+//     for "unset" loses nothing — and sending "top_k": 0 would be the silent
+//     empty-result bug this whole scheme exists to prevent.
 //   - MinScore, RRFK and Candidates are pointers, because for all three the server's
 //     zero is meaningful: a score floor of exactly 0; an RRF constant of 0 (the
 //     server fuses with 1/(rrf_k + rank + 1), src/store/read.rs, so 0 is the
@@ -37,6 +37,11 @@
 // into the body alongside the options.
 
 package nidus
+
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // A Record is a document: a caller-supplied id, an optional embedding, and typed
 // metadata.
@@ -62,11 +67,83 @@ type Record struct {
 //
 // Attrs keeps typed [Value]s rather than plain Go values — see the note on [Attrs]
 // for why, and call Attrs.Decode() for the loose map.
+//
+// Annotations is nil unless the query asked for Explain or Highlight, which is the
+// common case: the server omits the key entirely, so an unannotated response decodes
+// exactly as it always did.
 type Hit struct {
-	Collection string  `json:"collection"`
-	ID         string  `json:"id"`
-	Score      float32 `json:"score"`
-	Attrs      Attrs   `json:"attrs"`
+	Collection  string       `json:"collection"`
+	ID          string       `json:"id"`
+	Score       float32      `json:"score"`
+	Attrs       Attrs        `json:"attrs"`
+	Annotations *Annotations `json:"annotations,omitempty"`
+}
+
+// Annotations is why a hit matched: each fusion leg's own view of it, each BM25
+// clause's contribution, and highlighted fragments of the stored text.
+//
+// Every part is opt-in and independent, so a field being empty means "not asked for or
+// not applicable" rather than "zero". Vector and Text are nil outside a hybrid search,
+// which is the only query with two legs to compare.
+type Annotations struct {
+	Vector     *LegScore     `json:"vector,omitempty"`
+	Text       *LegScore     `json:"text,omitempty"`
+	Clauses    []ClauseScore `json:"clauses,omitempty"`
+	Highlights []Highlight   `json:"highlights,omitempty"`
+}
+
+// A LegScore is one fusion leg's view of a document: where it ranked within that leg
+// (0-based) and what the leg scored it, before fusion flattened the two into one number.
+type LegScore struct {
+	Rank  int     `json:"rank"`
+	Score float32 `json:"score"`
+}
+
+// A ClauseScore is one text clause's own BM25 contribution. Only clauses that actually
+// matched are reported, so a hit's Clauses may be shorter than the query's.
+type ClauseScore struct {
+	Field string  `json:"field"`
+	Score float32 `json:"score"`
+}
+
+// A Highlight is the fragments found in one full-text field.
+type Highlight struct {
+	Field     string     `json:"field"`
+	Fragments []Fragment `json:"fragments"`
+}
+
+// A Fragment is an excerpt of a field's stored text plus the ranges within it that a
+// query term matched. The ranges cover the surface form, so a stemmed match ("running"
+// for the query "run") highlights the word as the document spells it.
+type Fragment struct {
+	Text  string `json:"text"`
+	Spans []Span `json:"spans"`
+}
+
+// A Span is one matched range, in bytes from the start of the [Fragment.Text] it came
+// from — so frag.Text[s.Start:s.End] is the matched word, no conversion needed. It
+// travels as a two-element array, which is why it marshals by hand.
+type Span struct {
+	Start int
+	End   int
+}
+
+// MarshalJSON writes the [start, end] pair the server uses.
+func (s Span) MarshalJSON() ([]byte, error) { return json.Marshal([2]int{s.Start, s.End}) }
+
+// UnmarshalJSON reads the [start, end] pair. It decodes through a slice and checks the
+// length itself, because decoding into a [2]int would silently pad a one-element span
+// with a zero and drop anything past the second — both of which highlight the wrong text.
+func (s *Span) UnmarshalJSON(b []byte) error {
+	var pair []int
+	if err := json.Unmarshal(b, &pair); err != nil {
+		return fmt.Errorf("nidus: highlight span is not a [start, end] pair: %w", err)
+	}
+	if len(pair) != 2 {
+		return fmt.Errorf("nidus: highlight span has %d elements, want [start, end]", len(pair))
+	}
+	s.Start, s.End = pair[0], pair[1]
+	return nil
 }
 
 // A Footprint is the store's on-disk and in-RAM size, mirroring FootprintDto.
@@ -113,47 +190,210 @@ type Stats struct {
 	Footprint   Footprint `json:"footprint"`
 }
 
+// A RankBy is a ranking expression layered over the store's distance metric, and a
+// tagged union on the wire with exactly one variant today. Build it with [DecayRank];
+// a RankBy naming no variant is an encode error rather than a 400 from the server.
+type RankBy struct {
+	Decay *Decay `json:"Decay,omitempty"`
+}
+
+// DecayRank ranks by [Decay] — the only ranking expression the server has.
+func DecayRank(d Decay) *RankBy { return &RankBy{Decay: &d} }
+
+// MarshalJSON refuses an empty RankBy, which would otherwise travel as {} and come back
+// as a serde message about an unknown variant.
+func (r RankBy) MarshalJSON() ([]byte, error) {
+	if r.Decay == nil {
+		return nil, fmt.Errorf("nidus: RankBy names no ranking expression; build it with DecayRank")
+	}
+	return json.Marshal(map[string]*Decay{"Decay": r.Decay})
+}
+
+// A Decay is a recency penalty over a timestamp attribute:
+//
+//	score = base - Lambda * (1 - Decay^(age/Scale))
+//
+// Age is measured back from Origin, never from the wall clock, so the same query
+// against an unchanged store ranks the same way twice. The penalty is subtracted rather
+// than multiplied, which keeps it meaningful for the metrics whose scores are negative
+// or unbounded (Euclidean, DotProduct, BM25).
+//
+// Scale and Decay are plain values because the server rejects a zero for either (Scale
+// must be positive, Decay must be in (0, 1)), so 0 can safely mean "take the default" —
+// a week, and a factor of 0.5, which together make Scale a half-life. Lambda and Missing
+// are pointers because their zeros are real requests: Lambda &0 applies no penalty at
+// all, and Missing &0 fully penalizes a record whose timestamp is absent or unusable
+// (the default, 1.0, penalizes it not at all).
+type Decay struct {
+	// The timestamp attribute — a DateTime or an Int, epoch milliseconds.
+	Field string `json:"field"`
+	// "Now", in epoch milliseconds. Required: there is no server-side default.
+	Origin int64 `json:"origin"`
+	// The age in milliseconds at which the factor equals Decay.
+	Scale int64 `json:"scale,omitempty"`
+	// The factor reached at exactly Scale old.
+	Decay float32 `json:"decay,omitempty"`
+	// How much score a fully-decayed hit gives up.
+	Lambda *float32 `json:"lambda,omitempty"`
+	// The factor for a record whose Field is missing or not a timestamp.
+	Missing *float32 `json:"missing,omitempty"`
+}
+
+// A LimitPer caps how many hits may carry any one value of an attribute — "at most two
+// hits per file". Records missing the attribute form one shared group, so an absent
+// value cannot bypass the cap. Max must be at least 1.
+type LimitPer struct {
+	Field string `json:"field"`
+	Max   int    `json:"max"`
+}
+
+// An OrderBy sorts a [Client.List] by an attribute instead of storage order. Values of a
+// different type than the first orderable one, unorderable values (Null, List, NaN), and
+// records missing the attribute sort into one trailing bucket, either direction.
+type OrderBy struct {
+	Field      string `json:"field"`
+	Descending bool   `json:"descending,omitempty"`
+}
+
 // A SearchRequest is a vector (cosine) nearest-neighbour query. An empty Scope
 // searches every collection, merged into one ranking — sound because all
 // collections share one embedding space.
+// Exact forces the exact brute-force scan for this one query, bypassing any ANN index
+// and the quantized first pass — a guaranteed-exact answer without giving up the index
+// for every other query. IncludeAttributes/ExcludeAttributes project the returned attrs;
+// see [Projection]. RankBy and LimitPer reshape the ranking after scoring; see [Decay]
+// and [LimitPer].
 type SearchRequest struct {
 	Query    []float32 `json:"query"`
 	Scope    []string  `json:"scope,omitempty"`
 	TopK     int       `json:"top_k,omitempty"`     // 0 takes the server's default
+	Offset   int       `json:"offset,omitempty"`    // skip this many top-ranked hits
 	MinScore *float32  `json:"min_score,omitempty"` // nil is "no floor"; &0 is a floor of zero
 	Filter   Filter    `json:"filter,omitempty"`
+	Exact    bool      `json:"exact,omitempty"`
+	RankBy   *RankBy   `json:"rank_by,omitempty"`
+	LimitPer *LimitPer `json:"limit_per,omitempty"`
+	Projection
 }
 
-// A TextSearchRequest is a BM25 full-text query over one indexed field. MinScore is
-// a raw BM25 floor, not a cosine one — BM25 scores are unbounded above and not
-// comparable across queries, so a floor that works for one query may drop
-// everything for another.
+// A Projection selects which attrs the returned hits carry. Leave both nil for every attr
+// — the default, and what every pre-projection request already sends.
+//
+// Setting both is a 400 from the server rather than a precedence rule, so pick one. Both
+// are embedded (not flattened by a tag Go does not have) into SearchRequest and
+// ListRequest, which is why the fields land at the top level of the JSON body.
+type Projection struct {
+	// Return only these attrs. A named attr the record lacks is simply absent.
+	IncludeAttributes []string `json:"include_attributes,omitempty"`
+	// Return every attr but these.
+	ExcludeAttributes []string `json:"exclude_attributes,omitempty"`
+}
+
+// An FtsField is one entry of a [Client.SetFtsFields] schema: the attribute to
+// full-text index, plus the BM25 and analyzer knobs to override for it.
+//
+// Every knob is a pointer for the omit-vs-zero reason described at the top of this
+// file: the server's zero is meaningful for all four. K1 &0 saturates term frequency
+// immediately, B &0 disables length normalization, and AsciiFolding &false is the
+// default spelled out. Leave one nil to take the server's default (k1 = 1.2,
+// b = 0.75, US English, no folding, no token-length cap).
+type FtsField struct {
+	Field        string   `json:"field"`
+	K1           *float32 `json:"k1,omitempty"`
+	B            *float32 `json:"b,omitempty"`
+	Language     string   `json:"language,omitempty"`
+	AsciiFolding *bool    `json:"ascii_folding,omitempty"`
+	MaxTokenLen  *int     `json:"max_token_len,omitempty"`
+}
+
+// An FtsClause is one clause of a multi-field text query: an indexed field and the raw
+// query text for it, so title:"rust" plus body:"async runtime" is a single query.
+type FtsClause struct {
+	Field string `json:"field"`
+	Query string `json:"query"`
+}
+
+// How several [FtsClause]s fold into one text score, for the Combine field of a text or
+// hybrid request. CombineSum is the server's default, so leaving Combine empty is it.
+const (
+	// Add every matched clause's BM25 score: a doc hit on title *and* body outranks one
+	// hit on either alone.
+	CombineSum = "Sum"
+	// Take the strongest matched clause, so a long body cannot out-accumulate a precise
+	// title match.
+	CombineMax = "Max"
+)
+
+// HighlightOpts asks for excerpts of the matched text and sizes them. A zero value is
+// the request for the server's defaults — one fragment of 160 characters — so
+// &HighlightOpts{} is "highlight, and don't tell me how".
+//
+// FragmentChars is a character budget, cut on codepoint boundaries; the spans it comes
+// back with are byte offsets (see [Span]). Highlighting reads the stored text, so it
+// still works on a field a [Projection] dropped from the returned attrs.
+type HighlightOpts struct {
+	MaxFragments  int `json:"max_fragments,omitempty"`
+	FragmentChars int `json:"fragment_chars,omitempty"`
+}
+
+// A TextSearchRequest is a BM25 full-text query. MinScore is a raw BM25 floor, not a
+// cosine one — BM25 scores are unbounded above and not comparable across queries, so a
+// floor that works for one query may drop everything for another.
+//
+// Name the fields one of two ways and never both: Field plus Query for a single field,
+// or Clauses for several, each with its own text, folded by Combine. Sending both, or
+// neither, or an empty Clauses list is a 400 rather than an empty result — a client bug
+// there would otherwise read as "the corpus has no matches".
+//
+// Explain reports each matched clause's own BM25 score on every hit, and Highlight
+// returns excerpts; both land in [Hit.Annotations].
 type TextSearchRequest struct {
-	Field    string   `json:"field"`
-	Query    string   `json:"query"`
-	Scope    []string `json:"scope,omitempty"`
-	TopK     int      `json:"top_k,omitempty"`
-	MinScore *float32 `json:"min_score,omitempty"`
-	Filter   Filter   `json:"filter,omitempty"`
+	Field     string         `json:"field,omitempty"`
+	Query     string         `json:"query,omitempty"`
+	Clauses   []FtsClause    `json:"clauses,omitempty"`
+	Combine   string         `json:"combine,omitempty"` // CombineSum (default) or CombineMax
+	Scope     []string       `json:"scope,omitempty"`
+	TopK      int            `json:"top_k,omitempty"`
+	Offset    int            `json:"offset,omitempty"`
+	MinScore  *float32       `json:"min_score,omitempty"`
+	Filter    Filter         `json:"filter,omitempty"`
+	Explain   bool           `json:"explain,omitempty"`
+	Highlight *HighlightOpts `json:"highlight,omitempty"`
+	RankBy    *RankBy        `json:"rank_by,omitempty"`
+	LimitPer  *LimitPer      `json:"limit_per,omitempty"`
+	Projection
 }
 
 // A HybridSearchRequest fuses a vector query and a BM25 text query with reciprocal
-// rank fusion.
+// rank fusion. The text leg takes the same Field+Text / Clauses choice, and the same
+// Explain and Highlight knobs, as a [TextSearchRequest] — note the field is Text here,
+// not Query, matching the wire.
 //
 // RRFK is the RRF constant (higher flattens the weight of the top ranks) and
-// Candidates is how deep each leg goes before fusing. Both are pointers because a
-// zero is a legal, meaningful request for each — RRFK &0 is the maximally top-heavy
-// fusion, Candidates &0 fuses exactly TopK deep — so nil, not zero, is how you ask
-// for the server's default (60.0 and 100).
+// Candidates is how deep each leg goes before fusing. VectorWeight and TextWeight scale
+// each leg's contribution to the fused score, both defaulting to 1.0 — which reproduces
+// the unweighted fusion exactly.
+//
+// All four are pointers because a zero is a legal, meaningful request for each: RRFK &0
+// is the maximally top-heavy fusion, Candidates &0 fuses exactly TopK deep, and a weight
+// of &0 drops that leg's contribution entirely. nil, not zero, is how you ask for the
+// server's default (60.0, 100, 1.0 and 1.0).
 type HybridSearchRequest struct {
-	Vector     []float32 `json:"vector"`
-	Field      string    `json:"field"`
-	Text       string    `json:"text"`
-	Scope      []string  `json:"scope,omitempty"`
-	TopK       int       `json:"top_k,omitempty"`
-	Filter     Filter    `json:"filter,omitempty"`
-	RRFK       *float32  `json:"rrf_k,omitempty"`
-	Candidates *int      `json:"candidates,omitempty"`
+	Vector       []float32      `json:"vector"`
+	Field        string         `json:"field,omitempty"`
+	Text         string         `json:"text,omitempty"`
+	Clauses      []FtsClause    `json:"clauses,omitempty"`
+	Combine      string         `json:"combine,omitempty"`
+	Scope        []string       `json:"scope,omitempty"`
+	TopK         int            `json:"top_k,omitempty"`
+	Offset       int            `json:"offset,omitempty"`
+	Filter       Filter         `json:"filter,omitempty"`
+	RRFK         *float32       `json:"rrf_k,omitempty"`
+	Candidates   *int           `json:"candidates,omitempty"`
+	Explain      bool           `json:"explain,omitempty"`
+	Highlight    *HighlightOpts `json:"highlight,omitempty"`
+	VectorWeight *float32       `json:"vector_weight,omitempty"`
+	TextWeight   *float32       `json:"text_weight,omitempty"`
 }
 
 // A ListRequest is a metadata-only query: no vector, paginated, filter-driven.
@@ -162,10 +402,32 @@ type HybridSearchRequest struct {
 // omitting a zero Offset changes nothing — but Limit's default is 100, so a zero
 // Limit must be omitted rather than sent, exactly like TopK.
 type ListRequest struct {
+	Scope   []string `json:"scope,omitempty"`
+	Offset  int      `json:"offset,omitempty"`
+	Limit   int      `json:"limit,omitempty"`
+	Filter  Filter   `json:"filter,omitempty"`
+	OrderBy *OrderBy `json:"order_by,omitempty"` // nil keeps storage order
+	Projection
+}
+
+// An AggregateRequest counts the records a filter matches and sums the named
+// attributes. An empty Scope aggregates over every collection, and an empty Filter
+// matches every record — so the zero value is "how many records are there".
+type AggregateRequest struct {
 	Scope  []string `json:"scope,omitempty"`
-	Offset int      `json:"offset,omitempty"`
-	Limit  int      `json:"limit,omitempty"`
 	Filter Filter   `json:"filter,omitempty"`
+	Sum    []string `json:"sum,omitempty"`
+}
+
+// An Aggregation is the answer to an [AggregateRequest].
+//
+// Each sum stays a tagged [Value] rather than becoming a float: it is an Int while
+// every addend was an Int, and a Float otherwise, so a byte count does not come back
+// having quietly lost precision to float64. Sums has one entry per requested field
+// either way: a field with no numeric value anywhere sums to Int(0), not to nothing.
+type Aggregation struct {
+	Count uint64 `json:"count"`
+	Sums  Attrs  `json:"sums"`
 }
 
 // RememberOptions tunes a text-native ingest: the server embeds the text and upserts

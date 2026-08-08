@@ -20,6 +20,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestValueRoundTripEveryKind pins the externally-tagged wire form of every variant
@@ -43,6 +44,14 @@ func TestValueRoundTripEveryKind(t *testing.T) {
 		{"BoolFalse", Bool(false), `{"Bool":false}`},
 		{"List", List("a", "b"), `{"List":["a","b"]}`},
 		{"ListEmpty", List(), `{"List":[]}`},
+		{"Float", Float(1.5), `{"Float":1.5}`},
+		{"FloatNegativeZero", Float(math.Copysign(0, -1)), `{"Float":-0}`},
+		// encoding/json writes an integral float64 without a fractional part, and serde
+		// reads a bare 2 into an f64 — so the tag, not the digits, carries the type.
+		{"FloatIntegral", Float(2), `{"Float":2}`},
+		{"DateTime", DateTimeMillis(1700000000000), `{"DateTime":1700000000000}`},
+		{"DateTimeEpoch", DateTimeMillis(0), `{"DateTime":0}`},
+		{"DateTimeBeforeEpoch", DateTimeMillis(-1), `{"DateTime":-1}`},
 	}
 
 	for _, tc := range cases {
@@ -183,8 +192,8 @@ func TestValueIntegerValuedFloatDecodesAsInt(t *testing.T) {
 }
 
 // TestValueFractionalIntRejected — 2024.5 is an error, never a truncation to 2024.
-// There is no float attribute type, so dropping the fraction would be silent data
-// loss on the way in.
+// A fractional number is a Float attribute, so a server that sent one under the Int
+// tag is disagreeing with this SDK about a type; dropping the fraction would hide it.
 func TestValueFractionalIntRejected(t *testing.T) {
 	for _, lit := range []string{`{"Int":2024.5}`, `{"Int":-0.5}`, `{"Int":1e-3}`} {
 		var v Value
@@ -211,21 +220,109 @@ func TestValueIntOverflowRejected(t *testing.T) {
 	}
 }
 
-// TestValueOfRejectsFloats — floats belong in the vector. Note that an
-// integer-valued float64 is rejected too: on the way *in* the caller's type says
-// float, and honouring it would establish an attribute type the store does not have.
-// (Contrast TestValueIntegerValuedFloatDecodesAsInt, where a JSON number's type is
-// genuinely ambiguous and there is no caller intent to respect.)
-func TestValueOfRejectsFloats(t *testing.T) {
-	for _, x := range []any{float32(1.5), float64(2.5), float32(2024), float64(2024)} {
+// TestValueOfSplitsIntFromFloatByStaticType — the rule Go gets to state precisely,
+// because it has the types JS lacks: float64(2024) is a Float even though it is
+// integral, and int64(2024) is an Int even though a Float could hold it. Nothing is
+// inferred from the *value*, so a numeric attribute's type is stable across records.
+func TestValueOfSplitsIntFromFloatByStaticType(t *testing.T) {
+	for _, x := range []any{float32(2024), float64(2024), float32(1.5), float64(2.5)} {
+		got, err := ValueOf(x)
+		if err != nil {
+			t.Fatalf("ValueOf(%v) failed: %v", x, err)
+		}
+		if got.Kind() != KindFloat {
+			t.Errorf("ValueOf(%v) is a %v; a Go float is always a Float", x, got.Kind())
+		}
+	}
+	for _, x := range []any{2024, int64(2024), uint8(7)} {
+		got, err := ValueOf(x)
+		if err != nil {
+			t.Fatalf("ValueOf(%v) failed: %v", x, err)
+		}
+		if got.Kind() != KindInt {
+			t.Errorf("ValueOf(%v) is a %v; a Go integer is always an Int", x, got.Kind())
+		}
+	}
+}
+
+// TestValueOfRejectsNonFiniteFloats — NaN and ±Inf have no JSON spelling. serde_json
+// writes them as `null` and refuses to read one back, so letting one through would
+// turn a caller's arithmetic slip into a 400 naming the server's parser.
+func TestValueOfRejectsNonFiniteFloats(t *testing.T) {
+	for _, x := range []any{math.NaN(), math.Inf(1), math.Inf(-1), float32(math.Inf(1))} {
 		v, err := ValueOf(x)
 		if err == nil {
-			t.Errorf("ValueOf(%v) succeeded as %v; attributes have no float type", x, v)
+			t.Errorf("ValueOf(%v) succeeded as %v; JSON has no NaN or Infinity", x, v)
 			continue
 		}
-		if !strings.Contains(err.Error(), "float") {
-			t.Errorf("ValueOf(%v) error = %q, want it to mention floats", x, err)
+		if !strings.Contains(err.Error(), "Float") {
+			t.Errorf("ValueOf(%v) error = %q, want it to name the Float attribute", x, err)
 		}
+	}
+	// The constructor is not gated, so the encoder is the second line: a Float built
+	// directly must still fail rather than marshal as `null`.
+	if _, err := json.Marshal(Float(math.NaN())); err == nil {
+		t.Error("marshalling Float(NaN) succeeded, want an error")
+	}
+}
+
+// TestDateTimeIsEpochMillisInUTC — the whole contract of the variant: an absolute
+// instant, milliseconds, no timezone. A Time in any location must produce the same
+// wire number, and come back as the same instant rendered in UTC.
+func TestDateTimeIsEpochMillisInUTC(t *testing.T) {
+	const ms int64 = 1700000000123
+	utc := time.UnixMilli(ms).UTC()
+	tokyo := utc.In(time.FixedZone("JST", 9*60*60))
+
+	for _, in := range []time.Time{utc, tokyo} {
+		encoded, err := json.Marshal(DateTime(in))
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		if want := `{"DateTime":1700000000123}`; string(encoded) != want {
+			t.Errorf("DateTime(%v) marshalled as %s, want %s", in, encoded, want)
+		}
+	}
+
+	var back Value
+	if err := json.Unmarshal([]byte(`{"DateTime":1700000000123}`), &back); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	got, ok := back.DateTime()
+	if !ok {
+		t.Fatalf("kind = %v, want KindDateTime", back.Kind())
+	}
+	if !got.Equal(utc) {
+		t.Errorf("decoded %v, want %v", got, utc)
+	}
+	if got.Location() != time.UTC {
+		t.Errorf("decoded in %v; a DateTime carries no timezone and renders as UTC", got.Location())
+	}
+	// Sub-millisecond precision is truncated, because milliseconds is the wire type.
+	sub, err := json.Marshal(DateTime(utc.Add(999 * time.Microsecond)))
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	if string(sub) != `{"DateTime":1700000000123}` {
+		t.Errorf("sub-millisecond precision survived as %s, want it truncated", sub)
+	}
+}
+
+// TestDateTimeKeepsFullInt64Precision — a DateTime is an i64 of milliseconds and goes
+// through the same literal-text decode as Int, so the 2^53 rounding trap is covered on
+// this path too rather than assumed to be.
+func TestDateTimeKeepsFullInt64Precision(t *testing.T) {
+	const lit = `{"DateTime":9007199254740993}`
+	var v Value
+	if err := json.Unmarshal([]byte(lit), &v); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	again, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	if string(again) != lit {
+		t.Errorf("round trip of %s produced %s", lit, again)
 	}
 }
 
@@ -252,6 +349,10 @@ func TestValueOfNormalizes(t *testing.T) {
 		{"uint16", uint16(16), Int(16)},
 		{"uint32", uint32(32), Int(32)},
 		{"uint64", uint64(math.MaxInt64), Int(math.MaxInt64)},
+		{"float32", float32(1.5), Float(1.5)},
+		{"float64", 2.5, Float(2.5)},
+		{"float64 integral", 2024.0, Float(2024)},
+		{"time.Time", time.UnixMilli(1700000000000).UTC(), DateTimeMillis(1700000000000)},
 		{"[]string", []string{"a", "b"}, List("a", "b")},
 		{"[]any of strings", []any{"a", "b"}, List("a", "b")},
 		{"[]any empty", []any{}, List()},
@@ -287,6 +388,7 @@ func TestValueOfRejectsUnsupported(t *testing.T) {
 		// The server's Int is an i64, so a u64 past its max has nowhere to go and must
 		// not wrap into a negative.
 		{"uint64 overflow", uint64(math.MaxUint64), "overflows"},
+		{"NaN", math.NaN(), "NaN"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -309,10 +411,10 @@ func TestMustValueOfPanicsOnUnsupported(t *testing.T) {
 	}
 	defer func() {
 		if recover() == nil {
-			t.Error("MustValueOf(1.5) did not panic")
+			t.Error("MustValueOf([]int{1}) did not panic")
 		}
 	}()
-	MustValueOf(1.5)
+	MustValueOf([]int{1})
 }
 
 // TestValueUnknownKindRoundTripsByteIdentical is the forward-compatibility contract:
@@ -397,6 +499,13 @@ func TestValueUnmarshalRejectsMalformedKnownTags(t *testing.T) {
 		`{"Bool":"yes"}`,
 		`{"List":[1,2]}`,
 		`{"List":"a"}`,
+		`{"Float":"1.5"}`,
+		`{"Float":true}`,
+		// `null` into a float64 leaves a silent 0.0, so the decoder goes through the
+		// literal digits instead — this row is what pins that.
+		`{"Float":null}`,
+		`{"DateTime":"1700000000000"}`,
+		`{"DateTime":1.5}`,
 		``,
 		`   `,
 		`[1,2]`,
@@ -456,6 +565,25 @@ func TestValueAccessorsAreCommaOK(t *testing.T) {
 	if got, ok := str.List(); ok || got != nil {
 		t.Errorf("Str.List() = (%v, %v), want (nil, false)", got, ok)
 	}
+	score, when := Float(1.5), DateTimeMillis(1700000000000)
+	if got, ok := score.Float(); !ok || got != 1.5 {
+		t.Errorf("Float.Float() = (%v, %v), want (1.5, true)", got, ok)
+	}
+	// An Int does not read as a Float and vice versa: same-type-only comparison on the
+	// server makes them different types, and a widening accessor would hide that.
+	if got, ok := num.Float(); ok || got != 0 {
+		t.Errorf("Int.Float() = (%v, %v), want (0, false)", got, ok)
+	}
+	if got, ok := score.Int(); ok || got != 0 {
+		t.Errorf("Float.Int() = (%d, %v), want (0, false)", got, ok)
+	}
+	if got, ok := when.DateTime(); !ok || got.UnixMilli() != 1700000000000 {
+		t.Errorf("DateTime.DateTime() = (%v, %v), want the instant and true", got, ok)
+	}
+	if got, ok := num.DateTime(); ok || !got.IsZero() {
+		t.Errorf("Int.DateTime() = (%v, %v), want (zero, false)", got, ok)
+	}
+
 	// Null answers false to all of them: it is set-but-empty, not a string.
 	if _, ok := null.Str(); ok {
 		t.Error("Null.Str() reported ok")
@@ -512,6 +640,8 @@ func TestValueStringIsForHumans(t *testing.T) {
 		{Bool(false), "false"},
 		{List("a", "b"), `["a", "b"]`},
 		{List(), "[]"},
+		{Float(1.5), "1.5"},
+		{DateTimeMillis(1700000000123), "2023-11-14T22:13:20.123Z"},
 	}
 	for _, tc := range cases {
 		if got := tc.val.String(); got != tc.want {
@@ -540,6 +670,8 @@ func TestKindString(t *testing.T) {
 		{KindInt, "Int"},
 		{KindBool, "Bool"},
 		{KindList, "List"},
+		{KindFloat, "Float"},
+		{KindDateTime, "DateTime"},
 		{KindUnknown, "Unknown"},
 		{Kind(99), "Kind(99)"},
 	}
@@ -604,22 +736,28 @@ func TestAttrsRoundTrip(t *testing.T) {
 	}
 }
 
-// TestAttrsOfNamesTheFailingKey — "cannot use float64" alone is not enough to find
+// TestAttrsOfNamesTheFailingKey — "cannot use []int" alone is not enough to find
 // the offending field in a wide document.
 func TestAttrsOfNamesTheFailingKey(t *testing.T) {
-	got, err := AttrsOf(map[string]any{"lang": "rust", "score": 1.5})
+	got, err := AttrsOf(map[string]any{"lang": "rust", "score": []int{1}})
 	if err == nil {
-		t.Fatalf("AttrsOf succeeded as %v, want an error for the float", got)
+		t.Fatalf("AttrsOf succeeded as %v, want an error for the []int", got)
 	}
 	if !strings.Contains(err.Error(), `"score"`) {
 		t.Errorf("error = %q, want it to name the score attribute", err)
 	}
 
-	ok, err := AttrsOf(map[string]any{"lang": "rust", "year": 2024, "tags": []string{"a"}, "none": nil})
+	ok, err := AttrsOf(map[string]any{
+		"lang": "rust", "year": 2024, "tags": []string{"a"}, "none": nil,
+		"score": 1.5, "seen": time.UnixMilli(1700000000000).UTC(),
+	})
 	if err != nil {
 		t.Fatalf("AttrsOf failed: %v", err)
 	}
-	want := Attrs{"lang": Str("rust"), "year": Int(2024), "tags": List("a"), "none": Null()}
+	want := Attrs{
+		"lang": Str("rust"), "year": Int(2024), "tags": List("a"), "none": Null(),
+		"score": Float(1.5), "seen": DateTimeMillis(1700000000000),
+	}
 	if !reflect.DeepEqual(ok, want) {
 		t.Errorf("AttrsOf = %v, want %v", ok, want)
 	}
@@ -632,19 +770,23 @@ func TestAttrsOfNamesTheFailingKey(t *testing.T) {
 // the typed accessors.
 func TestAttrsDecode(t *testing.T) {
 	got := Attrs{
-		"lang": Str("rust"),
-		"year": Int(2024),
-		"ok":   Bool(true),
-		"tags": List("a", "b"),
-		"none": Null(),
+		"lang":  Str("rust"),
+		"year":  Int(2024),
+		"ok":    Bool(true),
+		"tags":  List("a", "b"),
+		"none":  Null(),
+		"score": Float(1.5),
+		"seen":  DateTimeMillis(1700000000000),
 	}.Decode()
 
 	want := map[string]any{
-		"lang": "rust",
-		"year": int64(2024),
-		"ok":   true,
-		"tags": []string{"a", "b"},
-		"none": nil,
+		"lang":  "rust",
+		"year":  int64(2024),
+		"ok":    true,
+		"tags":  []string{"a", "b"},
+		"none":  nil,
+		"score": 1.5,
+		"seen":  time.UnixMilli(1700000000000).UTC(),
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Decode() = %#v, want %#v", got, want)

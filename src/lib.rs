@@ -20,6 +20,8 @@
 //! ```
 
 mod ann;
+// Opt-in result annotations: per-leg sub-scores and highlighted fragments (nidus-m50.5).
+mod annotate;
 pub mod backend;
 // Cooperative cancellation for long scans: a request deadline frees the client, only the
 // scan loop can free the CPU.
@@ -31,6 +33,8 @@ mod data;
 mod diag;
 mod filter;
 mod fts;
+// Reciprocal Rank Fusion over several ranked legs, keeping each leg's own rank/score.
+mod fuse;
 mod glob;
 mod index_cache;
 mod lock;
@@ -77,6 +81,7 @@ pub use memory::{META_DIM, META_EMBEDDER, Memory, RecallOpts, RememberMode};
 #[cfg(all(feature = "memory", feature = "summarize"))]
 pub use memory::{META_SOURCE, META_SUMMARY};
 
+pub use annotate::{Annotations, ClauseScore, Fragment, Highlight, HighlightOpts, LegScore};
 pub use anyhow::Result;
 pub use backend::{
     Appender, BackendLock, CasOutcome, ClusterLease, LeaseLost, LeaseRenewer, LocalFs, LocalRam,
@@ -84,10 +89,11 @@ pub use backend::{
 };
 pub use cancel::Cancel;
 pub use config::{Config, Fsync, LeaseWait, OpenMode};
-pub use fts::Language;
+pub use fts::{Analyzer, FtsField, Language};
 pub use model::{
-    AnnConfig, AnnKind, ClusterStatus, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts,
-    Predicate, QuantKind, Quantization, Record, Role, SearchOpts, Value,
+    AggregateOpts, Aggregation, AnnConfig, AnnKind, ClusterStatus, Decay, Distance, Filter,
+    Footprint, FtsClause, FtsCombine, FtsQuery, Hit, HybridOpts, LimitPer, ListOpts, OrderBy,
+    Predicate, Projection, QuantKind, Quantization, RankBy, Record, Role, SearchOpts, Value,
 };
 pub use store::Readiness;
 
@@ -185,25 +191,27 @@ impl Nidus {
         self.store.create_collection(name)
     }
 
-    /// Create `collection` and declare its full-text-indexed fields up front (each a
-    /// `(field, language)` pair). The recommended way to enable [BM25 full-text
-    /// search](Self::text_search): indexing is fully incremental from the first upsert.
-    pub fn create_collection_with_fts(
-        &mut self,
-        name: &str,
-        fields: &[(String, Language)],
-    ) -> Result<()> {
+    /// Create `collection` and declare its full-text-indexed fields up front. The recommended
+    /// way to enable [BM25 full-text search](Self::text_search): indexing is fully incremental
+    /// from the first upsert.
+    pub fn create_collection_with_fts(&mut self, name: &str, fields: &[FtsField]) -> Result<()> {
         self.store.create_collection_with_fts(name, fields)
     }
 
-    /// Declare which attribute fields of `collection` are full-text indexed for BM25, each with its
-    /// analyzer [`Language`]. Callable before or after upserting — on a collection that already holds
-    /// docs it builds the index once. Redeclaring rebuilds the affected fields.
-    pub fn set_fts_schema(
-        &mut self,
-        collection: &str,
-        fields: &[(String, Language)],
-    ) -> Result<()> {
+    /// Declare which attribute fields of `collection` are full-text indexed, each with its own
+    /// [`FtsField`] tuning (`k1`, `b`, [`Analyzer`]). Redeclaring rebuilds the affected fields.
+    ///
+    /// ```
+    /// # use nidus::{FtsField, Nidus};
+    /// # fn main() -> nidus::Result<()> {
+    /// # let mut db = Nidus::open_in_memory(3)?;
+    /// db.set_fts_schema("docs", &[
+    ///     FtsField::new("title").k1(1.5),
+    ///     FtsField::new("body").ascii_folding(true).max_token_len(40),
+    /// ])?;
+    /// # Ok(()) }
+    /// ```
+    pub fn set_fts_schema(&mut self, collection: &str, fields: &[FtsField]) -> Result<()> {
         self.store.set_fts_schema(collection, fields)
     }
 
@@ -240,6 +248,7 @@ impl Nidus {
     }
 
     pub fn delete_where(&mut self, collection: &str, filter: &Filter) -> Result<usize> {
+        filter::validate(filter)?;
         self.store.delete_where(collection, filter)
     }
 
@@ -258,17 +267,38 @@ impl Nidus {
         }
     }
 
-    /// List records matching `filter` across a [`Scope`], without vector scoring.
-    pub fn list<'a>(
-        &self,
-        scope: impl Into<Scope<'a>>,
-        filter: &Filter,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Vec<Hit>> {
+    /// List records matching `opts.filter` across a [`Scope`], without vector scoring. With
+    /// [`ListOpts::order_by`] set this is a plain ORDER BY over an attribute.
+    pub fn list<'a>(&self, scope: impl Into<Scope<'a>>, opts: &ListOpts) -> Result<Vec<Hit>> {
+        filter::validate(&opts.filter)?;
         let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        self.store.list(&refs, filter, offset, limit)
+        self.store.list(&refs, opts)
+    }
+
+    /// Count the records matching `opts.filter` across a [`Scope`] and sum the attributes named
+    /// in [`AggregateOpts::sum`], without materializing a single [`Record`].
+    ///
+    /// ```
+    /// # use nidus::{AggregateOpts, Nidus, Scope};
+    /// # fn main() -> nidus::Result<()> {
+    /// # let db = Nidus::open_in_memory(3)?;
+    /// let stats = db.aggregate(Scope::All, &AggregateOpts {
+    ///     sum: vec!["bytes".into()],
+    ///     ..Default::default()
+    /// })?;
+    /// assert_eq!(stats.count, 0);
+    /// # Ok(()) }
+    /// ```
+    pub fn aggregate<'a>(
+        &self,
+        scope: impl Into<Scope<'a>>,
+        opts: &AggregateOpts,
+    ) -> Result<Aggregation> {
+        filter::validate(&opts.filter)?;
+        let names = self.scope_names(scope);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        Ok(self.store.aggregate(&refs, opts))
     }
 
     /// Search a [`Scope`] — one collection, a subset, or the whole store — for the
@@ -279,6 +309,7 @@ impl Nidus {
         query: &[f32],
         opts: &SearchOpts,
     ) -> Result<Vec<Hit>> {
+        filter::validate(&opts.filter)?;
         let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.search(&refs, query, opts)
@@ -293,6 +324,7 @@ impl Nidus {
         query: &FtsQuery,
         opts: &SearchOpts,
     ) -> Result<Vec<Hit>> {
+        filter::validate(&opts.filter)?;
         let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.text_search(&refs, query, opts)
@@ -308,6 +340,7 @@ impl Nidus {
         text: &FtsQuery,
         opts: &HybridOpts,
     ) -> Result<Vec<Hit>> {
+        filter::validate(&opts.filter)?;
         let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.hybrid_search(&refs, vector, text, opts)

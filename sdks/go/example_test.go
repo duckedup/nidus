@@ -63,12 +63,15 @@ func Example() {
 		log.Fatal(err)
 	}
 
-	// Attributes are typed. There is no float attribute — floats belong in the vector.
+	// Attributes are typed, and the constructor is the type: Int and Float are distinct
+	// on the server, so nidus.Int(2024) and nidus.Float(2024) never compare equal.
 	if _, err := db.Upsert(ctx, "docs", []nidus.Record{
 		{
 			ID:     "a",
 			Vector: []float32{0.1, 0.2, 0.3},
-			Attrs:  nidus.Attrs{"lang": nidus.Str("rust"), "year": nidus.Int(2024)},
+			Attrs: nidus.Attrs{
+				"lang": nidus.Str("rust"), "year": nidus.Int(2024), "score": nidus.Float(0.75),
+			},
 		},
 		// No vector: a text-only document, findable by text search and metadata.
 		{ID: "b", Attrs: nidus.Attrs{"body": nidus.Str("vector stores are neat")}},

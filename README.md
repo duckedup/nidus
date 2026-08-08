@@ -57,7 +57,7 @@ fast dependency.
 
 ```toml
 [dependencies]
-nidus = "0.43"
+nidus = "0.52"
 ```
 
 ```rust
@@ -72,7 +72,7 @@ db.create_collection("code")?;
 // Index some records: id + embedding + arbitrary typed metadata.
 let mut attrs = BTreeMap::new();
 attrs.insert("path".into(), Value::Str("src/auth/login.rs".into()));
-db.upsert("code", &[Record { id: "a".into(), vector: vec![1.0, 0.0, 0.0, 0.0], attrs }])?;
+db.upsert("code", &[Record::new("a", vec![1.0, 0.0, 0.0, 0.0], attrs)])?;
 
 // Nearest neighbours (cosine), top-k.
 let hits = db.search("code", &[1.0, 0.0, 0.0, 0.0], &SearchOpts { top_k: 5, ..Default::default() })?;
@@ -85,6 +85,7 @@ let opts = SearchOpts {
     top_k: 10,
     filter: Filter(vec![Predicate::Glob("path".into(), "src/auth/*".into())]),
     min_score: Some(0.5),
+    ..Default::default()
 };
 let hits = db.search(Scope::All, &[1.0, 0.0, 0.0, 0.0], &opts)?;
 # anyhow::Ok(())
@@ -110,8 +111,14 @@ See [`examples/demo.rs`](examples/demo.rs) for an end-to-end run (`cargo run
 - **Scoped search** — query one collection, a subset, or the **whole store** in one
   call, merged into a single ranking. Sound because every collection shares one
   embedding space (one pinned dimension).
-- **Typed metadata + filters** — attach `Str`/`Int`/`Bool`/`List`/`Null` attributes
-  and filter with `Eq` / `Glob` / `In` predicates before scoring.
+- **Typed metadata + filters** — attach `Str`/`Int`/`Float`/`Bool`/`List`/`DateTime`/
+  `Null` attributes and narrow results *before* they score: equality and sets, ranges,
+  globs, list containment, fuzzy/token/phrase/regex text matching, and `All`/`Any`/`Not`
+  boolean composition over any of them.
+- **Rank and shape the answer** — layer a recency decay over the store's metric, weight
+  the legs of a hybrid query, `ORDER BY` an attribute, cap hits per attribute value,
+  project which attrs come back, paginate a documented total ordering, or ask a hit to
+  `explain` itself with per-clause scores and highlighted fragments.
 - **Idempotent upserts** by caller-supplied id; `delete`, `delete_where`, per-
   collection metadata.
 - **Crash-safe & durable** — an append-only flat-`f32` `data` segment plus a framed,

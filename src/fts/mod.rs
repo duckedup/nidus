@@ -8,25 +8,26 @@ use serde::{Deserialize, Serialize};
 use crate::model::Value;
 
 mod analyzer;
+mod fold;
+mod highlight;
+mod schema;
 
-pub use analyzer::Language;
 pub(crate) use analyzer::analyze;
+pub use analyzer::{Analyzer, Language};
+pub(crate) use highlight::fragments;
+pub use schema::FtsField;
+pub(crate) use schema::validate;
 
 /// The full text of attribute `field` for FTS purposes: a `Str` directly, a `List`
 /// joined by spaces (each element is its own run of terms), everything else empty.
-fn field_text(attrs: &BTreeMap<String, Value>, field: &str) -> String {
+/// Highlight offsets are into **this** string, so a `List` field's spans index the join.
+pub(crate) fn field_text(attrs: &BTreeMap<String, Value>, field: &str) -> String {
     match attrs.get(field) {
         Some(Value::Str(s)) => s.clone(),
         Some(Value::List(items)) => items.join(" "),
         _ => String::new(),
     }
 }
-
-/// BM25 term-frequency saturation. Larger = term frequency matters more before
-/// saturating. The conventional default.
-const K1: f32 = 1.2;
-/// BM25 length normalization. `0` = none, `1` = full. The conventional default.
-const B: f32 = 0.75;
 
 /// One posting: a document's local docnum and the term's frequency in this field.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -40,7 +41,8 @@ struct Posting {
 /// overwritten), and `id_to_docnum` is the authoritative live mapping.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct FieldIndex {
-    lang: Language,
+    /// The field's declared BM25 params + analyzer — what this index was built under.
+    cfg: FtsField,
     /// term → postings, appended in docnum order.
     postings: HashMap<String, Vec<Posting>>,
     /// docnum → field length in terms (`0` once tombstoned).
@@ -58,15 +60,15 @@ pub(crate) struct FieldIndex {
 }
 
 impl FieldIndex {
-    pub(crate) fn new(lang: Language) -> Self {
+    pub(crate) fn new(cfg: FtsField) -> Self {
         Self {
-            lang,
+            cfg,
             ..Default::default()
         }
     }
 
-    pub(crate) fn language(&self) -> Language {
-        self.lang
+    pub(crate) fn analyzer(&self) -> Analyzer {
+        self.cfg.analyzer
     }
 
     /// Index (or re-index) document `id` with this field's `text`. Re-indexing an
@@ -75,7 +77,7 @@ impl FieldIndex {
     pub(crate) fn index(&mut self, id: &str, text: &str) {
         self.tombstone(id);
 
-        let terms = analyze(text, self.lang);
+        let terms = analyze(text, self.cfg.analyzer);
         let len = terms.len() as u32;
         let docnum = self.docnum_to_id.len() as u32;
 
@@ -130,6 +132,7 @@ impl FieldIndex {
         }
         let avgdl = self.avgdl();
         let n = self.doc_count as f32;
+        let (k1, b) = (self.cfg.k1, self.cfg.b);
 
         // docnum → accumulated score.
         let mut scores: HashMap<u32, f32> = HashMap::new();
@@ -158,7 +161,7 @@ impl FieldIndex {
             for p in live {
                 let dl = self.doc_len[p.docnum as usize] as f32;
                 let tf = p.tf as f32;
-                let norm = tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avgdl));
+                let norm = tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * dl / avgdl));
                 *scores.entry(p.docnum).or_insert(0.0) += idf * norm;
             }
         }
@@ -181,12 +184,12 @@ impl FieldIndex {
 }
 
 /// All FTS state for a store: the per-`(collection, field)` indexes plus the declared schema
-/// (`collection → [(field, language)]`). The schema is the source of truth for which attrs are
+/// (`collection → [FtsField]`). The schema is the source of truth for which attrs are
 /// full-text indexed; it is persisted via the op-log and replayed on open.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Fts {
     fields: HashMap<(String, String), FieldIndex>,
-    schema: HashMap<String, Vec<(String, Language)>>,
+    schema: HashMap<String, Vec<FtsField>>,
 }
 
 impl Fts {
@@ -196,35 +199,34 @@ impl Fts {
         !self.schema.is_empty()
     }
 
-    /// The on-disk cache validity key: format version, BM25 params, and the full declared schema,
-    /// deterministically ordered. Any change to the analyzer params or schema flips it, so
-    /// [`crate::index_cache`] rejects a stale cache and the index is rebuilt.
+    /// The on-disk cache validity key: format version plus the full declared schema —
+    /// every field's name, BM25 `k1`/`b`, and analyzer — deterministically ordered. Any
+    /// change flips it, so [`crate::index_cache`] rejects the stale cache and rebuilds.
     pub(crate) fn cache_key(&self) -> Vec<u8> {
-        /// Bump when the inverted-index layout or analyzer behaviour changes.
-        const FTS_CACHE_VERSION: u8 = 1;
+        /// Bump when the inverted-index layout or analyzer behaviour changes. `2` = per-field
+        /// BM25/analyzer params (`1` keyed the two store-wide constants separately).
+        const FTS_CACHE_VERSION: u8 = 2;
         let mut key = vec![FTS_CACHE_VERSION];
-        key.extend_from_slice(&K1.to_le_bytes());
-        key.extend_from_slice(&B.to_le_bytes());
         // BTreeMap iterates key-sorted, so the encoding is deterministic. Serializing a
         // BTreeMap of owned/Copy types is infallible; a silent drop here would weaken the
         // cache's validity (two schemas could share a key), so we assert rather than skip.
-        let sorted: std::collections::BTreeMap<&String, &Vec<(String, Language)>> =
+        let sorted: std::collections::BTreeMap<&String, &Vec<FtsField>> =
             self.schema.iter().collect();
         let bytes = bincode::serialize(&sorted).expect("FTS schema serialization is infallible");
         key.extend_from_slice(&bytes);
         key
     }
 
-    /// The declared `(field, language)` list for `collection`, if any.
-    pub(crate) fn schema_for(&self, collection: &str) -> Option<&[(String, Language)]> {
+    /// The declared fields for `collection`, if any.
+    pub(crate) fn schema_for(&self, collection: &str) -> Option<&[FtsField]> {
         self.schema.get(collection).map(Vec::as_slice)
     }
 
-    /// The analyzer language declared for `collection`.`field`, if it is indexed.
-    pub(crate) fn field_language(&self, collection: &str, field: &str) -> Option<Language> {
+    /// The analyzer declared for `collection`.`field`, if it is indexed.
+    pub(crate) fn field_analyzer(&self, collection: &str, field: &str) -> Option<Analyzer> {
         self.fields
             .get(&(collection.to_string(), field.to_string()))
-            .map(FieldIndex::language)
+            .map(FieldIndex::analyzer)
     }
 
     /// Fraction of indexed docs tombstoned across all field indexes — the FTS analog of the
@@ -247,12 +249,12 @@ impl Fts {
 
     /// Declare (or redeclare) `collection`'s full-text fields, discarding any existing
     /// field indexes for it. The caller then re-indexes the collection's live docs.
-    pub(crate) fn set_schema(&mut self, collection: &str, fields: &[(String, Language)]) {
+    pub(crate) fn set_schema(&mut self, collection: &str, fields: &[FtsField]) {
         self.fields.retain(|(c, _), _| c != collection);
-        for (field, lang) in fields {
+        for f in fields {
             self.fields.insert(
-                (collection.to_string(), field.clone()),
-                FieldIndex::new(*lang),
+                (collection.to_string(), f.field.clone()),
+                FieldIndex::new(f.clone()),
             );
         }
         self.schema.insert(collection.to_string(), fields.to_vec());
@@ -271,11 +273,11 @@ impl Fts {
         let Some(decl) = schema.get(collection) else {
             return;
         };
-        for (field, _lang) in decl {
-            let Some(idx) = fields.get_mut(&(collection.to_string(), field.clone())) else {
+        for f in decl {
+            let Some(idx) = fields.get_mut(&(collection.to_string(), f.field.clone())) else {
                 continue;
             };
-            let text = field_text(attrs, field);
+            let text = field_text(attrs, &f.field);
             if text.is_empty() {
                 idx.tombstone(id);
             } else {
@@ -287,10 +289,10 @@ impl Fts {
     /// Tombstone document `id` across all of `collection`'s field indexes (delete).
     pub(crate) fn remove_doc(&mut self, collection: &str, id: &str) {
         if let Some(decl) = self.schema.get(collection) {
-            for (field, _) in decl {
+            for f in decl {
                 if let Some(idx) = self
                     .fields
-                    .get_mut(&(collection.to_string(), field.clone()))
+                    .get_mut(&(collection.to_string(), f.field.clone()))
                 {
                     idx.tombstone(id);
                 }
@@ -308,8 +310,7 @@ impl Fts {
     /// re-index all live docs from scratch — used on compaction and on open.
     pub(crate) fn clear_indexes(&mut self) {
         for ((_, _), idx) in self.fields.iter_mut() {
-            let lang = idx.language();
-            *idx = FieldIndex::new(lang);
+            *idx = FieldIndex::new(idx.cfg.clone());
         }
     }
 
@@ -337,7 +338,12 @@ mod tests {
     use super::*;
 
     fn idx_with(docs: &[(&str, &str)]) -> FieldIndex {
-        let mut idx = FieldIndex::new(Language::English);
+        idx_cfg(FtsField::new("body"), docs)
+    }
+
+    /// An index over `docs` built under an explicit field configuration.
+    fn idx_cfg(cfg: FtsField, docs: &[(&str, &str)]) -> FieldIndex {
+        let mut idx = FieldIndex::new(cfg);
         for (id, text) in docs {
             idx.index(id, text);
         }
@@ -346,7 +352,7 @@ mod tests {
 
     /// Analyze a query string into terms (the analysis the store does once per query).
     fn q(query: &str) -> Vec<String> {
-        analyze(query, Language::English)
+        analyze(query, Analyzer::default())
     }
 
     /// `score` ranked descending, for assertions.
@@ -439,6 +445,143 @@ mod tests {
         assert!(idx.score(&q("")).is_empty());
         assert!(idx.score(&q("the and of")).is_empty()); // all stopwords
         assert!(idx.score(&q("zzz")).is_empty()); // unknown term
+    }
+
+    // ── per-field BM25 tuning ─────────────────────────────────────────────────────
+
+    #[test]
+    fn default_params_reproduce_the_frozen_bm25_score() {
+        // A regression freeze. Hand-checked against the BM25 formula at k1 = 1.2, b = 0.75:
+        // idf = ln(1.6) = 0.470004, and d1 (tf 1, dl 3, avgdl 3) has norm exactly 1.
+        let idx = idx_with(&[
+            ("d1", "the cat sat on the mat"),
+            ("d2", "cats and more cats running with cats"),
+            ("d3", "a dog barked"),
+        ]);
+        let hits = ranked(&idx, "cat");
+        let by_id = |id: &str| hits.iter().find(|(i, _)| i == id).unwrap().1;
+        // Tolerance, not equality: BM25's idf uses `ln`, which Miri evaluates to within
+        // an ULP rather than exactly. A parameter change moves these by ~1e-2.
+        assert!((by_id("d1") - 0.470_003_63).abs() < 1e-6, "{hits:?}");
+        assert!((by_id("d2") - 0.689_338_7).abs() < 1e-6, "{hits:?}");
+    }
+
+    #[test]
+    fn raising_k1_raises_the_reward_for_repeated_terms() {
+        let docs: &[(&str, &str)] = &[
+            ("many", "needle needle needle needle and some padding"),
+            ("one", "needle and some padding text goes here"),
+        ];
+        let gap = |k1: f32| {
+            let idx = idx_cfg(FtsField::new("body").k1(k1), docs);
+            let hits = ranked(&idx, "needle");
+            assert_eq!(hits[0].0, "many");
+            hits[0].1 - hits[1].1
+        };
+        // k1 = 0 saturates tf immediately, so both docs score on length alone.
+        assert!(gap(0.0) < gap(1.2), "k1=0 must flatten the tf advantage");
+        assert!(gap(1.2) < gap(3.0), "a larger k1 must widen it");
+    }
+
+    #[test]
+    fn b_zero_drops_the_length_penalty() {
+        let docs: &[(&str, &str)] = &[
+            ("short", "needle"),
+            (
+                "long",
+                "needle plus a lot of other unrelated padding words here",
+            ),
+        ];
+        let idx = idx_cfg(FtsField::new("body").b(0.0), docs);
+        let hits = ranked(&idx, "needle");
+        // Same tf, no length normalization → identical scores (the default b ranks
+        // "short" strictly first, as `shorter_docs_score_higher_for_same_tf` asserts).
+        assert!((hits[0].1 - hits[1].1).abs() < 1e-6, "{hits:?}");
+    }
+
+    // ── analyzer configuration ────────────────────────────────────────────────────
+
+    #[test]
+    fn ascii_folding_makes_accented_and_bare_spellings_one_term() {
+        let docs: &[(&str, &str)] = &[("d1", "the café was open")];
+        let folded = FtsField::new("body").ascii_folding(true);
+        let idx = idx_cfg(folded.clone(), docs);
+        let terms = |text: &str| analyze(text, folded.analyzer);
+        assert_eq!(idx.score(&terms("cafe")).len(), 1);
+        assert_eq!(idx.score(&terms("café")).len(), 1);
+        // Off (the default), the two spellings stay separate terms.
+        let plain = idx_cfg(FtsField::new("body"), docs);
+        assert!(plain.score(&q("cafe")).is_empty());
+        assert_eq!(plain.score(&q("café")).len(), 1);
+    }
+
+    #[test]
+    fn max_token_len_keeps_long_tokens_out_of_the_index() {
+        let blob = "a".repeat(64);
+        let docs = [("d1", format!("alpha {blob} omega"))];
+        let docs: Vec<(&str, &str)> = docs.iter().map(|(i, t)| (*i, t.as_str())).collect();
+        let capped = FtsField::new("body").max_token_len(8);
+        let idx = idx_cfg(capped.clone(), &docs);
+        assert_eq!(idx.score(&analyze("alpha", capped.analyzer)).len(), 1);
+        assert!(idx.score(&analyze(&blob, capped.analyzer)).is_empty());
+        // The dropped token doesn't count toward the doc length either.
+        assert_eq!(idx.doc_len[0], 2);
+    }
+
+    // ── cache invalidation ────────────────────────────────────────────────────────
+
+    /// The cache key a store would carry with `fields` declared on one collection.
+    fn key_for(fields: &[FtsField]) -> Vec<u8> {
+        let mut fts = Fts::default();
+        fts.set_schema("docs", fields);
+        fts.cache_key()
+    }
+
+    #[test]
+    fn cache_key_changes_on_every_schema_parameter() {
+        // The highest-consequence property here: a store whose schema changed must
+        // rebuild. A key collision would serve postings scored under the old params.
+        let base = FtsField::new("body");
+        let baseline = key_for(std::slice::from_ref(&base));
+        for variant in [
+            base.clone().k1(1.201),
+            base.clone().b(0.7501),
+            base.clone().ascii_folding(true),
+            base.clone().max_token_len(40),
+            base.clone().language(Language::English).k1(0.0),
+            FtsField::new("title"),
+        ] {
+            assert_ne!(
+                baseline,
+                key_for(std::slice::from_ref(&variant)),
+                "{variant:?}"
+            );
+        }
+        assert_ne!(baseline, key_for(&[base.clone(), FtsField::new("title")]));
+        // Redeclaring the same schema must keep the key, or every reopen would rebuild.
+        assert_eq!(baseline, key_for(&[base]));
+    }
+
+    #[test]
+    fn cache_key_is_stable_across_declaration_order_of_collections() {
+        let mut a = Fts::default();
+        a.set_schema("x", &[FtsField::new("body")]);
+        a.set_schema("y", &[FtsField::new("body")]);
+        let mut b = Fts::default();
+        b.set_schema("y", &[FtsField::new("body")]);
+        b.set_schema("x", &[FtsField::new("body")]);
+        assert_eq!(a.cache_key(), b.cache_key());
+    }
+
+    #[test]
+    fn schema_accessors_expose_the_declared_configuration() {
+        let mut fts = Fts::default();
+        fts.set_schema("docs", &[FtsField::new("body").ascii_folding(true).k1(1.7)]);
+        let decl = fts.schema_for("docs").unwrap();
+        assert_eq!(decl.len(), 1);
+        assert_eq!(decl[0].k1, 1.7);
+        assert!(fts.field_analyzer("docs", "body").unwrap().ascii_folding);
+        assert!(fts.field_analyzer("docs", "title").is_none());
     }
 
     #[test]

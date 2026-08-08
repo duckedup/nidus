@@ -9,7 +9,7 @@ default-members = ["."]
 
 [package]
 name = "nidus"
-version = "0.43.0"
+version = "0.52.0"
 edition = "2024"
 rust-version = "1.96"
 description = "A small, pure-Rust embeddable vector store: brute-force or ANN cosine search over a single append-only directory, with pluggable persistence (local files, S3, GCS). No SQL, no query engine; builds in seconds."
@@ -129,6 +129,11 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 crc32fast = "1"
+
+# `Predicate::Regex` (SPEC §7.5), in the DEFAULT build. A finite-automata engine with a
+# documented linear-time guarantee — no backtracking, so there is no ReDoS class to
+# defend against. Pure Rust, no C, no native linking.
+regex = "1"
 
 # Storage-backend deps (SPEC §13), in the DEFAULT build. The cloud clients are
 # sans-IO (build + sign requests; no transport, no async) — `rusty-s3` (Sigv4 = pure

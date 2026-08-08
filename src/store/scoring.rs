@@ -111,7 +111,7 @@ pub(super) fn parallel_topk<'a, T, F>(
     score_one: F,
 ) -> Result<TopK<T>>
 where
-    T: Send,
+    T: Ord + Send,
     F: Fn(&[(u64, &'a str, &'a str)]) -> Result<TopK<T>> + Sync,
 {
     let chunk_len = scan.len().div_ceil(workers);

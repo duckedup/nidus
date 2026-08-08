@@ -15,21 +15,27 @@ use crate::backend::{
 };
 use crate::config::{Config, LeaseWait, OpenMode};
 use crate::data::Segments;
-use crate::fts::Fts;
+use crate::fts::{Fts, FtsField};
 use crate::log::OpLog;
 use crate::manifest::{MANIFEST_KEY, Manifest};
 use crate::model::{AnnConfig, ClusterStatus, Distance, Op, Role};
 
+mod aggregate;
 mod memtier;
 mod quant;
+mod rank;
 mod read;
 mod scoring;
+mod text;
 mod write;
 
 #[cfg(test)]
 mod tests;
 
 use quant::Quant;
+/// Marks a caller's mistake rather than a server fault; `server::classify` maps it to a
+/// `400`. Tagged in the library (not just the `cli` build) so `filter::validate` can use it.
+pub(crate) use read::BAD_QUERY;
 
 // ── In-RAM types ─────────────────────────────────────────────────────────────
 
@@ -842,7 +848,19 @@ impl Store {
                         dead_rows += 1;
                     }
                 }
+                // Legacy shape: a language per field, no BM25/analyzer params. Adopting the
+                // defaults here is what makes a pre-nidus-m50.13 log open unchanged.
                 Op::SetFtsSchema { collection, fields } => {
+                    let fields: Vec<FtsField> = fields
+                        .into_iter()
+                        .map(|(field, lang)| FtsField::new(field).language(lang))
+                        .collect();
+                    collections
+                        .entry(collection.clone())
+                        .or_insert_with(Collection::new);
+                    fts.set_schema(&collection, &fields);
+                }
+                Op::SetFtsFields { collection, fields } => {
                     // The collection exists implicitly (matches SetMeta leniency); the
                     // field indexes are (re)built from the live docs once replay finishes.
                     collections

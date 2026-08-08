@@ -11,8 +11,9 @@ use serde::Serialize;
 
 use crate::server::dto::{AnnDto, FootprintDto, HitDto};
 use crate::{
-    AnnConfig, Config, Distance, Filter, Fsync, FtsQuery, HybridOpts, Language, LeaseWait, Nidus,
-    OpenMode, Quantization, Record, Scope, SearchOpts,
+    AggregateOpts, AnnConfig, Config, Distance, Filter, Fsync, FtsClause, FtsCombine, FtsField,
+    FtsQuery, HighlightOpts, HybridOpts, LeaseWait, LimitPer, ListOpts, Nidus, OpenMode, OrderBy,
+    Projection, Quantization, Record, Scope, SearchOpts,
 };
 
 // AI-ingest (memory) wiring for `serve`: only under the `memory` feature (pulled
@@ -448,6 +449,81 @@ impl From<FsyncArg> for Fsync {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum CombineArg {
+    #[default]
+    Sum,
+    Max,
+}
+
+impl From<CombineArg> for FtsCombine {
+    fn from(c: CombineArg) -> Self {
+        match c {
+            CombineArg::Sum => FtsCombine::Sum,
+            CombineArg::Max => FtsCombine::Max,
+        }
+    }
+}
+
+/// The multi-clause / annotation half of a text or hybrid query, shared by both subcommands
+/// so the two cannot drift (nidus-m50.10, nidus-m50.5).
+#[derive(Args, Debug, Default)]
+struct TextQueryArgs {
+    /// An extra query clause, `field=text` (repeatable). Use instead of the positional
+    /// field + query pair, never alongside it.
+    #[arg(long = "clause")]
+    clauses: Vec<String>,
+    /// How several clauses fold into one score.
+    #[arg(long, value_enum, default_value_t = CombineArg::Sum)]
+    combine: CombineArg,
+    /// Annotate each hit with its per-clause (and, for hybrid, per-leg) scores.
+    #[arg(long)]
+    explain: bool,
+    /// Return highlighted fragments of the matched text.
+    #[arg(long)]
+    highlight: bool,
+    /// Fragments per field when highlighting.
+    #[arg(long, default_value_t = HighlightOpts::default().max_fragments)]
+    max_fragments: usize,
+    /// Characters per fragment when highlighting.
+    #[arg(long, default_value_t = HighlightOpts::default().fragment_chars)]
+    fragment_chars: usize,
+}
+
+impl TextQueryArgs {
+    /// Build the query, taking the clauses from the positional `field`/`text` pair or from
+    /// repeated `--clause field=text` — the same either/or the HTTP body enforces.
+    fn query(&self, field: Option<String>, text: Option<String>) -> anyhow::Result<FtsQuery> {
+        let clauses = match (field, text, self.clauses.is_empty()) {
+            (Some(f), Some(t), true) => vec![FtsClause::new(f, t)],
+            (None, None, false) => self
+                .clauses
+                .iter()
+                .map(|c| {
+                    c.split_once('=')
+                        .map(|(f, t)| FtsClause::new(f, t))
+                        .ok_or_else(|| anyhow::anyhow!("--clause must be field=text, got '{c}'"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            (None, None, true) => {
+                anyhow::bail!("give a field and its query text, or one or more --clause field=text")
+            }
+            _ => {
+                anyhow::bail!("the positional field/text pair and --clause are mutually exclusive")
+            }
+        };
+        let mut q = FtsQuery::multi(clauses).combine(self.combine.into());
+        if self.highlight {
+            q = q.highlight(
+                HighlightOpts::default()
+                    .max_fragments(self.max_fragments)
+                    .fragment_chars(self.fragment_chars),
+            );
+        }
+        Ok(q)
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Run the HTTP server.
@@ -552,13 +628,47 @@ enum Command {
         query_file: Option<PathBuf>,
         #[arg(long, short = 'k', default_value_t = 10)]
         top_k: usize,
+        /// Skip this many top-ranked hits before returning (pagination).
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Drop hits scoring below this cosine similarity.
         #[arg(long)]
         min_score: Option<f32>,
-        /// AND-filter as JSON. Predicates: Eq, Ne, Glob, IGlob, In, NotIn, Lt, Le, Gt, Ge.
+        /// AND-filter as JSON. Leaves: Eq, Ne, Glob, IGlob, In, NotIn, Lt, Le, Gt, Ge, Contains, NotContains, ContainsAny. Groups: All, Any, Not.
         /// E.g. '[{"Ge":["ts",{"Int":1700000000}]},{"Ne":["status",{"Str":"archived"}]}]'.
         #[arg(long = "where")]
         filter: Option<String>,
+        /// Force the exact scan, bypassing any ANN index and the quantized first pass.
+        #[arg(long)]
+        exact: bool,
+        /// Return only this attr (repeatable). Mutually exclusive with --exclude-attr.
+        #[arg(long = "include-attr")]
+        include_attributes: Vec<String>,
+        /// Return every attr but this one (repeatable). Mutually exclusive with --include-attr.
+        #[arg(long = "exclude-attr")]
+        exclude_attributes: Vec<String>,
+        /// Ranking expression as JSON, e.g. '{"Decay":{"field":"ts","origin":1700000000000,"scale":604800000,"lambda":0.2}}'.
+        #[arg(long = "rank-by")]
+        rank_by: Option<String>,
+        /// Cap hits per distinct value of this attribute (needs --limit-per-max).
+        #[arg(long = "limit-per", requires = "limit_per_max")]
+        limit_per: Option<String>,
+        /// Maximum hits kept per distinct --limit-per value.
+        #[arg(long = "limit-per-max", requires = "limit_per")]
+        limit_per_max: Option<usize>,
+    },
+    /// Count records matching a filter, and sum numeric attributes, without listing them.
+    Aggregate {
+        #[command(flatten)]
+        store: StoreArgs,
+        /// Collections to aggregate over; omit for every collection.
+        collections: Vec<String>,
+        /// AND-filter as JSON (same form as `search --where`).
+        #[arg(long = "where")]
+        filter: Option<String>,
+        /// Attribute to sum (repeatable). Missing and non-numeric values are skipped.
+        #[arg(long = "sum")]
+        sum: Vec<String>,
     },
     /// List records by metadata filter (no vector query).
     List {
@@ -572,13 +682,25 @@ enum Command {
         /// Maximum number of results.
         #[arg(long, short = 'n', default_value_t = 100)]
         limit: usize,
-        /// AND-filter as JSON. Predicates: Eq, Ne, Glob, IGlob, In, NotIn, Lt, Le, Gt, Ge.
+        /// AND-filter as JSON. Leaves: Eq, Ne, Glob, IGlob, In, NotIn, Lt, Le, Gt, Ge, Contains, NotContains, ContainsAny. Groups: All, Any, Not.
         /// E.g. '[{"Ge":["ts",{"Int":1700000000}]},{"Ne":["status",{"Str":"archived"}]}]'.
         #[arg(long = "where")]
         filter: Option<String>,
+        /// Return only this attr (repeatable). Mutually exclusive with --exclude-attr.
+        #[arg(long = "include-attr")]
+        include_attributes: Vec<String>,
+        /// Return every attr but this one (repeatable). Mutually exclusive with --include-attr.
+        #[arg(long = "exclude-attr")]
+        exclude_attributes: Vec<String>,
+        /// Sort by this attribute instead of storage order.
+        #[arg(long = "order-by")]
+        order_by: Option<String>,
+        /// Sort --order-by descending.
+        #[arg(long, requires = "order_by")]
+        desc: bool,
     },
-    /// Declare a collection's full-text-indexed fields (BM25). Fields use the US
-    /// English analyzer. Re-running rebuilds the affected field indexes.
+    /// Declare a collection's full-text-indexed fields (BM25). The tuning flags apply to
+    /// every `--field` in the invocation. Re-running rebuilds the affected field indexes.
     SetFtsSchema {
         #[command(flatten)]
         store: StoreArgs,
@@ -586,20 +708,37 @@ enum Command {
         /// Attribute field to full-text index (repeatable).
         #[arg(long = "field", required = true)]
         fields: Vec<String>,
+        /// BM25 term-frequency saturation (default 1.2).
+        #[arg(long)]
+        k1: Option<f32>,
+        /// BM25 length normalization, 0..=1 (default 0.75).
+        #[arg(long)]
+        b: Option<f32>,
+        /// Fold Latin diacritics to ASCII, so "café" and "cafe" share a term.
+        #[arg(long)]
+        ascii_folding: bool,
+        /// Drop tokens longer than this many characters (default: no limit).
+        #[arg(long)]
+        max_token_len: Option<usize>,
     },
-    /// Full-text (BM25) search of a field declared via `set-fts-schema`.
+    /// Full-text (BM25) search of fields declared via `set-fts-schema`.
     TextSearch {
         #[command(flatten)]
         store: StoreArgs,
-        /// The full-text-indexed field to search.
-        field: String,
+        /// The full-text-indexed field to search. Omit when using --clause.
+        field: Option<String>,
         /// Query text (analyzed the same way documents were indexed).
-        query: String,
+        query: Option<String>,
+        #[command(flatten)]
+        text: TextQueryArgs,
         /// Collections to search; omit to search every collection.
         #[arg(long = "in")]
         collections: Vec<String>,
         #[arg(long, short = 'k', default_value_t = 10)]
         top_k: usize,
+        /// Skip this many top-ranked hits before returning (pagination).
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Drop hits scoring below this raw BM25 score.
         #[arg(long)]
         min_score: Option<f32>,
@@ -611,10 +750,12 @@ enum Command {
     HybridSearch {
         #[command(flatten)]
         store: StoreArgs,
-        /// The full-text-indexed field for the BM25 leg.
-        field: String,
+        /// The full-text-indexed field for the BM25 leg. Omit when using --clause.
+        field: Option<String>,
         /// Query text for the BM25 leg.
-        text: String,
+        text: Option<String>,
+        #[command(flatten)]
+        query: TextQueryArgs,
         /// Read the query vector (JSON array) from this file instead of stdin.
         #[arg(long)]
         query_file: Option<PathBuf>,
@@ -623,6 +764,9 @@ enum Command {
         collections: Vec<String>,
         #[arg(long, short = 'k', default_value_t = 10)]
         top_k: usize,
+        /// Skip this many top-ranked fused hits before returning (pagination).
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// AND-filter as JSON, applied to both legs.
         #[arg(long = "where")]
         filter: Option<String>,
@@ -632,6 +776,12 @@ enum Command {
         /// Candidates pulled per leg before fusing.
         #[arg(long, default_value_t = 100)]
         candidates: usize,
+        /// Weight on the vector leg's fused contribution.
+        #[arg(long, default_value_t = 1.0)]
+        vector_weight: f32,
+        /// Weight on the BM25 leg's fused contribution.
+        #[arg(long, default_value_t = 1.0)]
+        text_weight: f32,
     },
     /// Print every record in a collection (JSON).
     Get {
@@ -754,8 +904,15 @@ pub fn run(cli: Cli) -> Result<()> {
             collections,
             query_file,
             top_k,
+            offset,
             min_score,
             filter,
+            exact,
+            include_attributes,
+            exclude_attributes,
+            rank_by,
+            limit_per,
+            limit_per_max,
         } => {
             let db = open(&store, false)?;
             let query: Vec<f32> = serde_json::from_str(&read_input(query_file.as_ref())?)?;
@@ -765,8 +922,17 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             let opts = SearchOpts {
                 top_k,
+                offset,
                 min_score,
                 filter,
+                exact,
+                projection: projection(include_attributes, exclude_attributes)?,
+                rank_by: rank_by.map(|s| serde_json::from_str(&s)).transpose()?,
+                // clap's `requires` pairing means either both flags are present or neither is.
+                limit_per: limit_per
+                    .zip(limit_per_max)
+                    .map(|(f, m)| LimitPer::new(f, m)),
+                ..Default::default()
             };
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
             let hits = if refs.is_empty() {
@@ -783,43 +949,95 @@ pub fn run(cli: Cli) -> Result<()> {
             offset,
             limit,
             filter,
+            include_attributes,
+            exclude_attributes,
+            order_by,
+            desc,
         } => {
             let db = open(&store, false)?;
             let filter = match filter {
                 Some(s) => serde_json::from_str(&s)?,
                 None => Filter::default(),
             };
+            let opts = ListOpts {
+                offset,
+                limit,
+                filter,
+                projection: projection(include_attributes, exclude_attributes)?,
+                order_by: order_by.map(|f| OrderBy {
+                    field: f,
+                    descending: desc,
+                }),
+            };
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
             let hits = if refs.is_empty() {
-                db.list(Scope::All, &filter, offset, limit)?
+                db.list(Scope::All, &opts)?
             } else {
-                db.list(Scope::Collections(&refs), &filter, offset, limit)?
+                db.list(Scope::Collections(&refs), &opts)?
             };
             let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
+            print_json(&out)
+        }
+        Command::Aggregate {
+            store,
+            collections,
+            filter,
+            sum,
+        } => {
+            let db = open(&store, false)?;
+            let filter = match filter {
+                Some(s) => serde_json::from_str(&s)?,
+                None => Filter::default(),
+            };
+            let opts = AggregateOpts { filter, sum };
+            let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
+            let out = if refs.is_empty() {
+                db.aggregate(Scope::All, &opts)?
+            } else {
+                db.aggregate(Scope::Collections(&refs), &opts)?
+            };
             print_json(&out)
         }
         Command::SetFtsSchema {
             store,
             collection,
             fields,
+            k1,
+            b,
+            ascii_folding,
+            max_token_len,
         } => {
             let mut db = open(&store, true)?;
-            let decl: Vec<(String, Language)> = fields
+            let decl: Vec<FtsField> = fields
                 .iter()
-                .map(|f| (f.clone(), Language::English))
+                .map(|name| {
+                    let mut f = FtsField::new(name).ascii_folding(ascii_folding);
+                    f.k1 = k1.unwrap_or(f.k1);
+                    f.b = b.unwrap_or(f.b);
+                    f.analyzer.max_token_len = max_token_len;
+                    f
+                })
                 .collect();
             db.set_fts_schema(&collection, &decl)?;
-            print_json(&serde_json::json!({ "collection": collection, "fts_fields": fields }))
+            print_json(&serde_json::json!({
+                "collection": collection,
+                "fts_fields": fields,
+                "k1": decl[0].k1,
+                "b": decl[0].b,
+            }))
         }
         Command::TextSearch {
             store,
             field,
             query,
+            text,
             collections,
             top_k,
+            offset,
             min_score,
             filter,
         } => {
+            let q = text.query(field, query)?;
             let db = open(&store, false)?;
             let filter = match filter {
                 Some(s) => serde_json::from_str(&s)?,
@@ -827,10 +1045,12 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             let opts = SearchOpts {
                 top_k,
+                offset,
                 min_score,
                 filter,
+                explain: text.explain,
+                ..Default::default()
             };
-            let q = FtsQuery::new(field, query);
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
             let hits = if refs.is_empty() {
                 db.text_search(Scope::All, &q, &opts)?
@@ -844,13 +1064,18 @@ pub fn run(cli: Cli) -> Result<()> {
             store,
             field,
             text,
+            query,
             query_file,
             collections,
             top_k,
+            offset,
             filter,
             rrf_k,
             candidates,
+            vector_weight,
+            text_weight,
         } => {
+            let q = query.query(field, text)?;
             let db = open(&store, false)?;
             let vector: Vec<f32> = serde_json::from_str(&read_input(query_file.as_ref())?)?;
             let filter = match filter {
@@ -859,11 +1084,14 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             let opts = HybridOpts {
                 top_k,
+                offset,
                 filter,
                 rrf_k,
                 candidates,
+                explain: query.explain,
+                vector_weight,
+                text_weight,
             };
-            let q = FtsQuery::new(field, text);
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
             let hits = if refs.is_empty() {
                 db.hybrid_search(Scope::All, &vector, &q, &opts)?
@@ -1040,6 +1268,17 @@ fn serve(
     rt.block_on(crate::server::serve(move || Nidus::open(open_config), cfg))
 }
 
+/// Resolve `--include-attr`/`--exclude-attr` into a [`Projection`]. Both given is an error,
+/// not a precedence rule — the same refusal the HTTP surface makes (nidus-m50.15).
+fn projection(include: Vec<String>, exclude: Vec<String>) -> Result<Projection> {
+    match (include.is_empty(), exclude.is_empty()) {
+        (true, true) => Ok(Projection::All),
+        (false, true) => Ok(Projection::Include(include)),
+        (true, false) => Ok(Projection::Exclude(exclude)),
+        (false, false) => anyhow::bail!("--include-attr and --exclude-attr are mutually exclusive"),
+    }
+}
+
 /// Read JSON from `file`, or from stdin when absent.
 fn read_input(file: Option<&PathBuf>) -> Result<String> {
     match file {
@@ -1160,6 +1399,114 @@ mod tests {
                 assert_eq!(min_score, Some(0.2));
             }
             _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn search_parses_the_ranking_knobs() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "search",
+            "--dir",
+            "/tmp/s",
+            "docs",
+            "--rank-by",
+            r#"{"Decay":{"field":"ts","origin":0}}"#,
+            "--limit-per",
+            "file",
+            "--limit-per-max",
+            "2",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Search {
+                rank_by,
+                limit_per,
+                limit_per_max,
+                ..
+            } => {
+                assert!(rank_by.is_some());
+                assert_eq!(limit_per.as_deref(), Some("file"));
+                assert_eq!(limit_per_max, Some(2));
+            }
+            _ => panic!("expected Search"),
+        }
+        // The cap's two halves are useless apart, so clap requires them together.
+        assert!(
+            Cli::try_parse_from([
+                "nidus",
+                "search",
+                "--dir",
+                "/tmp/s",
+                "docs",
+                "--limit-per",
+                "file"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn list_parses_order_by_and_aggregate_parses_sums() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "list",
+            "--dir",
+            "/tmp/s",
+            "--order-by",
+            "ts",
+            "--desc",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::List { order_by, desc, .. } => {
+                assert_eq!(order_by.as_deref(), Some("ts"));
+                assert!(desc);
+            }
+            _ => panic!("expected List"),
+        }
+        // `--desc` alone has nothing to reverse.
+        assert!(Cli::try_parse_from(["nidus", "list", "--dir", "/tmp/s", "--desc"]).is_err());
+
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "aggregate",
+            "--dir",
+            "/tmp/s",
+            "docs",
+            "--sum",
+            "bytes",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Aggregate {
+                collections, sum, ..
+            } => {
+                assert_eq!(collections, vec!["docs"]);
+                assert_eq!(sum, vec!["bytes"]);
+            }
+            _ => panic!("expected Aggregate"),
+        }
+    }
+
+    #[test]
+    fn hybrid_search_leg_weights_default_to_one() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "hybrid-search",
+            "--dir",
+            "/tmp/s",
+            "body",
+            "quantum",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::HybridSearch {
+                vector_weight,
+                text_weight,
+                ..
+            } => assert_eq!((vector_weight, text_weight), (1.0, 1.0)),
+            _ => panic!("expected HybridSearch"),
         }
     }
 

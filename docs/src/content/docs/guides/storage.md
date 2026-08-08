@@ -42,7 +42,7 @@ in-flight batch** — everything fsynced before it is intact, and the in-RAM ind
 is fully reproducible from the files.
 
 `Fsync::OnFlush` defers **both** fsyncs to an explicit
-[`flush()`](/reference/api/#flush) or close, which re-establishes the same
+[`flush()`](/reference/api/#search--maintenance) or close, which re-establishes the same
 data-then-log ordering in one go. This is much faster but weaker: an unflushed
 batch can be lost on a crash. Use it when you are bulk-loading and can afford to
 redo the load on failure.
@@ -77,7 +77,7 @@ Resource exhaustion never corrupts a store:
 
 Because segments are never rewritten in place, a `delete` or an overwriting
 `upsert` leaves the old row behind as a **dead row** — still on disk, no
-longer referenced by the index. [`compact()`](/reference/api/#compact) collapses
+longer referenced by the index. [`compact()`](/reference/api/#search--maintenance) collapses
 every [segment](#segments) into one fresh `data` segment that drops the dead rows,
 publishes the new manifest, and reclaims the old segment objects.
 
@@ -176,7 +176,7 @@ search-only processes reading a store another process is writing.
 
 A `ReadOnly` snapshot is fixed at the moment it opened. To pick up a writer's later
 commits — appends, deletes, seals, compactions — without reopening, call
-[`refresh()`](/reference/api/#refresh):
+[`refresh()`](/reference/api/#search--maintenance):
 
 ```rust
 use nidus::{Config, Nidus, OpenMode, Scope, SearchOpts};

@@ -22,14 +22,19 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Sequence
+from datetime import datetime, timezone
 
 import pytest
 
 from nidus import AttrInput, Filter, Predicate, f, v
 
 
-def test_every_predicate_variant_has_the_two_tuple_shape() -> None:
-    """Ten variants, each externally tagged over ``[key, operand]``."""
+def test_every_leaf_predicate_variant_has_the_two_tuple_shape() -> None:
+    """Seventeen leaf variants, each externally tagged over ``[key, operand]``.
+
+    The combinators deliberately break this shape, and so does ``fuzzy`` — see the group
+    tests and the three-element test below.
+    """
     assert f.eq("lang", "rust") == {"Eq": ["lang", {"Str": "rust"}]}
     assert f.ne("lang", "go") == {"Ne": ["lang", {"Str": "go"}]}
     assert f.glob("path", "src/*") == {"Glob": ["path", "src/*"]}
@@ -42,6 +47,88 @@ def test_every_predicate_variant_has_the_two_tuple_shape() -> None:
     assert f.le("year", 2020) == {"Le": ["year", {"Int": 2020}]}
     assert f.gt("year", 2020) == {"Gt": ["year", {"Int": 2020}]}
     assert f.ge("year", 2020) == {"Ge": ["year", {"Int": 2020}]}
+    assert f.contains("tags", "rust") == {"Contains": ["tags", {"Str": "rust"}]}
+    assert f.not_contains("tags", "wip") == {"NotContains": ["tags", {"Str": "wip"}]}
+    assert f.contains_any("tags", ["rust", "go"]) == {
+        "ContainsAny": ["tags", [{"Str": "rust"}, {"Str": "go"}]]
+    }
+    assert f.contains_all_tokens("body", "async runtime") == {
+        "ContainsAllTokens": ["body", "async runtime"]
+    }
+    assert f.contains_any_token("body", "async runtime") == {
+        "ContainsAnyToken": ["body", "async runtime"]
+    }
+    assert f.contains_token_sequence("body", "async runtime") == {
+        "ContainsTokenSequence": ["body", "async runtime"]
+    }
+    assert f.regex("path", "src/.*[.]rs") == {"Regex": ["path", "src/.*[.]rs"]}
+
+
+def test_fuzzy_is_the_one_predicate_with_a_three_element_operand() -> None:
+    """The edit budget is part of the operand, so ``Fuzzy`` breaks the 2-tuple shape.
+
+    Asserted on the serialized form as well: the server's ``Fuzzy(String, String, usize)``
+    deserializes from a 3-element array and from nothing else, so a client that dropped the
+    budget (or nested it) would fail every fuzzy query with a deserialization error.
+    """
+    predicate = f.fuzzy("title", "levenshtein", 2)
+    assert predicate == {"Fuzzy": ["title", "levenshtein", 2]}
+    (operand,) = predicate.values()
+    assert len(operand) == 3
+    assert json.dumps(predicate, separators=(",", ":")) == '{"Fuzzy":["title","levenshtein",2]}'
+
+
+def test_the_text_predicates_take_a_bare_string_like_glob_does() -> None:
+    """Five more variants holding a ``String``, not a tagged ``Value`` — the ``glob`` shape."""
+    for predicate in (
+        f.fuzzy("k", "s", 1),
+        f.contains_all_tokens("k", "s"),
+        f.contains_any_token("k", "s"),
+        f.contains_token_sequence("k", "s"),
+        f.regex("k", "s"),
+    ):
+        (operand,) = predicate.values()
+        assert operand[0] == "k"
+        assert operand[1] == "s"
+        assert isinstance(operand[1], str)
+
+
+def test_contains_any_refuses_a_bare_string() -> None:
+    """A `str` is a `Sequence[str]`, so this type-checks and would encode one predicate
+    per CHARACTER and match nothing — the same trap `in_`/`not_in` already guard."""
+    with pytest.raises(TypeError, match="expects a sequence"):
+        f.contains_any("tags", "rust")
+    assert f.contains_any("tags", ["rust"]) == {"ContainsAny": ["tags", [{"Str": "rust"}]]}
+
+
+def test_the_combinators_are_not_key_value_tuples() -> None:
+    """``all_``/``any_`` wrap a bare list of predicates, ``not_`` a single one."""
+    assert f.any_(f.eq("a", 1), f.eq("b", 2)) == {
+        "Any": [{"Eq": ["a", {"Int": 1}]}, {"Eq": ["b", {"Int": 2}]}]
+    }
+    assert f.all_(f.eq("a", 1)) == {"All": [{"Eq": ["a", {"Int": 1}]}]}
+    assert f.not_(f.eq("a", 1)) == {"Not": {"Eq": ["a", {"Int": 1}]}}
+
+
+def test_empty_groups_are_empty_lists_not_null() -> None:
+    """The identities (``All`` true, ``Any`` false) only hold if they deserialize."""
+    assert f.all_() == {"All": []}
+    assert f.any_() == {"Any": []}
+
+
+def test_groups_nest() -> None:
+    """A group holding a group — the whole point of the combinators."""
+    nested = f.not_(f.any_(f.contains("tags", "wip")))
+    assert nested == {"Not": {"Any": [{"Contains": ["tags", {"Str": "wip"}]}]}}
+    assert json.loads(json.dumps(nested)) == nested
+
+
+def test_all_is_a_predicate_while_and_is_a_filter() -> None:
+    """The distinction that decides which one a caller needs: only ``all_`` nests."""
+    assert isinstance(f.and_(f.eq("a", 1)), list)
+    assert isinstance(f.all_(f.eq("a", 1)), dict)
+    # So a conjunction can sit inside a disjunction only via all_.
+    assert f.any_(f.all_(f.eq("a", 1))) == {"Any": [{"All": [{"Eq": ["a", {"Int": 1}]}]}]}
 
 
 def test_glob_takes_a_bare_string_while_the_others_take_a_value() -> None:
@@ -121,10 +208,34 @@ def test_a_boolean_operand_is_not_encoded_as_an_int() -> None:
     assert f.in_("flags", [True, False]) == {"In": ["flags", [{"Bool": True}, {"Bool": False}]]}
 
 
-def test_a_float_operand_is_rejected() -> None:
-    """No float attribute type, so no float comparisons either — fail at the call site."""
-    with pytest.raises(TypeError, match="no float attribute type"):
-        f.gt("year", 2020.5)
+def test_a_float_operand_keeps_its_type_through_the_predicate() -> None:
+    """Comparisons are same-type only, so ``2020`` and ``2020.0`` are different filters.
+
+    The predicate builders normalize through ``encode_value``, which means the Python type
+    of the operand is what picks ``Int`` or ``Float`` — a range over a ``Float`` attribute
+    written with an ``int`` operand matches nothing, silently.
+    """
+    assert f.gt("score", 2020.5) == {"Gt": ["score", {"Float": 2020.5}]}
+    assert f.gt("score", 2020.0) == {"Gt": ["score", {"Float": 2020.0}]}
+    assert f.gt("year", 2020) == {"Gt": ["year", {"Int": 2020}]}
+    assert f.in_("score", [1.5, 2]) == {"In": ["score", [{"Float": 1.5}, {"Int": 2}]]}
+
+
+def test_a_datetime_operand_encodes_as_epoch_milliseconds() -> None:
+    """A range over instants: both operand forms reach the same wire number."""
+    when = datetime(2023, 11, 14, 22, 13, 20, tzinfo=timezone.utc)
+    assert f.ge("seen", when) == {"Ge": ["seen", {"DateTime": 1700000000000}]}
+    assert f.ge("seen", v.datetime(1700000000000)) == f.ge("seen", when)
+
+
+def test_an_unencodable_operand_is_rejected_at_the_call_site() -> None:
+    """A value with no attribute type fails here, not as a 400 naming serde."""
+    with pytest.raises(TypeError, match="set"):
+        f.gt("year", {2020})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="finite"):
+        f.gt("score", float("nan"))
+    with pytest.raises(ValueError, match="aware datetime"):
+        f.ge("seen", datetime(2023, 11, 14))
 
 
 def test_filter_serializes_as_a_bare_array() -> None:

@@ -197,7 +197,7 @@ How it works:
   data. The intended deployment is still a single writer; a second exists only to take over a
   dead one.
 - **Many readers, refreshing.** Every commit advances the manifest version, so a `ReadOnly`
-  instance picks up the writer's changes with a single cheap [`refresh()`](/reference/api/#refresh)
+  instance picks up the writer's changes with a single cheap [`refresh()`](/reference/api/#search--maintenance)
   — no reopen. Call it on whatever cadence you like (per request, on a timer); it is a no-op
   when nothing changed. A refresh is incremental where it can be: it re-reads only the segment
   that grew (reusing the immutable ones) and, when a shared memory tier holds a current snapshot,

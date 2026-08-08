@@ -3,7 +3,9 @@
 // A `Filter` is AND-combined predicates; on the wire it is a plain array. Each
 // predicate is a *positive assertion about a present attribute* — an absent key
 // matches nothing, including the negative predicates (`ne`/`notIn`) and ranges.
-// Comparisons are same-type only (Int↔Int numeric, Str↔Str lexical, Bool↔Bool).
+// Comparisons are same-type only (Int↔Int numeric, Float↔Float by IEEE, Str↔Str
+// lexical, Bool↔Bool, DateTime↔DateTime as instants), so an operand's encoded type
+// has to match the attribute's: `ge("score", v.float(2))`, not `ge("score", 2)`.
 
 import type { AttrInput, Filter, Predicate, Value } from "./types.js";
 import { encodeValue } from "./values.js";
@@ -55,6 +57,56 @@ export const f = {
   ge: (key: string, value: AttrInput): Predicate => ({
     Ge: [key, encodeValue(value)],
   }),
+  /** `attrs[key]` is a `List` containing `value` (whole-element, not substring). */
+  contains: (key: string, value: AttrInput): Predicate => ({
+    Contains: [key, encodeValue(value)],
+  }),
+  /** `attrs[key]` is a present `List` not containing `value`. */
+  notContains: (key: string, value: AttrInput): Predicate => ({
+    NotContains: [key, encodeValue(value)],
+  }),
+  /** `attrs[key]` is a `List` sharing at least one element with `values`. */
+  containsAny: (key: string, values: AttrInput[]): Predicate => ({
+    ContainsAny: [key, values.map(encodeValue)],
+  }),
+  /** Every sub-predicate holds. `all()` is `true`. */
+  all: (...preds: Predicate[]): Predicate => ({ All: preds }),
+  /** At least one sub-predicate holds. `any()` is `false`. */
+  any: (...preds: Predicate[]): Predicate => ({ Any: preds }),
+  /**
+   * The sub-predicate does not hold. Differs from {@link f.ne} on an absent key:
+   * `not(eq(k, v))` matches a record with no `k`, `ne(k, v)` does not.
+   */
+  not: (pred: Predicate): Predicate => ({ Not: pred }),
+  /**
+   * `attrs[key]` is within `maxEdits` Levenshtein edits of `text`, ASCII-case-folded on
+   * both sides; a `List` matches if any element does. The only three-element predicate.
+   * A `maxEdits` above 8 is refused by the server, not clamped.
+   */
+  fuzzy: (key: string, text: string, maxEdits: number): Predicate => ({
+    Fuzzy: [key, text, maxEdits],
+  }),
+  /**
+   * Every token of `text` appears among `attrs[key]`'s tokens, in any order. Tokens are
+   * ASCII-case-folded runs of alphanumerics; a `List` matches if any single element does.
+   */
+  containsAllTokens: (key: string, text: string): Predicate => ({
+    ContainsAllTokens: [key, text],
+  }),
+  /** At least one token of `text` appears among `attrs[key]`'s tokens. Empty never matches. */
+  containsAnyToken: (key: string, text: string): Predicate => ({
+    ContainsAnyToken: [key, text],
+  }),
+  /** `text`'s tokens appear consecutively and in order — a phrase match. */
+  containsTokenSequence: (key: string, text: string): Predicate => ({
+    ContainsTokenSequence: [key, text],
+  }),
+  /**
+   * `attrs[key]` matches the regular expression, **anchored at both ends** like
+   * {@link f.glob} — `.*` opts back into a substring search, and `(?i)` into case folding.
+   * The syntax is Rust's `regex`, not JS's: no backreferences and no lookaround.
+   */
+  regex: (key: string, pattern: string): Predicate => ({ Regex: [key, pattern] }),
   /** Collect predicates into a {@link Filter} (purely sugar — they already AND). */
   and: (...preds: Predicate[]): Filter => preds,
 } as const;

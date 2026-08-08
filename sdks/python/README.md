@@ -102,14 +102,32 @@ dataclasses (`collection`, `id`, `score`, `attrs`). `attrs` is a plain `dict`, s
 for `.get` unless every record in scope is known to carry the key — a search spans
 whatever the scope holds, and attrs are per-record, not a schema.
 
-There is no float attribute type — floats belong in the vector, so passing one raises
-`TypeError` rather than silently truncating. For an explicit type, use the `v.*`
-helpers (`v.str`, `v.int`, `v.bool`, `v.list`, `v.nil`):
+The Python type of an attribute decides its nidus type, and the pair that matters is
+`Int` vs `Float`: `2` is an `Int`, `2.0` is a `Float`. They are separate types on the
+server and comparisons are same-type only, so a `Float` attribute filtered with an `int`
+operand matches nothing — keep a numeric field's Python type uniform across records.
+`nan` and `inf` are refused (`ValueError`): JSON cannot spell them.
+
+A `datetime` becomes a `DateTime` — a UTC instant carried as epoch **milliseconds**, so
+sub-millisecond precision is truncated and the timezone is not stored. It must be
+**aware**; a naive `datetime` raises `ValueError` rather than being assumed to be UTC,
+because the wrong guess is off by hours in valid-looking JSON. Reading one back gives an
+aware `datetime`, not an `int`, so a decoded `attrs` map re-encodes to what it came from.
+
+For an explicit type, use the `v.*` helpers (`v.str`, `v.int`, `v.float`, `v.bool`,
+`v.list`, `v.datetime`, `v.nil`):
 
 ```python
+from datetime import datetime, timezone
+
 from nidus import v
 
-db.upsert("docs", [{"id": "d", "attrs": {"tags": v.list(["a", "b"]), "rank": v.int(7)}}])
+db.upsert("docs", [{"id": "d", "attrs": {
+    "tags": v.list(["a", "b"]),
+    "rank": v.int(7),
+    "score": v.float(1),                      # a whole number, stored as a Float
+    "seen": v.datetime(datetime.now(timezone.utc)),
+}}])
 ```
 
 `v.nil()` is the explicit `Null` value — "set, and empty" — which is a different fact
@@ -136,23 +154,38 @@ hits = db.search(
 )
 ```
 
-Predicates: `eq`, `ne`, `glob`, `iglob`, `in_`, `not_in`, `lt`, `le`, `gt`, `ge`, plus
-`and_`. `iglob` is `glob` with ASCII case folded on both sides.
-The three trailing underscores are not style — `in` and `and` are reserved words in
-Python, so `f.in_`, `f.not_in`, and `f.and_` are the JS SDK's `f.in`, `f.notIn`, and
-`f.and`. Nothing else deviates.
+Predicates: `eq`, `ne`, `glob`, `iglob`, `in_`, `not_in`, `lt`, `le`, `gt`, `ge`,
+`contains`, `not_contains`, `contains_any`; the text ones `fuzzy`, `contains_all_tokens`,
+`contains_any_token`, `contains_token_sequence`, `regex`; and the groups `all_`, `any_`,
+`not_`, plus `and_`. The trailing underscores are not style — `in`, `and` and `not` are
+reserved words in Python and `all`/`any` shadow builtins, so `f.in_`, `f.not_in`, `f.and_`,
+`f.all_`, `f.any_` and `f.not_` are the JS SDK's `f.in`, `f.notIn`, `f.and`, `f.all`,
+`f.any` and `f.not`. Nothing else deviates.
+
+```python
+f.iglob("path", "Src/*")                     # glob, ASCII case folded on both sides
+f.regex("path", "src/.*[.]rs")               # anchored at BOTH ends, like glob
+f.fuzzy("title", "levenshtein", 2)           # within N edits (N > 8 is an error)
+f.contains_token_sequence("body", "async runtime")   # a phrase, in order
+```
+
+The text predicates tokenize (ASCII-case-folded runs of alphanumerics), so case and
+punctuation do not count, and each of them matches a list attribute when any single
+element does.
 
 A `Filter` is just a `list` of predicates, AND-combined, so `f.and_(...)` is sugar for
 building that list — `filter=[f.eq("lang", "rust")]` is equally valid.
 
-Comparisons are same-type only (int↔int numeric, str↔str lexical, bool↔bool). A range
-predicate against a mismatched type matches nothing, which is the usual reason a filter
-mysteriously returns no rows.
+Comparisons are same-type only (int↔int numeric, float↔float by IEEE, str↔str lexical,
+bool↔bool, datetime↔datetime as instants). A range predicate against a mismatched type
+matches nothing, which is the usual reason a filter mysteriously returns no rows — and
+`f.gt("score", 2)` against a `Float` attribute is exactly that mismatch.
 
 ## Full-text and hybrid search
 
 ```python
 db.set_fts_schema("docs", ["body"])
+# Per-field tuning: db.set_fts_schema("docs", [{"field": "body", "k1": 1.5}])
 
 # BM25 text search over one indexed field
 text_hits = db.text_search(field="body", query="vector store", top_k=10)
@@ -167,7 +200,35 @@ hybrid_hits = db.hybrid_search(
 ```
 
 `hybrid_search` takes no `min_score`: its score is a fused RRF rank, not a similarity,
-so there is no meaningful floor to set. `rrf_k` and `candidates` tune the fusion.
+so there is no meaningful floor to set. `rrf_k` and `candidates` tune the fusion, and
+`vector_weight`/`text_weight` scale each leg's contribution to it (both default to 1.0,
+which is the unweighted fusion exactly).
+
+A query may name several fields instead of one, each with its own text, and ask *why* a
+document matched:
+
+```python
+hits = db.text_search(
+    clauses=[{"field": "title", "query": "rust"}, {"field": "body", "query": "async runtime"}],
+    combine="Sum",      # or "Max" — Sum rewards matching in two fields, Max takes the best
+    explain=True,       # each matched clause's own BM25 score
+    highlight=True,     # or {"max_fragments": 2, "fragment_chars": 80}
+)
+
+for hit in hits:
+    for clause in hit.annotations.clauses:
+        print(clause.field, clause.score)
+    for highlight in hit.annotations.highlights:
+        for fragment in highlight.fragments:
+            start, end = fragment.spans[0]
+            print(fragment.text.encode()[start:end])   # spans are BYTE offsets into `text`
+```
+
+`field`+`query` and `clauses` are mutually exclusive, and an empty clause list is refused
+at the call site rather than answered as "no matches". `hit.annotations` is `None` unless
+`explain` or `highlight` asked for it — on a hybrid search it also carries each leg's own
+`rank` and `score`, which is the only way to see a leg's rank, since the returned score is
+the fused one.
 
 ## Remembering and recalling (text-native)
 
@@ -200,6 +261,8 @@ Every endpoint of the HTTP API has a method:
 db.collections()                    # list[str]
 db.stats()                          # dimension, distance, ANN config, collections, footprint
 db.list(scope=["docs"], filter=[f.eq("lang", "rust")], offset=0, limit=50)
+db.list(order_by={"field": "updated_at", "descending": True})   # sort by an attribute
+db.aggregate(scope=["docs"], sum=["bytes"])   # -> Aggregation(count=…, sums={"bytes": …})
 db.records("docs")                  # every record, attrs decoded; vector is None for text-only
 db.get_meta("docs"); db.set_meta("docs", {"owner": "search-team"})
 db.delete("docs", ["a"])            # by id
@@ -217,7 +280,35 @@ double as "unset".
 
 `stats().ann` is `None` when the store does exact brute-force search, rather than an
 `AnnInfo` full of defaults. Likewise `Record.vector` is `None` — never `[]` — for a
-text-only document.
+text-only document. `aggregate` is answered from the in-RAM index alone (no record is
+built, no vector is read), and its sums keep the server's type: a run of `Int`s is an
+`int`, a run that met one `Float` is a `float`.
+
+### Ranking
+
+`search` and `text_search` take two more knobs. `rank_by` layers a ranking expression over
+the metric, and `limit_per` caps how many hits may share one attribute value:
+
+```python
+from datetime import datetime, timedelta, timezone
+
+from nidus import rank
+
+hits = db.search(
+    query=[0.1, 0.2, 0.3],
+    rank_by=rank.decay("updated_at", datetime.now(timezone.utc), scale=timedelta(days=7)),
+    limit_per={"field": "path", "max": 2},   # at most 2 hits per file
+)
+```
+
+Decay **subtracts** `lambda_ * (1 - factor)` from the base score rather than multiplying
+it, so it stays meaningful where scores are negative or unbounded (Euclidean, dot product,
+BM25). Ages are measured back from the `origin` you pass, never from the wall clock, so
+the same query against an unchanged store ranks the same way twice. `scale` is a half-life
+by default, and a record whose timestamp is missing or unusable is **not** penalized
+(`missing` defaults to 1.0). `origin` takes an aware `datetime` or epoch milliseconds and
+`scale` a `timedelta` or milliseconds; `lambda_` carries the underscore because `lambda`
+is a reserved word, and travels as `lambda`.
 
 ## Three things the client refuses to send
 
@@ -309,9 +400,9 @@ A status of `0` is the sentinel for **no response at all** — connection refuse
 failure, or the request exceeded `timeout`. Every nidus SDK uses the same sentinel, so
 "was this even reachable?" is answered identically in all of them.
 
-Value errors are raised locally, before any request: a `float` attribute or a
-non-string list element is a `TypeError`, and an integer outside `i64` is a `ValueError`
-(Python's ints are unbounded; the store's `Int` is not).
+Value errors are raised locally, before any request: an attribute type the store has no
+variant for (or a non-string list element) is a `TypeError`, and an integer outside `i64`,
+a non-finite `float`, or a naive `datetime` is a `ValueError`.
 
 ## Documentation
 

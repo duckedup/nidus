@@ -111,6 +111,16 @@ to those. The exact path is:
    similarity in `[-1, 1]`.
 4. Keep the top-k in a bounded heap, optionally dropping anything below
    `min_score`.
+5. Cut the page. The ranking is a **total order** — score descending, then
+   `collection`, then `id` — computed `offset + top_k` deep, so
+   [pagination](/guides/search/#paginating-a-search) tiles it with no gap and no overlap.
+
+Steps 3–5 are where the opt-in ranking knobs sit: a
+[`rank_by`](/guides/search/#ranking-by-recency) recency penalty is subtracted from each
+base score before the heap sees it, and
+[`limit_per`](/guides/search/#capping-hits-per-attribute-value) caps hits per attribute
+value as the page is cut. Both are off by default, and an untouched query returns exactly
+what it always did.
 
 Scoping the whole store in one call is sound because **every collection shares
 one embedding space** — one dimension is pinned for the life of the store, so
@@ -137,7 +147,7 @@ chunked dot product, an allocation-free top-k scan, and a storage-order
 None of those are walls — they are *seams*, additive over the same append-only
 format. Several have since shipped as opt-in modes: an [ANN
 index](/guides/search/#approximate-search-ann), [scalar/binary
-quantization](/guides/search/#int8-scalar-quantization), and [memory-mapped
+quantization](/guides/search/#quantization), and [memory-mapped
 larger-than-RAM stores](/guides/storage/#larger-than-ram-memory-mapped-segments).
 Each stays off by default, so the simple exact-in-RAM store is what you get until
 you opt in.

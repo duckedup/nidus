@@ -189,6 +189,9 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 		{"SetFtsSchema", `{"ok":true}`, http.MethodPost, "/collections/docs/fts-schema", func(c *Client) error {
 			return c.SetFtsSchema(ctx, "docs", []string{"body"})
 		}},
+		{"SetFtsFields", `{"ok":true}`, http.MethodPost, "/collections/docs/fts-schema", func(c *Client) error {
+			return c.SetFtsFields(ctx, "docs", []FtsField{{Field: "body"}})
+		}},
 		{"Search", `[]`, http.MethodPost, "/search", func(c *Client) error {
 			_, err := c.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}})
 			return err
@@ -205,6 +208,10 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 		}},
 		{"List", `[]`, http.MethodPost, "/list", func(c *Client) error {
 			_, err := c.List(ctx, ListRequest{Scope: []string{"docs"}})
+			return err
+		}},
+		{"Aggregate", `{"count":0,"sums":{}}`, http.MethodPost, "/aggregate", func(c *Client) error {
+			_, err := c.Aggregate(ctx, AggregateRequest{Sum: []string{"bytes"}})
 			return err
 		}},
 		{"Remember", `{"ok":true}`, http.MethodPost, "/collections/docs/remember", func(c *Client) error {
@@ -363,6 +370,120 @@ func TestSearchOmitsZeroTopK(t *testing.T) {
 	}
 	if body := fake.sentBody(t); body != `{"query":[1,0,0],"top_k":5}` {
 		t.Errorf("body = %s, want top_k:5", body)
+	}
+}
+
+// TestSearchPaginationOffsetIsAdditive pins the new knob against the promise that a
+// client which never sets it sends byte-identical requests: a zero Offset is omitted
+// (the server's own default), and a set one travels in the server's spelling.
+func TestSearchPaginationOffsetIsAdditive(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}, TopK: 5}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); strings.Contains(body, "offset") {
+		t.Errorf("body = %s, must not mention offset when Offset is 0", body)
+	}
+
+	if _, err := db.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}, TopK: 5, Offset: 10}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"query":[1,0,0],"top_k":5,"offset":10}` {
+		t.Errorf("body = %s, want offset:10", body)
+	}
+
+	if _, err := db.TextSearch(ctx, TextSearchRequest{Field: "body", Query: "fox", Offset: 3}); err != nil {
+		t.Fatalf("TextSearch failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"field":"body","query":"fox","offset":3}` {
+		t.Errorf("body = %s, want offset:3", body)
+	}
+
+	if _, err := db.HybridSearch(ctx, HybridSearchRequest{
+		Vector: []float32{1, 0, 0}, Field: "body", Text: "fox", Offset: 3,
+	}); err != nil {
+		t.Fatalf("HybridSearch failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"vector":[1,0,0],"field":"body","text":"fox","offset":3}` {
+		t.Errorf("body = %s, want offset:3", body)
+	}
+}
+
+// TestExactAndProjectionAreAdditive — both knobs must be invisible until asked for, so a
+// client that never sets them keeps sending byte-identical bodies, and must travel in the
+// server's spelling when set. The embedded Projection's fields promote to the top level.
+func TestExactAndProjectionAreAdditive(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}, TopK: 5}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"query":[1,0,0],"top_k":5}` {
+		t.Errorf("body = %s, want no exact/projection keys", body)
+	}
+
+	if _, err := db.Search(ctx, SearchRequest{
+		Query:      []float32{1, 0, 0},
+		Exact:      true,
+		Projection: Projection{IncludeAttributes: []string{"title"}},
+	}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"query":[1,0,0],"exact":true,"include_attributes":["title"]}` {
+		t.Errorf("body = %s, want exact + include_attributes", body)
+	}
+
+	if _, err := db.List(ctx, ListRequest{
+		Limit:      5,
+		Projection: Projection{ExcludeAttributes: []string{"body"}},
+	}); err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"limit":5,"exclude_attributes":["body"]}` {
+		t.Errorf("body = %s, want exclude_attributes", body)
+	}
+}
+
+// TestSetFtsFieldsOmitsUnsetKnobs — an FtsField carrying only a name must marshal to
+// the same defaults the bare-string form gets, and an explicit zero must survive
+// `omitempty` (which is why the knobs are pointers).
+func TestSetFtsFieldsOmitsUnsetKnobs(t *testing.T) {
+	fake := &capture{reply: `{"ok":true}`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if err := db.SetFtsFields(ctx, "docs", []FtsField{{Field: "body"}}); err != nil {
+		t.Fatalf("SetFtsFields failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"fields":[{"field":"body"}]}` {
+		t.Errorf("body = %s, want only the field name", body)
+	}
+
+	zero := float32(0)
+	folding := true
+	cap40 := 40
+	err := db.SetFtsFields(ctx, "docs", []FtsField{
+		{Field: "body", B: &zero, AsciiFolding: &folding, MaxTokenLen: &cap40},
+	})
+	if err != nil {
+		t.Fatalf("SetFtsFields failed: %v", err)
+	}
+	want := `{"fields":[{"field":"body","b":0,"ascii_folding":true,"max_token_len":40}]}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+
+	// A nil slice is the lawful empty schema, as for SetFtsSchema.
+	if err := db.SetFtsFields(ctx, "docs", nil); err != nil {
+		t.Fatalf("SetFtsFields failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"fields":[]}` {
+		t.Errorf("body = %s, want an empty fields array", body)
 	}
 }
 
@@ -605,6 +726,9 @@ func TestNilSlicesAndMapsBecomeEmptyCollections(t *testing.T) {
 		{"SetFtsSchema", `{"fields":[]}`, func(ctx context.Context, c *Client) error {
 			return c.SetFtsSchema(ctx, "docs", nil)
 		}},
+		{"SetFtsFields", `{"fields":[]}`, func(ctx context.Context, c *Client) error {
+			return c.SetFtsFields(ctx, "docs", nil)
+		}},
 		// A bodyless POST still sends {}, so the request is well-formed JSON all the
 		// way through whatever sits between the client and the server.
 		{"CreateCollection", `{}`, func(ctx context.Context, c *Client) error {
@@ -755,21 +879,21 @@ func TestUnencodableFilterFailsBeforeSending(t *testing.T) {
 		{"Search", func(ctx context.Context, c *Client) error {
 			_, err := c.Search(ctx, SearchRequest{
 				Query:  []float32{1, 0, 0},
-				Filter: And(Eq("lang", "rust"), Ge("score", 0.5)),
+				Filter: And(Eq("lang", "rust"), Ge("score", []int{1})),
 			})
 			return err
 		}},
 		{"List", func(ctx context.Context, c *Client) error {
-			_, err := c.List(ctx, ListRequest{Filter: And(Eq("score", 1.5))})
+			_, err := c.List(ctx, ListRequest{Filter: And(Eq("score", []int{1}))})
 			return err
 		}},
 		{"DeleteWhere", func(ctx context.Context, c *Client) error {
-			_, err := c.DeleteWhere(ctx, "docs", And(Eq("score", 1.5)))
+			_, err := c.DeleteWhere(ctx, "docs", And(Eq("score", []int{1})))
 			return err
 		}},
 		{"TextSearch", func(ctx context.Context, c *Client) error {
 			_, err := c.TextSearch(ctx, TextSearchRequest{
-				Field: "body", Query: "fox", Filter: And(Eq("score", 1.5)),
+				Field: "body", Query: "fox", Filter: And(Eq("score", []int{1})),
 			})
 			return err
 		}},
@@ -781,14 +905,14 @@ func TestUnencodableFilterFailsBeforeSending(t *testing.T) {
 
 			err := tc.call(context.Background(), db)
 			if err == nil {
-				t.Fatal("call succeeded; a filter holding a float must not be sent")
+				t.Fatal("call succeeded; a filter holding an unencodable value must not be sent")
 			}
 			if got := fake.snapshot(); got.calls != 0 {
 				t.Errorf("the server saw %d requests; nothing should have been sent, and "+
 					"body = %s", got.calls, got.body)
 			}
-			if !strings.Contains(err.Error(), "float") {
-				t.Errorf("error = %q, want it to name the float that could not be encoded", err)
+			if !strings.Contains(err.Error(), "cannot use") {
+				t.Errorf("error = %q, want it to name the value that could not be encoded", err)
 			}
 			// Not an *Error: nothing was sent, so there is no status, and Status 0
 			// ("never got an answer") would misattribute a caller mistake to the network.
@@ -1515,5 +1639,359 @@ func TestConcurrentUseIsSafe(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Errorf("concurrent Search failed: %v", err)
+	}
+}
+
+// TestRankingKnobsAreAdditive — rank_by, limit_per and order_by must be absent from a
+// request that does not use them, so today's bodies stay byte-identical, and must
+// carry only the sub-knobs the caller actually named when they are used.
+func TestRankingKnobsAreAdditive(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.Search(ctx, SearchRequest{Query: []float32{1}}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"query":[1]}` {
+		t.Errorf("body = %s, want no ranking keys at all", body)
+	}
+
+	// A Decay naming only what it changes: scale, decay, lambda and missing all default
+	// on the server, so sending them would restate a default this SDK does not own.
+	_, err := db.Search(ctx, SearchRequest{
+		Query:  []float32{1},
+		RankBy: DecayRank(Decay{Field: "ts", Origin: 1700000000000}),
+	})
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	want := `{"query":[1],"rank_by":{"Decay":{"field":"ts","origin":1700000000000}}}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+
+	// Every knob set, including the two whose zero is a real request.
+	_, err = db.Search(ctx, SearchRequest{
+		Query: []float32{1},
+		RankBy: DecayRank(Decay{
+			Field: "ts", Origin: 1700000000000, Scale: 604800000, Decay: 0.9,
+			Lambda: f32(2), Missing: f32(0),
+		}),
+		LimitPer: &LimitPer{Field: "path", Max: 2},
+	})
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	want = `{"query":[1],"rank_by":{"Decay":{"field":"ts","origin":1700000000000,` +
+		`"scale":604800000,"decay":0.9,"lambda":2,"missing":0}},` +
+		`"limit_per":{"field":"path","max":2}}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+
+	// order_by rides on /list, and ascending is the wire default.
+	if _, err := db.List(ctx, ListRequest{OrderBy: &OrderBy{Field: "ts"}}); err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"order_by":{"field":"ts"}}` {
+		t.Errorf("body = %s, want an ascending order_by", body)
+	}
+	if _, err := db.List(ctx, ListRequest{
+		OrderBy: &OrderBy{Field: "ts", Descending: true},
+	}); err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"order_by":{"field":"ts","descending":true}}` {
+		t.Errorf("body = %s, want a descending order_by", body)
+	}
+}
+
+// TestRankByNamingNoExpressionIsAnEncodeError — RankBy is a tagged union, so an empty
+// one would travel as {} and come back as a serde message about an unknown variant.
+// Failing in the encoder keeps the mistake at the call site that made it.
+func TestRankByNamingNoExpressionIsAnEncodeError(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+
+	_, err := db.Search(context.Background(), SearchRequest{
+		Query: []float32{1}, RankBy: &RankBy{},
+	})
+	if err == nil {
+		t.Fatal("Search succeeded with an empty RankBy, want an encode error")
+	}
+	if !strings.Contains(err.Error(), "DecayRank") {
+		t.Errorf("error = %q, want it to point at the builder", err)
+	}
+	if got := fake.snapshot(); got.calls != 0 {
+		t.Errorf("server saw %d requests; the body must fail before sending", got.calls)
+	}
+}
+
+// TestTextQuerySpellings — the single field+query pair and the clauses list are
+// mutually exclusive on the server, so the old spelling must still travel exactly as it
+// did and the new one must travel alone.
+func TestTextQuerySpellings(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	// The compatibility contract: unchanged bytes for the single-field form.
+	if _, err := db.TextSearch(ctx, TextSearchRequest{Field: "body", Query: "fox"}); err != nil {
+		t.Fatalf("TextSearch failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"field":"body","query":"fox"}` {
+		t.Errorf("body = %s, want the single-field spelling unchanged", body)
+	}
+
+	// The clauses form must not drag an empty field/query along, which the server reads
+	// as "both spellings at once" and refuses.
+	_, err := db.TextSearch(ctx, TextSearchRequest{
+		Clauses: []FtsClause{{Field: "title", Query: "rust"}, {Field: "body", Query: "async"}},
+		Combine: CombineMax,
+	})
+	if err != nil {
+		t.Fatalf("TextSearch failed: %v", err)
+	}
+	want := `{"clauses":[{"field":"title","query":"rust"},{"field":"body","query":"async"}],` +
+		`"combine":"Max"}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+
+	// Sum is the server's default, so leaving Combine empty must omit the key.
+	_, err = db.TextSearch(ctx, TextSearchRequest{
+		Clauses: []FtsClause{{Field: "title", Query: "rust"}},
+	})
+	if err != nil {
+		t.Fatalf("TextSearch failed: %v", err)
+	}
+	if body := fake.sentBody(t); strings.Contains(body, "combine") {
+		t.Errorf("body = %s, must omit combine when it is unset", body)
+	}
+
+	// Hybrid takes the same choice, spelled `text` rather than `query`.
+	_, err = db.HybridSearch(ctx, HybridSearchRequest{
+		Vector:  []float32{1, 0, 0},
+		Clauses: []FtsClause{{Field: "title", Query: "rust"}},
+		Combine: CombineSum,
+	})
+	if err != nil {
+		t.Fatalf("HybridSearch failed: %v", err)
+	}
+	want = `{"vector":[1,0,0],"clauses":[{"field":"title","query":"rust"}],"combine":"Sum"}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+}
+
+// TestExplainAndHighlightAreAdditive — both are off unless asked for, and an empty
+// HighlightOpts is the request for the server's defaults rather than for zero
+// fragments of zero characters.
+func TestExplainAndHighlightAreAdditive(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.TextSearch(ctx, TextSearchRequest{Field: "body", Query: "fox"}); err != nil {
+		t.Fatalf("TextSearch failed: %v", err)
+	}
+	body := fake.sentBody(t)
+	for _, field := range []string{"explain", "highlight"} {
+		if strings.Contains(body, field) {
+			t.Errorf("body = %s, must omit %s when it is unset", body, field)
+		}
+	}
+
+	_, err := db.TextSearch(ctx, TextSearchRequest{
+		Field: "body", Query: "fox", Explain: true, Highlight: &HighlightOpts{},
+	})
+	if err != nil {
+		t.Fatalf("TextSearch failed: %v", err)
+	}
+	want := `{"field":"body","query":"fox","explain":true,"highlight":{}}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+
+	_, err = db.HybridSearch(ctx, HybridSearchRequest{
+		Vector: []float32{1}, Field: "body", Text: "fox",
+		Explain:   true,
+		Highlight: &HighlightOpts{MaxFragments: 3, FragmentChars: 40},
+	})
+	if err != nil {
+		t.Fatalf("HybridSearch failed: %v", err)
+	}
+	want = `{"vector":[1],"field":"body","text":"fox","explain":true,` +
+		`"highlight":{"max_fragments":3,"fragment_chars":40}}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+}
+
+// TestHybridWeightsOmitNilAndSendZero — the omit-vs-zero rule again, and the case a
+// plain float32 gets wrong: both weights default to 1.0 on the server, so a zero-valued
+// field would silently ask for "weight this leg at nothing" on every unweighted query.
+func TestHybridWeightsOmitNilAndSendZero(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.HybridSearch(ctx, HybridSearchRequest{
+		Vector: []float32{1}, Field: "body", Text: "fox",
+	}); err != nil {
+		t.Fatalf("HybridSearch failed: %v", err)
+	}
+	body := fake.sentBody(t)
+	for _, field := range []string{"vector_weight", "text_weight"} {
+		if strings.Contains(body, field) {
+			t.Errorf("body = %s, must omit %s when it is nil", body, field)
+		}
+	}
+
+	// Dropping the vector leg entirely is a real request, and the only way to spell it.
+	_, err := db.HybridSearch(ctx, HybridSearchRequest{
+		Vector: []float32{1}, Field: "body", Text: "fox",
+		VectorWeight: f32(0), TextWeight: f32(2.5),
+	})
+	if err != nil {
+		t.Fatalf("HybridSearch failed: %v", err)
+	}
+	want := `{"vector":[1],"field":"body","text":"fox","vector_weight":0,"text_weight":2.5}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s — an explicit zero must travel", body, want)
+	}
+}
+
+// TestTextSearchProjectionAndRanking — /text-search takes the projection and the
+// ranking knobs too, and each must stay absent until asked for.
+func TestTextSearchProjectionAndRanking(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+
+	_, err := db.TextSearch(context.Background(), TextSearchRequest{
+		Field: "body", Query: "fox",
+		RankBy:     DecayRank(Decay{Field: "ts", Origin: 1}),
+		LimitPer:   &LimitPer{Field: "path", Max: 1},
+		Projection: Projection{ExcludeAttributes: []string{"body"}},
+	})
+	if err != nil {
+		t.Fatalf("TextSearch failed: %v", err)
+	}
+	want := `{"field":"body","query":"fox","rank_by":{"Decay":{"field":"ts","origin":1}},` +
+		`"limit_per":{"field":"path","max":1},"exclude_attributes":["body"]}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+}
+
+// TestHitAnnotationsDecode — a hit carrying annotations, and one that does not. The
+// second case is the common one and the one that must not regress: the server omits
+// the key entirely, and the decoded Hit has to be indistinguishable from today's.
+func TestHitAnnotationsDecode(t *testing.T) {
+	annotated := `[{"collection":"docs","id":"a","score":0.9,"attrs":{},"annotations":{` +
+		`"vector":{"rank":0,"score":0.98},"text":{"rank":1,"score":1.1},` +
+		`"clauses":[{"field":"title","score":0.49}],` +
+		`"highlights":[{"field":"body","fragments":[` +
+		`{"text":"we were running","spans":[[8,15]]}]}]}}]`
+	fake := &capture{reply: annotated}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	hits, err := db.HybridSearch(ctx, HybridSearchRequest{
+		Vector: []float32{1}, Field: "body", Text: "run", Explain: true,
+	})
+	if err != nil {
+		t.Fatalf("HybridSearch failed: %v", err)
+	}
+	a := hits[0].Annotations
+	if a == nil {
+		t.Fatal("Annotations = nil, want the decoded annotations")
+	}
+	if a.Vector == nil || a.Vector.Rank != 0 || a.Vector.Score != 0.98 {
+		t.Errorf("Vector = %+v, want rank 0 score 0.98", a.Vector)
+	}
+	if a.Text == nil || a.Text.Rank != 1 || a.Text.Score != 1.1 {
+		t.Errorf("Text = %+v, want rank 1 score 1.1", a.Text)
+	}
+	if len(a.Clauses) != 1 || a.Clauses[0].Field != "title" || a.Clauses[0].Score != 0.49 {
+		t.Errorf("Clauses = %+v, want one title clause scoring 0.49", a.Clauses)
+	}
+	if len(a.Highlights) != 1 || a.Highlights[0].Field != "body" {
+		t.Fatalf("Highlights = %+v, want one over body", a.Highlights)
+	}
+	frag := a.Highlights[0].Fragments[0]
+	// The spans are byte offsets into the fragment's own text, so slicing it directly
+	// is the whole point of decoding them into a named pair.
+	if got := frag.Text[frag.Spans[0].Start:frag.Spans[0].End]; got != "running" {
+		t.Errorf("span %v covers %q, want %q", frag.Spans[0], got, "running")
+	}
+
+	plain := &capture{reply: `[{"collection":"docs","id":"a","score":0.9,"attrs":{}}]`}
+	hits, err = serve(t, plain).Search(ctx, SearchRequest{Query: []float32{1}})
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if hits[0].Annotations != nil {
+		t.Errorf("Annotations = %+v on an unannotated hit, want nil", hits[0].Annotations)
+	}
+}
+
+// TestSpanRejectsAMalformedPair — a span that is not a two-element array is an error
+// rather than a zero span, which would silently highlight the wrong text (or nothing).
+func TestSpanRejectsAMalformedPair(t *testing.T) {
+	for _, raw := range []string{`{"start":1,"end":2}`, `[1]`, `[1,2,3]`, `"1,2"`} {
+		var s Span
+		if err := json.Unmarshal([]byte(raw), &s); err == nil {
+			t.Errorf("Unmarshal(%s) succeeded, want an error", raw)
+		}
+	}
+	// And the round trip, since the marshalled form is what an SDK test fixture writes.
+	encoded, err := json.Marshal(Span{Start: 8, End: 15})
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	if string(encoded) != `[8,15]` {
+		t.Errorf("Marshal = %s, want [8,15]", encoded)
+	}
+}
+
+// TestAggregateBodyAndResponse — the zero request counts everything, and the sums come
+// back as tagged Values so an Int total does not arrive having passed through a float.
+func TestAggregateBodyAndResponse(t *testing.T) {
+	fake := &capture{reply: `{"count":12,"sums":{"bytes":{"Int":40960},"ratio":{"Float":1.5}}}`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.Aggregate(ctx, AggregateRequest{}); err != nil {
+		t.Fatalf("Aggregate failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{}` {
+		t.Errorf("body = %s, want {} — scope, filter and sum all default", body)
+	}
+
+	out, err := db.Aggregate(ctx, AggregateRequest{
+		Scope:  []string{"docs"},
+		Filter: And(Eq("lang", "rust")),
+		Sum:    []string{"bytes", "ratio"},
+	})
+	if err != nil {
+		t.Fatalf("Aggregate failed: %v", err)
+	}
+	want := `{"scope":["docs"],"filter":[{"Eq":["lang",{"Str":"rust"}]}],"sum":["bytes","ratio"]}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+
+	if out.Count != 12 {
+		t.Errorf("Count = %d, want 12", out.Count)
+	}
+	if n, ok := out.Sums["bytes"].Int(); !ok || n != 40960 {
+		t.Errorf("Sums[bytes] = %v, want Int(40960)", out.Sums["bytes"])
+	}
+	// A Float sum must stay a Float: it is the tag that says the addends were not all
+	// integers, and collapsing it would lose that.
+	if f, ok := out.Sums["ratio"].Float(); !ok || f != 1.5 {
+		t.Errorf("Sums[ratio] = %v, want Float(1.5)", out.Sums["ratio"])
 	}
 }

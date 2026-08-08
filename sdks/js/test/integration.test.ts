@@ -102,6 +102,98 @@ describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
     expect(ids).toContain("y");
   });
 
+  it("carries the ranking, annotation, and aggregate knobs end to end", async () => {
+    const day = 86_400_000;
+    const origin = 1_700_000_000_000;
+    await db.createCollection("m50");
+    await db.setFtsSchema("m50", ["title", "body"]);
+    await db.upsert("m50", [
+      {
+        id: "p",
+        vector: [1, 0, 0],
+        attrs: {
+          title: "rust vectors",
+          body: "the quick brown fox",
+          path: "src/a.rs",
+          ts: new Date(origin),
+          bytes: 100,
+        },
+      },
+      {
+        id: "q",
+        vector: [0, 1, 0],
+        attrs: {
+          title: "go vectors",
+          body: "foxes run quickly",
+          path: "src/a.rs",
+          ts: new Date(origin - 30 * day),
+          bytes: 200,
+        },
+      },
+    ]);
+
+    const hits = await db.textSearch({
+      scope: ["m50"],
+      clauses: [
+        { field: "title", query: "rust" },
+        { field: "body", query: "fox" },
+      ],
+      combine: "Sum",
+      explain: true,
+      highlight: { maxFragments: 1, fragmentChars: 40 },
+    });
+    expect(hits[0]!.id).toBe("p");
+    const annotations = hits[0]!.annotations!;
+    expect(annotations.clauses!.map((c) => c.field)).toContain("title");
+    const body = annotations.highlights!.find((h) => h.field === "body")!;
+    const fragment = body.fragments[0]!;
+    expect(fragment.text.slice(...fragment.spans[0]!)).toBe("fox");
+
+    const scoped = { scope: ["m50"] };
+    const ids = async (filter: ReturnType<typeof f.and>) =>
+      (await db.list({ ...scoped, filter })).map((h) => h.id);
+    expect(await ids(f.and(f.fuzzy("title", "rast vectors", 1)))).toEqual(["p"]);
+    expect(await ids(f.and(f.containsTokenSequence("body", "brown fox")))).toEqual(["p"]);
+    expect(await ids(f.and(f.containsAnyToken("body", "fox")))).toEqual(["p"]);
+    expect(await ids(f.and(f.regex("path", "src/.*\\.rs")))).toEqual(["p", "q"]);
+
+    const ordered = await db.list({
+      ...scoped,
+      orderBy: { field: "bytes", descending: true },
+    });
+    expect(ordered.map((h) => h.id)).toEqual(["q", "p"]);
+
+    // Both records share one `path`, so a cap of 1 keeps only the better-scoring one.
+    const capped = await db.search({
+      ...scoped,
+      query: [1, 0, 0],
+      limitPer: { field: "path", max: 1 },
+    });
+    expect(capped.map((h) => h.id)).toEqual(["p"]);
+
+    // Equally similar, but `q` is 30 days older — decay is what separates them.
+    const decayed = await db.search({
+      ...scoped,
+      query: [1, 1, 0],
+      rankBy: { decay: { field: "ts", origin, scale: 7 * day } },
+    });
+    expect(decayed[0]!.id).toBe("p");
+
+    expect(await db.aggregate({ ...scoped, sum: ["bytes"] })).toEqual({
+      count: 2,
+      sums: { bytes: 300 },
+    });
+
+    const hybrid = await db.hybridSearch({
+      ...scoped,
+      vector: [1, 0, 0],
+      clauses: [{ field: "body", query: "fox" }],
+      textWeight: 2,
+      explain: true,
+    });
+    expect(hybrid[0]!.annotations!.text).toBeDefined();
+  });
+
   it("deletes and reflects the change in stats", async () => {
     expect(await db.delete("docs", { ids: ["b"] })).toBe(1);
     const remaining = await db.records("docs");

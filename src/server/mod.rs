@@ -22,10 +22,11 @@ use axum::{
 use serde_json::{Value as JsonValue, json};
 use tokio::net::TcpListener;
 
-use crate::{FtsQuery, HybridOpts, Language, Nidus, Record, Scope, SearchOpts};
+use crate::{FtsField, FtsQuery, HybridOpts, ListOpts, Nidus, Record, Scope, SearchOpts};
 use dto::{
-    AnnDto, DeleteRequest, FootprintDto, FtsSchemaRequest, HitDto, HybridSearchRequest,
-    ListRequest, SearchRequest, TextSearchRequest, UpsertRequest,
+    AggregateRequest, AggregationDto, AnnDto, DeleteRequest, FootprintDto, FtsSchemaRequest,
+    HitDto, HybridSearchRequest, ListRequest, MAX_TOP_K, SearchRequest, TextSearchRequest,
+    UpsertRequest,
 };
 
 // ── AI-ingest (memory) imports: only under the `memory` feature (pulled by the
@@ -386,6 +387,7 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/text-search", post(text_search))
         .route("/hybrid-search", post(hybrid_search))
         .route("/list", post(list))
+        .route("/aggregate", post(aggregate))
         .route("/flush", post(flush))
         .route("/compact", post(compact))
         .route("/refresh", post(refresh));
@@ -657,23 +659,50 @@ async fn search(
     State(st): State<AppState>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
+    check_page(req.offset, req.top_k)?;
+    let SearchRequest {
+        query,
+        scope,
+        top_k,
+        offset,
+        min_score,
+        filter,
+        exact,
+        include_attributes,
+        exclude_attributes,
+        rank_by,
+        limit_per,
+    } = req;
+    let projection = check_projection(include_attributes, exclude_attributes)?;
     let hits = run_read(st, move |db| {
-        let SearchRequest {
-            query,
-            scope,
-            top_k,
-            min_score,
-            filter,
-        } = req;
         let opts = SearchOpts {
             top_k,
+            offset,
             min_score,
             filter,
+            exact,
+            projection,
+            // Vector search has one score to report; annotations are a text/hybrid surface.
+            explain: false,
+            rank_by,
+            limit_per,
         };
         scoped(&scope, |s| db.search(s, &query, &opts))
     })
     .await?;
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+}
+
+/// `POST /aggregate`: count the filter-matching records and sum the named attributes,
+/// without materializing any of them.
+async fn aggregate(
+    State(st): State<AppState>,
+    Json(req): Json<AggregateRequest>,
+) -> Result<Json<AggregationDto>, ApiError> {
+    let AggregateRequest { scope, filter, sum } = req;
+    let opts = crate::AggregateOpts { filter, sum };
+    let out = run_read(st, move |db| scoped(&scope, |s| db.aggregate(s, &opts))).await?;
+    Ok(Json(AggregationDto::from(out)))
 }
 
 /// Resolve a wire `scope` (an empty list means "every collection") and run `f` with the
@@ -692,14 +721,25 @@ async fn list(
     State(st): State<AppState>,
     Json(req): Json<ListRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
+    let ListRequest {
+        scope,
+        offset,
+        limit,
+        filter,
+        include_attributes,
+        exclude_attributes,
+        order_by,
+    } = req;
+    let projection = check_projection(include_attributes, exclude_attributes)?;
     let hits = run_read(st, move |db| {
-        let ListRequest {
-            scope,
+        let opts = ListOpts {
             offset,
             limit,
             filter,
-        } = req;
-        scoped(&scope, |s| db.list(s, &filter, offset, limit))
+            projection,
+            order_by,
+        };
+        scoped(&scope, |s| db.list(s, &opts))
     })
     .await?;
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
@@ -711,11 +751,7 @@ async fn set_fts_schema(
     Json(req): Json<FtsSchemaRequest>,
 ) -> Result<Json<JsonValue>, ApiError> {
     run_write(st, move |db| {
-        let decl: Vec<(String, Language)> = req
-            .fields
-            .iter()
-            .map(|f| (f.clone(), Language::English))
-            .collect();
+        let decl: Vec<FtsField> = req.fields.into_iter().map(FtsField::from).collect();
         db.set_fts_schema(&name, &decl)
     })
     .await?;
@@ -726,21 +762,43 @@ async fn text_search(
     State(st): State<AppState>,
     Json(req): Json<TextSearchRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
+    check_page(req.offset, req.top_k)?;
+    let TextSearchRequest {
+        field,
+        query,
+        clauses,
+        combine,
+        scope,
+        top_k,
+        offset,
+        min_score,
+        filter,
+        explain,
+        highlight,
+        include_attributes,
+        exclude_attributes,
+        rank_by,
+        limit_per,
+    } = req;
+    let clauses = check_clauses(field, query, clauses)?;
+    let projection = check_projection(include_attributes, exclude_attributes)?;
     let hits = run_read(st, move |db| {
-        let TextSearchRequest {
-            field,
-            query,
-            scope,
-            top_k,
-            min_score,
-            filter,
-        } = req;
         let opts = SearchOpts {
             top_k,
+            offset,
             min_score,
             filter,
+            explain,
+            projection,
+            rank_by,
+            limit_per,
+            ..Default::default()
         };
-        let q = FtsQuery::new(field, query);
+        let q = FtsQuery {
+            clauses,
+            combine,
+            highlight,
+        };
         scoped(&scope, |s| db.text_search(s, &q, &opts))
     })
     .await?;
@@ -751,24 +809,41 @@ async fn hybrid_search(
     State(st): State<AppState>,
     Json(req): Json<HybridSearchRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
+    check_page(req.offset, req.top_k)?;
+    let HybridSearchRequest {
+        vector,
+        field,
+        text,
+        clauses,
+        combine,
+        scope,
+        top_k,
+        offset,
+        filter,
+        rrf_k,
+        candidates,
+        explain,
+        highlight,
+        vector_weight,
+        text_weight,
+    } = req;
+    let clauses = check_clauses(field, text, clauses)?;
     let hits = run_read(st, move |db| {
-        let HybridSearchRequest {
-            vector,
-            field,
-            text,
-            scope,
-            top_k,
-            filter,
-            rrf_k,
-            candidates,
-        } = req;
         let opts = HybridOpts {
             top_k,
+            offset,
             filter,
             rrf_k,
             candidates,
+            explain,
+            vector_weight,
+            text_weight,
         };
-        let q = FtsQuery::new(field, text);
+        let q = FtsQuery {
+            clauses,
+            combine,
+            highlight,
+        };
         scoped(&scope, |s| db.hybrid_search(s, &vector, &q, &opts))
     })
     .await?;
@@ -880,6 +955,7 @@ async fn recall(
     Path(name): Path<String>,
     Json(req): Json<RecallRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
+    check_page(0, req.top_k)?;
     let embedder = st.embedder.clone().ok_or_else(missing_embedder_error)?;
 
     let RecallRequest {
@@ -898,6 +974,7 @@ async fn recall(
         top_k,
         min_score,
         filter,
+        ..Default::default()
     };
     let hits = run_read(st, move |db| {
         crate::memory::guard_recall_identity(db, embedder.as_ref(), &name)?;
@@ -986,13 +1063,47 @@ impl ApiError {
 
     /// A `400 Bad Request` with a caller-facing message (e.g. a memory route hit
     /// on a server started without an embedder, or an unknown `remember` mode).
-    #[cfg(feature = "memory")]
     fn bad_request(err: anyhow::Error) -> Self {
         ApiError {
             status: StatusCode::BAD_REQUEST,
             err,
         }
     }
+}
+
+/// Refuse an absurd page at the edge (nidus-m50.17, nidus-m50.8). The bound is on
+/// `offset + top_k`, since that is how deep the ranking is actually computed — and it is a
+/// refusal, not a clamp: a silently shortened page would look like the end of the results.
+fn check_page(offset: usize, top_k: usize) -> Result<(), ApiError> {
+    let depth = offset.saturating_add(top_k);
+    if depth > MAX_TOP_K {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "offset {offset} + top_k {top_k} exceeds the maximum of {MAX_TOP_K}"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve a request's projection, refusing a body that names both an include and an exclude
+/// list. A `400`, not a precedence rule: silently honouring one of two contradictory
+/// instructions returns a payload the caller did not ask for (nidus-m50.15).
+fn check_projection(
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+) -> Result<crate::Projection, ApiError> {
+    dto::resolve_projection(include, exclude)
+        .map_err(|msg| ApiError::bad_request(anyhow::anyhow!(msg)))
+}
+
+/// Resolve a text query's clauses, refusing an unusable body — both spellings at once, neither,
+/// or an empty `clauses` list — with a `400` (nidus-m50.10).
+fn check_clauses(
+    field: Option<String>,
+    text: Option<String>,
+    clauses: Option<Vec<dto::FtsClauseDto>>,
+) -> Result<Vec<crate::FtsClause>, ApiError> {
+    dto::resolve_clauses(field, text, clauses)
+        .map_err(|msg| ApiError::bad_request(anyhow::anyhow!(msg)))
 }
 
 /// Map a store error to an HTTP status. Defaults to `500`; recognises the
@@ -1008,7 +1119,13 @@ fn classify(err: &anyhow::Error) -> StatusCode {
     let msg = format!("{err:#}").to_lowercase();
     if msg.contains("store is not open yet") {
         StatusCode::SERVICE_UNAVAILABLE
-    } else if msg.contains("does not match store dimension") {
+    } else if msg.contains("does not match store dimension")
+        || msg.contains("fts field")
+        || msg.contains("full-text query")
+        || msg.contains(crate::store::BAD_QUERY)
+    {
+        // A rejected FTS schema, a clause-less text query, or a malformed ranking knob:
+        // bad request bodies, not server faults.
         StatusCode::BAD_REQUEST
     } else if msg.contains("read-only store") {
         StatusCode::FORBIDDEN
@@ -1175,6 +1292,414 @@ mod tests {
         assert_eq!(stats["ann"], JsonValue::Null); // exact search by default
         assert_eq!(stats["collections"], json!(["docs"]));
         assert_eq!(stats["footprint"]["doc_count"], 2);
+    }
+
+    /// A filter the caller wrote wrong is a bad request, not a server fault (nidus-oih).
+    /// Only the library `Err` was pinned before, so these fell through `classify` to a 500 —
+    /// which also books a client mistake against the 5xx health metric.
+    #[tokio::test]
+    async fn an_unusable_filter_is_a_bad_request_not_a_server_error() {
+        let app = test_router(3);
+        for (path, body) in [
+            (
+                "/search",
+                json!({"query": [1, 0, 0], "filter": [{"Regex": ["k", "("]}]}),
+            ),
+            (
+                "/search",
+                json!({"query": [1, 0, 0], "filter": [{"Fuzzy": ["k", "x", 99]}]}),
+            ),
+            // Nested inside a group: `validate` recurses, so the tag must survive the nesting.
+            (
+                "/search",
+                json!({"query": [1, 0, 0], "filter": [{"Not": {"Regex": ["k", "("]}}]}),
+            ),
+            ("/list", json!({"filter": [{"Regex": ["k", "("]}]})),
+        ] {
+            let resp = app.clone().oneshot(post(path, body.clone())).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{path} {body}: a caller's bad filter must not be a 5xx"
+            );
+            // The 400 must still say WHICH predicate was wrong. Tagging the error with
+            // `.context` instead of inline once reduced this to "invalid query option".
+            let err = json_body(resp).await["error"].as_str().unwrap().to_string();
+            assert!(err.contains('`'), "{path}: error names no predicate: {err}");
+        }
+    }
+
+    /// A `top_k` nothing clamps used to reach the bounded top-k heap and abort the process
+    /// on "capacity overflow" (nidus-m50.17). The edge must call it a bad request instead.
+    #[tokio::test]
+    async fn an_absurd_top_k_is_a_bad_request_not_a_panic() {
+        let app = test_router(3);
+        for (path, body) in [
+            (
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": usize::MAX / 2}),
+            ),
+            (
+                "/text-search",
+                json!({"field": "body", "query": "x", "top_k": MAX_TOP_K + 1}),
+            ),
+            (
+                "/hybrid-search",
+                json!({"vector": [1, 0, 0], "field": "body", "text": "x", "top_k": MAX_TOP_K + 1}),
+            ),
+        ] {
+            let resp = app.clone().oneshot(post(path, body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+            let err = json_body(resp).await["error"].as_str().unwrap().to_string();
+            assert!(err.contains("top_k"), "{path}: {err}");
+        }
+    }
+
+    /// The bound is a ceiling, not a narrowing: everything up to it still searches.
+    #[tokio::test]
+    async fn a_top_k_at_the_maximum_still_searches() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [{"id": "a", "vector": [1, 0, 0], "attrs": {}}]}),
+            ))
+            .await
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": MAX_TOP_K}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await[0]["id"], "a");
+    }
+
+    /// The bound is on how deep the ranking is computed, so a legal `top_k` with an offset
+    /// that pushes past the ceiling is refused — and refused, not clamped, because a
+    /// silently shortened page is indistinguishable from the end of the results.
+    #[tokio::test]
+    async fn an_offset_that_pushes_past_the_maximum_is_a_bad_request() {
+        let app = test_router(3);
+        for (path, body) in [
+            (
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": 10, "offset": MAX_TOP_K}),
+            ),
+            (
+                "/text-search",
+                json!({"field": "body", "query": "x", "top_k": 1, "offset": MAX_TOP_K}),
+            ),
+            (
+                "/hybrid-search",
+                json!({"vector": [1, 0, 0], "field": "body", "text": "x", "offset": MAX_TOP_K}),
+            ),
+        ] {
+            let resp = app.clone().oneshot(post(path, body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+            let err = json_body(resp).await["error"].as_str().unwrap().to_string();
+            assert!(err.contains("offset"), "{path}: {err}");
+        }
+        // Exactly at the ceiling still searches.
+        let resp = app
+            .oneshot(post(
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": 10, "offset": MAX_TOP_K - 10}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// `offset` is additive: omitting it must behave exactly as before it existed, and
+    /// supplying it must cut the same ranking into non-overlapping pages.
+    #[tokio::test]
+    async fn search_offset_paginates_over_http() {
+        let app = test_router(3);
+        for (i, id) in ["a", "b", "c", "d"].iter().enumerate() {
+            app.clone()
+                .oneshot(post(
+                    "/collections/docs/upsert",
+                    json!({"records": [{"id": id, "vector": [1.0, i as f32 * 0.1, 0.0], "attrs": {}}]}),
+                ))
+                .await
+                .unwrap();
+        }
+        let hits = |body: JsonValue| {
+            let app = app.clone();
+            async move {
+                let resp = app.oneshot(post("/search", body)).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                json_body(resp).await
+            }
+        };
+
+        let implicit = hits(json!({"query": [1, 0, 0], "top_k": 2})).await;
+        let explicit = hits(json!({"query": [1, 0, 0], "top_k": 2, "offset": 0})).await;
+        assert_eq!(implicit, explicit, "an omitted offset is offset 0");
+        assert_eq!(implicit[0]["id"], "a");
+
+        let second = hits(json!({"query": [1, 0, 0], "top_k": 2, "offset": 2})).await;
+        assert_eq!(second[0]["id"], "c");
+        assert_eq!(second[1]["id"], "d");
+
+        let past_the_end = hits(json!({"query": [1, 0, 0], "top_k": 2, "offset": 99})).await;
+        assert_eq!(
+            past_the_end,
+            json!([]),
+            "an offset past the end is an empty page"
+        );
+    }
+
+    /// Projection is opt-in over the wire: an omitted pair is every attr, `include_attributes`
+    /// narrows to the named ones, `exclude_attributes` drops them — on `/search` and `/list` alike.
+    #[tokio::test]
+    async fn projection_narrows_the_attrs_over_http() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [{"id": "a", "vector": [1, 0, 0], "attrs": {
+                    "title": {"Str": "t"}, "body": {"Str": "long"}, "lang": {"Str": "rust"}
+                }}]}),
+            ))
+            .await
+            .unwrap();
+        let attrs = |path: &'static str, body: JsonValue| {
+            let app = app.clone();
+            async move {
+                let resp = app.oneshot(post(path, body)).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let hits = json_body(resp).await;
+                hits[0]["attrs"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<String>>()
+            }
+        };
+        let query = json!({"query": [1, 0, 0], "top_k": 1});
+        assert_eq!(
+            attrs("/search", query.clone()).await,
+            vec!["body", "lang", "title"],
+            "an omitted projection is every attr"
+        );
+        assert_eq!(
+            attrs(
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": 1, "include_attributes": ["title"]})
+            )
+            .await,
+            vec!["title"]
+        );
+        assert_eq!(
+            attrs(
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": 1, "exclude_attributes": ["body"]})
+            )
+            .await,
+            vec!["lang", "title"]
+        );
+        assert_eq!(
+            attrs("/list", json!({"include_attributes": ["lang"]})).await,
+            vec!["lang"]
+        );
+        assert_eq!(
+            attrs("/list", json!({"exclude_attributes": ["body", "lang"]})).await,
+            vec!["title"]
+        );
+    }
+
+    /// Both projection lists in one body is a `400`, not a precedence rule (nidus-m50.15):
+    /// honouring one of two contradictory instructions ships a payload nobody asked for.
+    #[tokio::test]
+    async fn both_projection_lists_at_once_is_a_bad_request() {
+        let app = test_router(3);
+        for (path, body) in [
+            (
+                "/search",
+                json!({"query": [1, 0, 0], "include_attributes": ["a"], "exclude_attributes": ["b"]}),
+            ),
+            (
+                "/list",
+                json!({"include_attributes": ["a"], "exclude_attributes": ["b"]}),
+            ),
+        ] {
+            let resp = app.clone().oneshot(post(path, body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+            let err = json_body(resp).await["error"].as_str().unwrap().to_string();
+            assert!(err.contains("mutually exclusive"), "{path}: {err}");
+        }
+    }
+
+    /// `exact` is additive: omitting it is the store's configured path, and asking for it
+    /// answers the same ranking (this store has no index, so both are the brute-force scan).
+    #[tokio::test]
+    async fn exact_is_an_additive_search_knob() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "a", "vector": [1, 0, 0], "attrs": {}},
+                    {"id": "b", "vector": [0, 1, 0], "attrs": {}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        let hits = |body: JsonValue| {
+            let app = app.clone();
+            async move {
+                let resp = app.oneshot(post("/search", body)).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                json_body(resp).await
+            }
+        };
+        let implicit = hits(json!({"query": [1, 0, 0], "top_k": 2})).await;
+        let forced = hits(json!({"query": [1, 0, 0], "top_k": 2, "exact": true})).await;
+        assert_eq!(implicit, forced);
+        assert_eq!(implicit[0]["id"], "a");
+    }
+
+    /// Two docs at the same base score, one a week older, in one file. Enough to drive decay,
+    /// `limit_per`, `order_by`, and `/aggregate` over the wire.
+    async fn ranked_router() -> Router {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "fresh", "vector": [1, 0, 0],
+                     "attrs": {"ts": {"DateTime": 1_000_000_000_000i64},
+                               "file": {"Str": "a.rs"}, "bytes": {"Int": 10}}},
+                    {"id": "stale", "vector": [1, 0, 0],
+                     "attrs": {"ts": {"DateTime": 999_395_200_000i64},
+                               "file": {"Str": "a.rs"}, "bytes": {"Int": 32}}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        app
+    }
+
+    #[tokio::test]
+    async fn rank_by_decay_reorders_over_http() {
+        let app = ranked_router().await;
+        let body = json!({
+            "query": [1, 0, 0], "top_k": 2,
+            "rank_by": {"Decay": {"field": "ts", "origin": 1_000_000_000_000i64,
+                                  "scale": 604_800_000i64, "lambda": 0.4}}
+        });
+        let resp = app.clone().oneshot(post("/search", body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        assert_eq!(hits[0]["id"], "fresh");
+        assert_eq!(hits[1]["id"], "stale");
+        // base 1.0 − 0.4 × (1 − 0.5) at exactly one half-life.
+        let stale = hits[1]["score"].as_f64().unwrap();
+        assert!((stale - 0.8).abs() < 1e-5, "{stale}");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_rank_by_is_a_bad_request() {
+        let app = ranked_router().await;
+        let body = json!({
+            "query": [1, 0, 0],
+            "rank_by": {"Decay": {"field": "ts", "origin": 0, "scale": 0}}
+        });
+        let resp = app.oneshot(post("/search", body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn limit_per_caps_hits_over_http() {
+        let app = ranked_router().await;
+        let body =
+            json!({"query": [1, 0, 0], "top_k": 2, "limit_per": {"field": "file", "max": 1}});
+        let resp = app.oneshot(post("/search", body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        assert_eq!(hits.as_array().unwrap().len(), 1, "both share one file");
+    }
+
+    #[tokio::test]
+    async fn order_by_sorts_a_list_over_http() {
+        let app = ranked_router().await;
+        let ids = |descending: bool| {
+            let app = app.clone();
+            async move {
+                let body = json!({"order_by": {"field": "bytes", "descending": descending}});
+                let resp = app.oneshot(post("/list", body)).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                json_body(resp).await
+            }
+        };
+        assert_eq!(ids(false).await[0]["id"], "fresh");
+        assert_eq!(ids(true).await[0]["id"], "stale");
+    }
+
+    #[tokio::test]
+    async fn aggregate_counts_and_sums_over_http() {
+        let app = ranked_router().await;
+        let resp = app
+            .clone()
+            .oneshot(post("/aggregate", json!({"sum": ["bytes"]})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out = json_body(resp).await;
+        assert_eq!(out["count"], 2);
+        assert_eq!(out["sums"]["bytes"], json!({"Int": 42}));
+
+        // A filter that matches nothing still answers, with a zero count.
+        let body = json!({"filter": [{"Eq": ["file", {"Str": "nope"}]}], "sum": ["bytes"]});
+        let resp = app.oneshot(post("/aggregate", body)).await.unwrap();
+        let out = json_body(resp).await;
+        assert_eq!(out["count"], 0);
+        assert_eq!(out["sums"]["bytes"], json!({"Int": 0}));
+    }
+
+    #[tokio::test]
+    async fn hybrid_leg_weights_default_to_the_unweighted_fusion() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/fts-schema",
+                json!({"fields": ["body"]}),
+            ))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "v", "vector": [1, 0, 0], "attrs": {"body": {"Str": "nothing"}}},
+                    {"id": "t", "attrs": {"body": {"Str": "quantum physics"}}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        let fused = |body: JsonValue| {
+            let app = app.clone();
+            async move {
+                let resp = app.oneshot(post("/hybrid-search", body)).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                json_body(resp).await
+            }
+        };
+        let base = json!({"vector": [1, 0, 0], "field": "body", "text": "quantum", "top_k": 2});
+        let mut explicit = base.clone();
+        explicit["vector_weight"] = json!(1.0);
+        explicit["text_weight"] = json!(1.0);
+        assert_eq!(fused(base.clone()).await, fused(explicit).await);
+
+        let mut heavy = base;
+        heavy["vector_weight"] = json!(8.0);
+        assert_eq!(fused(heavy).await[0]["id"], "v");
     }
 
     /// Before the store opens — a standby awaiting promotion — liveness must answer while
@@ -1528,6 +2053,199 @@ mod tests {
             .map(|h| h["id"].as_str().unwrap().to_string())
             .collect();
         assert!(ids.contains(&"a".to_string()) && ids.contains(&"b".to_string()));
+    }
+
+    /// The tuned form of the FTS schema body: per-field `k1`/`b`/analyzer, mixed with the
+    /// bare-name form in one request, and visible in the ranking it produces.
+    #[tokio::test]
+    async fn fts_schema_accepts_per_field_tuning() {
+        let app = test_router(3);
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/docs/fts-schema",
+                json!({"fields": ["title", {"field": "body", "b": 0.0, "ascii_folding": true}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "short", "attrs": {"body": {"Str": "café"}}},
+                    {"id": "long", "attrs": {"body": {"Str": "cafe cafe plus assorted padding words"}}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Folding made both spellings one term, and `b = 0` lets the longer doc win.
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/text-search",
+                json!({"field": "body", "query": "cafe", "top_k": 5}),
+            ))
+            .await
+            .unwrap();
+        let hits = json_body(resp).await;
+        assert_eq!(hits.as_array().unwrap().len(), 2);
+        assert_eq!(hits[0]["id"], "long");
+    }
+
+    /// An out-of-range BM25 parameter is a 400, not a store that scores nonsense forever.
+    #[tokio::test]
+    async fn fts_schema_rejects_an_impossible_parameter() {
+        let resp = test_router(3)
+            .oneshot(post(
+                "/collections/docs/fts-schema",
+                json!({"fields": [{"field": "body", "b": 4.0}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A store with `title` + `body` indexed and three docs, for the multi-clause tests.
+    async fn two_field_router() -> Router {
+        let app = test_router(3);
+        assert_eq!(
+            app.clone()
+                .oneshot(post(
+                    "/collections/docs/fts-schema",
+                    json!({"fields": [{"field": "title", "b": 0.0}, {"field": "body", "b": 0.0}]}),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "spread", "attrs": {"title": {"Str": "needle"}, "body": {"Str": "needle"}}},
+                    {"id": "focused", "attrs": {"title": {"Str": "alpha"}, "body": {"Str": "needle needle needle needle"}}},
+                    {"id": "filler", "attrs": {"title": {"Str": "needle"}, "body": {"Str": "gamma"}}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        app
+    }
+
+    /// Several BM25 clauses over the wire, and `combine` changing the ranking (nidus-m50.10).
+    #[tokio::test]
+    async fn multi_clause_text_search_over_http() {
+        let app = two_field_router().await;
+        let query = |combine: &str| {
+            json!({"clauses": [
+                {"field": "title", "query": "needle"},
+                {"field": "body", "query": "needle"}
+            ], "combine": combine, "top_k": 5})
+        };
+        let top = |hits: &JsonValue| hits[0]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(post("/text-search", query("Sum")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(top(&json_body(resp).await), "spread");
+
+        let resp = app
+            .clone()
+            .oneshot(post("/text-search", query("Max")))
+            .await
+            .unwrap();
+        assert_eq!(top(&json_body(resp).await), "focused");
+    }
+
+    /// A body with no usable clause spelling is a `400`, never an empty result set.
+    #[tokio::test]
+    async fn an_unusable_text_query_body_is_a_400() {
+        let app = two_field_router().await;
+        for body in [
+            json!({"clauses": []}),
+            json!({"top_k": 5}),
+            json!({"field": "body", "query": "x", "clauses": [{"field": "title", "query": "y"}]}),
+        ] {
+            for route in ["/text-search", "/hybrid-search"] {
+                let mut body = body.clone();
+                if route == "/hybrid-search" {
+                    // The hybrid body spells the single form `field` + `text`.
+                    let obj = body.as_object_mut().unwrap();
+                    if let Some(q) = obj.remove("query") {
+                        obj.insert("text".into(), q);
+                    }
+                    obj.insert("vector".into(), json!([1, 0, 0]));
+                }
+                let resp = app
+                    .clone()
+                    .oneshot(post(route, body.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{route} {body}");
+            }
+        }
+    }
+
+    /// `explain` and `highlight` are opt-in, and the fragments index the stored text
+    /// even when the projection dropped the field (nidus-m50.5).
+    #[tokio::test]
+    async fn annotations_are_opt_in_over_http() {
+        let app = two_field_router().await;
+
+        // Default: no `annotations` key at all.
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/text-search",
+                json!({"field": "body", "query": "needle", "top_k": 5}),
+            ))
+            .await
+            .unwrap();
+        let hits = json_body(resp).await;
+        assert!(hits[0].get("annotations").is_none());
+
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/text-search",
+                json!({
+                    "clauses": [{"field": "title", "query": "needle"}, {"field": "body", "query": "needle"}],
+                    "top_k": 5, "explain": true, "highlight": {"fragment_chars": 40}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        let a = &hits[0]["annotations"];
+        assert_eq!(a["clauses"][0]["field"], "title");
+        assert_eq!(a["highlights"][0]["field"], "title");
+        assert_eq!(a["highlights"][0]["fragments"][0]["spans"][0][0], 0);
+
+        // Hybrid reports each leg's own rank and score.
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/hybrid-search",
+                json!({"vector": [1, 0, 0], "field": "body", "text": "needle",
+                       "top_k": 5, "explain": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        assert!(hits[0]["annotations"]["text"]["rank"].is_number());
     }
 
     // ── Backpressure (nidus-abx.2) ──────────────────────────────────────────

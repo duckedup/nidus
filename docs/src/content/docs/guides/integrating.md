@@ -10,10 +10,11 @@ into its runtime.
 
 ## Map your document onto a Record
 
-A `Record` is an `id`, a `vector`, and an open `attrs` map. Every field of your
-document either *is* one of those or fits an attr. Pick a stable `id` (it is the
+A `Record` is an `id`, an **optional** `vector`, and an open `attrs` map. Every field of
+your document either *is* one of those or fits an attr. Pick a stable `id` (it is the
 upsert key), embed the content into `vector`, and project the rest into typed
-attrs:
+attrs (a document with no embedding is `Record::text_only(id, attrs)`, found by
+[full-text search](/guides/search/#full-text-search-bm25) and never by vector `search`):
 
 ```rust
 use std::collections::BTreeMap;
@@ -105,8 +106,13 @@ let db = Nidus::open(Config::new("/path/to/store", 768).query_threads(4))?;
 Pick one. Intra-query threads help when queries arrive **one at a time** against a
 large store on otherwise-idle cores. The plain f32 scan is memory-bandwidth-bound,
 so its speedup is real but sublinear (≈1.3–1.4× at 4–8 threads on 100k × 768).
-Threads pay off best paired with [int8 quantization](/guides/search/#int8-scalar-quantization):
+Threads pay off best paired with [int8 quantization](/guides/search/#quantization):
 the int8 first pass moves 4× fewer bytes (compute- not bandwidth-bound), so it
 splits across the same workers and scales to ≈2.4× at 4 threads. If you already have
 query-level concurrency, leave `query_threads` at `1` — splitting each query then
 just oversubscribes the cores your concurrent readers are already using.
+
+One exception to know: a query carrying
+[`rank_by`](/guides/search/#ranking-by-recency) runs **single-threaded** regardless. It
+needs each candidate's attrs to compute the age penalty, and the parallel scan kernels
+never see them.

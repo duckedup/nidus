@@ -33,6 +33,7 @@ so the same id appears in your logs and the server's.
 | `POST /text-search` | BM25 full-text search | `text_search` |
 | `POST /hybrid-search` | fused vector + BM25 (RRF) | `hybrid_search` |
 | `POST /list` | metadata-only query (no vector) | `list` |
+| `POST /aggregate` | count + sum over a filter, no records materialized | `aggregate` |
 | `POST /flush` | flush buffered writes to disk | `flush` |
 | `POST /compact` | reclaim dead rows and superseded log records | `compact` |
 | `POST /refresh` | adopt another instance's newer committed state | `refresh` |
@@ -228,8 +229,8 @@ curl -s -X PUT localhost:7700/collections/docs/meta \
 
 ### `POST /collections/{name}/fts-schema`
 
-Declare which attribute fields of a collection are full-text indexed for BM25 (US
-English analyzer). Run it once before (or after) upserting; see
+Declare which attribute fields of a collection are full-text indexed for BM25. Run it
+once before (or after) upserting; see
 [Full-text search](/guides/search/#full-text-search-bm25) for the ranking model.
 
 ```bash
@@ -239,13 +240,31 @@ curl -s -X POST localhost:7700/collections/docs/fts-schema \
 # → {"ok": true}
 ```
 
+A field entry may also be an object, tuning BM25 and the analyzer for that field alone.
+Every key but `field` is optional and defaults to what the bare-name form gets — `k1`
+1.2, `b` 0.75, `language` `"english"`, no ASCII folding, no token-length cap
+([details](/guides/search/#tuning-a-field)):
+
+```bash
+curl -s -X POST localhost:7700/collections/docs/fts-schema \
+  -H 'content-type: application/json' \
+  -d '{"fields": ["title", {"field": "body", "k1": 1.5, "b": 0.3, "ascii_folding": true}]}'
+# → {"ok": true}
+```
+
 ## Records
 
 ### `POST /collections/{name}/upsert`
 
 Insert or overwrite records by id. Each record is `{id, vector, attrs}`; `vector`
-length must match the store dimension. `attrs` values are tagged
-(`{"Str": …}`, `{"Int": …}`, `{"Bool": …}`, `{"List": […]}`, `{"Null": null}`).
+length must match the store dimension, and may be **omitted** for a text-only document.
+`attrs` values are tagged: `{"Str": …}`, `{"Int": …}`, `{"Bool": …}`, `{"List": […]}`,
+`{"Float": …}`, `{"DateTime": …}` (epoch milliseconds) — and the unit variant `Null` is
+the bare string `"Null"`, not an object.
+
+`Float` and `Int` are distinct types and never cross-compare in a filter, so a whole
+number sent as `{"Float": 1.0}` stays a `Float` on the way back out. Pick one spelling per
+attribute and keep to it.
 
 ```bash
 curl -s localhost:7700/collections/docs/upsert \
@@ -311,20 +330,88 @@ curl -s localhost:7700/search \
 | `query` | — (required) | query vector; length must equal the store dimension |
 | `scope` | all collections | collection names to search |
 | `top_k` | `10` | maximum hits to return |
+| `offset` | `0` | top-ranked hits to skip, for pagination |
 | `min_score` | none | drop hits scoring below this similarity |
 | `filter` | none | AND of predicates applied before scoring |
+| `exact` | `false` | force the exact scan, bypassing any index and quantization |
+| `include_attributes` | all attrs | return only these attrs |
+| `exclude_attributes` | all attrs | return every attr but these |
+| `rank_by` | none | a [ranking expression](/guides/search/#ranking-by-recency) over the metric |
+| `limit_per` | none | cap hits per distinct value of an attribute |
 
-Returns hits sorted by descending score:
+Returns hits ordered by `(score desc, collection, id)` — the tie-break is a guarantee,
+which is what makes paging coherent:
 
 ```json
 [{"collection": "docs", "id": "a", "score": 1.0, "attrs": {"lang": {"Str": "rust"}}}]
 ```
 
+`offset` pages one ranking: `{"top_k": 20}` then `{"top_k": 20, "offset": 20}` tiles it
+with no gap and no overlap. An `offset` past the last hit returns `[]` rather than an
+error. `offset + top_k` may not exceed **10 000** — beyond that the request is a `400`,
+never a silently shortened page. A page is stable only against an unchanging store;
+concurrent writes shift the ranking under a paged walk.
+
+`exact: true` runs the exact brute-force scan for that one request, bypassing the ANN
+walk, the per-segment index, and the quantized first pass — the store keeps its index for
+every other query.
+
+`include_attributes` and `exclude_attributes` choose which attrs the hits carry; omit
+both for every attr, exactly as before. Sending **both** in one request is a `400`, not a
+precedence rule. The projection is applied where the hit is built, so an excluded attr is
+never serialized — which is the point on a collection of long text bodies.
+
+#### Ranking by recency
+
+`rank_by` layers a recency decay over the metric: an age penalty **subtracted** from each
+hit's score, so it works for every distance metric and for BM25 alike.
+
+```bash
+curl -s localhost:7700/search \
+  -H 'content-type: application/json' \
+  -d '{
+        "query": [1, 0, 0],
+        "rank_by": {"Decay": {"field": "updated_at",
+                              "origin": 1770000000000,
+                              "scale": 604800000,
+                              "lambda": 0.2}}
+      }'
+```
+
+| `Decay` field | Default | Meaning |
+| --- | --- | --- |
+| `field` | — (required) | timestamp attr: a `DateTime` or an `Int`, epoch milliseconds |
+| `origin` | — (required) | "now" in epoch ms; ages are measured back from here |
+| `scale` | `604800000` (7 days) | the age at which the factor equals `decay` |
+| `decay` | `0.5` | the factor at one `scale` of age — `0.5` makes `scale` a half-life |
+| `lambda` | `1.0` | score a fully-decayed hit gives up |
+| `missing` | `1.0` | factor for a record with no usable timestamp — **no penalty** |
+
+The score is `base − lambda × (1 − decay^(age / scale))`. `missing` defaults to `1.0`, so
+enabling decay never buries records written before the field existed. `rank_by` does not
+force an exact scan — over an ANN or quantized result set it reorders within an approximate
+candidate set. A malformed expression (a non-positive `scale`, a `decay` outside `(0, 1)`, a
+negative `lambda`) is a `400`.
+
+#### Capping hits per attribute value
+
+```bash
+curl -s localhost:7700/search \
+  -H 'content-type: application/json' \
+  -d '{"query": [1, 0, 0], "top_k": 20, "limit_per": {"field": "path", "max": 2}}'
+```
+
+Records **missing** the attribute share one group, and the value is read from the stored
+record, so `exclude_attributes` cannot lift the cap. The cap is exact only within an
+over-fetch window, so a capped page may come back shorter than `top_k`; what is guaranteed
+is that no page carries more than `max` hits for one value.
+
 ### `POST /text-search`
 
-BM25 full-text search of a declared field. Returns the same hit shape as `/search`.
-Takes `field`, `query`, `scope`, `top_k`, `filter`, and `min_score` — here a **raw
-BM25** floor (not cosine).
+BM25 full-text search of declared fields. Returns the same hit shape as `/search`.
+Takes `scope`, `top_k`, `offset`, `filter`, `rank_by`, `limit_per`, `min_score` — here a
+**raw BM25** floor (not cosine) — the `include_attributes`/`exclude_attributes` projection,
+and the query itself in one of two spellings.
 
 ```bash
 curl -s localhost:7700/text-search \
@@ -332,11 +419,39 @@ curl -s localhost:7700/text-search \
   -d '{"field": "body", "query": "running quickly", "scope": ["docs"], "top_k": 5}'
 ```
 
+Name several fields with `clauses` instead — each clause carries its own text:
+
+```bash
+curl -s localhost:7700/text-search \
+  -H 'content-type: application/json' \
+  -d '{
+        "clauses": [
+          {"field": "title", "query": "rust"},
+          {"field": "body",  "query": "async runtime"}
+        ],
+        "combine": "Sum",
+        "top_k": 5
+      }'
+```
+
+| field | default | meaning |
+| --- | --- | --- |
+| `field` + `query` | — | the single-clause spelling |
+| `clauses` | — | `[{field, query}, …]`, one entry per field searched |
+| `combine` | `"Sum"` | `"Sum"` adds every matched clause's score; `"Max"` takes the strongest |
+| `explain` | `false` | report each matched clause's own BM25 score |
+| `highlight` | absent | `{}` for defaults, or `{"max_fragments": 2, "fragment_chars": 120}` |
+
+`field`+`query` and `clauses` are **mutually exclusive**, and an empty `clauses` list is a
+`400` — an empty result set would otherwise read as "no matches" rather than "no query".
+
 ### `POST /hybrid-search`
 
 Fuse a vector query and a BM25 text query with Reciprocal Rank Fusion. Takes `vector`
-+ `field` + `text`, plus `top_k`, `filter`, `rrf_k` (default 60), and `candidates`
-(default 100). There is no `min_score` (a fused RRF score has no absolute scale).
+plus the text leg — `field` + `text`, or the same `clauses` + `combine` as `/text-search` —
+plus `top_k`, `offset` (which pages the **fused** ranking, never a leg),
+`filter`, `rrf_k` (default 60), `candidates` (default 100), and `explain`/`highlight`.
+There is no `min_score` (a fused RRF score has no absolute scale).
 Returns the same hit shape as `/search`.
 
 ```bash
@@ -344,6 +459,44 @@ curl -s localhost:7700/hybrid-search \
   -H 'content-type: application/json' \
   -d '{"vector": [1,0,0], "field": "body", "text": "vector database", "top_k": 5}'
 ```
+
+`vector_weight` and `text_weight` (both default `1.0`) scale each leg's contribution to the
+fused score. Leaving them out — or sending `1.0` for both — reproduces the unweighted fusion
+exactly. A non-finite or negative weight is a `400`.
+
+```bash
+curl -s localhost:7700/hybrid-search \
+  -H 'content-type: application/json' \
+  -d '{"vector": [1,0,0], "field": "body", "text": "CVE-2026-1234", "text_weight": 3.0}'
+```
+
+### Annotations: why a hit matched
+
+`explain` and `highlight` add an `annotations` object to each hit. Both are opt-in, and the
+key is **absent** otherwise — an unannotated response is byte-for-byte what it always was.
+
+```json
+{
+  "collection": "docs", "id": "a", "score": 0.031, "attrs": {"title": {"Str": "vector search"}},
+  "annotations": {
+    "vector": {"rank": 0, "score": 0.98},
+    "text": {"rank": 1, "score": 1.10},
+    "clauses": [{"field": "title", "score": 0.49}, {"field": "body", "score": 0.61}],
+    "highlights": [
+      {"field": "body", "fragments": [
+        {"text": "the engineers were running", "spans": [[19, 26]]}
+      ]}
+    ]
+  }
+}
+```
+
+`vector`/`text` are the fusion legs' own rank and score, and appear only on
+`/hybrid-search`. `clauses` lists the clauses that actually matched, in query order.
+`spans` are `[start, end)` **byte** offsets into that fragment's `text`, covering the word
+as the document spells it — a query for `run` marks `running`. Highlighting reads the
+stored text, so it still works on a field `include_attributes`/`exclude_attributes`
+dropped from the payload: that pairing (drop the long body, keep the snippet) is the point.
 
 ### `POST /list`
 
@@ -361,12 +514,80 @@ curl -s localhost:7700/list \
       }'
 ```
 
-`limit` defaults to `100`, `offset` to `0`. The response shape matches search
-(hits with a `score` of `0`, since nothing is scored).
+`limit` defaults to `100`, `offset` to `0`. `/list` takes the same
+`include_attributes`/`exclude_attributes` projection as `/search`, with the same `400`
+when both are sent. The response shape matches search (hits with a `score` of `0`, since
+nothing is scored).
 
-The `filter` in both `/search` and `/list` is an AND of predicates: `Eq`, `Ne`,
-`Glob`, `IGlob`, `In`, `NotIn`, `Lt`, `Le`, `Gt`, `Ge`. See
-[Search & filters](/guides/search/) for the full predicate grammar.
+`order_by` sorts by an attribute instead of storage order — ORDER BY with no vector query.
+Sorting runs over the whole match set before the page is cut, so `offset`/`limit` walk the
+sorted order.
+
+```bash
+curl -s localhost:7700/list \
+  -H 'content-type: application/json' \
+  -d '{"order_by": {"field": "updated_at", "descending": true}, "limit": 20}'
+```
+
+`descending` defaults to `false`. Values that do not order against the first orderable one —
+a different `Value` variant, an unorderable `Null`/`List`, or a record missing the attribute
+— sort into one trailing bucket, which stays trailing when reversed.
+
+### `POST /aggregate`
+
+Count the filter-matching records and total numeric attributes, without materializing any
+of them. Same `scope` and `filter` as `/list`.
+
+```bash
+curl -s localhost:7700/aggregate \
+  -H 'content-type: application/json' \
+  -d '{
+        "scope": ["docs"],
+        "filter": [{"Eq": ["lang", {"Str": "rust"}]}],
+        "sum": ["bytes"]
+      }'
+```
+
+```json
+{"count": 12, "sums": {"bytes": {"Int": 40960}}}
+```
+
+`count` is always reported; `sum` names attributes to total. Each total is a tagged value —
+`Int` while every addend was an `Int`, `Float` once any `Float` joined. A missing or
+non-numeric value is skipped rather than counted as zero. A filter matching nothing answers
+`{"count": 0, ...}` rather than erroring.
+
+### The `filter` grammar
+
+Every route that takes a `filter` — `/search`, `/text-search`, `/hybrid-search`, `/list`,
+`/aggregate`, and `/collections/{name}/delete` — takes the same one: a JSON array of
+predicates, AND-combined. Each predicate is a single-key object naming the variant.
+
+| Group | Predicates |
+| --- | --- |
+| Equality & sets | `Eq`, `Ne`, `In`, `NotIn` |
+| Ranges (same-type, orderable) | `Lt`, `Le`, `Gt`, `Ge` |
+| Patterns | `Glob`, `IGlob` (ASCII-case-insensitive), `Regex` |
+| List containment | `Contains`, `NotContains`, `ContainsAny` |
+| Text | `Fuzzy`, `ContainsAllTokens`, `ContainsAnyToken`, `ContainsTokenSequence` |
+| Boolean groups | `All`, `Any`, `Not` |
+
+```json
+[
+  {"Any": [{"Eq": ["lang", {"Str": "rust"}]}, {"Eq": ["lang", {"Str": "go"}]}]},
+  {"Not": {"Contains": ["tags", {"Str": "generated"}]}},
+  {"Ge": ["updated_at", {"DateTime": 1770000000000}]},
+  {"Fuzzy": ["name", "nidus", 2]},
+  {"Regex": ["path", "src/[a-z]+/mod\\.rs"]}
+]
+```
+
+`All`/`Any`/`Not` take predicates rather than values, so any boolean shape nests inside
+the outer AND. `Not` and `Ne` differ on a **missing** attribute: `Ne` requires the key
+present, `Not` is a true complement. A filter is validated once per query, before any row
+is scanned, so an unparseable `Regex` or a `Fuzzy` budget above 8 is **refused with an
+error** rather than quietly matching nothing. See
+[Search & filters](/guides/search/#filters) for the full semantics.
 
 ## Maintenance
 
