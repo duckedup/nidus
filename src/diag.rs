@@ -113,19 +113,12 @@ fn write_value(out: &mut String, v: &dyn std::fmt::Display) {
     out.push('"');
 }
 
-/// Emit a levelled, structured event.
+/// Emit a levelled, structured event. Named `diag!`, not `log!`, because `crate::log` is the
+/// op-log codec; the level check precedes argument evaluation, so a suppressed event is one load.
 ///
 /// ```ignore
 /// diag!(Level::Warn, "lease", "renewal failed transiently", "attempt" => attempt, "err" => format!("{e:#}"));
 /// ```
-///
-/// Named `diag!` rather than `log!` because `crate::log` is already the op-log codec —
-/// two `log`s in one crate, in different namespaces, is exactly the ambiguity a reader
-/// should never have to resolve.
-///
-/// The level check happens *before* the arguments are evaluated, so a suppressed event
-/// costs an atomic load — formatting an error chain for a `debug` line nobody asked for
-/// would otherwise be a real cost on a hot path.
 macro_rules! diag {
     ($lvl:expr, $target:expr, $msg:expr $(, $k:expr => $v:expr)* $(,)?) => {{
         let lvl = $lvl;

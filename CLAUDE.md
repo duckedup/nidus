@@ -300,7 +300,7 @@ mmap (`src/data/mmap.rs`) — so check §9 rather than trusting a list here.
   new sibling file over appending to it — and move the matching tests into the
   module's own `tests.rs` rather than growing one giant test block.
 - **Comments: 3 lines maximum, and they must add clarity.** This is a hard cap on every
-  comment and doc comment — `//`, `///`, `//!` — counting the whole block, including any
+  comment and doc comment — `//` and `///` — counting the whole block, including any
   `///` blank separators. A comment earns its place by saying something the code cannot:
   the non-obvious *why*, a constraint that will bite, a bug it guards against. It does not
   earn its place by restating the code, justifying the design at length, arguing with an
@@ -309,9 +309,16 @@ mmap (`src/data/mmap.rs`) — so check §9 rather than trusting a list here.
   `bd` issue — not above the code.** When trimming, keep the fact and drop the argument:
   "rmcp reports `rmcp 3.1.1` here, not this crate" beats a paragraph explaining why that
   matters. Long comments are not thoroughness; they push the code off the screen and go
-  stale where prose in a commit cannot. **One exception:** a doc example (a ```` ``` ````
+  stale where prose in a commit cannot. **Two exceptions.** A doc example (a ```` ``` ````
   fence) is test code, not commentary, so it does not count toward the cap — the prose
-  around it still does.
+  around it still does. And **`//!` module/crate docs are exempt entirely**: that block is
+  the crate's published rustdoc landing page (what a reader meets on docs.rs), not
+  commentary sitting between a reader and the code, so the reason for the cap — keeping
+  code on screen — does not apply. `//!` earns no licence to ramble; it is just reviewed
+  as documentation rather than counted. The exemption is **per line, not per block**: a
+  `///` doc that happens to abut a `//!` one — no blank line between, which is ordinary
+  Rust — is still counted, or a stray `//!` would be a one-line way to dodge the cap.
+  `lib/laws.mjs` `commentCap` implements both exceptions.
 - **Commit style**: emoji prefix + short description (e.g. `🪺 op-log codec`).
 - **Issue tracking**: GitHub Issues — run `gh issue list --state open` for available work.
 - **Branch workflow**: one branch per issue or bundled epic, push for PR review.
