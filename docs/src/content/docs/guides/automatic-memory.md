@@ -285,5 +285,7 @@ when the key is absent and when it is in the future, which is the behaviour you 
 - [MCP (agent memory)](/guides/mcp/) — the tool surface the model sees, and the stdio
   transport for the single-client case.
 - [Remember & recall](/guides/remember-and-recall/) — the same layer from Rust, and
-  what an embedder needs from you.
+  what an embedder needs from you. Note the attr table above describes what the
+  **server** stamps; the in-process Rust `Memory::remember` does not currently write
+  `nidus.text`, so `text_search` against it needs you to set that attr yourself.
 - [Search & filters](/guides/search/) — the filter grammar the hooks above use.
