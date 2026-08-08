@@ -1175,6 +1175,47 @@ The general rule this encodes: a change to the *segment format* needs a named ca
 because it is the one layer where being wrong is expensive to walk back. Query-path
 features do not carry that burden and are judged on their own merits.
 
+### 9.1 A bundled zero-config local embedder — RESOLVED (not shipping)
+
+Every shipped embedder (voyage, openai, ollama, cohere, gemini, mistral, jina,
+openai-compat) needs an API key or a running daemon, so `nidus mcp` cannot be
+zero-config. The question was whether to ship a local embedder to close that gap.
+
+**The premise this was filed under turned out to be wrong**, and that is worth
+recording because it will come up again. The assumption was that a local embedder
+collides with the §1/§13.6 build-cost bar. It does not. That bar rules out an
+*inference engine* — ONNX Runtime is exactly the multi-minute native-toolchain
+dependency nidus exists to avoid. But a **static** embedder (model2vec-style) is not
+an inference engine: it is a token→vector lookup table plus mean-pooling, which is
+tens of lines of pure Rust and costs nothing to compile. Measured for reference: the
+clean default build is ~16s against a "well under a minute" budget.
+
+The real cost is **weight distribution**, a constraint the build bar does not speak to:
+
+- **Bundled in the crate** — ~8 MB (int8) to ~32 MB (f32) for a table worth using.
+  Every `cargo add nidus` pays it, including the majority who use Voyage or OpenAI,
+  and crates.io's default package limit is 10 MB. This directly contradicts the
+  dependency-lean promise the crate is built around.
+- **Fetched on first use** — keeps the crate lean, but needs a cache directory,
+  checksum verification, and a network round trip, and "zero-config" that reaches the
+  network on first run is not obviously better than an API key.
+- **User-supplied** — not zero-config by definition.
+
+**Decision: ship nothing.** nidus does not embed text and does not plan to; it stores
+vectors and answers queries over them. The gap is closed by documentation, not code:
+the docs state plainly that an embedder is the caller's to provide, and point at
+Ollama as the fully local, keyless option that already exists (`embed-ollama`, no API
+key, `base_url` to a local daemon). That covers the "I don't want to phone a hosted
+API" case today without putting a model table inside a vector store.
+
+The quality ceiling reinforces it: static embeddings retain roughly 85% of a small
+transformer's benchmark performance, so a bundled default would be *both* a size cost
+*and* the worst-scoring option in the list — a poor thing to make the zero-config path.
+
+Revisit only if the trade changes shape — a table small enough to be unremarkable, or
+a caller for whom the Ollama route is genuinely unavailable. The decision is "no",
+not "never", and nothing in the format or the `AnyEmbedder` enum forecloses it.
+
 ---
 
 ## 10. Module layout
