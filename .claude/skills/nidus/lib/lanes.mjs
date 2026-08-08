@@ -23,7 +23,7 @@ const RULES = [
   {
     recipe: 'cargo clippy --all-targets --features mcp -- -D warnings',
     why: 'the MCP surface changed — it compiles only under the `mcp` feature',
-    match: [/^src\/server\/mcp\.rs$/, /^tests\/e2e\/mcp\.rs$/],
+    match: [/^src\/server\/mcp(\.rs$|\/)/, /^tests\/e2e\/mcp(\.rs$|\/)/],
   },
   {
     recipe: 'just ci-embed',
@@ -53,7 +53,7 @@ const RULES = [
   {
     recipe: 'just test-e2e',
     why: 'end-to-end tests changed — they drive the real `nidus serve` binary',
-    match: [/^tests\/e2e\/(?!cluster\.rs)/, /^src\/server\/mcp\.rs$/],
+    match: [/^tests\/e2e\/(?!cluster\.rs)/, /^src\/server\/mcp(\.rs$|\/)/],
   },
   {
     recipe: 'just docs-build',

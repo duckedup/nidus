@@ -85,6 +85,24 @@ pub struct ServeConfig {
     pub summarizer: Option<Arc<AnySummarizer>>,
 }
 
+/// How `nidus mcp` (the stdio transport) is configured beyond the store itself. No
+/// `addr`/`token`/limit knobs like [`ServeConfig`]'s — none of those mean anything over a pipe
+/// with exactly one client.
+#[cfg(feature = "mcp")]
+pub struct StdioConfig {
+    /// Embedder backing `remember`/`recall`. `None` disables them (the tool then answers
+    /// an `internal_error` naming `--embed-provider`, same as `nidus serve`).
+    #[cfg(feature = "memory")]
+    pub embedder: Option<Arc<AnyEmbedder>>,
+    /// Optional summarizer enabling `summarize: true` on `remember`.
+    #[cfg(all(feature = "memory", feature = "summarize"))]
+    pub summarizer: Option<Arc<AnySummarizer>>,
+    /// How often to renew the cluster writer lease, as in [`ServeConfig`]. An interactive
+    /// session idles far longer than `lock_ttl` between writes, so without this a peer
+    /// reclaims the lease and the next write finds itself fenced.
+    pub lease_renew_interval: std::time::Duration,
+}
+
 /// Shared, cloneable handle to the one open store.
 #[derive(Clone)]
 struct AppState {
@@ -201,62 +219,7 @@ where
     });
 
     // Keep the writer lease warm on a timer.
-    {
-        let db = state.db.clone();
-        let ttl = renew_every;
-        tokio::spawn(async move {
-            // Wait for the store to open (a standby may take a long time), then grab the
-            // lease handle once. `None` means this instance is not a cluster writer.
-            let lease = loop {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                let handle = db
-                    .try_read()
-                    .ok()
-                    .and_then(|g| g.as_ref().and_then(|db| db.lease_renewer()));
-                if let Some(handle) = handle {
-                    break handle;
-                }
-                // Opened but holds no lease → not a cluster writer, nothing to renew.
-                if db
-                    .try_read()
-                    .ok()
-                    .is_some_and(|g| g.as_ref().is_some_and(|db| db.lease_renewer().is_none()))
-                {
-                    return;
-                }
-            };
-            let mut ticker = tokio::time::interval(ttl);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                ticker.tick().await;
-                let lease = lease.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Err(e) = lease.renew() {
-                        // A definitive loss latches the store's `fenced` flag, so `/ready` and
-                        // `/cluster` report it without waiting for a write to discover it
-                        // (nidus-lp4.7). A transient error latches nothing; the next tick retries.
-                        if crate::backend::is_lease_lost(&e) {
-                            crate::diag::diag!(
-                                crate::diag::Level::Error,
-                                "lease",
-                                "writer lease LOST on background renewal — this instance is \
-                                 fenced and now reports NOT ready",
-                                "err" => format!("{e:#}"),
-                            );
-                        } else {
-                            crate::diag::diag!(
-                                crate::diag::Level::Warn,
-                                "lease",
-                                "background lease renewal failed transiently, will retry",
-                                "err" => format!("{e:#}"),
-                            );
-                        }
-                    }
-                })
-                .await;
-            }
-        });
-    }
+    spawn_lease_renewal(state.db.clone(), renew_every);
 
     // Optional self-refresh, so a read-only instance stays current without a sidecar
     // calling POST /refresh. A tokio task rather than a library background thread: "no
@@ -314,6 +277,70 @@ where
     // A failed open outranks the serve result: it is the actual cause.
     if let Some(e) = open_failed.write().ok().and_then(|mut f| f.take()) {
         return Err(e);
+    }
+    served
+}
+
+/// Speak MCP over stdio, for a local client that spawns its own `nidus mcp --dir …`. Unlike
+/// [`serve`], the store opens EAGERLY and FAILS FAST — a second process on the same
+/// directory exits immediately with an error naming the lock conflict.
+#[cfg(feature = "mcp")]
+pub async fn serve_stdio<F>(open: F, cfg: StdioConfig) -> anyhow::Result<()>
+where
+    F: FnOnce() -> anyhow::Result<Nidus> + Send + 'static,
+{
+    let db = tokio::task::spawn_blocking(open)
+        .await
+        .map_err(|e| anyhow::anyhow!("task join error: {e}"))?
+        .context(
+            "opening the store for `nidus mcp` — if another process already holds the writer \
+             lock, run `nidus serve` instead so every client shares one writer",
+        )?;
+    let readiness = std::sync::OnceLock::new();
+    let _ = readiness.set(db.readiness());
+    let slot = Arc::new(RwLock::new(Some(db)));
+
+    // A slim, inert `AppState`: no listener, so nothing sheds or bounds, and
+    // `limits::current_cancel()` correctly returns `None` off the axum path. "Large", not
+    // `usize::MAX`: tokio's `Semaphore` panics past 2^61-1 and `Limits` multiplies by 4.
+    const EFFECTIVELY_UNBOUNDED: usize = 1 << 20;
+    let state = AppState {
+        db: slot.clone(),
+        open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        readiness: Arc::new(readiness),
+        max_staleness: None,
+        token: None,
+        limits: Arc::new(limits::Limits::new(
+            EFFECTIVELY_UNBOUNDED,
+            None,
+            None,
+            None,
+            usize::MAX,
+        )),
+        commit: commit::Committer::new(),
+        #[cfg(feature = "memory")]
+        embedder: cfg.embedder,
+        #[cfg(all(feature = "memory", feature = "summarize"))]
+        summarizer: cfg.summarizer,
+    };
+    spawn_lease_renewal(slot.clone(), cfg.lease_renew_interval);
+
+    // STDERR, NEVER STDOUT: stdout is the JSON-RPC framing channel, and a stray print there
+    // corrupts the stream.
+    eprintln!("nidus speaking MCP 2026-07-28 over stdio (EOF / Ctrl-C / SIGTERM to stop)");
+
+    // A supervisor stops this with a signal rather than by closing stdin, and the flush below
+    // (plus the writer-lock release on drop) is only reachable if we return instead of dying.
+    let served = tokio::select! {
+        r = mcp::serve_stdio(state) => r,
+        _ = shutdown_signal() => Ok(()),
+    };
+
+    // Best-effort durability flush on a clean shutdown (no-op if never opened this far).
+    if let Ok(mut db) = slot.write()
+        && let Some(db) = db.as_mut()
+    {
+        let _ = db.flush();
     }
     served
 }
@@ -418,6 +445,64 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth))
         .layer(middleware::from_fn(metrics::observe))
         .with_state(state)
+}
+
+/// Renew the cluster writer lease on a timer, independent of write traffic. Without it an
+/// idle writer's lease goes stale and a standby peer legitimately reclaims it, fencing a
+/// process that is alive and about to write. No-op when this instance holds no lease.
+fn spawn_lease_renewal(db: Arc<RwLock<Option<Nidus>>>, ttl: std::time::Duration) {
+    tokio::spawn(async move {
+        // Wait for the store to open (a standby may take a long time), then grab the
+        // lease handle once. `None` means this instance is not a cluster writer.
+        let lease = loop {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let handle = db
+                .try_read()
+                .ok()
+                .and_then(|g| g.as_ref().and_then(|db| db.lease_renewer()));
+            if let Some(handle) = handle {
+                break handle;
+            }
+            // Opened but holds no lease → not a cluster writer, nothing to renew.
+            if db
+                .try_read()
+                .ok()
+                .is_some_and(|g| g.as_ref().is_some_and(|db| db.lease_renewer().is_none()))
+            {
+                return;
+            }
+        };
+        let mut ticker = tokio::time::interval(ttl);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let lease = lease.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(e) = lease.renew() {
+                    // A definitive loss latches the store's `fenced` flag, so `/ready` and
+                    // `/cluster` report it without waiting for a write to discover it
+                    // (nidus-lp4.7). A transient error latches nothing; the next tick retries.
+                    if crate::backend::is_lease_lost(&e) {
+                        crate::diag::diag!(
+                            crate::diag::Level::Error,
+                            "lease",
+                            "writer lease LOST on background renewal — this instance is \
+                             fenced and now reports NOT ready",
+                            "err" => format!("{e:#}"),
+                        );
+                    } else {
+                        crate::diag::diag!(
+                            crate::diag::Level::Warn,
+                            "lease",
+                            "background lease renewal failed transiently, will retry",
+                            "err" => format!("{e:#}"),
+                        );
+                    }
+                }
+            })
+            .await;
+        }
+    });
 }
 
 /// Resolve on the first shutdown signal: Ctrl-C everywhere, plus SIGTERM on Unix. Catching

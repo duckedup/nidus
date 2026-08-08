@@ -253,6 +253,16 @@ test('lanes: the MCP surface pulls its own feature build', () => {
   eq(r.run.map(l => l.recipe).includes('just test-e2e'), true, 'e2e')
 })
 
+// The same lane must survive `mcp.rs` becoming `mcp/` (nidus-k28) — a path-pinned
+// detector would silently drop the only gate that compiles the MCP surface.
+test('lanes: the MCP surface pulls its feature build as a directory too', () => {
+  for (const p of ['src/server/mcp/stdio.rs', 'tests/e2e/mcp/filters.rs']) {
+    const r = lanes([p]).run.map(l => l.recipe)
+    eq(r.includes('cargo clippy --all-targets --features mcp -- -D warnings'), true, `mcp clippy: ${p}`)
+    eq(r.includes('just test-e2e'), true, `e2e: ${p}`)
+  }
+})
+
 test('lanes: codec changes pull Miri', () => {
   eq(lanes(['src/log/mod.rs']).run.map(l => l.recipe).includes('just miri'), true, 'miri')
 })

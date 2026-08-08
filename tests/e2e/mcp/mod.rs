@@ -1,13 +1,18 @@
 //! E2E tests for the MCP `2026-07-28` surface at `/mcp` (nidus-zm2.3). A nested `tower`
 //! service carrying part of its protocol in headers, so an in-process `oneshot` exercises
-//! neither. No embedder in this lane: the rest assert honest failure instead.
+//! neither. This file stays HTTP-only; `stdio`/`attrs`/`filters`/`hygiene` are siblings.
+
+mod attrs;
+mod filters;
+mod hygiene;
+mod stdio;
 
 use serde_json::{Value, json};
 
 use crate::harness::{RunningServer, Server};
 
 /// The protocol version these tests speak.
-const VERSION: &str = "2026-07-28";
+pub(super) const VERSION: &str = "2026-07-28";
 
 /// Headers every MCP request needs. `Accept` names both types because Streamable HTTP may
 /// answer either — JSON here, or SSE if a handler ever emits a notification first.
@@ -49,8 +54,9 @@ fn mcp(server: &RunningServer, method: &str, name: Option<&str>, body: &Value) -
     server.post_with_headers("/mcp", body, &headers(method, name))
 }
 
-/// The `result` of a successful JSON-RPC response, or a panic naming the error.
-fn result(body: &Value) -> Value {
+/// The `result` of a successful JSON-RPC response, or a panic naming the error. Shared with
+/// `stdio` — the envelope shape is transport-agnostic.
+pub(super) fn result(body: &Value) -> Value {
     assert!(
         body.get("error").is_none(),
         "expected a result, got JSON-RPC error: {body}"
@@ -58,8 +64,8 @@ fn result(body: &Value) -> Value {
     body["result"].clone()
 }
 
-/// The concatenated text of a `tools/call` result's content blocks.
-fn text(result: &Value) -> String {
+/// The concatenated text of a `tools/call` result's content blocks. Shared with `stdio`.
+pub(super) fn text(result: &Value) -> String {
     result["content"]
         .as_array()
         .expect("content array")
@@ -69,8 +75,8 @@ fn text(result: &Value) -> String {
         .join("\n")
 }
 
-/// The tool list, in the order the server returned it.
-fn tool_names(result: &Value) -> Vec<String> {
+/// The tool list, in the order the server returned it. Shared with `stdio`.
+pub(super) fn tool_names(result: &Value) -> Vec<String> {
     result["tools"]
         .as_array()
         .expect("tools array")
@@ -166,6 +172,9 @@ fn tools_list_is_complete_ordered_and_cacheable() {
             "hybrid_search",
             "list_collections",
             "stats",
+            "forget",
+            "get",
+            "browse",
         ],
         "tool list changed — if this is deliberate, append rather than reorder"
     );
@@ -199,6 +208,64 @@ fn tools_list_is_complete_ordered_and_cacheable() {
         !rendered.contains("\"vector\""),
         "no MCP tool may take a raw vector argument: {rendered}"
     );
+}
+
+/// Walk a schema and collect every `$ref` fragment and every `$defs` key path it declares.
+fn refs_and_defs(node: &Value, at_root: bool, refs: &mut Vec<String>, defs: &mut Vec<String>) {
+    match node {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if key == "$ref"
+                    && let Some(r) = value.as_str()
+                {
+                    refs.push(r.to_string());
+                } else if key == "$defs"
+                    && at_root
+                    && let Some(d) = value.as_object()
+                {
+                    defs.extend(d.keys().map(|k| format!("#/$defs/{k}")));
+                }
+                refs_and_defs(value, false, refs, defs);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                refs_and_defs(item, false, refs, defs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every `$ref` a tool advertises must resolve against that tool's OWN schema root — a JSON
+/// Pointer fragment is resolved from the document root, so `$defs` parked under a property
+/// resolves nowhere and a strict client rejects the whole schema (nidus-k28.3).
+#[test]
+fn every_schema_ref_resolves_at_its_own_document_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+
+    let (status, body) = mcp(
+        &server,
+        "tools/list",
+        None,
+        &rpc(1, "tools/list", json!({})),
+    );
+    assert_eq!(status, 200, "tools/list failed: {body}");
+
+    for tool in result(&body)["tools"].as_array().expect("tools array") {
+        let name = tool["name"].as_str().unwrap_or("<unnamed>");
+        let schema = &tool["inputSchema"];
+        let (mut refs, mut defs) = (Vec::new(), Vec::new());
+        refs_and_defs(schema, true, &mut refs, &mut defs);
+        for r in &refs {
+            assert!(
+                defs.contains(r),
+                "tool `{name}` emits `{r}` but its schema root declares only {defs:?} — \
+                 a client resolving from the root cannot compile this: {schema}"
+            );
+        }
+    }
 }
 
 /// The adapter reads the *same store* the HTTP routes write — written over HTTP with raw
