@@ -230,20 +230,26 @@ two disagree, the tree wins and both are stale.
 **Storage model.** A store is a set of objects behind a `Persistence` backend (SPEC
 §13) — a local directory by default, an `s3://`/`gs://` prefix by URL: `manifest`
 (the live-segment set + the pinned dimension/distance — the atomic commit point,
-§14.2), one or more append-only fixed-stride `f32` segments (the base segment is
-still named `data`; sealing mints `seg-NNNNNNNN`, and none is ever rewritten in
-place), `log` (append-only op stream — the commit record), and `lock`. `open` reads
-the manifest, loads the live segments into one global row space, and replays `log`
-into an in-RAM index (`collection → { id → (row, attrs) }`). Search is brute-force
+§14.2), one or more fixed-stride `f32` segments (the base segment is still named
+`data`; sealing mints `seg-NNNNNNNN`), `log` (append-only op stream — the commit
+record), and `lock`. Segments are append-only in normal operation; the one exception
+is `compact()`, which collapses the live set and **rewrites the base segment in
+place** (`Segments::rewrite`), leaving the sealed ones unreferenced for deletion.
+`open` reads the manifest, loads the live segments into one global row space, and
+replays `log` into an in-RAM index (`collection → { id → (row, attrs) }`). Search is
+brute-force
 cosine over a `Scope` — one collection, a subset, or the whole store — merged into
 one ranking (sound because all collections share one embedding space); vectors are
 unit-normalized on insert so `score = dot(v, q)`.
 
-**Durability.** Per-batch fsync: append vectors → fsync `data` → append committing
-log records → fsync `log`. A crash loses at most the in-flight batch (the index is
-reproducible). Cross-process readers are lock-free: read `data` to size S, replay
-`log`, ignore any record referencing a row ≥ S/dim — a consistent, possibly-stale
-snapshot, never torn.
+**Durability.** Per-batch fsync, and the write order is load-bearing: append vectors
+to the active segment → fsync it → append committing log records → fsync `log`. So a
+committed `Upsert`'s row is already durable before anything references it, and a crash
+loses at most the in-flight batch (the index is reproducible). Cross-process readers
+are lock-free: read the manifest, open the segments it names for a total of N rows,
+replay `log`, and ignore any record referencing a row ≥ N — a consistent,
+possibly-stale snapshot, never torn. `Nidus::refresh()` advances that snapshot in place
+by re-applying the same rule at a newer manifest version (SPEC §6.2, §14.6).
 
 **Graceful failure (SPEC §6.6).** Appends are atomic (a partial write rolls back to
 the row/frame boundary) and `upsert` is all-or-nothing (rolls `data`+`log` back to
