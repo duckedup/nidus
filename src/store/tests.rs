@@ -1830,7 +1830,7 @@ fn binary_state_covers_all_rows_multiword() {
 
 // Ignored under Miri: builds thousands of rows to make recall meaningful — far too
 // slow at Miri's ~100x. Pure in-RAM logic, covered amply by the f32/serial path.
-#[cfg_attr(miri, ignore)]
+#[cfg_attr(miri, ignore)] // N=2000 x 128-dim binary recall sweep; far too slow under Miri.
 #[test]
 fn binary_search_recall_high_vs_exact() {
     let dim = 128;
@@ -1891,7 +1891,7 @@ fn binary_pseudo_store(dim: usize, n: usize, threads: usize) -> Store {
 }
 
 // Ignored under Miri — needs to clear PARALLEL_SCAN_WORK_FLOOR to engage threads.
-#[cfg_attr(miri, ignore)]
+#[cfg_attr(miri, ignore)] // spawns query threads over ~1.5k x 768-dim rows; threads + size not for Miri.
 #[test]
 fn binary_parallel_matches_serial() {
     // Pseudo-random sign codes make Hamming ties near the overscan boundary
@@ -1957,7 +1957,7 @@ fn threaded_store(dim: usize, n: usize, threads: usize) -> Store {
 // Ignored under Miri: clearing PARALLEL_SCAN_WORK_FLOOR takes minutes at Miri's ~100x slowdown,
 // and the scan is safe Rust over shared `&` reads that the borrow checker already proves
 // data-race-free, so Miri adds no coverage.
-#[cfg_attr(miri, ignore)]
+#[cfg_attr(miri, ignore)] // spawns query threads over ~1.5k x 768-dim rows; threads + size not for Miri.
 #[test]
 fn parallel_search_matches_serial() {
     // A wide dim clears the work floor at ~1.4k rows — far cheaper than narrow dims.
@@ -1982,7 +1982,7 @@ fn parallel_search_matches_serial() {
 }
 
 // Ignored under Miri — same reason as `parallel_search_matches_serial`.
-#[cfg_attr(miri, ignore)]
+#[cfg_attr(miri, ignore)] // spawns query threads over ~1.5k x 768-dim rows; ran >10min under Miri.
 #[test]
 fn parallel_search_respects_filter_and_min_score() {
     let dim = 768;
@@ -2001,7 +2001,7 @@ fn parallel_search_respects_filter_and_min_score() {
 
 // The quantized first pass scales across threads; its parallel and serial candidate
 // sets must produce the same final ranking. Ignored under Miri (same cost reason).
-#[cfg_attr(miri, ignore)]
+#[cfg_attr(miri, ignore)] // spawns query threads over ~1.5k x 768-dim rows; threads + size not for Miri.
 #[test]
 fn parallel_quantized_matches_serial() {
     let dim = 768;
@@ -2286,7 +2286,7 @@ fn ann_quant_store(dim: usize, cfg: AnnConfig, quant: Quantization, vectors: &[V
 // thresholds are looser than above — still well clear of chance.
 
 #[test]
-#[cfg_attr(miri, ignore)]
+#[cfg_attr(miri, ignore)] // N=2000 HNSW build is too slow under Miri.
 fn hnsw_int8_walk_recall() {
     let (n, dim, k) = (2000, 32, 10);
     let data = random_unit_vectors(n, dim, 11);
@@ -2301,7 +2301,7 @@ fn hnsw_int8_walk_recall() {
 }
 
 #[test]
-#[cfg_attr(miri, ignore)]
+#[cfg_attr(miri, ignore)] // N=2000 HNSW build is too slow under Miri.
 fn hnsw_binary_walk_recall() {
     let (n, dim, k) = (2000, 64, 10);
     let data = random_unit_vectors(n, dim, 13);
@@ -2322,7 +2322,7 @@ fn hnsw_binary_walk_recall() {
 }
 
 #[test]
-#[cfg_attr(miri, ignore)]
+#[cfg_attr(miri, ignore)] // N=2000 IVF build is too slow under Miri.
 fn ivf_int8_walk_recall() {
     let (n, dim, k) = (2000, 32, 10);
     let data = random_unit_vectors(n, dim, 15);
@@ -5389,7 +5389,7 @@ fn exact_bypasses_the_quantized_first_pass() {
 /// `exact: false` is the default and must leave an indexed store on the index — asserted by
 /// the ANN path answering identically whether the flag is omitted or spelled out.
 #[test]
-#[cfg_attr(miri, ignore)]
+#[cfg_attr(miri, ignore)] // N=600 ANN build; ran >10min under Miri.
 fn exact_false_is_the_untouched_approximate_path() {
     let (n, dim, k) = (600, 16, 5);
     let data = random_unit_vectors(n, dim, 25);
@@ -5541,7 +5541,7 @@ fn text_search_projects_attrs() {
 /// Hits materialize on the index paths too, so projection has to reach the ANN walk's rerank
 /// and the quantized two-pass tail — not only the brute-force scan.
 #[test]
-#[cfg_attr(miri, ignore)]
+#[cfg_attr(miri, ignore)] // ANN + quantized build over 1024-dim rows; ran >10min under Miri.
 fn projection_applies_on_the_ann_and_quantized_paths() {
     let dim = 16;
     let data = random_unit_vectors(300, dim, 27);
@@ -5673,7 +5673,7 @@ fn sum_and_max_rank_the_same_corpus_differently() {
 // The bit-exactness this asserts is the point, so it is not loosened to a tolerance.
 // BM25's `idf` calls `ln`, which Miri evaluates non-deterministically; real float
 // semantics make these exact, so the guarantee is enforced on the native run.
-#[cfg_attr(miri, ignore)]
+#[cfg_attr(miri, ignore)] // asserts exact BM25 score bits; Miri's `ln` differs from host libm by 1 ULP.
 fn a_single_clause_scores_exactly_as_the_one_field_query_always_did() {
     let store = two_field_store(&[
         titled("d1", "t", "the cat sat on the mat"),
@@ -6508,7 +6508,7 @@ fn grouping_on_an_unknown_attribute_yields_one_missing_group() {
 /// Past MAX_GROUPS the answer says so. A short list of groups is indistinguishable from a
 /// complete one, which is the whole reason the flag exists rather than a silent truncation.
 /// Ignored under Miri only for its size — 10k records is minutes there, milliseconds natively.
-#[cfg_attr(miri, ignore)]
+#[cfg_attr(miri, ignore)] // upserts MAX_GROUPS+1 = 10_001 records; ran >10min under Miri.
 #[test]
 fn outrunning_the_group_cap_is_reported_not_hidden() {
     let mut store = Store::in_memory(2).unwrap();
