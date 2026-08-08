@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AnnConfig, AnnKind, Filter, Footprint, FtsField, Hit, Language, ListOpts, Projection, Record,
-    Value,
+    AnnConfig, AnnKind, Annotations, Filter, Footprint, FtsClause, FtsCombine, FtsField,
+    HighlightOpts, Hit, Language, ListOpts, Projection, Record, Value,
 };
 
 /// Body of `POST /collections/{name}/upsert`.
@@ -90,11 +90,26 @@ fn default_candidates() -> usize {
     100
 }
 
-/// Body of `POST /text-search` (BM25). An empty `scope` searches every collection.
+/// One clause of a multi-field text query: `{"field": "title", "query": "rust"}`.
 #[derive(Debug, Deserialize)]
-pub struct TextSearchRequest {
+pub struct FtsClauseDto {
     pub field: String,
     pub query: String,
+}
+
+/// Body of `POST /text-search` (BM25). An empty `scope` searches every collection. Name the
+/// fields either as one `field` + `query` pair or as a `clauses` list — never both.
+#[derive(Debug, Deserialize)]
+pub struct TextSearchRequest {
+    #[serde(default)]
+    pub field: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub clauses: Option<Vec<FtsClauseDto>>,
+    /// How several clauses fold into one score: `"Sum"` (default) or `"Max"`.
+    #[serde(default)]
+    pub combine: FtsCombine,
     #[serde(default)]
     pub scope: Vec<String>,
     #[serde(default = "default_top_k")]
@@ -106,14 +121,32 @@ pub struct TextSearchRequest {
     pub min_score: Option<f32>,
     #[serde(default)]
     pub filter: Filter,
+    /// Report each matched clause's own BM25 score on every hit.
+    #[serde(default)]
+    pub explain: bool,
+    /// Return highlighted fragments; `{}` takes the defaults. Highlighting reads the stored
+    /// text, so it still works on a field the projection below dropped.
+    #[serde(default)]
+    pub highlight: Option<HighlightOpts>,
+    #[serde(default)]
+    pub include_attributes: Option<Vec<String>>,
+    #[serde(default)]
+    pub exclude_attributes: Option<Vec<String>>,
 }
 
-/// Body of `POST /hybrid-search`: fuse a vector query and a BM25 text query (RRF).
+/// Body of `POST /hybrid-search`: fuse a vector query and a BM25 text query (RRF). The text
+/// leg takes the same `field`+`text` / `clauses` choice as `/text-search`.
 #[derive(Debug, Deserialize)]
 pub struct HybridSearchRequest {
     pub vector: Vec<f32>,
-    pub field: String,
-    pub text: String,
+    #[serde(default)]
+    pub field: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub clauses: Option<Vec<FtsClauseDto>>,
+    #[serde(default)]
+    pub combine: FtsCombine,
     #[serde(default)]
     pub scope: Vec<String>,
     #[serde(default = "default_top_k")]
@@ -126,6 +159,32 @@ pub struct HybridSearchRequest {
     pub rrf_k: f32,
     #[serde(default = "default_candidates")]
     pub candidates: usize,
+    /// Report each leg's own rank and score, plus every matched clause's BM25 score.
+    #[serde(default)]
+    pub explain: bool,
+    #[serde(default)]
+    pub highlight: Option<HighlightOpts>,
+}
+
+/// Resolve a text query's clauses from the two accepted spellings: the single `field` +
+/// `text` pair, or a non-empty `clauses` list. Both, neither, or an empty list is a caller
+/// error — an empty result would otherwise read as "no matches" rather than "no query".
+pub(super) fn resolve_clauses(
+    field: Option<String>,
+    text: Option<String>,
+    clauses: Option<Vec<FtsClauseDto>>,
+) -> Result<Vec<FtsClause>, &'static str> {
+    match (field, text, clauses) {
+        (Some(f), Some(t), None) => Ok(vec![FtsClause::new(f, t)]),
+        (None, None, Some(list)) if !list.is_empty() => Ok(list
+            .into_iter()
+            .map(|c| FtsClause::new(c.field, c.query))
+            .collect()),
+        (None, None, Some(_)) => Err("clauses must not be empty"),
+        (None, None, None) => Err("a text query needs a field plus its text, or a clauses list"),
+        (_, _, Some(_)) => Err("field/text and clauses are mutually exclusive; send one form"),
+        _ => Err("field and its query text must be sent together"),
+    }
 }
 
 /// One entry of [`FtsSchemaRequest::fields`]: either a bare field name (everything
@@ -237,6 +296,10 @@ pub struct HitDto {
     pub id: String,
     pub score: f32,
     pub attrs: BTreeMap<String, Value>,
+    /// Present only when the query asked to `explain` or to highlight, so an unannotated
+    /// response is byte-identical to a nidus without annotations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Annotations>,
 }
 
 impl From<Hit> for HitDto {
@@ -246,6 +309,7 @@ impl From<Hit> for HitDto {
             id: h.id,
             score: h.score,
             attrs: h.attrs,
+            annotations: h.annotations,
         }
     }
 }
@@ -364,6 +428,129 @@ mod tests {
             decoded,
             vec![FtsField::new("title"), FtsField::new("body").b(0.4)]
         );
+    }
+
+    /// Decode a `/text-search` body and resolve its clauses exactly as the handler does.
+    fn clauses(json: serde_json::Value) -> Result<Vec<FtsClause>, &'static str> {
+        let req: TextSearchRequest = serde_json::from_value(json).unwrap();
+        resolve_clauses(req.field, req.query, req.clauses)
+    }
+
+    #[test]
+    fn the_single_field_body_still_means_one_clause() {
+        // The compatibility contract: `{"field": …, "query": …}` must not change meaning.
+        assert_eq!(
+            clauses(json!({"field": "body", "query": "run"})).unwrap(),
+            vec![FtsClause::new("body", "run")]
+        );
+    }
+
+    #[test]
+    fn a_clauses_list_carries_distinct_text_per_field() {
+        let got = clauses(json!({"clauses": [
+            {"field": "title", "query": "rust"},
+            {"field": "body", "query": "async runtime"}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                FtsClause::new("title", "rust"),
+                FtsClause::new("body", "async runtime")
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unusable_clause_spelling_is_refused_rather_than_guessed() {
+        for body in [
+            json!({"clauses": []}),
+            json!({}),
+            json!({"field": "body"}),
+            json!({"query": "run"}),
+            json!({"field": "body", "query": "run", "clauses": [{"field": "t", "query": "x"}]}),
+        ] {
+            assert!(clauses(body.clone()).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn combine_accepts_both_json_spellings_and_defaults_to_sum() {
+        let req: TextSearchRequest = serde_json::from_value(json!({"clauses": []})).unwrap();
+        assert_eq!(req.combine, FtsCombine::Sum);
+        for (form, want) in [
+            ("Sum", FtsCombine::Sum),
+            ("sum", FtsCombine::Sum),
+            ("Max", FtsCombine::Max),
+            ("max", FtsCombine::Max),
+        ] {
+            let req: TextSearchRequest =
+                serde_json::from_value(json!({"clauses": [], "combine": form})).unwrap();
+            assert_eq!(req.combine, want, "{form}");
+        }
+    }
+
+    #[test]
+    fn a_hit_without_annotations_serializes_exactly_as_it_always_did() {
+        let hit = HitDto::from(Hit::new("docs", "a", 0.5, BTreeMap::new()));
+        assert_eq!(
+            serde_json::to_value(&hit).unwrap(),
+            json!({"collection": "docs", "id": "a", "score": 0.5, "attrs": {}})
+        );
+    }
+
+    /// The annotation wire spelling every SDK will mirror in nidus-m50.18. Asserted here
+    /// because the crate's own round trip is bincode, which would not catch a rename.
+    #[test]
+    fn annotation_json_spelling_is_stable() {
+        let mut hit = Hit::new("docs", "a", 0.5, BTreeMap::new());
+        hit.annotations = Some(crate::Annotations {
+            vector: Some(crate::LegScore {
+                rank: 0,
+                score: 0.5,
+            }),
+            text: Some(crate::LegScore {
+                rank: 2,
+                score: 1.5,
+            }),
+            clauses: vec![crate::ClauseScore {
+                field: "title".into(),
+                score: 1.5,
+            }],
+            highlights: vec![crate::Highlight {
+                field: "body".into(),
+                fragments: vec![crate::Fragment {
+                    text: "we were running".into(),
+                    spans: vec![(8, 15)],
+                }],
+            }],
+        });
+        assert_eq!(
+            serde_json::to_value(HitDto::from(hit)).unwrap()["annotations"],
+            json!({
+                "vector": {"rank": 0, "score": 0.5},
+                "text": {"rank": 2, "score": 1.5},
+                "clauses": [{"field": "title", "score": 1.5}],
+                "highlights": [{
+                    "field": "body",
+                    "fragments": [{"text": "we were running", "spans": [[8, 15]]}]
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn highlight_options_come_off_the_wire_with_their_defaults() {
+        let req: TextSearchRequest =
+            serde_json::from_value(json!({"clauses": [], "highlight": {}})).unwrap();
+        assert_eq!(req.highlight, Some(HighlightOpts::default()));
+        let req: TextSearchRequest =
+            serde_json::from_value(json!({"clauses": [], "highlight": {"max_fragments": 3}}))
+                .unwrap();
+        assert_eq!(req.highlight.unwrap().max_fragments, 3);
+        // Absent means no highlighting, and `explain` is off unless asked.
+        let req: TextSearchRequest = serde_json::from_value(json!({"clauses": []})).unwrap();
+        assert!(req.highlight.is_none() && !req.explain);
     }
 
     #[test]

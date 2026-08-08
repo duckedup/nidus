@@ -486,3 +486,95 @@ fn every_acknowledged_concurrent_write_survives_sigkill() {
         acked.len()
     );
 }
+
+/// Multi-clause BM25 and result annotations through the real binary: several fields in one
+/// query, `combine` changing the ranking, and highlight spans that index the stored text even
+/// when the projection dropped the field (nidus-m50.10, nidus-m50.5).
+#[test]
+fn multi_clause_text_search_and_annotations_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/fts-schema",
+                &json!({"fields": [{"field": "title", "b": 0.0}, {"field": "body", "b": 0.0}]}),
+            )
+            .0,
+        200
+    );
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/upsert",
+                &json!({"records": [
+                    {"id": "spread", "attrs": {"title": {"Str": "needle"}, "body": {"Str": "needle plus the engineers were running"}}},
+                    {"id": "focused", "attrs": {"title": {"Str": "alpha"}, "body": {"Str": "needle needle needle needle"}}},
+                    {"id": "filler", "attrs": {"title": {"Str": "needle"}, "body": {"Str": "gamma"}}}
+                ]}),
+            )
+            .0,
+        200
+    );
+
+    let clauses = json!([
+        {"field": "title", "query": "needle"},
+        {"field": "body", "query": "needle"}
+    ]);
+    let (status, hits) = server.post(
+        "/text-search",
+        &json!({"clauses": clauses, "combine": "Sum", "top_k": 5}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(hits[0]["id"], "spread", "Sum adds both clauses: {hits}");
+    assert!(hits[0].get("annotations").is_none(), "opt-in: {hits}");
+
+    let (status, hits) = server.post(
+        "/text-search",
+        &json!({"clauses": clauses, "combine": "Max", "top_k": 5}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(hits[0]["id"], "focused", "Max takes the strongest: {hits}");
+
+    // An empty clause list is a 400, never a silently empty result set.
+    let (status, _) = server.post("/text-search", &json!({"clauses": [], "top_k": 5}));
+    assert_eq!(status, 400);
+
+    // Highlighting over a stemmed match, with the field projected out of the payload.
+    let (status, hits) = server.post(
+        "/text-search",
+        &json!({
+            "field": "body", "query": "run", "top_k": 5, "explain": true,
+            "highlight": {"fragment_chars": 60}, "include_attributes": ["title"]
+        }),
+    );
+    assert_eq!(status, 200);
+    let hit = &hits[0];
+    assert_eq!(hit["id"], "spread");
+    assert!(hit["attrs"].get("body").is_none(), "body projected away");
+    let a = &hit["annotations"];
+    assert_eq!(a["clauses"][0]["field"], "body");
+    let frag = &a["highlights"][0]["fragments"][0];
+    let text = frag["text"].as_str().expect("fragment text");
+    let spans = frag["spans"].as_array().expect("spans");
+    let marked: Vec<&str> = spans
+        .iter()
+        .map(|s| {
+            let (lo, hi) = (s[0].as_u64().unwrap(), s[1].as_u64().unwrap());
+            &text[lo as usize..hi as usize]
+        })
+        .collect();
+    // "run" (query) and "running" (document) share a stem, so the span covers the word as
+    // the document spells it — which no substring search for "run" would have found.
+    assert_eq!(marked, vec!["running"], "{frag}");
+
+    // Hybrid reports each leg's own rank and score.
+    let (status, hits) = server.post(
+        "/hybrid-search",
+        &json!({"vector": [1, 0, 0], "field": "body", "text": "needle",
+                "top_k": 5, "explain": true}),
+    );
+    assert_eq!(status, 200);
+    assert!(hits[0]["annotations"]["text"]["rank"].is_number(), "{hits}");
+}

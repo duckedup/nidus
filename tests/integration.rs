@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use nidus::{
-    AnnConfig, Config, Distance, Filter, ListOpts, Nidus, OpenMode, Predicate, Quantization,
-    Record, Scope, SearchOpts, Value,
+    AnnConfig, Config, Distance, Filter, FtsClause, FtsField, FtsQuery, HighlightOpts, ListOpts,
+    Nidus, OpenMode, Predicate, Quantization, Record, Scope, SearchOpts, Value,
 };
 
 fn rec(id: &str, vector: Vec<f32>, kind: &str) -> Record {
@@ -636,4 +636,69 @@ fn text_predicates_through_the_store() {
         .is_err()
     );
     assert!(db.delete_where("c", &over).is_err());
+}
+
+/// Multi-clause BM25 plus annotations through the public API, across a reopen: a title/body
+/// corpus queried over both fields, with per-clause scores and fragments that index the
+/// stored text (nidus-m50.10, nidus-m50.5).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn multi_field_text_search_and_annotations_survive_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    {
+        let mut db = Nidus::open(Config::new(&path, 3)).unwrap();
+        db.create_collection_with_fts("docs", &[FtsField::new("title"), FtsField::new("body")])
+            .unwrap();
+        let doc = |id: &str, title: &str, body: &str| {
+            let mut attrs = BTreeMap::new();
+            attrs.insert("title".to_string(), Value::Str(title.to_string()));
+            attrs.insert("body".to_string(), Value::Str(body.to_string()));
+            Record::text_only(id, attrs)
+        };
+        db.upsert(
+            "docs",
+            &[
+                doc(
+                    "a",
+                    "vector search",
+                    "the engineers were running benchmarks",
+                ),
+                doc("b", "unrelated", "nothing of interest here"),
+            ],
+        )
+        .unwrap();
+        db.flush().unwrap();
+    }
+
+    let db = Nidus::open(Config::new(&path, 3)).unwrap();
+    let query = FtsQuery::multi([
+        FtsClause::new("title", "vector"),
+        FtsClause::new("body", "run"),
+    ])
+    .highlight(HighlightOpts::default());
+    let hits = db
+        .text_search(
+            "docs",
+            &query,
+            &SearchOpts {
+                top_k: 10,
+                explain: true,
+                projection: nidus::Projection::include(["title"]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "a");
+
+    let a = hits[0].annotations.as_ref().unwrap();
+    assert_eq!(a.clauses.len(), 2, "both clauses matched: {a:?}");
+    // The body was projected out of the payload, but its snippet still explains the match —
+    // and the span covers "running", the surface form of the stemmed query term "run".
+    assert!(!hits[0].attrs.contains_key("body"));
+    let body = a.highlights.iter().find(|h| h.field == "body").unwrap();
+    let f = &body.fragments[0];
+    let marked: Vec<&str> = f.spans.iter().map(|&(s, e)| &f.text[s..e]).collect();
+    assert_eq!(marked, vec!["running"]);
 }

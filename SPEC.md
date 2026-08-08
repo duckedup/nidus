@@ -585,8 +585,25 @@ reliable guard there is to refuse work *before* allocating:
   pair of lists, so "include and exclude at once" is unrepresentable in the library; the
   wire form carries `include_attributes`/`exclude_attributes` and answers `400` when both
   are sent, rather than inventing a precedence rule (nidus-m50.15). Ranking is untouched:
-  projection changes the payload, never the order or the scores. `RecallOpts` has neither
-  knob, for the same reason it has no `offset` — the memory API stays lean.
+  projection changes the payload, never the order or the scores. **Highlighting is
+  independent of it** (§7.6): fragments are cut from the *stored* text, so projecting a long
+  body away and keeping only its snippet is the supported combination, not a silent no-op.
+  `RecallOpts` has neither knob, for the same reason it has no `offset` — the memory API
+  stays lean.
+- **A full-text query is a list of clauses** (`FtsQuery { clauses, combine, highlight }`,
+  nidus-m50.10). Each `FtsClause { field, text }` names one indexed field *and its own query
+  text*, so `title:"rust"` + `body:"async runtime"` is a single query — the reason the shape
+  is `clauses: [{field, text}]` rather than `fields: [name]`. A document's clause scores fold
+  by `FtsCombine`: `Sum` (the default — matching two fields beats matching one harder) or
+  `Max` (the strongest single clause, so a long body cannot out-accumulate a precise title).
+  A clause naming a field the collection does not index contributes nothing; a single clause
+  scores exactly as the one-field query always did under either fold, because BM25 here is
+  strictly positive so both folds are identities on one value. An **empty clause list is an
+  error**, not a match-all — over HTTP a `400`, since an empty result would otherwise read as
+  "the corpus has no matches" rather than "you sent no query". `min_score` applies to the
+  folded score. `hybrid_search` fuses one vector leg with the *combined* text leg, so the RRF
+  numbers for a single-clause query are unchanged and per-clause weights stay out of scope
+  (they belong to the ranking ticket).
 - **Filters** (`Filter` = AND of `Predicate`s) are evaluated against `attrs` before
   scoring: `Eq` (typed equality), `Ne` (typed inequality), `Glob` / `IGlob` (pattern
   match on a `Str` attr, case-sensitive and ASCII-case-insensitive, §7.1), `In` /
@@ -730,6 +747,33 @@ pattern into a process-wide cache keyed by the pattern text; the per-record path
 read-locked lookup. The cache is capped (256 distinct patterns) and cleared wholesale on
 overflow, since patterns arrive from untrusted request bodies.
 
+### 7.6 Result annotations — why a hit matched
+
+A `Hit` carries one score and an attrs map, which does not answer "which clause fired, and
+what part of the text matched". `Hit::annotations` does, and is `None` unless the query asked
+(nidus-m50.5) — the default response is byte-identical to a nidus without the feature.
+
+- **Per-leg sub-scores** (`SearchOpts::explain` / `HybridOpts::explain`). A `text_search` hit
+  reports each *matched* clause's own BM25 score in query order (an unmatched clause is
+  absent, not a zero row). A `hybrid_search` hit additionally reports each fusion leg's own
+  `(rank, score)` — the data `rrf_fuse` already computes per leg and used to discard at the
+  call site. The clause breakdown is carried across fusion in a side map keyed by
+  `(collection, id)`, because fusion rebuilds the `Hit` and cannot see inside a leg. Vector
+  `search` ignores `explain`: it has a single score, and reporting it twice explains nothing.
+- **Highlighted fragments** (`FtsQuery::highlight`). The hard part is that the analyzer stems
+  and folds, so a matched *term* is generally **not a substring of the stored text** — a query
+  for "run" matches a document spelling it "running", and searching the text for the term
+  finds nothing. So the analyzer is the offset source: `analyze_spans` is the single analysis
+  path (`analyze` is it with the offsets dropped, so a highlighter can never disagree with the
+  index about what was a term) and every emitted term carries the byte range of the original
+  text it came from. A fragment is a character window around the matched spans, snapped to
+  token boundaries at both ends so it does not open or close mid-word, with `spans` rebased to
+  byte offsets **within the fragment**. `HighlightOpts { max_fragments, fragment_chars }`
+  bounds it; a `List` field is highlighted over the same space-joined text the index saw.
+
+Both run on the **final page**, after pagination and after the fused truncate, so the cost is
+bounded by `top_k` rather than by the candidate set.
+
 ---
 
 ## 8. Compaction
@@ -848,9 +892,11 @@ build until a real need exists.
   full-text-indexed attribute fields (`create_collection_with_fts` / `set_fts_schema`,
   persisted as a `SetFtsFields` op). nidus then maintains an in-RAM inverted index per
   `(collection, field)` and answers `text_search(FtsQuery)` by BM25, reusing the same
-  `Hit`/`Filter`/scope/top-k machinery as vector search. `hybrid_search` fuses a vector
+  `Hit`/`Filter`/scope/top-k machinery as vector search. A query is a **list of clauses**
+  over several fields, folded by `Sum` or `Max` (§7). `hybrid_search` fuses a vector
   and a BM25 query with **Reciprocal Rank Fusion** (rank-based, so the incomparable
-  cosine/BM25 scales need no normalization). The analyzer is pure-Rust, zero-FFI
+  cosine/BM25 scales need no normalization), and either surface can annotate its hits with
+  per-leg sub-scores and highlighted fragments (§7.6). The analyzer is pure-Rust, zero-FFI
   (lowercase → Unicode tokenize → optional ASCII folding + token-length cap → English
   stopwords → Porter stem) behind a `Language` enum (US English today; the seam is open
   for more).
@@ -947,7 +993,8 @@ src/
 ├── lib.rs        Public API (Nidus, Scope); #![forbid(unsafe_code)]; re-exports
 ├── config.rs     Config, Fsync, OpenMode, ann/quant/memory/persistence settings (§4.1)
 ├── model.rs      Shared type vocabulary: Value, Record, Predicate/Filter, Op,
-│                 Distance, Quantization, AnnConfig, FtsQuery (pure defs + serde)
+│                 Distance, Quantization, AnnConfig, FtsQuery/FtsClause/FtsCombine
+│                 (pure defs + serde)
 ├── crc.rs        table CRC32 (zero-dep)
 ├── glob/         minimal * ? [..] matcher (§7.1)
 ├── filter/       Filter/Predicate evaluation against a record's attrs: mod.rs
@@ -966,7 +1013,10 @@ src/
 │                 validity-keyed; a stale/missing/torn load → rebuild (never fatal)
 ├── ann/          opt-in ANN index (Config::ann): hnsw.rs (graph) + ivf.rs (lists) +
 │                 persist.rs (cache round-trip)
-├── fts/          opt-in full-text (BM25) index: mod.rs + analyzer.rs (tokenize/stem)
+├── fts/          opt-in full-text (BM25) index: mod.rs + analyzer.rs (tokenize/stem/
+│                 span) + fold.rs + schema.rs (FtsField) + highlight.rs (fragments, §7.6)
+├── annotate.rs   opt-in result annotations: LegScore/ClauseScore/Highlight/Fragment
+│                 + HighlightOpts (§7.6)
 ├── backend/      pluggable storage & memory (§13): mod.rs (Persistence/Appender/
 │                 MemoryTier/BackendLock traits + URL routing), local.rs (LocalFs +
 │                 FileAppender), ram.rs (LocalRam + MemAppender), object.rs
@@ -975,8 +1025,9 @@ src/
 └── store/        the integrator: mod.rs (Store type, open/in_memory ctors, lock +
                   ANN lifecycle glue), scoring.rs (scan kernels + parallel engine),
                   quant.rs (int8/binary state + quantized two-pass search), read.rs
-                  (accessors, exact + ANN search), write.rs (upsert/delete/flush/
-                  compact), memtier.rs (working-set publish/adopt), tests.rs
+                  (accessors, exact + ANN search), text.rs (multi-clause BM25, hybrid
+                  fusion, annotations), write.rs (upsert/delete/flush/compact),
+                  memtier.rs (working-set publish/adopt), tests.rs
 
 # ── `cli` feature only (the `nidus` binary, --features cli) ──
 ├── bin/nidus.rs  thin entry point: parse args → cli::run

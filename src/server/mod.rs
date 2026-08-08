@@ -678,6 +678,8 @@ async fn search(
             filter,
             exact,
             projection,
+            // Vector search has one score to report; annotations are a text/hybrid surface.
+            explain: false,
         };
         scoped(&scope, |s| db.search(s, &query, &opts))
     })
@@ -741,24 +743,38 @@ async fn text_search(
     Json(req): Json<TextSearchRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
     check_page(req.offset, req.top_k)?;
+    let TextSearchRequest {
+        field,
+        query,
+        clauses,
+        combine,
+        scope,
+        top_k,
+        offset,
+        min_score,
+        filter,
+        explain,
+        highlight,
+        include_attributes,
+        exclude_attributes,
+    } = req;
+    let clauses = check_clauses(field, query, clauses)?;
+    let projection = check_projection(include_attributes, exclude_attributes)?;
     let hits = run_read(st, move |db| {
-        let TextSearchRequest {
-            field,
-            query,
-            scope,
-            top_k,
-            offset,
-            min_score,
-            filter,
-        } = req;
         let opts = SearchOpts {
             top_k,
             offset,
             min_score,
             filter,
+            explain,
+            projection,
             ..Default::default()
         };
-        let q = FtsQuery::new(field, query);
+        let q = FtsQuery {
+            clauses,
+            combine,
+            highlight,
+        };
         scoped(&scope, |s| db.text_search(s, &q, &opts))
     })
     .await?;
@@ -770,26 +786,36 @@ async fn hybrid_search(
     Json(req): Json<HybridSearchRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
     check_page(req.offset, req.top_k)?;
+    let HybridSearchRequest {
+        vector,
+        field,
+        text,
+        clauses,
+        combine,
+        scope,
+        top_k,
+        offset,
+        filter,
+        rrf_k,
+        candidates,
+        explain,
+        highlight,
+    } = req;
+    let clauses = check_clauses(field, text, clauses)?;
     let hits = run_read(st, move |db| {
-        let HybridSearchRequest {
-            vector,
-            field,
-            text,
-            scope,
-            top_k,
-            offset,
-            filter,
-            rrf_k,
-            candidates,
-        } = req;
         let opts = HybridOpts {
             top_k,
             offset,
             filter,
             rrf_k,
             candidates,
+            explain,
         };
-        let q = FtsQuery::new(field, text);
+        let q = FtsQuery {
+            clauses,
+            combine,
+            highlight,
+        };
         scoped(&scope, |s| db.hybrid_search(s, &vector, &q, &opts))
     })
     .await?;
@@ -1041,6 +1067,17 @@ fn check_projection(
         .map_err(|msg| ApiError::bad_request(anyhow::anyhow!(msg)))
 }
 
+/// Resolve a text query's clauses, refusing an unusable body — both spellings at once, neither,
+/// or an empty `clauses` list — with a `400` (nidus-m50.10).
+fn check_clauses(
+    field: Option<String>,
+    text: Option<String>,
+    clauses: Option<Vec<dto::FtsClauseDto>>,
+) -> Result<Vec<crate::FtsClause>, ApiError> {
+    dto::resolve_clauses(field, text, clauses)
+        .map_err(|msg| ApiError::bad_request(anyhow::anyhow!(msg)))
+}
+
 /// Map a store error to an HTTP status. Defaults to `500`; recognises the
 /// store's client-fault messages and the writer-lock conflict.
 fn not_open() -> anyhow::Error {
@@ -1054,9 +1091,12 @@ fn classify(err: &anyhow::Error) -> StatusCode {
     let msg = format!("{err:#}").to_lowercase();
     if msg.contains("store is not open yet") {
         StatusCode::SERVICE_UNAVAILABLE
-    } else if msg.contains("does not match store dimension") || msg.contains("fts field") {
-        // The second is a rejected FTS schema (an out-of-range k1/b, an empty field name) —
-        // a malformed request body, not a server fault.
+    } else if msg.contains("does not match store dimension")
+        || msg.contains("fts field")
+        || msg.contains("full-text query")
+    {
+        // The last two are a rejected FTS schema (an out-of-range k1/b, an empty field name)
+        // and a clause-less text query — malformed request bodies, not server faults.
         StatusCode::BAD_REQUEST
     } else if msg.contains("read-only store") {
         StatusCode::FORBIDDEN
@@ -1867,6 +1907,144 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A store with `title` + `body` indexed and three docs, for the multi-clause tests.
+    async fn two_field_router() -> Router {
+        let app = test_router(3);
+        assert_eq!(
+            app.clone()
+                .oneshot(post(
+                    "/collections/docs/fts-schema",
+                    json!({"fields": [{"field": "title", "b": 0.0}, {"field": "body", "b": 0.0}]}),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "spread", "attrs": {"title": {"Str": "needle"}, "body": {"Str": "needle"}}},
+                    {"id": "focused", "attrs": {"title": {"Str": "alpha"}, "body": {"Str": "needle needle needle needle"}}},
+                    {"id": "filler", "attrs": {"title": {"Str": "needle"}, "body": {"Str": "gamma"}}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        app
+    }
+
+    /// Several BM25 clauses over the wire, and `combine` changing the ranking (nidus-m50.10).
+    #[tokio::test]
+    async fn multi_clause_text_search_over_http() {
+        let app = two_field_router().await;
+        let query = |combine: &str| {
+            json!({"clauses": [
+                {"field": "title", "query": "needle"},
+                {"field": "body", "query": "needle"}
+            ], "combine": combine, "top_k": 5})
+        };
+        let top = |hits: &JsonValue| hits[0]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(post("/text-search", query("Sum")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(top(&json_body(resp).await), "spread");
+
+        let resp = app
+            .clone()
+            .oneshot(post("/text-search", query("Max")))
+            .await
+            .unwrap();
+        assert_eq!(top(&json_body(resp).await), "focused");
+    }
+
+    /// A body with no usable clause spelling is a `400`, never an empty result set.
+    #[tokio::test]
+    async fn an_unusable_text_query_body_is_a_400() {
+        let app = two_field_router().await;
+        for body in [
+            json!({"clauses": []}),
+            json!({"top_k": 5}),
+            json!({"field": "body", "query": "x", "clauses": [{"field": "title", "query": "y"}]}),
+        ] {
+            for route in ["/text-search", "/hybrid-search"] {
+                let mut body = body.clone();
+                if route == "/hybrid-search" {
+                    // The hybrid body spells the single form `field` + `text`.
+                    let obj = body.as_object_mut().unwrap();
+                    if let Some(q) = obj.remove("query") {
+                        obj.insert("text".into(), q);
+                    }
+                    obj.insert("vector".into(), json!([1, 0, 0]));
+                }
+                let resp = app
+                    .clone()
+                    .oneshot(post(route, body.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{route} {body}");
+            }
+        }
+    }
+
+    /// `explain` and `highlight` are opt-in, and the fragments index the stored text
+    /// even when the projection dropped the field (nidus-m50.5).
+    #[tokio::test]
+    async fn annotations_are_opt_in_over_http() {
+        let app = two_field_router().await;
+
+        // Default: no `annotations` key at all.
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/text-search",
+                json!({"field": "body", "query": "needle", "top_k": 5}),
+            ))
+            .await
+            .unwrap();
+        let hits = json_body(resp).await;
+        assert!(hits[0].get("annotations").is_none());
+
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/text-search",
+                json!({
+                    "clauses": [{"field": "title", "query": "needle"}, {"field": "body", "query": "needle"}],
+                    "top_k": 5, "explain": true, "highlight": {"fragment_chars": 40}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        let a = &hits[0]["annotations"];
+        assert_eq!(a["clauses"][0]["field"], "title");
+        assert_eq!(a["highlights"][0]["field"], "title");
+        assert_eq!(a["highlights"][0]["fragments"][0]["spans"][0][0], 0);
+
+        // Hybrid reports each leg's own rank and score.
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/hybrid-search",
+                json!({"vector": [1, 0, 0], "field": "body", "text": "needle",
+                       "top_k": 5, "explain": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        assert!(hits[0]["annotations"]["text"]["rank"].is_number());
     }
 
     // ── Backpressure (nidus-abx.2) ──────────────────────────────────────────

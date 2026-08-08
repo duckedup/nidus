@@ -20,6 +20,8 @@
 //! ```
 
 mod ann;
+// Opt-in result annotations: per-leg sub-scores and highlighted fragments (nidus-m50.5).
+mod annotate;
 pub mod backend;
 // Cooperative cancellation for long scans: a request deadline frees the client, only the
 // scan loop can free the CPU.
@@ -79,6 +81,7 @@ pub use memory::{META_DIM, META_EMBEDDER, Memory, RecallOpts, RememberMode};
 #[cfg(all(feature = "memory", feature = "summarize"))]
 pub use memory::{META_SOURCE, META_SUMMARY};
 
+pub use annotate::{Annotations, ClauseScore, Fragment, Highlight, HighlightOpts, LegScore};
 pub use anyhow::Result;
 pub use backend::{
     Appender, BackendLock, CasOutcome, ClusterLease, LeaseLost, LeaseRenewer, LocalFs, LocalRam,
@@ -88,8 +91,9 @@ pub use cancel::Cancel;
 pub use config::{Config, Fsync, LeaseWait, OpenMode};
 pub use fts::{Analyzer, FtsField, Language};
 pub use model::{
-    AnnConfig, AnnKind, ClusterStatus, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts,
-    ListOpts, Predicate, Projection, QuantKind, Quantization, Record, Role, SearchOpts, Value,
+    AnnConfig, AnnKind, ClusterStatus, Distance, Filter, Footprint, FtsClause, FtsCombine,
+    FtsQuery, Hit, HybridOpts, ListOpts, Predicate, Projection, QuantKind, Quantization, Record,
+    Role, SearchOpts, Value,
 };
 pub use store::Readiness;
 

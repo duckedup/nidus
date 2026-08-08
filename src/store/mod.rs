@@ -24,6 +24,7 @@ mod memtier;
 mod quant;
 mod read;
 mod scoring;
+mod text;
 mod write;
 
 #[cfg(test)]

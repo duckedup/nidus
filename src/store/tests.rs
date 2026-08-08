@@ -5477,3 +5477,351 @@ fn projection_applies_on_the_ann_and_quantized_paths() {
         }
     }
 }
+
+// ── Multi-clause BM25 + result annotations (nidus-m50.10, nidus-m50.5) ───────
+
+use crate::annotate::HighlightOpts;
+use crate::model::{FtsClause, FtsCombine};
+
+/// A text-only doc with both indexed fields populated.
+fn titled(id: &str, title: &str, body: &str) -> Record {
+    let mut attrs = BTreeMap::new();
+    attrs.insert("title".to_string(), Value::Str(title.to_string()));
+    attrs.insert("body".to_string(), Value::Str(body.to_string()));
+    Record::text_only(id, attrs)
+}
+
+/// A store indexing `title` and `body` with length normalization off, so the fixtures'
+/// scores depend on term frequency alone.
+fn two_field_store(docs: &[Record]) -> Store {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema(
+            "docs",
+            &[FtsField::new("title").b(0.0), FtsField::new("body").b(0.0)],
+        )
+        .unwrap();
+    store.upsert("docs", docs).unwrap();
+    store
+}
+
+/// The Sum/Max fixture: `spread` matches both fields weakly, `focused` matches only `body`
+/// but strongly, `filler` matches only `title`.
+fn combine_fixture() -> Store {
+    two_field_store(&[
+        titled("spread", "needle", "needle"),
+        titled("focused", "alpha", "needle needle needle needle"),
+        titled("filler", "needle", "gamma"),
+    ])
+}
+
+fn hit_ids(hits: &[Hit]) -> Vec<&str> {
+    hits.iter().map(|h| h.id.as_str()).collect()
+}
+
+#[test]
+fn a_clause_per_field_searches_both_at_once() {
+    let store = two_field_store(&[
+        titled("a", "rust vector store", "unrelated prose"),
+        titled("b", "unrelated heading", "an embedded vector store"),
+        titled("c", "nothing here", "nothing there"),
+    ]);
+    let q = FtsQuery::multi([
+        FtsClause::new("title", "rust"),
+        FtsClause::new("body", "embedded"),
+    ]);
+    let hits = store.text_search(&["docs"], &q, &default_opts(10)).unwrap();
+    // Each doc is found through a different clause; neither could find both alone.
+    let mut found = hit_ids(&hits);
+    found.sort_unstable();
+    assert_eq!(found, vec!["a", "b"]);
+}
+
+#[test]
+fn sum_and_max_rank_the_same_corpus_differently() {
+    let store = combine_fixture();
+    let q = || {
+        FtsQuery::multi([
+            FtsClause::new("title", "needle"),
+            FtsClause::new("body", "needle"),
+        ])
+    };
+    let sum = store
+        .text_search(&["docs"], &q(), &default_opts(10))
+        .unwrap();
+    // Sum adds both clauses, so matching two fields beats matching one field harder.
+    assert_eq!(hit_ids(&sum), vec!["spread", "focused", "filler"]);
+
+    let max = store
+        .text_search(&["docs"], &q().combine(FtsCombine::Max), &default_opts(10))
+        .unwrap();
+    // Max takes the strongest single clause, which flips the top of the ranking.
+    assert_eq!(max[0].id, "focused");
+    assert!(max[0].score < sum[0].score, "{max:?} vs {sum:?}");
+}
+
+#[test]
+fn a_single_clause_scores_exactly_as_the_one_field_query_always_did() {
+    let store = two_field_store(&[
+        titled("d1", "t", "the cat sat on the mat"),
+        titled("d2", "t", "cats and more cats running with cats"),
+        titled("d3", "t", "a dog barked"),
+    ]);
+    let run = |q: FtsQuery| store.text_search(&["docs"], &q, &default_opts(10)).unwrap();
+    let baseline = run(FtsQuery::new("body", "cat"));
+    assert_eq!(hit_ids(&baseline), vec!["d2", "d1"]);
+    // The multi-clause machinery must not perturb a one-clause query under either fold.
+    for combine in [FtsCombine::Sum, FtsCombine::Max] {
+        let hits = run(FtsQuery::multi([FtsClause::new("body", "cat")]).combine(combine));
+        assert_eq!(hits, baseline, "{combine:?}");
+    }
+}
+
+#[test]
+fn a_clause_list_must_not_be_empty() {
+    let store = combine_fixture();
+    let empty = FtsQuery::multi([]);
+    assert!(
+        store
+            .text_search(&["docs"], &empty, &default_opts(10))
+            .is_err()
+    );
+    assert!(
+        store
+            .hybrid_search(&["docs"], &[0.0, 0.0, 0.0], &empty, &HybridOpts::default())
+            .is_err()
+    );
+}
+
+#[test]
+fn a_clause_naming_an_unindexed_field_contributes_nothing() {
+    let store = combine_fixture();
+    let q = FtsQuery::multi([
+        FtsClause::new("title", "needle"),
+        FtsClause::new("author", "needle"),
+    ]);
+    let hits = store.text_search(&["docs"], &q, &default_opts(10)).unwrap();
+    let mut found = hit_ids(&hits);
+    found.sort_unstable();
+    assert_eq!(found, vec!["filler", "spread"]);
+}
+
+#[test]
+fn hybrid_fuses_a_vector_leg_with_several_text_clauses() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("title"), FtsField::new("body")])
+        .unwrap();
+    let rec = |id: &str, v: Vec<f32>, title: &str, body: &str| {
+        let mut r = titled(id, title, body);
+        Record::new(id, v, std::mem::take(&mut r.attrs))
+    };
+    store
+        .upsert(
+            "docs",
+            &[
+                rec("vec", vec![1.0, 0.0, 0.0], "nothing", "nothing"),
+                rec("title-hit", vec![0.0, 1.0, 0.0], "quantum", "nothing"),
+                rec("body-hit", vec![0.0, 0.0, 1.0], "nothing", "photon physics"),
+            ],
+        )
+        .unwrap();
+    let q = FtsQuery::multi([
+        FtsClause::new("title", "quantum"),
+        FtsClause::new("body", "photon"),
+    ]);
+    let hits = store
+        .hybrid_search(&["docs"], &[1.0, 0.0, 0.0], &q, &HybridOpts::default())
+        .unwrap();
+    let mut found = hit_ids(&hits);
+    found.sort_unstable();
+    // The vector leg carries `vec`; the two clauses each carry one more document.
+    assert_eq!(found, vec!["body-hit", "title-hit", "vec"]);
+}
+
+#[test]
+fn explain_reports_each_matched_clauses_own_score() {
+    let store = combine_fixture();
+    let q = FtsQuery::multi([
+        FtsClause::new("title", "needle"),
+        FtsClause::new("body", "needle"),
+    ]);
+    let plain = store.text_search(&["docs"], &q, &default_opts(10)).unwrap();
+    assert!(
+        plain.iter().all(|h| h.annotations.is_none()),
+        "annotations must stay opt-in"
+    );
+
+    let opts = SearchOpts {
+        top_k: 10,
+        explain: true,
+        ..Default::default()
+    };
+    let hits = store.text_search(&["docs"], &q, &opts).unwrap();
+    let by_id = |id: &str| {
+        hits.iter()
+            .find(|h| h.id == id)
+            .unwrap()
+            .annotations
+            .clone()
+            .unwrap()
+    };
+    let spread = by_id("spread");
+    assert_eq!(
+        spread
+            .clauses
+            .iter()
+            .map(|c| c.field.as_str())
+            .collect::<Vec<_>>(),
+        vec!["title", "body"],
+        "matched clauses are reported in query order"
+    );
+    // The parts must add up to the fused score the hit carries.
+    let total: f32 = spread.clauses.iter().map(|c| c.score).sum();
+    let hit_score = hits.iter().find(|h| h.id == "spread").unwrap().score;
+    assert!((total - hit_score).abs() < 1e-6);
+    // A doc that matched one clause reports one clause, not a zero row for the other.
+    assert_eq!(by_id("focused").clauses.len(), 1);
+    assert_eq!(by_id("focused").clauses[0].field, "body");
+}
+
+#[test]
+fn explain_reports_each_legs_rank_and_score_on_a_hybrid_hit() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    let mut attrs = BTreeMap::new();
+    attrs.insert("body".to_string(), Value::Str("quantum physics".into()));
+    store
+        .upsert(
+            "docs",
+            &[
+                Record::new("both", vec![1.0, 0.0, 0.0], attrs.clone()),
+                Record::new("vec-only", vec![0.9, 0.1, 0.0], BTreeMap::new()),
+            ],
+        )
+        .unwrap();
+    let q = FtsQuery::new("body", "quantum");
+    let opts = HybridOpts {
+        explain: true,
+        ..Default::default()
+    };
+    let hits = store
+        .hybrid_search(&["docs"], &[1.0, 0.0, 0.0], &q, &opts)
+        .unwrap();
+    let both = hits.iter().find(|h| h.id == "both").unwrap();
+    let a = both.annotations.clone().unwrap();
+    let vector = a.vector.expect("vector leg reported");
+    let text = a.text.expect("text leg reported");
+    assert_eq!(vector.rank, 0);
+    assert!((vector.score - 1.0).abs() < 1e-6, "{vector:?}");
+    assert_eq!(text.rank, 0);
+    assert_eq!(a.clauses.len(), 1);
+    assert!((text.score - a.clauses[0].score).abs() < 1e-6);
+
+    // A doc only the vector leg returned reports that leg alone.
+    let vec_only = hits.iter().find(|h| h.id == "vec-only").unwrap();
+    let a = vec_only.annotations.clone().unwrap();
+    assert!(a.vector.is_some() && a.text.is_none() && a.clauses.is_empty());
+
+    // And without `explain` the hits carry nothing extra.
+    let plain = store
+        .hybrid_search(&["docs"], &[1.0, 0.0, 0.0], &q, &HybridOpts::default())
+        .unwrap();
+    assert!(plain.iter().all(|h| h.annotations.is_none()));
+}
+
+#[test]
+fn highlight_spans_index_the_original_text_across_the_stemmer() {
+    let store = two_field_store(&[
+        titled("a", "t", "The engineers were running experiments overnight"),
+        titled("b", "t", "We run the suite nightly"),
+    ]);
+    // "running" (query) and "run" (document) share a stem, and vice versa: the span must
+    // cover the *document's* spelling either way, which no substring search would find.
+    for (query, want) in [("running", "run"), ("run", "running")] {
+        let q = FtsQuery::new("body", query).highlight(HighlightOpts::default());
+        let hits = store.text_search(&["docs"], &q, &default_opts(10)).unwrap();
+        let hit = hits
+            .iter()
+            .find(|h| h.id == if want == "run" { "b" } else { "a" })
+            .unwrap();
+        let hl = &hit.annotations.as_ref().unwrap().highlights;
+        assert_eq!(hl.len(), 1);
+        assert_eq!(hl[0].field, "body");
+        let frag = &hl[0].fragments[0];
+        let marked: Vec<&str> = frag.spans.iter().map(|&(s, e)| &frag.text[s..e]).collect();
+        assert_eq!(marked, vec![want], "query {query:?}");
+    }
+}
+
+#[test]
+fn highlighting_reads_the_stored_text_even_when_projection_drops_the_field() {
+    // The combination the feature exists for: drop the 10 KB body from the payload and keep
+    // only the snippet that explains the match (nidus-m50.5).
+    let store = two_field_store(&[titled("a", "heading", "the engineers were running late")]);
+    let q = FtsQuery::new("body", "run").highlight(HighlightOpts::default());
+    let opts = SearchOpts {
+        top_k: 10,
+        projection: Projection::include(["title"]),
+        ..Default::default()
+    };
+    let hits = store.text_search(&["docs"], &q, &opts).unwrap();
+    assert_eq!(
+        attr_keys(&hits[0]),
+        vec!["title"],
+        "body was projected away"
+    );
+    let hl = &hits[0].annotations.as_ref().unwrap().highlights;
+    assert!(hl[0].fragments[0].text.contains("running"));
+
+    // Excluding it is the same story.
+    let opts = SearchOpts {
+        top_k: 10,
+        projection: Projection::exclude(["body"]),
+        ..Default::default()
+    };
+    let hits = store.text_search(&["docs"], &q, &opts).unwrap();
+    assert_eq!(attr_keys(&hits[0]), vec!["title"]);
+    assert!(!hits[0].annotations.as_ref().unwrap().highlights.is_empty());
+}
+
+#[test]
+fn highlighting_covers_every_matched_clause_and_survives_fusion() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("title"), FtsField::new("body")])
+        .unwrap();
+    let mut attrs = BTreeMap::new();
+    attrs.insert("title".to_string(), Value::Str("running order".into()));
+    attrs.insert(
+        "body".to_string(),
+        Value::Str("the tests all passed".into()),
+    );
+    store
+        .upsert("docs", &[Record::new("a", vec![1.0, 0.0, 0.0], attrs)])
+        .unwrap();
+    let q = FtsQuery::multi([
+        FtsClause::new("title", "run"),
+        FtsClause::new("body", "test"),
+    ])
+    .highlight(HighlightOpts::default());
+
+    let hits = store.text_search(&["docs"], &q, &default_opts(10)).unwrap();
+    let fields: Vec<&str> = hits[0]
+        .annotations
+        .as_ref()
+        .unwrap()
+        .highlights
+        .iter()
+        .map(|h| h.field.as_str())
+        .collect();
+    assert_eq!(fields, vec!["title", "body"]);
+
+    // Fusion rebuilds the hit, so highlighting is applied to the fused page, not the leg.
+    let hits = store
+        .hybrid_search(&["docs"], &[1.0, 0.0, 0.0], &q, &HybridOpts::default())
+        .unwrap();
+    assert_eq!(hits[0].annotations.as_ref().unwrap().highlights.len(), 2);
+}

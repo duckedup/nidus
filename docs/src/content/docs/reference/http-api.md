@@ -354,9 +354,10 @@ never serialized — which is the point on a collection of long text bodies.
 
 ### `POST /text-search`
 
-BM25 full-text search of a declared field. Returns the same hit shape as `/search`.
-Takes `field`, `query`, `scope`, `top_k`, `offset`, `filter`, and `min_score` — here a
-**raw BM25** floor (not cosine).
+BM25 full-text search of declared fields. Returns the same hit shape as `/search`.
+Takes `scope`, `top_k`, `offset`, `filter`, `min_score` — here a **raw BM25** floor (not
+cosine) — the `include_attributes`/`exclude_attributes` projection, and the query itself in
+one of two spellings.
 
 ```bash
 curl -s localhost:7700/text-search \
@@ -364,11 +365,39 @@ curl -s localhost:7700/text-search \
   -d '{"field": "body", "query": "running quickly", "scope": ["docs"], "top_k": 5}'
 ```
 
+Name several fields with `clauses` instead — each clause carries its own text:
+
+```bash
+curl -s localhost:7700/text-search \
+  -H 'content-type: application/json' \
+  -d '{
+        "clauses": [
+          {"field": "title", "query": "rust"},
+          {"field": "body",  "query": "async runtime"}
+        ],
+        "combine": "Sum",
+        "top_k": 5
+      }'
+```
+
+| field | default | meaning |
+| --- | --- | --- |
+| `field` + `query` | — | the single-clause spelling |
+| `clauses` | — | `[{field, query}, …]`, one entry per field searched |
+| `combine` | `"Sum"` | `"Sum"` adds every matched clause's score; `"Max"` takes the strongest |
+| `explain` | `false` | report each matched clause's own BM25 score |
+| `highlight` | absent | `{}` for defaults, or `{"max_fragments": 2, "fragment_chars": 120}` |
+
+`field`+`query` and `clauses` are **mutually exclusive**, and an empty `clauses` list is a
+`400` — an empty result set would otherwise read as "no matches" rather than "no query".
+
 ### `POST /hybrid-search`
 
 Fuse a vector query and a BM25 text query with Reciprocal Rank Fusion. Takes `vector`
-+ `field` + `text`, plus `top_k`, `offset` (which pages the **fused** ranking, never a
-leg), `filter`, `rrf_k` (default 60), and `candidates` (default 100). There is no `min_score` (a fused RRF score has no absolute scale).
+plus the text leg — `field` + `text`, or the same `clauses` + `combine` as `/text-search` —
+plus `top_k`, `offset` (which pages the **fused** ranking, never a leg),
+`filter`, `rrf_k` (default 60), `candidates` (default 100), and `explain`/`highlight`.
+There is no `min_score` (a fused RRF score has no absolute scale).
 Returns the same hit shape as `/search`.
 
 ```bash
@@ -376,6 +405,34 @@ curl -s localhost:7700/hybrid-search \
   -H 'content-type: application/json' \
   -d '{"vector": [1,0,0], "field": "body", "text": "vector database", "top_k": 5}'
 ```
+
+### Annotations: why a hit matched
+
+`explain` and `highlight` add an `annotations` object to each hit. Both are opt-in, and the
+key is **absent** otherwise — an unannotated response is byte-for-byte what it always was.
+
+```json
+{
+  "collection": "docs", "id": "a", "score": 0.031, "attrs": {"title": {"Str": "vector search"}},
+  "annotations": {
+    "vector": {"rank": 0, "score": 0.98},
+    "text": {"rank": 1, "score": 1.10},
+    "clauses": [{"field": "title", "score": 0.49}, {"field": "body", "score": 0.61}],
+    "highlights": [
+      {"field": "body", "fragments": [
+        {"text": "the engineers were running", "spans": [[19, 26]]}
+      ]}
+    ]
+  }
+}
+```
+
+`vector`/`text` are the fusion legs' own rank and score, and appear only on
+`/hybrid-search`. `clauses` lists the clauses that actually matched, in query order.
+`spans` are `[start, end)` **byte** offsets into that fragment's `text`, covering the word
+as the document spells it — a query for `run` marks `running`. Highlighting reads the
+stored text, so it still works on a field `include_attributes`/`exclude_attributes`
+dropped from the payload: that pairing (drop the long body, keep the snippet) is the point.
 
 ### `POST /list`
 

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::annotate::{Annotations, HighlightOpts};
 use crate::fts::{FtsField, Language};
 
 /// The similarity / distance metric used for scoring. Pinned at store creation
@@ -318,24 +319,89 @@ pub enum Predicate {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Filter(pub Vec<Predicate>);
 
-/// A full-text query: the indexed `field` and the raw query `text`. The text is analyzed
-/// (lowercase → tokenize → stopword → stem) with the field's language at query time, exactly as
-/// documents were at index time, so a query term matches a stored term sharing its stem.
-#[derive(Clone, Debug)]
-pub struct FtsQuery {
+/// How several [`FtsClause`]s fold into one text score (nidus-m50.10).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FtsCombine {
+    /// Add every matched clause's BM25 score, so a doc hit on title *and* body outranks
+    /// one hit on either alone. The default.
+    #[default]
+    #[serde(alias = "sum")]
+    Sum,
+    /// Take the strongest matched clause, so a long body cannot out-accumulate a precise
+    /// title match.
+    #[serde(alias = "max")]
+    Max,
+}
+
+/// One clause of an [`FtsQuery`]: an indexed `field` and the raw query `text` for it. Each
+/// clause carries its own text, so `title:"rust"` + `body:"async runtime"` is one query.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FtsClause {
     /// The full-text-indexed attribute field to search (declared in the FTS schema).
     pub field: String,
-    /// Raw query text.
+    /// Raw query text for this field.
     pub text: String,
 }
 
-impl FtsQuery {
-    /// A query over `field` for `text`.
+impl FtsClause {
+    /// A clause searching `field` for `text`.
     pub fn new(field: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
             field: field.into(),
             text: text.into(),
         }
+    }
+}
+
+/// A full-text query: one or more [`FtsClause`]s folded by [`FtsCombine`], plus optional
+/// highlighting. Each clause's text is analyzed with *that field's* analyzer at query time,
+/// exactly as documents were at index time, so a query term matches a term sharing its stem.
+#[derive(Clone, Debug)]
+pub struct FtsQuery {
+    /// The clauses to score. At least one — an empty list is an error, not a match-all.
+    pub clauses: Vec<FtsClause>,
+    /// How the clauses' scores fold together.
+    pub combine: FtsCombine,
+    /// Return highlighted fragments of each clause field's stored text. `None` (the
+    /// default) returns no fragments and does no extra work.
+    pub highlight: Option<HighlightOpts>,
+}
+
+impl FtsQuery {
+    /// A single-clause query over `field` for `text` — the original shape, unchanged.
+    pub fn new(field: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::multi([FtsClause::new(field, text)])
+    }
+
+    /// A query over several clauses, combined by [`FtsCombine::Sum`] unless
+    /// [`combine`](Self::combine) says otherwise.
+    pub fn multi(clauses: impl IntoIterator<Item = FtsClause>) -> Self {
+        Self {
+            clauses: clauses.into_iter().collect(),
+            combine: FtsCombine::default(),
+            highlight: None,
+        }
+    }
+
+    /// Set how the clauses fold together.
+    pub fn combine(mut self, combine: FtsCombine) -> Self {
+        self.combine = combine;
+        self
+    }
+
+    /// Return highlighted fragments of the matched text.
+    pub fn highlight(mut self, opts: HighlightOpts) -> Self {
+        self.highlight = Some(opts);
+        self
+    }
+
+    /// Reject a query with nothing to score. An empty clause list is a caller error rather
+    /// than an empty result, so a client bug does not read as "the corpus has no matches".
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if self.clauses.is_empty() {
+            anyhow::bail!("a full-text query must carry at least one clause");
+        }
+        Ok(())
     }
 }
 
@@ -402,6 +468,9 @@ pub struct SearchOpts {
     pub exact: bool,
     /// Which attrs the returned hits carry. Default: all of them.
     pub projection: Projection,
+    /// Annotate each hit with why it matched (nidus-m50.5). On a `text_search` that is each
+    /// clause's own BM25 score; vector `search` ignores it, having a single score to report.
+    pub explain: bool,
 }
 
 /// Query parameters for a metadata-only listing (no vector scoring).
@@ -443,6 +512,9 @@ pub struct HybridOpts {
     /// How deep to pull each leg before fusing (clamped up to at least `top_k`). Larger
     /// improves fusion recall at linear cost. Default 100.
     pub candidates: usize,
+    /// Annotate each hit with each leg's own rank and score plus every matched BM25
+    /// clause's contribution (nidus-m50.5). Default `false`.
+    pub explain: bool,
 }
 
 impl Default for HybridOpts {
@@ -453,6 +525,7 @@ impl Default for HybridOpts {
             filter: Filter::default(),
             rrf_k: 60.0,
             candidates: 100,
+            explain: false,
         }
     }
 }
@@ -467,10 +540,14 @@ pub struct Hit {
     pub id: String,
     pub score: f32,
     pub attrs: BTreeMap<String, Value>,
+    /// Why this hit matched — per-leg sub-scores and highlighted fragments. `None` unless
+    /// the query opted in (`explain` / `FtsQuery::highlight`), so the default is unchanged.
+    pub annotations: Option<Annotations>,
 }
 
 impl Hit {
-    /// One result from `collection`, scored `score`, carrying the record's `attrs`.
+    /// One result from `collection`, scored `score`, carrying the record's `attrs` and no
+    /// annotations (a search path attaches those afterwards, when asked).
     pub fn new(
         collection: impl Into<String>,
         id: impl Into<String>,
@@ -482,6 +559,7 @@ impl Hit {
             id: id.into(),
             score,
             attrs,
+            annotations: None,
         }
     }
 }

@@ -58,16 +58,39 @@ impl Analyzer {
     }
 }
 
+/// One analyzed term plus the byte range of the **original** text it came from. Stemming
+/// and folding mean the term is usually *not* a substring of that range, which is exactly
+/// why the range is carried rather than re-found by searching for the term (nidus-m50.5).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TermSpan {
+    pub(crate) term: String,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
 /// Analyze `text` into a sequence of normalized terms (in document order, duplicates
 /// kept so term frequencies are countable). Empty input → no terms.
 pub(crate) fn analyze(text: &str, cfg: Analyzer) -> Vec<String> {
+    analyze_spans(text, cfg)
+        .into_iter()
+        .map(|t| t.term)
+        .collect()
+}
+
+/// [`analyze`], keeping each surviving term's byte range in `text`. The one analysis path —
+/// `analyze` is this, with the offsets dropped — so a highlighter can never disagree with
+/// the index about what was a term.
+pub(crate) fn analyze_spans(text: &str, cfg: Analyzer) -> Vec<TermSpan> {
     let tokens = tokenize(text, cfg.ascii_folding, cfg.max_token_len);
     match cfg.language {
         Language::English => tokens
             .into_iter()
-            .filter(|t| !is_stopword(t))
-            .map(|t| stem(&t))
-            .filter(|t| !t.is_empty())
+            .filter(|t| !is_stopword(&t.term))
+            .map(|t| TermSpan {
+                term: stem(&t.term),
+                ..t
+            })
+            .filter(|t| !t.term.is_empty())
             .collect(),
     }
 }
@@ -75,33 +98,41 @@ pub(crate) fn analyze(text: &str, cfg: Analyzer) -> Vec<String> {
 /// Split `text` into lowercased tokens on runs of Unicode alphanumerics, everything else being a
 /// separator. Lowercasing is std's `char::to_lowercase`, which covers the Latin script we target —
 /// a pragmatic stand-in for full UAX #29 segmentation that stays dependency-free.
-fn tokenize(text: &str, ascii_folding: bool, max_token_len: Option<usize>) -> Vec<String> {
+fn tokenize(text: &str, ascii_folding: bool, max_token_len: Option<usize>) -> Vec<TermSpan> {
     let mut out = Vec::new();
     let mut cur = String::new();
+    let mut start = 0usize;
     // The length cap counts the token as the text held it, before folding can expand it
     // ("ß" → "ss"), so the cap means the same thing whether folding is on or off.
-    let mut push = |cur: &mut String| {
+    let mut push = |cur: &mut String, start: usize, end: usize| {
         let token = std::mem::take(cur);
         if max_token_len.is_some_and(|max| token.chars().count() > max) {
             return;
         }
-        out.push(if ascii_folding {
-            fold_ascii(&token)
-        } else {
-            token
+        out.push(TermSpan {
+            term: if ascii_folding {
+                fold_ascii(&token)
+            } else {
+                token
+            },
+            start,
+            end,
         });
     };
-    for ch in text.chars() {
+    for (i, ch) in text.char_indices() {
         if ch.is_alphanumeric() {
+            if cur.is_empty() {
+                start = i;
+            }
             for lc in ch.to_lowercase() {
                 cur.push(lc);
             }
         } else if !cur.is_empty() {
-            push(&mut cur);
+            push(&mut cur, start, i);
         }
     }
     if !cur.is_empty() {
-        push(&mut cur);
+        push(&mut cur, start, text.len());
     }
     out
 }
@@ -527,9 +558,17 @@ impl Porter {
 mod tests {
     use super::*;
 
+    /// Tokenize, keeping only the token text.
+    fn terms(text: &str, ascii_folding: bool, max_token_len: Option<usize>) -> Vec<String> {
+        tokenize(text, ascii_folding, max_token_len)
+            .into_iter()
+            .map(|t| t.term)
+            .collect()
+    }
+
     /// Tokenize with today's defaults (no folding, no length cap).
     fn tok(text: &str) -> Vec<String> {
-        tokenize(text, false, None)
+        terms(text, false, None)
     }
 
     #[test]
@@ -544,7 +583,7 @@ mod tests {
     #[test]
     fn ascii_folding_is_off_by_default_and_folds_when_on() {
         assert_eq!(tok("Café RÉSUMÉ"), vec!["café", "résumé"]);
-        assert_eq!(tokenize("Café RÉSUMÉ", true, None), vec!["cafe", "resume"]);
+        assert_eq!(terms("Café RÉSUMÉ", true, None), vec!["cafe", "resume"]);
     }
 
     #[test]
@@ -561,14 +600,14 @@ mod tests {
     #[test]
     fn max_token_len_drops_only_the_oversized_tokens() {
         assert_eq!(
-            tokenize("ok aaaaaaaa fine", false, Some(4)),
+            terms("ok aaaaaaaa fine", false, Some(4)),
             vec!["ok", "fine"]
         );
         // The cap counts chars, not bytes, so a 4-char accented token survives a cap of 4.
-        assert_eq!(tokenize("héllo", false, Some(4)), Vec::<String>::new());
-        assert_eq!(tokenize("héll", false, Some(4)), vec!["héll"]);
+        assert_eq!(terms("héllo", false, Some(4)), Vec::<String>::new());
+        assert_eq!(terms("héll", false, Some(4)), vec!["héll"]);
         // And it is measured before folding expands "ß" into two ASCII chars.
-        assert_eq!(tokenize("straße", true, Some(6)), vec!["strasse"]);
+        assert_eq!(terms("straße", true, Some(6)), vec!["strasse"]);
     }
 
     #[test]
@@ -644,6 +683,35 @@ mod tests {
         let r = stem("running");
         assert_eq!(r, stem("run"));
         assert_eq!(stem("runs"), stem("run"));
+    }
+
+    #[test]
+    fn spans_point_at_the_surface_form_not_the_stem() {
+        // The property the highlighter rests on: the term is "run", but the range covers
+        // the word as the document actually spells it.
+        let text = "The developers were running quickly";
+        let spans = analyze_spans(text, Analyzer::default());
+        let run = spans.iter().find(|t| t.term == "run").unwrap();
+        assert_eq!(&text[run.start..run.end], "running");
+        let dev = spans.iter().find(|t| t.term == "develop").unwrap();
+        assert_eq!(&text[dev.start..dev.end], "developers");
+    }
+
+    #[test]
+    fn spans_survive_folding_punctuation_and_multibyte_text() {
+        let text = "Le café, «RÉSUMÉ» — 42!";
+        let cfg = Analyzer::default().ascii_folding(true);
+        let spans = analyze_spans(text, cfg);
+        let at = |term: &str| {
+            let t = spans.iter().find(|t| t.term == term).unwrap();
+            &text[t.start..t.end]
+        };
+        assert_eq!(at("cafe"), "café");
+        assert_eq!(at("resum"), "RÉSUMÉ");
+        assert_eq!(at("42"), "42");
+        // Dropping the offsets reproduces `analyze` exactly.
+        let terms: Vec<String> = spans.into_iter().map(|t| t.term).collect();
+        assert_eq!(terms, analyze(text, cfg));
     }
 
     #[test]

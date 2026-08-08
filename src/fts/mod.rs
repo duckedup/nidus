@@ -9,16 +9,19 @@ use crate::model::Value;
 
 mod analyzer;
 mod fold;
+mod highlight;
 mod schema;
 
 pub(crate) use analyzer::analyze;
 pub use analyzer::{Analyzer, Language};
+pub(crate) use highlight::fragments;
 pub use schema::FtsField;
 pub(crate) use schema::validate;
 
 /// The full text of attribute `field` for FTS purposes: a `Str` directly, a `List`
 /// joined by spaces (each element is its own run of terms), everything else empty.
-fn field_text(attrs: &BTreeMap<String, Value>, field: &str) -> String {
+/// Highlight offsets are into **this** string, so a `List` field's spans index the join.
+pub(crate) fn field_text(attrs: &BTreeMap<String, Value>, field: &str) -> String {
     match attrs.get(field) {
         Some(Value::Str(s)) => s.clone(),
         Some(Value::List(items)) => items.join(" "),

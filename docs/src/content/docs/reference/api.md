@@ -1,6 +1,6 @@
 ---
 title: API reference
-description: The full nidus public surface — Nidus, Config, Record, Value, Filter, Predicate, Scope, SearchOpts, FtsQuery, HybridOpts, ListOpts, Hit, Footprint.
+description: The full nidus public surface — Nidus, Config, Record, Value, Filter, Predicate, Scope, SearchOpts, FtsQuery, HybridOpts, ListOpts, Hit, Annotations, Footprint.
 ---
 
 The complete public API. All fallible methods return `anyhow::Result`. For the
@@ -56,7 +56,7 @@ searchers plus one writer (see
 | ------ | --------- | ----- |
 | `list` | `fn list<'a>(&self, scope: impl Into<Scope<'a>>, opts: &ListOpts) -> Result<Vec<Hit>>` | Metadata-only query — no vector, returns filter-matched records in insertion order; `ListOpts`'s `offset`/`limit` paginate. |
 | `search` | `fn search<'a>(&self, scope: impl Into<Scope<'a>>, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>` | Ranked search over a scope using the store's distance metric; `SearchOpts`'s `offset`/`top_k` paginate. |
-| `text_search` | `fn text_search<'a>(&self, scope: impl Into<Scope<'a>>, query: &FtsQuery, opts: &SearchOpts) -> Result<Vec<Hit>>` | [BM25 full-text search](/guides/search/#full-text-search-bm25); `min_score` is a raw BM25 floor. |
+| `text_search` | `fn text_search<'a>(&self, scope: impl Into<Scope<'a>>, query: &FtsQuery, opts: &SearchOpts) -> Result<Vec<Hit>>` | [BM25 full-text search](/guides/search/#full-text-search-bm25) over one or more field clauses; `min_score` is a raw BM25 floor. |
 | `hybrid_search` | `fn hybrid_search<'a>(&self, scope: impl Into<Scope<'a>>, vector: &[f32], text: &FtsQuery, opts: &HybridOpts) -> Result<Vec<Hit>>` | [Hybrid vector + BM25](/guides/search/#hybrid-search-rrf), fused with Reciprocal Rank Fusion. |
 | `flush` | `fn flush(&mut self) -> Result<()>` | Force an fsync (relevant under `Fsync::OnFlush`). |
 | `deferred` | `fn deferred<T>(&mut self, f: impl FnOnce(&mut Nidus) -> Result<T>) -> Result<T>` | Run `f`'s mutations with their durable barrier deferred, so several can share one — see [group commit](/guides/how-it-works/#group-commit). **Report nothing successful until `commit` returns `Ok`**: until then the bytes are appended but not durable. |
@@ -190,10 +190,12 @@ pub struct SearchOpts {
     pub min_score: Option<f32>,  // drop results below this score
     pub exact: bool,             // force the exact scan for this query
     pub projection: Projection,  // which attrs the hits carry
+    pub explain: bool,           // annotate each hit with its per-clause BM25 scores
 }
 ```
 
-Implements `Default` (`offset: 0`, `exact: false`, `projection: Projection::All`) —
+Implements `Default` (`offset: 0`, `exact: false`, `explain: false`,
+`projection: Projection::All`) —
 `SearchOpts { top_k: 5, ..Default::default() }` is the idiomatic call. Reused by
 `text_search`, where `min_score` is a raw BM25 floor.
 
@@ -224,21 +226,61 @@ saving on a long-body collection is real. Ranking and scores are unaffected. An 
 rather than two lists, so "include and exclude at once" cannot be expressed; the HTTP
 surface answers `400` for the wire form that sends both.
 
-## `FtsQuery` & `Language`
+## `FtsQuery`, `FtsClause`, `FtsCombine` & `Language`
 
-A [full-text query](/guides/search/#full-text-search-bm25): the indexed field and the
-raw query text (analyzed at query time the same way documents were at index time).
+A [full-text query](/guides/search/#full-text-search-bm25): one or more clauses, each
+naming an indexed field *and its own* raw query text (analyzed at query time the same way
+documents were at index time).
 
 ```rust
 pub struct FtsQuery {
-    pub field: String,  // a full-text-indexed attribute field
-    pub text: String,   // raw query text
+    pub clauses: Vec<FtsClause>,           // at least one; empty is an error
+    pub combine: FtsCombine,               // how clause scores fold (default Sum)
+    pub highlight: Option<HighlightOpts>,  // None = no fragments (the default)
 }
 
-pub enum Language { English }  // the analyzer; extensible (US English today)
+pub struct FtsClause {
+    pub field: String,  // a full-text-indexed attribute field
+    pub text: String,   // raw query text for this field
+}
+
+pub enum FtsCombine { Sum, Max }  // add every matched clause, or take the strongest
+pub enum Language { English }     // the analyzer; extensible (US English today)
 ```
 
-Construct with `FtsQuery::new(field, text)`.
+`FtsQuery::new(field, text)` is the one-clause shorthand; `FtsQuery::multi([...])` takes
+several, with `.combine(...)` and `.highlight(...)` builders. See
+[searching several fields at once](/guides/search/#searching-several-fields-at-once).
+
+## `HighlightOpts`, `Annotations` & friends
+
+The opt-in [explanation of a hit](/guides/search/#explaining-a-hit).
+
+```rust
+pub struct HighlightOpts {
+    pub max_fragments: usize,   // fragments per field (default 1)
+    pub fragment_chars: usize,  // characters per fragment (default 160)
+}
+
+pub struct Annotations {
+    pub vector: Option<LegScore>,     // the vector leg's rank + score (hybrid only)
+    pub text: Option<LegScore>,       // the BM25 leg's rank + score (hybrid only)
+    pub clauses: Vec<ClauseScore>,    // each matched clause's own BM25 score
+    pub highlights: Vec<Highlight>,   // fragments, one entry per matched field
+}
+
+pub struct LegScore    { pub rank: usize, pub score: f32 }
+pub struct ClauseScore { pub field: String, pub score: f32 }
+pub struct Highlight   { pub field: String, pub fragments: Vec<Fragment> }
+pub struct Fragment {
+    pub text: String,                 // an excerpt of the stored text
+    pub spans: Vec<(usize, usize)>,   // matched byte ranges *within* `text`
+}
+```
+
+Fragment offsets index the **original** text, not the analyzed tokens — a query for `run`
+highlights a document's `running`. Highlighting reads the stored value, so it is unaffected
+by [`Projection`](#projection).
 
 ## `HybridOpts`
 
@@ -252,11 +294,13 @@ pub struct HybridOpts {
     pub filter: Filter,    // applied to both legs
     pub rrf_k: f32,        // RRF rank-bias constant (default 60)
     pub candidates: usize, // depth pulled per leg before fusing (default 100)
+    pub explain: bool,     // annotate each hit with per-leg and per-clause scores
 }
 ```
 
-Implements `Default` (`top_k: 10`, `offset: 0`). `offset` pages the **fused** ranking,
-never a leg. There is no `min_score` — a fused RRF score has no absolute scale.
+Implements `Default` (`top_k: 10`, `offset: 0`, `explain: false`). `offset` pages the
+**fused** ranking, never a leg. There is no `min_score` — a fused RRF score has no
+absolute scale.
 
 ## `ListOpts`
 
@@ -286,6 +330,7 @@ pub struct Hit {
     pub id: String,
     pub score: f32,   // meaning depends on the store's Distance metric
     pub attrs: BTreeMap<String, Value>,
+    pub annotations: Option<Annotations>,  // why it matched; None unless asked
 }
 
 impl Hit {

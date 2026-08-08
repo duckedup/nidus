@@ -483,6 +483,36 @@ let hits = db.text_search(
 # anyhow::Ok(())
 ```
 
+### Searching several fields at once
+
+A query is a **list of clauses**, and each clause carries its own text — so a record with
+both a title and a body can be searched across both in one query, with different words per
+field:
+
+```rust
+use nidus::{FtsClause, FtsCombine, FtsQuery};
+
+let q = FtsQuery::multi([
+    FtsClause::new("title", "rust"),
+    FtsClause::new("body", "async runtime"),
+]);
+let hits = db.text_search("docs", &q, &SearchOpts { top_k: 10, ..Default::default() })?;
+
+// …or take the strongest single clause instead of adding them up:
+let q = q.combine(FtsCombine::Max);
+# anyhow::Ok(())
+```
+
+- **`FtsCombine::Sum`** (the default) adds every matched clause's BM25 score, so a document
+  that hits the title *and* the body outranks one that hits either alone.
+- **`FtsCombine::Max`** takes the strongest clause, so a long body cannot out-accumulate a
+  precise title match.
+- A clause naming a field the collection does not full-text index simply contributes
+  nothing. An **empty clause list is an error** — over HTTP a `400` — because an empty
+  result would otherwise read as "no matches" rather than "you sent no query".
+- `FtsQuery::new(field, text)` is the one-clause shorthand, and a single clause scores
+  exactly the same under either combine mode. `min_score` applies to the combined score.
+
 - **Analyzer.** US English today (`Language::English`): lowercase → Unicode word
   tokenization → English stopword removal → Porter stemming. Stemming means a query for
   `run` matches documents containing `running`, `runs`, or `ran`. The same analysis runs
@@ -557,6 +587,59 @@ ranking, never a leg), a `filter` applied to both legs, `rrf_k` (the rank-bias c
 default 60), and `candidates` (how deep each leg is pulled before fusing, default 100). There is no `min_score` — a fused RRF score has no
 absolute scale; threshold the individual legs via `search` / `text_search` if you need
 a floor.
+
+The text leg takes the same multi-clause `FtsQuery` as `text_search`: the clauses are
+combined into one BM25 leg first, then fused with the vector leg, so a single-clause hybrid
+query produces exactly the numbers it always did.
+
+## Explaining a hit
+
+A `Hit` carries one score and the record's attrs, which does not tell you *why* it matched.
+`Hit::annotations` does. It is `None` unless the query asks, so nothing about the default
+response changes.
+
+```rust
+use nidus::{FtsQuery, HighlightOpts, SearchOpts};
+
+let q = FtsQuery::new("body", "run").highlight(HighlightOpts::default());
+let hits = db.text_search(
+    "docs",
+    &q,
+    &SearchOpts { top_k: 10, explain: true, ..Default::default() },
+)?;
+
+for hit in &hits {
+    let a = hit.annotations.as_ref().unwrap();
+    for clause in &a.clauses {
+        println!("{} scored {}", clause.field, clause.score);
+    }
+    for hl in &a.highlights {
+        for frag in &hl.fragments {
+            for &(start, end) in &frag.spans {
+                println!("{}: …{}…  matched {:?}", hl.field, frag.text, &frag.text[start..end]);
+            }
+        }
+    }
+}
+# anyhow::Ok(())
+```
+
+- **`explain: true`** reports each *matched* clause's own BM25 score, in query order (a
+  clause that did not match is absent, not a zero). On `hybrid_search`, `HybridOpts::explain`
+  additionally reports each fusion leg's own `(rank, score)`, so you can see whether a
+  document rode in on the vector leg, the text leg, or both. Vector `search` ignores it — it
+  has a single score to report.
+- **`highlight`** returns fragments of the field's stored text with the byte ranges that
+  matched. The offsets index the **original** text, not the analyzed token stream: a query
+  for `run` highlights the word a document spells `running`, which no substring search would
+  find. `HighlightOpts { max_fragments, fragment_chars }` bounds the output; fragments are
+  snapped to word boundaries so they never open or close mid-word, and `spans` are byte
+  offsets *within the fragment*.
+- **Highlighting and [projection](#choosing-the-attrs-a-hit-carries) are independent.**
+  Fragments are cut from the stored text, so dropping a 10 KB body from the payload and
+  keeping only its snippet is the supported combination — not a silent no-op.
+- Annotations are computed on the returned page, after pagination, so the cost scales with
+  `top_k` rather than with the candidate set.
 
 Full-text and hybrid search are a runtime feature over the same store — like ANN and
 quantization, they change nothing about the on-disk vector format, and a store opened

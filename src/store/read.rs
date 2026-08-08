@@ -1,8 +1,8 @@
 //! Reads and search: cheap accessors, the row-sorted scan plumbing that feeds every query the
 //! data matrix in storage order, exact f32 brute force, and the approximate `search_ann`. The
-//! quantized first pass lives in [`super::quant`].
+//! quantized first pass lives in [`super::quant`], full-text and hybrid in [`super::text`].
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Result, bail};
 
@@ -11,12 +11,7 @@ use super::{ScanOrder, Store, oom};
 use crate::ann::Walk;
 use crate::config::Config;
 use crate::filter;
-use crate::fts::Analyzer;
-use crate::fuse::{FusionLeg, rrf_fuse};
-use crate::model::{
-    AnnConfig, Distance, Filter, Footprint, FtsQuery, Hit, HybridOpts, ListOpts, Projection,
-    SearchOpts,
-};
+use crate::model::{AnnConfig, Distance, Filter, Footprint, Hit, ListOpts, Projection, SearchOpts};
 use crate::search::{TopK, dot, euclidean_neg_sq, normalize};
 
 /// The options a search *path* runs with: rank `offset + top_k` deep, then let the caller's
@@ -29,17 +24,18 @@ fn deepened(opts: &SearchOpts) -> SearchOpts {
     }
 }
 
-/// Drop the first `offset` ranked hits — the ONE place a page boundary is cut. An offset past
-/// the end is an empty page, never an error: a caller walking pages must be able to stop.
-fn paginate(mut hits: Vec<Hit>, offset: usize) -> Vec<Hit> {
+/// Drop the first `offset` ranked entries — the ONE place a page boundary is cut. An offset past
+/// the end is an empty page, never an error: a caller walking pages must be able to stop. Generic
+/// so hybrid can page the fused ranking while it still carries each leg's detail.
+pub(super) fn paginate<T>(mut ranked: Vec<T>, offset: usize) -> Vec<T> {
     if offset == 0 {
-        return hits;
+        return ranked;
     }
-    if offset >= hits.len() {
+    if offset >= ranked.len() {
         return Vec::new();
     }
-    hits.drain(..offset);
-    hits
+    ranked.drain(..offset);
+    ranked
 }
 
 impl Store {
@@ -291,7 +287,7 @@ impl Store {
     // ── Search ──────────────────────────────────────────────────────────────────
 
     /// Reject a query vector whose length is not the store's pinned dimension (nidus-c5v).
-    fn check_query_dim(&self, query: &[f32]) -> Result<()> {
+    pub(super) fn check_query_dim(&self, query: &[f32]) -> Result<()> {
         let dim = self.data.dimension();
         if query.len() != dim {
             bail!(
@@ -378,99 +374,6 @@ impl Store {
             })?
         };
         Ok(paginate(ranked, opts.offset))
-    }
-
-    /// Full-text (BM25) search over `collections`, reusing the same `Hit`/`Filter`/top-k
-    /// machinery as vector `search`. `min_score` here is a raw BM25 floor, not cosine. Text-only
-    /// and vector-bearing docs are both eligible; ties break on `(collection, id)`.
-    pub fn text_search(
-        &self,
-        collections: &[&str],
-        query: &FtsQuery,
-        opts: &SearchOpts,
-    ) -> Result<Vec<Hit>> {
-        if opts.top_k == 0 {
-            return Ok(Vec::new());
-        }
-        // Same shape as `search`: rank `offset + top_k` deep, cut the page in one place at the end.
-        let mut topk: TopK<(&str, &str)> = TopK::new(opts.offset.saturating_add(opts.top_k));
-        // Analyze the query text once per distinct field analyzer across the scope
-        // (collections usually share one), not once per collection.
-        let mut analyzed: HashMap<Analyzer, Vec<String>> = HashMap::new();
-        for &col_name in collections {
-            let Some(col) = self.collections.get(col_name) else {
-                continue;
-            };
-            let Some(cfg) = self.fts.field_analyzer(col_name, &query.field) else {
-                continue; // this collection doesn't full-text-index the field
-            };
-            analyzed
-                .entry(cfg)
-                .or_insert_with(|| crate::fts::analyze(&query.text, cfg));
-            let terms = &analyzed[&cfg];
-            for (id, score) in self.fts.score(col_name, &query.field, terms) {
-                if let Some(min) = opts.min_score
-                    && score < min
-                {
-                    continue;
-                }
-                // Hint-verify the id against the live index and apply the metadata
-                // filter (the FTS index can lag a delete until the next rebuild).
-                let Some(entry) = col.docs.get(id) else {
-                    continue;
-                };
-                if !filter::matches(&opts.filter, &entry.attrs) {
-                    continue;
-                }
-                topk.offer(score, (col_name, id));
-            }
-        }
-        // `TopK` already resolves ties on `(collection, id)`, so no re-sort is needed here.
-        Ok(paginate(
-            self.hits_from_topk(topk, &opts.projection),
-            opts.offset,
-        ))
-    }
-
-    /// Hybrid search: fuse a vector and a BM25 leg with Reciprocal Rank Fusion. Each leg runs
-    /// independently `candidates` deep, then a doc's fused score is the sum of
-    /// `1 / (rrf_k + rank + 1)`; a doc in only one leg is carried by it. Ties break on `(collection, id)`.
-    pub fn hybrid_search(
-        &self,
-        collections: &[&str],
-        vector: &[f32],
-        text: &FtsQuery,
-        opts: &HybridOpts,
-    ) -> Result<Vec<Hit>> {
-        // Ahead of the `top_k == 0` shortcut, not after: the vector leg validates, but the
-        // shortcut returns before the leg runs. Validating here means a bad query does not change
-        // verdict based on `top_k`.
-        self.check_query_dim(vector)?;
-
-        if opts.top_k == 0 {
-            return Ok(Vec::new());
-        }
-        // Pull each leg at least a full page deep (`offset + top_k`) so fusion can fill it.
-        let page = opts.offset.saturating_add(opts.top_k);
-        let leg_opts = SearchOpts {
-            top_k: opts.candidates.max(page),
-            filter: opts.filter.clone(),
-            ..Default::default()
-        };
-        let vector_leg = self.search(collections, vector, &leg_opts)?;
-        let text_leg = self.text_search(collections, text, &leg_opts)?;
-
-        // The per-leg detail is dropped here; `hybrid_search` reports only the fused score.
-        let fused = rrf_fuse(
-            vec![FusionLeg::new(vector_leg), FusionLeg::new(text_leg)],
-            opts.rrf_k,
-        );
-        let hits: Vec<Hit> = fused.into_iter().map(|(hit, _per_leg)| hit).collect();
-        // The page is cut on the *fused* ranking, never per leg — a leg's rank is an input to
-        // the fused score, so paginating a leg would change which documents fuse at all.
-        let mut hits = paginate(hits, opts.offset);
-        hits.truncate(opts.top_k);
-        Ok(hits)
     }
 
     /// Score an already-gathered, filter-passing scan exactly into ranked [`Hit`]s — the shared

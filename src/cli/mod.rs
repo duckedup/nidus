@@ -11,8 +11,9 @@ use serde::Serialize;
 
 use crate::server::dto::{AnnDto, FootprintDto, HitDto};
 use crate::{
-    AnnConfig, Config, Distance, Filter, Fsync, FtsField, FtsQuery, HybridOpts, LeaseWait,
-    ListOpts, Nidus, OpenMode, Projection, Quantization, Record, Scope, SearchOpts,
+    AnnConfig, Config, Distance, Filter, Fsync, FtsClause, FtsCombine, FtsField, FtsQuery,
+    HighlightOpts, HybridOpts, LeaseWait, ListOpts, Nidus, OpenMode, Projection, Quantization,
+    Record, Scope, SearchOpts,
 };
 
 // AI-ingest (memory) wiring for `serve`: only under the `memory` feature (pulled
@@ -448,6 +449,81 @@ impl From<FsyncArg> for Fsync {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum CombineArg {
+    #[default]
+    Sum,
+    Max,
+}
+
+impl From<CombineArg> for FtsCombine {
+    fn from(c: CombineArg) -> Self {
+        match c {
+            CombineArg::Sum => FtsCombine::Sum,
+            CombineArg::Max => FtsCombine::Max,
+        }
+    }
+}
+
+/// The multi-clause / annotation half of a text or hybrid query, shared by both subcommands
+/// so the two cannot drift (nidus-m50.10, nidus-m50.5).
+#[derive(Args, Debug, Default)]
+struct TextQueryArgs {
+    /// An extra query clause, `field=text` (repeatable). Use instead of the positional
+    /// field + query pair, never alongside it.
+    #[arg(long = "clause")]
+    clauses: Vec<String>,
+    /// How several clauses fold into one score.
+    #[arg(long, value_enum, default_value_t = CombineArg::Sum)]
+    combine: CombineArg,
+    /// Annotate each hit with its per-clause (and, for hybrid, per-leg) scores.
+    #[arg(long)]
+    explain: bool,
+    /// Return highlighted fragments of the matched text.
+    #[arg(long)]
+    highlight: bool,
+    /// Fragments per field when highlighting.
+    #[arg(long, default_value_t = HighlightOpts::default().max_fragments)]
+    max_fragments: usize,
+    /// Characters per fragment when highlighting.
+    #[arg(long, default_value_t = HighlightOpts::default().fragment_chars)]
+    fragment_chars: usize,
+}
+
+impl TextQueryArgs {
+    /// Build the query, taking the clauses from the positional `field`/`text` pair or from
+    /// repeated `--clause field=text` — the same either/or the HTTP body enforces.
+    fn query(&self, field: Option<String>, text: Option<String>) -> anyhow::Result<FtsQuery> {
+        let clauses = match (field, text, self.clauses.is_empty()) {
+            (Some(f), Some(t), true) => vec![FtsClause::new(f, t)],
+            (None, None, false) => self
+                .clauses
+                .iter()
+                .map(|c| {
+                    c.split_once('=')
+                        .map(|(f, t)| FtsClause::new(f, t))
+                        .ok_or_else(|| anyhow::anyhow!("--clause must be field=text, got '{c}'"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            (None, None, true) => {
+                anyhow::bail!("give a field and its query text, or one or more --clause field=text")
+            }
+            _ => {
+                anyhow::bail!("the positional field/text pair and --clause are mutually exclusive")
+            }
+        };
+        let mut q = FtsQuery::multi(clauses).combine(self.combine.into());
+        if self.highlight {
+            q = q.highlight(
+                HighlightOpts::default()
+                    .max_fragments(self.max_fragments)
+                    .fragment_chars(self.fragment_chars),
+            );
+        }
+        Ok(q)
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Run the HTTP server.
@@ -617,14 +693,16 @@ enum Command {
         #[arg(long)]
         max_token_len: Option<usize>,
     },
-    /// Full-text (BM25) search of a field declared via `set-fts-schema`.
+    /// Full-text (BM25) search of fields declared via `set-fts-schema`.
     TextSearch {
         #[command(flatten)]
         store: StoreArgs,
-        /// The full-text-indexed field to search.
-        field: String,
+        /// The full-text-indexed field to search. Omit when using --clause.
+        field: Option<String>,
         /// Query text (analyzed the same way documents were indexed).
-        query: String,
+        query: Option<String>,
+        #[command(flatten)]
+        text: TextQueryArgs,
         /// Collections to search; omit to search every collection.
         #[arg(long = "in")]
         collections: Vec<String>,
@@ -644,10 +722,12 @@ enum Command {
     HybridSearch {
         #[command(flatten)]
         store: StoreArgs,
-        /// The full-text-indexed field for the BM25 leg.
-        field: String,
+        /// The full-text-indexed field for the BM25 leg. Omit when using --clause.
+        field: Option<String>,
         /// Query text for the BM25 leg.
-        text: String,
+        text: Option<String>,
+        #[command(flatten)]
+        query: TextQueryArgs,
         /// Read the query vector (JSON array) from this file instead of stdin.
         #[arg(long)]
         query_file: Option<PathBuf>,
@@ -810,6 +890,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 filter,
                 exact,
                 projection: projection(include_attributes, exclude_attributes)?,
+                ..Default::default()
             };
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
             let hits = if refs.is_empty() {
@@ -881,12 +962,14 @@ pub fn run(cli: Cli) -> Result<()> {
             store,
             field,
             query,
+            text,
             collections,
             top_k,
             offset,
             min_score,
             filter,
         } => {
+            let q = text.query(field, query)?;
             let db = open(&store, false)?;
             let filter = match filter {
                 Some(s) => serde_json::from_str(&s)?,
@@ -897,9 +980,9 @@ pub fn run(cli: Cli) -> Result<()> {
                 offset,
                 min_score,
                 filter,
+                explain: text.explain,
                 ..Default::default()
             };
-            let q = FtsQuery::new(field, query);
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
             let hits = if refs.is_empty() {
                 db.text_search(Scope::All, &q, &opts)?
@@ -913,6 +996,7 @@ pub fn run(cli: Cli) -> Result<()> {
             store,
             field,
             text,
+            query,
             query_file,
             collections,
             top_k,
@@ -921,6 +1005,7 @@ pub fn run(cli: Cli) -> Result<()> {
             rrf_k,
             candidates,
         } => {
+            let q = query.query(field, text)?;
             let db = open(&store, false)?;
             let vector: Vec<f32> = serde_json::from_str(&read_input(query_file.as_ref())?)?;
             let filter = match filter {
@@ -933,8 +1018,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 filter,
                 rrf_k,
                 candidates,
+                explain: query.explain,
             };
-            let q = FtsQuery::new(field, text);
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
             let hits = if refs.is_empty() {
                 db.hybrid_search(Scope::All, &vector, &q, &opts)?
