@@ -519,7 +519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(miri, ignore)] // file-backed via open_tmp; also `memory` is off in the Miri lane.
     async fn first_write_declares_default_fts_schema_and_is_gated() {
         let (_dir, mut db) = open_tmp(8);
         let emb = FakeEmbedder::new(8, "fake", "v1");

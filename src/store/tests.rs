@@ -5024,6 +5024,7 @@ fn an_absurd_top_k_returns_every_doc_instead_of_panicking() {
 #[test]
 // BM25's `idf` calls `ln`, which Miri evaluates non-deterministically; the fused bits
 // then vary by an ULP run-to-run. Real float semantics make these exact.
+#[cfg_attr(miri, ignore)]
 fn hybrid_search_is_unchanged_by_the_fusion_extraction() {
     let (store, vector, text) = golden_fixture();
     // Ids paired with the exact bits of their fused score, most relevant first.
@@ -5262,6 +5263,7 @@ fn text_search_paginates() {
 #[test]
 // BM25's `ln` is non-deterministic under Miri by design, so a fused ranking can reorder by
 // an ULP there — the same reason `hybrid_search_is_deterministic` is ignored.
+#[cfg_attr(miri, ignore)]
 fn hybrid_search_paginates_the_fused_ranking() {
     let (store, vector, text) = golden_fixture();
     let full = store

@@ -203,6 +203,26 @@ test('miri: a documented ignore is accepted', () => {
   eq(ids(laws.miriIgnore(src, null, 'src/store/tests.rs')), [], 'findings')
 })
 
+// Regression (nidus #99): the codebase's existing style puts the reason on the line
+// ABOVE the attribute. Reading only the trailing form reported those as bare, and two
+// correctly-ignored float-ULP tests were deleted on the strength of it.
+test('miri: a reason on the line above the attribute counts', () => {
+  const src = [
+    '#[test]',
+    "// BM25's `idf` calls `ln`, which Miri evaluates non-deterministically.",
+    '#[cfg_attr(miri, ignore)]',
+    'fn hybrid_scores_are_exact() {',
+    '  assert_eq!(hit.score.to_bits(), 0x3f2a_1b3c);',
+    '}',
+  ].join('\n')
+  eq(ids(laws.miriIgnore(src, null, 'src/store/tests.rs')), [], 'findings')
+})
+
+test('miri: an attribute directly under another attribute is still bare', () => {
+  const src = '#[test]\n#[cfg_attr(miri, ignore)]\nfn cosine_is_symmetric() {\n  assert_eq!(dot(&a, &b), dot(&b, &a));\n}\n'
+  eq(ids(laws.miriIgnore(src, null, 'src/search/mod.rs')), ['miri-ignore'], 'findings')
+})
+
 test('miri: an empty trailing comment does not count as documentation', () => {
   const src = '#[cfg_attr(miri, ignore)] //\n#[test]\nfn cosine_is_symmetric() {\n  assert_eq!(dot(&a, &b), dot(&b, &a));\n}\n'
   eq(ids(laws.miriIgnore(src, null, 'src/search/mod.rs')), ['miri-ignore'], 'findings')
