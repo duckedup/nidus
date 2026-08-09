@@ -147,15 +147,23 @@ fn full_store_lifecycle_through_the_binary() {
     );
     assert_eq!(ids(&hits), ["a"], "stemming should reach the CLI: {hits}");
 
-    // Hybrid fuses the two legs: the vector leg favours b, the text leg a.
+    // Hybrid fuses two legs that disagree, so the fused winner is one neither leg picks
+    // alone. A `contains` check would prove nothing: at k=5 over three docs the vector
+    // leg alone returns all of them, text leg or no text leg.
+    let hits = ok(&["search", "--dir", dir, "-k", "1", "docs"], "[0,1,0]");
+    assert_eq!(
+        ids(&hits),
+        ["b"],
+        "the vector leg alone ranks b first: {hits}"
+    );
     let hits = ok(
-        &["hybrid-search", "--dir", dir, "-k", "5", "body", "running"],
+        &["hybrid-search", "--dir", dir, "-k", "1", "body", "running"],
         "[0,1,0]",
     );
-    let fused = ids(&hits);
-    assert!(
-        fused.contains(&"a".to_string()) && fused.contains(&"b".to_string()),
-        "both legs should contribute: {hits}"
+    assert_eq!(
+        ids(&hits),
+        ["a"],
+        "the text leg must outweigh the vector leg's own top hit: {hits}"
     );
 
     // `get` prints whole records — vectors included, unlike a hit.
