@@ -174,9 +174,15 @@ against `main`; a path → those files; nothing → the working tree.
    this change does not actually finish the issue.
 4. **Commit.** Subject `🪺 <area>: <terse description>` — an emoji prefix and the area, no
    issue or PR number (the squash merge appends `(#<pr>)`; a second `(#<n>)` for the issue
-   would be unreadable next to it). The issue ref belongs in the PR body. The commit body
-   explains why, not what. This repo does keep `Co-Authored-By` and `Claude-Session`
-   trailers — match `git log`, do not assume.
+   would be unreadable next to it). The issue ref belongs in the PR body.
+   **Keep the body short or omit it**: of the last 25 commits on `main`, 4 have a body at all.
+   GitHub's squash default concatenates the branch's commit messages into the merge message,
+   so a long body becomes the text the maintainer has to edit at merge. Reasoning belongs in
+   the PR body, which is durable and is not concatenated into anything. (Trailers your harness
+   stamps on every commit are its business, not this repo's — this is about body length.)
+   Counting `git log` yourself is right, but count **25+ top-level commits**: a small window
+   over a squash-merge repo shows the sub-commits preserved *inside* one PR's squash message,
+   which reads exactly like a convention and is not one.
 5. **Push.** `git pull --rebase` then `git push -u origin <branch>`. Issue state lives on
    GitHub, so nothing tracker-related ships with the commit.
 6. **Offer the PR** with `AskUserQuestion` — open it, or stop with the branch pushed. When
@@ -340,5 +346,11 @@ back to the user.
   the main thread so one context has seen the whole change.
 - `nidus-check` is the source of truth for lanes, laws and dispatch safety. If it is wrong, fix
   the checker and its selftest — do not work around it in prose.
+- **Ask whether a check could have failed, not whether it passed.** Three times in two days a
+  check ran green and proved nothing: regression tests for a p1 that passed without the fix
+  (they corrupted a compressed byte, so they tested the decompressor), a fails-without-fix
+  signal that only ever appeared by accident, and a `git log -6` sample that could not have
+  disconfirmed the convention it was sampling. A green result from a check that had no failing
+  mode is indistinguishable from no check. For a regression test, go and watch it go red.
 - Peers get worktrees under `.claude/worktrees/`, never a shared tree and never a fresh clone.
   Prune them when the ticket ships.
