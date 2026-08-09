@@ -2,6 +2,7 @@
 // broken detector fails here instead of silently passing a real review.
 
 import * as laws from './laws.mjs'
+import * as fleet from './fleet.mjs'
 import { lanes } from './lanes.mjs'
 
 const cases = []
@@ -381,6 +382,175 @@ test('lanes: an SDK README does not run that SDK suite', () => {
 test('lanes: each SDK gets its own lane', () => {
   eq(lanes(['sdks/go/client.go']).run.map(l => l.recipe), ['cd sdks/go && go test ./...'], 'go')
   eq(lanes(['sdks/python/src/nidus/client.py']).run.map(l => l.recipe), ['cd sdks/python && python -m pytest tests -k "not integration"'], 'py')
+})
+
+// ── fleet ──────────────────────────────────────────────────────────────────
+
+const SELF = { dir: '/r/nidus', commonDir: '/r/nidus/.git', remote: 'git@github.com:duckedup/nidus.git', mainSha: 'aaa', login: 'austin' }
+const wt = (name, slug, over = {}) => ({
+  name, dir: `/r/nidus/.claude/worktrees/${slug}`, isRepo: true, commonDir: '/r/nidus/.git',
+  remote: SELF.remote, branch: slug, dirty: false, mainSha: 'aaa', ...over,
+})
+
+test('fleet: worktrees off one clone are the clean case', () => {
+  eq(ids(fleet.treeFindings([wt('a', 'x'), wt('b', 'y')], SELF)), [], 'findings')
+})
+
+test('fleet: two peers in one directory is an error', () => {
+  const found = fleet.treeFindings([wt('a', 'x'), wt('b', 'x')], SELF)
+  eq(ids(found), ['fleet-shared-tree'], 'findings')
+})
+
+test('fleet: a peer in the coordinator own tree is an error', () => {
+  const found = fleet.treeFindings([wt('a', 'x', { dir: '/r/nidus' })], SELF)
+  eq(found.filter(f => f.id === 'fleet-shared-tree').length, 1, 'shared')
+})
+
+test('fleet: the coordinator own row is not a collision with itself', () => {
+  const me = wt('coordinator', 'x', { dir: '/r/nidus', commonDir: '/r/nidus/.git', branch: 'austin/141', self: true })
+  eq(ids(fleet.treeFindings([me, wt('a', 'y')], SELF)), [], 'findings')
+})
+
+test('fleet: a trailing slash does not hide a shared tree', () => {
+  const found = fleet.treeFindings([wt('a', 'x'), wt('b', 'x', { dir: '/r/nidus/.claude/worktrees/x/' })], SELF)
+  eq(ids(found), ['fleet-shared-tree'], 'findings')
+})
+
+test('fleet: a separate clone of the same remote is a warning, not an error', () => {
+  const found = fleet.treeFindings([wt('a', 'x', { dir: '/r/n2', commonDir: '/r/n2/.git' })], SELF)
+  eq(ids(found), ['fleet-separate-clone'], 'findings')
+  eq(found[0].severity, 'warn', 'severity')
+})
+
+test('fleet: a foreign remote is an error', () => {
+  const found = fleet.treeFindings([wt('a', 'x', { commonDir: '/r/other/.git', remote: 'git@github.com:someone/fork.git' })], SELF)
+  eq(found.some(f => f.id === 'fleet-foreign-remote'), true, 'foreign')
+})
+
+test('fleet: ssh and https spellings of one remote match', () => {
+  const found = fleet.treeFindings([wt('a', 'x', { remote: 'https://github.com/duckedup/nidus' })], SELF)
+  eq(ids(found), [], 'findings')
+})
+
+test('fleet: a peer on main, dirty, or behind is warned about', () => {
+  eq(ids(fleet.treeFindings([wt('a', 'x', { branch: 'main' })], SELF)), ['fleet-on-main'], 'on main')
+  eq(ids(fleet.treeFindings([wt('a', 'x', { dirty: true })], SELF)), ['fleet-dirty-tree'], 'dirty')
+  eq(ids(fleet.treeFindings([wt('a', 'x', { mainSha: 'bbb' })], SELF)), ['fleet-stale-main'], 'stale')
+})
+
+test('fleet: a peer with no known cwd cannot be dispatched', () => {
+  eq(ids(fleet.treeFindings([{ name: 'a', dir: null }], SELF)), ['fleet-no-tree'], 'findings')
+})
+
+test('fleet: a parked queue has no tree and that is fine', () => {
+  eq(ids(fleet.treeFindings([{ name: 'backlog', dir: null, unassigned: true }], SELF)), [], 'findings')
+})
+
+test('fleet: a parked queue still has its tickets checked', () => {
+  const peers = [{ name: 'backlog', dir: null, unassigned: true, queue: [9] }]
+  eq(ids(fleet.issueFindings(peers, { 9: { state: 'CLOSED', linkedPrs: [] } })), ['fleet-issue-closed'], 'findings')
+})
+
+const OPEN = { state: 'OPEN', assignees: [], linkedPrs: [] }
+
+test('fleet: an open unclaimed queue is clear', () => {
+  const peers = [{ name: 'a', queue: [141] }]
+  eq(ids(fleet.issueFindings(peers, { 141: OPEN }, { login: 'austin' })), [], 'findings')
+})
+
+test('fleet: the same ticket in two queues is an error', () => {
+  const peers = [{ name: 'a', queue: [141] }, { name: 'b', queue: [141] }]
+  eq(ids(fleet.issueFindings(peers, { 141: OPEN })), ['fleet-double-assigned'], 'findings')
+})
+
+test('fleet: a closed or missing ticket is an error', () => {
+  eq(ids(fleet.issueFindings([{ name: 'a', queue: [9] }], { 9: { ...OPEN, state: 'CLOSED' } })), ['fleet-issue-closed'], 'closed')
+  eq(ids(fleet.issueFindings([{ name: 'a', queue: [9] }], {})), ['fleet-issue-missing'], 'missing')
+})
+
+test('fleet: a ticket already assigned elsewhere warns, but not against yourself', () => {
+  const taken = { 9: { ...OPEN, assignees: ['someone'] } }
+  eq(ids(fleet.issueFindings([{ name: 'a', queue: [9] }], taken, { login: 'austin' })), ['fleet-issue-taken'], 'taken')
+  const mine = { 9: { ...OPEN, assignees: ['austin'] } }
+  eq(ids(fleet.issueFindings([{ name: 'a', queue: [9] }], mine, { login: 'austin' })), [], 'mine')
+})
+
+test('fleet: an open PR already closing the ticket warns', () => {
+  const issues = { 9: { ...OPEN, linkedPrs: [{ number: 50, state: 'OPEN' }] } }
+  eq(ids(fleet.issueFindings([{ name: 'a', queue: [9] }], issues)), ['fleet-issue-has-pr'], 'findings')
+})
+
+test('fleet: a merged PR on the ticket does not warn', () => {
+  const issues = { 9: { ...OPEN, linkedPrs: [{ number: 50, state: 'MERGED' }] } }
+  eq(ids(fleet.issueFindings([{ name: 'a', queue: [9] }], issues)), [], 'findings')
+})
+
+const MAIN = { path: '/r/nidus', branch: 'main', isMain: true, dirty: false, hasCommits: false }
+const agentWt = (id, over = {}) => ({
+  path: `/r/nidus/.claude/worktrees/agent-${id}`, branch: `worktree-agent-${id}`,
+  isMain: false, dirty: false, hasCommits: false, ...over,
+})
+
+test('fleet: the main tree and declared peer trees are never orphans', () => {
+  const peer = { path: '/r/nidus/.claude/worktrees/x', branch: 'austin/141', isMain: false, dirty: false, hasCommits: false }
+  eq(ids(fleet.orphanFindings([MAIN, peer], [{ name: 'a', dir: '/r/nidus/.claude/worktrees/x' }], SELF)), [], 'findings')
+})
+
+test('fleet: an agent worktree nobody claims is an orphan', () => {
+  const found = fleet.orphanFindings([MAIN, agentWt('a0c1')], [], SELF)
+  eq(ids(found), ['fleet-orphan-agent-worktree'], 'findings')
+  eq(/prune/.test(found[0].detail), true, 'prune suggested when clean')
+})
+
+test('fleet: an orphan carrying commits says prune will not reclaim it', () => {
+  const found = fleet.orphanFindings([MAIN, agentWt('a0c1', { hasCommits: true })], [], SELF)
+  eq(/--force/.test(found[0].detail), true, 'force')
+  eq(/will not reclaim/.test(found[0].detail), true, 'explains why prune fails')
+})
+
+test('fleet: a non-agent worktree outside the plan is reported separately', () => {
+  const stray = { path: '/r/nidus/.claude/worktrees/old', branch: 'austin/99', isMain: false, dirty: false, hasCommits: false }
+  eq(ids(fleet.orphanFindings([MAIN, stray], [], SELF)), ['fleet-unaccounted-worktree'], 'findings')
+})
+
+test('fleet: two peers claiming one file is flagged for sequencing', () => {
+  const peers = [
+    { name: 'a', surface: { 139: ['src/cli/mod.rs'] } },
+    { name: 'b', surface: { 141: ['src/cli/mod.rs', 'src/store/mod.rs'] } },
+  ]
+  const found = fleet.overlapFindings(peers)
+  eq(ids(found), ['fleet-file-overlap'], 'findings')
+  eq(found[0].subject, 'src/cli/mod.rs', 'subject')
+})
+
+test('fleet: one peer holding a file across its own tickets is not an overlap', () => {
+  const peers = [{ name: 'a', surface: { 139: ['src/cli/mod.rs'], 140: ['src/cli/mod.rs'] } }]
+  eq(ids(fleet.overlapFindings(peers)), [], 'findings')
+})
+
+test('fleet: rehydrate derives shipped / in-review / in-flight / queued', () => {
+  const peers = [{ name: 'own-138', queue: [138, 139, 140, 141] }]
+  const issues = {
+    138: { state: 'CLOSED', assignees: [], linkedPrs: [{ number: 60, state: 'MERGED' }] },
+    139: { state: 'OPEN', assignees: [], linkedPrs: [{ number: 61, state: 'OPEN' }] },
+    140: { state: 'OPEN', assignees: [], linkedPrs: [] },
+    141: { state: 'OPEN', assignees: [], linkedPrs: [] },
+  }
+  const trees = [MAIN, { path: '/r/nidus/.claude/worktrees/x', branch: 'austin/140-sweep', isMain: false }]
+  const rows = fleet.rehydrate(peers, issues, trees)
+  eq(rows.map(r => `${r.issue}:${r.state}`), ['138:shipped', '139:in-review', '140:in-flight', '141:queued'], 'states')
+  eq(rows[0].pr, 60, 'merged pr surfaced')
+})
+
+test('fleet: rehydrate does not confuse #14 with #141', () => {
+  const trees = [MAIN, { path: '/r/nidus/.claude/worktrees/y', branch: 'austin/141-profile', isMain: false }]
+  const rows = fleet.rehydrate([{ name: 'a', queue: [14] }], { 14: { state: 'OPEN', linkedPrs: [] } }, trees)
+  eq(rows[0].state, 'queued', 'no false branch match')
+})
+
+test('fleet: an issue closed with no PR still reads as shipped', () => {
+  const rows = fleet.rehydrate([{ name: 'a', queue: [9] }], { 9: { state: 'CLOSED', linkedPrs: [] } }, [MAIN])
+  eq(rows[0].state, 'shipped', 'state')
 })
 
 export function selftest({ json = false } = {}) {

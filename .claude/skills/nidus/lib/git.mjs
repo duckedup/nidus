@@ -128,6 +128,84 @@ export function closingIssues(t) {
   return new Set(Array.from(text.matchAll(re), m => `#${m[1]}`))
 }
 
+// ── fleet IO ───────────────────────────────────────────────────────────────
+
+const inDir = (dir, cmd) => sh(`git -C ${JSON.stringify(dir)} ${cmd}`, { allowFail: true }).trim()
+
+export function treeFacts(dir) {
+  if (!existsSync(dir)) return { dir, isRepo: false }
+  const top = inDir(dir, 'rev-parse --show-toplevel')
+  if (!top) return { dir, isRepo: false }
+  // commonDir is the shared object store: equal across worktrees of one clone,
+  // distinct across separate clones. That is what tells the two layouts apart.
+  return {
+    dir: top,
+    isRepo: true,
+    commonDir: inDir(dir, 'rev-parse --path-format=absolute --git-common-dir') || null,
+    isWorktree: inDir(dir, 'rev-parse --is-inside-work-tree') === 'true' && inDir(dir, 'rev-parse --git-dir') !== inDir(dir, 'rev-parse --git-common-dir'),
+    remote: inDir(dir, 'remote get-url origin') || null,
+    branch: inDir(dir, 'branch --show-current') || null,
+    dirty: inDir(dir, 'status --porcelain --untracked-files=no') !== '',
+    mainSha: inDir(dir, 'rev-parse origin/main') || null,
+  }
+}
+
+// `prune` only reclaims worktrees whose directory is gone. One carrying commits or
+// edits survives it, so report both — they decide whether removal needs --force.
+export function worktrees(dir = process.cwd()) {
+  const out = inDir(dir, 'worktree list --porcelain')
+  const main = inDir(dir, 'rev-parse --path-format=absolute --git-common-dir').replace(/\/\.git\/?$/, '')
+  const list = []
+  for (const block of out.split('\n\n')) {
+    const path = block.match(/^worktree (.+)$/m)?.[1]
+    if (!path) continue
+    const isMain = path.replace(/\/+$/, '') === main.replace(/\/+$/, '')
+    list.push({
+      path,
+      branch: block.match(/^branch refs\/heads\/(.+)$/m)?.[1] || null,
+      detached: /^detached$/m.test(block),
+      isMain,
+      dirty: isMain ? false : inDir(path, 'status --porcelain --untracked-files=no') !== '',
+      hasCommits: isMain ? false : inDir(path, 'rev-list --count origin/main..HEAD') !== '0',
+    })
+  }
+  return list
+}
+
+export function selfFacts() {
+  return {
+    ...treeFacts(process.cwd()),
+    login: JSON.parse(sh('gh api user --jq "{login:.login}"', { allowFail: true }) || '{}').login || null,
+  }
+}
+
+// gh has no linked-PR field on an issue, so derive it the way GitHub does: an open
+// PR whose title or body carries a closing keyword for that number.
+export function issueFacts(numbers) {
+  const out = {}
+  // --state all, because a merged PR is how a cleared coordinator learns a ticket
+  // already shipped. The open-PR detector filters for OPEN itself.
+  const raw = sh('gh pr list --state all --limit 200 --json number,title,body,state', { allowFail: true })
+  let prs = []
+  try { prs = JSON.parse(raw || '[]') } catch { prs = [] }
+
+  for (const n of numbers) {
+    const meta = sh(`gh issue view ${n} --json number,state,assignees`, { allowFail: true })
+    if (!meta) continue
+    try {
+      const j = JSON.parse(meta)
+      const re = new RegExp(`\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+#${n}\\b`, 'i')
+      out[String(n)] = {
+        number: j.number,
+        state: j.state,
+        assignees: (j.assignees || []).map(a => a.login),
+        linkedPrs: prs.filter(p => re.test(`${p.title}\n${p.body || ''}`)).map(p => ({ number: p.number, state: p.state })),
+      }
+    } catch { /* unparseable — the missing-issue detector reports it */ }
+  }
+  return out
+}
+
 export function issueTitles(refs) {
   const out = {}
   for (const r of refs) {
