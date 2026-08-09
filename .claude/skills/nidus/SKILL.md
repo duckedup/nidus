@@ -100,6 +100,9 @@ sharp paragraphs beat ten pages.
    - `BLUEPRINT-<id>.md` at the **repo root**: summary, the table of sub-blueprints, complete
      file create/modify/remove list, group ordering and why, and the global verification lanes
      from `nidus-check lanes`.
+   - **Exception: never write one inside `docs/src/content/docs/`.** Starlight's `docsLoader()`
+     schema-validates every `.md` under that root, so a blueprint there fails `just docs-build`
+     with an error pointing at the blueprint. Put that slice's file at `docs/BLUEPRINT-<id>.md`.
    - Never name these `SPEC-*.md` — `SPEC.md` at the root is nidus's product spec.
    - Each sub-blueprint carries: context, files to modify/create/remove, concrete code
      patterns to mirror (path + line range + snippet, so the agent never re-explores), the
@@ -123,6 +126,11 @@ Needs blueprints. If none exist for this target, run **Spec** first (including i
 3. Fan out:
    `Workflow({ scriptPath: ".claude/skills/nidus/implement.workflow.js",
                args: { id, scratchDir, groups } })`
+   Each unit is `{ dir, content, path }`. **Pass `path` — the absolute path to that
+   sub-blueprint** — as well as `content`. `content` is captured for *every* group the moment
+   you launch, so without `path` a blueprint edited mid-run reaches nobody, including groups
+   that have not started; the agent reads `path` at its own start instead. The file is
+   gitignored, so it is never in the agent's worktree and the path must be absolute (#175).
    **Groups sequence state, not just timing.** A later group is handed every earlier patch and
    applies them before it starts, because that dependency is the only reason it is a later
    group. So put a blueprint in group N+1 exactly when it needs group N's code to exist —

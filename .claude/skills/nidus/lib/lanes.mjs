@@ -60,23 +60,41 @@ const RULES = [
     why: 'the docs site changed — the Astro build is the only gate on it',
     match: [/^docs\//],
   },
+  // Each SDK lane mirrors its CI job step for step (ci.yml `sdk-js`/`sdk-go`/`sdk-python`,
+  // as of 2026-08-09). A lane that runs a subset is a subset wearing a total: it reports
+  // green for a change CI will reject. Re-check this mapping when those jobs change.
   {
-    recipe: 'cd sdks/js && npm ci && npm run typecheck && npm run test:unit',
+    recipe: 'cd sdks/js && npm ci && npm run typecheck && npm run test:unit && npm run build',
     why: 'the JS SDK changed',
     match: [/^sdks\/js\//],
     exclude: [/\.md$/, /^sdks\/js\/LICENSE$/],
   },
   {
-    recipe: 'cd sdks/go && go test ./...',
+    // `gofmt -l` lists offending files and still exits 0, so a bare call in a && chain
+    // passes silently. Test its output for emptiness, exactly as the CI job does.
+    recipe: 'cd sdks/go && test -z "$(gofmt -l .)" && go vet ./... && go test ./...',
     why: 'the Go SDK changed',
     match: [/^sdks\/go\//],
     exclude: [/\.md$/, /^sdks\/go\/LICENSE$/],
   },
   {
-    recipe: 'cd sdks/python && python -m pytest tests -k "not integration"',
+    recipe: 'cd sdks/python && ruff check && ruff format --check && mypy src && pytest --ignore=tests/test_integration.py',
     why: 'the Python SDK changed',
     match: [/^sdks\/python\//],
     exclude: [/\.md$/, /^sdks\/python\/LICENSE$/],
+  },
+  {
+    // The SDK↔server contract (CLAUDE.md §2). The unit lanes above run against a mocked
+    // transport, so they pass just as happily against a shape the server never emits;
+    // this is the only lane that can tell. Manual: it needs a release build and a server.
+    recipe: 'cargo build --release --features cli && export NIDUS_BIN=$PWD/target/release/nidus'
+      + ' && (cd sdks/js && npm run test:integration)'
+      + ' && (cd sdks/go && go test -tags integration ./...)'
+      + ' && (cd sdks/python && pytest tests/test_integration.py)',
+    why: 'an SDK changed — only a real `nidus serve` proves the wire contract (#172)',
+    manual: true,
+    match: [/^sdks\//],
+    exclude: [/\.md$/, /LICENSE$/],
   },
   {
     recipe: 'just e2e-services-up && just test-e2e-cluster',

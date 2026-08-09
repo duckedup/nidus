@@ -11,9 +11,12 @@ export const meta = {
 //   id: "nidus-oes",
 //   scratchDir: "/abs/path",              // where agents write their patches
 //   groups: [                              // ordered; group N starts after N-1 finishes
-//     [ { dir, content }, ... ],
+//     [ { dir, content, path }, ... ],     // path: ABSOLUTE path to the blueprint file
 //   ],
 // }
+//
+// `content` is captured at launch for every group, so pass `path` as well: the agent reads
+// it at unit start, which is what makes a mid-run blueprint edit reach later groups (#175).
 //
 // Workers do NOT build. Each owns one isolated slice and returns a patch; the merging
 // thread runs the lanes once against the merged tree. N workers would otherwise mean N
@@ -57,8 +60,16 @@ That commit is local bookkeeping and is never pushed — it is what keeps your p
 If a patch fails to apply, stop and report 'blocked' naming it. Do not proceed against a tree
 missing the code you depend on, and do not re-implement it yourself.
 ` : ''
+  // Read at unit start, not captured at launch, so a blueprint edited mid-run reaches the
+  // agents that have not started yet. The path is absolute into the coordinating checkout:
+  // BLUEPRINT-*.md is gitignored, so it is never in this agent's own worktree (#175).
+  const authoritative = spec.path ? `
+YOUR BLUEPRINT IS THE FILE AT ${spec.path}. Read it FIRST, with an absolute path — it is NOT in
+your worktree (gitignored) and it is authoritative. It may have been edited since this run
+started, in which case it supersedes the copy below. Use the copy only if the file is missing.
+` : ''
   return `You are implementing ONE blueprint for ${cfg.id} in an isolated git worktree.
-${deps}
+${deps}${authoritative}
 
 BLUEPRINT (implement exactly this, nothing outside its scope):
 ${spec.content}
