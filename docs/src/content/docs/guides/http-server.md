@@ -42,9 +42,11 @@ Pass `--read-only` to serve without taking the writer lock: a search-only proces
 that can run beside a separate writer.
 
 To serve approximate (ANN) search, add `--ann hnsw` or `--ann ivf` (with the
-optional `--ann-*` knobs from the [command-line guide](/guides/cli-and-server/)).
-The index lives in memory for the life of the process; `GET /stats` reports the
-active configuration.
+optional `--ann-*` knobs from the [command-line guide](/guides/cli-and-server/)), or
+record it once as the store's default with `nidus configure --ann hnsw` (see
+[Configure once](/guides/cli-and-server/#configure-once-recording-store-defaults))
+so `serve` picks it up without the flag. The index lives in memory for the life of
+the process; `GET /stats` reports the active configuration.
 
 ## A complete session over HTTP
 
@@ -78,7 +80,8 @@ curl -s localhost:7700/search \
 
 # 4. Inspect the store.
 curl -s localhost:7700/stats
-# → {"dimension":3,"distance":"Cosine","collections":["docs"],"footprint":{…}}
+# → {"dimension":3,"distance":"Cosine","ann":null,"quantization":null,
+#    "query_threads":1,"mmap":false,"collections":["docs"],"footprint":{…}}
 ```
 
 That is a complete vector store over the network: no Rust toolchain on the client,

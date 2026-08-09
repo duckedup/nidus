@@ -9,6 +9,7 @@ use super::{DataSegment, HEADER_LEN};
 use crate::backend::{Persistence, appender_for};
 use crate::manifest::{BASE_SEGMENT, Manifest};
 use crate::model::Distance;
+use crate::profile::OpenProfile;
 
 /// One open segment: its object name and the loaded [`DataSegment`].
 struct Seg {
@@ -351,8 +352,10 @@ impl Segments {
         Ok(dropped)
     }
 
-    /// A manifest snapshot of the current segment set — what seal/compaction persist.
-    pub fn manifest(&self) -> Manifest {
+    /// A manifest snapshot of the current segment set — what seal/compaction persist. `profile`
+    /// is the store's recorded open-time profile (nidus-141): `Segments` knows nothing about
+    /// `Config`, so the caller carries it through every rewrite rather than it being lost here.
+    pub fn manifest(&self, profile: OpenProfile) -> Manifest {
         let names = self.segs.iter().map(|s| s.name.clone()).collect();
         Manifest::new(
             self.dimension(),
@@ -360,6 +363,7 @@ impl Segments {
             names,
             self.next_id,
             self.version,
+            profile,
         )
     }
 
@@ -499,7 +503,7 @@ mod tests {
     fn manifest_reflects_segment_set() {
         let rows = vec![vec![1.0_f32, 2.0], vec![3.0, 4.0]];
         let s = two_segment(2, &rows, 1);
-        let m = s.manifest();
+        let m = s.manifest(OpenProfile::default());
         assert_eq!(
             m.segments,
             vec!["data".to_string(), "seg-00000001".to_string()]

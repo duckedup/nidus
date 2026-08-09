@@ -19,6 +19,7 @@ use crate::fts::{Fts, FtsField};
 use crate::log::OpLog;
 use crate::manifest::{MANIFEST_KEY, Manifest};
 use crate::model::{AnnConfig, ClusterStatus, Distance, Op, Role};
+use crate::profile::OpenProfile;
 
 pub(crate) mod aggregate;
 mod memtier;
@@ -147,6 +148,14 @@ fn jitter(span: Duration) -> Duration {
 /// held lock, etc.) but must keep these signatures — `lib.rs` calls them verbatim.
 pub struct Store {
     config: Config,
+    /// The recorded open-time profile (nidus-141), carried verbatim through every manifest
+    /// rewrite (seal/compaction/`set_open_profile`) independent of `config`'s resolved fields —
+    /// `config` may hold a value from an explicit flag that was never recorded here.
+    open_profile: OpenProfile,
+    /// The config as the caller supplied it, before any profile merge. `refresh` re-merges
+    /// from this rather than from `config`, so a cleared or lowered knob actually retracts
+    /// instead of `.or()`-ing back to the previously-merged value.
+    baseline_config: Config,
     data: Segments,
     log: OpLog,
     /// Where the store's objects live: `LocalFs`, or `S3`/`Gcs` for an object-backed store.
@@ -253,7 +262,7 @@ impl Store {
     /// backend-injection tests. `location` only feeds the "store is locked" message. The backend
     /// may be local or a whole-object store.
     pub(crate) fn open_with(
-        config: Config,
+        mut config: Config,
         location: &str,
         persistence: Arc<dyn Persistence>,
         memory: Option<Box<dyn MemoryTier>>,
@@ -339,6 +348,13 @@ impl Store {
             None => Manifest::fresh(config.dimension, config.distance),
         };
 
+        // nidus-141: merge the recorded profile now that the manifest is resolved, before
+        // mmap/quantization/ann read it below (an explicit flag still wins). `validate()` ran
+        // before this merge, so re-run it: a profile-supplied combo must fail like a flag one.
+        let baseline_config = config.clone();
+        config.apply_profile(&manifest.profile);
+        config.validate()?;
+
         // CAS fencing applies to a cluster *writer*'s object writes: each rewrite is conditional
         // on the version it last saw, so one superseded mid-batch is fenced rather than clobbering
         // a peer (SPEC §14.6, nidus-ahw). Readers never write.
@@ -357,7 +373,8 @@ impl Store {
         // No manifest on disk → write one now, initializing a fresh store and migrating a legacy
         // one in the same step. ReadOnly never writes; it reads the synthesized manifest in RAM.
         if on_disk.is_none() && config.open_mode == OpenMode::ReadWrite {
-            data.manifest().store(persistence.as_ref())?;
+            data.manifest(manifest.profile.clone())
+                .store(persistence.as_ref())?;
         }
 
         // Capture the manifest's CAS token for a cluster writer — the fence anchor for every
@@ -398,6 +415,8 @@ impl Store {
 
         let mut store = Store {
             config,
+            open_profile: manifest.profile.clone(),
+            baseline_config,
             data,
             log,
             persistence: Some(persistence),
@@ -502,6 +521,8 @@ impl Store {
             .ann
             .map(|a| Ann::empty(a, config.dimension, config.distance));
         let mut store = Store {
+            open_profile: OpenProfile::default(),
+            baseline_config: config.clone(),
             data: Segments::in_memory_with(config.dimension, config.distance),
             log: OpLog::in_memory(),
             persistence: None,
@@ -642,6 +663,39 @@ impl Store {
         self.loaded_log_offset = watermark;
         self.row_to_doc = Vec::new();
         self.invalidate_scan_order();
+
+        // nidus-141: re-merge ann/quantization/query_threads (the "query path" knobs) so a
+        // live reader adopts a writer's profile change, reconciling the in-RAM struct too so a
+        // toggle actually activates. mmap is skipped: it can't remap open segments mid-refresh.
+        self.open_profile = manifest.profile.clone();
+        let mut merged = self.baseline_config.clone();
+        merged.apply_profile(&manifest.profile);
+        // Built into a local before any assignment: `Quant::empty` is fallible, and this
+        // function documents that a failure leaves the prior snapshot intact.
+        let requant = if self.config.quantization == merged.quantization {
+            None
+        } else {
+            Some(match merged.quantization {
+                Some(q) => Some(Quant::empty(
+                    q.kind,
+                    self.data.dimension(),
+                    self.config.distance,
+                )?),
+                None => None,
+            })
+        };
+        self.config.query_threads = merged.query_threads;
+        if let Some(q) = requant {
+            self.config.quantization = merged.quantization;
+            self.quant = q;
+        }
+        if self.config.ann != merged.ann {
+            self.config.ann = merged.ann;
+            self.ann = self
+                .config
+                .ann
+                .map(|a| Ann::empty(a, self.data.dimension(), self.config.distance));
+        }
 
         self.rebuild_quant();
         self.load_or_build_ann()?;

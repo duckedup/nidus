@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 
-use crate::model::{AnnConfig, Distance, Quantization};
+use crate::model::{AnnConfig, Distance, QuantKind, Quantization};
+use crate::profile::OpenProfile;
 
 /// What a [`OpenMode::ReadWrite`] open does when another instance already holds the
 /// writer handle.
@@ -108,6 +109,20 @@ pub struct Config {
     /// holding a heartbeated lease and advancing the manifest per commit, plus any number of
     /// `ReadOnly` readers picking its writes up via `refresh`. Default `false`.
     pub cluster: bool,
+    /// Which of the profile-eligible knobs were set explicitly via a builder call, so
+    /// [`Config::apply_profile`] knows an explicit setter must beat a recorded default.
+    explicit: ExplicitFlags,
+}
+
+/// Tracks which profile-eligible [`Config`] knobs were set explicitly, independent of the
+/// resolved value each field holds (a caller can explicitly set `ann(None)`, which must still
+/// beat a recorded profile).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ExplicitFlags {
+    pub(crate) quantization: bool,
+    pub(crate) ann: bool,
+    pub(crate) query_threads: bool,
+    pub(crate) mmap: bool,
 }
 
 impl Config {
@@ -133,6 +148,7 @@ impl Config {
             persistence: String::new(),
             memory: String::new(),
             cluster: false,
+            explicit: ExplicitFlags::default(),
         }
     }
 
@@ -190,6 +206,7 @@ impl Config {
     /// Enable vector quantization for faster search (int8 or binary; `None` disables).
     pub fn quantization(mut self, q: Option<Quantization>) -> Self {
         self.quantization = q;
+        self.explicit.quantization = true;
         self
     }
 
@@ -198,12 +215,14 @@ impl Config {
     /// index walk plus an exact f32 rerank.
     pub fn ann(mut self, ann: Option<AnnConfig>) -> Self {
         self.ann = ann;
+        self.explicit.ann = true;
         self
     }
 
     /// Set the number of worker threads for a single exact search (`1` = serial).
     pub fn query_threads(mut self, n: usize) -> Self {
         self.query_threads = n;
+        self.explicit.query_threads = true;
         self
     }
 
@@ -225,6 +244,7 @@ impl Config {
     /// [`mmap`](Self::mmap).
     pub fn mmap(mut self, on: bool) -> Self {
         self.mmap = on;
+        self.explicit.mmap = true;
         self
     }
 
@@ -250,6 +270,48 @@ impl Config {
         self
     }
 
+    /// Resolve recorded [`OpenProfile`] defaults against this config: an explicit builder call
+    /// always wins, otherwise a recorded value fills in, otherwise the built-in default (already
+    /// in place) stands. Applied per knob independently.
+    pub(crate) fn apply_profile(&mut self, p: &OpenProfile) {
+        if !self.explicit.quantization {
+            self.quantization = p.quantization.or(self.quantization);
+        }
+        if !self.explicit.ann {
+            self.ann = p.ann.or(self.ann);
+        }
+        if !self.explicit.query_threads {
+            self.query_threads = p.query_threads.unwrap_or(self.query_threads);
+        }
+        if !self.explicit.mmap {
+            self.mmap = p.mmap.unwrap_or(self.mmap);
+        }
+    }
+
+    /// Build an [`OpenProfile`] capturing only the knobs this config set explicitly, ready to
+    /// hand to `Nidus::set_open_profile`. Knobs left at their defaults stay unrecorded, so
+    /// recording never freezes a value the caller never chose.
+    pub fn to_profile(&self) -> OpenProfile {
+        OpenProfile {
+            ann: if self.explicit.ann { self.ann } else { None },
+            quantization: if self.explicit.quantization {
+                self.quantization
+            } else {
+                None
+            },
+            query_threads: if self.explicit.query_threads {
+                Some(self.query_threads)
+            } else {
+                None
+            },
+            mmap: if self.explicit.mmap {
+                Some(self.mmap)
+            } else {
+                None
+            },
+        }
+    }
+
     /// Validate cross-field invariants that do not depend on the backend — called by every
     /// store constructor before any IO. (Backend-specific checks, e.g. cluster mode needing a
     /// shared store, live in `Store::open_with`, which has the resolved backend in hand.)
@@ -266,6 +328,18 @@ impl Config {
                  (segment_max_rows + segment_index_min_rows): once a segment is IVF-indexed, \
                  search fans out per-segment and never uses the quantized matrix, so \
                  quantization would cost memory and CPU with no effect — enable one or the other"
+            );
+        }
+        // Also enforced when the quantized matrix is built, but a recorded profile resolves at
+        // *open*, so an unbuildable combination must be rejected before it can be persisted —
+        // otherwise every later open fails, including the one needed to clear it (nidus-141).
+        if matches!(self.quantization, Some(q) if q.kind == QuantKind::Binary)
+            && self.distance != Distance::Cosine
+        {
+            bail!(
+                "binary quantization requires Distance::Cosine (sign codes are an angular \
+                 proxy and ignore magnitude); use int8 quantization for a dot-product or \
+                 Euclidean store"
             );
         }
         Ok(())
@@ -297,6 +371,80 @@ mod tests {
         assert_eq!(c.open_mode, OpenMode::ReadOnly);
         assert_eq!(c.auto_compact, None);
         assert_eq!(c.lock_ttl, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn explicit_setters_are_tracked_independently() {
+        let c = Config::new("/tmp/s", 8).mmap(true);
+        assert!(c.explicit.mmap);
+        assert!(!c.explicit.ann);
+        assert!(!c.explicit.quantization);
+        assert!(!c.explicit.query_threads);
+    }
+
+    #[test]
+    fn apply_profile_fills_unset_knobs() {
+        let mut c = Config::new("/tmp/s", 8);
+        let p = OpenProfile {
+            ann: Some(AnnConfig::hnsw()),
+            quantization: Some(Quantization::int8()),
+            query_threads: Some(4),
+            mmap: Some(true),
+        };
+        c.apply_profile(&p);
+        assert_eq!(c.ann, Some(AnnConfig::hnsw()));
+        assert_eq!(c.quantization, Some(Quantization::int8()));
+        assert_eq!(c.query_threads, 4);
+        assert!(c.mmap);
+    }
+
+    #[test]
+    fn apply_profile_never_overrides_an_explicit_setter() {
+        let mut c = Config::new("/tmp/s", 8)
+            .ann(None)
+            .quantization(Some(Quantization::binary()))
+            .query_threads(2)
+            .mmap(false);
+        let p = OpenProfile {
+            ann: Some(AnnConfig::hnsw()),
+            quantization: Some(Quantization::int8()),
+            query_threads: Some(4),
+            mmap: Some(true),
+        };
+        c.apply_profile(&p);
+        assert_eq!(
+            c.ann, None,
+            "explicit ann(None) must beat a recorded profile"
+        );
+        assert_eq!(c.quantization, Some(Quantization::binary()));
+        assert_eq!(c.query_threads, 2);
+        assert!(!c.mmap);
+    }
+
+    #[test]
+    fn to_profile_captures_only_explicit_knobs() {
+        let c = Config::new("/tmp/s", 8).mmap(true).query_threads(3);
+        let p = c.to_profile();
+        assert_eq!(p.mmap, Some(true));
+        assert_eq!(p.query_threads, Some(3));
+        assert_eq!(p.ann, None);
+        assert_eq!(p.quantization, None);
+    }
+
+    #[test]
+    fn to_profile_round_trips_through_apply_profile() {
+        let source = Config::new("/tmp/s", 8)
+            .ann(Some(AnnConfig::ivf()))
+            .quantization(Some(Quantization::binary()));
+        let profile = source.to_profile();
+
+        let mut target = Config::new("/tmp/other", 8);
+        target.apply_profile(&profile);
+        assert_eq!(target.ann, Some(AnnConfig::ivf()));
+        assert_eq!(target.quantization, Some(Quantization::binary()));
+        // Knobs the source never set explicitly stay untouched on the target.
+        assert_eq!(target.query_threads, 1);
+        assert!(!target.mmap);
     }
 
     #[test]

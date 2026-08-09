@@ -51,8 +51,8 @@ commitments, and every change is judged against them; trading one away is a chan
   Every surface has a load-bearing test in CI — end-to-end where only end-to-end can
   prove it. A feature without its test is not shipped.
 - **Stable** — durable by construction: crash-safe log, CRC'd codecs, torn-tail
-  recovery, graceful ENOSPC/OOM (§6), additive on-disk formats (§9). Boring to depend
-  on is the goal.
+  recovery, graceful ENOSPC/OOM (§6), additive on-disk formats (§9) with one deliberate
+  exception, the versioned manifest (§14.2). Boring to depend on is the goal.
 
 The hard bar on dependencies is **build-and-ship speed, not zero-C absolutism.** What
 disqualified DuckDB and LanceDB was a *multi-minute* build (a large C/C++ tree, a whole
@@ -306,6 +306,10 @@ pub struct Config {
     pub lock_ttl: Duration,        // stale writer-lock reclamation window. default 60s
     pub max_vector_bytes: Option<u64>, // hard ceiling on the vector matrix
                                    //   (rows*dim*4); None = unbounded (default). §6.6
+    pub quantization: Option<Quantization>, // two-pass quantized search; None disables (default)
+    pub ann: Option<AnnConfig>,    // approximate index (HNSW/IVF); None = exact brute force (default)
+    pub query_threads: usize,      // worker threads for one search. default 1 (serial)
+    pub mmap: bool,                // memory-map sealed segments instead of RAM. default false
 }
 pub enum Fsync { PerBatch, OnFlush }
 pub enum OpenMode { ReadWrite, ReadOnly }   // ReadOnly takes no writer lock; rejects writes
@@ -317,8 +321,16 @@ impl Config {
     pub fn auto_compact(self, ratio: Option<f32>) -> Self;
     pub fn lock_ttl(self, ttl: Duration) -> Self;
     pub fn max_vector_bytes(self, bytes: Option<u64>) -> Self;
+    pub fn quantization(self, q: Option<Quantization>) -> Self;
+    pub fn ann(self, ann: Option<AnnConfig>) -> Self;
+    pub fn query_threads(self, n: usize) -> Self;
+    pub fn mmap(self, on: bool) -> Self;
 }
 ```
+
+These four knobs (`quantization`, `ann`, `query_threads`, `mmap`) are also the ones
+`OpenProfile` can record as store-level defaults (§14.2, nidus-141): an explicit
+setter here always wins over a recorded default for the same knob, at every open.
 
 - `OpenMode::ReadOnly` opens **without** taking the writer lock and rejects
   mutations — the basis for many concurrent search-only processes over a store
@@ -965,8 +977,9 @@ Full reindexes churn little; incremental indexing needs this to bound growth.
 
 ## 9. Seams: shipped and still-deferred
 
-Every seam here is purely additive over the format in §5 — **none changed the on-disk
-byte layout.** Several were designed-for here and have since been built; the design
+Every seam here is purely additive over the format in §5 — **none changed the vector
+data layout.** The manifest is versioned separately and *has* changed: v2 carries the
+open profile (§14.2), and a v2 manifest is unreadable by a pre-0.60 binary. Several were designed-for here and have since been built; the design
 rationale is kept so the choices stay legible. The rest stay deferred: do **not**
 build until a real need exists.
 
@@ -1652,7 +1665,8 @@ seam, the append-only format), not a rewrite, and changes no public API (§4).
 
 **Phases 1–5 are built** (the segment format + manifest + WAL→segment sealing; the
 per-segment IVF / exhaustive-tail split; per-segment mmap; manifest-versioned reader refresh;
-and cluster mode — §14.6), each additive over the same on-disk format.
+and cluster mode — §14.6), each additive over the same segment format. The manifest that
+names those segments is the one versioned object: it went to v2 for the open profile.
 
 ### 14.1 Principle: the durable objects are the store; a process is a cache over them
 
@@ -1677,6 +1691,23 @@ mutated: only created, merged, or dropped. The store becomes three things:
 - a set of **immutable segments** (the bulk of the data);
 - a tiny **manifest** naming the live segments (the atomic commit point — swapping it
   publishes a new state).
+
+**The manifest is FORMAT VERSION 2** (nidus-141): besides the enforced pins (dimension,
+distance — a mismatch on open is a hard error, never silently reconciled) it now also
+carries an *advisory* `OpenProfile`: recorded defaults for `ann`, `quantization`,
+`query_threads`, and `mmap`. These are plain defaults, not invariants — an explicit flag
+or `Config` setter on a later open always overrides the recorded value for that knob, and
+an absent profile (the pre-141 case) just means "use the built-in defaults," never an
+error. `nidus configure` (or `Nidus::set_open_profile`) is what writes a profile.
+
+**Compatibility is one-way.** A v2 decode accepts a v1 manifest and lifts it in place with
+an empty profile, so upgrading nidus is transparent: every existing store keeps opening,
+with no recorded defaults, exactly as before. The reverse does not hold: once anything
+rewrites the manifest at v2, a pre-0.60 binary that opens it hard-fails with "manifest
+format version 2 is not supported." That is an accepted, one-time cost of the upgrade, not
+a bug: the alternative (silently downgrading a v2 manifest's profile away to stay
+v1-readable) would make configuring a store next to a mixed fleet of binary versions look
+like it worked and then silently stop applying.
 
 Immutability is what unlocks everything else, because each scaling limit of the monolith
 dissolves into a segment operation:

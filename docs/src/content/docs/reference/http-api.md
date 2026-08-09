@@ -19,7 +19,7 @@ so the same id appears in your logs and the server's.
 | Method & path | Operation | Library method |
 | --- | --- | --- |
 | `GET /health` | liveness check: `503` only when unrecoverably broken (always unauthenticated) | – |
-| `GET /stats` | dimension, distance, ann config, collections, footprint | `dimension` / `footprint` |
+| `GET /stats` | dimension, distance, the resolved open profile (ann, quantization, query_threads, mmap), collections, footprint | `dimension` / `footprint` |
 | `GET /collections` | list collection names | `collections` |
 | `POST /collections/{name}` | create a collection | `create_collection` |
 | `DELETE /collections/{name}` | drop a collection and its records | `drop_collection` |
@@ -162,6 +162,9 @@ Store-wide introspection, the network equivalent of `nidus stats`.
   "dimension": 768,
   "distance": "Cosine",
   "ann": null,
+  "quantization": null,
+  "query_threads": 1,
+  "mmap": false,
   "collections": ["docs", "notes"],
   "footprint": {
     "rows": 1240,
@@ -176,8 +179,9 @@ Store-wide introspection, the network equivalent of `nidus stats`.
 `rows` counts every vector slot on disk (including superseded ones); `dead_rows`
 is how many a `compact` would reclaim; `doc_count` is the live record count.
 `ann` is `null` for exact brute-force search (the default), or echoes the active
-ANN configuration when the server was started with `--ann hnsw`/`--ann ivf` (only
-the knobs that apply to the chosen index are reported):
+ANN configuration when the server opened with one, whether from an explicit
+`--ann hnsw`/`--ann ivf` flag or a default recorded earlier with `nidus configure`
+(only the knobs that apply to the chosen index are reported):
 
 ```json
 "ann": { "kind": "Hnsw", "overscan": 4, "seed": 11400714819323198485,

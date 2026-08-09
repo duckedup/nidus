@@ -622,6 +622,7 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
     let mut store = Store {
         fenced: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         last_verified: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        baseline_config: config.clone(),
         config,
         data: Segments::in_memory_with(2, Distance::Cosine),
         log: OpLog::in_memory(),
@@ -631,6 +632,7 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         lease: None,
         collections: HashMap::new(),
         dead_rows: 0,
+        open_profile: OpenProfile::default(),
         quant: None,
         ann: None,
         seg_indexes: Vec::new(),
@@ -1201,6 +1203,180 @@ fn distance_mismatch_on_reopen_errors() {
         msg.contains("distance"),
         "error should mention distance: {msg}"
     );
+}
+
+// ── Open-profile persistence tests (nidus-141) ────────────────────────
+
+#[cfg_attr(miri, ignore)] // fsync
+#[test]
+fn recorded_profile_applies_on_reopen_with_bare_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let mut store = Store::open(Config::new(&path, 3)).unwrap();
+        store
+            .set_open_profile(&OpenProfile {
+                ann: Some(AnnConfig::hnsw()),
+                quantization: Some(Quantization::int8()),
+                query_threads: Some(4),
+                mmap: None,
+            })
+            .unwrap();
+    }
+    // A bare Config sets nothing explicitly, so every knob must resolve from the manifest.
+    let store = Store::open(Config::new(&path, 3)).unwrap();
+    assert_eq!(store.config().ann, Some(AnnConfig::hnsw()));
+    assert_eq!(store.config().quantization, Some(Quantization::int8()));
+    assert_eq!(store.config().query_threads, 4);
+}
+
+#[cfg_attr(miri, ignore)] // fsync
+#[test]
+fn explicit_flag_beats_recorded_profile_on_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let mut store = Store::open(Config::new(&path, 3)).unwrap();
+        store
+            .set_open_profile(&OpenProfile {
+                ann: None,
+                quantization: Some(Quantization::int8()),
+                query_threads: Some(4),
+                mmap: None,
+            })
+            .unwrap();
+    }
+    let store = Store::open(Config::new(&path, 3).query_threads(2)).unwrap();
+    assert_eq!(
+        store.config().query_threads,
+        2,
+        "an explicit builder call must beat the recorded profile"
+    );
+    assert_eq!(
+        store.config().quantization,
+        Some(Quantization::int8()),
+        "a knob the caller never set explicitly still adopts the recorded profile"
+    );
+}
+
+#[cfg_attr(miri, ignore)] // fsync
+#[test]
+fn no_recorded_profile_opens_on_built_in_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        Store::open(Config::new(&path, 3)).unwrap();
+    }
+    let store = Store::open(Config::new(&path, 3)).unwrap();
+    assert_eq!(store.config().ann, None);
+    assert_eq!(store.config().quantization, None);
+    assert_eq!(store.config().query_threads, 1);
+    assert!(!store.config().mmap);
+}
+
+#[cfg_attr(miri, ignore)] // fsync
+#[test]
+fn cleared_profile_reopens_on_built_in_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let mut store = Store::open(Config::new(&path, 3)).unwrap();
+        store
+            .set_open_profile(&OpenProfile {
+                ann: Some(AnnConfig::hnsw()),
+                quantization: Some(Quantization::int8()),
+                query_threads: Some(4),
+                mmap: None,
+            })
+            .unwrap();
+    }
+    {
+        let mut store = Store::open(Config::new(&path, 3)).unwrap();
+        assert_eq!(
+            store.config().ann,
+            Some(AnnConfig::hnsw()),
+            "sanity: the profile applied before it is cleared"
+        );
+        store.clear_open_profile().unwrap();
+    }
+    let store = Store::open(Config::new(&path, 3)).unwrap();
+    assert_eq!(store.config().ann, None);
+    assert_eq!(store.config().quantization, None);
+    assert_eq!(store.config().query_threads, 1);
+}
+
+#[cfg_attr(miri, ignore)] // fsync
+#[test]
+fn profile_survives_a_seal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let mut store = Store::open(Config::new(&path, 2).segment_max_rows(Some(1))).unwrap();
+        store
+            .set_open_profile(&OpenProfile {
+                ann: None,
+                quantization: Some(Quantization::int8()),
+                query_threads: Some(3),
+                mmap: None,
+            })
+            .unwrap();
+        store.create_collection("col").unwrap();
+        // The second upsert crosses the 1-row segment cap, forcing a seal (SPEC §14.4) — the
+        // hazard this test guards: a seal must carry the profile forward, not drop it.
+        store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+        store.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
+    }
+    let store = Store::open(Config::new(&path, 2).segment_max_rows(Some(1))).unwrap();
+    assert_eq!(
+        store.config().quantization,
+        Some(Quantization::int8()),
+        "a seal must not revert the recorded profile to defaults"
+    );
+    assert_eq!(store.config().query_threads, 3);
+}
+
+#[cfg_attr(miri, ignore)] // fsync
+#[test]
+fn pre_profile_v1_manifest_opens_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let mut store = Store::open(Config::new(&path, 3)).unwrap();
+        store.create_collection("col").unwrap();
+        store
+            .upsert("col", &[rec("doc1", vec![1.0, 2.0, 3.0])])
+            .unwrap();
+    }
+    // Overwrite the v2 manifest `open` just wrote with a hand-built v1 blob (bincode's
+    // positional format, no `profile` field) — a pre-nidus-141 manifest must still open.
+    #[derive(serde::Serialize)]
+    struct V1Shape {
+        format_version: u16,
+        dimension: u64,
+        distance: Distance,
+        segments: Vec<String>,
+        next_id: u64,
+        version: u64,
+    }
+    let v1 = V1Shape {
+        format_version: 1,
+        dimension: 3,
+        distance: Distance::Cosine,
+        segments: vec!["data".to_string()],
+        next_id: 1,
+        version: 1,
+    };
+    let payload = bincode::serialize(&v1).unwrap();
+    let crc = crc32fast::hash(&payload);
+    let mut bytes = Vec::with_capacity(4 + payload.len());
+    bytes.extend_from_slice(&crc.to_le_bytes());
+    bytes.extend_from_slice(&payload);
+    std::fs::write(path.join("manifest"), &bytes).unwrap();
+
+    let store = Store::open(Config::new(&path, 3)).unwrap();
+    let records = store.get_all("col");
+    assert_eq!(records.len(), 1);
+    assert_eq!(store.open_profile, OpenProfile::default());
 }
 
 // ── list (metadata-only query) tests ─────────────────────────────────
@@ -6819,4 +6995,60 @@ fn a_degenerate_cap_is_refused() {
             "{bad:?} must be refused"
         );
     }
+}
+
+/// Regression, review finding: `refresh` re-merged onto the already-merged config, so
+/// `p.ann.or(self.ann)` reproduced the stale value and a cleared knob never retracted.
+#[cfg_attr(miri, ignore)] // fsync
+#[test]
+fn refresh_retracts_a_cleared_profile_knob() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let mut writer = Store::open(Config::new(&path, 3)).unwrap();
+    writer
+        .set_open_profile(&OpenProfile {
+            ann: Some(AnnConfig::hnsw()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let mut reader = Store::open(Config::new(&path, 3).open_mode(OpenMode::ReadOnly)).unwrap();
+    assert_eq!(
+        reader.config().ann,
+        Some(AnnConfig::hnsw()),
+        "reader should adopt the recorded profile at open"
+    );
+
+    writer.clear_open_profile().unwrap();
+    reader.refresh().unwrap();
+    assert_eq!(
+        reader.config().ann,
+        None,
+        "a live reader must drop an ann default the writer cleared"
+    );
+}
+
+/// Regression, review finding: an unbuildable profile could be persisted, and since a profile
+/// resolves at open, every later open failed — including the `clear` needed to undo it.
+#[cfg_attr(miri, ignore)] // fsync
+#[test]
+fn set_open_profile_rejects_a_combination_that_could_never_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let mut store = Store::open(Config::new(&path, 3).distance(Distance::Euclidean)).unwrap();
+
+    let err = store
+        .set_open_profile(&OpenProfile {
+            quantization: Some(Quantization::binary()),
+            ..Default::default()
+        })
+        .expect_err("binary quantization on a Euclidean store must be refused");
+    assert!(
+        err.to_string().contains("binary quantization requires"),
+        "{err}"
+    );
+
+    drop(store);
+    Store::open(Config::new(&path, 3).distance(Distance::Euclidean))
+        .expect("the store must still open: nothing unbuildable was persisted");
 }

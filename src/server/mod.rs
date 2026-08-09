@@ -654,6 +654,9 @@ async fn stats(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> 
             "dimension": db.dimension(),
             "distance": format!("{:?}", db.config().distance),
             "ann": db.config().ann.map(AnnDto::from),
+            "quantization": db.config().quantization,
+            "query_threads": db.config().query_threads,
+            "mmap": db.config().mmap,
             "collections": db.collections(),
             "footprint": FootprintDto::from(db.footprint()),
         }))

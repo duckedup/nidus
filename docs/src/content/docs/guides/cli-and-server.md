@@ -154,6 +154,10 @@ nidus compact    --dir ./store
 nidus compact    --dir ./store --expired  # delete lapsed entries, then reclaim rows
 nidus delete     --dir ./store docs a b
 
+# Record the open-time knobs (--ann, --quantization, --query-threads, --mmap) as
+# this store's own defaults; see "Configure once" below
+nidus configure  --dir ./store --ann hnsw
+
 # Snapshot the whole store to one portable .tar.gz, and restore it
 nidus backup     --dir ./store --out ./store.tar.gz
 nidus restore    --in ./store.tar.gz --dir ./restored
@@ -174,10 +178,10 @@ API](/reference/http-api/#post-compact)).
 ## Approximate search (ANN)
 
 By default search is exact brute-force. For larger stores you can opt into an
-in-memory approximate-nearest-neighbour index with `--ann hnsw` or `--ann ivf`.
-Unlike `--dim` and `--distance`, the ANN choice is **not** recorded in the store
-header: it is a property of how you *open* the store, so pass it on every command
-that should build or consult the index (including `serve`):
+in-memory approximate-nearest-neighbour index with `--ann hnsw` or `--ann ivf`. Pass
+it on the commands that should use it, or record it once as the store's own default
+with [`nidus configure`](#configure-once-recording-store-defaults) so later commands,
+including `serve`, pick it up without repeating the flag:
 
 ```bash
 # Upsert into a store whose index you maintain as an HNSW graph
@@ -229,8 +233,9 @@ single writer; for many concurrent writers, prefer a local store and snapshot to
 ## Speed, memory & durability flags
 
 Defaults are exact, all-RAM, and durable per batch. These flags trade along each of those
-axes; like `--ann`, none is recorded in the header, so pass them on every command that
-should open the store that way (including `serve`):
+axes. Pass them on the commands that should use them, or record them once with
+[`nidus configure`](#configure-once-recording-store-defaults) so later commands,
+including `serve`, pick them up without repeating the flag:
 
 ```bash
 # Quantize the search first pass, then rerank candidates in exact f32.
@@ -260,6 +265,38 @@ gives each sufficiently large sealed segment its own IVF index. Housekeeping kno
 Every flag also reads from a `NIDUS_*` environment variable (`NIDUS_QUANTIZATION`,
 `NIDUS_MMAP`, `NIDUS_QUERY_THREADS`, …), so a container can be configured entirely through
 the environment with no command line.
+
+## Configure once: recording store defaults
+
+`--ann`, `--quantization`, `--query-threads`, and `--mmap` are open-time knobs: which
+index to walk, how the search first pass scores, how many threads split one query's
+scan, and whether sealed segments are memory-mapped. `nidus configure` records the
+flags you pass it as the store's own defaults, so later commands, including `serve`,
+inherit them without repeating the flag:
+
+```bash
+# Record ANN + quantization as this store's defaults, once
+nidus configure --dir ./store --ann hnsw --quantization int8
+
+# Every later command picks them up automatically
+echo '[1,0,0]' | nidus search --dir ./store docs -k 5
+nidus serve --dir ./store --dim 768
+```
+
+Precedence is: an explicit flag (or its `NIDUS_*` environment variable, since clap
+resolves the variable into the flag) always wins for that one call; otherwise a
+recorded default applies; otherwise the built-in default. So `nidus search --dir
+./store --exact docs` still forces brute force even after `--ann` is configured.
+`mmap` is the one knob that is a bare on/off rather than a value with its own "off"
+state, so once `--mmap` is recorded, `--no-mmap` opts a single command back out.
+
+Recording defaults writes the profile into the manifest, which moves it to format
+version 2. Every nidus binary from this release onward reads a v2 manifest fine
+(and lifts an older v1 manifest transparently, with no recorded defaults), but the
+reverse does not hold: an older, **pre-0.60** binary refuses a v2 manifest outright
+with `format version 2 is not supported`. Configuring a store is a one-way upgrade:
+harmless for a store one version of nidus owns, but worth knowing before you
+configure a store that a mixed fleet of older and newer binaries all open.
 
 ## Running several instances over one shared store
 

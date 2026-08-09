@@ -1,6 +1,6 @@
 ---
 title: API reference
-description: The full nidus public surface (Nidus, Config, Record, Value, Filter, Predicate, Scope, SearchOpts, Projection, RankBy, Decay, LimitPer, OrderBy, AggregateOpts, FtsQuery, HybridOpts, ListOpts, Hit, Annotations, Footprint).
+description: The full nidus public surface (Nidus, Config, OpenProfile, Record, Value, Filter, Predicate, Scope, SearchOpts, Projection, RankBy, Decay, LimitPer, OrderBy, AggregateOpts, FtsQuery, HybridOpts, ListOpts, Hit, Annotations, Footprint).
 ---
 
 The complete public API. All fallible methods return `anyhow::Result`. For the
@@ -25,7 +25,7 @@ searchers plus one writer (see
 | Method | Signature | Notes |
 | ------ | --------- | ----- |
 | `dimension` | `fn dimension(&self) -> usize` | The pinned embedding dimension. |
-| `config` | `fn config(&self) -> &Config` | The config the store was opened with. |
+| `config` | `fn config(&self) -> &Config` | The **effective** config: the caller's explicit settings merged with any [`OpenProfile`](#openprofile) defaults recorded in the store, an explicit setting always winning. |
 | `footprint` | `fn footprint(&self) -> Footprint` | A cheap snapshot of the vector footprint. |
 | `cluster_status` | `fn cluster_status(&self) -> ClusterStatus` | Role, writer-handle state, fencing token, commit counter, staleness (what [`GET /cluster`](/reference/http-api/#get-cluster) reports). |
 
@@ -67,6 +67,9 @@ searchers plus one writer (see
 | `sweep_expired` | `fn sweep_expired(&mut self) -> Result<usize>` | Delete every entry across every collection whose `nidus.expires_at` has passed, then compact to reclaim the rows, in one call. Returns the number of entries deleted. Available in every build, no feature flag. |
 | `refresh` | `fn refresh(&mut self) -> Result<bool>` | Adopt a separate writer's newer committed state into a lock-free [`ReadOnly`](/reference/configuration/#openmode) handle without reopening; it picks up appends, deletes, seals, and compactions at one consistent point. Returns `true` when newer state was adopted, `false` when already current (the cheap case) or for a `ReadWrite`/in-memory handle. See [refreshing a reader](/guides/storage/#refreshing-a-reader). |
 | `persist_index` | `fn persist_index(&mut self) -> Result<()>` | Write the derived index caches: the [ANN index](#annconfig--annkind) to its `ann` cache and the full-text index to its `fts` cache, so the next `open()` loads them instead of rebuilding. Out-of-band (never on `upsert`/`flush`); no-op for whichever index is off, and when in-memory or read-only. `compact()` refreshes them too. |
+| `open_profile` | `fn open_profile(&self) -> &OpenProfile` | The profile currently recorded in the manifest. Empty when nothing has been recorded. |
+| `set_open_profile` | `fn set_open_profile(&mut self, p: &OpenProfile) -> Result<()>` | Record `p` as this store's open-time default for `ann`/`quantization`/`query_threads`/`mmap`, so a later `open()` with no explicit setting for a knob picks it up. Build `p` with [`Config::to_profile`](#config), which captures only the knobs that config set explicitly. Replaces the recorded profile wholesale, so merge onto `open_profile()` first if you mean to add one knob. Rejected on a read-only store, and rejected if the resulting combination could not be opened. |
+| `clear_open_profile` | `fn clear_open_profile(&mut self) -> Result<()>` | Remove the recorded profile. Later opens fall back to built-in defaults unless a knob is set explicitly. |
 
 ## `Scope`
 
@@ -550,3 +553,25 @@ pub struct AnnConfig {
 May be combined with [`Quantization`](#quantization): the index walk then scores
 quantized codes for cheaper candidate selection, and the exact f32 rerank over the
 resulting candidates restores accuracy.
+
+## `OpenProfile`
+
+Recorded open-time defaults for `ann`, `quantization`, `query_threads`, and `mmap`,
+carried in the store's manifest (SPEC §14.2). `Nidus::set_open_profile` writes the calling
+config's currently-set knobs here; every later `open()` merges a recorded field in
+wherever the caller left that knob unset, and an explicit [`Config`] setter for the
+same knob always wins. See [Configure once](/guides/cli-and-server/#configure-once-recording-store-defaults).
+
+```rust
+pub struct OpenProfile {
+    pub ann: Option<AnnConfig>,
+    pub quantization: Option<Quantization>,
+    pub query_threads: Option<usize>,
+    pub mmap: Option<bool>,
+}
+```
+
+Each `None` means "nothing recorded for this knob," not "explicitly off": there is
+no recorded-off state for these four, only recorded-on or absent. A store that has
+never been configured has an all-`None` profile and behaves exactly as before this
+existed.

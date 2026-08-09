@@ -13,6 +13,7 @@ use crate::filter;
 use crate::fts::FtsField;
 use crate::manifest::MANIFEST_KEY;
 use crate::model::{Distance, Filter, Op, Record, Value};
+use crate::profile::OpenProfile;
 use crate::search::normalize;
 
 impl Store {
@@ -144,7 +145,7 @@ impl Store {
         let Some(p) = self.persistence.clone() else {
             return Ok(());
         };
-        let manifest = self.data.manifest();
+        let manifest = self.data.manifest(self.open_profile.clone());
         if !self.config.cluster {
             return manifest.store(p.as_ref());
         }
@@ -166,6 +167,33 @@ impl Store {
             // still applies). Keep `manifest_cas` `None` so we stay on this path.
             CasOutcome::Unsupported => manifest.store(p.as_ref()),
         }
+    }
+
+    /// The store's currently recorded open-time profile (nidus-141), empty when nothing is
+    /// recorded and every knob resolves to its built-in default (or an explicit flag).
+    pub fn open_profile(&self) -> &OpenProfile {
+        &self.open_profile
+    }
+
+    /// Record `p` as the store's open-time profile so every later open resolves
+    /// ann/quantization/query_threads/mmap without re-passing them — an explicit act, never
+    /// implied by `open` itself. `ReadOnly` rejects it, matching every other mutation.
+    pub fn set_open_profile(&mut self, p: &OpenProfile) -> Result<()> {
+        self.check_writable()?;
+        // A recorded profile resolves at open, not here, so an unbuildable combination would
+        // fail every future open — including the `clear` that would undo it. Reject it now.
+        let mut resolved = self.baseline_config.clone();
+        resolved.apply_profile(p);
+        resolved.validate()?;
+        self.open_profile = p.clone();
+        self.data.bump_version();
+        self.persist_manifest()
+    }
+
+    /// Clear the recorded profile (write an empty one) — later opens fall back to built-in
+    /// defaults unless overridden by an explicit flag.
+    pub fn clear_open_profile(&mut self) -> Result<()> {
+        self.set_open_profile(&OpenProfile::default())
     }
 
     pub fn create_collection(&mut self, name: &str) -> Result<()> {
