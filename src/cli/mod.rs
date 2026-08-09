@@ -890,6 +890,13 @@ enum Command {
         /// Extra attrs as a JSON object of typed values, e.g. '{"tag":{"Str":"ops"}}'.
         #[arg(long)]
         attrs: Option<String>,
+        /// Seconds until this memory expires. Omit to never expire.
+        #[arg(long)]
+        ttl_seconds: Option<i64>,
+        /// Cosine floor (0-1) above which this write updates the nearest existing
+        /// entry instead of inserting a near-duplicate.
+        #[arg(long)]
+        dedupe_threshold: Option<f32>,
         /// Summarize the text first and embed the summary, storing both.
         #[cfg(feature = "summarize")]
         #[arg(long)]
@@ -1275,6 +1282,8 @@ pub fn run(cli: Cli) -> Result<()> {
             text,
             id,
             attrs,
+            ttl_seconds,
+            dedupe_threshold,
             #[cfg(feature = "summarize")]
             summarize,
         } => memory::remember(
@@ -1284,6 +1293,8 @@ pub fn run(cli: Cli) -> Result<()> {
             text,
             id,
             attrs,
+            ttl_seconds,
+            dedupe_threshold,
             #[cfg(feature = "summarize")]
             summarize,
         ),
