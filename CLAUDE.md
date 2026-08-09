@@ -2,6 +2,21 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+## Core Foundation: Speed, Testing, Stable
+
+Three commitments every change is judged against (SPEC §1 — trading one away is a
+design change, not an implementation detail):
+
+1. **Speed** — the clean build stays in seconds and CI asserts it; dependencies are
+   judged by build-and-ship cost. Never trade this away silently.
+2. **Testing** — verify against the real artifact, never assume (SPEC §11). Every
+   behaviour claim is backed by a test that runs in CI: surfaces only a real binary
+   can prove get e2e tests (`tests/e2e/`), and the SDK↔server contract runs against a
+   real server on every PR (`sdk-integration`). A change without its test is not done,
+   and a bug fix ships with a regression test verified to fail without the fix.
+3. **Stable** — crash safety, CRC'd codecs, graceful resource exhaustion, additive
+   on-disk formats. Weakening any of these is a design change: file an issue first.
+
 ## GitHub Issues
 
 This project tracks work in **GitHub Issues** on `duckedup/nidus`, via the `gh` CLI.
@@ -135,11 +150,11 @@ Our own code still carries `#![deny(unsafe_code)]` (see "Safe Rust" below for wh
 
 **FORBIDDEN — the multi-minute C trees nidus exists to avoid:** bundled C/C++
 (DuckDB's `libduckdb-sys`), vendored OpenSSL, `aws-lc-sys`, or a transitively-huge
-graph (Arrow + DataFusion). The guardrail is empirical: **the whole-crate clean build
-stays well under a minute** (measured ~7s). Note this is a *reviewer's* guardrail, not
-an automated one — no CI job times the build today, so nothing will fail the PR that
-blows the budget; SPEC §1 and the `Cargo.toml` comment both still claim CI asserts it
-(#95). Adding a dependency that
+graph (Arrow + DataFusion). The guardrail is empirical and **CI-enforced**: the
+`build-budget` job times a clean, uncached, offline build of the default features on
+every PR and fails past 60s (measured ~7s; the bound is order-of-magnitude on purpose,
+like the scale.rs timings, so it never flakes and still catches a bundled-C tree).
+Adding a dependency that
 blows that budget — or a bundled-C / native-linking crate — is a design change, not
 an implementation detail: raise it as an issue first. Judge a dep by "does it blow up
 compile time / require a heavy toolchain / bloat the binary," not "is it pure Rust."

@@ -41,10 +41,23 @@ off the default build — and nothing more.
 
 ### Thesis (the product *is* the constraints)
 
-The hard bar is **build-and-ship speed, not zero-C absolutism.** What disqualified
-DuckDB and LanceDB was a *multi-minute* build (a large C/C++ tree, a whole SQL engine)
-— not the mere presence of any C. nidus's bar is concrete and testable: **a clean build
-stays under a minute** (it is ~seconds today).
+**Core foundation — speed, testing, stable.** Everything below elaborates these three
+commitments, and every change is judged against them; trading one away is a change to
+*what nidus is*, not an implementation detail:
+
+- **Speed** — builds in seconds, installs with a bare `cargo add`, answers queries at
+  brute-force-fast latencies. The bar is empirical and CI-asserted, never aspirational.
+- **Testing** — behaviour is *verified against the real artifact, never assumed* (§11).
+  Every surface has a load-bearing test in CI — end-to-end where only end-to-end can
+  prove it. A feature without its test is not shipped.
+- **Stable** — durable by construction: crash-safe log, CRC'd codecs, torn-tail
+  recovery, graceful ENOSPC/OOM (§6), additive on-disk formats (§9). Boring to depend
+  on is the goal.
+
+The hard bar on dependencies is **build-and-ship speed, not zero-C absolutism.** What
+disqualified DuckDB and LanceDB was a *multi-minute* build (a large C/C++ tree, a whole
+SQL engine) — not the mere presence of any C. nidus's bar is concrete and testable: **a
+clean build stays under a minute** (it is ~seconds today).
 
 1. **Pure-Rust-first, fast to build.** Prefer well-established pure-Rust crates
    (`anyhow`, `serde`/`bincode`, `crc32fast`, `regex`, …). A C-compiling/native-linking dep is
