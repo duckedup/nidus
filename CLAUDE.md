@@ -17,6 +17,24 @@ design change, not an implementation detail):
 3. **Stable** — crash safety, CRC'd codecs, graceful resource exhaustion, additive
    on-disk formats. Weakening any of these is a design change: file an issue first.
 
+## Work through the `/nidus` skill
+
+Substantive work goes through the `/nidus` skill (`.claude/skills/nidus/`), not ad-hoc
+process. It encodes this file's laws in code (`bin/nidus-check lanes|laws`) so they are
+checked, not re-derived from prose. Reach for it by default:
+
+- **`/nidus fit <idea>`** — feature thought work BEFORE anything is built: is it the
+  right fit, does it make sense, who would use it. Verdicts are recorded (issue or
+  `decision` label) so ideas are decided once.
+- **`/nidus spec` → `implement`** — research, blueprints, a user gate, then parallel
+  implementation with per-directory scopes and self-verifying agents.
+- **`/nidus review`** — deterministic law checks plus adversarially-verified findings.
+  Run it on your own diff before opening a PR, not only on others'.
+- **`/nidus ship`** — the version-bump, `Closes`-audit, push-and-PR checklist.
+
+Skipping the skill for a one-line fix is fine; skipping it for feature work, reviews,
+or anything multi-file is not.
+
 ## GitHub Issues
 
 This project tracks work in **GitHub Issues** on `duckedup/nidus`, via the `gh` CLI.
