@@ -177,6 +177,34 @@ export interface Stats {
 }
 
 /**
+ * `/ready` readiness, mirroring the wire verbatim in snake_case. A `200` decodes
+ * `role`/`staleness_secs`; a `503` carries only `reason` (see
+ * {@link NidusClient.ready}, which never throws on either).
+ */
+export interface Readiness {
+  ready: boolean;
+  role?: string;
+  staleness_secs?: number;
+  reason?: string;
+}
+
+/**
+ * `/cluster` status, mirroring the wire verbatim in snake_case. `role` is the
+ * server's own `{:?}` spelling, passed through as-is so a future role needs no
+ * SDK change (same reasoning as {@link AnnInfo.kind}).
+ */
+export interface ClusterStatus {
+  role: string;
+  cluster: boolean;
+  holds_writer_handle: boolean;
+  fenced: boolean;
+  lease_owner: string | null;
+  commit_version: number;
+  staleness_secs: number;
+  max_staleness_secs: number | null;
+}
+
+/**
  * Which attrs the returned hits carry. Omit both for every attr (the default).
  * Sending both is a `400` — the server refuses rather than picking one.
  */

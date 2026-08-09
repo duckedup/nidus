@@ -63,6 +63,24 @@ describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
     if (dir) rmSync(dir, { recursive: true, force: true });
   });
 
+  it("reports readiness, cluster status, and refresh over the real server", async () => {
+    const readiness = await db.ready();
+    expect(readiness.ready).toBe(true);
+    expect(typeof readiness.role).toBe("string");
+    expect(readiness.role!.length).toBeGreaterThan(0);
+    expect(typeof readiness.staleness_secs).toBe("number");
+
+    const status = await db.cluster();
+    expect(typeof status.role).toBe("string");
+    expect(typeof status.cluster).toBe("boolean");
+    expect(typeof status.holds_writer_handle).toBe("boolean");
+    expect(typeof status.fenced).toBe("boolean");
+    expect(typeof status.commit_version).toBe("number");
+    expect(typeof status.staleness_secs).toBe("number");
+
+    expect(typeof (await db.refresh())).toBe("boolean");
+  });
+
   it("create → upsert → search → stats", async () => {
     await db.createCollection("docs");
     expect(await db.collections()).toContain("docs");

@@ -42,12 +42,14 @@ from .ranking import RankBy
 from .types import (
     Aggregation,
     Batch,
+    ClusterStatus,
     FtsClause,
     FtsField,
     HighlightOpts,
     Hits,
     LimitPer,
     OrderBy,
+    Readiness,
     Record,
     RecordInput,
     RememberResult,
@@ -117,6 +119,19 @@ class NidusClient:
         except Exception:
             return False
         return _wire.is_success(status)
+
+    def ready(self) -> Readiness:
+        """Whether this instance can serve: store open, not fenced, not stale.
+
+        A ``503`` is the negative answer rather than an exception, so a poll loop branches on
+        ``.ready`` instead of catching. Any other failure still raises ``NidusError``.
+        """
+        status, text = self._send("GET", _wire.READY, None)
+        return _wire.decode_readiness(status, text)
+
+    def cluster(self) -> ClusterStatus:
+        """Role, writer-handle state, fencing token, commit counter, staleness."""
+        return _wire.decode_cluster(self._request("GET", _wire.CLUSTER))
 
     def stats(self) -> Stats:
         """Store-wide introspection: dimension, distance, ANN config, collections, footprint."""
@@ -491,6 +506,10 @@ class NidusClient:
     def compact(self) -> None:
         """Compact the store, reclaiming space from deleted and overwritten rows."""
         self._request("POST", _wire.COMPACT, _wire.empty_body())
+
+    def refresh(self) -> bool:
+        """Adopt a writer's newer committed state. Returns whether anything was adopted."""
+        return _wire.decode_refresh(self._request("POST", _wire.REFRESH, _wire.empty_body()))
 
     # ── Lifetime ─────────────────────────────────────────────────────────────────────
 

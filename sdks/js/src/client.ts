@@ -11,6 +11,7 @@ import type {
   AggregateOptions,
   Aggregation,
   BatchSearchOptions,
+  ClusterStatus,
   DecodedRecord,
   Filter,
   FtsField,
@@ -20,6 +21,7 @@ import type {
   ListOptions,
   NidusRecord,
   RankBy,
+  Readiness,
   RecallOptions,
   RecordInput,
   RememberOptions,
@@ -91,6 +93,23 @@ export class NidusClient {
   /** Store-wide introspection: dimension, distance, ANN config, collections, footprint. */
   stats(): Promise<Stats> {
     return this.request<Stats>("GET", "/stats");
+  }
+
+  /**
+   * Readiness: whether this instance can serve. A `503` is the negative answer, not an
+   * error, so a poll loop branches on `ready` instead of catching. Other failures throw.
+   */
+  async ready(): Promise<Readiness> {
+    const res = await this.raw("GET", "/ready");
+    const text = await res.text();
+    if (res.status === 503) return { ready: false, reason: extractError(text, 503) };
+    if (!res.ok) throw new NidusError(extractError(text, res.status), res.status);
+    return JSON.parse(text) as Readiness;
+  }
+
+  /** Cluster role, writer-handle state, fencing token, commit counter, staleness. */
+  cluster(): Promise<ClusterStatus> {
+    return this.request<ClusterStatus>("GET", "/cluster");
   }
 
   /** List every collection name. */
@@ -412,6 +431,12 @@ export class NidusClient {
   /** Compact the store (reclaim space from deleted/overwritten rows). */
   async compact(): Promise<void> {
     await this.request("POST", "/compact", {});
+  }
+
+  /** Adopt a writer's newer committed state. Returns whether anything was adopted. */
+  async refresh(): Promise<boolean> {
+    const res = await this.request<{ adopted: boolean }>("POST", "/refresh", {});
+    return res.adopted;
   }
 
   // ── Internals ─────────────────────────────────────────────────────────────

@@ -237,9 +237,12 @@ written with a different embedding model is a `409`, not a silently meaningless 
 
 ## The rest of the API
 
-Every data-plane endpoint of the [HTTP API](/reference/http-api/) has a method (the
-ops probes `/ready`, `/cluster`, `/refresh`, and `/metrics` are for orchestrators and
-scrapers; hit them with plain HTTP):
+Every data-plane endpoint of the [HTTP API](/reference/http-api/) has a method. The
+ops probes are methods too, with one exception: `Ready`, `Cluster`, and `Refresh`
+each have a typed method, while `/metrics` stays unwrapped since it is a scraper's
+endpoint, not something application code calls. `Ready` returns a verdict rather
+than an error when the server reports not-ready, so a `503` is a value you check,
+not a failure you unwrap:
 
 ```go
 ok := db.Health(ctx)                       // bool: needs no token; "is it up", one answer
@@ -258,6 +261,9 @@ n, err = db.DeleteWhere(ctx, "docs", nidus.And(nidus.Lt("year", 2000))) // empty
 err = db.Flush(ctx)
 err = db.Compact(ctx)
 err = db.DropCollection(ctx, "docs")
+r, err := db.Ready(ctx)                    // 503 is a verdict: r.Ready false, r.Reason set
+cs, err := db.Cluster(ctx)                 // role, lease state, commit version
+adopted, err := db.Refresh(ctx)            // bool: did it adopt newer state
 ```
 
 ## Errors

@@ -818,3 +818,77 @@ describe("error handling", () => {
     expect(err.status).toBe(0);
   });
 });
+
+describe("ops surface (ready/cluster/refresh)", () => {
+  it("decodes a 200 ready response and hits GET /ready", async () => {
+    const { fn, calls } = mockFetch({ ready: true, role: "Leader", staleness_secs: 0 });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const res = await db.ready();
+    expect(calls[0]!.url).toBe("http://x/ready");
+    expect(calls[0]!.init.method).toBe("GET");
+    expect(res).toEqual({ ready: true, role: "Leader", staleness_secs: 0 });
+  });
+
+  it("resolves (not rejects) on a 503, returning ready:false and the error message", async () => {
+    const { fn } = mockFetch({ error: "store is stale" }, 503);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const res = await db.ready();
+    expect(res).toEqual({ ready: false, reason: "store is stale" });
+  });
+
+  it("still throws NidusError for a non-503 non-2xx status", async () => {
+    const { fn: fn500 } = mockFetch({ error: "internal error" }, 500);
+    const db500 = new NidusClient({ baseUrl: "http://x", fetch: fn500 });
+    await expect(db500.ready()).rejects.toMatchObject({
+      name: "NidusError",
+      status: 500,
+      message: "internal error",
+    });
+
+    const { fn: fn401 } = mockFetch({ error: "unauthorized" }, 401);
+    const db401 = new NidusClient({ baseUrl: "http://x", fetch: fn401 });
+    await expect(db401.ready()).rejects.toMatchObject({
+      name: "NidusError",
+      status: 401,
+    });
+  });
+
+  it("decodes all eight cluster fields, including the nullable ones", async () => {
+    const { fn, calls } = mockFetch({
+      role: "Follower",
+      cluster: true,
+      holds_writer_handle: false,
+      fenced: false,
+      lease_owner: null,
+      commit_version: 42,
+      staleness_secs: 3,
+      max_staleness_secs: null,
+    });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const status = await db.cluster();
+    expect(calls[0]!.url).toBe("http://x/cluster");
+    expect(status).toEqual({
+      role: "Follower",
+      cluster: true,
+      holds_writer_handle: false,
+      fenced: false,
+      lease_owner: null,
+      commit_version: 42,
+      staleness_secs: 3,
+      max_staleness_secs: null,
+    });
+  });
+
+  it("posts to /refresh and returns the adopted boolean", async () => {
+    const { fn: fnTrue, calls: callsTrue } = mockFetch({ adopted: true });
+    const dbTrue = new NidusClient({ baseUrl: "http://x", fetch: fnTrue });
+    expect(await dbTrue.refresh()).toBe(true);
+    expect(callsTrue[0]!.url).toBe("http://x/refresh");
+    expect(callsTrue[0]!.init.method).toBe("POST");
+    expect(callsTrue[0]!.json).toEqual({});
+
+    const { fn: fnFalse } = mockFetch({ adopted: false });
+    const dbFalse = new NidusClient({ baseUrl: "http://x", fetch: fnFalse });
+    expect(await dbFalse.refresh()).toBe(false);
+  });
+});

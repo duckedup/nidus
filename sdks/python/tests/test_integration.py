@@ -419,6 +419,25 @@ def test_the_ranking_and_annotation_surface(server: str) -> None:
         assert db.aggregate(scope=["posts"], sum=["absent"]).sums == {"absent": 0}
 
 
+def test_ready_cluster_and_refresh_against_a_real_server(server: str) -> None:
+    """Shape, not specific values: a standalone server is ready, decodes, and adopts nothing."""
+    with NidusClient(server, timeout=10.0) as db:
+        readiness = db.ready()
+        assert readiness.ready is True
+        assert readiness.role
+
+        status = db.cluster()
+        assert status.role
+        assert isinstance(status.cluster, bool)
+        assert isinstance(status.holds_writer_handle, bool)
+        assert isinstance(status.fenced, bool)
+        assert isinstance(status.commit_version, int)
+        assert isinstance(status.staleness_secs, int)
+
+        # A standalone instance has no writer lease to adopt from.
+        assert isinstance(db.refresh(), bool)
+
+
 def test_a_collection_name_with_a_slash_and_a_space_round_trips(server: str) -> None:
     """Path escaping, proven against the real router rather than against a string assertion."""
     name = "a/b c"
@@ -467,3 +486,6 @@ async def test_the_async_client_drives_the_same_server(server: str) -> None:
         stats = await db.stats()
         assert stats.dimension == 3
         assert stats.footprint.doc_count == 1
+        assert (await db.ready()).ready is True
+        assert (await db.cluster()).role
+        assert isinstance(await db.refresh(), bool)

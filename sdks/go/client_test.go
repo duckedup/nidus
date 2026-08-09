@@ -239,6 +239,14 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 		{"Ping", `{}`, http.MethodGet, "/health", func(c *Client) error {
 			return c.Ping(ctx)
 		}},
+		{"Ready", `{"ready":true,"role":"Solo","staleness_secs":0}`, http.MethodGet, "/ready", func(c *Client) error {
+			_, err := c.Ready(ctx)
+			return err
+		}},
+		{"Cluster", `{"role":"Solo","cluster":false,"holds_writer_handle":true,"fenced":false,"lease_owner":null,"commit_version":1,"staleness_secs":0,"max_staleness_secs":null}`, http.MethodGet, "/cluster", func(c *Client) error {
+			_, err := c.Cluster(ctx)
+			return err
+		}},
 		{"Stats", `{"dimension":3}`, http.MethodGet, "/stats", func(c *Client) error {
 			_, err := c.Stats(ctx)
 			return err
@@ -323,6 +331,10 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 		}},
 		{"Compact", `{"ok":true}`, http.MethodPost, "/compact", func(c *Client) error {
 			return c.Compact(ctx)
+		}},
+		{"Refresh", `{"adopted":true}`, http.MethodPost, "/refresh", func(c *Client) error {
+			_, err := c.Refresh(ctx)
+			return err
 		}},
 	}
 
@@ -1342,6 +1354,102 @@ func TestErrorClassifiers(t *testing.T) {
 	}
 	if got := (&Error{Message: "nope", Status: 400}).Error(); got != "nidus: nope (HTTP 400)" {
 		t.Errorf("Error() = %q", got)
+	}
+}
+
+// TestReadyDecodesA200 — a 200 is the ordinary case: Ready decodes the body straight
+// through and asks GET /ready.
+func TestReadyDecodesA200(t *testing.T) {
+	fake := &capture{reply: `{"ready":true,"role":"Solo","staleness_secs":5}`}
+	db := serve(t, fake)
+
+	got, err := db.Ready(context.Background())
+	if err != nil {
+		t.Fatalf("Ready failed: %v", err)
+	}
+	want := &Readiness{Ready: true, Role: "Solo", StalenessSecs: 5}
+	if *got != *want {
+		t.Errorf("Ready = %+v, want %+v", *got, *want)
+	}
+	if snap := fake.snapshot(); snap.method != http.MethodGet || snap.path != "/ready" {
+		t.Errorf("request = %s %s, want GET /ready", snap.method, snap.path)
+	}
+}
+
+// TestReadyOn503IsNotAnError is the decision this ticket fixes in place: a 503 from
+// /ready is the negative readiness answer, not a failure, so it must come back as
+// (Readiness{Ready:false}, nil) rather than making a poll loop branch on an error.
+func TestReadyOn503IsNotAnError(t *testing.T) {
+	fake := &capture{status: http.StatusServiceUnavailable, reply: `{"error":"store not open"}`}
+	db := serve(t, fake)
+
+	got, err := db.Ready(context.Background())
+	if err != nil {
+		t.Fatalf("Ready returned an error for a 503, want (Readiness, nil): %v", err)
+	}
+	want := &Readiness{Ready: false, Reason: "store not open"}
+	if *got != *want {
+		t.Errorf("Ready = %+v, want %+v", *got, *want)
+	}
+}
+
+// TestReadyOn500IsAnError — only 503 gets the special treatment; every other status
+// is still the ordinary error path, with a nil *Readiness.
+func TestReadyOn500IsAnError(t *testing.T) {
+	fake := &capture{status: http.StatusInternalServerError, reply: `{"error":"boom"}`}
+	db := serve(t, fake)
+
+	got, err := db.Ready(context.Background())
+	if got != nil {
+		t.Errorf("Ready = %+v, want nil on a 500", got)
+	}
+	var nerr *Error
+	if !errors.As(err, &nerr) {
+		t.Fatalf("error is %T, want *nidus.Error", err)
+	}
+	if nerr.Status != http.StatusInternalServerError {
+		t.Errorf("Status = %d, want 500", nerr.Status)
+	}
+}
+
+// TestClusterDecodesAllFields — LeaseOwner and MaxStalenessSecs come back nil when
+// the server sends null, since a single-instance store has neither.
+func TestClusterDecodesAllFields(t *testing.T) {
+	fake := &capture{reply: `{"role":"Solo","cluster":false,"holds_writer_handle":true,` +
+		`"fenced":false,"lease_owner":null,"commit_version":7,"staleness_secs":0,` +
+		`"max_staleness_secs":null}`}
+	db := serve(t, fake)
+
+	got, err := db.Cluster(context.Background())
+	if err != nil {
+		t.Fatalf("Cluster failed: %v", err)
+	}
+	want := &ClusterStatus{
+		Role: "Solo", Cluster: false, HoldsWriterHandle: true, Fenced: false,
+		LeaseOwner: nil, CommitVersion: 7, StalenessSecs: 0, MaxStalenessSecs: nil,
+	}
+	if *got != *want {
+		t.Errorf("Cluster = %+v, want %+v", *got, *want)
+	}
+}
+
+// TestRefreshReportsAdopted covers both outcomes: a newer manifest was picked up, or
+// this snapshot was already current.
+func TestRefreshReportsAdopted(t *testing.T) {
+	for _, adopted := range []bool{true, false} {
+		fake := &capture{reply: fmt.Sprintf(`{"adopted":%v}`, adopted)}
+		db := serve(t, fake)
+
+		got, err := db.Refresh(context.Background())
+		if err != nil {
+			t.Fatalf("Refresh failed: %v", err)
+		}
+		if got != adopted {
+			t.Errorf("Refresh = %v, want %v", got, adopted)
+		}
+		if snap := fake.snapshot(); snap.method != http.MethodPost || snap.path != "/refresh" {
+			t.Errorf("request = %s %s, want POST /refresh", snap.method, snap.path)
+		}
 	}
 }
 
