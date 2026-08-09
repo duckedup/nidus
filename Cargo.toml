@@ -9,7 +9,7 @@ default-members = ["."]
 
 [package]
 name = "nidus"
-version = "0.56.1"
+version = "0.57.0"
 edition = "2024"
 rust-version = "1.96"
 description = "A small, pure-Rust embeddable vector store: brute-force or ANN cosine search over a single append-only directory, with pluggable persistence (local files, S3, GCS). No SQL, no query engine; builds in seconds."
@@ -47,7 +47,7 @@ required-features = ["memory", "embed-all", "summarize-all"]
 # and `cargo tree -p nidus` (`just deps`) pull NOTHING beyond the four core
 # crates below, and the core build/test/Miri path stays pure and seconds-long.
 # Turning it on adds the binary-only deps (all pure Rust, zero FFI).
-cli = ["dep:clap", "dep:tokio", "dep:axum", "dep:tower", "dep:http-body", "dep:serde_json", "dep:tar", "dep:flate2"]
+cli = ["dep:clap", "dep:tokio", "dep:axum", "dep:tower", "dep:http-body", "dep:serde_json", "dep:tar", "dep:flate2", "dep:tempfile"]
 
 # ── AI ingest layer (SPEC §9 / epic nidus-54l) — all OFF by default ──────────
 # nidus widens from a tight vector store to an all-in-one "memory": text in,
@@ -188,6 +188,9 @@ serde_json = { version = "1", optional = true }
 # zlib. cli-feature-only, so the pure-`cargo add nidus` tree is untouched.
 tar = { version = "0.4", optional = true }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
+# `backup::verify`'s scratch extraction dir. cli-feature-only; kept in
+# [dev-dependencies] too so existing test-only uses need no change.
+tempfile = { version = "3", optional = true }
 
 # The MCP 2026-07-28 server surface (nidus-zm2), `mcp`-gated. Pure Rust, no FFI: 27
 # crates marginal over the existing `cli` tree of 163, ~4.3s of cold build, and the

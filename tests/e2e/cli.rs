@@ -2,10 +2,13 @@
 //! Everything here is what the parse-level tests in `src/cli/` structurally cannot see —
 //! stdout JSON shapes, stdin handling, exit codes, and the archive on disk.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use serde_json::{Value, json};
 
 /// Run the binary with `args`, feeding `stdin` and capturing both streams. `NIDUS_*` is
@@ -60,6 +63,33 @@ fn fails(args: &[&str], stdin: &str) -> String {
     );
     assert!(stdout.trim().is_empty(), "wrote to stdout: {stdout}");
     String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// Flip one byte of `path` at `offset`, in place. Used to corrupt an archive at a
+/// chosen position rather than a random one, so a failing assertion reproduces.
+fn flip_byte(path: &str, offset: usize) {
+    let mut bytes = std::fs::read(path).unwrap();
+    assert!(offset < bytes.len(), "offset {offset} out of range");
+    bytes[offset] ^= 0xFF;
+    std::fs::write(path, &bytes).unwrap();
+}
+
+/// Flip one byte of the first tar entry's content, then re-gzip losslessly. Every
+/// structural layer stays valid, so only the CRC baseline can catch it (#152).
+fn corrupt_first_entry_content(archive: &str, content_offset: usize) {
+    let mut tar_bytes = Vec::new();
+    GzDecoder::new(&std::fs::File::open(archive).unwrap())
+        .read_to_end(&mut tar_bytes)
+        .unwrap();
+    let offset = 512 + content_offset;
+    assert!(offset < tar_bytes.len(), "content offset out of range");
+    tar_bytes[offset] ^= 0xFF;
+
+    let mut regzipped = Vec::new();
+    let mut enc = GzEncoder::new(&mut regzipped, Compression::default());
+    enc.write_all(&tar_bytes).unwrap();
+    enc.finish().unwrap();
+    std::fs::write(archive, regzipped).unwrap();
 }
 
 /// The ids of a `Vec<HitDto>` / `Vec<Record>` response, in the order printed.
@@ -388,6 +418,180 @@ fn backup_and_restore_round_trip_through_the_binary() {
     // `--yes` is the scripted path, and it goes through.
     let report = ok(&["restore", "-i", archive, "--dir", dst, "--yes"], "");
     assert_eq!(report["records"], 3, "{report}");
+}
+
+/// A byte flipped in the compressed body must fail `verify` and name the corruption,
+/// and a byte flipped in either edge case (gzip trailer, tar's zero padding) must fail
+/// too, since #152 showed a corrupted archive can otherwise restore looking clean.
+#[test]
+fn verify_accepts_a_good_archive_and_rejects_a_corrupted_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    let src = src.to_str().expect("utf-8 temp path");
+    ok(&["create", "--dir", src, "--dim", "3", "docs"], "");
+    ok(&["upsert", "--dir", src, "docs"], &seed());
+
+    let archive = tmp.path().join("snapshot.tar.gz");
+    let archive = archive.to_str().expect("utf-8 temp path");
+    ok(&["backup", "--dir", src, "-o", archive], "");
+
+    let report = ok(&["verify", "-i", archive], "");
+    assert_eq!(report["dimension"], 3, "{report}");
+    assert_eq!(report["collections"], json!(["docs"]), "{report}");
+    assert_eq!(report["records"], 3, "{report}");
+    assert!(
+        report["objects_checked"].as_u64().unwrap_or(0) > 0,
+        "{report}"
+    );
+
+    // Corrupted vector content that every structural layer still accepts: only the
+    // CRC baseline can catch it, so the message must name the object and its crc32.
+    corrupt_first_entry_content(archive, 70);
+    let err = fails(&["verify", "-i", archive], "");
+    assert!(
+        err.contains("data") && err.contains("crc32"),
+        "should name the corrupted object: {err}"
+    );
+
+    // A raw flip breaks a structural layer instead. The message varies by which one,
+    // so assert only that it fails loudly rather than pinning tar/gzip wording.
+    ok(&["backup", "--dir", src, "-o", archive], "");
+    let len = std::fs::metadata(archive).unwrap().len() as usize;
+    assert!(len > 100, "archive too small to pick a body offset");
+    flip_byte(archive, len / 4);
+    assert!(!fails(&["verify", "-i", archive], "").is_empty());
+}
+
+/// The #152 regression: gzip's trailer CRC is never reached and tar checksums only
+/// headers, so a payload-content flip restores with exit 0 and a correct-looking
+/// report (measured 114/204 single-bit flips). Must fail pre-fix, or it proves nothing.
+#[test]
+fn restore_rejects_a_corrupted_archive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    let src = src.to_str().expect("utf-8 temp path");
+    ok(&["create", "--dir", src, "--dim", "3", "docs"], "");
+    ok(&["upsert", "--dir", src, "docs"], &seed());
+
+    let archive = tmp.path().join("snapshot.tar.gz");
+    let archive = archive.to_str().expect("utf-8 temp path");
+    ok(&["backup", "--dir", src, "-o", archive], "");
+
+    // `data`'s content starts right after its 512-byte tar header; offset 70 lands
+    // past the segment's own 64-byte header, inside real vector bytes (#152's example).
+    corrupt_first_entry_content(archive, 70);
+
+    let dst = tmp.path().join("dst");
+    std::fs::create_dir(&dst).unwrap();
+    let dst = dst.to_str().expect("utf-8 temp path");
+    fails(&["restore", "-i", archive, "--dir", dst, "--yes"], "");
+
+    // Left unusable-or-absent: either no readable store at all, or one that itself
+    // fails `stats` — never a silently-wrong-but-successful-looking store.
+    let stats = run(&["stats", "--dir", dst], "");
+    assert!(
+        !stats.status.success(),
+        "a corrupted restore must not leave a usable store: {:?}",
+        String::from_utf8_lossy(&stats.stdout)
+    );
+}
+
+/// Chopping the gzip trailer is a different failure mode than body corruption
+/// (#138) — cover it separately so one fix cannot regress the other silently.
+#[test]
+fn verify_rejects_a_truncated_archive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    let src = src.to_str().expect("utf-8 temp path");
+    ok(&["create", "--dir", src, "--dim", "3", "docs"], "");
+    ok(&["upsert", "--dir", src, "docs"], &seed());
+
+    let archive = tmp.path().join("snapshot.tar.gz");
+    let archive = archive.to_str().expect("utf-8 temp path");
+    ok(&["backup", "--dir", src, "-o", archive], "");
+
+    let mut bytes = std::fs::read(archive).unwrap();
+    assert!(bytes.len() > 8, "archive too small to truncate");
+    bytes.truncate(bytes.len() - 8);
+    std::fs::write(archive, &bytes).unwrap();
+
+    fails(&["verify", "-i", archive], "");
+}
+
+/// `backup --verify` on the happy path must still print a `BackupReport`, not switch
+/// its output shape to a verify report just because the flag was passed.
+#[test]
+fn backup_verify_flag_round_trips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    let src = src.to_str().expect("utf-8 temp path");
+    ok(&["create", "--dir", src, "--dim", "3", "docs"], "");
+    ok(&["upsert", "--dir", src, "docs"], &seed());
+
+    let archive = tmp.path().join("snapshot.tar.gz");
+    let archive = archive.to_str().expect("utf-8 temp path");
+    let report = ok(&["backup", "--dir", src, "-o", archive, "--verify"], "");
+    assert_eq!(report["backup"], archive, "still a BackupReport: {report}");
+    assert_eq!(report["dimension"], 3, "{report}");
+    assert!(
+        report["archive_bytes"].as_u64().unwrap_or(0) > 0,
+        "{report}"
+    );
+}
+
+/// #130's regression class was a sealed segment silently dropped from a backup;
+/// `verify` must actually open a segmented store, not just a single-segment one.
+#[test]
+fn verify_accepts_a_segmented_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    let src = src.to_str().expect("utf-8 temp path");
+    ok(
+        &[
+            "create",
+            "--dir",
+            src,
+            "--dim",
+            "3",
+            "--segment-max-rows",
+            "2",
+            "docs",
+        ],
+        "",
+    );
+    // A seal is only checked at the *start* of the next append (`maybe_seal`), so it
+    // takes two calls past the threshold, not one call of 3 rows, to freeze a segment.
+    let two = json!([
+        {"id": "a", "vector": [1, 0, 0], "attrs": {}},
+        {"id": "b", "vector": [0, 1, 0], "attrs": {}},
+    ])
+    .to_string();
+    let one = json!([{"id": "c", "vector": [0, 0, 1], "attrs": {}}]).to_string();
+    ok(
+        &["upsert", "--dir", src, "--segment-max-rows", "2", "docs"],
+        &two,
+    );
+    ok(
+        &["upsert", "--dir", src, "--segment-max-rows", "2", "docs"],
+        &one,
+    );
+
+    let archive = tmp.path().join("snapshot.tar.gz");
+    let archive = archive.to_str().expect("utf-8 temp path");
+    let backup_report = ok(&["backup", "--dir", src, "-o", archive], "");
+    assert!(
+        backup_report["segments"].as_u64().unwrap_or(0) > 0,
+        "expected at least one sealed segment: {backup_report}"
+    );
+
+    let report = ok(&["verify", "-i", archive], "");
+    assert_eq!(report["records"], 3, "{report}");
+    assert_eq!(report["collections"], json!(["docs"]), "{report}");
 }
 
 // ── `nidus remember` / `nidus recall` (#134) ────────────────────────────────
