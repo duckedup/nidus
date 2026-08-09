@@ -68,9 +68,8 @@ fn serve_without_dim_or_embedder_still_fails() {
 }
 
 /// The inference is gated on there being no store yet, not merely on `--dim` being
-/// absent. An existing store keeps the dimension in its own header even when a
-/// differently-sized embedder is configured — copying `cli/memory.rs::open_with`
-/// verbatim would override it here and break every raw vector endpoint.
+/// absent. Copying `cli/memory.rs::open_with` verbatim would override the header here
+/// and break every raw vector endpoint.
 #[test]
 fn an_existing_store_keeps_its_own_dimension_over_the_embedder() {
     let tmp = tempfile::tempdir().unwrap();
