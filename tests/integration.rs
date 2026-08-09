@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 
 use nidus::{
     AggregateOpts, AnnConfig, Config, Decay, Distance, Filter, FtsClause, FtsField, FtsQuery,
-    HighlightOpts, LimitPer, ListOpts, Nidus, OpenMode, OrderBy, Predicate, Quantization, RankBy,
-    Record, Scope, SearchOpts, Value,
+    HighlightOpts, LimitPer, ListOpts, META_EXPIRES_AT, Nidus, OpenMode, OrderBy, Predicate,
+    Quantization, RankBy, Record, Scope, SearchOpts, Value,
 };
 
 fn rec(id: &str, vector: Vec<f32>, kind: &str) -> Record {
@@ -766,4 +766,75 @@ fn ranking_and_aggregation_survive_a_reopen() {
         .unwrap();
     assert_eq!(stats.count, 2);
     assert_eq!(stats.sums["bytes"], Value::Int(42));
+}
+
+// ── sweep_expired (nidus-140) ─────────────────────────────────────────────────
+
+fn rec_ttl(id: &str, expires_at: Option<i64>) -> Record {
+    let mut attrs = BTreeMap::new();
+    if let Some(exp) = expires_at {
+        attrs.insert(META_EXPIRES_AT.to_string(), Value::DateTime(exp));
+    }
+    Record::new(id, vec![1.0, 0.0, 0.0], attrs)
+}
+
+#[cfg_attr(miri, ignore)] // upsert fsyncs
+#[test]
+fn sweep_expired_deletes_only_past_entries_across_collections() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Nidus::open(Config::new(dir.path(), 3)).unwrap();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let past = now_ms - 3_600_000;
+    let future = now_ms + 3_600_000;
+
+    for c in ["c1", "c2"] {
+        db.create_collection(c).unwrap();
+        db.upsert(
+            c,
+            &[
+                rec_ttl("past", Some(past)),
+                rec_ttl("future", Some(future)),
+                rec_ttl("none", None),
+            ],
+        )
+        .unwrap();
+    }
+
+    let swept = db.sweep_expired().unwrap();
+    assert_eq!(swept, 2);
+
+    for c in ["c1", "c2"] {
+        let ids: Vec<String> = db.get_all(c).into_iter().map(|r| r.id).collect();
+        assert!(!ids.contains(&"past".to_string()), "{c}: past survived");
+        assert!(ids.contains(&"future".to_string()), "{c}: future missing");
+        assert!(ids.contains(&"none".to_string()), "{c}: none missing");
+    }
+
+    assert_eq!(db.footprint().dead_rows, 0);
+}
+
+#[cfg_attr(miri, ignore)] // upsert fsyncs
+#[test]
+fn sweep_expired_no_op_when_nothing_expired() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Nidus::open(Config::new(dir.path(), 3)).unwrap();
+    db.create_collection("c").unwrap();
+    let future = i64::MAX / 2;
+    db.upsert(
+        "c",
+        &[rec_ttl("future", Some(future)), rec_ttl("none", None)],
+    )
+    .unwrap();
+
+    let before = db.footprint();
+    let swept = db.sweep_expired().unwrap();
+    assert_eq!(swept, 0);
+    let after = db.footprint();
+    assert_eq!(before.rows, after.rows);
+    assert_eq!(before.dead_rows, after.dead_rows);
+    assert_eq!(before.doc_count, after.doc_count);
 }

@@ -25,6 +25,11 @@ claude mcp add nidus -- nidus mcp --dir ~/.nidus --dim 1024 \
   --embed-provider voyage --embed-model voyage-3
 ```
 
+`--dim` is optional here as long as `~/.nidus` does not exist yet: with an
+embedder configured, nidus reads the dimension from it instead. Point the same
+command at a store that already exists and the on-disk header wins regardless,
+so a `--dim` that disagrees with it is still a hard error.
+
 A stdio session opens the store and **holds the writer lock for its lifetime**.
 There is no listener standing by to keep answering while a second client waits,
 so another `nidus mcp` (or `nidus serve`) pointed at the same directory fails
@@ -52,6 +57,10 @@ nidus serve --dir ./store --dim 1024 \
   --embed-provider voyage --embed-model voyage-3 \
   --token "$NIDUS_TOKEN"
 ```
+
+As with `nidus mcp`, `--dim` here is only needed if `./store` does not already
+exist and no embedder is configured; with `--embed-provider` set, a not-yet-created
+store infers its dimension from the embedder instead.
 
 Then register it with your client. For anything that reads the standard MCP
 config shape:

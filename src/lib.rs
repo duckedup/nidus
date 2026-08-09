@@ -40,6 +40,9 @@ mod index_cache;
 mod lock;
 mod log;
 mod manifest;
+// Metadata keys and clock helpers needed ungated (outside the `memory` feature),
+// e.g. by `Nidus::sweep_expired` (nidus-140).
+mod meta;
 // Process-wide counters, rendered as Prometheus text by `GET /metrics` and readable
 // in-process by an embedding application (nidus-abx.4).
 pub mod metrics;
@@ -77,8 +80,8 @@ pub mod summarize;
 mod memory;
 #[cfg(feature = "memory")]
 pub use memory::{
-    META_CREATED_AT, META_DIM, META_EMBEDDER, META_EXPIRES_AT, META_TEXT, META_UPDATED_AT, Memory,
-    RecallOpts, RememberMode, RememberOpts, Remembered,
+    META_CREATED_AT, META_DIM, META_EMBEDDER, META_TEXT, META_UPDATED_AT, Memory, RecallOpts,
+    RememberMode, RememberOpts, Remembered,
 };
 // The summarize-mode attr keys are only defined when summaries can be produced.
 #[cfg(all(feature = "memory", feature = "summarize"))]
@@ -93,6 +96,7 @@ pub use backend::{
 pub use cancel::Cancel;
 pub use config::{Config, Fsync, LeaseWait, OpenMode};
 pub use fts::{Analyzer, FtsField, Language};
+pub use meta::META_EXPIRES_AT;
 pub use model::{
     AggregateOpts, Aggregation, AnnConfig, AnnKind, ClusterStatus, Decay, Distance, Filter,
     Footprint, FtsClause, FtsCombine, FtsQuery, Group, Hit, HybridOpts, LimitPer, ListOpts,
@@ -389,6 +393,26 @@ impl Nidus {
     /// Reclaim dead rows and superseded log records.
     pub fn compact(&mut self) -> Result<()> {
         self.store.compact()
+    }
+
+    /// Delete every entry whose `nidus.expires_at` has passed, then reclaim the rows.
+    /// Read-time expiry is unchanged; this is the deliberate, caller-triggered reclaim.
+    pub fn sweep_expired(&mut self) -> Result<usize> {
+        let now = meta::now_ms();
+        // Bare `Le`, not `not_expired_predicate`'s `Not(Le)`: an absent `expires_at`
+        // must not match, or entries that never had a TTL would be deleted.
+        let filter = Filter(vec![Predicate::Le(
+            META_EXPIRES_AT.to_string(),
+            Value::DateTime(now),
+        )]);
+        let mut swept = 0;
+        for collection in self.collections() {
+            swept += self.delete_where(&collection, &filter)?;
+        }
+        if swept > 0 {
+            self.compact()?;
+        }
+        Ok(swept)
     }
 
     /// Adopt a separate writer's newer committed state into a lock-free `ReadOnly` handle without

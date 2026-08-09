@@ -1,12 +1,12 @@
 //! Text-native memory API (epic nidus-54l, tickets .4 + .10).
 
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 
 use crate::embed::{AnyEmbedder, Embedder, embedder_identity};
-use crate::{Filter, FtsField, Hit, Nidus, Predicate, Record, SearchOpts, Value};
+use crate::meta::now_ms;
+use crate::{Filter, FtsField, Hit, META_EXPIRES_AT, Nidus, Predicate, Record, SearchOpts, Value};
 
 #[cfg(feature = "summarize")]
 use crate::summarize::{AnySummarizer, SummarizeOpts, Summarizer};
@@ -33,9 +33,6 @@ pub const META_TEXT: &str = "nidus.text";
 pub const META_CREATED_AT: &str = "nidus.created_at";
 /// Attr key holding the `Value::DateTime` (UTC epoch ms) an entry was last written.
 pub const META_UPDATED_AT: &str = "nidus.updated_at";
-/// Attr key holding the `Value::DateTime` (UTC epoch ms) after which an entry is
-/// expired. Absent means the entry never expires.
-pub const META_EXPIRES_AT: &str = "nidus.expires_at";
 
 /// Default `top_k` used by [`recall`](Memory::recall) when [`RecallOpts::top_k`]
 /// is left at its `0` default.
@@ -207,14 +204,6 @@ impl Memory {
 /// remembered text, all-default tuning (English analyzer, `k1=1.2`, `b=0.75`).
 pub(crate) fn default_fts_fields() -> Vec<FtsField> {
     vec![FtsField::new(META_TEXT)]
-}
-
-/// The current time as `Value::DateTime`'s representation: UTC epoch milliseconds.
-pub(crate) fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// Drop caller-supplied recency keys before stamping. `created_at`/`updated_at` would be

@@ -151,6 +151,7 @@ nidus collections --dir ./store
 nidus get        --dir ./store docs
 nidus stats      --dir ./store
 nidus compact    --dir ./store
+nidus compact    --dir ./store --expired  # delete lapsed entries, then reclaim rows
 nidus delete     --dir ./store docs a b
 
 # Snapshot the whole store to one portable .tar.gz, and restore it
@@ -161,6 +162,14 @@ nidus restore    --in ./store.tar.gz --dir ./restored
 Read-only commands (`search`, `list`, `get`, `collections`, `stats`, and
 `backup`) open the store without taking the writer lock, so they can run
 alongside a writer such as a running server.
+
+`compact --expired` deletes every entry across the store whose `nidus.expires_at`
+has passed, then reclaims the rows those deletes freed, in one call: the manual
+"filter by timestamp, delete, then compact" sequence in one step. It is a plain
+write command like `compact` and `delete`: it opens the store read-write and blocks
+on the writer lock if a server already holds it, so against a running server the
+equivalent is `POST /compact {"expired": true}` (see [HTTP
+API](/reference/http-api/#post-compact)).
 
 ## Approximate search (ANN)
 
@@ -502,6 +511,13 @@ JSON:
 # --dim is only needed if the store doesn't exist yet; otherwise it's inferred.
 nidus serve --dir ./store --dim 768 --addr 127.0.0.1:7700
 ```
+
+Started with `--embed-provider` instead, `--dim` drops from required to optional for
+a store directory that does not exist yet: the embedder has its own dimension, so
+nidus reads it from there. This is a narrower rule than the general one above, and
+only covers the not-yet-created case: point either form at a store that already
+exists and the on-disk header wins, so passing a `--dim` that disagrees with it is
+still a hard error.
 
 The complete network workflow, authentication, and request limits are on the
 [HTTP server](/guides/http-server/) page; the endpoint-by-endpoint reference is the
