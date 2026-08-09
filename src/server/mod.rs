@@ -1520,10 +1520,9 @@ mod tests {
         assert_eq!(stats["footprint"]["doc_count"], 2);
     }
 
-    /// A bodyless `POST /compact` — the shape every shipped SDK and the documented curl
-    /// example send — must keep reclaiming dead rows, not be rejected for lacking a body
-    /// (nidus-140). Asserts the `dead_rows` delta, not just the envelope: an envelope-only
-    /// check would pass against a handler that silently does nothing.
+    /// A bodyless `POST /compact` — what every shipped SDK and the documented curl send —
+    /// must still reclaim. Asserts the `dead_rows` delta, since an envelope-only check
+    /// would pass against a handler that does nothing.
     #[tokio::test]
     async fn compact_with_no_body_still_reclaims_dead_rows() {
         let app = test_router(3);
