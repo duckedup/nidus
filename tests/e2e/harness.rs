@@ -52,7 +52,9 @@ impl Server {
     }
 
     /// A server with no `--dim` at all, so the flag cannot be what resolves the
-    /// dimension. Only the #139 inference tests want this.
+    /// dimension. Gated to match `serve_dim`, its only caller, or plain `--features cli`
+    /// sees dead code.
+    #[cfg(all(feature = "mcp", feature = "embed-ollama"))]
     pub fn without_dim(dir: impl Into<std::path::PathBuf>) -> Self {
         Server {
             dir: dir.into(),
