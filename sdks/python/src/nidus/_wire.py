@@ -68,6 +68,7 @@ from .types import (
     OrderBy,
     Record,
     RecordInput,
+    RememberResult,
     Stats,
 )
 from .values import AttrInput, Value, decode_attrs, decode_value, encode_attrs
@@ -426,11 +427,15 @@ def remember_body(
     text: str,
     mode: Optional[str] = None,
     attrs: Optional[Mapping[str, AttrInput]] = None,
+    ttl_seconds: Optional[int] = None,
+    dedupe_threshold: Optional[float] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /collections/{name}/remember`` (text in, server embeds).
 
     ``attrs`` *is* pruned when unset here — unlike a record's, the server declares this
-    one ``#[serde(default)]``, so omitting it is well-defined.
+    one ``#[serde(default)]``, so omitting it is well-defined. The two knobs prune the
+    same way, and only on ``None``: a zero is a real request for both (see
+    :meth:`~nidus.NidusClient.remember`), not a way of asking for the default.
     """
     return prune(
         {
@@ -438,6 +443,8 @@ def remember_body(
             "text": text,
             "mode": mode,
             "attrs": encode_attrs(attrs) if attrs is not None else None,
+            "ttl_seconds": ttl_seconds,
+            "dedupe_threshold": dedupe_threshold,
         }
     )
 
@@ -655,6 +662,20 @@ def decode_upserted(payload: Any) -> int:
 def decode_deleted(payload: Any) -> int:
     """The count from either delete form's response."""
     return _count(payload, "deleted")
+
+
+def decode_remember(payload: Any, requested_id: str) -> RememberResult:
+    """A remember response, with the id the write actually landed on.
+
+    ``requested_id`` stands in when the server echoes none — that is a server predating
+    the echoed fields, and reporting ``""`` there would misname the record it did write.
+    """
+    body = payload or {}
+    return RememberResult(
+        id=str(body.get("id", requested_id)),
+        upserted=_count(body, "upserted"),
+        deduped=bool(body.get("deduped", False)),
+    )
 
 
 def extract_error(text: str, status: int) -> str:

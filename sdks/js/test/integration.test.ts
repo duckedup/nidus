@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { NidusClient, f, v } from "../src/index.js";
+import { NidusClient, NidusError, f, v } from "../src/index.js";
 
 // End-to-end against a real `nidus serve`. Mirrors the server's own
 // `full_lifecycle_over_http` test, but driven entirely through the SDK.
@@ -198,5 +198,22 @@ describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
     expect(await db.delete("docs", { ids: ["b"] })).toBe(1);
     const remaining = await db.records("docs");
     expect(remaining.map((r) => r.id)).toEqual(["a"]);
+  });
+
+  // 404 when the binary lacks the `memory` feature (what `just build-cli` builds, so
+  // the usual case here), 400 when the routes exist but no `--embed-provider` was
+  // given. Either way the new options travel and the call fails visibly, with a status.
+  it("fails visibly with a status when the server has no embedder", async () => {
+    const err = (await db
+      .remember("notes", "a", "the quick brown fox", {
+        ttlSeconds: 3600,
+        dedupeThreshold: 0.95,
+      })
+      .then(
+        () => null,
+        (e) => e,
+      )) as NidusError;
+    expect(err).toBeInstanceOf(NidusError);
+    expect([400, 404]).toContain(err.status);
   });
 });

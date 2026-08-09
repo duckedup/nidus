@@ -276,23 +276,35 @@ and upserts; `Recall` embeds the query and vector-searches.
 
 ```go
 // Embed "the quick brown fox" and store it under id "a"
-err := db.Remember(ctx, "notes", "a", "the quick brown fox",
+out, err := db.Remember(ctx, "notes", "a", "the quick brown fox",
     nidus.RememberOptions{Attrs: nidus.Attrs{"tag": nidus.Str("x")}})
 
 // Summarize first, then embed the summary (the server also needs
 // --summarize-provider). The stored record additionally carries nidus.summary
 // attr; the raw text is always stored under nidus.text.
-err = db.Remember(ctx, "notes", "b", longArticle,
+out, err = db.Remember(ctx, "notes", "b", longArticle,
     nidus.RememberOptions{Mode: "summarize"})
 
+// Expire in an hour, and fold this write onto any entry it is >=0.95 similar to
+// rather than storing a competing near-duplicate. out.ID is the record that
+// actually changed — the match's id, not "c", whenever out.Deduped is true.
+ttl, floor := int64(3600), float32(0.95)
+out, err = db.Remember(ctx, "notes", "c", "the quick brown fox",
+    nidus.RememberOptions{TTLSeconds: &ttl, DedupeThreshold: &floor})
+
 // Embed the query text and search, best-first
-floor := float32(0.2)
 hits, err := db.Recall(ctx, "notes", "quick fox", nidus.RecallOptions{
     TopK:     5,
     MinScore: &floor,
     Filter:   nidus.And(nidus.Eq("tag", "x")),
 })
 ```
+
+Both knobs are pointers because zero means something in each: a `TTLSeconds` of `0`
+expires the entry immediately, and a `DedupeThreshold` of `0` matches *any* entry rather
+than disabling dedupe. Dedupe is a vector search server-side, so it needs the same
+embedder `Remember` does, and an already-expired entry is never a candidate — a lapsed
+TTL cannot be revived by a later near-duplicate.
 
 Two different failures are worth telling apart when these do not work:
 

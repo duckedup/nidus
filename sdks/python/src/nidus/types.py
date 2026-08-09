@@ -204,6 +204,20 @@ class Stats:
     footprint: Footprint
 
 
+@dataclass(frozen=True)
+class RememberResult:
+    """What a :meth:`~nidus.NidusClient.remember` actually wrote.
+
+    ``id`` is the record that changed, which is *not* the requested id when ``deduped``: a
+    ``dedupe_threshold`` match redirects the write onto the entry it matched, so this is
+    the only way to learn which memory now holds the text.
+    """
+
+    id: str
+    upserted: int
+    deduped: bool
+
+
 class _RecordRequired(TypedDict):
     """The one field every record must carry (split out so the rest can be optional)."""
 

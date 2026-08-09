@@ -477,22 +477,55 @@ type BatchFuse struct {
 // Mode is "raw" (embed the text as given, the default) or "summarize" (summarize
 // first, embed the summary, and stamp a nidus.summary attr — which needs
 // a server started with a summarizer). The raw text is always stored under nidus.text. Attrs is metadata stamped on the record.
+//
+// TTLSeconds and DedupeThreshold are pointers for the usual reason (see the package
+// comment): zero is meaningful in both — a TTL of 0 expires the entry immediately, and a
+// dedupe floor of 0 matches any entry at all rather than disabling dedupe.
 type RememberOptions struct {
 	Mode  string
 	Attrs Attrs
+
+	// TTLSeconds is how long this memory lives, counted from the write. Nil never expires.
+	TTLSeconds *int64
+
+	// DedupeThreshold is a cosine floor above which this write updates the nearest existing
+	// entry instead of inserting a competing near-duplicate; nil disables dedupe. It is a
+	// vector search server-side, so it needs the embedder Remember does, and an expired
+	// entry is never a candidate — a lapsed TTL cannot be revived by a near-duplicate.
+	DedupeThreshold *float32
 }
 
 type rememberWire struct {
-	ID    string `json:"id"`
-	Text  string `json:"text"`
-	Mode  string `json:"mode,omitempty"`
-	Attrs Attrs  `json:"attrs,omitempty"`
+	ID              string   `json:"id"`
+	Text            string   `json:"text"`
+	Mode            string   `json:"mode,omitempty"`
+	Attrs           Attrs    `json:"attrs,omitempty"`
+	TTLSeconds      *int64   `json:"ttl_seconds,omitempty"`
+	DedupeThreshold *float32 `json:"dedupe_threshold,omitempty"`
 }
 
 // wire takes id and text because they are arguments of the Remember call rather
-// than options — the server wants all four in one body.
+// than options — the server wants all of them in one body.
 func (o RememberOptions) wire(id, text string) rememberWire {
-	return rememberWire{ID: id, Text: text, Mode: o.Mode, Attrs: o.Attrs}
+	return rememberWire{
+		ID:              id,
+		Text:            text,
+		Mode:            o.Mode,
+		Attrs:           o.Attrs,
+		TTLSeconds:      o.TTLSeconds,
+		DedupeThreshold: o.DedupeThreshold,
+	}
+}
+
+// A RememberResult reports what a [Client.Remember] actually wrote.
+//
+// ID is the record that changed, which is not the requested id when Deduped: a
+// DedupeThreshold match redirects the write onto the entry it matched, so this is the
+// only way to learn which memory now holds the text.
+type RememberResult struct {
+	ID       string `json:"id"`
+	Upserted int    `json:"upserted"`
+	Deduped  bool   `json:"deduped"`
 }
 
 // RecallOptions tunes a recall: the server embeds the query text and vector-searches

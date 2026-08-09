@@ -47,6 +47,7 @@ from .types import (
     OrderBy,
     Record,
     RecordInput,
+    RememberResult,
     Stats,
 )
 from .values import AttrInput
@@ -384,10 +385,23 @@ class AsyncNidusClient:
         *,
         mode: Optional[str] = None,
         attrs: Optional[Mapping[str, AttrInput]] = None,
-    ) -> None:
-        """Embed ``text`` and upsert it under ``id`` (idempotent on ``id``)."""
-        await self._request(
-            "POST", _wire.remember_path(collection), _wire.remember_body(id, text, mode, attrs)
+        ttl_seconds: Optional[int] = None,
+        dedupe_threshold: Optional[float] = None,
+    ) -> RememberResult:
+        """Embed ``text`` and upsert it under ``id`` (idempotent on ``id``).
+
+        ``ttl_seconds`` expires the memory that long after the write. ``dedupe_threshold``
+        folds it onto a near-duplicate above that cosine floor instead — which needs the
+        server's embedder, never matches an expired entry, and makes the returned ``id``
+        the entry written rather than the one asked for. See the sync twin for the detail.
+        """
+        return _wire.decode_remember(
+            await self._request(
+                "POST",
+                _wire.remember_path(collection),
+                _wire.remember_body(id, text, mode, attrs, ttl_seconds, dedupe_threshold),
+            ),
+            id,
         )
 
     async def recall(

@@ -426,12 +426,22 @@ func (c *Client) Aggregate(ctx context.Context, req AggregateRequest) (*Aggregat
 // With opts.Mode == "summarize" the server summarizes first, embeds the summary, and
 // stamps a nidus.summary attr; the raw text is always stored under nidus.text, so a
 // recall stays explainable back to it — that path needs a server started with a summarizer.
+//
+// The result names the record that actually changed: with opts.DedupeThreshold set, a
+// near-duplicate match redirects the write onto the matched entry, so RememberResult.ID
+// is not always the id passed in.
 func (c *Client) Remember(
 	ctx context.Context, collection, id, text string, opts RememberOptions,
-) error {
-	return c.request(
-		ctx, http.MethodPost, collPath(collection, "/remember"), opts.wire(id, text), nil,
-	)
+) (RememberResult, error) {
+	// Seeded with the requested id so a server predating the echoed fields — which
+	// answers {ok, upserted} — reports the record it did write, not "".
+	out := RememberResult{ID: id}
+	if err := c.request(
+		ctx, http.MethodPost, collPath(collection, "/remember"), opts.wire(id, text), &out,
+	); err != nil {
+		return RememberResult{}, err
+	}
+	return out, nil
 }
 
 // Recall embeds query server-side and vector-searches the collection, best-first.

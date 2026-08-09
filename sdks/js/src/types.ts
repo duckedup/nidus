@@ -444,6 +444,27 @@ export interface RememberOptions {
   mode?: "raw" | "summarize";
   /** Typed metadata to stamp on the stored record (plain JS values auto-normalized). */
   attrs?: Record<string, AttrInput>;
+  /** Seconds until this memory expires, counted from the write. Omit to never expire. */
+  ttlSeconds?: number;
+  /**
+   * Cosine-similarity floor above which this write updates the nearest existing entry
+   * instead of inserting a competing near-duplicate. Omit to disable (a plain upsert by
+   * `id`). Needs a server with an embedder; an expired entry is never a candidate.
+   */
+  dedupeThreshold?: number;
+}
+
+/** What {@link NidusClient.remember} resolves to. */
+export interface RememberResult {
+  /**
+   * The id actually written. Equal to the requested id unless `deduped` — a dedupe match
+   * redirects the write onto the entry it matched.
+   */
+  id: string;
+  /** How many records the write touched. */
+  upserted: number;
+  /** Whether `dedupeThreshold` matched an existing entry and redirected the write. */
+  deduped: boolean;
 }
 
 /** Options for {@link NidusClient.recall} (embed the query text, then vector-search). */

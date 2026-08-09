@@ -237,6 +237,19 @@ def test_a_server_error_arrives_as_a_nidus_error(server: str) -> None:
         assert caught.value.message
 
 
+def test_remember_with_ttl_and_dedupe_fails_visibly_without_an_embedder(server: str) -> None:
+    """404 when the binary lacks the ``memory`` feature (what ``just build-cli`` builds, so
+    the usual case here), 400 when the routes exist but no ``--embed-provider`` was given.
+    Either way the two knobs reach the wire and the call fails with a status, not silently.
+    """
+    with NidusClient(server, timeout=10.0) as db:
+        with pytest.raises(NidusError) as caught:
+            db.remember(
+                "notes", "a", "the quick brown fox", ttl_seconds=3600, dedupe_threshold=0.95
+            )
+        assert caught.value.status in (400, 404)
+
+
 def test_the_guarded_slips_never_reach_the_server(server: str) -> None:
     """The data-loss cases, against the real server that used to accept them.
 

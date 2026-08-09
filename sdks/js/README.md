@@ -227,6 +227,13 @@ await db.remember("notes", "a", "the quick brown fox", { attrs: { tag: "x" } });
 // always stored under `nidus.text`.
 await db.remember("notes", "b", longArticle, { mode: "summarize" });
 
+// Expire in an hour, and fold this write onto any entry it is ≥0.95 similar to rather
+// than storing a competing near-duplicate.
+const { id, deduped } = await db.remember("notes", "c", "the quick brown fox", {
+  ttlSeconds: 3600,
+  dedupeThreshold: 0.95,
+});
+
 // Embed the query text and search, best-first (attrs decoded to plain JS values)
 const hits = await db.recall("notes", "quick fox", {
   topK: 5,
@@ -235,9 +242,16 @@ const hits = await db.recall("notes", "quick fox", {
 });
 ```
 
+`remember` resolves to `{ id, upserted, deduped }`. Read `id` from it rather than
+assuming the one you passed: a `dedupeThreshold` match redirects the write onto the
+entry it matched, and that entry's id is the one that changed. An already-expired
+entry is never a dedupe candidate, so a TTL that has run out cannot be revived by a
+later near-duplicate.
+
 Both throw a `NidusError` with status `400` if the server has no embedder configured
 (the message names `--embed-provider`); `mode: "summarize"` without a summarizer is
-likewise a `400`.
+likewise a `400`. Dedupe needs that same embedder — it is a vector search under the
+hood.
 
 ## Everything else
 

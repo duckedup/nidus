@@ -46,6 +46,7 @@ from nidus import (
     OrderBy,
     Record,
     RecordInput,
+    RememberResult,
     Stats,
 )
 
@@ -59,6 +60,7 @@ PUBLIC_SHAPES = [
     Stats,
     Aggregation,
     Annotations,
+    RememberResult,
     LegScore,
     ClauseScore,
     Highlight,
