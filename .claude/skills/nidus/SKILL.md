@@ -207,24 +207,33 @@ You become the **coordinator**: the developer's only screen. You hand tickets ou
 from colliding, relay the gates, and report. You do not implement and you do not review other
 people's PRs into existence — you dispatch, sequence, unblock.
 
-Three tiers, and the distinction is what each one is allowed to assume:
+**Peers are other Claude sessions, one per working directory. Do not spawn agents to own
+tickets.** This was tested: a spawned agent has **no `Workflow` tool at all** — measured
+directly, `ToolSearch select:Workflow` returns nothing, while a full session has it loaded up
+front. So a spawned agent cannot run `implement.workflow.js` *or* `spec.workflow.js`; it
+cannot fan out and it cannot research. It also cannot reach the developer, so every gate has
+to be relayed through you, and `isolation: "worktree"` reclaims its worktree the moment it
+stops with no files written — which is exactly what the gate protocol asks it to do. A peer
+session has none of these problems.
 
-| Tier | Model | Lifetime | Owns |
-|---|---|---|---|
-| **coordinator** | opus | the session | the queue, the roster, the gates, the developer's attention |
-| **owner** | opus | **one ticket** | spec → blueprints → fan-out → merge → verify → review → fix → PR |
-| **worker** | sonnet | one blueprint | one slice of one ticket, in its own worktree |
+| | full session (peer) | spawned agent |
+|---|---|---|
+| `Workflow` | yes | **absent entirely** |
+| can fan out workers | yes | no |
+| can gate with the developer | directly | only relayed through you |
+| worktree survives a stop | yes | reclaimed if nothing written |
 
-**An owner is never reused.** A new ticket is a new spawn, never a `SendMessage` to the owner
-that just finished — that would carry the last ticket's context into the next one, which is
-exactly the failure `/clear` exists to prevent and which no agent can perform on itself. A
-fresh agent *is* the clear. Reuse an owner only to answer a question about the ticket it is
-already on.
-
-**Workers do not build.** A worker owns one slice and its worktree does not contain the
+**Workers do not build.** The one place agents belong is *inside* a peer's own
+`implement.workflow.js` fan-out. A worker owns one slice and its worktree does not contain the
 others, so a green lane there proves nothing and a red one is usually a sibling's missing
-half. The owner runs the lanes once, against the merged tree, where the answer is real. This
-is also what keeps the fan-out cheap: N workers cost N patches, not N cold Rust builds.
+half. The peer runs the lanes once, against the merged tree. N workers cost N patches, not N
+cold Rust builds.
+
+**A peer may be forbidden from fanning out at all.** Sessions can carry standing user-level
+instructions — "no `Agent`, no `Workflow` unless I ask" is a real one. **You cannot lift that**,
+and confirming a peer *has* a tool is not permission to use it. It rules out Spec step 1 as
+well as the implement fan-out, so that peer researches and blueprints by hand: slower, not
+smaller. Ask early rather than briefing a plan the peer cannot follow.
 
 The target is who does what, in plain English or as `138,144 | 139+140,148+149 | 141,142,143`
 where `,` separates PRs, `+` bundles issues into one PR, and `|` separates peers. Your own
@@ -242,6 +251,13 @@ git worktree list                                     # the registry, from anywh
 git worktree add .claude/worktrees/<slug> -b austin/<n>-<slug> origin/main
 git worktree remove <path> && git branch -D <branch>  # once the ticket has shipped
 ```
+
+**Cut it from a freshly fetched `origin/main`, and re-check that before every dispatch.** A
+worktree cut an hour ago runs the skill and the laws as they were an hour ago: two peers were
+briefed to work around a `SKILL.md` bug that had already been fixed on `main`, because their
+worktrees predated the fix. "It is fixed on `main`" is no use to a peer executing the copy in
+its own tree. When `main` moves under a live peer, tell it to `git fetch origin && git rebase
+origin/main` rather than assuming it will notice.
 
 Provision the worktree yourself, then tell the peer to `EnterWorktree` with that `path`.
 **CLAUDE.md's "Parallel sessions work in git worktrees" paragraph is what authorises that,
@@ -316,6 +332,19 @@ collision detector you have.
 Demand three reports per ticket: **claimed**, **blocked or colliding**, **PR open with its
 number**. Ask for the file-level surface *before* they go deep, not after.
 
+**A peer's Spec gate goes to the developer directly, not through you.** A peer is a full
+session in the developer's own terminal, so relaying only adds a hop and a chance for you to
+garble it — and your message can never stand in for the gate anyway, which is the one thing a
+peer message explicitly is not. Ask for the verdict afterwards so the plan file stays true.
+(Relaying is only correct for a spawned agent, which has no way to reach the developer at all.
+That is one more reason not to use one.)
+
+**Assign versions yourself, up front, one per in-flight branch.** Two branches claiming one
+`Cargo.toml` version means the second to merge releases nothing and says nothing about it.
+`nidus-check fleet` detects it, but not colliding beats detecting, and only you can see across
+the branches. Gaps are harmless — `release.yml` tags whatever is in `Cargo.toml` — so never
+recycle a version freed by a cancelled ticket without re-checking the tree first.
+
 When a peer reports a defect, **settle who files it before either of you does**. Both filing is
 the likely outcome otherwise — the peer is closest to the evidence, you are closest to the
 priority — and a duplicate left open describes a bug that is already fixed, which is the
@@ -333,15 +362,14 @@ peer is correct; say so rather than silently swapping.
 
 ### 5. Clearing context
 
-`/clear` is a built-in CLI command. No agent can invoke it, on itself or anyone else.
-
-**For owners this is solved by construction**: one owner per ticket, spawned fresh, so there
-is no context to clear. Never reuse one for a second ticket to save the spawn.
-
-**For peer sessions it is not**, and cannot be. A peer that should start its next ticket clean
+`/clear` is a built-in CLI command. No agent can invoke it, on itself or anyone else, and no
+message from you can make a peer clear itself. A peer that should start its next ticket clean
 **stops and reports** instead; you batch those and surface one prompt naming every peer that
-is parked. Never tell a peer it can clear itself, and never let "clear before each ticket"
-quietly degrade into carrying context.
+is parked. Never let "clear before each ticket" quietly degrade into carrying context.
+
+This is the one real cost of peers over spawned agents, and it buys everything in the table
+above. One keystroke per ticket boundary is the price of a session that can fan out, research,
+and answer the developer directly.
 
 ### 6. Keep the fleet fed
 
