@@ -400,6 +400,15 @@ back to the user.
   the main thread so one context has seen the whole change.
 - `nidus-check` is the source of truth for lanes, laws and dispatch safety. If it is wrong, fix
   the checker and its selftest — do not work around it in prose.
+- **Assert the behaviour, not that the machinery ran.** The rule below is reactive: it catches a
+  no-failing-mode check once you construct the counterfactual. This one is preventive and reads
+  off the assertion itself — does it name what would be wrong if the change were absent, or only
+  that something happened? "The store opened", "the command ran", "the diff was checked" are all
+  true whether or not the code works, which is why they go green and why they do not look wrong.
+  Worked example: an e2e test drove `nidus search` across a restart to prove an open-time profile
+  merge, and passed with the merge disabled, because `search` has no profile-dependent output. It
+  asserted the store opened. Eight instances in one fleet run, so treat it as the default failure
+  of a test written in a hurry.
 - **Ask whether a check could have failed, not whether it passed.** Three times in two days a
   check ran green and proved nothing: regression tests for a p1 that passed without the fix
   (they corrupted a compressed byte, so they tested the decompressor), a fails-without-fix
