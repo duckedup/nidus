@@ -94,6 +94,40 @@ export function versionBump(baseCargo, headCargo, changed) {
     `release.yml only cuts a release when the v<version> tag does not already exist, so an un-bumped PR ships NOTHING. Changed: ${touched.slice(0, 6).join(', ')}${touched.length > 6 ? '…' : ''}`)]
 }
 
+// A run that examined nothing must not read as a pass. Reported as a finding rather than
+// a console line so it survives --json and cannot be hidden by another finding — the
+// exact asymmetry that let a vacuous run mask a real comment-cap error (#173).
+export function emptyScope(changed, kind = 'range') {
+  if ((changed || []).length) return []
+  return [finding('empty-scope', 'warn', 'scope', 1,
+    `no files examined — this ${kind} contains no changes, so no law could have failed`,
+    'A clean result here says nothing about your work. Commit first, or widen the target with --base/--pr/--path.')]
+}
+
+const cmpVersion = (a, b) => {
+  const pa = String(a).split('.').map(Number)
+  const pb = String(b).split('.').map(Number)
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0)
+    if (d) return d
+  }
+  return 0
+}
+
+// versionBump and docsVersionSync both compare merge-base to head, so neither can see a
+// branch landing *behind* a version already on origin/main — the second merge silently
+// releases nothing. Only a branch that edits Cargo.toml can do this: leave it alone and
+// the merge keeps main's value.
+export function versionBackwards(headCargo, originCargo, changed) {
+  if (!(changed || []).includes('Cargo.toml')) return []
+  const head = versionOf(headCargo)
+  const origin = versionOf(originCargo)
+  if (!head || !origin || cmpVersion(head, origin) >= 0) return []
+  return [finding('version-backwards', 'error', 'Cargo.toml', 1,
+    `version ${head} is behind origin/main's ${origin}`,
+    'Merging this would move the crate version backwards, and release.yml only tags a version it has not seen — so it would ship nothing, silently. Rebase and pick a version above origin/main.')]
+}
+
 const SNIPPET_FILES = ['README.md', 'docs/src/content/docs/getting-started.md']
 
 export function docsVersionSync(baseCargo, headCargo, texts) {

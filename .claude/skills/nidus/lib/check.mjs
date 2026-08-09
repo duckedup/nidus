@@ -42,6 +42,7 @@ function runLaws() {
   const added = git.addedFiles(t)
   const addedLines = git.addedLineMap(t)
   const findings = []
+  findings.push(...laws.emptyScope(changed, t.kind))
 
   for (const f of changed.filter(RS)) {
     const text = git.readAt(t, f)
@@ -65,6 +66,10 @@ function runLaws() {
     const headCargo = git.readAt(t, 'Cargo.toml') || ''
     const baseCargo = git.readBase(t, 'Cargo.toml') || ''
     findings.push(...laws.versionBump(baseCargo, headCargo, changed))
+    // Against where origin/main is NOW, not the merge base — the backwards case is
+    // invisible from inside the branch, which is why no existing law catches it.
+    const originCargo = git.readAtRef('origin/main', 'Cargo.toml')
+    if (originCargo) findings.push(...laws.versionBackwards(headCargo, originCargo, changed))
     findings.push(...laws.docsVersionSync(baseCargo, headCargo, {
       'README.md': git.readAt(t, 'README.md'),
       'docs/src/content/docs/getting-started.md': git.readAt(t, 'docs/src/content/docs/getting-started.md'),
@@ -83,7 +88,10 @@ function runLaws() {
   if (asJson) {
     console.log(JSON.stringify({ target: { kind: t.kind, base: t.base, head: t.head }, changed, findings }, null, 2))
   } else {
-    if (!findings.length) console.log(`No law violations. (${changed.length} changed file(s), ${t.kind})`)
+    // Printed unconditionally: when this was tied to the no-findings branch, any finding
+    // hid what had been examined, so a run over nothing read exactly like a clean one.
+    console.log(`Examined ${changed.length} changed file(s) (${t.kind}).`)
+    if (!findings.length) console.log('No law violations.')
     for (const f of findings) {
       console.log(`${f.severity === 'error' ? '✗' : '!'} [${f.id}] ${f.file}:${f.line} — ${f.summary}\n    ${f.detail}`)
     }

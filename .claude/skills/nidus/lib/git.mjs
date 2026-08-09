@@ -96,6 +96,13 @@ export function readBase(t, path) {
   return out === '' ? null : out
 }
 
+// Where a ref *currently* is, independent of this branch's merge base — which is the only
+// way to see a version that has moved on origin/main since the branch was cut (#173).
+export function readAtRef(ref, path) {
+  const out = sh(`git show ${ref}:${path}`, { allowFail: true })
+  return out === '' ? null : out
+}
+
 export function diffFor(t, path) {
   if (t.kind === 'path') return ''
   const range = t.head ? `${t.base}...${t.head}` : t.base
