@@ -187,9 +187,28 @@ Ask before the commit. Never commit or push without the user choosing to.
 
 ## Fleet
 
-You become the coordinator: you hand tickets to peer Claude sessions, keep them from
-colliding, and work your own queue in the gaps. You do not implement other people's
-tickets and you do not review their PRs into existence — you dispatch, sequence, unblock.
+You become the **coordinator**: the developer's only screen. You hand tickets out, keep them
+from colliding, relay the gates, and report. You do not implement and you do not review other
+people's PRs into existence — you dispatch, sequence, unblock.
+
+Three tiers, and the distinction is what each one is allowed to assume:
+
+| Tier | Model | Lifetime | Owns |
+|---|---|---|---|
+| **coordinator** | opus | the session | the queue, the roster, the gates, the developer's attention |
+| **owner** | opus | **one ticket** | spec → blueprints → fan-out → merge → verify → review → fix → PR |
+| **worker** | sonnet | one blueprint | one slice of one ticket, in its own worktree |
+
+**An owner is never reused.** A new ticket is a new spawn, never a `SendMessage` to the owner
+that just finished — that would carry the last ticket's context into the next one, which is
+exactly the failure `/clear` exists to prevent and which no agent can perform on itself. A
+fresh agent *is* the clear. Reuse an owner only to answer a question about the ticket it is
+already on.
+
+**Workers do not build.** A worker owns one slice and its worktree does not contain the
+others, so a green lane there proves nothing and a red one is usually a sibling's missing
+half. The owner runs the lanes once, against the merged tree, where the answer is real. This
+is also what keeps the fan-out cheap: N workers cost N patches, not N cold Rust builds.
 
 The target is who does what, in plain English or as `138,144 | 139+140,148+149 | 141,142,143`
 where `,` separates PRs, `+` bundles issues into one PR, and `|` separates peers. Your own
@@ -273,12 +292,17 @@ whose change the other must build on. The waiter rebases onto the lander's final
 told the resulting signature, not left to diff for it. Reordering your own queue to unblock a
 peer is correct; say so rather than silently swapping.
 
-### 5. Clearing context is the user's keystroke
+### 5. Clearing context
 
-`/clear` is a built-in CLI command. No agent can invoke it, on itself or anyone else. So a
-peer that should start its next ticket clean **stops and reports** instead. Batch those and
-surface one prompt naming every peer that is parked. Never tell a peer it can clear itself,
-and never let "clear before each ticket" quietly degrade into carrying context.
+`/clear` is a built-in CLI command. No agent can invoke it, on itself or anyone else.
+
+**For owners this is solved by construction**: one owner per ticket, spawned fresh, so there
+is no context to clear. Never reuse one for a second ticket to save the spawn.
+
+**For peer sessions it is not**, and cannot be. A peer that should start its next ticket clean
+**stops and reports** instead; you batch those and surface one prompt naming every peer that
+is parked. Never tell a peer it can clear itself, and never let "clear before each ticket"
+quietly degrade into carrying context.
 
 ### 6. Keep the fleet fed
 

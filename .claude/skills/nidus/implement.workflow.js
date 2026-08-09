@@ -1,6 +1,6 @@
 export const meta = {
   name: 'nidus-implement',
-  description: 'Implement each blueprint in an isolated worktree and return verified source patches for the main thread to merge',
+  description: 'Implement each blueprint in an isolated worktree and return source patches for the main thread to merge and verify',
   phases: [
     { title: 'Implement' },
   ],
@@ -9,39 +9,26 @@ export const meta = {
 // args (from the /nidus implement path):
 // {
 //   id: "nidus-oes",
-//   scratchDir: "/abs/path",              // where agents write patches + verify logs
+//   scratchDir: "/abs/path",              // where agents write their patches
 //   groups: [                              // ordered; group N starts after N-1 finishes
-//     [ { dir, content, verify: ["just ci", ...] }, ... ],
+//     [ { dir, content }, ... ],
 //   ],
 // }
 //
-// Unlike a codegen repo, a nidus worktree is a COMPLETE checkout: `just ci` really does
-// build and test there. So an agent's own verification is authoritative, not advisory,
-// and a failed lane is a real reason to retry.
+// Workers do NOT build. Each owns one isolated slice and returns a patch; the merging
+// thread runs the lanes once against the merged tree. N workers would otherwise mean N
+// cold Rust builds to prove something that only holds after the merge anyway.
 const cfg = typeof args === 'string' ? JSON.parse(args) : (args || {})
 
 const IMPL_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['dir', 'status', 'patch_file', 'verification', 'blockers', 'notes'],
+  required: ['dir', 'status', 'patch_file', 'files_changed', 'blockers', 'notes'],
   properties: {
     dir: { type: 'string' },
     status: { enum: ['success', 'partial', 'blocked'] },
     patch_file: { type: 'string', description: 'Absolute path to the written patch, or "" if no changes' },
     files_changed: { type: 'array', items: { type: 'string' } },
-    verification: {
-      type: 'array',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['command', 'result'],
-        properties: {
-          command: { type: 'string' },
-          result: { enum: ['pass', 'fail'] },
-          log_excerpt: { type: 'string' },
-        },
-      },
-    },
     blockers: { type: 'array', items: { type: 'string' } },
     notes: { type: 'string' },
   },
@@ -60,7 +47,6 @@ const outOfScope = spec => (files) =>
 
 function implPrompt(spec, prior) {
   const patchFile = `${cfg.scratchDir}/${key(spec)}.patch`
-  const logFile = `${cfg.scratchDir}/${key(spec)}.verify.log`
   return `You are implementing ONE blueprint for ${cfg.id} in an isolated git worktree.
 
 BLUEPRINT (implement exactly this, nothing outside its scope):
@@ -71,9 +57,13 @@ Rules:
   little-endian, length-prefixed and CRC32-checked.
 - Only touch files under this blueprint's scope (${spec.dir}). Another agent owns the rest.
 - Do NOT commit, do NOT switch branches, do NOT push.
-- This worktree is a complete checkout — your verification commands genuinely work here, so a
-  failure is a real failure. Run each of ${JSON.stringify(spec.verify || [])} and tee it:
-      <command> 2>&1 | tee -a ${logFile}
+- **Do NOT build, test, lint or run any lane.** You own one slice of a larger change and your
+  worktree does not contain the others, so a green run here would prove nothing and a red one
+  is probably someone else's missing half. The thread that merges every patch runs the lanes
+  once, against the merged tree, where the answer is real. Write the code and stop.
+- Read whatever you need to get the slice right, and say so in notes if the blueprint looks
+  wrong or depends on a sibling slice. Reporting a suspicion costs nothing; guessing costs a
+  merge conflict.
 - Track work in GitHub Issues, never with markdown checklists.
 ${prior ? `\nYOUR PRIOR ATTEMPT FAILED — fix exactly this, do not start over:\n${prior}\n` : ''}
 When the blueprint is implemented and its lanes pass, write your patch:
@@ -84,8 +74,9 @@ Set files_changed to exactly what that patch contains — read it back with
 and copy the list verbatim. That patch is cut with \`git add -A\`, so it carries everything in
 this worktree, not only ${spec.dir}. If any file in it sits outside ${spec.dir}, say so in notes
 and why it was unavoidable. Do not hide it and do not hand-edit the patch to remove it.
-Report status 'success' only when the blueprint is fully implemented AND its verification passed;
-'partial' when implemented but a lane still fails; 'blocked' when you could not make the change.`
+Report status 'success' when the blueprint is fully implemented, 'partial' when some of it is
+implemented and you have said in notes exactly what is missing, 'blocked' when you could not
+make the change at all.`
 }
 
 const MAX_ATTEMPTS = 3 // 1 initial + 2 retries
@@ -102,11 +93,12 @@ async function implementOne(spec) {
       label: attempt === 1 ? `impl:${spec.dir}` : `impl:${spec.dir} (retry ${attempt - 1})`,
     })
     last = r
-    const failedLane = r && (r.verification || []).some(v => v.result === 'fail')
-    const bad = !r || r.status === 'blocked' || failedLane
+    // No lane to fail on any more, so a retry is only worth it when the worker produced
+    // nothing usable. 'partial' comes back with its gap named and the merger decides.
+    const bad = !r || r.status === 'blocked' || (r.status === 'success' && !r.patch_file && !(r.files_changed || []).length)
     if (!bad) return { spec, result: r, attempts: attempt }
     if (attempt >= MAX_ATTEMPTS) break
-    prior = JSON.stringify({ status: r && r.status, blockers: r && r.blockers, notes: r && r.notes, verification: r && r.verification })
+    prior = JSON.stringify({ status: r && r.status, blockers: r && r.blockers, notes: r && r.notes })
     log(`retry ${attempt} for ${spec.dir}`)
   }
   return { spec, result: last, attempts: MAX_ATTEMPTS, failed: true }
@@ -142,6 +134,5 @@ return {
     status: r.result && r.result.status,
     blockers: (r.result && r.result.blockers) || [],
     notes: r.result && r.result.notes,
-    verification: (r.result && r.result.verification) || [],
   })),
 }
