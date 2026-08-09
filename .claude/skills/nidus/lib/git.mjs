@@ -228,7 +228,9 @@ export function inflightVersions(dir = process.cwd()) {
     if (inDir(dir, `merge-base --is-ancestor ${ref} origin/main && echo merged`) === 'merged') continue
     const cargo = inDir(dir, `show ${ref}:Cargo.toml`)
     const v = cargo.match(/^version\s*=\s*"([^"]+)"/m)
-    if (v) out.push({ ref, version: v[1] })
+    if (!v) continue
+    const changed = inDir(dir, `diff --name-only origin/main...${ref}`)
+    out.push({ ref, version: v[1], changed: changed ? changed.split('\n') : [] })
   }
   return out
 }
