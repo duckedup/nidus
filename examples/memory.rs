@@ -40,7 +40,9 @@ use std::collections::BTreeMap;
 
 use nidus::embed::{AnyEmbedder, EmbedConfig, EmbedProvider, Embedder};
 use nidus::summarize::{AnySummarizer, SummarizeConfig, SummarizeProvider};
-use nidus::{Config, Memory, Nidus, RecallOpts, Record, RememberMode, SearchOpts, Value};
+use nidus::{
+    Config, Memory, Nidus, RecallOpts, Record, RememberMode, RememberOpts, SearchOpts, Value,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -112,11 +114,12 @@ async fn main() -> anyhow::Result<()> {
         ),
     ];
     for (id, text) in notes {
-        match memory
-            .remember("notes", id, text, attrs(text), RememberMode::Raw)
-            .await
-        {
-            Ok(()) => println!("  remembered [{id}]"),
+        let opts = RememberOpts {
+            attrs: attrs(text),
+            ..Default::default()
+        };
+        match memory.remember("notes", id, text, opts).await {
+            Ok(written) => println!("  remembered [{}]", written.id),
             Err(e) => {
                 // e.g. no reachable backend — report it and stop the demo cleanly.
                 println!("  could not reach the embedding backend: {e:#}");
@@ -126,23 +129,41 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Summarize mode: summarize the text first, embed the *summary*, and store
-    // both the summary and the original source so a hit stays explainable.
+    // A memory with an hour to live, folded onto any entry it is ≥0.95 similar to rather
+    // than stored as a competing near-duplicate. `written.id` is the row that changed —
+    // the match's, not "cache-note", whenever `written.deduped` is true.
+    let opts = RememberOpts {
+        attrs: BTreeMap::new(),
+        ttl_seconds: Some(3600),
+        dedupe_threshold: Some(0.95),
+        ..Default::default()
+    };
+    match memory
+        .remember(
+            "notes",
+            "cache-note",
+            "The warm search index can be shared across workers via Redis.",
+            opts,
+        )
+        .await
+    {
+        Ok(w) if w.deduped => println!("  folded onto the near-duplicate [{}]", w.id),
+        Ok(w) => println!("  remembered [{}] with a 1h ttl", w.id),
+        Err(e) => println!("  ttl/dedupe write failed: {e:#}"),
+    }
+
+    // Summarize mode: summarize the text first, embed the *summary*, and store it
+    // alongside the raw text (`nidus.text`) so a hit stays explainable.
     if can_summarize {
         let long = "In 2019 the team migrated the auth service off session cookies \
                     and onto short-lived bearer tokens, cutting a class of CSRF bugs \
                     and simplifying horizontal scaling.";
-        match memory
-            .remember(
-                "notes",
-                "auth-history",
-                long,
-                BTreeMap::new(),
-                RememberMode::Summarize,
-            )
-            .await
-        {
-            Ok(()) => println!("  remembered [auth-history] (summarized then embedded)"),
+        let opts = RememberOpts {
+            mode: RememberMode::Summarize,
+            ..Default::default()
+        };
+        match memory.remember("notes", "auth-history", long, opts).await {
+            Ok(_) => println!("  remembered [auth-history] (summarized then embedded)"),
             Err(e) => println!("  summarize path failed: {e:#}"),
         }
     }

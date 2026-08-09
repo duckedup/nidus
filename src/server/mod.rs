@@ -1078,7 +1078,6 @@ async fn remember(
     // `mut` only when a summarizer can stamp META_SUMMARY into it.
     #[cfg_attr(not(all(feature = "memory", feature = "summarize")), allow(unused_mut))]
     let mut attrs = attrs;
-    crate::memory::strip_reserved_recency(&mut attrs);
     let raw_text = text.clone();
 
     // 1) (Optional) summarize + 2) embed — all lock-free network IO.
@@ -1117,71 +1116,33 @@ async fn remember(
             )));
         }
     };
-    // Stamp the raw input on every call, both modes — the field the
-    // auto-provisioned FTS schema indexes (D1).
-    attrs.insert(
-        crate::memory::META_TEXT.to_string(),
-        crate::Value::Str(raw_text),
-    );
     let vector = embedder
         .embed(&embed_text)
         .await
         .map_err(anyhow::Error::new)?;
 
-    // 3) Store: pin the embedding-space identity (reused from `crate::memory`),
-    // resolve dedupe + recency, and upsert — the only step under the write lock.
-    let (n, resolved_id, deduped) = run_write(st, move |db| {
-        crate::memory::ensure_collection_and_pin(db, embedder.as_ref(), &name)?;
-
-        let mut target_id = id;
-        let mut deduped = false;
-        if let Some(threshold) = dedupe_threshold {
-            // Same expiry guard as the MCP tool: an expired entry is invisible to every
-            // read path, so merging onto one would inherit its past `expires_at` and land
-            // a write that reports success and is never visible.
-            let opts = SearchOpts {
-                top_k: 1,
-                min_score: Some(threshold),
-                filter: crate::Filter(vec![crate::memory::not_expired_predicate(
-                    crate::memory::now_ms(),
-                )]),
-                ..Default::default()
-            };
-            if let Some(hit) = db.search(name.as_str(), &vector, &opts)?.into_iter().next() {
-                // Merge onto the matched near-duplicate instead of inserting a
-                // competing entry (D6): new attrs win a key collision, and
-                // unsupplied keys survive.
-                target_id = hit.id;
-                deduped = true;
-                let mut merged = hit.attrs;
-                merged.extend(attrs.clone());
-                attrs = merged;
-            }
-        }
-        // Read `created_at` from the store, never from `attrs` — those are caller-supplied
-        // and would let a request forge its own birth date.
-        let prior_created = db.get(&name, &target_id).and_then(|existing| {
-            match existing.attrs.get(crate::memory::META_CREATED_AT) {
-                Some(crate::Value::DateTime(ts)) => Some(*ts),
-                _ => None,
-            }
-        });
-        crate::memory::stamp_recency(
-            &mut attrs,
-            crate::memory::now_ms(),
-            prior_created,
-            ttl_seconds,
-        );
-
-        let n = db.upsert(&name, &[Record::new(target_id.clone(), vector, attrs)])?;
-        Ok((n, target_id, deduped))
+    // 3) Store: stamping, dedup, recency, and the upsert all live in `crate::memory` so
+    // this surface cannot drift from the MCP tool or the in-process `Memory`. The whole
+    // body runs inside one write closure, which is what makes the read-modify-write atomic.
+    let write = crate::memory::RememberWrite {
+        id,
+        text: raw_text,
+        attrs,
+        ttl_seconds,
+        dedupe_threshold,
+    };
+    let written = run_write(st, move |db| {
+        crate::memory::commit_remember(db, embedder.as_ref(), &name, write, vector)
     })
     .await?;
     // `id` and `deduped` are echoed because a dedupe match redirects the write to another
     // entry: without them the caller cannot tell which record it just changed.
-    Ok(Json(
-        json!({ "ok": true, "upserted": n, "id": resolved_id, "deduped": deduped }),
-    ))
+    Ok(Json(json!({
+        "ok": true,
+        "upserted": written.upserted,
+        "id": written.id,
+        "deduped": written.deduped,
+    })))
 }
 
 /// `POST /collections/{name}/recall` — query text in, ranked hits out. Embeds

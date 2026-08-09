@@ -167,16 +167,10 @@ impl NidusMcp {
         let ttl_seconds = optional_usize(args, "ttl_seconds")?.map(|s| s as i64);
         let dedupe_threshold = optional_f32(args, "dedupe_threshold")?;
 
-        // Caller attrs first, reserved `nidus.*` stamped after so they win a collision —
-        // same merge order as the HTTP handler. `META_TEXT` carries the raw text on every
-        // call; `META_SUMMARY` is added on top only in summarize mode.
+        // `META_SUMMARY` is the only reserved key this surface stamps; `META_TEXT` and the
+        // recency attrs are stamped by `commit_remember`, so every surface gets them.
         #[cfg_attr(not(feature = "summarize"), allow(unused_mut))]
         let mut attrs = parse_attrs(args)?;
-        crate::memory::strip_reserved_recency(&mut attrs);
-        attrs.insert(
-            crate::memory::META_TEXT.to_string(),
-            crate::Value::Str(text.clone()),
-        );
         let embed_text = if summarize {
             #[cfg(feature = "summarize")]
             {
@@ -205,7 +199,7 @@ impl NidusMcp {
                 ));
             }
         } else {
-            text
+            text.clone()
         };
 
         let vector = embedder
@@ -213,66 +207,18 @@ impl NidusMcp {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        // The dedup search, the read-back, and the upsert all run inside this one write
+        // closure — atomic against every other queued write with no new plumbing (D8).
         let name = collection.clone();
-        let derived_id = id;
-        let (n, resolved_id, deduped) = crate::server::run_write(self.state.clone(), move |db| {
-            crate::memory::ensure_collection_and_pin(db, embedder.as_ref(), &name)?;
-
-            // Dedupe search happens before deciding the write target, inside the same
-            // write closure that holds `&mut Nidus` for its whole body — atomic against
-            // every other queued write with no new plumbing (D8).
-            let mut target_id = derived_id;
-            let mut deduped = false;
-            if let Some(threshold) = dedupe_threshold {
-                // Expired entries are dead to every read tool, so they must not be dedupe
-                // candidates either: merging onto one inherits its already-past
-                // `expires_at`, landing a write that reports success and is never visible.
-                let hits = db.search(
-                    name.as_str(),
-                    &vector,
-                    &crate::SearchOpts {
-                        top_k: 1,
-                        min_score: Some(threshold),
-                        filter: crate::Filter(vec![crate::memory::not_expired_predicate(
-                            crate::memory::now_ms(),
-                        )]),
-                        ..Default::default()
-                    },
-                )?;
-                if let Some(hit) = hits.into_iter().next() {
-                    target_id = hit.id;
-                    deduped = true;
-                }
-            }
-
-            // Read-before-write (same closure, so atomic): recovers the matched/reused
-            // entry's `created_at` so it survives, and — on a dedupe match only (D6) —
-            // its other attrs, so a caller-omitted field is not silently dropped.
-            let existing = db.get(&name, &target_id);
-            let prior_created =
-                existing
-                    .as_ref()
-                    .and_then(|r| match r.attrs.get(crate::memory::META_CREATED_AT) {
-                        Some(crate::Value::DateTime(ms)) => Some(*ms),
-                        _ => None,
-                    });
-            if let Some(record) = existing.filter(|_| deduped) {
-                for (k, v) in record.attrs {
-                    attrs.entry(k).or_insert(v);
-                }
-            }
-            crate::memory::stamp_recency(
-                &mut attrs,
-                crate::memory::now_ms(),
-                prior_created,
-                ttl_seconds,
-            );
-
-            let n = db.upsert(
-                &name,
-                &[crate::Record::new(target_id.clone(), vector, attrs)],
-            )?;
-            Ok((n, target_id, deduped))
+        let write = crate::memory::RememberWrite {
+            id,
+            text,
+            attrs,
+            ttl_seconds,
+            dedupe_threshold,
+        };
+        let written = crate::server::run_write(self.state.clone(), move |db| {
+            crate::memory::commit_remember(db, embedder.as_ref(), &name, write, vector)
         })
         .await
         .map_err(api_error)?;
@@ -280,13 +226,14 @@ impl NidusMcp {
         // The model reads this back and acts on it: it must say which happened and the
         // resolved id, because a derived id (or a dedupe match) is otherwise unknowable to
         // the caller who needs it to update or forget this memory later.
-        let verb = if deduped {
+        let verb = if written.deduped {
             "Updated an existing near-duplicate entry"
         } else {
             "Remembered a new entry"
         };
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "{verb} ({n} write) in `{collection}` with id `{resolved_id}`."
+            "{verb} ({} write) in `{collection}` with id `{}`.",
+            written.upserted, written.id
         ))]))
     }
 }

@@ -20,9 +20,9 @@ pub const META_DIM: &str = "nidus.dim";
 /// (the text that was actually embedded).
 #[cfg(feature = "summarize")]
 pub const META_SUMMARY: &str = "nidus.summary";
-/// Attr key under which [`RememberMode::Summarize`] stored the original source
-/// text before `nidus.text` existed. No longer stamped, kept so legacy records
-/// (written before nidus-k28) remain readable.
+/// Attr key under which [`RememberMode::Summarize`] stored the original source text
+/// before `nidus.text` existed. No longer stamped by any surface — [`META_TEXT`] carries
+/// the raw text — kept so records written before #133 remain readable.
 #[cfg(feature = "summarize")]
 pub const META_SOURCE: &str = "nidus.source";
 /// Attr key holding the raw remembered text, stamped on every `remember` write
@@ -42,14 +42,43 @@ pub const META_EXPIRES_AT: &str = "nidus.expires_at";
 const DEFAULT_TOP_K: usize = 10;
 
 /// How [`Memory::remember`] prepares the text it stores.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RememberMode {
     /// Embed the text as given and store it.
+    #[default]
     Raw,
-    /// Summarize the text first, embed the **summary**, and store both the
-    /// summary and a pointer to the source (see [`META_SUMMARY`]/[`META_SOURCE`]).
+    /// Summarize the text first, embed the **summary**, and store it under
+    /// [`META_SUMMARY`]. The raw text is stamped as [`META_TEXT`] in both modes.
     #[cfg(feature = "summarize")]
     Summarize,
+}
+
+/// Options for [`Memory::remember`]. Taken by value because `attrs` moves into the
+/// stored record.
+#[derive(Debug, Clone, Default)]
+pub struct RememberOpts {
+    /// How to prepare the text before embedding it.
+    pub mode: RememberMode,
+    /// Metadata stamped on the record. Reserved `nidus.*` recency keys are dropped:
+    /// they are stamped from the store, never accepted from a caller.
+    pub attrs: BTreeMap<String, Value>,
+    /// Seconds until this memory expires, counted from the write. `None` never expires.
+    pub ttl_seconds: Option<i64>,
+    /// Cosine floor above which this write updates the nearest existing entry instead of
+    /// inserting a competing near-duplicate. `None` disables dedup (a plain upsert by id).
+    pub dedupe_threshold: Option<f32>,
+}
+
+/// What a [`Memory::remember`] write actually did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Remembered {
+    /// The record written. Not the requested id when `deduped`: a near-duplicate match
+    /// redirects the write onto the entry it matched.
+    pub id: String,
+    /// Whether [`RememberOpts::dedupe_threshold`] matched and redirected the write.
+    pub deduped: bool,
+    /// How many records the upsert touched.
+    pub upserted: usize,
 }
 
 /// Options for [`Memory::recall`], mapped onto the store's [`SearchOpts`].
@@ -92,21 +121,28 @@ impl Memory {
         self
     }
 
-    /// Remember `text` under `id` in `collection`, embedding it (per `mode`) and
-    /// upserting a record with `attrs`.
+    /// Remember `text` under `id` in `collection`: prepare it per [`RememberOpts::mode`],
+    /// embed it, and upsert the row — stamping [`META_TEXT`] and the recency attrs, and
+    /// honouring the TTL and dedup knobs. The same write the HTTP and MCP surfaces run.
     pub async fn remember(
         &mut self,
         collection: &str,
         id: &str,
         text: &str,
-        attrs: BTreeMap<String, Value>,
-        mode: RememberMode,
-    ) -> anyhow::Result<()> {
-        match mode {
-            RememberMode::Raw => {
-                // Split-borrow: `&mut self.db` and `&self.embedder` are disjoint fields.
-                embed_and_store(&mut self.db, &self.embedder, collection, id, text, attrs).await
-            }
+        opts: RememberOpts,
+    ) -> anyhow::Result<Remembered> {
+        let RememberOpts {
+            mode,
+            attrs,
+            ttl_seconds,
+            dedupe_threshold,
+        } = opts;
+        // `mut` only on the path where a summary is stamped into it.
+        #[cfg_attr(not(feature = "summarize"), allow(unused_mut))]
+        let mut attrs = attrs;
+
+        let embed_text = match mode {
+            RememberMode::Raw => text.to_string(),
             #[cfg(feature = "summarize")]
             RememberMode::Summarize => {
                 let summarizer = self.summarizer.as_ref().context(
@@ -116,22 +152,26 @@ impl Memory {
                     .summarize(text, &SummarizeOpts::default())
                     .await
                     .with_context(|| format!("summarizing text for '{collection}/{id}'"))?;
-                // Store the summary (what we embed) and the source text so a hit
-                // is explainable back to what was ingested.
-                let mut attrs = attrs;
                 attrs.insert(META_SUMMARY.to_string(), Value::Str(summary.clone()));
-                attrs.insert(META_SOURCE.to_string(), Value::Str(text.to_string()));
-                embed_and_store(
-                    &mut self.db,
-                    &self.embedder,
-                    collection,
-                    id,
-                    &summary,
-                    attrs,
-                )
-                .await
+                summary
             }
-        }
+        };
+
+        // Split-borrow: `&mut self.db` and `&self.embedder` are disjoint fields.
+        embed_and_commit(
+            &mut self.db,
+            &self.embedder,
+            collection,
+            &embed_text,
+            RememberWrite {
+                id: id.to_string(),
+                text: text.to_string(),
+                attrs,
+                ttl_seconds,
+                dedupe_threshold,
+            },
+        )
+        .await
     }
 
     /// Recall the nearest remembered records to `query_text` from `collection`.
@@ -180,7 +220,6 @@ pub(crate) fn now_ms() -> i64 {
 /// Drop caller-supplied recency keys before stamping. `created_at`/`updated_at` would be
 /// overwritten anyway, but `expires_at` survives when no TTL is passed — letting a caller
 /// set an expiry that never went through `ttl_seconds`.
-#[allow(dead_code)]
 pub(crate) fn strip_reserved_recency(attrs: &mut BTreeMap<String, Value>) {
     for key in [META_CREATED_AT, META_UPDATED_AT, META_EXPIRES_AT] {
         attrs.remove(key);
@@ -190,7 +229,6 @@ pub(crate) fn strip_reserved_recency(attrs: &mut BTreeMap<String, Value>) {
 /// Stamp recency attrs in place: `updated_at` always moves to `now_ms`; `created_at`
 /// carries forward from `prior_created` (an update-in-place) or is set to `now_ms` (a
 /// fresh entry); `expires_at` is set only when `ttl_seconds` is given.
-#[allow(dead_code)]
 pub(crate) fn stamp_recency(
     attrs: &mut BTreeMap<String, Value>,
     now_ms: i64,
@@ -275,22 +313,104 @@ fn bail_if_identity_differs(
     Ok(())
 }
 
-/// Pin the collection, embed `embed_text`, and upsert the resulting record.
-async fn embed_and_store<E: Embedder>(
+/// One `remember` write, minus the vector: what every surface has in hand before it
+/// embeds, and what [`commit_remember`] needs after.
+pub(crate) struct RememberWrite {
+    pub id: String,
+    /// The raw remembered text, stamped as [`META_TEXT`] in every mode (#131). Not
+    /// necessarily what was embedded — a summarized write embeds the summary.
+    pub text: String,
+    pub attrs: BTreeMap<String, Value>,
+    pub ttl_seconds: Option<i64>,
+    pub dedupe_threshold: Option<f32>,
+}
+
+/// Embed `embed_text`, then commit. The seam the unit tests drive with a fake embedder;
+/// the server surfaces embed off-lock themselves and call [`commit_remember`] directly.
+async fn embed_and_commit<E: Embedder>(
     db: &mut Nidus,
     embedder: &E,
     collection: &str,
-    id: &str,
     embed_text: &str,
-    attrs: BTreeMap<String, Value>,
-) -> anyhow::Result<()> {
-    ensure_collection_and_pin(db, embedder, collection)?;
+    write: RememberWrite,
+) -> anyhow::Result<Remembered> {
     let vector = embedder
         .embed(embed_text)
         .await
-        .with_context(|| format!("embedding text for '{collection}/{id}'"))?;
-    db.upsert(collection, &[Record::new(id, vector, attrs)])?;
-    Ok(())
+        .with_context(|| format!("embedding text for '{collection}/{}'", write.id))?;
+    commit_remember(db, embedder, collection, write, vector)
+}
+
+/// The store half of a `remember`, shared by the Rust, HTTP, and MCP surfaces so the
+/// stamping, dedup, and recency rules cannot drift between them.
+///
+/// Sync and taking the vector already computed, because the callers that matter embed
+/// off-lock and then run this whole body inside one write closure — the read-modify-write
+/// is only atomic against other writers if the search, the read-back, and the upsert
+/// share a single `&mut Nidus`.
+pub(crate) fn commit_remember<E: Embedder>(
+    db: &mut Nidus,
+    embedder: &E,
+    collection: &str,
+    write: RememberWrite,
+    vector: Vec<f32>,
+) -> anyhow::Result<Remembered> {
+    let RememberWrite {
+        id,
+        text,
+        mut attrs,
+        ttl_seconds,
+        dedupe_threshold,
+    } = write;
+    ensure_collection_and_pin(db, embedder, collection)?;
+
+    // Stamped from here, never accepted from a caller — and before the dedup merge below,
+    // so this write's text wins over the matched entry's.
+    strip_reserved_recency(&mut attrs);
+    attrs.insert(META_TEXT.to_string(), Value::Str(text));
+
+    let mut target_id = id;
+    let mut deduped = false;
+    if let Some(threshold) = dedupe_threshold {
+        // An expired entry is dead to every read path, so it must not be a dedup candidate
+        // either: merging onto one inherits its already-past `expires_at`, landing a write
+        // that reports success and is never visible.
+        let opts = SearchOpts {
+            top_k: 1,
+            min_score: Some(threshold),
+            filter: Filter(vec![not_expired_predicate(now_ms())]),
+            ..Default::default()
+        };
+        if let Some(hit) = db.search(collection, &vector, &opts)?.into_iter().next() {
+            target_id = hit.id;
+            deduped = true;
+        }
+    }
+
+    // Read-before-write under the same borrow: recovers `created_at` from the store rather
+    // than from caller attrs, which would let a write forge its own birth date, and — on a
+    // dedup match only (D6) — the matched entry's other attrs, so an omitted field survives.
+    let existing = db.get(collection, &target_id);
+    let prior_created =
+        existing
+            .as_ref()
+            .and_then(|record| match record.attrs.get(META_CREATED_AT) {
+                Some(Value::DateTime(ms)) => Some(*ms),
+                _ => None,
+            });
+    if let Some(record) = existing.filter(|_| deduped) {
+        for (key, value) in record.attrs {
+            attrs.entry(key).or_insert(value);
+        }
+    }
+    stamp_recency(&mut attrs, now_ms(), prior_created, ttl_seconds);
+
+    let upserted = db.upsert(collection, &[Record::new(target_id.clone(), vector, attrs)])?;
+    Ok(Remembered {
+        id: target_id,
+        deduped,
+        upserted,
+    })
 }
 
 /// Recall-side identity guard: refuse a recall whose embedder differs from the one `collection` was
@@ -407,13 +527,62 @@ mod tests {
         (dir, db)
     }
 
+    /// A `RememberMode::Raw` write through the real path — exactly what `Memory::remember`
+    /// runs, minus the `Memory` wrapper the fake embedder cannot be poured into.
+    async fn remember_with<E: Embedder>(
+        db: &mut Nidus,
+        embedder: &E,
+        collection: &str,
+        id: &str,
+        text: &str,
+        opts: RememberOpts,
+    ) -> anyhow::Result<Remembered> {
+        embed_and_commit(
+            db,
+            embedder,
+            collection,
+            text,
+            RememberWrite {
+                id: id.to_string(),
+                text: text.to_string(),
+                attrs: opts.attrs,
+                ttl_seconds: opts.ttl_seconds,
+                dedupe_threshold: opts.dedupe_threshold,
+            },
+        )
+        .await
+    }
+
+    /// `remember_with` with no TTL and no dedup — the shape most of these tests want.
+    async fn remember_raw<E: Embedder>(
+        db: &mut Nidus,
+        embedder: &E,
+        collection: &str,
+        id: &str,
+        text: &str,
+        attrs: BTreeMap<String, Value>,
+    ) -> anyhow::Result<Remembered> {
+        remember_with(
+            db,
+            embedder,
+            collection,
+            id,
+            text,
+            RememberOpts {
+                attrs,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
     #[tokio::test]
     #[cfg_attr(miri, ignore)] // upsert fsyncs
     async fn remember_recall_round_trip() {
         let (_dir, mut db) = open_tmp(8);
         let emb = FakeEmbedder::new(8, "fake", "v1");
 
-        embed_and_store(
+        remember_raw(
             &mut db,
             &emb,
             "notes",
@@ -423,7 +592,7 @@ mod tests {
         )
         .await
         .unwrap();
-        embed_and_store(
+        remember_raw(
             &mut db,
             &emb,
             "notes",
@@ -457,7 +626,7 @@ mod tests {
         let (_dir, mut db) = open_tmp(8);
         let emb = FakeEmbedder::new(8, "fake", "v1");
 
-        embed_and_store(&mut db, &emb, "notes", "a", "hello world", BTreeMap::new())
+        remember_raw(&mut db, &emb, "notes", "a", "hello world", BTreeMap::new())
             .await
             .unwrap();
 
@@ -526,7 +695,7 @@ mod tests {
         let emb = FakeEmbedder::new(8, "fake", "v1");
 
         assert!(!db.has_fts_schema("notes"));
-        embed_and_store(&mut db, &emb, "notes", "a", "hello world", BTreeMap::new())
+        remember_raw(&mut db, &emb, "notes", "a", "hello world", BTreeMap::new())
             .await
             .unwrap();
         assert!(db.has_fts_schema("notes"));
@@ -542,7 +711,7 @@ mod tests {
             "custom_field".to_string(),
             Value::Str("bananas".to_string()),
         );
-        embed_and_store(&mut db, &emb, "notes", "b", "more text", attrs)
+        remember_raw(&mut db, &emb, "notes", "b", "more text", attrs)
             .await
             .unwrap();
 
@@ -568,7 +737,7 @@ mod tests {
     async fn mismatched_embedder_is_refused() {
         let (_dir, mut db) = open_tmp(8);
         let emb_v1 = FakeEmbedder::new(8, "fake", "v1");
-        embed_and_store(&mut db, &emb_v1, "notes", "a", "hello", BTreeMap::new())
+        remember_raw(&mut db, &emb_v1, "notes", "a", "hello", BTreeMap::new())
             .await
             .unwrap();
 
@@ -606,7 +775,7 @@ mod tests {
     async fn recall_with_mismatched_embedder_is_refused() {
         let (_dir, mut db) = open_tmp(8);
         let emb_v1 = FakeEmbedder::new(8, "fake", "v1");
-        embed_and_store(&mut db, &emb_v1, "notes", "a", "hello", BTreeMap::new())
+        remember_raw(&mut db, &emb_v1, "notes", "a", "hello", BTreeMap::new())
             .await
             .unwrap();
 
@@ -631,7 +800,7 @@ mod tests {
         let (_dir, mut db) = open_tmp(8);
         let emb = FakeEmbedder::new(8, "fake", "v1");
         for i in 0..3 {
-            embed_and_store(
+            remember_raw(
                 &mut db,
                 &emb,
                 "notes",
@@ -662,7 +831,7 @@ mod tests {
         let (_dir, mut db) = open_tmp(8);
         let emb = FakeEmbedder::new(8, "fake", "v1");
         for (id, text) in [("kept", "durable note"), ("gone", "ephemeral note")] {
-            embed_and_store(&mut db, &emb, "notes", id, text, BTreeMap::new())
+            remember_raw(&mut db, &emb, "notes", id, text, BTreeMap::new())
                 .await
                 .unwrap();
         }
@@ -685,6 +854,307 @@ mod tests {
         assert!(
             !ids.contains(&"gone"),
             "an expired entry must be hidden from recall: {ids:?}"
+        );
+    }
+
+    // ── Parity with the HTTP and MCP write paths (#133, #131) ───────────────
+
+    /// #131: the first write provisions an FTS schema over `nidus.text`, so a write that
+    /// never stamps it maintains a BM25 index over an always-empty field — rebuilt on every
+    /// open, and unmatchable by `text_search`. Fails outright without the stamping.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn remember_stamps_the_raw_text_and_it_is_full_text_searchable() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+
+        remember_raw(
+            &mut db,
+            &emb,
+            "notes",
+            "a",
+            "the quick brown fox",
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let stored = db.get("notes", "a").unwrap();
+        assert_eq!(
+            stored.attrs.get(META_TEXT),
+            Some(&Value::Str("the quick brown fox".to_string()))
+        );
+
+        let hits = db
+            .text_search(
+                "notes",
+                &crate::FtsQuery::new(META_TEXT, "quick"),
+                &SearchOpts {
+                    top_k: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the provisioned nidus.text index must actually have something in it"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn remember_stamps_recency_and_carries_created_at_forward() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+
+        remember_raw(&mut db, &emb, "notes", "a", "first", BTreeMap::new())
+            .await
+            .unwrap();
+        let first = db.get("notes", "a").unwrap().attrs;
+        let created = match first.get(META_CREATED_AT) {
+            Some(Value::DateTime(ms)) => *ms,
+            other => panic!("created_at must be stamped, got {other:?}"),
+        };
+        assert!(matches!(
+            first.get(META_UPDATED_AT),
+            Some(Value::DateTime(_))
+        ));
+        assert!(
+            !first.contains_key(META_EXPIRES_AT),
+            "no ttl means no expiry, not an expiry of zero"
+        );
+
+        remember_raw(&mut db, &emb, "notes", "a", "second", BTreeMap::new())
+            .await
+            .unwrap();
+        let second = db.get("notes", "a").unwrap().attrs;
+        assert_eq!(
+            second.get(META_CREATED_AT),
+            Some(&Value::DateTime(created)),
+            "a re-remember must not reset the birth date"
+        );
+    }
+
+    /// A caller cannot hand-write the reserved keys: `expires_at` in particular survives a
+    /// write with no `ttl_seconds` unless it is stripped, which is an expiry that never went
+    /// through the TTL knob.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn caller_supplied_recency_attrs_are_stripped() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+
+        let forged = BTreeMap::from([
+            (META_CREATED_AT.to_string(), Value::DateTime(1)),
+            (META_EXPIRES_AT.to_string(), Value::DateTime(2)),
+            ("keep".to_string(), Value::Str("mine".to_string())),
+        ]);
+        remember_raw(&mut db, &emb, "notes", "a", "text", forged)
+            .await
+            .unwrap();
+
+        let stored = db.get("notes", "a").unwrap().attrs;
+        assert!(
+            !stored.contains_key(META_EXPIRES_AT),
+            "a forged expires_at must not survive a write that passed no ttl"
+        );
+        assert_ne!(
+            stored.get(META_CREATED_AT),
+            Some(&Value::DateTime(1)),
+            "created_at comes from the store, not the caller"
+        );
+        assert_eq!(
+            stored.get("keep"),
+            Some(&Value::Str("mine".to_string())),
+            "stripping the reserved keys must not touch the caller's own"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn ttl_sets_expires_at_and_hides_the_entry_from_recall() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+
+        let ttl = RememberOpts {
+            ttl_seconds: Some(-1), // already elapsed, so no sleep is needed
+            ..Default::default()
+        };
+        remember_with(&mut db, &emb, "notes", "gone", "ephemeral note", ttl)
+            .await
+            .unwrap();
+        remember_raw(
+            &mut db,
+            &emb,
+            "notes",
+            "kept",
+            "durable note",
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.get("notes", "gone")
+                .unwrap()
+                .attrs
+                .contains_key(META_EXPIRES_AT)
+        );
+        let hits = recall_with(&db, &emb, "notes", "ephemeral note", &RecallOpts::default())
+            .await
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["kept"],
+            "the expired entry must be gone and the untimed one must stay: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn dedupe_redirects_the_write_and_merges_attrs() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+
+        let first = remember_with(
+            &mut db,
+            &emb,
+            "notes",
+            "original",
+            "the ranking bug is in the upsert path",
+            RememberOpts {
+                attrs: BTreeMap::from([
+                    ("kind".to_string(), Value::Str("bug".to_string())),
+                    ("owner".to_string(), Value::Str("ana".to_string())),
+                ]),
+                dedupe_threshold: Some(0.99),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.id, "original");
+        assert!(!first.deduped, "nothing to match on the first write");
+
+        // The same text under a different id: the threshold must fold it onto the original.
+        let second = remember_with(
+            &mut db,
+            &emb,
+            "notes",
+            "duplicate",
+            "the ranking bug is in the upsert path",
+            RememberOpts {
+                attrs: BTreeMap::from([("kind".to_string(), Value::Str("defect".to_string()))]),
+                dedupe_threshold: Some(0.99),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(second.deduped, "a near-duplicate must be detected");
+        assert_eq!(second.id, "original", "the write redirects onto the match");
+        assert!(
+            db.get("notes", "duplicate").is_none(),
+            "no competing entry may be created"
+        );
+
+        let merged = db.get("notes", "original").unwrap().attrs;
+        assert_eq!(
+            merged.get("kind"),
+            Some(&Value::Str("defect".to_string())),
+            "a supplied key wins the collision"
+        );
+        assert_eq!(
+            merged.get("owner"),
+            Some(&Value::Str("ana".to_string())),
+            "a key this write omitted must survive on the matched entry"
+        );
+    }
+
+    /// An expired entry is invisible to every read path, so folding onto one would inherit
+    /// its already-past `expires_at` — a write that reports success and is never visible.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn an_expired_entry_is_not_a_dedupe_candidate() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        let text = "the ranking bug is in the upsert path";
+
+        remember_with(
+            &mut db,
+            &emb,
+            "notes",
+            "stale",
+            text,
+            RememberOpts {
+                ttl_seconds: Some(-1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let fresh = remember_with(
+            &mut db,
+            &emb,
+            "notes",
+            "fresh",
+            text,
+            RememberOpts {
+                dedupe_threshold: Some(0.99),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !fresh.deduped,
+            "an expired entry must not be matched as a near-duplicate"
+        );
+        assert_eq!(fresh.id, "fresh");
+        assert!(
+            !db.get("notes", "fresh")
+                .unwrap()
+                .attrs
+                .contains_key(META_EXPIRES_AT),
+            "the new entry must not inherit the expired one's expiry"
+        );
+    }
+
+    /// Dedup carries the matched entry's birth date, not the write's own moment — the
+    /// merge would otherwise reset the age of every entry it folds onto.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn dedupe_preserves_the_matched_entrys_created_at() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        let text = "the warm index is shared via redis";
+
+        remember_raw(&mut db, &emb, "notes", "original", text, BTreeMap::new())
+            .await
+            .unwrap();
+        let created = db.get("notes", "original").unwrap().attrs[META_CREATED_AT].clone();
+
+        remember_with(
+            &mut db,
+            &emb,
+            "notes",
+            "duplicate",
+            text,
+            RememberOpts {
+                dedupe_threshold: Some(0.99),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get("notes", "original").unwrap().attrs[META_CREATED_AT],
+            created
         );
     }
 }
