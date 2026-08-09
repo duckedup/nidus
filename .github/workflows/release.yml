@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
 
+# Serialized (#124): a merge train pushes several bump commits minutes apart, and
+# concurrent runs raced the tag — one failed mid-publish and which commit the v0.55.3
+# artifacts came from was scheduler timing. Queued runs make the tag check deterministic.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 # The UNION of everything this workflow and every workflow it calls needs. A called
 # workflow's job cannot hold more permission than the caller's token grants, and GitHub
 # does not degrade gracefully when it asks for more — it refuses to start the entire run

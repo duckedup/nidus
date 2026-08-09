@@ -1056,8 +1056,13 @@ build until a real need exists.
   scope + metadata filter + `min_score` and ranks them by the exact f32 score, so
   final ordering is always exact even though candidate *selection* is approximate.
   **Approximation cost:** a very selective filter or collection-subset scope can
-  starve the candidate set (the graph walk surfaces too few matching rows) — recall
-  degrades silently there; an exact-prefilter path is the planned follow-up. Deletes
+  starve the candidate set (the graph walk surfaces too few matching rows). The
+  **exact-prefilter fallback** (nidus-0ou, shipped) closes this: when a narrowed
+  query's survivor population drops below what the overscanned walk can reliably
+  surface (`total/overscan`), the store gathers the filter-passing rows directly and
+  scores them exactly instead of walking the index — so selective filtered searches
+  stay exact rather than silently losing recall. The e2e canary
+  (`scale::ann_filtered_search_recall_stays_above_the_floor`) pins this. Deletes
   leave stale nodes in the index that are skipped at query time (the candidate→doc
   resolution is re-verified against the live index) and reclaimed on the next
   `compact` rebuild. ANN and quantization **may be combined** (nidus-ndu): when
@@ -1296,6 +1301,12 @@ compile together.
 
 ## 11. Testing strategy
 
+- **Verify, never assume.** Every claim about behaviour — in this SPEC, in an issue,
+  in a PR body — is held to what a test demonstrates against the real artifact, not
+  to what the prose asserts. When a surface can only be proven by driving the real
+  thing (a spawned binary, a real socket, an SDK against a live server), that
+  end-to-end test is the load-bearing one and runs in CI; a unit tier that would
+  pass while the contract is broken does not count as coverage.
 - **Pure-logic tests run under Miri** (cosine, glob, filter, CRC, and the
   value/op-log codecs exercised against in-memory `Vec<u8>` buffers). These must
   never be `#[cfg_attr(miri, ignore)]`.
