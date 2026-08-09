@@ -123,6 +123,10 @@ Needs blueprints. If none exist for this target, run **Spec** first (including i
 3. Fan out:
    `Workflow({ scriptPath: ".claude/skills/nidus/implement.workflow.js",
                args: { id, scratchDir, groups } })`
+   **Groups sequence state, not just timing.** A later group is handed every earlier patch and
+   applies them before it starts, because that dependency is the only reason it is a later
+   group. So put a blueprint in group N+1 exactly when it needs group N's code to exist —
+   "implement the thing" then "test the thing" is the usual split.
    Each agent is sonnet, runs in its own worktree, verifies itself (a nidus worktree is a
    complete checkout, so its lanes really do run), and returns a patch. Tell the user to watch
    with `/workflows`.
