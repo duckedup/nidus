@@ -190,6 +190,33 @@ type Stats struct {
 	Footprint   Footprint `json:"footprint"`
 }
 
+// Readiness is the /ready response: whether this instance can serve right now.
+//
+// Reason is set only by [Client.Ready] itself, from a 503 body — it is never on the
+// wire, hence json:"-". Role is the server's own {:?} spelling, passed through
+// verbatim, same as [AnnInfo.Kind].
+type Readiness struct {
+	Ready         bool   `json:"ready"`
+	Role          string `json:"role"`
+	StalenessSecs uint64 `json:"staleness_secs"`
+	Reason        string `json:"-"`
+}
+
+// ClusterStatus is the /cluster response: this instance's role and standing within a
+// cluster deployment. LeaseOwner and MaxStalenessSecs are nil when the server sends
+// null — a single-instance store has no lease owner, and a staleness bound only
+// applies to a replica.
+type ClusterStatus struct {
+	Role              string  `json:"role"`
+	Cluster           bool    `json:"cluster"`
+	HoldsWriterHandle bool    `json:"holds_writer_handle"`
+	Fenced            bool    `json:"fenced"`
+	LeaseOwner        *string `json:"lease_owner"`
+	CommitVersion     uint64  `json:"commit_version"`
+	StalenessSecs     uint64  `json:"staleness_secs"`
+	MaxStalenessSecs  *uint64 `json:"max_staleness_secs"`
+}
+
 // A RankBy is a ranking expression layered over the store's distance metric, and a
 // tagged union on the wire with exactly one variant today. Build it with [DecayRank];
 // a RankBy naming no variant is an encode error rather than a 400 from the server.

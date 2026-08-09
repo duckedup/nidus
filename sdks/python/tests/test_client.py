@@ -33,7 +33,7 @@ from typing import Any, Callable, NamedTuple
 
 import pytest
 
-from nidus import NidusClient, NidusError, RememberResult, f, rank, v
+from nidus import ClusterStatus, NidusClient, NidusError, Readiness, RememberResult, f, rank, v
 
 # Canned response payloads, one per shape the client has to decode. Kept beside the
 # endpoint table below so a row and its response read together.
@@ -49,6 +49,17 @@ STATS_PAYLOAD = {
         "vector_bytes": 24,
         "doc_count": 2,
     },
+}
+
+CLUSTER_PAYLOAD = {
+    "role": "Leader",
+    "cluster": True,
+    "holds_writer_handle": True,
+    "fenced": False,
+    "lease_owner": "node-a",
+    "commit_version": 42,
+    "staleness_secs": 0,
+    "max_staleness_secs": 30,
 }
 
 
@@ -115,6 +126,14 @@ def client(transport: StubTransport, **kwargs: Any) -> NidusClient:
 
 ENDPOINTS: list[tuple[str, Callable[[NidusClient], Any], str, str, Any]] = [
     ("health", lambda db: db.health(), "GET", "/health", "ok"),
+    (
+        "ready",
+        lambda db: db.ready(),
+        "GET",
+        "/ready",
+        {"ready": True, "role": "Leader", "staleness_secs": 0},
+    ),
+    ("cluster", lambda db: db.cluster(), "GET", "/cluster", CLUSTER_PAYLOAD),
     ("stats", lambda db: db.stats(), "GET", "/stats", STATS_PAYLOAD),
     ("collections", lambda db: db.collections(), "GET", "/collections", ["docs"]),
     ("create_collection", lambda db: db.create_collection("docs"), "POST", "/collections/docs", {}),
@@ -177,6 +196,7 @@ ENDPOINTS: list[tuple[str, Callable[[NidusClient], Any], str, str, Any]] = [
     ("recall", lambda db: db.recall("notes", "hello"), "POST", "/collections/notes/recall", []),
     ("flush", lambda db: db.flush(), "POST", "/flush", {"ok": True}),
     ("compact", lambda db: db.compact(), "POST", "/compact", {"ok": True}),
+    ("refresh", lambda db: db.refresh(), "POST", "/refresh", {"adopted": True}),
 ]
 
 
@@ -644,6 +664,74 @@ def test_health_is_false_when_the_transport_itself_blows_up() -> None:
 
     db = NidusClient("http://x", transport=exploding)
     assert db.health() is False
+
+
+# ── Readiness / cluster / refresh ────────────────────────────────────────────────────
+
+
+def test_ready_decodes_a_200_into_a_positive_readiness() -> None:
+    stub = StubTransport({"ready": True, "role": "Leader", "staleness_secs": 3})
+    out = client(stub).ready()
+    assert stub.last.method == "GET"
+    assert stub.last.url == "http://x/ready"
+    assert out == Readiness(ready=True, role="Leader", staleness_secs=3)
+
+
+def test_ready_on_503_returns_a_negative_readiness_and_does_not_raise() -> None:
+    """The decision under test: a 503 is an answer, not a fault."""
+    stub = StubTransport({"error": "store not open yet"}, status=503)
+    out = client(stub).ready()  # must not raise
+    assert out == Readiness(ready=False, reason="store not open yet")
+
+
+def test_ready_on_500_still_raises_nidus_error() -> None:
+    """Every OTHER non-2xx keeps raising, exactly as every other method does."""
+    stub = StubTransport({"error": "boom"}, status=500)
+    with pytest.raises(NidusError) as caught:
+        client(stub).ready()
+    assert caught.value.status == 500
+
+
+def test_cluster_decodes_every_field_including_the_nullable_ones() -> None:
+    stub = StubTransport(CLUSTER_PAYLOAD)
+    out = client(stub).cluster()
+    assert out == ClusterStatus(
+        role="Leader",
+        cluster=True,
+        holds_writer_handle=True,
+        fenced=False,
+        lease_owner="node-a",
+        commit_version=42,
+        staleness_secs=0,
+        max_staleness_secs=30,
+    )
+
+
+def test_cluster_decodes_null_lease_owner_and_max_staleness_as_none() -> None:
+    stub = StubTransport(
+        {
+            "role": "Follower",
+            "cluster": False,
+            "holds_writer_handle": False,
+            "fenced": True,
+            "lease_owner": None,
+            "commit_version": 7,
+            "staleness_secs": 12,
+            "max_staleness_secs": None,
+        }
+    )
+    out = client(stub).cluster()
+    assert out.lease_owner is None
+    assert out.max_staleness_secs is None
+
+
+@pytest.mark.parametrize("adopted", [True, False])
+def test_refresh_posts_and_returns_the_adopted_bool(adopted: bool) -> None:
+    stub = StubTransport({"adopted": adopted})
+    out = client(stub).refresh()
+    assert stub.last.method == "POST"
+    assert stub.last.url == "http://x/refresh"
+    assert out is adopted
 
 
 # ── Errors ───────────────────────────────────────────────────────────────────────────

@@ -25,7 +25,9 @@ import pytest
 httpx = pytest.importorskip("httpx", reason="the async client needs the nidus[async] extra")
 
 from nidus import (  # noqa: E402 - must follow the importorskip guard
+    ClusterStatus,
     NidusError,
+    Readiness,
     RememberResult,
     f,
     rank,
@@ -45,6 +47,17 @@ STATS_PAYLOAD = {
         "vector_bytes": 24,
         "doc_count": 2,
     },
+}
+
+CLUSTER_PAYLOAD = {
+    "role": "Leader",
+    "cluster": True,
+    "holds_writer_handle": True,
+    "fenced": False,
+    "lease_owner": "node-a",
+    "commit_version": 42,
+    "staleness_secs": 0,
+    "max_staleness_secs": 30,
 }
 
 
@@ -98,6 +111,14 @@ def client(mock: MockServer, **kwargs: Any) -> AsyncNidusClient:
 
 ENDPOINTS: list[tuple[str, Callable[[AsyncNidusClient], Any], str, str, Any]] = [
     ("health", lambda db: db.health(), "GET", "/health", "ok"),
+    (
+        "ready",
+        lambda db: db.ready(),
+        "GET",
+        "/ready",
+        {"ready": True, "role": "Leader", "staleness_secs": 0},
+    ),
+    ("cluster", lambda db: db.cluster(), "GET", "/cluster", CLUSTER_PAYLOAD),
     ("stats", lambda db: db.stats(), "GET", "/stats", STATS_PAYLOAD),
     ("collections", lambda db: db.collections(), "GET", "/collections", ["docs"]),
     ("create_collection", lambda db: db.create_collection("docs"), "POST", "/collections/docs", {}),
@@ -160,6 +181,7 @@ ENDPOINTS: list[tuple[str, Callable[[AsyncNidusClient], Any], str, str, Any]] = 
     ("recall", lambda db: db.recall("notes", "hello"), "POST", "/collections/notes/recall", []),
     ("flush", lambda db: db.flush(), "POST", "/flush", {"ok": True}),
     ("compact", lambda db: db.compact(), "POST", "/compact", {"ok": True}),
+    ("refresh", lambda db: db.refresh(), "POST", "/refresh", {"adopted": True}),
 ]
 
 
@@ -471,6 +493,80 @@ async def test_health_is_false_rather_than_raising(status: int) -> None:
     mock = MockServer({"error": "unhealthy"}, status=status)
     async with client(mock) as db:
         assert await db.health() is False
+
+
+# ── Readiness / cluster / refresh ────────────────────────────────────────────────────
+
+
+async def test_ready_decodes_a_200_into_a_positive_readiness() -> None:
+    mock = MockServer({"ready": True, "role": "Leader", "staleness_secs": 3})
+    async with client(mock) as db:
+        out = await db.ready()
+    assert mock.last.method == "GET"
+    assert str(mock.last.url) == "http://x/ready"
+    assert out == Readiness(ready=True, role="Leader", staleness_secs=3)
+
+
+async def test_ready_on_503_returns_a_negative_readiness_and_does_not_raise() -> None:
+    """The decision under test: a 503 is an answer, not a fault."""
+    mock = MockServer({"error": "store not open yet"}, status=503)
+    async with client(mock) as db:
+        out = await db.ready()  # must not raise
+    assert out == Readiness(ready=False, reason="store not open yet")
+
+
+async def test_ready_on_500_still_raises_nidus_error() -> None:
+    """Every OTHER non-2xx keeps raising, exactly as every other method does."""
+    mock = MockServer({"error": "boom"}, status=500)
+    async with client(mock) as db:
+        with pytest.raises(NidusError) as caught:
+            await db.ready()
+    assert caught.value.status == 500
+
+
+async def test_cluster_decodes_every_field_including_the_nullable_ones() -> None:
+    mock = MockServer(CLUSTER_PAYLOAD)
+    async with client(mock) as db:
+        out = await db.cluster()
+    assert out == ClusterStatus(
+        role="Leader",
+        cluster=True,
+        holds_writer_handle=True,
+        fenced=False,
+        lease_owner="node-a",
+        commit_version=42,
+        staleness_secs=0,
+        max_staleness_secs=30,
+    )
+
+
+async def test_cluster_decodes_null_lease_owner_and_max_staleness_as_none() -> None:
+    mock = MockServer(
+        {
+            "role": "Follower",
+            "cluster": False,
+            "holds_writer_handle": False,
+            "fenced": True,
+            "lease_owner": None,
+            "commit_version": 7,
+            "staleness_secs": 12,
+            "max_staleness_secs": None,
+        }
+    )
+    async with client(mock) as db:
+        out = await db.cluster()
+    assert out.lease_owner is None
+    assert out.max_staleness_secs is None
+
+
+@pytest.mark.parametrize("adopted", [True, False])
+async def test_refresh_posts_and_returns_the_adopted_bool(adopted: bool) -> None:
+    mock = MockServer({"adopted": adopted})
+    async with client(mock) as db:
+        out = await db.refresh()
+    assert mock.last.method == "POST"
+    assert str(mock.last.url) == "http://x/refresh"
+    assert out is adopted
 
 
 # ── Errors ───────────────────────────────────────────────────────────────────────────

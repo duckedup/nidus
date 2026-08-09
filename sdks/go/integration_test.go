@@ -1025,6 +1025,37 @@ func TestServerErrorsCarryTheirStatus(t *testing.T) {
 	})
 }
 
+// TestOpsSurfaceAgainstARealServer covers Ready, Cluster, and Refresh against a real
+// single-instance server — not what those fields mean for a cluster, only that this
+// SDK decodes the shape the running binary actually sends.
+func TestOpsSurfaceAgainstARealServer(t *testing.T) {
+	db := startServer(t)
+	ctx := context.Background()
+
+	ready, err := db.Ready(ctx)
+	if err != nil {
+		t.Fatalf("Ready failed: %v", err)
+	}
+	if !ready.Ready {
+		t.Errorf("Ready.Ready = false, want true for a server startServer already waited on")
+	}
+	if ready.Role == "" {
+		t.Error("Ready.Role is empty")
+	}
+
+	status, err := db.Cluster(ctx)
+	if err != nil {
+		t.Fatalf("Cluster failed: %v", err)
+	}
+	if status.Role == "" {
+		t.Error("Cluster.Role is empty")
+	}
+
+	if _, err := db.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh failed: %v", err)
+	}
+}
+
 // TestMemoryRoutesWithoutAnEmbedder pins what Remember and Recall actually answer on a
 // server that cannot serve them — the claim the SDK's comments and README make, and the
 // one that was wrong.

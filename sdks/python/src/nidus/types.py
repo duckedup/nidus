@@ -205,6 +205,30 @@ class Stats:
 
 
 @dataclass(frozen=True)
+class Readiness:
+    """The ``/ready`` verdict. A ``503`` is an answer here, not a fault."""
+
+    ready: bool
+    role: Optional[str] = None
+    staleness_secs: Optional[int] = None
+    reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ClusterStatus:
+    """Role and lease state, mirroring the ``/cluster`` response."""
+
+    role: str
+    cluster: bool
+    holds_writer_handle: bool
+    fenced: bool
+    lease_owner: Optional[str]
+    commit_version: int
+    staleness_secs: int
+    max_staleness_secs: Optional[int]
+
+
+@dataclass(frozen=True)
 class RememberResult:
     """What a :meth:`~nidus.NidusClient.remember` actually wrote.
 

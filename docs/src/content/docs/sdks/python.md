@@ -224,9 +224,12 @@ happens server-side.
 
 ## The rest of the API
 
-Every data-plane endpoint of the [HTTP API](/reference/http-api/) has a typed method
-(the ops probes `/ready`, `/cluster`, `/refresh`, and `/metrics` are for
-orchestrators and scrapers; hit them with plain HTTP):
+Every data-plane endpoint of the [HTTP API](/reference/http-api/) has a typed method.
+The ops probes are typed too, with one exception: `ready()`, `cluster()`, and
+`refresh()` each have a method, while `/metrics` stays unwrapped since it is a
+scraper's endpoint, not something application code calls. `ready()` returns a
+verdict rather than raising when the server reports not-ready, so a `503` is
+something you check, not something you catch:
 
 ```python
 db.collections()                    # list[str]
@@ -239,6 +242,10 @@ db.delete_where("docs", f.and_(f.lt("year", 2000)))
 db.flush(); db.compact()
 db.drop_collection("docs")
 db.health()                         # bool
+r = db.ready()                  # Readiness(ready=..., role=..., staleness_secs=...)
+if not r.ready: print(r.reason) # a 503 is an answer, not an exception
+db.cluster()                    # ClusterStatus
+db.refresh()                    # bool: did it adopt newer state
 ```
 
 Optional arguments all default to `None`, which means "omit the key" so the **server's**

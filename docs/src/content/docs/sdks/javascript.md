@@ -119,10 +119,13 @@ const hybrid = await db.hybridSearch({
 
 ## The rest of the API
 
-Every data-plane endpoint of the [HTTP API](/reference/http-api/) has a typed method
-(the ops probes `/ready`, `/cluster`, `/refresh`, and `/metrics` are for orchestrators
-and scrapers; hit them with plain HTTP). The memory layer is fully typed too:
-`db.remember()` (with `ttlSeconds` and `dedupeThreshold` options and a
+Every data-plane endpoint of the [HTTP API](/reference/http-api/) has a typed method.
+The ops probes are typed too, with one exception: `ready()`, `cluster()`, and
+`refresh()` each have a method, while `/metrics` stays unwrapped since it is a
+scraper's endpoint, not something application code calls. `ready()` returns a
+verdict rather than throwing when the server reports not-ready, so a `503` is
+something you branch on, not something you catch. The memory layer is fully typed
+too: `db.remember()` (with `ttlSeconds` and `dedupeThreshold` options and a
 `RememberResult` return) and `db.recall()`, plus `db.batchSearch()` and
 `db.aggregate()`; a fuller walkthrough of those is coming to this page
 ([#132](https://github.com/duckedup/nidus/issues/132)).
@@ -138,6 +141,10 @@ await db.deleteWhere("docs", f.and(f.lt("year", 2000)));
 await db.flush(); await db.compact();
 await db.dropCollection("docs");
 await db.health();                       // boolean
+const r = await db.ready();              // { ready, role, staleness_secs }
+if (!r.ready) console.warn(r.reason);    // a 503 is an answer, not a throw
+await db.cluster();                      // role, lease state, commit version
+await db.refresh();                      // boolean: did it adopt newer state
 ```
 
 ## Errors

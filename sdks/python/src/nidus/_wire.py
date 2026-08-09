@@ -55,6 +55,7 @@ from .types import (
     Annotations,
     Batch,
     ClauseScore,
+    ClusterStatus,
     Footprint,
     Fragment,
     FtsClause,
@@ -66,6 +67,7 @@ from .types import (
     LegScore,
     LimitPer,
     OrderBy,
+    Readiness,
     Record,
     RecordInput,
     RememberResult,
@@ -81,6 +83,9 @@ from .values import AttrInput, Value, decode_attrs, decode_value, encode_attrs
 # exist. Escaping it as %2F keeps a name with slashes or spaces a single path segment.
 
 HEALTH = "/health"
+READY = "/ready"
+CLUSTER = "/cluster"
+REFRESH = "/refresh"
 STATS = "/stats"
 COLLECTIONS = "/collections"
 SEARCH = "/search"
@@ -646,6 +651,47 @@ def decode_footprint(payload: Any) -> Footprint:
     )
 
 
+def decode_readiness(status: int, text: str) -> Readiness:
+    """Decode ``GET /ready``. A ``503`` is the negative verdict, not a fault.
+
+    Takes the raw ``(status, text)`` rather than a decoded payload, because the ``503``
+    branch must not run the request through :func:`decode_response`, which would raise.
+    """
+    if status == 503:
+        return Readiness(ready=False, reason=extract_error(text, status))
+    payload = decode_response(status, text)
+    if not isinstance(payload, Mapping):
+        raise NidusError(f"/ready returned no JSON object (got {payload!r})", 0)
+    return Readiness(
+        ready=bool(payload.get("ready", True)),
+        role=_opt_str(payload.get("role")),
+        staleness_secs=_opt_int(payload.get("staleness_secs")),
+    )
+
+
+def decode_cluster(payload: Any) -> ClusterStatus:
+    """Decode ``GET /cluster``. ``lease_owner``/``max_staleness_secs`` may be ``null``."""
+    if not isinstance(payload, Mapping):
+        raise NidusError(f"/cluster returned no JSON object (got {payload!r})", 0)
+    return ClusterStatus(
+        role=str(payload["role"]),
+        cluster=bool(payload["cluster"]),
+        holds_writer_handle=bool(payload["holds_writer_handle"]),
+        fenced=bool(payload["fenced"]),
+        lease_owner=_opt_str(payload.get("lease_owner")),
+        commit_version=int(payload["commit_version"]),
+        staleness_secs=int(payload["staleness_secs"]),
+        max_staleness_secs=_opt_int(payload.get("max_staleness_secs")),
+    )
+
+
+def decode_refresh(payload: Any) -> bool:
+    """Decode ``POST /refresh``: whether a newer committed state was adopted."""
+    if not isinstance(payload, Mapping):
+        raise NidusError(f"/refresh returned no JSON object (got {payload!r})", 0)
+    return bool(payload.get("adopted", False))
+
+
 def decode_collections(payload: Any) -> list[str]:
     return [str(name) for name in payload or ()]
 
@@ -899,3 +945,8 @@ def _attrs_of(payload: Mapping[str, Any]) -> Mapping[str, Value]:
 def _opt_int(value: Any) -> Optional[int]:
     """An optional integer knob: absent (``None``) stays absent, meaning "not applicable"."""
     return None if value is None else int(value)
+
+
+def _opt_str(value: Any) -> Optional[str]:
+    """An optional string field: absent (``None``) stays absent."""
+    return None if value is None else str(value)

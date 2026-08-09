@@ -2,10 +2,9 @@
 //
 // The surface mirrors the JavaScript SDK (sdks/js/src/client.ts) endpoint for
 // endpoint, deliberately: the SDKs are meant to be reviewable side by side, so a
-// method exists here if and only if it exists there. That is also why /ready,
-// /cluster, /refresh and /metrics are absent even though the server routes them —
-// wrapping them is a change to all the SDKs at once, not a favour this one does
-// alone.
+// method exists here if and only if it exists there — which is why /ready,
+// /cluster and /refresh shipped to all three SDKs together. /metrics remains
+// the one route still absent, out of scope until it moves the same way.
 //
 // The one place this SDK diverges in *shape*: every method takes a context.Context
 // first and returns (T, error). Cancellation and deadlines belong to the caller, and
@@ -18,6 +17,7 @@ package nidus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -172,6 +172,34 @@ func (c *Client) Ping(ctx context.Context) error {
 // where a diagnosis is thrown away for want of anywhere to put it.
 func (c *Client) Health(ctx context.Context) bool {
 	return c.Ping(ctx) == nil
+}
+
+// Ready reports whether this instance can serve: store open, not fenced, not stale.
+//
+// A 503 is the negative answer rather than a failure, so it comes back as a Readiness
+// with Ready false and Reason set — a poll loop branches on a value instead of on an
+// error. Every other status, and any transport failure, is still returned as an error.
+func (c *Client) Ready(ctx context.Context) (*Readiness, error) {
+	var out Readiness
+	err := c.request(ctx, http.MethodGet, "/ready", nil, &out)
+	if err == nil {
+		return &out, nil
+	}
+	var e *Error
+	if errors.As(err, &e) && e.IsUnavailable() {
+		return &Readiness{Ready: false, Reason: e.Message}, nil
+	}
+	return nil, err
+}
+
+// Cluster reads this instance's role and standing within a cluster deployment:
+// whether it holds the writer handle, is fenced, and how stale its snapshot is.
+func (c *Client) Cluster(ctx context.Context) (*ClusterStatus, error) {
+	var out ClusterStatus
+	if err := c.request(ctx, http.MethodGet, "/cluster", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // Stats reads store-wide introspection: dimension, distance metric, ANN
@@ -469,6 +497,18 @@ func (c *Client) Flush(ctx context.Context) error {
 // that holds the writer, so schedule it rather than calling it per request.
 func (c *Client) Compact(ctx context.Context) error {
 	return c.request(ctx, http.MethodPost, "/compact", struct{}{}, nil)
+}
+
+// Refresh advances this instance's snapshot to the latest committed manifest, and
+// reports whether a newer one was actually adopted.
+func (c *Client) Refresh(ctx context.Context) (bool, error) {
+	var out struct {
+		Adopted bool `json:"adopted"`
+	}
+	if err := c.request(ctx, http.MethodPost, "/refresh", struct{}{}, &out); err != nil {
+		return false, err
+	}
+	return out.Adopted, nil
 }
 
 // ── Internals ───────────────────────────────────────────────────────────────
