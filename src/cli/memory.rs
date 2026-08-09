@@ -58,19 +58,9 @@ fn parse_attrs(attrs: Option<String>) -> Result<BTreeMap<String, Value>> {
     }
 }
 
-/// Caller attrs first, reserved `nidus.*` stamped after so they win a collision — the merge
-/// order the MCP and HTTP handlers use. `Memory::remember` does not stamp `META_TEXT` itself,
-/// yet it declares an FTS schema over that field, so an unstamped write is unsearchable.
-fn merge_reserved(mut attrs: BTreeMap<String, Value>, text: &str) -> BTreeMap<String, Value> {
-    crate::memory::strip_reserved_recency(&mut attrs);
-    attrs.insert(
-        crate::memory::META_TEXT.to_string(),
-        Value::Str(text.to_string()),
-    );
-    attrs
-}
-
-/// `nidus remember`: embed `text` (optionally summarizing first) and upsert it.
+/// `nidus remember`: embed `text` (optionally summarizing first) and upsert it. The
+/// reserved `nidus.*` stamping (text, recency, expiry) all happens inside
+/// [`Memory::remember`] since #133, so nothing is merged here.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn remember(
     store: StoreArgs,
@@ -79,9 +69,11 @@ pub(super) fn remember(
     text: String,
     id: Option<String>,
     attrs: Option<String>,
+    ttl_seconds: Option<i64>,
+    dedupe_threshold: Option<f32>,
     #[cfg(feature = "summarize")] summarize: bool,
 ) -> Result<()> {
-    let attrs = merge_reserved(parse_attrs(attrs)?, &text);
+    let attrs = parse_attrs(attrs)?;
     let id = id.unwrap_or_else(|| content_id(&text));
     let rt = runtime()?;
 
@@ -110,8 +102,19 @@ pub(super) fn remember(
             memory = memory.with_summarizer(summarizer);
         }
 
-        memory
-            .remember(&collection, &id, &text, attrs, mode)
+        let mode_label = format!("{mode:?}");
+        let written = memory
+            .remember(
+                &collection,
+                &id,
+                &text,
+                crate::RememberOpts {
+                    mode,
+                    attrs,
+                    ttl_seconds,
+                    dedupe_threshold,
+                },
+            )
             .await?;
         // Nothing flushes on drop, so a one-shot process must take the barrier itself or
         // `--fsync on-flush` would discard the write it just reported.
@@ -119,8 +122,10 @@ pub(super) fn remember(
 
         super::print_json(&serde_json::json!({
             "collection": collection,
-            "id": id,
-            "mode": format!("{mode:?}"),
+            "id": written.id,
+            "deduped": written.deduped,
+            "upserted": written.upserted,
+            "mode": mode_label,
             "embedder": identity,
             "dimension": dimension,
         }))

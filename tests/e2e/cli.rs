@@ -568,6 +568,51 @@ fn remember_and_recall_round_trip_through_the_binary() {
     assert_eq!(ids(&hits), ["manual"], "filtered recall: {hits}");
 }
 
+/// The #133 knobs, through the binary: an expired write never surfaces on recall, and a
+/// near-duplicate write redirects to the matched entry and says so in the output JSON.
+#[cfg(all(feature = "mcp", feature = "embed-ollama"))]
+#[test]
+fn ttl_and_dedupe_flags_reach_the_memory_layer() {
+    use crate::mcp::support::{DIM, mock_embedder_per_text};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+    let url = mock_embedder_per_text(DIM);
+    let e = embed_args(&url);
+    let (p, b) = (e[0].as_str(), e[1].as_str());
+    let (u, v) = (e[2].as_str(), e[3].as_str());
+
+    // Expired the instant it is written; a live neighbour proves the store still answers.
+    #[rustfmt::skip]
+    ok(&["remember", "--dir", dir, p, b, u, v, "--id", "gone", "--ttl-seconds", "0",
+         "notes", "ephemeral scratch note"], "");
+    #[rustfmt::skip]
+    ok(&["remember", "--dir", dir, p, b, u, v, "--id", "kept",
+         "notes", "durable note"], "");
+
+    #[rustfmt::skip]
+    let hits = ok(&["recall", "--dir", dir, p, b, u, v, "-k", "5",
+                    "notes", "ephemeral scratch note"], "");
+    assert!(
+        !ids(&hits).contains(&"gone".to_string()),
+        "expired entry leaked: {hits}"
+    );
+    #[rustfmt::skip]
+    let hits = ok(&["recall", "--dir", dir, p, b, u, v, "-k", "5",
+                    "notes", "durable note"], "");
+    assert!(
+        ids(&hits).contains(&"kept".to_string()),
+        "no-TTL entry must surface: {hits}"
+    );
+
+    // A near-duplicate with the flag lands on the existing entry instead of a rival.
+    #[rustfmt::skip]
+    let out = ok(&["remember", "--dir", dir, p, b, u, v, "--id", "rival",
+                   "--dedupe-threshold", "0.95", "notes", "durable note"], "");
+    assert_eq!(out["deduped"], true, "{out}");
+    assert_eq!(out["id"], "kept", "write must redirect to the match: {out}");
+}
+
 /// `recall` opens read-only, so it answers against a directory a live server holds — the
 /// property that makes it usable from a shell hook on a machine already running nidus.
 #[cfg(all(feature = "mcp", feature = "embed-ollama"))]
