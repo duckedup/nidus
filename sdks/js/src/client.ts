@@ -23,6 +23,7 @@ import type {
   RecallOptions,
   RecordInput,
   RememberOptions,
+  RememberResult,
   SearchOptions,
   Stats,
   TextSearchOptions,
@@ -352,14 +353,17 @@ export class NidusClient {
    * summary, and stamps a `nidus.summary` attr (requires the server to have a
    * summarizer). The raw text is always stored under `nidus.text`. `opts.attrs` accept plain JS values or `v.*`
    * helpers; they are normalized for you.
+   *
+   * Read `id` off the result rather than assuming the one you passed:
+   * `opts.dedupeThreshold` can redirect the write onto a near-duplicate.
    */
   async remember(
     collection: string,
     id: string,
     text: string,
     opts: RememberOptions = {},
-  ): Promise<void> {
-    await this.request(
+  ): Promise<RememberResult> {
+    const res = await this.request<Partial<RememberResult> | undefined>(
       "POST",
       `/collections/${enc(collection)}/remember`,
       prune({
@@ -367,8 +371,17 @@ export class NidusClient {
         text,
         mode: opts.mode,
         attrs: opts.attrs ? encodeAttrs(opts.attrs) : undefined,
+        ttl_seconds: opts.ttlSeconds,
+        dedupe_threshold: opts.dedupeThreshold,
       }),
     );
+    // A server predating the echoed fields answers `{ok, upserted}`; falling back to the
+    // requested id keeps that case honest instead of reporting `undefined` as the target.
+    return {
+      id: res?.id ?? id,
+      upserted: res?.upserted ?? 0,
+      deduped: res?.deduped ?? false,
+    };
   }
 
   /**

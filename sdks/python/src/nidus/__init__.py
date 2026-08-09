@@ -55,6 +55,7 @@ from .types import (
     OrderBy,
     Record,
     RecordInput,
+    RememberResult,
     Stats,
 )
 from .values import (
@@ -108,6 +109,7 @@ __all__ = [
     "RankBy",
     "Record",
     "RecordInput",
+    "RememberResult",
     "Stats",
     "Transport",
     "Value",

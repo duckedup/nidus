@@ -50,6 +50,7 @@ from .types import (
     OrderBy,
     Record,
     RecordInput,
+    RememberResult,
     Stats,
 )
 from .values import AttrInput
@@ -437,15 +438,33 @@ class NidusClient:
         *,
         mode: Optional[str] = None,
         attrs: Optional[Mapping[str, AttrInput]] = None,
-    ) -> None:
+        ttl_seconds: Optional[int] = None,
+        dedupe_threshold: Optional[float] = None,
+    ) -> RememberResult:
         """Embed ``text`` and upsert it under ``id`` (idempotent on ``id``).
 
         With ``mode="summarize"`` the server summarizes first, embeds the summary, and
         stamps a ``nidus.summary`` attr (needs a summarizer configured). The raw text is
         always stored under ``nidus.text``, whichever mode is used.
+
+        ``ttl_seconds`` expires the memory that long after the write; ``None`` never
+        expires, and ``0`` expires it immediately. ``dedupe_threshold`` is a
+        cosine-similarity floor above which this write updates the nearest existing entry
+        instead of inserting a competing near-duplicate; ``None`` disables dedupe. Dedupe
+        is a vector search server-side, so it needs the same embedder ``remember`` does,
+        and an already-expired entry is never a candidate — a lapsed TTL cannot be revived
+        by a later near-duplicate.
+
+        Read :attr:`~nidus.RememberResult.id` off the result rather than assuming the one
+        passed in: a dedupe match redirects the write onto the entry it matched.
         """
-        self._request(
-            "POST", _wire.remember_path(collection), _wire.remember_body(id, text, mode, attrs)
+        return _wire.decode_remember(
+            self._request(
+                "POST",
+                _wire.remember_path(collection),
+                _wire.remember_body(id, text, mode, attrs, ttl_seconds, dedupe_threshold),
+            ),
+            id,
         )
 
     def recall(

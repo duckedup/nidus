@@ -24,7 +24,13 @@ import pytest
 
 httpx = pytest.importorskip("httpx", reason="the async client needs the nidus[async] extra")
 
-from nidus import NidusError, f, rank, v  # noqa: E402 - must follow the importorskip guard
+from nidus import (  # noqa: E402 - must follow the importorskip guard
+    NidusError,
+    RememberResult,
+    f,
+    rank,
+    v,
+)
 from nidus.aio import AsyncNidusClient  # noqa: E402 - same
 
 STATS_PAYLOAD = {
@@ -372,10 +378,28 @@ async def test_remember_and_recall_bodies() -> None:
             "attrs": {"tag": {"Str": "x"}},
         }
         assert "mode" not in mock.json
+        assert "ttl_seconds" not in mock.json
+        assert "dedupe_threshold" not in mock.json
     mock = MockServer([])
     async with client(mock) as db:
         await db.recall("notes", "hello")
         assert mock.json == {"query": "hello", "filter": []}
+
+
+async def test_remember_sends_ttl_and_dedupe_and_returns_what_was_written() -> None:
+    """The async twin decodes the redirected id exactly as the sync one does."""
+    mock = MockServer({"ok": True, "upserted": 1, "id": "older", "deduped": True})
+    async with client(mock) as db:
+        out = await db.remember(
+            "notes", "newer", "the quick brown fox", ttl_seconds=3600, dedupe_threshold=0.95
+        )
+    assert mock.json == {
+        "id": "newer",
+        "text": "the quick brown fox",
+        "ttl_seconds": 3600,
+        "dedupe_threshold": 0.95,
+    }
+    assert out == RememberResult(id="older", upserted=1, deduped=True)
 
 
 async def test_a_bodyless_write_sends_an_empty_json_object() -> None:

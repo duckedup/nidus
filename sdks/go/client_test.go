@@ -120,6 +120,7 @@ func (c *capture) sentBody(t *testing.T) string {
 // server treats as a real value.
 func f32(v float32) *float32 { return &v }
 func iptr(v int) *int        { return &v }
+func i64(v int64) *int64     { return &v }
 
 // ── Batch search and grouped aggregation ────────────────────────────────────
 
@@ -310,7 +311,8 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 			return err
 		}},
 		{"Remember", `{"ok":true}`, http.MethodPost, "/collections/docs/remember", func(c *Client) error {
-			return c.Remember(ctx, "docs", "a", "some text", RememberOptions{})
+			_, err := c.Remember(ctx, "docs", "a", "some text", RememberOptions{})
+			return err
 		}},
 		{"Recall", `[]`, http.MethodPost, "/collections/docs/recall", func(c *Client) error {
 			_, err := c.Recall(ctx, "docs", "some text", RecallOptions{})
@@ -654,23 +656,9 @@ func TestZeroValuedRequestFieldsAreOmitted(t *testing.T) {
 				return err
 			},
 		},
-		{
-			// Mode is absent for the default "raw" ingest, and attrs is absent rather
-			// than {} — the server defaults both.
-			"Remember", `{"id":"a","text":"some text"}`,
-			func(ctx context.Context, c *Client) error {
-				return c.Remember(ctx, "docs", "a", "some text", RememberOptions{})
-			},
-		},
-		{
-			"Remember summarizing", `{"id":"a","text":"some text","mode":"summarize","attrs":{"src":{"Str":"x"}}}`,
-			func(ctx context.Context, c *Client) error {
-				return c.Remember(ctx, "docs", "a", "some text", RememberOptions{
-					Mode:  "summarize",
-					Attrs: Attrs{"src": Str("x")},
-				})
-			},
-		},
+		// Remember's own zero-vs-omitted cases live in
+		// TestRememberOmitsUnsetKnobsAndSendsZeroes: it decodes an object rather than the
+		// search family's `[]`, so it cannot share this table's fake reply.
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2088,5 +2076,78 @@ func TestAggregateBodyAndResponse(t *testing.T) {
 	// integers, and collapsing it would lose that.
 	if f, ok := out.Sums["ratio"].Float(); !ok || f != 1.5 {
 		t.Errorf("Sums[ratio] = %v, want Float(1.5)", out.Sums["ratio"])
+	}
+}
+
+// ── Remember: the TTL and dedupe knobs ──────────────────────────────────────
+
+// TestRememberOmitsUnsetKnobsAndSendsZeroes covers every RememberOptions field's effect
+// on the body, and with it the omit-vs-zero rule on the two pointer knobs: a TTL of 0
+// expires the entry immediately and a dedupe floor of 0 matches any entry at all, so
+// neither zero may be dropped in favour of the server's default (never expire / no dedupe).
+func TestRememberOmitsUnsetKnobsAndSendsZeroes(t *testing.T) {
+	cases := []struct {
+		name string
+		opts RememberOptions
+		want string
+	}{
+		{"defaults", RememberOptions{}, `{"id":"a","text":"t"}`},
+		{
+			"mode and attrs",
+			RememberOptions{Mode: "summarize", Attrs: Attrs{"src": Str("x")}},
+			`{"id":"a","text":"t","mode":"summarize","attrs":{"src":{"Str":"x"}}}`,
+		},
+		{
+			"ttl and dedupe",
+			RememberOptions{TTLSeconds: i64(3600), DedupeThreshold: f32(0.95)},
+			`{"id":"a","text":"t","ttl_seconds":3600,"dedupe_threshold":0.95}`,
+		},
+		{
+			"zeroed ttl and dedupe are sent, not omitted",
+			RememberOptions{TTLSeconds: i64(0), DedupeThreshold: f32(0)},
+			`{"id":"a","text":"t","ttl_seconds":0,"dedupe_threshold":0}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &capture{reply: `{"ok":true,"upserted":1,"id":"a","deduped":false}`}
+			if _, err := serve(t, fake).Remember(
+				context.Background(), "notes", "a", "t", tc.opts,
+			); err != nil {
+				t.Fatalf("Remember failed: %v", err)
+			}
+			if body := fake.sentBody(t); body != tc.want {
+				t.Errorf("body = %s, want %s", body, tc.want)
+			}
+		})
+	}
+}
+
+// TestRememberResultReportsTheRecordActuallyWritten pins the reason the response is
+// decoded at all: on a dedupe match the server writes a *different* record than the one
+// asked for, and ID is the caller's only way to learn which.
+func TestRememberResultReportsTheRecordActuallyWritten(t *testing.T) {
+	ctx := context.Background()
+
+	fake := &capture{reply: `{"ok":true,"upserted":1,"id":"older","deduped":true}`}
+	out, err := serve(t, fake).Remember(ctx, "notes", "newer", "t", RememberOptions{
+		DedupeThreshold: f32(0.9),
+	})
+	if err != nil {
+		t.Fatalf("Remember failed: %v", err)
+	}
+	if out.ID != "older" || !out.Deduped || out.Upserted != 1 {
+		t.Errorf("result = %+v, want {ID:older Upserted:1 Deduped:true}", out)
+	}
+
+	// A server predating the echoed fields answers {ok, upserted}; reporting an empty ID
+	// there would be a lie about which record changed.
+	fake = &capture{reply: `{"ok":true,"upserted":1}`}
+	out, err = serve(t, fake).Remember(ctx, "notes", "a", "t", RememberOptions{})
+	if err != nil {
+		t.Fatalf("Remember failed: %v", err)
+	}
+	if out.ID != "a" || out.Deduped {
+		t.Errorf("result = %+v, want the requested id and Deduped false", out)
 	}
 }

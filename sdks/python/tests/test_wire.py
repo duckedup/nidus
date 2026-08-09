@@ -40,7 +40,7 @@ from decimal import Decimal
 
 import pytest
 
-from nidus import NidusError, _wire, f, rank, v
+from nidus import NidusError, RememberResult, _wire, f, rank, v
 
 # A `/stats` payload for a store doing exact brute-force search: `ann` is null.
 EXACT_STATS = {
@@ -523,6 +523,37 @@ def test_remember_body_prunes_mode_and_attrs() -> None:
     }
     # An explicitly empty attrs map is a real (if inert) value and is sent as `{}`.
     assert _wire.remember_body("d", "t", attrs={})["attrs"] == {}
+
+
+def test_remember_body_ttl_and_dedupe_prune_on_none_but_send_a_zero() -> None:
+    """Zero is a real request for both: expire immediately, and match any entry at all."""
+    assert _wire.remember_body("a", "t", ttl_seconds=3600, dedupe_threshold=0.95) == {
+        "id": "a",
+        "text": "t",
+        "ttl_seconds": 3600,
+        "dedupe_threshold": 0.95,
+    }
+    assert _wire.remember_body("a", "t", ttl_seconds=0, dedupe_threshold=0.0) == {
+        "id": "a",
+        "text": "t",
+        "ttl_seconds": 0,
+        "dedupe_threshold": 0.0,
+    }
+    body = _wire.remember_body("a", "t")
+    assert "ttl_seconds" not in body
+    assert "dedupe_threshold" not in body
+
+
+def test_decode_remember_reports_the_record_actually_written() -> None:
+    """On a dedupe match the server writes a different record than the one asked for."""
+    assert _wire.decode_remember(
+        {"ok": True, "upserted": 1, "id": "older", "deduped": True}, "newer"
+    ) == RememberResult(id="older", upserted=1, deduped=True)
+    # A server predating the echoed fields answers `{ok, upserted}`; naming the record it
+    # did write beats reporting an empty id.
+    assert _wire.decode_remember({"ok": True, "upserted": 1}, "a") == RememberResult(
+        id="a", upserted=1, deduped=False
+    )
 
 
 def test_recall_body() -> None:

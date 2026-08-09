@@ -677,15 +677,56 @@ describe("memory (remember/recall)", () => {
     const out = await db.remember("notes", "a", "the quick brown fox", {
       attrs: { tag: "x", year: 2024 },
     });
-    expect(out).toBeUndefined();
     expect(calls[0]!.url).toBe("http://x/collections/notes/remember");
     expect(calls[0]!.json).toEqual({
       id: "a",
       text: "the quick brown fox",
       attrs: { tag: { Str: "x" }, year: { Int: 2024 } },
     });
-    // `mode` is omitted so the server default ("raw") applies.
-    expect((calls[0]!.json as Record<string, unknown>).mode).toBeUndefined();
+    // `mode`, `ttl_seconds`, and `dedupe_threshold` are omitted so the server's own
+    // defaults ("raw", never expire, no dedupe) apply.
+    const body = calls[0]!.json as Record<string, unknown>;
+    expect(body.mode).toBeUndefined();
+    expect(body.ttl_seconds).toBeUndefined();
+    expect(body.dedupe_threshold).toBeUndefined();
+    // A response that echoes no `id` leaves the requested one standing.
+    expect(out).toEqual({ id: "a", upserted: 1, deduped: false });
+  });
+
+  it("maps ttlSeconds/dedupeThreshold to their snake_case wire keys", async () => {
+    const { fn, calls } = mockFetch({ ok: true, upserted: 1, id: "a", deduped: false });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.remember("notes", "a", "the quick brown fox", {
+      ttlSeconds: 3600,
+      dedupeThreshold: 0.95,
+    });
+    expect(calls[0]!.json).toEqual({
+      id: "a",
+      text: "the quick brown fox",
+      ttl_seconds: 3600,
+      dedupe_threshold: 0.95,
+    });
+  });
+
+  it("sends a zero ttl and a zero dedupe threshold rather than pruning them", async () => {
+    const { fn, calls } = mockFetch({ ok: true, upserted: 1, id: "a", deduped: false });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.remember("notes", "a", "t", { ttlSeconds: 0, dedupeThreshold: 0 });
+    expect(calls[0]!.json).toEqual({
+      id: "a",
+      text: "t",
+      ttl_seconds: 0,
+      dedupe_threshold: 0,
+    });
+  });
+
+  it("reports the id a dedupe match redirected the write onto", async () => {
+    const { fn } = mockFetch({ ok: true, upserted: 1, id: "older", deduped: true });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const out = await db.remember("notes", "newer", "the quick brown fox", {
+      dedupeThreshold: 0.9,
+    });
+    expect(out).toEqual({ id: "older", upserted: 1, deduped: true });
   });
 
   it("sends remember with mode:summarize and no attrs", async () => {

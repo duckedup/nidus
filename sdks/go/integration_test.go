@@ -1036,7 +1036,11 @@ func TestMemoryRoutesWithoutAnEmbedder(t *testing.T) {
 		t.Fatalf("CreateCollection failed: %v", err)
 	}
 
-	err := db.Remember(ctx, "notes", "a", "the quick brown fox", RememberOptions{})
+	// The TTL and dedupe knobs ride along, so a body carrying them still fails as one of
+	// these two rather than as a deserialization error.
+	_, err := db.Remember(ctx, "notes", "a", "the quick brown fox", RememberOptions{
+		TTLSeconds: i64(3600), DedupeThreshold: f32(0.95),
+	})
 	if err == nil {
 		t.Fatal("Remember succeeded on a server with no embedder")
 	}

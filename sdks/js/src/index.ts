@@ -42,6 +42,7 @@ export type {
   RecallOptions,
   RecordInput,
   RememberOptions,
+  RememberResult,
   SearchOptions,
   Stats,
   TextClause,

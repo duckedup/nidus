@@ -33,7 +33,7 @@ from typing import Any, Callable, NamedTuple
 
 import pytest
 
-from nidus import NidusClient, NidusError, f, rank, v
+from nidus import NidusClient, NidusError, RememberResult, f, rank, v
 
 # Canned response payloads, one per shape the client has to decode. Kept beside the
 # endpoint table below so a row and its response read together.
@@ -548,6 +548,24 @@ def test_remember_omits_mode_and_attrs_when_unset() -> None:
     db.remember("notes", "b", "a long article", mode="summarize")
     assert stub.last.json == {"id": "b", "text": "a long article", "mode": "summarize"}
     assert "attrs" not in stub.last.json
+    assert "ttl_seconds" not in stub.last.json
+    assert "dedupe_threshold" not in stub.last.json
+
+
+def test_remember_sends_ttl_and_dedupe_and_returns_what_was_written() -> None:
+    """The knobs reach the wire under their snake_case names, and the result names the
+    record that changed — which a dedupe match makes a *different* one."""
+    stub = StubTransport({"ok": True, "upserted": 1, "id": "older", "deduped": True})
+    out = client(stub).remember(
+        "notes", "newer", "the quick brown fox", ttl_seconds=3600, dedupe_threshold=0.95
+    )
+    assert stub.last.json == {
+        "id": "newer",
+        "text": "the quick brown fox",
+        "ttl_seconds": 3600,
+        "dedupe_threshold": 0.95,
+    }
+    assert out == RememberResult(id="older", upserted=1, deduped=True)
 
 
 def test_recall_defaults_to_an_empty_filter_and_omitted_bounds() -> None:
