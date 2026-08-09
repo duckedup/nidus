@@ -389,3 +389,257 @@ fn backup_and_restore_round_trip_through_the_binary() {
     let report = ok(&["restore", "-i", archive, "--dir", dst, "--yes"], "");
     assert_eq!(report["records"], 3, "{report}");
 }
+
+// ── `nidus remember` / `nidus recall` (#134) ────────────────────────────────
+// Gated like `memory_http.rs`: the mock embedder lives under the `mcp` module and
+// needs `embed-ollama`, so these compile under `--features serve`, not plain `cli`.
+
+/// The `--embed-*` flags pointing every memory subcommand at a mock embedder.
+#[cfg(all(feature = "mcp", feature = "embed-ollama"))]
+fn embed_args(url: &str) -> [String; 4] {
+    [
+        "--embed-provider".into(),
+        "ollama".into(),
+        "--embed-base-url".into(),
+        url.into(),
+    ]
+}
+
+/// Remember then recall, one process each, no server anywhere. The point of #134: a shell
+/// hook can write a fact and read it back without a long-lived `nidus serve`.
+#[cfg(all(feature = "mcp", feature = "embed-ollama"))]
+#[test]
+fn remember_and_recall_round_trip_through_the_binary() {
+    use crate::mcp::support::{DIM, mock_embedder_per_text};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+    let url = mock_embedder_per_text(DIM);
+    let e = embed_args(&url);
+    let (p, b) = (e[0].as_str(), e[1].as_str());
+    let (u, v) = (e[2].as_str(), e[3].as_str());
+
+    // No `--dim`: the store is created at the embedder's own dimension.
+    let out = ok(
+        &[
+            "remember",
+            "--dir",
+            dir,
+            p,
+            b,
+            u,
+            v,
+            "--attrs",
+            r#"{"tag": {"Str": "ops"}}"#,
+            "notes",
+            "the ranking bug is in the upsert path",
+        ],
+        "",
+    );
+    assert_eq!(out["collection"], "notes", "{out}");
+    assert_eq!(
+        out["dimension"], DIM,
+        "dimension comes from the embedder: {out}"
+    );
+    assert_eq!(out["mode"], "Raw", "{out}");
+    let derived = out["id"].as_str().expect("an id").to_string();
+    assert!(derived.starts_with("mem-"), "derived id: {out}");
+
+    let hits = ok(
+        &[
+            "recall",
+            "--dir",
+            dir,
+            p,
+            b,
+            u,
+            v,
+            "-k",
+            "5",
+            "notes",
+            "the ranking bug",
+        ],
+        "",
+    );
+    assert_eq!(ids(&hits), [derived.as_str()], "{hits}");
+    assert_eq!(hits[0]["attrs"]["tag"], json!({"Str": "ops"}), "{hits}");
+    // The raw text is stamped, so a recall hit says what was remembered — and the FTS
+    // schema `remember` declares over that field has something to index.
+    assert_eq!(
+        hits[0]["attrs"]["nidus.text"],
+        json!({"Str": "the ranking bug is in the upsert path"}),
+        "{hits}"
+    );
+
+    // Re-remembering the same text is content-addressed to the same id, so it replaces
+    // that record rather than accumulating a near-duplicate beside it.
+    let again = ok(
+        &[
+            "remember",
+            "--dir",
+            dir,
+            p,
+            b,
+            u,
+            v,
+            "notes",
+            "the ranking bug is in the upsert path",
+        ],
+        "",
+    );
+    assert_eq!(again["id"], derived.as_str(), "content-addressed: {again}");
+    let hits = ok(
+        &[
+            "recall",
+            "--dir",
+            dir,
+            p,
+            b,
+            u,
+            v,
+            "-k",
+            "5",
+            "notes",
+            "the ranking bug",
+        ],
+        "",
+    );
+    assert_eq!(
+        ids(&hits),
+        [derived.as_str()],
+        "one record, not two: {hits}"
+    );
+
+    let found = ok(
+        &[
+            "text-search",
+            "--dir",
+            dir,
+            "-k",
+            "5",
+            "nidus.text",
+            "ranking",
+        ],
+        "",
+    );
+    assert_eq!(
+        ids(&found),
+        [derived.as_str()],
+        "remembered text is searchable: {found}"
+    );
+
+    // An explicit id wins over the derived one, and `--where` filters the recall.
+    ok(
+        &[
+            "remember",
+            "--dir",
+            dir,
+            p,
+            b,
+            u,
+            v,
+            "--id",
+            "manual",
+            "--attrs",
+            r#"{"tag": {"Str": "docs"}}"#,
+            "notes",
+            "the changelog lives in docs",
+        ],
+        "",
+    );
+    let hits = ok(
+        &[
+            "recall",
+            "--dir",
+            dir,
+            p,
+            b,
+            u,
+            v,
+            "-k",
+            "5",
+            "--where",
+            r#"[{"Eq": ["tag", {"Str": "docs"}]}]"#,
+            "notes",
+            "changelog",
+        ],
+        "",
+    );
+    assert_eq!(ids(&hits), ["manual"], "filtered recall: {hits}");
+}
+
+/// `recall` opens read-only, so it answers against a directory a live server holds — the
+/// property that makes it usable from a shell hook on a machine already running nidus.
+#[cfg(all(feature = "mcp", feature = "embed-ollama"))]
+#[test]
+fn recall_runs_against_a_dir_a_server_holds() {
+    use crate::mcp::support::{DIM, per_text_embedder_server};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+    let url = crate::mcp::support::mock_embedder_per_text(DIM);
+    let e = embed_args(&url);
+    let (p, b) = (e[0].as_str(), e[1].as_str());
+    let (u, v) = (e[2].as_str(), e[3].as_str());
+
+    // Seed before the server takes the writer lock.
+    ok(
+        &[
+            "remember",
+            "--dir",
+            dir,
+            p,
+            b,
+            u,
+            v,
+            "--id",
+            "seeded",
+            "notes",
+            "deploys run at noon",
+        ],
+        "",
+    );
+
+    let server = per_text_embedder_server(tmp.path(), DIM);
+    assert_eq!(server.get("/health").0, 200);
+
+    let hits = ok(
+        &[
+            "recall", "--dir", dir, p, b, u, v, "-k", "5", "notes", "deploys",
+        ],
+        "",
+    );
+    assert_eq!(
+        ids(&hits),
+        ["seeded"],
+        "read-only recall beside a writer: {hits}"
+    );
+
+    // `remember`, by contrast, wants the lock the server is holding.
+    let err = fails(
+        &["remember", "--dir", dir, p, b, u, v, "notes", "a new fact"],
+        "",
+    );
+    assert!(err.contains("locked"), "{err}");
+}
+
+/// Both subcommands need an embedder, and the refusal must name the flag that supplies
+/// one — the store is otherwise perfectly openable, so the error is the only signal.
+#[cfg(all(feature = "mcp", feature = "embed-ollama"))]
+#[test]
+fn memory_subcommands_without_an_embedder_name_the_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+
+    for args in [
+        vec!["remember", "--dir", dir, "--dim", "3", "notes", "a fact"],
+        vec!["recall", "--dir", dir, "--dim", "3", "notes", "a fact"],
+    ] {
+        let err = fails(&args, "");
+        assert!(
+            err.contains("--embed-provider"),
+            "{:?} should name the flag: {err}",
+            args[0]
+        );
+    }
+}

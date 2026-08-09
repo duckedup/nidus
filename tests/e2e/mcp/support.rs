@@ -100,7 +100,7 @@ pub(super) fn mock_embedder_fixed(dim: usize) -> String {
 /// A persistent mock answering each request with [`vector_for`] the text carried in that
 /// request's own body, so identical texts embed identically and distinct texts embed apart —
 /// the property [`mock_embedder_fixed`] cannot give a near-duplicate/dedupe test.
-pub(super) fn mock_embedder_per_text(dim: usize) -> String {
+pub(crate) fn mock_embedder_per_text(dim: usize) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock embedder");
     let addr = listener.local_addr().expect("mock embedder addr");
     std::thread::spawn(move || {
