@@ -2,6 +2,21 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+## Core Foundation: Speed, Testing, Stable
+
+Three commitments every change is judged against (SPEC §1 — trading one away is a
+design change, not an implementation detail):
+
+1. **Speed** — the clean build stays in seconds and CI asserts it; dependencies are
+   judged by build-and-ship cost. Never trade this away silently.
+2. **Testing** — verify against the real artifact, never assume (SPEC §11). Every
+   behaviour claim is backed by a test that runs in CI: surfaces only a real binary
+   can prove get e2e tests (`tests/e2e/`), and the SDK↔server contract runs against a
+   real server on every PR (`sdk-integration`). A change without its test is not done,
+   and a bug fix ships with a regression test verified to fail without the fix.
+3. **Stable** — crash safety, CRC'd codecs, graceful resource exhaustion, additive
+   on-disk formats. Weakening any of these is a design change: file an issue first.
+
 ## GitHub Issues
 
 This project tracks work in **GitHub Issues** on `duckedup/nidus`, via the `gh` CLI.
