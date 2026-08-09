@@ -959,6 +959,51 @@ fn auto_compact_triggers_on_open() {
     }
 }
 
+/// #116: a read-only open past the dead-row threshold must open and skip the
+/// compaction — it holds no writer lock to rewrite `data`/`log` with — rather than
+/// die in `check_writable`. A writer opening afterwards still compacts.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn auto_compact_is_skipped_on_a_read_only_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let mut store = Store::open(Config::new(&path, 3).auto_compact(None)).unwrap();
+        store.create_collection("col").unwrap();
+        for (id, v) in [
+            ("a", vec![1.0, 0.0, 0.0]),
+            ("b", vec![0.0, 1.0, 0.0]),
+            ("c", vec![0.0, 0.0, 1.0]),
+        ] {
+            store.upsert("col", &[rec(id, v)]).unwrap();
+        }
+        store
+            .upsert("col", &[rec("a", vec![1.0, 0.0, 0.0])])
+            .unwrap();
+        store
+            .upsert("col", &[rec("b", vec![0.0, 1.0, 0.0])])
+            .unwrap();
+        assert_eq!(store.dead_rows, 2, "2 dead of 5 rows: past a 0.3 threshold");
+    }
+
+    {
+        let store = Store::open(
+            Config::new(&path, 3)
+                .auto_compact(Some(0.3))
+                .open_mode(OpenMode::ReadOnly),
+        )
+        .expect("a read-only open past the threshold must not fail (#116)");
+        assert_eq!(store.dead_rows, 2, "read-only must not compact");
+        assert_eq!(store.get_all("col").len(), 3);
+    }
+
+    {
+        let store = Store::open(Config::new(&path, 3).auto_compact(Some(0.3))).unwrap();
+        assert_eq!(store.dead_rows, 0, "the next writer open still compacts");
+    }
+}
+
 #[cfg_attr(miri, ignore)]
 #[test]
 fn upsert_idempotent_survives_reopen() {

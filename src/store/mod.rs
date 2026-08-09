@@ -427,8 +427,13 @@ impl Store {
         // it from the log, or if a compaction below rewrote `data`/`log` (new watermark).
         let mut tier_stale = !from_tier;
 
-        // 6. Auto-compact if the dead-row ratio exceeds the threshold.
-        if let Some(threshold) = store.config.auto_compact {
+        // 6. Auto-compact if the dead-row ratio exceeds the threshold. Writers only:
+        // a read-only open holds no writer lock and must never rewrite `data`/`log` —
+        // and must not fail either (#116); dead rows cost space, not correctness.
+        let auto_compact = (store.config.open_mode == OpenMode::ReadWrite)
+            .then_some(store.config.auto_compact)
+            .flatten();
+        if let Some(threshold) = auto_compact {
             let total_rows = store.data.row_count() as usize;
             let ratio = store.dead_rows as f32 / total_rows.max(1) as f32;
             if ratio > threshold {
@@ -453,8 +458,8 @@ impl Store {
 
         // 10. Auto-compact for FTS tombstone pressure too: text-only docs occupy no data rows, so
         //     step 6 cannot see their churn and dead postings would grow without bound. Checked
-        //     after the index is built so the ratio is meaningful.
-        if let Some(threshold) = store.config.auto_compact
+        //     after the index is built so the ratio is meaningful. Same writer-only gate as 6.
+        if let Some(threshold) = auto_compact
             && store.fts.tombstone_ratio() > threshold
         {
             store.compact()?;
