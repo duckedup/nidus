@@ -47,11 +47,20 @@ const IMPL_SCHEMA = {
   },
 }
 
+// The group/index prefix is the real key: slug() alone maps src/store, src.store and
+// src-store to one name, and two agents would then overwrite one patch in the shared
+// scratch dir — invisible to git, since each is isolated in its own worktree.
 const slug = dir => dir.replace(/[^A-Za-z0-9]+/g, '_')
+const key = spec => `g${spec._g}-${spec._i}-${slug(spec.dir)}`
+
+// A patch is cut with `git add -A`, so anything the agent touched outside its blueprint
+// rides along. Surface that to the merging thread instead of letting it merge silently.
+const outOfScope = spec => (files) =>
+  (files || []).filter(f => f !== spec.dir && !f.startsWith(spec.dir.replace(/\/*$/, '/')))
 
 function implPrompt(spec, prior) {
-  const patchFile = `${cfg.scratchDir}/${slug(spec.dir)}.patch`
-  const logFile = `${cfg.scratchDir}/${slug(spec.dir)}.verify.log`
+  const patchFile = `${cfg.scratchDir}/${key(spec)}.patch`
+  const logFile = `${cfg.scratchDir}/${key(spec)}.verify.log`
   return `You are implementing ONE blueprint for ${cfg.id} in an isolated git worktree.
 
 BLUEPRINT (implement exactly this, nothing outside its scope):
@@ -70,6 +79,11 @@ ${prior ? `\nYOUR PRIOR ATTEMPT FAILED — fix exactly this, do not start over:\
 When the blueprint is implemented and its lanes pass, write your patch:
     git add -A && git diff --cached > ${patchFile}
 Then return the structured result with patch_file set to "${patchFile}" (or "" if you changed nothing).
+Set files_changed to exactly what that patch contains — read it back with
+    git diff --cached --name-only
+and copy the list verbatim. That patch is cut with \`git add -A\`, so it carries everything in
+this worktree, not only ${spec.dir}. If any file in it sits outside ${spec.dir}, say so in notes
+and why it was unavoidable. Do not hide it and do not hand-edit the patch to remove it.
 Report status 'success' only when the blueprint is fully implemented AND its verification passed;
 'partial' when implemented but a lane still fails; 'blocked' when you could not make the change.`
 }
@@ -102,7 +116,8 @@ const groups = cfg.groups || []
 const results = []
 for (let g = 0; g < groups.length; g++) {
   log(`group ${g + 1}/${groups.length}: ${groups[g].length} blueprint(s)`)
-  results.push(...await parallel(groups[g].map(spec => () => implementOne(spec))))
+  const specs = groups[g].map((spec, i) => ({ ...spec, _g: g, _i: i }))
+  results.push(...await parallel(specs.map(spec => () => implementOne(spec))))
 }
 
 const ok = results.filter(r => r && !r.failed && r.result)
@@ -116,6 +131,9 @@ return {
     dir: r.result.dir,
     patch_file: r.result.patch_file,
     files_changed: r.result.files_changed || [],
+    // Self-reported, so treat it as a pointer for the merging thread to verify against
+    // the patch itself, never as proof the rest of the patch is in scope.
+    out_of_scope: outOfScope(r.spec)(r.result.files_changed),
     attempts: r.attempts,
   })),
   no_change: ok.filter(r => !r.result.patch_file).map(r => r.result.dir),

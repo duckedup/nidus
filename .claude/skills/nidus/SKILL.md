@@ -129,9 +129,12 @@ Needs blueprints. If none exist for this target, run **Spec** first (including i
 4. **You merge — this is not delegated.** For each returned patch:
    `git apply --whitespace=nowarn <patch_file>`. On conflict, resolve it yourself or re-run
    that one unit; never abandon a patch silently.
-5. Revert anything outside the blueprints' scope, then run the full lane set from
-   `nidus-check lanes --json` against the merged tree. Agents passing individually does not
-   mean the merged result passes.
+5. **Check scope before you trust the merge.** A patch is cut with `git add -A`, so it carries
+   everything in that worktree, not just the blueprint's directory. The workflow returns
+   `out_of_scope` per patch, but it is derived from the agent's own `files_changed` — confirm
+   it against the patch itself (`git apply --numstat <patch_file>`) rather than believing it,
+   and revert what does not belong. Then run the full lane set from `nidus-check lanes --json`
+   against the merged tree: agents passing individually does not mean the merged result passes.
 6. Report failures from the workflow with their blockers and log paths, and ask whether to
    investigate, skip, or abort.
 7. On success delete the blueprint files, then continue to **Review**.
