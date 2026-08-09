@@ -296,9 +296,12 @@ export function modGating(libText) {
 // ── 10. Issues this change ships but does not close ────────────────────────
 // A bare mention does not close on merge, so the issue silently outlives the work
 // that finished it (PR #63 found ten such tickets under the previous tracker).
-export function unclosedTickets(mentioned = new Set(), closing = new Set(), titles = {}) {
+// `acknowledged` is a deliberate third state, not a widening of `closing`: `Refs`/`Part of`
+// answer "have you addressed this issue's disposition" without claiming to close it, which
+// is what the finding's own remediation text has always advised.
+export function unclosedTickets(mentioned = new Set(), closing = new Set(), titles = {}, acknowledged = new Set()) {
   return Array.from(mentioned)
-    .filter(ref => !closing.has(ref) && titles[ref])
+    .filter(ref => !closing.has(ref) && !acknowledged.has(ref) && titles[ref])
     .map(ref => finding('stale-ticket', 'warn', 'PR body', 1,
       `${ref} is worked by this change but no Closes line will close it`,
       `"${titles[ref]}". CLAUDE.md: close the ticket in the PR that ships it. Add "Closes ${ref}" to the PR body, or leave it as Refs if this change does not finish it.`))

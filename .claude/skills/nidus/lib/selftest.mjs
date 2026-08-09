@@ -483,6 +483,30 @@ test('lanes: an empty scope does not read as "no lane applies" (#173)', () => {
   eq(empty === inert, false, 'the two answers are distinguishable')
 })
 
+// ── stale-ticket: intent, not every mention ────────────────────────────────
+
+const TITLES = { '#42': 'a real open issue', '#43': 'another open issue' }
+
+test('stale-ticket: an unaddressed issue still warns', () => {
+  eq(ids(laws.unclosedTickets(new Set(['#42']), new Set(), TITLES)), ['stale-ticket'], 'findings')
+})
+
+test('stale-ticket: a Closes line suppresses it', () => {
+  eq(ids(laws.unclosedTickets(new Set(['#42']), new Set(['#42']), TITLES)), [], 'findings')
+})
+
+// The finding's own remediation says "or leave it as Refs", but Refs was not accepted
+// by anything — following the printed advice left the warning exactly where it was.
+test('stale-ticket: an acknowledged ref suppresses it without claiming closure', () => {
+  eq(ids(laws.unclosedTickets(new Set(['#42']), new Set(), TITLES, new Set(['#42']))), [], 'findings')
+})
+
+test('stale-ticket: acknowledging one issue does not silence another', () => {
+  const found = laws.unclosedTickets(new Set(['#42', '#43']), new Set(), TITLES, new Set(['#42']))
+  eq(ids(found), ['stale-ticket'], 'one finding')
+  eq(found[0].summary.startsWith('#43'), true, 'the un-acknowledged one')
+})
+
 // ── fleet ──────────────────────────────────────────────────────────────────
 
 const SELF = { dir: '/r/nidus', commonDir: '/r/nidus/.git', remote: 'git@github.com:duckedup/nidus.git', mainSha: 'aaa', login: 'austin' }
