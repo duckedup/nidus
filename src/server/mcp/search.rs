@@ -9,7 +9,8 @@ use serde_json::{Map, Value as JsonValue, json};
 
 // Imported for its methods on `AnyEmbedder` — a trait method, not inherent.
 use crate::embed::Embedder;
-use crate::memory::{not_expired_predicate, now_ms};
+use crate::memory::not_expired_predicate;
+use crate::meta::now_ms;
 use crate::{Filter, HybridOpts, SearchOpts};
 
 use super::NidusMcp;

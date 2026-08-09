@@ -19,11 +19,11 @@ use ureq::Agent;
 /// confusing failure, so we would rather wait than flake.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Build a `nidus serve` invocation. `dim` and the store location are always needed;
-/// everything else is extra flags.
+/// Build a `nidus serve` invocation. The store location is always needed; `dim` is
+/// omitted only by the tests that prove it can be inferred (#139).
 pub struct Server {
     dir: std::path::PathBuf,
-    dim: usize,
+    dim: Option<usize>,
     args: Vec<String>,
     token: Option<String>,
     env: Vec<(String, String)>,
@@ -44,7 +44,21 @@ impl Server {
     pub fn new(dir: impl Into<std::path::PathBuf>, dim: usize) -> Self {
         Server {
             dir: dir.into(),
-            dim,
+            dim: Some(dim),
+            args: Vec::new(),
+            token: None,
+            env: Vec::new(),
+        }
+    }
+
+    /// A server with no `--dim` at all, so the flag cannot be what resolves the
+    /// dimension. Gated to match `serve_dim`, its only caller, or plain `--features cli`
+    /// sees dead code.
+    #[cfg(all(feature = "mcp", feature = "embed-ollama"))]
+    pub fn without_dim(dir: impl Into<std::path::PathBuf>) -> Self {
+        Server {
+            dir: dir.into(),
+            dim: None,
             args: Vec::new(),
             token: None,
             env: Vec::new(),
@@ -94,8 +108,6 @@ impl Server {
         cmd.arg("serve")
             .arg("--dir")
             .arg(&self.dir)
-            .arg("--dim")
-            .arg(self.dim.to_string())
             // Port 0: the kernel assigns a free port, which the startup line reports.
             .arg("--addr")
             .arg("127.0.0.1:0")
@@ -106,6 +118,9 @@ impl Server {
             .env_clear()
             .envs(std::env::vars().filter(|(k, _)| !k.starts_with("NIDUS_")))
             .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        if let Some(dim) = self.dim {
+            cmd.arg("--dim").arg(dim.to_string());
+        }
         if let Some(token) = &self.token {
             cmd.arg("--token").arg(token);
         }

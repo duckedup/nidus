@@ -682,6 +682,17 @@ Rewrite the store to reclaim `dead_rows` and superseded log records. Returns
 curl -s -X POST localhost:7700/compact   # → {"ok": true}
 ```
 
+An optional body sweeps expired entries first: `{"expired": true}` deletes every
+entry whose `nidus.expires_at` has passed, across every collection, then compacts to
+reclaim the rows it freed, all in one call. A bodyless `POST /compact` (or
+`{"expired": false}`) is still a plain compact with no sweep.
+
+```bash
+curl -s -X POST localhost:7700/compact \
+  -H 'content-type: application/json' \
+  -d '{"expired": true}'   # → {"ok": true}
+```
+
 ### `POST /refresh`
 
 Adopt newer state committed by another instance writing to the same shared store. A

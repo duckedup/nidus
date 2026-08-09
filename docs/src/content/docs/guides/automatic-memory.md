@@ -268,22 +268,20 @@ curl -sS http://127.0.0.1:7700/text-search \
 
 **A TTL hides an entry; it does not reclaim the row.** Expiry is evaluated at read
 time. nidus runs no background threads, so nothing sweeps expired entries on its own
-and the bytes stay on disk until you reclaim them deliberately:
-
-Reclaim through the **running server**, not the CLI: `nidus delete` and `nidus
-compact` open the store read-write and would block on the writer lock `nidus serve`
-already holds, for exactly the reason the stdio transport does:
+and the bytes stay on disk until you reclaim them deliberately. One call finds every
+lapsed entry, deletes it, and compacts the store to reclaim the rows:
 
 ```bash
-NOW=$(( $(date +%s) * 1000 ))
-curl -sS http://127.0.0.1:7700/collections/memories/delete \
+curl -sS -X POST http://127.0.0.1:7700/compact \
   -H 'content-type: application/json' \
-  -d "{\"filter\":[{\"Le\":[\"nidus.expires_at\",{\"DateTime\":$NOW}]}]}"
-curl -sS -X POST http://127.0.0.1:7700/compact
+  -d '{"expired": true}'
 ```
 
-The CLI forms (`nidus delete … --where`, `nidus compact`) are the same operations for
-a store with no server running.
+Reclaim through the **running server**, not the CLI, when one is running: `nidus
+compact` opens the store read-write and would block on the writer lock `nidus serve`
+already holds, for exactly the reason the stdio transport does. `nidus compact
+--expired` is the same operation for a store with no server running (and still blocks
+on the writer lock if one turns out to be running after all).
 
 **TTL is enforced on every memory read, not the raw store routes.** `recall`,
 `text_search`, `hybrid_search`, `browse` and `get` over MCP filter expired entries
@@ -301,6 +299,13 @@ Write it as `Not(Le(…))`, not as `Gt(…)`. Every predicate requires the key t
 **present**, so a bare `Gt` on `nidus.expires_at` is false for an entry that never got
 a TTL, silently hiding every never-expiring memory you have. `Not(Le(…))` is true both
 when the key is absent and when it is in the future, which is the behaviour you want.
+
+This is read-time filtering only, and it deliberately reads the opposite of the sweep
+above. The sweep that reclaims rows (`{"expired": true}` / `--expired`) matches on the
+**un-negated** `Le`: it wants exactly the entries that have a TTL and have passed it,
+never touching one with no `expires_at` at all. A read filter wants the reverse: keep
+everything except those same lapsed entries, including the ones with no TTL. Same
+field, opposite predicate, because the two are answering opposite questions.
 :::
 
 ## Where to next

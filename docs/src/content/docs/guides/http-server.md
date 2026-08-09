@@ -31,8 +31,12 @@ nidus serve --dir ./store --dim 768 --addr 127.0.0.1:7700
 
 `nidus serve` prints its bind address and serves until you stop it with Ctrl-C,
 flushing to disk on the way out. The store directory need not exist yet (the
-first write creates it), but `--dim` is required until it does, because the
-embedding dimension is pinned at creation.
+first write creates it), and for the raw vector routes `--dim` is required until
+it does, because the embedding dimension is pinned at creation. Started with
+`--embed-provider` instead, `--dim` is optional for a store that does not exist
+yet: the embedder already knows its own dimension, so nidus uses that. Either
+way, an existing store's on-disk header wins, and a `--dim` that disagrees with
+it is still a hard error.
 
 Pass `--read-only` to serve without taking the writer lock: a search-only process
 that can run beside a separate writer.
@@ -383,7 +387,7 @@ a container or an orchestrator. An explicit flag always wins over the variable.
 | Variable | Flag | Purpose |
 | --- | --- | --- |
 | `NIDUS_DIR` | `--dir` | Store directory (unused, but still required, with an object store) |
-| `NIDUS_DIM` | `--dim` | Embedding dimension (required to create a store) |
+| `NIDUS_DIM` | `--dim` | Embedding dimension (required to create a store, unless `--embed-provider` supplies one) |
 | `NIDUS_DISTANCE` | `--distance` | `cosine` \| `euclidean` \| `dot` |
 | `NIDUS_PERSISTENCE` | `--persistence` | Where durable bytes live: `s3://…`, `gs://…`, or a local path |
 | `NIDUS_MEMORY` | `--memory` | Shared working set: `redis://…` (or `valkey://…`, …) |

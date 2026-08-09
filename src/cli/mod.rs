@@ -22,7 +22,7 @@ use crate::{
 use std::sync::Arc;
 
 #[cfg(feature = "memory")]
-use crate::embed::{AnyEmbedder, EmbedConfig, EmbedProvider};
+use crate::embed::{AnyEmbedder, EmbedConfig, EmbedProvider, Embedder};
 #[cfg(all(feature = "memory", feature = "summarize"))]
 use crate::summarize::{AnySummarizer, SummarizeConfig, SummarizeProvider};
 
@@ -169,13 +169,7 @@ impl StoreArgs {
     /// against the header on open; otherwise the value comes from an existing store's header. With
     /// neither — no store and no `--dim` — creation cannot proceed.
     fn resolve(&self) -> Result<(usize, Distance)> {
-        // The local-file header peek only applies to a local store; an object-store
-        // location (`s3://`/`gs://`) has no peekable local `data`, so `--dim` is required.
-        let peeked = if self.is_object_store() {
-            None
-        } else {
-            crate::data::peek_header(&self.dir.join("data"))?
-        };
+        let peeked = self.peek()?;
         let dimension = match (self.dim, peeked) {
             (Some(d), _) => d,
             (None, Some((d, _))) => d,
@@ -190,6 +184,15 @@ impl StoreArgs {
             (None, None) => Distance::default(),
         };
         Ok((dimension, distance))
+    }
+
+    /// The `(dimension, distance)` an existing local store already committed to, if any.
+    /// An object-store location has no peekable local `data`, so it reads as absent.
+    fn peek(&self) -> Result<Option<(usize, Distance)>> {
+        if self.is_object_store() {
+            return Ok(None);
+        }
+        crate::data::peek_header(&self.dir.join("data"))
     }
 
     /// Whether `--persistence` names a (non-local) object store.
@@ -311,6 +314,19 @@ impl StoreArgs {
             cfg = cfg.seed(v);
         }
         Some(cfg)
+    }
+
+    /// Take the embedder's dimension when there is no `--dim` and no store yet, so
+    /// `serve --embed-provider …` into a fresh directory needs no dimension flag (#139).
+    #[cfg(feature = "memory")]
+    fn apply_embedder_dim(&mut self, embedder: Option<&AnyEmbedder>) -> Result<()> {
+        if self.dim.is_none()
+            && let Some(e) = embedder
+            && self.peek()?.is_none()
+        {
+            self.dim = Some(e.dimension());
+        }
+        Ok(())
     }
 }
 
@@ -835,6 +851,9 @@ enum Command {
     Compact {
         #[command(flatten)]
         store: StoreArgs,
+        /// First delete every entry whose `nidus.expires_at` has passed (#140).
+        #[arg(long)]
+        expired: bool,
     },
     /// Snapshot a store into a single compressed archive (`.tar.gz`).
     Backup {
@@ -1251,10 +1270,15 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             print_json(&serde_json::json!({ "deleted": n }))
         }
-        Command::Compact { store } => {
+        Command::Compact { store, expired } => {
             let mut db = open(&store, true)?;
-            db.compact()?;
-            print_json(&serde_json::json!({ "ok": true }))
+            if expired {
+                let swept = db.sweep_expired()?;
+                print_json(&serde_json::json!({ "swept": swept }))
+            } else {
+                db.compact()?;
+                print_json(&serde_json::json!({ "ok": true }))
+            }
         }
         Command::Backup {
             dir,
@@ -1418,9 +1442,10 @@ fn timeout_secs(secs: u64) -> Option<std::time::Duration> {
     (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
+#[cfg_attr(not(feature = "memory"), allow(unused_mut))]
 fn serve(
     args: ServeArgs,
-    store: StoreArgs,
+    mut store: StoreArgs,
     #[cfg(feature = "memory")] ingest: IngestArgs,
 ) -> Result<()> {
     let ServeArgs {
@@ -1455,10 +1480,6 @@ fn serve(
     } else {
         OpenMode::ReadWrite
     };
-    // Resolve the config here so a bad flag fails before anything binds, but defer the
-    // OPEN itself to the server: with `--wait-for-lease` it can block indefinitely, and
-    // the listener must already be answering liveness probes while a standby waits.
-    let open_config = store.config(mode)?;
     // An empty --token / NIDUS_TOKEN (clap reads the env var) means no auth.
     let token = token.filter(|t| !t.is_empty());
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1472,6 +1493,13 @@ fn serve(
     let embedder = rt.block_on(ingest.embedder())?;
     #[cfg(all(feature = "memory", feature = "summarize"))]
     let summarizer = rt.block_on(ingest.summarizer())?;
+
+    #[cfg(feature = "memory")]
+    store.apply_embedder_dim(embedder.as_deref())?;
+    // Resolve the config here so a bad flag fails before anything binds, but defer the
+    // OPEN itself to the server: with `--wait-for-lease` it can block indefinitely, and
+    // the listener must already be answering liveness probes while a standby waits.
+    let open_config = store.config(mode)?;
 
     let cfg = crate::server::ServeConfig {
         addr,
@@ -1497,7 +1525,7 @@ fn serve(
 /// `nidus mcp`: speak MCP over stdio. Always opens read-write — there is exactly one
 /// client and no reason to run a memory server it cannot write to.
 #[cfg(feature = "mcp")]
-fn mcp(store: StoreArgs, #[cfg(feature = "memory")] ingest: IngestArgs) -> Result<()> {
+fn mcp(mut store: StoreArgs, #[cfg(feature = "memory")] ingest: IngestArgs) -> Result<()> {
     // Honour `--read-only` as `serve` does: a reader that never takes the writer lock is a
     // legitimate way to run this alongside a writer. `remember`/`forget` then fail honestly.
     let mode = if store.read_only {
@@ -1505,7 +1533,6 @@ fn mcp(store: StoreArgs, #[cfg(feature = "memory")] ingest: IngestArgs) -> Resul
     } else {
         OpenMode::ReadWrite
     };
-    let open_config = store.config(mode)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -1514,6 +1541,10 @@ fn mcp(store: StoreArgs, #[cfg(feature = "memory")] ingest: IngestArgs) -> Resul
     let embedder = rt.block_on(ingest.embedder())?;
     #[cfg(all(feature = "memory", feature = "summarize"))]
     let summarizer = rt.block_on(ingest.summarizer())?;
+
+    #[cfg(feature = "memory")]
+    store.apply_embedder_dim(embedder.as_deref())?;
+    let open_config = store.config(mode)?;
 
     let cfg = crate::server::StdioConfig {
         #[cfg(feature = "memory")]
@@ -2477,5 +2508,107 @@ mod tests {
         };
         let err = args.resolve().unwrap_err().to_string();
         assert!(err.contains("--dim"), "unexpected error: {err}");
+    }
+
+    /// `peek()` must defer to `is_object_store()` before ever touching the local
+    /// filesystem, even when a stray local `data` file happens to exist.
+    #[test]
+    fn peek_ignores_local_data_under_object_store_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let cfg = Config::new(dir.path().to_path_buf(), 5);
+            Nidus::open(cfg).unwrap();
+        }
+        assert!(
+            dir.path().join("data").exists(),
+            "local store must have written a data file"
+        );
+        let args = StoreArgs {
+            dir: dir.path().to_path_buf(),
+            persistence: Some("s3://bucket/store".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(args.peek().unwrap(), None);
+    }
+
+    #[test]
+    fn compact_parses_expired_flag() {
+        let cli =
+            Cli::try_parse_from(["nidus", "compact", "--dir", "/tmp/s", "--expired"]).unwrap();
+        match cli.command {
+            Command::Compact { expired, .. } => assert!(expired),
+            _ => panic!("expected Compact"),
+        }
+
+        let cli = Cli::try_parse_from(["nidus", "compact", "--dir", "/tmp/s"]).unwrap();
+        match cli.command {
+            Command::Compact { expired, .. } => assert!(!expired),
+            _ => panic!("expected Compact"),
+        }
+    }
+
+    /// A minimal `AnyEmbedder` built synchronously (Voyage's constructor only does a
+    /// static model→dimension lookup, no network call), for the `apply_embedder_dim` tests.
+    #[cfg(all(feature = "memory", feature = "embed-voyage"))]
+    fn test_embedder() -> AnyEmbedder {
+        AnyEmbedder::Voyage(
+            crate::embed::voyage::VoyageEmbedder::new(EmbedConfig::new("voyage-3").api_key("k"))
+                .unwrap(),
+        )
+    }
+
+    #[cfg(all(feature = "memory", feature = "embed-voyage"))]
+    #[test]
+    fn apply_embedder_dim_fills_in_on_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let embedder = test_embedder();
+        let mut args = StoreArgs {
+            dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        args.apply_embedder_dim(Some(&embedder)).unwrap();
+        assert_eq!(args.dim, Some(embedder.dimension()));
+    }
+
+    #[cfg(all(feature = "memory", feature = "embed-voyage"))]
+    #[test]
+    fn apply_embedder_dim_does_not_override_existing_store_header() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let cfg = Config::new(dir.path().to_path_buf(), 5);
+            Nidus::open(cfg).unwrap();
+        }
+        let embedder = test_embedder();
+        assert_ne!(
+            embedder.dimension(),
+            5,
+            "test needs a mismatching dimension"
+        );
+        let mut args = StoreArgs {
+            dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        args.apply_embedder_dim(Some(&embedder)).unwrap();
+        assert_eq!(args.dim, None, "the header wins, so --dim stays unset");
+        assert_eq!(args.resolve().unwrap(), (5, Distance::default()));
+    }
+
+    #[cfg(all(feature = "memory", feature = "embed-voyage"))]
+    #[test]
+    fn apply_embedder_dim_does_not_override_explicit_dim() {
+        let dir = tempfile::tempdir().unwrap();
+        let embedder = test_embedder();
+        assert_ne!(
+            embedder.dimension(),
+            7,
+            "test needs a mismatching dimension"
+        );
+        let mut args = StoreArgs {
+            dir: dir.path().to_path_buf(),
+            dim: Some(7),
+            ..Default::default()
+        };
+        args.apply_embedder_dim(Some(&embedder)).unwrap();
+        assert_eq!(args.dim, Some(7));
     }
 }

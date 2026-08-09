@@ -195,7 +195,7 @@ impl NidusMcp {
         // guard via `with_ttl_guard`; reusing `filter::matches` keeps the absent-key
         // semantics in one place.
         let guard = crate::Filter(vec![crate::memory::not_expired_predicate(
-            crate::memory::now_ms(),
+            crate::meta::now_ms(),
         )]);
         let record = record.filter(|r| crate::filter::matches(&guard, &r.attrs));
 
