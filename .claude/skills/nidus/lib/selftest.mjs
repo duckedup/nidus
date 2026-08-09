@@ -3,7 +3,7 @@
 
 import * as laws from './laws.mjs'
 import * as fleet from './fleet.mjs'
-import { lanes } from './lanes.mjs'
+import { lanes, formatLanes } from './lanes.mjs'
 
 const cases = []
 const test = (name, fn) => cases.push({ name, fn })
@@ -412,6 +412,75 @@ test('lanes: each SDK lane runs every step its CI job runs (#172)', () => {
   for (const step of ['ruff check', 'ruff format --check', 'mypy src', 'pytest']) {
     eq(py.includes(step), true, `python lane runs ${step}`)
   }
+})
+
+// ── #173: a check must not report success without having run ───────────────
+
+test('laws: an empty changeset is itself a finding, not a clean result', () => {
+  const out = laws.emptyScope([], 'range')
+  eq(out.length, 1, 'one finding')
+  eq(out[0].id, 'empty-scope', 'id')
+})
+
+test('laws: a non-empty changeset reports no empty-scope finding', () => {
+  eq(laws.emptyScope(['src/lib.rs'], 'range').length, 0, 'silent when there is work')
+})
+
+// The asymmetry this closes: the scope disclosure used to be printed only when there
+// were no findings, so any finding hid it. Assert both together rather than inferring it.
+test('laws: the empty scope is reported even when another finding is present', () => {
+  const other = laws.commentCap('// a\n// b\n// c\n// d\nfn f() {}\n', null, 'src/x.rs')
+  eq(other.length > 0, true, 'fixture really does produce a finding')
+  const all = [...laws.emptyScope([], 'range'), ...other]
+  eq(all.filter(f => f.id === 'empty-scope').length, 1, 'empty-scope survives alongside it')
+})
+
+// Three distinct versions on purpose: base 0.58, head 0.59, origin/main 0.60. A
+// two-version fixture passes under both the old and the new logic and proves nothing.
+const CARGO = v => `[package]\nname = "nidus"\nversion = "${v}"\n`
+
+test('laws: a version below origin/main is caught (#173)', () => {
+  const out = laws.versionBackwards(CARGO('0.59.0'), CARGO('0.60.0'), ['Cargo.toml'])
+  eq(out.length, 1, 'one finding')
+  eq(out[0].id, 'version-backwards', 'id')
+  eq(out[0].severity, 'error', 'error, not a warning')
+})
+
+// The case both existing laws pass clean: base != head, so versionBump is satisfied and
+// docsVersionSync then checks the snippet against head, which matches. Neither can see it.
+test('laws: the backwards case slips past versionBump and docsVersionSync (#173)', () => {
+  const base = CARGO('0.60.0'), head = CARGO('0.59.0')
+  eq(laws.versionBump(base, head, ['src/lib.rs']).length, 0, 'versionBump sees a bump')
+  eq(laws.docsVersionSync(base, head, { 'README.md': 'nidus = "0.59"' }).length, 0, 'snippet matches head')
+  eq(laws.versionBackwards(head, CARGO('0.60.0'), ['Cargo.toml']).length, 1, 'only the new law catches it')
+})
+
+test('laws: a version at or above origin/main is fine', () => {
+  eq(laws.versionBackwards(CARGO('0.61.0'), CARGO('0.60.0'), ['Cargo.toml']).length, 0, 'ahead')
+  eq(laws.versionBackwards(CARGO('0.60.0'), CARGO('0.60.0'), ['Cargo.toml']).length, 0, 'equal')
+  eq(laws.versionBackwards(CARGO('0.10.0'), CARGO('0.9.0'), ['Cargo.toml']).length, 0, 'numeric, not lexical')
+})
+
+// A branch that never touches Cargo.toml cannot move the version backwards: the merge
+// keeps main's value. Firing there would nag every skill-only PR into a false bump.
+test('laws: an untouched Cargo.toml is not a backwards version', () => {
+  eq(laws.versionBackwards(CARGO('0.58.0'), CARGO('0.60.0'), ['.claude/skills/nidus/SKILL.md']).length, 0, 'not touched')
+})
+
+// The lanes half of #173, and the more dangerous half: a missing lane costs the
+// verification itself, not just a misread report. Structural, so --json carries it too.
+test('lanes: the result states how many files it examined (#173)', () => {
+  eq(lanes([]).examined, 0, 'nothing examined')
+  eq(lanes(['src/lib.rs', 'src/store/read.rs']).examined, 2, 'counts what it was given')
+})
+
+// "No automated lane applies" over zero files and over a file that genuinely needs no
+// lane must not print the same thing — one is an answer, the other is an empty question.
+test('lanes: an empty scope does not read as "no lane applies" (#173)', () => {
+  const empty = formatLanes(lanes([]))
+  const inert = formatLanes(lanes(['LICENSE']))
+  eq(/examined 0 file/i.test(empty), true, `empty scope is disclosed: ${empty}`)
+  eq(empty === inert, false, 'the two answers are distinguishable')
 })
 
 // ── fleet ──────────────────────────────────────────────────────────────────
