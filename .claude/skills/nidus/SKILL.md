@@ -127,9 +127,9 @@ Needs blueprints. If none exist for this target, run **Spec** first (including i
    applies them before it starts, because that dependency is the only reason it is a later
    group. So put a blueprint in group N+1 exactly when it needs group N's code to exist —
    "implement the thing" then "test the thing" is the usual split.
-   Each agent is sonnet, runs in its own worktree, verifies itself (a nidus worktree is a
-   complete checkout, so its lanes really do run), and returns a patch. Tell the user to watch
-   with `/workflows`.
+   Each agent is sonnet, runs in its own worktree, and returns a patch. They do **not** build
+   or run lanes — see "Workers do not build" under Fleet; you verify once, on the merged tree.
+   Tell the user to watch with `/workflows`.
 4. **You merge — this is not delegated.** For each returned patch:
    `git apply --whitespace=nowarn <patch_file>`. On conflict, resolve it yourself or re-run
    that one unit; never abandon a patch silently.
