@@ -267,12 +267,7 @@ where
         .await
         .context("server error");
 
-    // Best-effort durability flush on a clean shutdown (no-op if never opened).
-    if let Ok(mut db) = state.db.write()
-        && let Some(db) = db.as_mut()
-    {
-        let _ = db.flush();
-    }
+    shutdown_store(&state.db);
 
     // A failed open outranks the serve result: it is the actual cause.
     if let Some(e) = open_failed.write().ok().and_then(|mut f| f.take()) {
@@ -336,13 +331,34 @@ where
         _ = shutdown_signal() => Ok(()),
     };
 
-    // Best-effort durability flush on a clean shutdown (no-op if never opened this far).
-    if let Ok(mut db) = slot.write()
-        && let Some(db) = db.as_mut()
-    {
-        let _ = db.flush();
-    }
+    shutdown_store(&slot);
     served
+}
+
+/// Flush, then persist the derived ann/fts caches, on a clean shutdown. Both are
+/// best-effort: a failure warns and the next open rebuilds, and an interrupted persist is
+/// harmless because a torn cache fails its CRC and is discarded rather than adopted.
+fn shutdown_store(slot: &Arc<RwLock<Option<Nidus>>>) {
+    let Ok(mut guard) = slot.write() else { return };
+    let Some(db) = guard.as_mut() else { return };
+    if let Err(e) = db.flush() {
+        crate::diag::diag!(
+            crate::diag::Level::Warn,
+            "shutdown",
+            "flush failed",
+            "err" => format!("{e:#}"),
+        );
+    }
+    // Without this the store reopens correct but cold, silently paying a full index
+    // rebuild — the ~0.05s warm open in performance.md needs no out-of-band call (#142).
+    if let Err(e) = db.persist_index() {
+        crate::diag::diag!(
+            crate::diag::Level::Warn,
+            "shutdown",
+            "persisting the index cache failed",
+            "err" => format!("{e:#}"),
+        );
+    }
 }
 
 /// Warn at startup when the bind address makes the security posture worse than the

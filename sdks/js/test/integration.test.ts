@@ -29,6 +29,24 @@ try {
 const PORT = 7799;
 const baseUrl = `http://127.0.0.1:${PORT}`;
 
+// SIGTERM, then SIGKILL if it will not go — mirroring the Go suite's 5s escalation
+// and Python's `wait(timeout=10)`. Returns only once the child has actually exited.
+async function stopServer(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  child.kill("SIGTERM");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    exited,
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, 5000);
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  await exited;
+}
+
 describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
   let server: ChildProcess;
   let dir: string;
@@ -58,8 +76,11 @@ describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
     throw new Error(`nidus serve did not become ready in time (${last})`);
   });
 
-  afterAll(() => {
-    server?.kill("SIGTERM");
+  afterAll(async () => {
+    // Wait for exit before removing the directory: a graceful shutdown persists the
+    // ann/fts caches into it, so tearing it down mid-write races the writer and fails
+    // with ENOTEMPTY. The Go and Python suites already wait; this one did not.
+    if (server) await stopServer(server);
     if (dir) rmSync(dir, { recursive: true, force: true });
   });
 

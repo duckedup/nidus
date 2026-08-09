@@ -332,6 +332,36 @@ fn sigterm_flushes_and_releases_the_lock() {
     assert_eq!(hits[0]["id"], "b", "attrs and vectors survived the restart");
 }
 
+/// A graceful shutdown persists the derived ANN cache, not just the durable data. The
+/// bug this pins is silent: without it the store reopens correct but rebuilds the index,
+/// so only the cache object's presence distinguishes the two (#142).
+#[cfg(unix)]
+#[test]
+fn sigterm_persists_the_ann_cache() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let server = Server::new(dir.path(), 3).args(["--ann", "hnsw"]).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(server.post("/collections/docs/upsert", &records()).0, 200);
+    assert!(
+        !dir.path().join("ann").exists(),
+        "nothing should have persisted the cache before shutdown"
+    );
+    assert!(server.shutdown(), "clean shutdown should exit successfully");
+
+    assert!(
+        dir.path().join("ann").exists(),
+        "SIGTERM should persist the ANN cache so the next open is warm"
+    );
+
+    // The adopted cache must also be complete: a short one would still search, so assert
+    // the last-written record comes back rather than only that the object exists.
+    let restarted = Server::new(dir.path(), 3).args(["--ann", "hnsw"]).start();
+    let (status, hits) = restarted.post("/search", &json!({"query": [0, 1, 0], "top_k": 1}));
+    assert_eq!(status, 200);
+    assert_eq!(hits[0]["id"], "b", "the persisted cache covers every row");
+}
+
 /// SIGKILL is the crash path: nothing flushes and the lock file is left behind. The
 /// per-batch fsync default means acknowledged writes still survive, and `--lock-ttl`
 /// governs when the stale lock may be reclaimed.

@@ -642,7 +642,8 @@ the next `open()` *loads* it instead of rebuilding. The same call also writes th
 full-text index's `fts` cache when a collection declares one, so it is worth calling
 even on a store with no ANN index at all. It's an explicit, out-of-band operation
 (also triggered by `compact()`), never on the `upsert`/`flush` write path,
-so storage stays fast. Call it before shutting down a long-lived handle. `open()`
+so storage stays fast. `nidus serve` and `nidus mcp` call it for you on a clean
+shutdown, so only an embedded handle needs the explicit call before it is dropped. `open()`
 incrementally catches up any rows added since the cache was written, and silently
 rebuilds if the cache is missing, stale, or for a different config. The caches are
 derived data: deleting the `ann` or `fts` file only costs a one-time rebuild.
