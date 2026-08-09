@@ -96,6 +96,8 @@ function runLaws() {
 // than in a context that cannot clear itself.
 const PLAN = '.claude/fleet-plan.json'
 
+const mainVersion = () => (git.sh('git show origin/main:Cargo.toml', { allowFail: true }).match(/^version\s*=\s*"([^"]+)"/m) || [])[1] || null
+
 function runFleet() {
   const explicit = flag('plan')
   const planPath = typeof explicit === 'string' ? explicit : PLAN
@@ -116,6 +118,7 @@ function runFleet() {
     ...fleet.issueFindings(peers, issues, { login: self.login }),
     ...fleet.overlapFindings(peers),
     ...fleet.orphanFindings(trees, peers, self),
+    ...fleet.versionFindings(git.inflightVersions(), mainVersion(), git.releasedTags(), git.openPrRefs()),
   ]
   const state = fleet.rehydrate(peers, issues, trees)
 
@@ -139,7 +142,8 @@ const USAGE = `nidus-check — deterministic checks for this repo's laws and ver
   nidus-check fleet  [--plan <file.json>] [--status] [--json] [--strict]
       Is this dispatch safe? Shared working trees, foreign remotes, dirty or stale
       peer clones, tickets that are closed/taken/already-PR'd or queued twice,
-      files two peers both claim, and worktrees left behind by finished agents.
+      files two peers both claim, worktrees left behind by finished agents, and
+      two in-flight branches claiming one Cargo.toml version.
       Defaults to .claude/fleet-plan.json, which is the coordinator's durable
       state: everything else is derived, so a cleared session rehydrates with one
       run. --status prints just that derived state. The plan is

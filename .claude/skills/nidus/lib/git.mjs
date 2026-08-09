@@ -217,3 +217,27 @@ export function issueTitles(refs) {
   }
   return out
 }
+
+// Branches that are ahead of main, with the version each one claims. Two claiming
+// the same version is invisible from inside either tree.
+export function inflightVersions(dir = process.cwd()) {
+  const refs = inDir(dir, "for-each-ref --format='%(refname:short)' refs/remotes/origin").split('\n').filter(Boolean)
+  const out = []
+  for (const ref of refs) {
+    if (/\/(HEAD|main)$/.test(ref)) continue
+    if (inDir(dir, `merge-base --is-ancestor ${ref} origin/main && echo merged`) === 'merged') continue
+    const cargo = inDir(dir, `show ${ref}:Cargo.toml`)
+    const v = cargo.match(/^version\s*=\s*"([^"]+)"/m)
+    if (v) out.push({ ref, version: v[1] })
+  }
+  return out
+}
+
+export function releasedTags(dir = process.cwd()) {
+  return new Set(inDir(dir, "tag -l v*").split('\n').filter(Boolean))
+}
+
+export function openPrRefs() {
+  const raw = sh('gh pr list --state open --limit 200 --json headRefName', { allowFail: true })
+  try { return new Set(JSON.parse(raw || '[]').map(p => p.headRefName)) } catch { return new Set() }
+}

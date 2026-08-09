@@ -553,6 +553,44 @@ test('fleet: an issue closed with no PR still reads as shipped', () => {
   eq(rows[0].state, 'shipped', 'state')
 })
 
+test('fleet: two branches claiming one version is an error', () => {
+  const inflight = [{ ref: 'origin/a', version: '0.57.0' }, { ref: 'origin/b', version: '0.57.0' }]
+  const found = fleet.versionFindings(inflight, '0.56.1', new Set(['v0.56.1']))
+  eq(ids(found), ['fleet-version-collision'], 'findings')
+})
+
+test('fleet: a long-landed branch below main is not in flight', () => {
+  const stale = [{ ref: 'origin/old-a', version: '0.12.0' }, { ref: 'origin/old-b', version: '0.12.0' }]
+  eq(ids(fleet.versionFindings(stale, '0.56.1', new Set())), [], 'squash-merged branches stay quiet')
+})
+
+test('fleet: a branch with an open PR is in flight even at main version', () => {
+  const b = [{ ref: 'origin/live', version: '0.56.1' }]
+  eq(ids(fleet.versionFindings(b, '0.56.1', new Set(), new Set(['live']))), ['fleet-version-stale'], 'findings')
+})
+
+test('fleet: distinct versions ahead of main are clean', () => {
+  const inflight = [{ ref: 'origin/a', version: '0.57.0' }, { ref: 'origin/b', version: '0.58.0' }]
+  eq(ids(fleet.versionFindings(inflight, '0.56.1', new Set(['v0.56.1']))), [], 'findings')
+})
+
+test('fleet: a branch with a PR but no bump ships no release', () => {
+  const pr = new Set(['a'])
+  eq(ids(fleet.versionFindings([{ ref: 'origin/a', version: '0.56.1' }], '0.56.1', new Set(), pr)), ['fleet-version-stale'], 'equal')
+  eq(ids(fleet.versionFindings([{ ref: 'origin/a', version: '0.56.0' }], '0.56.1', new Set(), pr)), ['fleet-version-stale'], 'behind')
+})
+
+test('fleet: an already-tagged version is caught before the stale check', () => {
+  const found = fleet.versionFindings([{ ref: 'origin/a', version: '0.56.1' }], '0.56.1', new Set(['v0.56.1']), new Set(['a']))
+  eq(ids(found), ['fleet-version-released'], 'findings')
+})
+
+test('fleet: version compare is numeric, not lexical', () => {
+  eq(ids(fleet.versionFindings([{ ref: 'origin/a', version: '0.10.0' }], '0.9.0', new Set())), [], '0.10 > 0.9 and alone')
+  const two = [{ ref: 'origin/a', version: '0.10.0' }, { ref: 'origin/b', version: '0.9.1' }]
+  eq(ids(fleet.versionFindings(two, '0.9.0', new Set())), [], 'both ahead, both distinct')
+})
+
 export function selftest({ json = false } = {}) {
   const failures = []
   for (const c of cases) {
