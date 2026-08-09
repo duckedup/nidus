@@ -54,67 +54,32 @@ jobs:
           fi
 
   # clippy, test, and the release build are separate compiles (check-mode vs
-  # build-mode artifacts vs the release profile), so run them as parallel jobs
-  # instead of one sequential job. Each keeps its own cache slot. nidus is pure
-  # Rust with a tiny dependency tree, so every one of these is a seconds-long build.
+  # build-mode artifacts vs the release profile), so they stay parallel jobs with a
+  # cache slot each. Within a job the feature sets share one `target`, which is why
+  # collapsing them costs latency but not much CPU.
   #
-  # The first three jobs build the pure library (default features) — the fast,
-  # FFI-free core path. The `*-cli` jobs add `--features cli`, which pulls the
-  # binary-only deps (clap + the tokio/axum stack) and compiles the `nidus`
-  # binary + its lean (raw-endpoint-only) server. The `*-serve` jobs add
-  # `--features serve` (the shipped binary: `cli` + the full ingest layer), which
-  # compiles the text-native `/remember` + `/recall` routes and drives them
-  # offline against in-process mocks. The `*-ingest` jobs add the off-by-default
-  # AI ingest layer (`--features memory,embed-all,summarize-all`), which pulls the
-  # async network edge (reqwest → hyper → rustls/ring). Keeping every non-core
-  # feature set on its own lane means a core-only change never waits on a heavier
-  # compile, and the library's purity is checked on its own. (Miri stays on the
-  # pure path below — it can run neither the async server nor the async ingest edge.)
-  build:
-    name: ${{ matrix.name }}
+  # One job per kind of check, each covering every feature set as its own named step
+  # (#189). The names `clippy` and `test` are load-bearing: `main`'s ruleset requires
+  # them, so a required `test` now genuinely runs the CLI, server and ingest layers
+  # rather than the pure library alone.
+  #
+  # Feature sets: the default build is the pure, FFI-free library. `cli` adds the binary
+  # deps (clap + tokio/axum). `serve` is the shipped binary (`cli` plus the full ingest
+  # layer's routes). The last adds the off-by-default AI ingest edge (reqwest → hyper →
+  # rustls/ring). Miri stays on its own job below: it can run neither async edge.
+  #
+  # Steps carry `if: !cancelled()` so one run reports every broken feature set instead of
+  # stopping at the first, which is what `fail-fast: false` bought across the old matrix.
+  # A failed step still fails the job.
+  clippy:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: clippy
-            components: clippy
-            command: cargo clippy --all-targets -- -D warnings
-          - name: test
-            components: ""
-            command: cargo test
-          - name: release
-            components: ""
-            command: cargo build --release
-          - name: clippy-cli
-            components: clippy
-            command: cargo clippy --all-targets --features cli -- -D warnings
-          - name: test-cli
-            components: ""
-            command: cargo test --features cli
-          - name: clippy-serve
-            components: clippy
-            command: cargo clippy --all-targets --features serve -- -D warnings
-          - name: test-serve
-            components: ""
-            command: cargo test --features serve
-          - name: clippy-ingest
-            components: clippy
-            command: cargo clippy --all-targets --features memory,embed-all,summarize-all -- -D warnings
-          - name: test-ingest
-            components: ""
-            command: cargo test --features memory,embed-all,summarize-all
     steps:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: ${{ matrix.components }}
+          components: clippy
 
-      # First-party cache with restore-keys. A Cargo.lock change misses the exact
-      # key but falls back to the newest prior cache, so cargo reuses unchanged
-      # deps and only the workspace crate recompiles. registry/src is omitted
-      # (re-extracted from registry/cache) to keep the cache small.
       - uses: actions/cache@v5
         with:
           path: |
@@ -122,11 +87,81 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.name }}-
+            ${{ runner.os }}-cargo-clippy-
 
-      - run: ${{ matrix.command }}
+      - name: pure library (default features)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: cli
+        if: ${{ !cancelled() }}
+        run: cargo clippy --all-targets --features cli -- -D warnings
+      - name: serve
+        if: ${{ !cancelled() }}
+        run: cargo clippy --all-targets --features serve -- -D warnings
+      - name: ingest
+        if: ${{ !cancelled() }}
+        run: cargo clippy --all-targets --features memory,embed-all,summarize-all -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+
+      - name: pure library (default features)
+        run: cargo test
+      - name: cli
+        if: ${{ !cancelled() }}
+        run: cargo test --features cli
+      - name: serve
+        if: ${{ !cancelled() }}
+        run: cargo test --features serve
+      - name: ingest
+        if: ${{ !cancelled() }}
+        run: cargo test --features memory,embed-all,summarize-all
+
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: pure library (default features)
+        run: cargo build --release
+      - name: cli
+        if: ${{ !cancelled() }}
+        run: cargo build --release --features cli
+      - name: serve
+        if: ${{ !cancelled() }}
+        run: cargo build --release --features serve
+      - name: ingest
+        if: ${{ !cancelled() }}
+        run: cargo build --release --features memory,embed-all,summarize-all
 
   # Bit-rot guard for the benchmark crate. `default-members = ["."]` means neither
   # `cargo test` nor any lane above ever compiles `nidus-bench` — which is right (it
@@ -170,7 +205,7 @@ jobs:
   #      already present for ureq/redis — with NO aws-lc-sys and NO OpenSSL (the
   #      multi-minute C trees nidus exists to avoid).
   # It complements the compile-time `cfg` invariant in tests/build_thesis.rs
-  # (built on the `test` and `test-ingest` lanes above). `-e no-dev` excludes
+  # (built by the `test` job's default-features and ingest steps above). `-e no-dev` excludes
   # dev-dependencies so a test-only crate can never mask a real regression.
   build-thesis:
     name: build-thesis (dep-absence guard)
