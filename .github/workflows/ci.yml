@@ -383,3 +383,45 @@ jobs:
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks"
         run: cargo miri test
+
+  # The checker that decides which lanes a change needs and which repo laws it breaks
+  # was never run by CI (#183), so every law and every selftest case was advisory. Two
+  # jobs, because they answer different questions and carry different risk.
+
+  # The detectors themselves. Pure functions over fixtures: no repository state, no
+  # network, no `gh`. #179 and #182 both rest entirely on cases in here, and until now
+  # nothing ran them, so a later PR could delete one and go green.
+  checker-selftest:
+    name: nidus-check selftest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: .claude/skills/nidus/bin/nidus-check selftest
+
+  # The laws, against the PR's own diff. Deliberately NOT `--strict`: plain `laws` exits
+  # non-zero on `severity: 'error'` alone (check.mjs:100), which is the policy we want.
+  # `--strict` also fails on warnings, and `stale-ticket` warns for every open issue a PR
+  # merely references, so it would fail most PRs and get switched off.
+  checker-laws:
+    name: nidus-check laws
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: the laws compare a merge base to a head, and a shallow clone has
+      # no merge base to find.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      # `--pr` over `--base`: it reads the PR's real base ref rather than assuming main,
+      # and fetches what it needs itself. It also gives the ticket laws the PR body,
+      # which is where a `Closes` line actually lives.
+      - name: Check repo laws
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .claude/skills/nidus/bin/nidus-check laws --pr ${{ github.event.pull_request.number }}
