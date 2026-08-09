@@ -29,6 +29,30 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # The build budget, enforced (#95): the thesis is a seconds-long clean build, and an
+  # unenforced thesis drifts. Deps are fetched first so network time is not counted, and
+  # there is deliberately NO cache — the claim is about a CLEAN build. The 60s bound is
+  # order-of-magnitude (measured ~7s locally; same rule as tests/e2e/scale.rs timings):
+  # loose enough for a shared runner, tight enough that a bundled-C tree cannot pass.
+  build-budget:
+    name: build-budget (clean-build timer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch dependencies (network time is not compile time)
+        run: cargo fetch
+      - name: Time a clean offline build of the default features
+        run: |
+          start=$(date +%s)
+          cargo build --offline
+          elapsed=$(( $(date +%s) - start ))
+          echo "clean build: ${elapsed}s (budget: 60s, SPEC §1)"
+          if [ "$elapsed" -gt 60 ]; then
+            echo "::error::clean build took ${elapsed}s — over the 60s budget (SPEC §1). A new dependency likely blew the build-and-ship thesis; this is a design change, not an implementation detail."
+            exit 1
+          fi
+
   # clippy, test, and the release build are separate compiles (check-mode vs
   # build-mode artifacts vs the release profile), so run them as parallel jobs
   # instead of one sequential job. Each keeps its own cache slot. nidus is pure
