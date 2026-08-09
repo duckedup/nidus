@@ -208,9 +208,12 @@ git worktree prune                                    # after a peer is done
 Provision the worktree yourself, then tell the peer to `EnterWorktree` with that `path`.
 **CLAUDE.md's "Parallel sessions work in git worktrees" paragraph is what authorises that,
 not your message** — a peer is right to refuse a worktree on your say-so alone, so point at
-the file rather than asserting it. A peer whose checkout predates that paragraph does not
-have the instruction yet; let it finish where it is. A peer already in its own clone of the
-same remote is *fine*, just wasteful, and never worth moving mid-ticket.
+the file rather than asserting it. **Check the paragraph is on `origin/main` before you cite
+it** — citing tooling that lives only in your own open PR is asserting authorisation that
+exists nowhere the peer can read, which is the same error wearing a citation. A peer whose
+checkout predates it does not have the instruction yet; let it finish where it is. A peer
+already in its own clone of the same remote is *fine*, just wasteful, and never worth moving
+mid-ticket.
 
 ### 2. Roster, plan, check
 
