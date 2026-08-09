@@ -15,10 +15,17 @@ use serde::Serialize;
 use crate::backend::{Persistence, open_object_location};
 use crate::{Config, Nidus, OpenMode};
 
-/// Source-of-truth objects that make up the durable, portable state of a store.
-const ARCHIVED: [&str; 2] = ["data", "log"];
-/// Embedded manifest entry name (informational; restore tolerates its absence).
+/// Embedded report entry name (informational; restore tolerates its absence).
 const MANIFEST: &str = "nidus-backup.json";
+
+/// Is `name` part of a store's durable object set? (`ann`/`fts` caches and `lock`
+/// are rebuildable/transient and deliberately excluded, #130.)
+fn is_store_object(name: &str) -> bool {
+    name == "data"
+        || name == "log"
+        || name == crate::manifest::MANIFEST_KEY
+        || name.starts_with("seg-")
+}
 
 /// What a backup recorded, printed as JSON by the CLI.
 #[derive(Debug, Serialize)]
@@ -29,6 +36,8 @@ pub struct BackupReport {
     pub distance: String,
     pub data_bytes: u64,
     pub log_bytes: u64,
+    pub segments: usize,
+    pub segment_bytes: u64,
     pub archive_bytes: u64,
 }
 
@@ -54,23 +63,43 @@ struct Manifest {
     distance: String,
     data_bytes: u64,
     log_bytes: u64,
+    segments: usize,
 }
 
 /// Snapshot the store at `source` into a gzip-compressed tar object at `out_location`. Both are
 /// [`open_persistence`](crate::open_persistence) locations, so a store on any backend can be
 /// snapshotted to any backend.
 pub fn backup(source: &str, out_location: &str) -> Result<BackupReport> {
-    // Read the source store's durable objects through its backend — `data` first, then
-    // `log`, for the consistent lock-free snapshot (see the module docs).
+    // Read order gives the lock-free snapshot (§6.2): the store `manifest` (the segment
+    // set's commit point) first, then the segments it names (sealed ones are immutable),
+    // then `log` last, so replay ignores anything newer than the data we captured.
     let src = crate::open_persistence(source)?;
+    let store_manifest = src.get(crate::manifest::MANIFEST_KEY)?;
+    let sealed: Vec<String> = match &store_manifest {
+        Some(bytes) => crate::manifest::Manifest::decode(bytes)
+            .with_context(|| format!("{source} has an unreadable `manifest` object"))?
+            .segments
+            .into_iter()
+            .filter(|name| name != "data")
+            .collect(),
+        None => Vec::new(),
+    };
     let data = src
         .get("data")?
         .with_context(|| format!("no nidus store at {source} (no `data` object)"))?;
+    let mut segments: Vec<(String, Vec<u8>)> = Vec::with_capacity(sealed.len());
+    for name in &sealed {
+        let bytes = src.get(name)?.with_context(|| {
+            format!("{source} is torn: the manifest names `{name}` but it does not exist")
+        })?;
+        segments.push((name.clone(), bytes));
+    }
     let log = src.get("log")?.unwrap_or_default();
     let (dimension, distance) = crate::data::header_from_bytes(&data)
         .with_context(|| format!("{source} has no readable nidus header"))?;
 
     let created_unix = now_unix();
+    let segment_bytes: u64 = segments.iter().map(|(_, b)| b.len() as u64).sum();
 
     // Build the whole gzip-tar archive in memory, then PUT it as one object. A
     // snapshot of a dev/small-scale store fits in RAM comfortably (SPEC §13.7).
@@ -79,6 +108,13 @@ pub fn backup(source: &str, out_location: &str) -> Result<BackupReport> {
         let gz = GzEncoder::new(&mut archive, Compression::default());
         let mut tar = tar::Builder::new(gz);
         append_bytes(&mut tar, "data", &data, created_unix)?;
+        for (name, bytes) in &segments {
+            append_bytes(&mut tar, name, bytes, created_unix)?;
+        }
+        // Verbatim bytes: the manifest is CRC-framed, so re-encoding it would break it.
+        if let Some(bytes) = &store_manifest {
+            append_bytes(&mut tar, crate::manifest::MANIFEST_KEY, bytes, created_unix)?;
+        }
         append_bytes(&mut tar, "log", &log, created_unix)?;
 
         let manifest = Manifest {
@@ -88,6 +124,7 @@ pub fn backup(source: &str, out_location: &str) -> Result<BackupReport> {
             distance: format!("{distance:?}"),
             data_bytes: data.len() as u64,
             log_bytes: log.len() as u64,
+            segments: segments.len(),
         };
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         append_bytes(&mut tar, MANIFEST, &manifest_bytes, created_unix)?;
@@ -108,6 +145,8 @@ pub fn backup(source: &str, out_location: &str) -> Result<BackupReport> {
         distance: format!("{distance:?}"),
         data_bytes: data.len() as u64,
         log_bytes: log.len() as u64,
+        segments: segments.len(),
+        segment_bytes,
         archive_bytes: archive.len() as u64,
     })
 }
@@ -128,6 +167,18 @@ pub fn restore(
         bail!("aborted: {target_location} already contains a store (pass -y/--yes to overwrite)");
     }
 
+    // Clear the target's segment state before writing: a pre-existing `manifest` or
+    // `seg-*` the archive does not carry would otherwise point at segments that no
+    // longer match the restored `data`/`log` (#130).
+    let _ = target.delete(crate::manifest::MANIFEST_KEY);
+    if let Ok(existing) = target.list() {
+        for name in existing.iter().filter(|n| n.starts_with("seg-")) {
+            target
+                .delete(name)
+                .with_context(|| format!("failed to remove stale `{name}` at the target"))?;
+        }
+    }
+
     let (src, key) = open_object_location(in_location)?;
     let archive = src
         .get(&key)?
@@ -141,7 +192,7 @@ pub fn restore(
             Some(n) if path.components().count() == 1 => n.to_string(),
             _ => continue,
         };
-        if ARCHIVED.contains(&name.as_str()) {
+        if is_store_object(&name) {
             let mut buf = Vec::new();
             entry
                 .read_to_end(&mut buf)
@@ -153,7 +204,7 @@ pub fn restore(
                 found_data = true;
             }
         }
-        // The manifest and anything unexpected are ignored.
+        // The report JSON and anything unexpected are ignored.
     }
 
     if !found_data {
@@ -221,7 +272,9 @@ fn append_bytes<W: std::io::Write>(
 /// read as "absent" (the safe direction — the restore then proceeds and surfaces any
 /// real failure on `put`).
 fn store_present(p: &dyn Persistence) -> bool {
-    matches!(p.get("data"), Ok(Some(_))) || matches!(p.get("log"), Ok(Some(_)))
+    matches!(p.get("data"), Ok(Some(_)))
+        || matches!(p.get("log"), Ok(Some(_)))
+        || matches!(p.get(crate::manifest::MANIFEST_KEY), Ok(Some(_)))
 }
 
 /// Prompt on stderr; return `true` only on an explicit yes. EOF or a
@@ -348,5 +401,113 @@ mod tests {
         let archive = empty.path().join("snap.tar.gz");
         let err = backup(&empty.path().to_string_lossy(), &archive.to_string_lossy()).unwrap_err();
         assert!(err.to_string().contains("no nidus store"));
+    }
+
+    /// Write enough rows through a small `segment_max_rows` that the store seals
+    /// segments, returning each row's id and vector for later parity checks.
+    fn make_segmented_store(dir: &Path) -> Vec<(String, Vec<f32>)> {
+        let mut db =
+            Nidus::open(Config::new(dir.to_path_buf(), 3).segment_max_rows(Some(2))).unwrap();
+        let mut rows = Vec::new();
+        for i in 0..7u32 {
+            let v = vec![1.0 + i as f32, (i % 3) as f32, 0.5];
+            let id = format!("r{i}");
+            db.upsert("docs", &[rec(&id, v.clone())]).unwrap();
+            rows.push((id, v));
+        }
+        db.flush().unwrap();
+        rows
+    }
+
+    /// #130: a segmented store's sealed segments and its `manifest` must survive the
+    /// round trip — the old two-object archive silently lost every sealed row.
+    #[test]
+    fn segmented_store_round_trip_is_complete() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let archive = src.path().join("snap.tar.gz");
+        let rows = make_segmented_store(src.path());
+        assert!(
+            src.path().join("manifest").exists()
+                && std::fs::read_dir(src.path())
+                    .unwrap()
+                    .filter_map(|e| e.ok())
+                    .any(|e| e.file_name().to_string_lossy().starts_with("seg-")),
+            "test premise: the source store must actually be segmented"
+        );
+
+        let report = backup(&src.path().to_string_lossy(), &archive.to_string_lossy()).unwrap();
+        assert!(
+            report.segments >= 1,
+            "sealed segments must be archived: {report:?}"
+        );
+
+        let restored = dst.path().join("store");
+        let rr = restore(
+            &archive.to_string_lossy(),
+            &restored.to_string_lossy(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            rr.records,
+            rows.len(),
+            "every row survives, sealed ones included"
+        );
+
+        // Ranking parity: each row's own vector must rank itself first.
+        let db = Nidus::open(
+            Config::new(restored, 3)
+                .segment_max_rows(Some(2))
+                .open_mode(OpenMode::ReadOnly),
+        )
+        .unwrap();
+        for (id, v) in &rows {
+            let hits = db
+                .search(
+                    Scope::All,
+                    v,
+                    &SearchOpts {
+                        top_k: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(&hits[0].id, id, "restored ranking diverged for {id}");
+        }
+    }
+
+    /// #130 (restore half): restoring an unsegmented archive over a segmented store
+    /// must not leave a stale `manifest`/`seg-*` pointing at vanished rows.
+    #[test]
+    fn restore_over_a_segmented_store_leaves_no_stale_segments() {
+        let src = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let archive = src.path().join("snap.tar.gz");
+        make_store(src.path()); // unsegmented, 2 records
+        make_segmented_store(target.path()); // 7 records across segments
+
+        backup(&src.path().to_string_lossy(), &archive.to_string_lossy()).unwrap();
+        let rr = restore(
+            &archive.to_string_lossy(),
+            &target.path().to_string_lossy(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            rr.records, 2,
+            "the restored store is the archive's, not the old one"
+        );
+
+        let stale: Vec<String> = std::fs::read_dir(target.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("seg-"))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "stale segments survived the restore: {stale:?}"
+        );
     }
 }
