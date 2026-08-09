@@ -1,13 +1,13 @@
 ---
 title: How it works
-description: The nidus storage model and search path, end to end — from upsert to ranked hits.
+description: The nidus storage model and search path, end to end, from upsert to ranked hits.
 ---
 
 nidus holds dense vectors plus typed metadata in a single on-disk directory and
 answers nearest-neighbour queries over cosine (the default), dot, or Euclidean.
-Scoring is **exact by default** — every in-scope vector is compared — and you can
+Scoring is **exact by default** (every in-scope vector is compared), and you can
 opt into an [approximate index](/guides/search/#approximate-search-ann) (HNSW or IVF)
-for larger collections. There is no query planner and no background thread — the
+for larger collections. There is no query planner and no background thread: the
 whole thing is a RAM-resident matrix, an optional in-RAM index, and a small amount of
 write glue.
 
@@ -19,7 +19,7 @@ A store is a directory:
 <dir>/
   manifest  names the live segments (the first is `data`); the atomic commit point
   data      append-only, fixed-stride, row-major f32 matrix (header pins dimension)
-  log       append-only framed op stream: [len][bincode(Op)][crc32] — the commit record
+  log       append-only framed op stream: [len][bincode(Op)][crc32] (the commit record)
   lock      O_EXCL writer-exclusion lock file
   seg-…     additional immutable segments, once a store grows past the seal threshold
 ```
@@ -28,12 +28,12 @@ A store is a directory:
   dimension), row-major, **never rewritten in place**. New rows are appended. A store
   holds one or more such **segments** presented as a single dense row space; by default
   it is just `data` (see [Storage → Segments](/guides/storage/#segments)).
-- **`manifest`** names the live segments and pins the dimension/metric — a tiny
+- **`manifest`** names the live segments and pins the dimension/metric: a tiny
   CRC-checked object, replaced atomically when a segment is sealed or compacted.
 - **`log`** is the commit record: an append-only stream of framed,
   CRC32-checked, bincode-encoded operations (`CreateCollection`, `Upsert`,
   `Delete`, …). This is what makes a write durable.
-- **`lock`** excludes concurrent writers via an `O_EXCL` lock file — pure std,
+- **`lock`** excludes concurrent writers via an `O_EXCL` lock file: pure std,
   no `flock`, no FFI.
 
 ## Open
@@ -45,7 +45,7 @@ collection → { id → (row, attrs) }
 ```
 
 The index is fully reproducible from the two files, so it is never itself
-persisted. After open, **search never touches disk** — it sweeps the in-RAM
+persisted. After open, **search never touches disk**: it sweeps the in-RAM
 matrix. (The opt-in [`Config::mmap`](/guides/storage/#larger-than-ram-memory-mapped-segments)
 mode trades this for capacity: cold segments are mapped from disk and paged in on
 touch, so a store can outgrow RAM.)
@@ -61,7 +61,7 @@ store:
 4. fsync `log`.
 
 The `log` append is the commit point. A vector that made it into `data` but
-whose `Upsert` record never landed in `log` is simply ignored on the next open —
+whose `Upsert` record never landed in `log` is simply ignored on the next open:
 it is an unreferenced row, reclaimed by [compaction](/guides/storage/#compaction).
 Upsert is **all-or-nothing**: any failure mid-batch rolls `data` and `log` back
 to the entry marks, so a caught `ENOSPC` leaves the store exactly as it was.
@@ -86,7 +86,7 @@ db.commit()?; // one fsync pair for both batches
 ```
 
 The rule that keeps this honest: **do not tell anyone a write succeeded until `commit`
-returns `Ok`.** Before that its bytes are appended but not durable — the same tail state a
+returns `Ok`.** Before that its bytes are appended but not durable: the same tail state a
 crash leaves behind, which the next open discards. Deferring the barrier is a way to pay for
 durability once instead of N times, never a way to skip it.
 
@@ -97,22 +97,22 @@ succeeds. Nothing waits for a group to form, so a lone write is exactly as fast 
 ## Search
 
 Search scores (cosine, dot, or Euclidean) over a
-[`Scope`](/reference/api/#scope) — one collection, a named subset, or the whole
-store — merged into a single ranking. By default it is exact (every in-scope row is
+[`Scope`](/reference/api/#scope) (one collection, a named subset, or the whole
+store), merged into a single ranking. By default it is exact (every in-scope row is
 scored); with [`Config::ann`](/guides/search/#approximate-search-ann) set it instead
 walks an approximate index for a candidate set and applies the same scope/filter/rerank
 to those. The exact path is:
 
 1. Resolve the scope to a set of candidate rows.
 2. Apply the metadata [`Filter`](/guides/search/#filters) (before any dot
-   product — cheap rows are discarded first).
+   product: cheap rows are discarded first).
 3. Score each surviving row against the query with a dot product. Because
    vectors are **unit-normalized on insert**, `score = dot(v, q)` *is* cosine
    similarity in `[-1, 1]`.
 4. Keep the top-k in a bounded heap, optionally dropping anything below
    `min_score`.
-5. Cut the page. The ranking is a **total order** — score descending, then
-   `collection`, then `id` — computed `offset + top_k` deep, so
+5. Cut the page. The ranking is a **total order** (score descending, then
+   `collection`, then `id`) computed `offset + top_k` deep, so
    [pagination](/guides/search/#paginating-a-search) tiles it with no gap and no overlap.
 
 Steps 3–5 are where the opt-in ranking knobs sit: a
@@ -123,7 +123,7 @@ value as the page is cut. Both are off by default, and an untouched query return
 what it always did.
 
 Scoping the whole store in one call is sound because **every collection shares
-one embedding space** — one dimension is pinned for the life of the store, so
+one embedding space**: one dimension is pinned for the life of the store, so
 all vectors are directly comparable.
 
 The scoring kernel is plain safe Rust the optimizer can vectorize: an 8-lane
@@ -133,7 +133,7 @@ chunked dot product, an allocation-free top-k scan, and a storage-order
 
 ## What it deliberately is not
 
-- **Exact by default.** The default search compares every in-scope vector — 100%
+- **Exact by default.** The default search compares every in-scope vector: 100%
   recall, by construction. Approximate indexing (HNSW/IVF) is opt-in via
   [`Config::ann`](/guides/search/#approximate-search-ann) when you want speed over
   exactness at larger scale.
@@ -144,7 +144,7 @@ chunked dot product, an allocation-free top-k scan, and a storage-order
   want it over the wire, [`nidus serve`](/guides/http-server/) exposes the whole
   store over HTTP.
 
-None of those are walls — they are *seams*, additive over the same append-only
+None of those are walls: they are *seams*, additive over the same append-only
 format. Several have since shipped as opt-in modes: an [ANN
 index](/guides/search/#approximate-search-ann), [scalar/binary
 quantization](/guides/search/#quantization), and [memory-mapped

@@ -1,10 +1,10 @@
 ---
 title: Command line
-description: Use nidus from the terminal with the `nidus` binary — create, upsert, search, inspect, back up, and restore a store directory.
+description: "Use nidus from the terminal with the `nidus` binary: create, upsert, search, inspect, back up, and restore a store directory."
 ---
 
 Besides the Rust library, nidus ships a `nidus` binary: a command-line tool for
-working with a store directly. It operates on an ordinary store directory — the
+working with a store directly. It operates on an ordinary store directory, the
 very same format the library reads and writes. The same binary also runs an HTTP
 server; that has its own [HTTP server](/guides/http-server/) page.
 
@@ -14,7 +14,7 @@ its extra dependencies are compiled only when you ask for them.
 
 ## Install
 
-The fastest path needs **no Rust toolchain** — one command fetches a prebuilt
+The fastest path needs **no Rust toolchain**: one command fetches a prebuilt
 `nidus` binary for your platform from the latest release and drops it in
 `~/.local/bin`:
 
@@ -39,7 +39,7 @@ Every route installs the same single `nidus` executable.
 
 ## Quickstart: local search in four commands
 
-From an empty directory to a working nearest-neighbour query — no Rust, no
+From an empty directory to a working nearest-neighbour query: no Rust, no
 config files, no daemon to register. Pick a store directory and an embedding
 dimension once (here a toy `3`); after the store exists, `--dim` is remembered.
 
@@ -56,7 +56,7 @@ echo '[
   {"id":"b","vector":[0,1,0],"attrs":{"lang":{"Str":"go"}}}
 ]' | nidus upsert --dir ./store docs
 
-# 4. Search. No --dim needed — it is read from the store.
+# 4. Search. No --dim needed: it is read from the store.
 echo '[1,0,0]' | nidus search --dir ./store docs -k 2
 ```
 
@@ -69,24 +69,24 @@ same store over the network instead, point
 
 Every command takes the store directory (`--dir`/`-d`). The embedding dimension
 is pinned in the store the first time you create a collection, so **`--dim` is
-only needed at creation** — afterwards it is read from the store. (Pass it anyway
+only needed at creation**. Afterwards it is read from the store. (Pass it anyway
 and it is checked: a mismatch is a hard error, not a silent surprise.) The
 `--distance` metric (`cosine`, `euclidean`, or `dot`) works the same way: chosen
 at creation (default `cosine`), inferred thereafter. Records, query vectors, and
 filters are JSON; output is JSON on stdout.
 
 ```bash
-# Create a collection — dimension pinned here (default cosine distance)
+# Create a collection: dimension pinned here (default cosine distance)
 nidus create --dir ./store --dim 3 docs
 
 # Or with Euclidean distance
 nidus create --dir ./store --dim 3 --distance euclidean docs
 
-# Upsert records (JSON array) from stdin or a --file — no --dim needed
+# Upsert records (JSON array) from stdin or a --file (no --dim needed)
 echo '[{"id":"a","vector":[1,0,0],"attrs":{"lang":{"Str":"rust"}}}]' \
   | nidus upsert --dir ./store docs
 
-# Nearest-neighbour search — query vector on stdin
+# Nearest-neighbour search: query vector on stdin
 echo '[1,0,0]' | nidus search --dir ./store docs -k 5
 
 # Search every collection at once (omit the collection names)
@@ -167,7 +167,7 @@ alongside a writer such as a running server.
 By default search is exact brute-force. For larger stores you can opt into an
 in-memory approximate-nearest-neighbour index with `--ann hnsw` or `--ann ivf`.
 Unlike `--dim` and `--distance`, the ANN choice is **not** recorded in the store
-header — it is a property of how you *open* the store, so pass it on every command
+header: it is a property of how you *open* the store, so pass it on every command
 that should build or consult the index (including `serve`):
 
 ```bash
@@ -192,13 +192,13 @@ configuration.
 ## Storage & memory backends
 
 By default a store is a local directory and its working set is the process heap. Two
-optional flags point each axis elsewhere — see [Storage backends](/guides/storage-backends/)
+optional flags point each axis elsewhere. See [Storage backends](/guides/storage-backends/)
 and [Memory stores](/guides/memory-stores/) for the full model; both work on every
 store-opening command, including `serve`:
 
 ```bash
 # --persistence: where the durable data/log live. A live object-store-backed store
-# (whole-object rewrite on flush). Pass --dim — the remote header is not peeked.
+# (whole-object rewrite on flush). Pass --dim: the remote header is not peeked.
 nidus upsert --dir ./meta --dim 768 --persistence s3://my-bucket/store docs < recs.json
 nidus search --dir ./meta --dim 768 --persistence s3://my-bucket/store docs -k 5 < q.json
 
@@ -211,10 +211,10 @@ nidus serve --dir ./store --dim 768 --memory redis://cache:6379?prefix=docs
 or `gs://<bucket>[/<prefix>]`; cloud credentials come from the standard environment
 (`AWS_*` / `GOOGLE_APPLICATION_CREDENTIALS`). `--memory` accepts `local` (the default) or a
 `redis://`/`rediss://`/`valkey://`/`valkeys://`/`keydb://`/`dragonfly://` URL. The axes
-compose, and search is identical either way — it always runs over local RAM.
+compose, and search is identical either way: it always runs over local RAM.
 
 A live object-store-backed store rewrites the whole `data`/`log` object on each flush
-(`O(object)`, fine for low write rates) and takes an **advisory** writer lock — suited to a
+(`O(object)`, fine for low write rates) and takes an **advisory** writer lock, suited to a
 single writer; for many concurrent writers, prefer a local store and snapshot to the cloud.
 
 ## Speed, memory & durability flags
@@ -240,7 +240,7 @@ nidus serve --dir ./store --dim 768 --segment-max-rows 250000 --mmap
 nidus upsert --dir ./store --fsync on-flush docs < recs.json
 ```
 
-`--quantization` accepts `int8` or `binary` (`binary` is cosine-only — sign codes discard
+`--quantization` accepts `int8` or `binary` (`binary` is cosine-only: sign codes discard
 magnitude), with `--quant-rescore` tuning the over-fetch before the exact rerank. Candidate
 selection is approximate; the final ranking is always exact. `--segment-index-min-rows`
 gives each sufficiently large sealed segment its own IVF index. Housekeeping knobs:
@@ -255,8 +255,8 @@ the environment with no command line.
 ## Running several instances over one shared store
 
 `--cluster` runs nidus as one of several cooperating instances over the *same* store. It
-requires both shared axes — an object-store `--persistence` **and** a Redis-family
-`--memory` tier — and is refused with a clear error otherwise, since a local directory or a
+requires both shared axes (an object-store `--persistence` **and** a Redis-family
+`--memory` tier) and is refused with a clear error otherwise, since a local directory or a
 process-local working set cannot be shared:
 
 ```bash
@@ -272,8 +272,8 @@ nidus serve --dir ./meta --dim 768 --cluster --read-only \
 A reader loads the store's committed state when it starts and keeps serving that snapshot;
 `POST /refresh` advances it to whatever the writer has committed since, and answers
 `{"adopted": true}` when there was something new. Reads deliberately do not refresh on
-their own — that would add a metadata fetch to every query, which is the opposite of what
-a read-heavy fan-out wants — so poll it as often as your staleness tolerance requires.
+their own (that would add a metadata fetch to every query, which is the opposite of what
+a read-heavy fan-out wants), so poll it as often as your staleness tolerance requires.
 
 ### Failover
 
@@ -288,25 +288,25 @@ nidus serve --dir ./meta --dim 768 --cluster --wait-for-lease \
   --persistence s3://my-bucket/store --memory redis://cache:6379 --lock-ttl 15
 ```
 
-While waiting, a standby reports `200` on `/health` (it is alive — waiting is its job) and
+While waiting, a standby reports `200` on `/health` (it is alive: waiting is its job) and
 `503` on `/ready` (it has no store, so it should get no traffic). Point your liveness probe
 at `/health` and your readiness probe at `/ready` and an orchestrator does the right thing
 on its own: keep the standby running, route around it, and route to it once promoted.
 
 The two probes answer different questions, and both are deliberately blind to an instance
-being merely **busy** — a large upsert holds the store's write guard for the whole batch, and
+being merely **busy**: a large upsert holds the store's write guard for the whole batch, and
 neither probe takes that lock, so a working writer is never mistaken for a broken one.
 `/ready` additionally reports `503` for a fenced writer or a reader past `--max-staleness`;
 `/health` reports `503` only when a panic has left the process unrecoverable, which is the one
 case where restarting it is the right response.
 
 Pass a number of seconds (`--wait-for-lease 300`) to give up after that long instead of
-waiting indefinitely — useful in a script that should not hang.
+waiting indefinitely, useful in a script that should not hang.
 
 ### Choosing `--lock-ttl`
 
 `--lock-ttl` bounds how long a dead writer's handle stays un-reclaimable, and therefore how
-long promotion takes (within a second either side — lease stamps have one-second granularity,
+long promotion takes (within a second either side: lease stamps have one-second granularity,
 and the reclaim rule errs towards leaving a live writer alone). Lower is faster failover.
 The default is 60s; 10–30s is a reasonable cluster setting.
 
@@ -314,17 +314,17 @@ The default is 60s; 10–30s is a reasonable cluster setting.
 third of the TTL, out of band and without the store lock, so renewal continues *during* a
 long write. You do not need to size the TTL against your largest batch, and a slow
 object-store `PUT` no longer risks a healthy writer being replaced mid-flight. An idle writer
-is kept alive by the same timer — issuing no writes for hours does not put its lease at risk.
+is kept alive by the same timer: issuing no writes for hours does not put its lease at risk.
 
 What the two directions actually cost:
 
 | | Too low | Too high |
 | --- | --- | --- |
-| Cost | A run of failed renewals — an object store having a bad minute — can expire a lease that a healthy writer still believes it holds | A crashed writer's slice of the store is read-only for that long before a standby takes over |
-| Floor | Renewal is `TTL/3`, so anything under a few seconds gives the renewer no room to retry through a blip | — |
+| Cost | A run of failed renewals (an object store having a bad minute) can expire a lease that a healthy writer still believes it holds | A crashed writer's slice of the store is read-only for that long before a standby takes over |
+| Floor | Renewal is `TTL/3`, so anything under a few seconds gives the renewer no room to retry through a blip | (none) |
 
 That first case is *safe*, just disruptive: the superseded writer is
-[fenced](/guides/storage-backends/#cooperating-instances-cluster), not allowed to clobber —
+[fenced](/guides/storage-backends/#cooperating-instances-cluster), not allowed to clobber:
 every durable write is compare-and-swapped against the version it last saw, so its next batch
 is refused rather than applied. You lose the writer, never the data. It reports `503` from
 `/ready` immediately (the background renewer latches the state; nobody has to wait for a
@@ -332,7 +332,7 @@ write to discover it), and an orchestrator recycles it. Set the TTL so that does
 on an ordinary hiccup.
 
 A renewal that fails because the object store was briefly unreachable does **not** fence the
-writer — only the store actually reporting a different lease owner does. That distinction is
+writer: only the store actually reporting a different lease owner does. That distinction is
 why a blip costs the write in flight rather than the instance.
 
 If failover latency matters more than the TTL can give you, run a standby with
@@ -354,7 +354,7 @@ nidus serve --dir ./meta --dim 768 --cluster --read-only \
 `--refresh-interval` removes the need for a sidecar or cron calling `POST /refresh`.
 `--max-staleness` is the safety net: if refreshing stops working, readiness fails and the
 instance leaves the load balancer rather than quietly serving ever-older results. Reads
-themselves are never rejected — the bound governs *routing*, not correctness.
+themselves are never rejected: the bound governs *routing*, not correctness.
 
 `GET /cluster` reports each instance's role, whether it holds the writer handle, whether it
 has been fenced, the commit counter it is serving, and its staleness. That is what to check
@@ -365,30 +365,38 @@ There is no election and no coordinator, and none is needed: the object store's 
 writes (`If-Match` on S3, `ifGenerationMatch` on GCS) are a linearizable compare-and-swap,
 so exactly one claimant can win the handle even when several try at the same instant. That
 is the same primitive a consensus protocol would give you, already durable and already
-shared — which is why a writer that stalls and wakes up superseded is *refused* rather than
+shared, which is why a writer that stalls and wakes up superseded is *refused* rather than
 allowed to clobber its successor's commits.
 
 This is deliberately **not** a managed cluster: there is no coordinator, no replication, and
 no rebalancing. Writes are fenced (a superseded writer is refused rather than allowed to
 clobber committed data) and `--lock-ttl` sets the lease window. If you only want more
 capacity across a few machines, a simpler shape needs none of this: run one independent
-instance per box and fan queries out client-side, merging the top-k yourself — sound because
-every instance shares one embedding space. See
+instance per box and fan queries out client-side, merging the top-k yourself (sound because
+every instance shares one embedding space). See
 [running across a few boxes](/guides/multi-box/) for the recipe.
 
 ## Backup & restore
 
-A store is just a directory, so you can always copy it by hand — but `nidus
-backup` packages the whole thing into a single compressed `.tar.gz` you can
-stash before an upgrade or hand to a cron job, and `nidus restore` brings it
-back.
+A store is just a directory, so you can always copy it by hand, but `nidus
+backup` packages the durable core (`data` + `log`) into a single compressed
+`.tar.gz` you can stash before an upgrade or hand to a cron job, and `nidus
+restore` brings it back.
+
+:::caution
+On a store using `--segment-max-rows`, the sealed segments (`manifest` + `seg-*`)
+are **not** included in the archive yet, so `nidus backup` is complete only for
+unsegmented stores. Back up a segmented store by copying the whole directory or
+bucket prefix. [#130](https://github.com/duckedup/nidus/issues/130) tracks making
+the archive segment-complete.
+:::
 
 ```bash
 # Snapshot ./store into one portable archive.
 nidus backup --dir ./store --out ./store.tar.gz
 
 # Omit --out and you get a sortable, timestamped name in the current directory,
-# e.g. store-1781063324.tar.gz — handy for keeping a series of snapshots.
+# e.g. store-1781063324.tar.gz, handy for keeping a series of snapshots.
 nidus backup --dir ./store
 
 # Restore into a directory. If the target already holds a store you are asked to
@@ -398,8 +406,8 @@ nidus restore --in ./store.tar.gz --dir ./store --yes
 ```
 
 The archive's `--out`/`--in` is a [storage-backend](/guides/storage-backends/) location, so
-besides a plain path it accepts a `file://` URL, an `s3://` bucket, or a `gs://` bucket
-— the snapshot is written and read as one object on whatever backend the location names:
+besides a plain path it accepts a `file://` URL, an `s3://` bucket, or a `gs://` bucket.
+The snapshot is written and read as one object on whatever backend the location names:
 
 ```bash
 nidus backup  --dir ./store --out file:///backups/store.tar.gz
@@ -417,14 +425,14 @@ nidus backup  --persistence s3://my-bucket/store --out ./store.tar.gz
 nidus restore --in ./store.tar.gz --persistence s3://my-bucket/store --dir ./meta
 ```
 
-The archive is an ordinary gzip-compressed tarball — `tar tzf store.tar.gz`
+The archive is an ordinary gzip-compressed tarball: `tar tzf store.tar.gz`
 lists the `data` and `log` files plus a small `nidus-backup.json` manifest
 (version, timestamp, dimension), so you can inspect or extract it with standard
 tools too. Restore reopens the store afterwards to confirm it loads, and never
 carries over a stale writer lock.
 
 **Backup is a safe hot snapshot.** It does not take the writer lock, so it can
-run while a writer — including `nidus serve` — is busy. It captures the same
+run while a writer (including `nidus serve`) is busy. It captures the same
 consistent, possibly-slightly-stale view a [lock-free reader](/guides/storage/)
 sees: never a torn or half-written store.
 
@@ -440,7 +448,7 @@ snapshot is a one-line cron entry:
 ## Over the network
 
 The same `nidus` binary serves a store over HTTP, so a client with no Rust
-toolchain can do the full job — create, upsert, search, inspect, maintain — in
+toolchain can do the full job (create, upsert, search, inspect, maintain) in
 JSON:
 
 ```bash

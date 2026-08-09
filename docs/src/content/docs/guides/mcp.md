@@ -1,6 +1,6 @@
 ---
 title: MCP (agent memory)
-description: nidus speaks the Model Context Protocol over stdio or at nidus serve's /mcp, so any MCP client can use a store as long-term memory — remember text, recall it by meaning, with no glue code.
+description: "nidus speaks the Model Context Protocol over stdio or at nidus serve's /mcp, so any MCP client can use a store as long-term memory: remember text, recall it by meaning, with no glue code."
 ---
 
 nidus speaks the [Model Context Protocol](https://modelcontextprotocol.io) over
@@ -12,12 +12,12 @@ later by meaning, without you writing any integration code.
 
 This is the [memory layer](/guides/remember-and-recall/) with a different front
 door. Everything MCP exposes goes through the same store, the same embedder, and
-the same locking that the [HTTP API](/reference/http-api/) uses — write over
+the same locking that the [HTTP API](/reference/http-api/) uses. Write over
 HTTP and read over MCP, or the reverse, and you are talking to one store.
 
 ## Over stdio
 
-The `mcp` subcommand speaks MCP on stdin/stdout — no address, no token, nothing
+The `mcp` subcommand speaks MCP on stdin/stdout: no address, no token, nothing
 to bind. This is the shape most local clients expect:
 
 ```bash
@@ -25,19 +25,19 @@ claude mcp add nidus -- nidus mcp --dir ~/.nidus --dim 1024 \
   --embed-provider voyage --embed-model voyage-3
 ```
 
-A stdio session opens the store and **holds the writer lock for its lifetime** —
-there is no listener standing by to keep answering while a second client waits,
+A stdio session opens the store and **holds the writer lock for its lifetime**.
+There is no listener standing by to keep answering while a second client waits,
 so another `nidus mcp` (or `nidus serve`) pointed at the same directory fails
 immediately, naming the lock. Run one stdio session per store, or use `nidus
 serve` below when several clients need to share one.
 
-Pass `--read-only` to open without taking that lock — any number of read-only
+Pass `--read-only` to open without taking that lock: any number of read-only
 sessions can run alongside a writer. `recall`, `text_search`, `hybrid_search`,
 `get`, and `browse` all work; `remember` and `forget` fail, since they write.
 
 ## Over HTTP (`nidus serve`)
 
-The endpoint ships in the `mcp` feature, which is part of the `serve` umbrella —
+The endpoint ships in the `mcp` feature, which is part of the `serve` umbrella,
 so a binary built for the memory layer already has it:
 
 ```bash
@@ -70,8 +70,8 @@ config shape:
 
 `/mcp` sits behind the same bearer token as every other route, so if you started
 the server with `--token` the client has to send it. Drop the `headers` block if
-you did not. Unlike stdio, several clients can share one `nidus serve` process —
-there is one writer lock either way, but the server holds it and applies every
+you did not. Unlike stdio, several clients can share one `nidus serve` process.
+There is one writer lock either way, but the server holds it and applies every
 client's writes rather than each client racing for its own.
 
 ## The tools
@@ -81,11 +81,11 @@ client's writes rather than each client racing for its own.
 | `remember` | Store text in a collection. Embedded server-side; optionally summarized first. |
 | `recall` | Search by meaning and get the closest entries back with scores. |
 | `text_search` | Search by keyword (BM25) instead, for when exact wording matters. |
-| `hybrid_search` | Both at once, fused — semantic intent plus a term that must appear. |
+| `hybrid_search` | Both at once, fused: semantic intent plus a term that must appear. |
 | `list_collections` | List the collections in the store. |
 | `stats` | Dimension, distance metric, collections, and memory footprint. |
 | `forget` | Remove memories by id or by metadata filter. Irreversible. |
-| `get` | Fetch one memory by id — its id and attrs, never its vector. |
+| `get` | Fetch one memory by id: its id and attrs, never its vector. |
 | `browse` | List a collection's contents, bounded and optionally filtered, without a query. |
 
 Every one of them takes **natural language, never vectors**. That is deliberate:
@@ -95,16 +95,16 @@ vector-taking endpoints (`POST /search`, and the `vector` field on
 embed your query text server-side to get there instead.
 
 `remember` derives a content-based id when you do not pass one, which makes it
-idempotent — remembering the same sentence twice replaces the entry rather than
+idempotent: remembering the same sentence twice replaces the entry rather than
 accumulating near-duplicates that then compete for the same results. Pass an
 explicit `id` when you want to update a specific memory later. It also takes an
-optional `attrs` object — structured metadata stored alongside the text (e.g.
+optional `attrs` object: structured metadata stored alongside the text (e.g.
 `{"project": {"Str": "nidus"}, "tags": {"List": ["mcp"]}}`), each value tagged
 by type, so a memory can later be found by filter as well as by meaning.
 
 `recall`, `text_search`, and `hybrid_search` all take an optional `filter`: a
 JSON array of metadata predicates, AND-combined, with `Any`/`Not` for OR and
-negation. It narrows a search to the records that match before scoring — the
+negation. It narrows a search to the records that match before scoring, the
 same filters `forget` and `browse` use to scope which records they touch.
 
 ### No setup step
@@ -118,8 +118,8 @@ CLI invocation and no HTTP call.
 ### Reserved attrs
 
 `remember` stamps a few keys of its own alongside whatever `attrs` you pass.
-They are ordinary attrs — filterable, and usable as the timestamp field for
-recency-decay ranking — so they are worth knowing by name:
+They are ordinary attrs (filterable, and usable as the timestamp field for
+recency-decay ranking), so they are worth knowing by name:
 
 | Key | What it holds |
 | --- | --- |
@@ -130,8 +130,8 @@ recency-decay ranking — so they are worth knowing by name:
 
 Reserved keys win a collision, so an attr you pass under one of these names is
 overwritten rather than silently changing what the store relies on. In summarize
-mode `nidus.summary` holds the generated summary — the text that was actually
-embedded — while `nidus.text` still holds your original.
+mode `nidus.summary` holds the generated summary (the text that was actually
+embedded) while `nidus.text` still holds your original.
 
 ### Expiry and duplicates
 
@@ -146,13 +146,13 @@ embedded — while `nidus.text` still holds your original.
   matched entry that your call did not supply are **kept**, not dropped; the
   attrs you do supply win. Expired entries are never dedupe candidates, so a
   write is never merged onto a record that has already lapsed. Leave it out and
-  the check never runs — which is worth knowing, because the check costs a scan
+  the check never runs, which is worth knowing, because the check costs a scan
   of the collection while the write lock is held, so on a large collection an
   opted-in `remember` is meaningfully slower than one without it.
 
 Correcting or removing what you stored is `forget`'s job: pass `ids` to
 remove specific memories, or `filter` to remove every match at once. At least
-one of them is required — a call with neither is refused rather than treated
+one of them is required: a call with neither is refused rather than treated
 as "remove everything in the collection". Before writing, `get` and `browse`
 let an agent check what is already there: `get` looks up one id directly,
 and `browse` lists a collection's contents (optionally filtered) so a model
@@ -165,20 +165,21 @@ subscriptions, or tasks: every nidus operation is a fast synchronous call, so
 there is nothing to subscribe to and nothing long-running to hand back a task
 handle for. Record-level hygiene is exposed (`forget`, `get`, `browse`), and
 `remember` provisions a collection on first write, but the rest of
-collection-level lifecycle — reconfiguring or dropping one — and store
+collection-level lifecycle (reconfiguring or dropping one) and store
 maintenance (`compact`, `flush`) are not: those remain operator actions,
 deliberately out of an agent's reach.
 
 **A TTL hides an entry; it does not reclaim its row.** Expiry is applied when
 you read, by excluding expired entries from results. The underlying row stays
 until something explicitly deletes it and compacts the store, and nidus runs no
-background threads — so nothing sweeps on a timer. A long-lived store with heavy
+background threads, so nothing sweeps on a timer. A long-lived store with heavy
 TTL churn grows until an operator compacts it.
 
-**Expiry applies to the MCP tools, not to the raw HTTP search routes.**
-`POST /search`, `/recall`, and `/list` are a general-purpose store API whose
-callers pass their own filters; they return expired entries unless you filter
-`nidus.expires_at` yourself.
+**Expiry applies to every memory read, not to the raw store routes.** The MCP
+tools and `POST /recall` all hide expired entries automatically. `POST /search`
+and `/list` are the general-purpose store API whose callers pass their own
+filters; those two return expired entries unless you filter `nidus.expires_at`
+yourself.
 
 Authorization is the server's existing bearer token rather than MCP's OAuth
 flows. For a store you run yourself, a token over loopback is the honest security
@@ -188,14 +189,14 @@ no token set.
 ## Protocol version
 
 nidus implements the `2026-07-28` revision. Over stdio that means the ordinary
-session-based handshake — a client sends `initialize`, nidus answers with its
+session-based handshake: a client sends `initialize`, nidus answers with its
 negotiated version and server info, the client confirms with
 `notifications/initialized`, and the session proceeds. Over HTTP the same
 revision is used statelessly instead: no `initialize` handshake, no session ids,
 and method and tool names carried in the `Mcp-Method` and `Mcp-Name` headers so a
 gateway can route without reading the body. Statelessness is what lets `/mcp` sit
 behind an ordinary round-robin load balancer alongside
-[multi-box deployments](/guides/multi-box/) — there is no session to pin a client
+[multi-box deployments](/guides/multi-box/): there is no session to pin a client
 to an instance, which stdio (one process, one client) never needed anyway.
 
 Older clients still work. The server negotiates down, and `server/discover`

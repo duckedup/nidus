@@ -3,7 +3,7 @@ title: Embedding in a host app
 description: How a consuming tool maps its document type onto a nidus Record and bridges the synchronous API into an async runtime.
 ---
 
-nidus knows nothing about your domain — it is a general-purpose vector store. A
+nidus knows nothing about your domain: it is a general-purpose vector store. A
 consuming tool maps its own document type onto a nidus
 [`Record`](/reference/api/#record) and, if it is async, wraps the store to bridge
 into its runtime.
@@ -43,12 +43,12 @@ fn to_record(c: Chunk) -> Record {
 ```
 
 The [`Null`-vs-absent](/guides/search/#typed-metadata) distinction preserves
-"computed-empty" versus "un-indexed" semantics — don't collapse them.
+"computed-empty" versus "un-indexed" semantics. Don't collapse them.
 
 ## Many collections, one dimension
 
 A store has **one embedding space**. Use collections to partition documents that
-share that space — e.g. `code`, `docs`, `commits` — and search any subset or all
+share that space (e.g. `code`, `docs`, `commits`) and search any subset or all
 of them in one ranked call. If you need two genuinely different embedding models
 (different dimensions), use two stores.
 
@@ -88,11 +88,11 @@ There are two independent ways to put cores to work, and they suit opposite
 workloads:
 
 - **Query-level (the default).** Many `&self` searches run at once under
-  `Arc<RwLock<Nidus>>` — one core per in-flight query. This is what you want for a
+  `Arc<RwLock<Nidus>>`: one core per in-flight query. This is what you want for a
   server fielding concurrent requests; it maxes out **throughput**.
 - **Intra-query (`Config::query_threads`).** A *single* large exact search is split
   across `query_threads` worker threads (`std::thread::scope`, per-chunk heaps
-  merged at the end), cutting **one query's latency**. Opt-in — the default of `1`
+  merged at the end), cutting **one query's latency**. Opt-in: the default of `1`
   keeps search single-threaded.
 
 ```rust
@@ -109,7 +109,7 @@ so its speedup is real but sublinear (≈1.3–1.4× at 4–8 threads on 100k ×
 Threads pay off best paired with [int8 quantization](/guides/search/#quantization):
 the int8 first pass moves 4× fewer bytes (compute- not bandwidth-bound), so it
 splits across the same workers and scales to ≈2.4× at 4 threads. If you already have
-query-level concurrency, leave `query_threads` at `1` — splitting each query then
+query-level concurrency, leave `query_threads` at `1`: splitting each query then
 just oversubscribes the cores your concurrent readers are already using.
 
 One exception to know: a query carrying

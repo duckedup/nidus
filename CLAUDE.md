@@ -407,6 +407,10 @@ The docs live in `docs/` — an Astro + Starlight site (`just docs` / `docs-buil
 / `docs-preview`), deployed to GitHub Pages at **nidus.duckedup.org** by
 `.github/workflows/docs.yml` on push to `main` under `docs/**`.
 
+**Style: NO em dashes in user-facing prose** (docs site, README, SDK READMEs).
+Reword with a period, comma, colon, or parentheses. A sweep removed them all;
+do not reintroduce them. (En dashes in numeric ranges are fine.)
+
 **Positioning.** nidus is a vector store **for development and small-scale use**.
 Keep the public framing open: do NOT pin it down as "an embeddable library" (or
 "a library, not a server") and do NOT make public promises about future modes

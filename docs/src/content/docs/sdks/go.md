@@ -1,13 +1,13 @@
 ---
 title: Go SDK
-description: "github.com/duckedup/nidus/sdks/go — the official Go client for nidus. Connect to a local or remote nidus server over HTTP, upsert, and search."
+description: "github.com/duckedup/nidus/sdks/go: the official Go client for nidus. Connect to a local or remote nidus server over HTTP, upsert, and search."
 ---
 
 [`github.com/duckedup/nidus/sdks/go`](https://pkg.go.dev/github.com/duckedup/nidus/sdks/go)
 is the official Go client for nidus. It drives a running
-[`nidus serve`](/guides/http-server/) instance over HTTP — local or remote.
+[`nidus serve`](/guides/http-server/) instance over HTTP, local or remote.
 
-It has **zero dependencies** — standard library only (`net/http`, `encoding/json`,
+It has **zero dependencies**: standard library only (`net/http`, `encoding/json`,
 `context`), so there is no `go.sum` beside its `go.mod` and nothing that can pull a
 transitive surprise into your binary.
 
@@ -16,7 +16,7 @@ go get github.com/duckedup/nidus/sdks/go
 ```
 
 The module path ends in `go`, but the package is `nidus`, so imports read the way you
-want and need no alias — a final path element that differs from the package name is
+want and need no alias: a final path element that differs from the package name is
 legal Go, though some editors will offer to add one anyway:
 
 ```go
@@ -28,7 +28,7 @@ db, err := nidus.NewClient("http://127.0.0.1:7700")
 The SDK is versioned in lockstep with nidus, so `sdks/go@v0.39.0` is the client for
 nidus `0.39.x`. Match the two and the wire contract lines up. Because the module lives
 in a repository subdirectory, Go resolves it by a tag carrying that prefix
-(`sdks/go/v0.39.0`) — which is exactly what `@v0.39.0` finds:
+(`sdks/go/v0.39.0`), which is exactly what `@v0.39.0` finds:
 
 ```sh
 go get github.com/duckedup/nidus/sdks/go@v0.39.0
@@ -36,7 +36,7 @@ go get github.com/duckedup/nidus/sdks/go@v0.39.0
 
 ## Connecting
 
-"Local vs remote" is just the base URL — point the client at a local `nidus serve` or
+"Local vs remote" is just the base URL: point the client at a local `nidus serve` or
 any reachable host. When the server was started with a
 [token](/guides/http-server/), pass it with `WithToken`.
 
@@ -56,7 +56,7 @@ db, err := nidus.NewClient(
 ```
 
 `WithTimeout` is applied as a context deadline per request, so it composes with a
-caller's own context rather than overriding it — whichever deadline is earlier wins. A
+caller's own context rather than overriding it; whichever deadline is earlier wins. A
 `*Client` is safe for concurrent use and owns the connection pool, so build one per
 server and share it. `WithHTTPClient` accepts your own `*http.Client` (custom transport,
 proxy, TLS, retries, instrumentation); `WithHeader` adds a header sent on every request.
@@ -83,7 +83,7 @@ n, err := db.Upsert(ctx, "docs", []nidus.Record{
         Attrs: nidus.Attrs{"lang": nidus.Str("rust"), "year": nidus.Int(2024)}},
     {ID: "b", Vector: []float32{0.4, 0.5, 0.6},
         Attrs: nidus.Attrs{"lang": nidus.Str("go"), "year": nidus.Int(2023)}},
-    // text-only doc — omit the vector
+    // text-only doc: omit the vector
     {ID: "c", Attrs: nidus.Attrs{"body": nidus.Str("vector stores are neat")}},
 })
 
@@ -97,7 +97,7 @@ for _, hit := range hits {
 Leave `TopK` zero to take the server's default (10): a zero is omitted from the request
 rather than sent, since `"top_k": 0` would be a request for no results. The knobs whose
 zero the server *does* treat as a real value are pointers, so an explicit zero can
-travel — `MinScore` (`nil` is "no floor", `&0` is a floor of exactly zero) and hybrid
+travel: `MinScore` (`nil` is "no floor", `&0` is a floor of exactly zero) and hybrid
 search's `RRFK` and `Candidates`.
 
 A `Record` with a `nil` `Vector` is a text-only document. A non-nil but *empty* Vector is
@@ -113,7 +113,7 @@ hits, err := db.Search(ctx, nidus.SearchRequest{
 })
 ```
 
-If your attributes arrive as plain Go values — out of your own JSON decode, say — use
+If your attributes arrive as plain Go values (out of your own JSON decode, say), use
 `nidus.AttrsOf(map[string]any{…})`, or `nidus.ValueOf` for a single value. Both reject
 what the store has no type for and name the offending key.
 
@@ -141,7 +141,7 @@ plain := hit.Attrs.Decode() // map[string]any: string, int64, bool, []string, ni
 ## Filtering
 
 Build an AND-filter with the predicate constructors. Each predicate is a positive
-assertion about a **present** attribute — an absent key matches nothing (including the
+assertion about a **present** attribute: an absent key matches nothing (including the
 negative predicates). See [Search & filters](/guides/search/) for the full semantics.
 
 ```go
@@ -174,7 +174,7 @@ err = db.SetFtsFields(ctx, "docs", []nidus.FtsField{
     {Field: "body", K1: &k1, AsciiFolding: &folding},
 })
 
-// BM25 text search — scores are raw BM25, not comparable across queries
+// BM25 text search: scores are raw BM25, not comparable across queries
 text, err := db.TextSearch(ctx, nidus.TextSearchRequest{
     Field: "body", Query: "vector store", TopK: 10,
 })
@@ -189,26 +189,34 @@ hybrid, err := db.HybridSearch(ctx, nidus.HybridSearchRequest{
 ```
 
 `RRFK` and `Candidates` are `*float32` / `*int`: `nil` takes the server's defaults (60 and
-100). They are pointers because zero is a real request for both — the server fuses with
+100). They are pointers because zero is a real request for both: the server fuses with
 `1/(rrf_k + rank + 1)`, so an `RRFK` of `0` is the maximally top-heavy weighting, and a
 `Candidates` of `0` fuses exactly `TopK` deep with no over-fetch.
 
 ## Remembering and recalling
 
 When the server is started with an embedder (`nidus serve --embed-provider …`), you can
-send **text** and let the server embed it — no vectors client-side. `Remember` embeds
+send **text** and let the server embed it: no vectors client-side. `Remember` embeds
 and upserts; `Recall` embeds the query and vector-searches. See
 [Remember & recall](/guides/remember-and-recall/).
 
 ```go
 // Embed "the quick brown fox" and store it under id "a"
-err := db.Remember(ctx, "notes", "a", "the quick brown fox",
+res, err := db.Remember(ctx, "notes", "a", "the quick brown fox",
     nidus.RememberOptions{Attrs: nidus.Attrs{"tag": nidus.Str("x")}})
 
+// Expire after an hour, and fold near-duplicates into the closest existing
+// entry instead of inserting a competitor. On a dedupe match, res.Deduped is
+// true and res.ID names the entry the write actually landed on.
+ttl := int64(3600)
+threshold := float32(0.95)
+res, err = db.Remember(ctx, "notes", "a2", "the quick brown fox!",
+    nidus.RememberOptions{TTLSeconds: &ttl, DedupeThreshold: &threshold})
+
 // Summarize first, then embed the summary (the server also needs
-// --summarize-provider). The record additionally carries nidus.summary
-// and nidus.source attrs.
-err = db.Remember(ctx, "notes", "b", longArticle,
+// --summarize-provider). The record additionally carries the nidus.summary
+// attr, with the raw input in nidus.text.
+res, err = db.Remember(ctx, "notes", "b", longArticle,
     nidus.RememberOptions{Mode: "summarize"})
 
 // Embed the query text and search, best-first
@@ -229,10 +237,12 @@ written with a different embedding model is a `409`, not a silently meaningless 
 
 ## The rest of the API
 
-Every endpoint of the [HTTP API](/reference/http-api/) has a method:
+Every data-plane endpoint of the [HTTP API](/reference/http-api/) has a method (the
+ops probes `/ready`, `/cluster`, `/refresh`, and `/metrics` are for orchestrators and
+scrapers; hit them with plain HTTP):
 
 ```go
-ok := db.Health(ctx)                       // bool — needs no token; "is it up", one answer
+ok := db.Health(ctx)                       // bool: needs no token; "is it up", one answer
 err = db.Ping(ctx)                         // the same call, keeping the reason it failed
 stats, err := db.Stats(ctx)                // dimension, distance, ANN config, footprint
 names, err := db.Collections(ctx)          // []string
@@ -260,12 +270,12 @@ if _, err := db.Upsert(ctx, "docs", records); err != nil {
     var nerr *nidus.Error
     if errors.As(err, &nerr) {
         switch {
-        case nerr.IsBadRequest():     // 400/422 — the request is wrong; retrying cannot help
-        case nerr.IsUnauthorized():   // 401 — missing or wrong bearer token
-        case nerr.IsReadOnly():       // 403 — a write against a read-only store
-        case nerr.IsLocked():         // 409 — the writer lock is held elsewhere
-        case nerr.IsUnavailable():    // 503 — shed under backpressure, or store not open
-        case nerr.IsOutOfCapacity():  // 507 — the store refused to grow; it is intact
+        case nerr.IsBadRequest():     // 400/422: the request is wrong; retrying cannot help
+        case nerr.IsUnauthorized():   // 401: missing or wrong bearer token
+        case nerr.IsReadOnly():       // 403: a write against a read-only store
+        case nerr.IsLocked():         // 409: the writer lock is held elsewhere
+        case nerr.IsUnavailable():    // 503: shed under backpressure, or store not open
+        case nerr.IsOutOfCapacity():  // 507: the store refused to grow; it is intact
         }
         log.Println(nerr.Status, nerr.Message)
     }
@@ -273,12 +283,12 @@ if _, err := db.Upsert(ctx, "docs", records); err != nil {
 ```
 
 `IsBadRequest()` covers `400` **and** `422`. That split belongs to the server's HTTP layer
-rather than to nidus: a JSON *syntax* error — and the store's own client faults, such as a
-dimension mismatch — is a `400`, while a body whose *types* do not deserialize (`TopK: -1`)
+rather than to nidus: a JSON *syntax* error (and the store's own client faults, such as a
+dimension mismatch) is a `400`, while a body whose *types* do not deserialize (`TopK: -1`)
 is a `422`. To a caller they are one thing, since retrying neither can ever succeed.
 `409` and `503` are the two a retry with backoff is the right answer to.
 
-`IsTransport()` — status `0` — means the request never got an answer at all: the server
+`IsTransport()` (status `0`) means the request never got an answer at all: the server
 was unreachable, or the request outlived its deadline. Unlike the status-carrying cases
 it says nothing about whether the write was applied, since a timeout can fire after the
 server has committed.

@@ -9,13 +9,13 @@ to install, no daemon to run, and no network.
 
 There are two ways in. This page takes the **vector-store** path: you bring the
 embeddings and nidus stores and searches them. If you'd rather hand nidus plain
-text and let it embed for you — remember natural language, recall the relevant
-bits — see [Remember & recall](/guides/remember-and-recall/); it's the same store
+text and let it embed for you (remember natural language, recall the relevant
+bits), see [Remember & recall](/guides/remember-and-recall/); it's the same store
 with an embedding step wrapped around it.
 
 :::tip[Just want local search, no Rust?]
-If you'd rather not write Rust, install the `nidus` command-line tool — no
-toolchain required — and stand up a working local store in four commands. See
+If you'd rather not write Rust, install the `nidus` command-line tool (no
+toolchain required) and stand up a working local store in four commands. See
 [Quickstart: local search in four commands](/guides/cli-and-server/#quickstart-local-search-in-four-commands).
 :::
 
@@ -35,13 +35,13 @@ anyhow = "1"     # nidus returns anyhow::Result
 ```
 
 nidus requires **Rust 1.96+** (edition 2024). It pulls in only popular, mostly
-pure-Rust crates — the local store and search path are pure Rust, and the bundled
-S3/GCS backends add only a small TLS compile (`ring`), never a bundled C++ tree — so
+pure-Rust crates: the local store and search path are pure Rust, and the bundled
+S3/GCS backends add only a small TLS compile (`ring`), never a bundled C++ tree, so
 the whole build is seconds, not minutes.
 
 ## Open a store
 
-A store is a single directory. The **location is always your choice** — nidus
+A store is a single directory. The **location is always your choice**: nidus
 contributes no path defaults, env vars, or hidden directories. The **embedding
 dimension is pinned** at creation and checked on every reopen.
 
@@ -62,7 +62,7 @@ use nidus::Nidus;
 // Same as Config::new(dir, dim) with all defaults.
 let db = Nidus::open_dir("/path/to/store", 768)?;
 
-// A throwaway store with no files — handy for tests.
+// A throwaway store with no files, handy for tests.
 let db = Nidus::open_in_memory(768)?;
 # anyhow::Ok(())
 ```
@@ -71,7 +71,7 @@ let db = Nidus::open_in_memory(768)?;
 
 A `Record` is a caller-supplied `id`, its `vector` (length must equal the store
 dimension), and an open map of typed `attrs`. Upserts are **idempotent by id**
-within a collection — re-upserting the same id replaces it.
+within a collection: re-upserting the same id replaces it.
 
 ```rust
 use std::collections::BTreeMap;
@@ -86,13 +86,13 @@ db.upsert("code", &[Record::new("a", vec![/* 768 f32s */], attrs)])?;
 ```
 
 Pass a slice to upsert a whole batch in one durable, all-or-nothing call. A record
-may also carry no embedding — `Record::text_only(id, attrs)` — for a document indexed
+may also carry no embedding (`Record::text_only(id, attrs)`) for a document indexed
 purely by [full-text search](/guides/search/#full-text-search-bm25).
 
 ## Search
 
 `search` takes a [`Scope`](/reference/api/#scope), a query vector, and
-[`SearchOpts`](/reference/api/#searchopts). It returns ranked `Hit`s — each
+[`SearchOpts`](/reference/api/#searchopts). It returns ranked `Hit`s, each
 carrying its source collection, id, cosine score, and the matched record's
 attrs.
 
@@ -126,7 +126,7 @@ let hits = db.search(Scope::All, &query, &opts)?;
 ```
 
 Scoping the whole store is sound because every collection shares one embedding
-space — see [Search & filters](/guides/search/).
+space; see [Search & filters](/guides/search/).
 
 ## Run the example
 
@@ -138,7 +138,7 @@ cargo run --example demo
 
 ## Where to next
 
-- [How it works](/guides/how-it-works/) — the storage model and search path.
-- [Storage & durability](/guides/storage/) — the on-disk format and crash safety.
-- [Configuration](/reference/configuration/) — every knob on `Config`.
-- [API reference](/reference/api/) — the full surface.
+- [How it works](/guides/how-it-works/): the storage model and search path.
+- [Storage & durability](/guides/storage/): the on-disk format and crash safety.
+- [Configuration](/reference/configuration/): every knob on `Config`.
+- [API reference](/reference/api/): the full surface.

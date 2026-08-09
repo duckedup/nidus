@@ -1,16 +1,16 @@
 ---
 title: Remember & recall
-description: Store natural-language text and get the relevant pieces back — nidus embeds the text for you (optionally summarizing first) with the provider of your choice, then answers queries by cosine similarity.
+description: Store natural-language text and get the relevant pieces back. nidus embeds the text for you (optionally summarizing first) with the provider of your choice, then answers queries by cosine similarity.
 ---
 
 nidus is a vector store, so it works in vectors: you hand it a `Vec<f32>` and it
 answers nearest-neighbour queries. The **memory** layer adds the step before and
-after that — **text in, relevant text out**. You `remember` a piece of text and
+after that: **text in, relevant text out**. You `remember` a piece of text and
 nidus embeds it for you (optionally summarizing it first) with the provider you
 choose; you `recall` with a natural-language query and get the closest pieces
 back, ranked by cosine similarity.
 
-It sits on top of the same store — a thin, async convenience layer over the
+It sits on top of the same store: a thin, async convenience layer over the
 synchronous core. The raw `Vec<f32>` API underneath never changes, so if you
 already have your own embeddings you can skip this entirely (see [the escape
 hatch](#the-escape-hatch-bring-your-own-vector) below).
@@ -21,51 +21,51 @@ hatch](#the-escape-hatch-bring-your-own-vector) below).
 and answers queries over them; turning text into a vector is delegated to a provider
 you choose. So before `remember`/`recall` will work, you need exactly one of:
 
-- **A hosted provider and its API key** — Voyage, OpenAI, Cohere, Gemini, Mistral,
+- **A hosted provider and its API key**: Voyage, OpenAI, Cohere, Gemini, Mistral,
   Jina, or any OpenAI-compatible endpoint. Enable its `embed-<name>` feature and set
   the key. See [the provider table](#embedding-providers-and-their-default-models).
-- **A local daemon** — [Ollama](#a-fully-local-keyless-setup-with-ollama). No API key
+- **A local daemon**: [Ollama](#a-fully-local-keyless-setup-with-ollama). No API key
   and nothing leaves your machine, at the cost of running a daemon.
-- **Your own vectors** — skip the memory layer and use the raw `Vec<f32>` API. See
+- **Your own vectors**: skip the memory layer and use the raw `Vec<f32>` API. See
   [the escape hatch](#the-escape-hatch-bring-your-own-vector).
 
 There is deliberately no bundled local embedder. A model table worth using is 8–32 MB,
 which every `cargo add nidus` would carry whether or not it embeds anything, and static
-embeddings score meaningfully below a real model — so it would be both the heaviest and
+embeddings score meaningfully below a real model, so it would be both the heaviest and
 the weakest option on the list. Ollama already covers the fully-local case. The
 reasoning is recorded in `SPEC.md` §9.1.
 
 ## Turn it on
 
-The memory layer and its provider adapters are **off by default** — the plain
+The memory layer and its provider adapters are **off by default**: the plain
 `cargo add nidus` stays a pure, dependency-lean sync vector store. Opt in with
 Cargo features: `memory` for the `remember`/`recall` surface, one `embed-<name>`
 feature per embedding provider you want, and (optionally) a `summarize-<name>`
 feature for the summarize-then-embed mode.
 
 ```toml
-# Cargo.toml — the all-in-one memory with OpenAI embeddings and
+# Cargo.toml: the all-in-one memory with OpenAI embeddings and
 # Anthropic summarization:
 [dependencies]
-nidus = { version = "0.28", features = ["memory", "embed-openai", "summarize-anthropic"] }
+nidus = { version = "0.55", features = ["memory", "embed-openai", "summarize-anthropic"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-Enable only the providers you use — each `embed-<name>` compiles just that one
+Enable only the providers you use: each `embed-<name>` compiles just that one
 adapter. The umbrella features `embed-all` and `summarize-all` pull in every
 shipped adapter at once.
 
 :::note
 Enabling `embed`/`summarize` adds `reqwest` (with rustls TLS, reusing the `ring`
 already present) plus `tokio` and `serde_json`. There is no new C toolchain and
-no bundled OpenSSL — the build stays fast. The memory API is async; the store
+no bundled OpenSSL, so the build stays fast. The memory API is async; the store
 underneath is still synchronous.
 :::
 
 ## Pick a provider
 
 Both the embedder and the summarizer are chosen **at runtime** through a closed
-enum — no `Box<dyn>`, no dynamic dispatch cost. Build one from a provider and a
+enum: no `Box<dyn>`, no dynamic dispatch cost. Build one from a provider and a
 config:
 
 ```rust
@@ -90,10 +90,10 @@ let embedder = AnyEmbedder::build(
 | Gemini | `embed-gemini` | `EmbedProvider::Gemini` | `text-embedding-004` |
 | Mistral | `embed-mistral` | `EmbedProvider::Mistral` | `mistral-embed` |
 | Jina | `embed-jina` | `EmbedProvider::Jina` | `jina-embeddings-v3` |
-| OpenAI-compatible | `embed-openai-compat` | `EmbedProvider::OpenAiCompat` | *(none — set a model)* |
+| OpenAI-compatible | `embed-openai-compat` | `EmbedProvider::OpenAiCompat` | *(none: set a model)* |
 
 The **OpenAI-compatible** adapter is the catch-all: point its `base_url` at any
-service that speaks the standard `/v1/embeddings` shape — Azure OpenAI, Together,
+service that speaks the standard `/v1/embeddings` shape: Azure OpenAI, Together,
 Fireworks, vLLM, LiteLLM, DeepInfra, and so on. It has no default model, so pass
 one explicitly.
 
@@ -121,12 +121,12 @@ let config = EmbedConfig::new("text-embedding-3-large")   // model (empty = defa
 # let _ = config;
 ```
 
-- **`api_key`** — the bearer token. Keyless providers (Ollama, and some
+- **`api_key`**: the bearer token. Keyless providers (Ollama, and some
   OpenAI-compatible gateways) leave it empty.
-- **`base_url`** — override the provider's default endpoint. This is how you
+- **`base_url`**: override the provider's default endpoint. This is how you
   route through a self-hosted proxy or gateway, reach an OpenAI-compatible
   service, or point at a mock in tests.
-- **`header(name, value)`** — extra headers applied to every request, for
+- **`header(name, value)`**: extra headers applied to every request, for
   gateway auth or tenant routing. Chain it more than once.
 
 ### A fully local, keyless setup with Ollama
@@ -192,8 +192,23 @@ for h in &hits {
 upserts a record under your `id` with your `attrs`. `recall` embeds the query
 (using the provider's query side, where it distinguishes document from query
 vectors) and runs a vector search. `RecallOpts` maps straight onto the store's
-search options — `top_k`, a `min_score` floor, and an optional metadata
-[`Filter`](/guides/search/).
+search options: `top_k`, a `min_score` floor, and an optional metadata
+[`Filter`](/guides/search/). Two fields are sentinels: `top_k: 0` (the default)
+means 10, and `min_score: 0.0` means no floor.
+
+`recall` also filters expiry automatically: an entry whose `nidus.expires_at` is
+in the past is invisible to it (and to the server's memory reads), while the raw
+`search`/`list` store API still returns it. Only the HTTP and MCP write paths set
+that attr today; see the parity note below.
+
+:::note
+The in-process `Memory::remember` is leaner than the server's write path: it does
+not take `ttl_seconds`/`dedupe_threshold` options and it does not stamp the
+`nidus.text` attr the auto-provisioned full-text schema indexes. If you need TTL,
+dedupe, or BM25 over remembered text from Rust today, write through a
+`nidus serve` instance, or track
+[#131](https://github.com/duckedup/nidus/issues/131) and the parity work.
+:::
 
 ### Raw vs. Summarize
 
@@ -232,7 +247,7 @@ memory.remember(
 # }
 ```
 
-Requesting `Summarize` without a summarizer attached is an error — the message
+Requesting `Summarize` without a summarizer attached is an error: the message
 tells you to add one with `with_summarizer`.
 
 ## Dimension and embedder-identity pinning
@@ -248,14 +263,14 @@ that on two axes:
 - **Embedder identity.** On the first write into a collection, nidus records the
   embedder's `"provider/model"` identity in the collection metadata (under
   `nidus.embedder`). Every later write re-checks it and **refuses** if a
-  different embedder is now in play — catching an accidental cross-model write
+  different embedder is now in play, catching an accidental cross-model write
   before it corrupts a collection's ranking. To switch models, use a separate
   collection.
 
 ## The escape hatch: bring your own vector
 
-`Memory` is strictly additive. The underlying `Nidus` store — with its raw,
-synchronous, dependency-free `Vec<f32>` API — is always right there:
+`Memory` is strictly additive. The underlying `Nidus` store (with its raw,
+synchronous, dependency-free `Vec<f32>` API) is always right there:
 
 ```rust
 use nidus::{Memory, Nidus};
@@ -271,7 +286,7 @@ let db: Nidus = memory.into_inner();   // unwrap back to the bare store
 ```
 
 So if you already produce your own embeddings, or want a model nidus ships no
-adapter for, keep using `Nidus` directly — upsert your own vectors and search
+adapter for, keep using `Nidus` directly: upsert your own vectors and search
 with your own query vectors, with zero async and zero provider dependencies.
 Embedding is a property of *this handle*, not of the on-disk store: one process
 can wrap a store with an OpenAI embedder while another opens the same directory
@@ -281,8 +296,8 @@ raw.
 
 Nothing about this layer assumes a provider is reachable. Building an embedder
 that requires a key without one, or pointing at a host that is down, returns a
-**typed, descriptive error** — `EmbedError` / `SummarizeError`, each with
-`Config`, `Backend`, `Api { status, body }`, and `Decode` variants — not a panic.
+**typed, descriptive error** (`EmbedError` / `SummarizeError`, each with
+`Config`, `Backend`, `Api { status, body }`, and `Decode` variants), not a panic.
 Transient failures (HTTP 429 and 5xx) are retried with backoff before the error
 surfaces. Match on the variant to decide whether to fall back, retry, or fail.
 
@@ -296,14 +311,14 @@ clear message for the provider-backed part.
 cargo run --example memory --features memory,embed-all,summarize-all
 ```
 
-Point it at a provider with environment variables — see the comments at the top
+Point it at a provider with environment variables. See the comments at the top
 of `examples/memory.rs`.
 
 ## Where to next
 
-- [MCP (agent memory)](/guides/mcp/) — expose this layer to an agent over the
+- [MCP (agent memory)](/guides/mcp/): expose this layer to an agent over the
   Model Context Protocol.
-- [Search & filters](/guides/search/) — what `recall` runs underneath.
-- [Embedding in a host app](/guides/integrating/) — mapping your document type
+- [Search & filters](/guides/search/): what `recall` runs underneath.
+- [Embedding in a host app](/guides/integrating/): mapping your document type
   onto a `Record`.
-- [API reference](/reference/api/) — the full surface.
+- [API reference](/reference/api/): the full surface.

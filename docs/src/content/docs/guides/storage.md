@@ -8,7 +8,7 @@ This page covers the on-disk format, what survives a crash, how dead rows are
 reclaimed, and how a second process reads a store another is writing.
 
 This page is about a store on **local disk**. To keep the durable data somewhere
-else — Amazon S3 or Google Cloud Storage — see [Storage backends](/guides/storage-backends/);
+else (Amazon S3 or Google Cloud Storage), see [Storage backends](/guides/storage-backends/);
 to share the in-memory index across processes via Redis, see
 [Memory stores](/guides/memory-stores/).
 
@@ -18,7 +18,7 @@ to share the in-memory index across processes via Redis, see
 <dir>/
   manifest  names the live segments (the first is `data`) + pins dimension/metric
   data      append-only, fixed-stride, row-major f32 matrix (header pins dimension)
-  log       append-only framed op stream: [len][bincode(Op)][crc32] — the commit record
+  log       append-only framed op stream: [len][bincode(Op)][crc32] (the commit record)
   lock      O_EXCL writer-exclusion lock file
   seg-…     additional immutable segments (only once a store seals past the threshold)
 ```
@@ -26,11 +26,11 @@ to share the in-memory index across processes via Redis, see
 All on-disk encoding is **little-endian and explicit**. Every `log` record is
 length-prefixed and CRC32-checked, so a torn tail (a half-written final record
 after a crash) is detectable and is dropped on the next open. The `manifest` is a
-`[crc32][bincode]` object replaced atomically — a reader sees one whole manifest
+`[crc32][bincode]` object replaced atomically: a reader sees one whole manifest
 version, never a torn mix.
 
 The `data` header pins the embedding **dimension** at creation. Reopening a store
-with a different dimension is a hard error — one embedding space per store, for
+with a different dimension is a hard error: one embedding space per store, for
 the life of the store.
 
 ## The durability contract
@@ -38,7 +38,7 @@ the life of the store.
 The default fsync policy is [`Fsync::PerBatch`](/reference/configuration/#fsync):
 each `upsert`/`delete` call appends vectors, fsyncs `data`, appends the
 committing `log` records, then fsyncs `log`. **A crash loses at most the
-in-flight batch** — everything fsynced before it is intact, and the in-RAM index
+in-flight batch**: everything fsynced before it is intact, and the in-RAM index
 is fully reproducible from the files.
 
 `Fsync::OnFlush` defers **both** fsyncs to an explicit
@@ -54,7 +54,7 @@ the barrier is already amortised and the gap is closer to 2×.
 
 A crash under `OnFlush` can leave the `log` durable while the rows it references
 are not. That is not a torn store: replay ignores any record pointing past the
-end of `data`, so recovery drops the tail and opens cleanly on the prefix — the
+end of `data`, so recovery drops the tail and opens cleanly on the prefix, the
 same rule that lets readers work lock-free.
 
 ## Graceful failure
@@ -68,7 +68,7 @@ Resource exhaustion never corrupts a store:
   abort (except `attrs`/`id` clones, which std gives no fallible reserve for).
 - **A hard ceiling holds under overcommit.**
   [`Config::max_vector_bytes`](/reference/configuration/#max_vector_bytes)
-  refuses a batch *before* allocating — the only guard that works on systems
+  refuses a batch *before* allocating, the only guard that works on systems
   where the kernel SIGKILLs before an allocation fails.
   [`Nidus::footprint()`](/reference/api/#footprint) is the introspection hook for
   deciding whether you can afford more data.
@@ -76,13 +76,13 @@ Resource exhaustion never corrupts a store:
 ## Compaction
 
 Because segments are never rewritten in place, a `delete` or an overwriting
-`upsert` leaves the old row behind as a **dead row** — still on disk, no
+`upsert` leaves the old row behind as a **dead row**: still on disk, no
 longer referenced by the index. [`compact()`](/reference/api/#search--maintenance) collapses
 every [segment](#segments) into one fresh `data` segment that drops the dead rows,
 publishes the new manifest, and reclaims the old segment objects.
 
 Compaction also runs automatically on `open` when the dead-row ratio exceeds
-[`Config::auto_compact`](/reference/configuration/#auto_compact) (default `0.5` —
+[`Config::auto_compact`](/reference/configuration/#auto_compact) (default `0.5`,
 half the rows dead). Set it to `None` to disable and compact only on demand.
 
 [`footprint()`](/reference/api/#footprint) reports `rows`, `dead_rows`, and
@@ -90,21 +90,21 @@ half the rows dead). Set it to `None` to disable and compact only on demand.
 
 ## Segments
 
-A store's vectors live in one or more **segments** — self-contained, immutable chunks of
-rows — named in order by the `manifest`. The last one is the **active** segment that new
+A store's vectors live in one or more **segments** (self-contained, immutable chunks of
+rows) named in order by the `manifest`. The last one is the **active** segment that new
 rows append to; the rest are sealed and never rewritten. The segments are presented to
 search as a single dense row space, so this is invisible to queries: the same exact
 brute-force scan runs whether a store is one segment or many.
 
 By default a store is a **single segment** (`data`) and behaves exactly as it always has.
 Set [`Config::segment_max_rows`](/reference/configuration/#segment_max_rows) to roll the
-active segment into a sealed one once it grows past *N* rows and start a fresh one — no
+active segment into a sealed one once it grows past *N* rows and start a fresh one. No
 data is copied; sealing just publishes a new `manifest`. Sealing and
 [compaction](#compaction) (which collapses every segment back into one) replace the
 manifest atomically, which is the store's commit point.
 
 A store that predates this format (just `data` + `log`, no `manifest`) is migrated
-transparently on the first read-write open — `data` becomes the base segment and a
+transparently on the first read-write open: `data` becomes the base segment and a
 manifest is written. A read-only open of such a store writes nothing.
 
 Segments are also the unit of **indexing at scale**: with
@@ -117,7 +117,7 @@ fresh data. See [per-segment indexing](/guides/search/#per-segment-indexing-at-s
 
 By default nidus loads every segment into RAM on `open`. Set
 [`Config::mmap(true)`](/reference/configuration/#mmap) and each **immutable** (sealed)
-segment is instead served from a read-only **memory-map** of its file — the operating
+segment is instead served from a read-only **memory-map** of its file: the operating
 system pages a segment in on demand and reclaims it under pressure, so a store can hold
 more vectors than fit in memory. The **active** segment (the one still taking appends)
 stays in RAM.
@@ -135,21 +135,21 @@ let store = Nidus::open(
 ```
 
 Search over mapped segments goes through the same row accessor as the in-RAM path, so
-**results are identical** — still exact (or, with an [index](/guides/search/), the same
+**results are identical**: still exact (or, with an [index](/guides/search/), the same
 approximate set), still filter- and `min_score`-respecting. It composes with quantization
 and the [per-segment indexes](/guides/search/#per-segment-indexing-at-scale): a cold
 segment can be both mapped and indexed.
 
 A few conditions apply:
 
-- It is effective only for a **local-filesystem** store with **sealed** segments — it
+- It is effective only for a **local-filesystem** store with **sealed** segments: it
   needs [`segment_max_rows`](/reference/configuration/#segment_max_rows) to create
   immutable segments and a mappable local file. An object-store (`s3://`/`gs://`) or
   in-memory store silently stays all-RAM.
 - The host must be **little-endian** (the on-disk `f32` layout). Other hosts fall back to
   loading into RAM.
 - [Compaction](#compaction) still materializes the live set in RAM, so it is bounded by
-  memory even when the store as a whole is not — keep it infrequent on a very large store.
+  memory even when the store as a whole is not. Keep it infrequent on a very large store.
 
 ## Cross-process readers
 
@@ -167,15 +167,15 @@ let reader = Nidus::open(
 
 A `ReadOnly` open takes **no lock**. It reads the `manifest`, loads the segments it
 names to their current total size *S*, replays `log`, and ignores any record that
-references a row ≥ *S*/dim. The result is a **consistent, possibly-stale snapshot** —
-never a torn read — even while the writer is mid-append: a not-yet-named segment or a
+references a row ≥ *S*/dim. The result is a **consistent, possibly-stale snapshot**
+(never a torn read), even while the writer is mid-append: a not-yet-named segment or a
 row past *S* is simply invisible until its commit. This is the lock-free basis for
 search-only processes reading a store another process is writing.
 
 ### Refreshing a reader
 
 A `ReadOnly` snapshot is fixed at the moment it opened. To pick up a writer's later
-commits — appends, deletes, seals, compactions — without reopening, call
+commits (appends, deletes, seals, compactions) without reopening, call
 [`refresh()`](/reference/api/#search--maintenance):
 
 ```rust
@@ -196,15 +196,15 @@ let hits = reader.search(Scope::All, &query, &SearchOpts::default())?;
 ```
 
 `refresh` re-reads the `manifest` and, when a newer version is published or the `log`
-has grown, moves to the newer state at a single consistent point — then swaps it in
+has grown, moves to the newer state at a single consistent point, then swaps it in
 **atomically** (a failure leaves the prior snapshot serving, never a torn mix). It
 returns `true` when newer state was adopted and `false` when the reader was already
-current — the cheap common case (a small `manifest` read plus a `log` stat, no segment
+current, the cheap common case (a small `manifest` read plus a `log` stat, no segment
 or index work), so it is safe to call before a batch of queries. A `ReadWrite` handle is
 already the source of truth, so its `refresh` is always a no-op.
 
 It also stays cheap *when* there is new state. If only the active segment grew (plain
-appends — no seal or compaction changed the segment list), `refresh` re-reads just that
+appends, with no seal or compaction changing the segment list), `refresh` re-reads just that
 one segment object and reuses every immutable segment, instead of re-fetching the whole
 set; a seal/compaction takes the full re-open. And when a shared
 [memory tier](/guides/memory-stores/) holds a snapshot matching the new state, the reader
