@@ -280,8 +280,11 @@ clones.
 
 `{"peers":[{"name":…,"dir":…,"self":true?,"queue":[…],"surface":{"<issue>":["path"]}}]}`.
 It catches shared trees, foreign remotes, dirty or stale peer checkouts, tickets that are
-closed, already assigned, already carried by an open PR, or queued to two peers at once, and
-files two peers both claim. **Errors block dispatch.** Re-run it whenever a peer reports its
+closed, already assigned, already carried by an open PR, or queued to two peers at once,
+files two peers both claim, and **two branches claiming one `Cargo.toml` version** — of which
+the second to merge releases nothing, silently, because `release.yml` only cuts a release when
+the tag is new. No branch can see that from inside its own tree, which is why it is yours.
+**Errors block dispatch.** Re-run it whenever a peer reports its
 surface or you re-cut the queue.
 
 ### 3. The brief
