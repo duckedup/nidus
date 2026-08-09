@@ -3,8 +3,10 @@
 
 import { lanes, formatLanes } from './lanes.mjs'
 import * as laws from './laws.mjs'
+import * as fleet from './fleet.mjs'
 import * as git from './git.mjs'
 import { selftest } from './selftest.mjs'
+import { readFileSync } from 'node:fs'
 
 const argv = process.argv.slice(2)
 const cmd = argv[0]
@@ -90,6 +92,27 @@ function runLaws() {
   return errors.length || (argv.includes('--strict') && findings.length) ? 1 : 0
 }
 
+function runFleet() {
+  const planPath = flag('plan')
+  if (typeof planPath !== 'string') { console.error('fleet: --plan <file.json> is required'); return 1 }
+  const plan = JSON.parse(readFileSync(planPath, 'utf8'))
+  const self = git.selfFacts()
+
+  const peers = (plan.peers || []).map(p => ({ ...p, ...(p.dir ? git.treeFacts(p.dir) : {}), name: p.name }))
+  const queued = [...new Set(peers.flatMap(p => (p.queue || []).map(String)))]
+  const issues = queued.length ? git.issueFacts(queued) : {}
+
+  const findings = [
+    ...fleet.treeFindings(peers, self),
+    ...fleet.issueFindings(peers, issues, { login: self.login }),
+    ...fleet.overlapFindings(peers),
+  ]
+
+  if (asJson) console.log(JSON.stringify({ self, peers, issues, findings }, null, 2))
+  else console.log(fleet.formatFleet(findings))
+  return findings.some(f => f.severity === 'error') || (argv.includes('--strict') && findings.length) ? 1 : 0
+}
+
 const USAGE = `nidus-check — deterministic checks for this repo's laws and verification lanes
 
   nidus-check lanes  [--base <ref>] [--pr <n>] [--paths a,b] [--json]
@@ -101,6 +124,12 @@ const USAGE = `nidus-check — deterministic checks for this repo's laws and ver
       stale install snippets, bot-stamped files, heavy deps, test placement,
       bogus Miri ignores, feature gating, tickets left in_progress.
 
+  nidus-check fleet  --plan <file.json> [--json] [--strict]
+      Is this dispatch safe? Shared working trees, foreign remotes, dirty or stale
+      peer clones, tickets that are closed/taken/already-PR'd or queued twice, and
+      files two peers both claim. The plan is
+      {"peers":[{"name":…,"dir":…,"queue":[…],"surface":{"<issue>":["path"]}}]}.
+
   nidus-check selftest
       Run the fixture suite for the detectors.
 
@@ -110,6 +139,7 @@ const exit = (() => {
   switch (cmd) {
     case 'lanes': return runLanes()
     case 'laws': return runLaws()
+    case 'fleet': return runFleet()
     case 'selftest': return selftest({ json: asJson })
     default: console.log(USAGE); return cmd ? 1 : 0
   }

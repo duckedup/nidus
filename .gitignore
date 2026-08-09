@@ -33,3 +33,6 @@
 # Blueprints are transient planning files, deleted once implemented. Ignored so a
 # skipped cleanup can never land one in a commit.
 BLUEPRINT-*.md
+
+# ── retired bd/Dolt tracker residue (CLAUDE.md: never reinstall) ─────────────
+.beads/

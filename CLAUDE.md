@@ -31,6 +31,10 @@ checked, not re-derived from prose. Reach for it by default:
 - **`/nidus review`** — deterministic law checks plus adversarially-verified findings.
   Run it on your own diff before opening a PR, not only on others'.
 - **`/nidus ship`** — the version-bump, `Closes`-audit, push-and-PR checklist.
+- **`/nidus fleet <who does what>`** — coordinate peer sessions across several tickets at
+  once: a worktree each under `.claude/worktrees/` (never a shared tree, never a fresh
+  clone), `nidus-check fleet` to block a colliding dispatch, and overlapping tickets
+  sequenced rather than raced.
 
 Skipping the skill for a one-line fix is fine; skipping it for feature work, reviews,
 or anything multi-file is not.
