@@ -137,6 +137,9 @@ export function lanes(paths) {
   const inert = files.filter(f => !covered.has(f) && INERT.some(re => re.test(f)))
   const unmatched = files.filter(f => !covered.has(f) && !inert.includes(f))
   return {
+    // What the answer is *about*. Without it, an empty file list and a change that
+    // genuinely needs no lane are the same output, and the first reads as the second.
+    examined: files.length,
     run: hit.filter(h => !h.manual),
     manual: hit.filter(h => h.manual),
     inert,
@@ -145,7 +148,12 @@ export function lanes(paths) {
 }
 
 export function formatLanes(result) {
-  const out = []
+  const out = [`Examined ${result.examined ?? 0} file(s).`]
+  if (!result.examined) {
+    out.push('Nothing to check — this target has no files, so no lane could have applied.')
+    out.push('Commit first, or name the files with --paths.')
+    return out.join('\n')
+  }
   if (result.run.length) {
     out.push('Run these:')
     for (const l of result.run) out.push(`  ${l.recipe}\n      ↳ ${l.why} (${l.cause})`)

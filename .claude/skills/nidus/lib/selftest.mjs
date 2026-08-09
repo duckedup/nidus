@@ -3,7 +3,7 @@
 
 import * as laws from './laws.mjs'
 import * as fleet from './fleet.mjs'
-import { lanes } from './lanes.mjs'
+import { lanes, formatLanes } from './lanes.mjs'
 
 const cases = []
 const test = (name, fn) => cases.push({ name, fn })
@@ -465,6 +465,22 @@ test('laws: a version at or above origin/main is fine', () => {
 // keeps main's value. Firing there would nag every skill-only PR into a false bump.
 test('laws: an untouched Cargo.toml is not a backwards version', () => {
   eq(laws.versionBackwards(CARGO('0.58.0'), CARGO('0.60.0'), ['.claude/skills/nidus/SKILL.md']).length, 0, 'not touched')
+})
+
+// The lanes half of #173, and the more dangerous half: a missing lane costs the
+// verification itself, not just a misread report. Structural, so --json carries it too.
+test('lanes: the result states how many files it examined (#173)', () => {
+  eq(lanes([]).examined, 0, 'nothing examined')
+  eq(lanes(['src/lib.rs', 'src/store/read.rs']).examined, 2, 'counts what it was given')
+})
+
+// "No automated lane applies" over zero files and over a file that genuinely needs no
+// lane must not print the same thing — one is an answer, the other is an empty question.
+test('lanes: an empty scope does not read as "no lane applies" (#173)', () => {
+  const empty = formatLanes(lanes([]))
+  const inert = formatLanes(lanes(['LICENSE']))
+  eq(/examined 0 file/i.test(empty), true, `empty scope is disclosed: ${empty}`)
+  eq(empty === inert, false, 'the two answers are distinguishable')
 })
 
 // ── fleet ──────────────────────────────────────────────────────────────────
