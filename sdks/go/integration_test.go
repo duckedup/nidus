@@ -29,6 +29,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,7 +59,7 @@ const (
 //
 // Keeping the transcript is the whole reason this is not io.Discard: a server that
 // fails to start says why on stderr — a port in use, a store already locked, a bad
-// flag — and a test that reports "did not become healthy in time" while throwing that
+// flag — and a test that reports "did not become ready in time" while throwing that
 // away is a test that costs an hour to debug.
 type logBuffer struct {
 	mu  sync.Mutex
@@ -194,12 +196,9 @@ func (c *child) baseURL(t *testing.T) string {
 	return ""
 }
 
-// client returns a client for this server, waited until /health answers.
-//
-// /health is the real gate rather than the startup line: the address is bound before
-// the store is open, so a request sent on the strength of the banner alone can race a
-// 503. /health also needs no token, which is what lets the same wait serve a
-// token-protected server.
+// client returns a client for this server, waited until /ready answers 200 (#121):
+// /health is liveness and answers before the store finishes opening, so gating on it
+// hands tests a server that can still 503. /ready is equally token-exempt.
 func (c *child) client(t *testing.T, opts ...Option) *Client {
 	t.Helper()
 	addr := c.baseURL(t)
@@ -208,13 +207,23 @@ func (c *child) client(t *testing.T, opts ...Option) *Client {
 		t.Fatalf("NewClient(%q) failed: %v", addr, err)
 	}
 
-	// Ping rather than Health, so a give-up reports *why* the last attempt failed —
-	// connection refused reads very differently from a 503 from a store that is still
-	// opening, and the transcript alone cannot always tell them apart.
+	// Raw GET so a give-up reports *why* the last attempt failed — connection refused
+	// reads very differently from a 503 from a store that is still opening.
+	ready := func() error {
+		resp, err := http.Get(addr + "/ready")
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("/ready answered %s", resp.Status)
+		}
+		return nil
+	}
 	deadline := time.Now().Add(startupTimeout)
 	var last error
 	for time.Now().Before(deadline) {
-		last = db.Ping(context.Background())
+		last = ready()
 		if last == nil {
 			return db
 		}
@@ -223,7 +232,7 @@ func (c *child) client(t *testing.T, opts ...Option) *Client {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("nidus serve at %s did not become healthy within %s (last attempt: %v)%s",
+	t.Fatalf("nidus serve at %s did not become ready within %s (last attempt: %v)%s",
 		addr, startupTimeout, last, c.transcript())
 	return nil
 }
@@ -1069,7 +1078,7 @@ func TestBearerTokenIsEnforced(t *testing.T) {
 	const token = "s3cret-token"
 	server := spawn(t, t.TempDir(), "--token", token)
 
-	// The unauthenticated client is the one that waits for health: /health is exempt
+	// The unauthenticated client is the one that waits for readiness: /ready is exempt
 	// from auth (so an orchestrator does not read a 401 as "not ready"), and gating on
 	// it here proves that exemption rather than assuming it.
 	anon := server.client(t)

@@ -41,13 +41,21 @@ describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
       ["serve", "--dir", dir, "--dim", "3", "--addr", `127.0.0.1:${PORT}`],
       { stdio: "ignore" },
     );
-    // Poll /health until the server is up (or give up after ~5s).
+    // Poll /ready, not /health (#121): health is liveness and answers before the
+    // store finishes opening, so a health gate can hand tests a server that 503s.
     const deadline = Date.now() + 5000;
+    let last = "";
     while (Date.now() < deadline) {
-      if (await db.health()) return;
+      try {
+        const res = await fetch(`${baseUrl}/ready`);
+        if (res.status === 200) return;
+        last = `/ready answered ${res.status}`;
+      } catch (e) {
+        last = String(e);
+      }
       await new Promise((r) => setTimeout(r, 100));
     }
-    throw new Error("nidus serve did not become healthy in time");
+    throw new Error(`nidus serve did not become ready in time (${last})`);
   });
 
   afterAll(() => {

@@ -29,6 +29,8 @@ import os
 import re
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -79,11 +81,10 @@ def server(tmp_path: Path) -> Iterator[str]:
         )
     try:
         base_url = _await_base_url(child, log)
-        db = NidusClient(base_url, timeout=5.0)
         deadline = time.monotonic() + STARTUP_TIMEOUT
-        while not db.health():
+        while not _ready(base_url):
             if time.monotonic() > deadline:
-                pytest.fail(f"nidus serve never became healthy\n{_transcript(log)}")
+                pytest.fail(f"nidus serve never became ready\n{_transcript(log)}")
             time.sleep(0.05)
         yield base_url
     finally:
@@ -95,6 +96,16 @@ def server(tmp_path: Path) -> Iterator[str]:
         except subprocess.TimeoutExpired:  # pragma: no cover - only if shutdown hangs
             child.kill()
             child.wait()
+
+
+def _ready(base_url: str) -> bool:
+    """``/ready``, not ``/health`` (#121): health is liveness and answers before the
+    store finishes opening, so a health gate can hand tests a server that still 503s."""
+    try:
+        with urllib.request.urlopen(f"{base_url}/ready", timeout=1.0) as resp:
+            return bool(resp.status == 200)
+    except (urllib.error.URLError, OSError):
+        return False
 
 
 def _await_base_url(child: subprocess.Popen[bytes], log: Path) -> str:
