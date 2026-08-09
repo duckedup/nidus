@@ -137,7 +137,7 @@ export function orphanFindings(list = [], peers = [], self = {}) {
 // What a coordinator needs back after its own context is gone. Everything here is
 // derived from GitHub and the worktree registry, so a cleared session rebuilds the
 // whole picture from one command instead of remembering it.
-export function rehydrate(peers = [], issues = {}, list = []) {
+export function rehydrate(peers = [], issues = {}, list = [], branches = []) {
   const rows = []
   for (const p of peers) {
     for (const n of p.queue || []) {
@@ -146,14 +146,26 @@ export function rehydrate(peers = [], issues = {}, list = []) {
       const prs = (meta && meta.linkedPrs) || []
       const merged = prs.find(pr => pr.state === 'MERGED')
       const open = prs.find(pr => pr.state === 'OPEN')
-      const wt = list.find(w => !w.isMain && new RegExp(`(^|[^0-9])${id}([^0-9]|$)`).test(w.branch || ''))
+      const names = ref => new RegExp(`(^|[^0-9])${id}([^0-9]|$)`).test(ref || '')
+      const wt = list.find(w => !w.isMain && names(w.branch))
+      // A peer working in its own clone has no worktree here, so its pushed branch is
+      // the only evidence the ticket is moving. Without this it reads as untouched.
+      const remote = branches.find(names)
 
       let state = 'queued'
       if (merged || (meta && meta.state && meta.state !== 'OPEN')) state = 'shipped'
       else if (open) state = 'in-review'
-      else if (wt) state = 'in-flight'
+      else if (wt || remote) state = 'in-flight'
 
-      rows.push({ issue: id, holder: p.name, state, pr: (merged || open || {}).number || null, branch: (wt && wt.branch) || null })
+      rows.push({ issue: id, holder: p.name, state, pr: (merged || open || {}).number || null, branch: (wt && wt.branch) || remote || null })
+    }
+    // Tickets sharing one PR share its fate, but only one of them names the branch.
+    // Without this the siblings read as untouched and get dispatched to someone else.
+    for (const bundle of p.bundles || []) {
+      const mine = rows.filter(r => r.holder === p.name && bundle.map(String).includes(r.issue))
+      const lead = mine.find(r => r.state !== 'queued')
+      if (!lead) continue
+      for (const r of mine) if (r.state === 'queued') Object.assign(r, { state: lead.state, pr: lead.pr, branch: lead.branch, via: lead.issue })
     }
   }
   return rows
@@ -164,7 +176,7 @@ export function formatRehydrate(rows) {
   const order = { 'in-review': 0, 'in-flight': 1, queued: 2, shipped: 3 }
   const sorted = [...rows].sort((a, b) => order[a.state] - order[b.state] || Number(a.issue) - Number(b.issue))
   const lines = sorted.map(r => {
-    const bits = [r.pr ? `PR #${r.pr}` : null, r.branch].filter(Boolean).join('  ')
+    const bits = [r.pr ? `PR #${r.pr}` : null, r.branch, r.via ? `(bundled with #${r.via})` : null].filter(Boolean).join('  ')
     return `  ${r.state.padEnd(9)} #${r.issue.padEnd(4)} ${r.holder.padEnd(14)} ${bits}`
   })
   const counts = sorted.reduce((m, r) => ({ ...m, [r.state]: (m[r.state] || 0) + 1 }), {})

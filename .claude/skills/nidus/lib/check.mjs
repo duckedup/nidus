@@ -120,7 +120,7 @@ function runFleet() {
     ...fleet.orphanFindings(trees, peers, self),
     ...fleet.versionFindings(git.inflightVersions(), mainVersion(), git.releasedTags(), git.openPrRefs()),
   ]
-  const state = fleet.rehydrate(peers, issues, trees)
+  const state = fleet.rehydrate(peers, issues, trees, git.inflightVersions().map(b => b.ref))
 
   if (asJson) console.log(JSON.stringify({ plan: planPath, self, peers, issues, state, findings }, null, 2))
   else if (argv.includes('--status')) console.log(fleet.formatRehydrate(state))
