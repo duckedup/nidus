@@ -82,7 +82,9 @@ function runLaws() {
 
   findings.push(...laws.testPlacement(added, f => git.readAt(t, f)))
   const mentioned = git.mentionedIssues(t)
-  findings.push(...laws.unclosedTickets(mentioned, git.closingIssues(t), git.issueTitles(mentioned)))
+  findings.push(...laws.unclosedTickets(
+    mentioned, git.closingIssues(t), git.issueTitles(mentioned), git.acknowledgedIssues(t),
+  ))
 
   const errors = findings.filter(f => f.severity === 'error')
   if (asJson) {

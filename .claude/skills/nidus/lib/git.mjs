@@ -17,7 +17,7 @@ export function sh(cmd, { allowFail = false } = {}) {
 // and how to read a file's full text at that head.
 export function resolveTarget({ base, head, pr, path } = {}) {
   if (pr) {
-    const meta = JSON.parse(sh(`gh pr view ${pr} --json baseRefName,headRefOid,number,title,body,state,isDraft,url`))
+    const meta = JSON.parse(sh(`gh pr view ${pr} --json baseRefName,headRefName,headRefOid,number,title,body,state,isDraft,url`))
     sh(`git fetch --quiet origin pull/${pr}/head`)
     const headOid = meta.headRefOid
     sh(`git fetch --quiet origin ${meta.baseRefName}`, { allowFail: true })
@@ -109,19 +109,35 @@ export function diffFor(t, path) {
   return sh(`git diff ${range} -- ${path}`, { allowFail: true })
 }
 
-// Issue ids this change claims to ship — from the branch name, its commit subjects,
-// and the PR title/body. Lets the ticket check tell "close this before merge" apart
-// from "unrelated backlog rot".
+// Issue ids this change declares itself to BE — branch name, commit subjects, PR title.
+// Deliberately not the bodies: a `#n` in prose is context, and cross-referencing related
+// issues is good practice, so scraping bodies made the law fire on exactly that.
 // A branch is austin/<n>-<slug>, so its leading number is an issue ref too.
 export function mentionedIssues(t) {
-  const branch = sh('git branch --show-current', { allowFail: true })
+  // The PR's own head ref, not the local checkout: targeting a PR from an unrelated
+  // branch used to attribute that branch's issue to it, and CI checks out a detached
+  // merge ref where `--show-current` is empty, losing the signal altogether.
+  const branch = t.pr ? (t.pr.headRefName || '') : sh('git branch --show-current', { allowFail: true })
   let text = branch.replace(/(?:^|\/)(\d+)-/g, ' #$1 ')
   if (t.base) {
     const range = t.head ? `${t.base}..${t.head}` : `${t.base}..HEAD`
-    text += '\n' + sh(`git log --format=%s%n%b ${range}`, { allowFail: true })
+    text += '\n' + sh(`git log --format=%s ${range}`, { allowFail: true })
   }
-  if (t.pr) text += `\n${t.pr.title || ''}\n${t.pr.body || ''}`
+  if (t.pr) text += `\n${t.pr.title || ''}`
   return new Set(text.match(/#\d+/g) || [])
+}
+
+// Refs/Part of/See: the author has stated this issue's disposition without claiming to
+// close it. Read from the bodies, where such a trailer is actually written.
+const ACK_RE = /\b(?:refs?|part of|see)\s+#(\d+)/gi
+
+export function acknowledgedIssues(t) {
+  let text = t.pr ? t.pr.body || '' : ''
+  if (t.base) {
+    const range = t.head ? `${t.base}..${t.head}` : `${t.base}..HEAD`
+    text += '\n' + sh(`git log --format=%b ${range}`, { allowFail: true })
+  }
+  return new Set(Array.from(text.matchAll(ACK_RE), m => `#${m[1]}`))
 }
 
 // GitHub's own closing keywords; anything else is a mention that will NOT close.
