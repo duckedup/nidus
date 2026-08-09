@@ -1104,8 +1104,9 @@ build until a real need exists.
   vectors, so they are persisted only as an optimization: a separate `ann` file
   (`NIDUS\0` header + `bincode` + CRC32, atomically written) lets `open` *load* the
   index instead of rebuilding it (the expensive part — HNSW build is scalar/
-  single-threaded). It is written strictly **out-of-band** — on `compact` and the
-  explicit `Nidus::persist_index()`, **never** on the `upsert`/`flush` hot path, so
+  single-threaded). It is written strictly **out-of-band** — on `compact`, the
+  explicit `Nidus::persist_index()`, and the clean-shutdown path of `nidus serve` /
+  `nidus mcp` (§9) — **never** on the `upsert`/`flush` hot path, so
   writes stay fast and there is no background thread. `open` loads the cache, validates
   it against the current `(dim, distance, kind, params, quantization)` + a CRC, and **incrementally
   catches up** any rows appended since it was written; an absent, stale, over-long, or

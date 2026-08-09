@@ -59,7 +59,9 @@ sweep isn't enough. Both stay pure-safe-Rust and are off by default:
   collection outgrows a full scan. On realistic clustered data (n=20k, dim=768) HNSW
   returns **~0.99–1.0 recall@10 at ~7–10× the query speed** of the exact scan; IVF
   ~1.0 recall at ~3×. The graph is in-RAM but [persisted](/guides/search/#approximate-search-ann)
-  so a warm `open()` is **~0.05 s** instead of rebuilding (~36 s here), and a cold
+  so a warm `open()` is **~0.05 s** instead of rebuilding (~36 s here). `nidus serve`
+  persists the cache when it stops cleanly, so a restart is warm without any
+  out-of-band call. A cold
   rebuild parallelizes over `query_threads` (**~36 s → ~5 s at 8 threads**). Recall is
   data-dependent (uniform-random vectors are a near-worst case), so measure your own:
   `just bench-ann clustered=1`.

@@ -430,9 +430,9 @@ docker run --rm -p 7700:7700 \
 
 The image binds `0.0.0.0:7700` and exposes the unauthenticated `GET /health` and
 `GET /ready` for liveness/readiness probes. It handles `SIGTERM` (the signal an
-orchestrator sends to stop a container): on stop it flushes and releases the writer
-lock, so a replacement instance re-acquires it immediately instead of waiting out
-the lock TTL. Set a `NIDUS_TOKEN` whenever the port is reachable beyond localhost,
+orchestrator sends to stop a container): on stop it flushes, persists the ANN and
+full-text caches so the next start is warm, and releases the writer lock, so a
+replacement instance re-acquires it immediately instead of waiting out the lock TTL. Set a `NIDUS_TOKEN` whenever the port is reachable beyond localhost,
 and read [Securing a deployment](#securing-a-deployment) first: a `0.0.0.0` bind is
 plain HTTP, so the token and the data both cross the network in cleartext unless
 something in front of the container terminates TLS.
