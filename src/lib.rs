@@ -78,7 +78,7 @@ mod memory;
 #[cfg(feature = "memory")]
 pub use memory::{
     META_CREATED_AT, META_DIM, META_EMBEDDER, META_EXPIRES_AT, META_TEXT, META_UPDATED_AT, Memory,
-    RecallOpts, RememberMode,
+    RecallOpts, RememberMode, RememberOpts, Remembered,
 };
 // The summarize-mode attr keys are only defined when summaries can be produced.
 #[cfg(all(feature = "memory", feature = "summarize"))]
