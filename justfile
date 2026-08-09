@@ -72,8 +72,10 @@ test-cli:
 # End-to-end tests only: spawn the real `nidus serve` binary and drive it over HTTP.
 # Included in `test-cli` (they need no services and run in seconds); this recipe is
 # for iterating on them alone. Pass a filter, e.g. `just test-e2e token`.
+# The embed/summarize features gate suites driven by hand-rolled TCP mocks — no real
+# services — so leaving them off would silently compile those suites away (#111).
 test-e2e *FILTER:
-    cargo test --features cli,mcp --test e2e {{ FILTER }}
+    cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai --test e2e {{ FILTER }}
 
 # Start the services the cluster e2e tests need (real S3 + real Redis-family tier).
 # The container definitions live in scripts/e2e-services.sh — one source of truth,
@@ -95,7 +97,7 @@ test-e2e-valkey-cluster *FILTER:
     ./scripts/e2e-services.sh up-cluster
     trap './scripts/e2e-services.sh down-cluster' EXIT
     NIDUS_E2E_REDIS_URL="$(./scripts/e2e-services.sh cluster-url)" \
-        cargo test --features cli --test e2e cluster::{{ FILTER }} -- --ignored --test-threads=2
+        cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai --test e2e cluster::{{ FILTER }} -- --ignored --test-threads=2
 
 # Cluster e2e: several real `nidus serve` processes over a shared object store and
 # memory tier. #[ignore]d by default (they need the services above), so run them
@@ -103,7 +105,7 @@ test-e2e-valkey-cluster *FILTER:
 # Override the endpoints with NIDUS_E2E_S3_ENDPOINT / NIDUS_E2E_S3_BUCKET /
 # NIDUS_E2E_S3_KEY / NIDUS_E2E_S3_SECRET / NIDUS_E2E_REDIS_URL.
 test-e2e-cluster *FILTER:
-    cargo test --features cli --test e2e cluster::{{ FILTER }} -- --ignored --test-threads=2
+    cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai --test e2e cluster::{{ FILTER }} -- --ignored --test-threads=2
 
 # Release build of the `nidus` binary
 build-cli:

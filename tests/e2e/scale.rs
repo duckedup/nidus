@@ -249,6 +249,88 @@ fn filtered_search_at_scale_matches_ground_truth() {
     }
 }
 
+/// **The ANN recall canary under a selective filter** (#114, SPEC §9's named limitation):
+/// HNSW over the same corpus, filter, and ground truth as the exact filtered test above,
+/// held to a recall floor — the acceptance test for the exact-prefilter follow-up.
+#[test]
+fn ann_filtered_search_recall_stays_above_the_floor() {
+    let corpus = Corpus::generate(0xF117E4, N, DIM, 3);
+    let dir = tempfile::tempdir().unwrap();
+    // Small build params on purpose: the default `ef_construction = 200` makes a debug-build
+    // ingest blow the harness's per-request timeout, and the canary is about the filtered
+    // search path, not graph quality — the floor below was observed with exactly these.
+    let server = Server::new(dir.path(), DIM)
+        .args([
+            "--ann",
+            "hnsw",
+            "--ann-m",
+            "8",
+            "--ann-ef-construction",
+            "16",
+        ])
+        .start();
+
+    // Hand-rolled ingest at a fifth of `BATCH`: graph inserts are slow enough in a debug
+    // build that a 500-record batch would flirt with the harness's 30s request timeout.
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    for (b, chunk) in corpus.vectors.chunks(100).enumerate() {
+        let records: Vec<Value> = chunk
+            .iter()
+            .enumerate()
+            .map(|(j, v)| {
+                let i = b * 100 + j;
+                json!({
+                    "id": Corpus::id(i),
+                    "vector": v,
+                    "attrs": {"bucket": {"Int": (i % 10) as i64}}
+                })
+            })
+            .collect();
+        let (status, body) = server.post("/collections/docs/upsert", &json!({"records": records}));
+        assert_eq!(status, 200, "batch {b} failed: {body}");
+    }
+
+    let mut recalls = Vec::new();
+    for (qi, query) in corpus.queries.iter().enumerate() {
+        let (status, hits) = server.post(
+            "/search",
+            &json!({
+                "query": query,
+                "top_k": TOP_K,
+                "filter": [{"Eq": ["bucket", {"Int": 7}]}]
+            }),
+        );
+        assert_eq!(status, 200, "query {qi} failed: {hits}");
+
+        let ids = hit_ids(&hits);
+        // Approximate or not, a hit that fails the filter is a correctness bug, not a
+        // recall trade — assert membership before measuring recall.
+        for id in &ids {
+            let i: usize = id
+                .strip_prefix("doc-")
+                .and_then(|n| n.parse().ok())
+                .expect("parse id");
+            assert_eq!(i % 10, 7, "{id} does not satisfy bucket == 7");
+        }
+        let truth = corpus.ground_truth(query, TOP_K, |i| i % 10 == 7);
+        recalls.push(recall_at_k(&ids, &truth));
+    }
+
+    let mean = recalls.iter().sum::<f64>() / recalls.len() as f64;
+    println!(
+        "hnsw filtered recall@{TOP_K}: mean {mean:.3} over {} queries",
+        recalls.len()
+    );
+    // A collapse detector, not a benchmark: observed 1.000 (the exact-prefilter fallback,
+    // nidus-0ou, kicks in at this selectivity), so 0.6 is comfortably clear of noise while
+    // still catching the starvation SPEC §9 warns about if the fallback ever regresses.
+    assert!(
+        mean >= 0.6,
+        "hnsw filtered recall@{TOP_K} collapsed to {mean:.3} — the ANN candidate walk is \
+         being starved by the filter and nothing is compensating"
+    );
+}
+
 /// The quantized first pass is a speed/recall trade, so the contract is recall, not an exact match.
 /// This pins that the trade is made well end-to-end: int8 codes select, an exact f32 rerank orders,
 /// and what comes back over HTTP still contains nearly all of the true top-k.

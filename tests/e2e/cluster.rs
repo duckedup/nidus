@@ -672,6 +672,59 @@ fn cluster_endpoint_distinguishes_writer_from_reader() {
     assert_eq!(w["commit_version"], r["commit_version"]);
 }
 
+/// A `nidus serve` over shared backends WITHOUT `--cluster` — object persistence plus a
+/// memory tier, one instance at a time.
+fn standalone_instance(prefix: &str) -> (tempfile::TempDir, RunningServer) {
+    require_services();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let bucket = service("NIDUS_E2E_S3_BUCKET", "nidus-test");
+    let server = Server::new(dir.path(), 3)
+        .args([
+            "--persistence",
+            &format!("s3://{bucket}/{prefix}"),
+            "--memory",
+            &service("NIDUS_E2E_REDIS_URL", "redis://127.0.0.1:6479"),
+        ])
+        .env(
+            "AWS_ENDPOINT_URL",
+            &service("NIDUS_E2E_S3_ENDPOINT", "http://127.0.0.1:9100"),
+        )
+        .env(
+            "AWS_ACCESS_KEY_ID",
+            &service("NIDUS_E2E_S3_KEY", "minioadmin"),
+        )
+        .env(
+            "AWS_SECRET_ACCESS_KEY",
+            &service("NIDUS_E2E_S3_SECRET", "minioadmin"),
+        )
+        .env("AWS_REGION", &service("NIDUS_E2E_S3_REGION", "us-east-1"))
+        .start();
+    (dir, server)
+}
+
+/// **The memory tier outside cluster mode** (#115): `--persistence s3://` + `--memory
+/// redis://` with no `--cluster` must still make the shared backends a complete record — a
+/// fresh process with an empty `--dir` reconstructs everything the first one committed.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs minio + valkey (just test-e2e-cluster)"]
+fn memory_tier_outside_cluster_mode_survives_a_restart() {
+    let prefix = unique_prefix("standalone-tier");
+    let (_adir, first) = standalone_instance(&prefix);
+    seed(&first);
+    for (i, id) in ["x", "y", "z"].iter().enumerate() {
+        let v = [i as i32 % 2, (i as i32 + 1) % 2, 0];
+        assert_eq!(upsert(&first, id, v).0, 200);
+    }
+    let expected = ids(&first);
+    assert!(first.shutdown(), "graceful shutdown must succeed");
+
+    // A brand-new process with an empty --dir: everything must come from s3 + the tier.
+    let (_bdir, second) = standalone_instance(&prefix);
+    assert_eq!(doc_count(&second), 3);
+    assert_eq!(ids(&second), expected);
+}
+
 /// A reader restarted from scratch reconstructs the same state, so the shared backend and
 /// tier are a complete record of the store — not just a delta over some local file.
 #[test]
@@ -691,4 +744,171 @@ fn fresh_reader_reconstructs_state_from_shared_backend() {
     let (_rdir, reader) = instance(&prefix, true, &[]);
     assert_eq!(doc_count(&reader), 3);
     assert_eq!(ids(&reader), expected);
+}
+
+// ── The MCP surface on a cluster node (`mcp` feature) ────────────────────────
+
+/// Minimal local copy of tests/e2e/mcp/mod.rs's request shape — sibling test modules
+/// cannot import from one another, and the envelope is a few lines.
+#[cfg(feature = "mcp")]
+fn mcp_call(server: &RunningServer, id: u32, tool: &str, arguments: Value) -> (u16, Value) {
+    const VERSION: &str = "2026-07-28";
+    let params = json!({
+        "name": tool,
+        "arguments": arguments,
+        "_meta": {
+            "io.modelcontextprotocol/protocolVersion": VERSION,
+            "io.modelcontextprotocol/clientInfo": { "name": "nidus-e2e", "version": "0" },
+            "io.modelcontextprotocol/clientCapabilities": {},
+        },
+    });
+    let body = json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": params });
+    server.post_with_headers(
+        "/mcp",
+        &body,
+        &[
+            ("accept", "application/json, text/event-stream"),
+            ("mcp-protocol-version", VERSION),
+            ("mcp-method", "tools/call"),
+            ("mcp-name", tool),
+        ],
+    )
+}
+
+/// The concatenated text of a successful `tools/call` result's content blocks.
+#[cfg(feature = "mcp")]
+fn mcp_text(body: &Value) -> String {
+    assert!(
+        body.get("error").is_none(),
+        "expected a result, got JSON-RPC error: {body}"
+    );
+    body["result"]["content"]
+        .as_array()
+        .expect("content array")
+        .iter()
+        .filter_map(|b| b["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// **Cluster × MCP** (#112): a fenced writer answering a write-shaped MCP tool call must
+/// return a clean error naming the lease — never a hang, never a silently-accepted stale
+/// write. Same SIGSTOP choreography as `stalled_writer_is_fenced_and_cannot_clobber`.
+#[cfg(all(unix, feature = "mcp"))]
+#[test]
+#[ignore = "needs minio + valkey (just test-e2e-cluster)"]
+fn fenced_writer_refuses_mcp_writes_with_a_clean_error() {
+    let prefix = unique_prefix("mcp-fence");
+    let (_adir, writer_a) = instance(&prefix, false, &[]);
+    seed(&writer_a);
+    assert_eq!(upsert(&writer_a, "from-a", [1, 0, 0]).0, 200);
+
+    // A stalls past its lease; B takes over and commits.
+    writer_a.pause();
+    std::thread::sleep(past_the_lease());
+    let (_bdir, writer_b) = instance(&prefix, false, &[]);
+    assert_eq!(upsert(&writer_b, "from-b", [0, 1, 0]).0, 200);
+
+    // A wakes up superseded. `forget` with ids is write-shaped and needs no embedder, so
+    // the only thing that can refuse it is the lease fence.
+    writer_a.resume();
+    let (status, body) = mcp_call(
+        &writer_a,
+        1,
+        "forget",
+        json!({"collection": "docs", "ids": ["from-a"]}),
+    );
+    assert!(
+        status >= 400 || body.get("error").is_some(),
+        "a fenced writer must refuse an MCP write, got {status} {body}"
+    );
+    let err = body["error"]["message"]
+        .as_str()
+        .or_else(|| body["error"].as_str())
+        .unwrap_or_default();
+    assert!(
+        err.contains("lease") || err.contains("fence"),
+        "the refusal must name the lease/fence, got {status} {body}"
+    );
+
+    // The decisive assertion: the stale delete never landed, on B or in the durable store.
+    assert_eq!(ids(&writer_b), vec!["from-a", "from-b"]);
+    let (_rdir, reader) = instance(&prefix, true, &[]);
+    assert_eq!(ids(&reader), vec!["from-a", "from-b"]);
+}
+
+/// **Cluster × MCP** (#112): a cluster reader serves MCP read tools over `/mcp`, and a
+/// commit adopted via `POST /refresh` is visible through them.
+#[cfg(feature = "mcp")]
+#[test]
+#[ignore = "needs minio + valkey (just test-e2e-cluster)"]
+fn reader_serves_mcp_reads_and_sees_adopted_commits() {
+    let prefix = unique_prefix("mcp-reader");
+    let (_wdir, writer) = instance(&prefix, false, &[]);
+    seed(&writer);
+    assert_eq!(upsert(&writer, "first", [1, 0, 0]).0, 200);
+
+    let (_rdir, reader) = instance(&prefix, true, &[]);
+    let (status, body) = mcp_call(&reader, 1, "stats", json!({}));
+    assert_eq!(status, 200, "stats over /mcp on a reader failed: {body}");
+    let stats: Value = serde_json::from_str(&mcp_text(&body)).expect("stats is JSON");
+    assert_eq!(stats["footprint"]["doc_count"], 1, "reader adopted at open");
+
+    // The writer commits again; the reader refreshes and MCP must see the new commit.
+    assert_eq!(upsert(&writer, "second", [0, 1, 0]).0, 200);
+    let (status, body) = reader.post("/refresh", &json!({}));
+    assert_eq!(status, 200);
+    assert_eq!(body["adopted"], true, "a new commit should be adopted");
+
+    let (status, body) = mcp_call(&reader, 2, "stats", json!({}));
+    assert_eq!(status, 200, "stats after refresh failed: {body}");
+    let stats: Value = serde_json::from_str(&mcp_text(&body)).expect("stats is JSON");
+    assert_eq!(
+        stats["footprint"]["doc_count"], 2,
+        "MCP stats must reflect the adopted commit: {stats}"
+    );
+
+    let (status, body) = mcp_call(&reader, 3, "browse", json!({"collection": "docs"}));
+    assert_eq!(status, 200, "browse after refresh failed: {body}");
+    let listed = mcp_text(&body);
+    assert!(
+        listed.contains("first") && listed.contains("second"),
+        "browse must list both committed records: {listed}"
+    );
+}
+
+// ── gs:// persistence via a GCS emulator (fake-gcs-server) ───────────────────
+
+/// **The gs:// lane** (#113): one persistence round trip against fake-gcs-server. Gated on
+/// `NIDUS_E2E_GCS_ENDPOINT` (`just e2e-services-up` prints the value) so the suite stays
+/// green where the emulator is not running.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs fake-gcs-server (just e2e-services-up, then NIDUS_E2E_GCS_ENDPOINT)"]
+fn gcs_persistence_round_trip_via_emulator() {
+    let Ok(endpoint) = std::env::var("NIDUS_E2E_GCS_ENDPOINT") else {
+        eprintln!("skipping: NIDUS_E2E_GCS_ENDPOINT is not set (just e2e-services-up starts it)");
+        return;
+    };
+    let bucket = service("NIDUS_E2E_GCS_BUCKET", "nidus-test");
+    let prefix = unique_prefix("gcs");
+    let start = |dir: &std::path::Path| {
+        Server::new(dir, 3)
+            .args(["--persistence", &format!("gs://{bucket}/{prefix}")])
+            .env("NIDUS_GCS_ENDPOINT", &endpoint)
+            .start()
+    };
+
+    let adir = tempfile::tempdir().expect("temp dir");
+    let first = start(adir.path());
+    seed(&first);
+    assert_eq!(upsert(&first, "a", [1, 0, 0]).0, 200);
+    assert_eq!(upsert(&first, "b", [0, 1, 0]).0, 200);
+    assert!(first.shutdown(), "graceful shutdown must succeed");
+
+    // A brand-new process with an empty --dir: everything must come back from gs://.
+    let bdir = tempfile::tempdir().expect("temp dir");
+    let second = start(bdir.path());
+    assert_eq!(doc_count(&second), 2);
+    assert_eq!(ids(&second), vec!["a", "b"]);
 }
