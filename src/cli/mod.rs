@@ -849,6 +849,9 @@ enum Command {
         /// Defaults to `<dir-name>-<unix-secs>.tar.gz` in the current directory.
         #[arg(long, short = 'o')]
         out: Option<String>,
+        /// After writing the archive, re-read it and prove it is restorable.
+        #[arg(long)]
+        verify: bool,
     },
     /// Restore a store from a `nidus backup` archive (`.tar.gz`).
     Restore {
@@ -866,6 +869,13 @@ enum Command {
         /// Overwrite an existing store without prompting (for cron / scripts).
         #[arg(long, short = 'y')]
         yes: bool,
+    },
+    /// Prove a backup archive is restorable: check its integrity and open it
+    /// read-only in a scratch location.
+    Verify {
+        /// Backup archive location to verify (a local path, `file://…`, `s3://…`).
+        #[arg(long = "in", short = 'i')]
+        input: String,
     },
     /// Print store footprint and collections (JSON).
     Stats {
@@ -1250,10 +1260,15 @@ pub fn run(cli: Cli) -> Result<()> {
             dir,
             persistence,
             out,
+            verify,
         } => {
             let out = out.unwrap_or_else(|| backup::default_out_name(&dir));
             let source = persistence.unwrap_or_else(|| dir.to_string_lossy().into_owned());
-            print_json(&backup::backup(&source, &out)?)
+            let report = backup::backup(&source, &out)?;
+            if verify {
+                backup::verify(&out)?;
+            }
+            print_json(&report)
         }
         Command::Restore {
             input,
@@ -1264,6 +1279,7 @@ pub fn run(cli: Cli) -> Result<()> {
             let target = persistence.unwrap_or_else(|| dir.to_string_lossy().into_owned());
             print_json(&backup::restore(&input, &target, yes)?)
         }
+        Command::Verify { input } => print_json(&backup::verify(&input)?),
         Command::Stats { store } => {
             let db = open(&store, false)?;
             print_json(&serde_json::json!({
@@ -2084,6 +2100,34 @@ mod tests {
         match cli.command {
             Command::Backup { out, .. } => assert_eq!(out, None),
             _ => panic!("expected Backup"),
+        }
+    }
+
+    #[test]
+    fn backup_verify_flag_defaults_off() {
+        let cli = Cli::try_parse_from(["nidus", "backup", "-d", "/tmp/s"]).unwrap();
+        match cli.command {
+            Command::Backup { verify, .. } => assert!(!verify),
+            _ => panic!("expected Backup"),
+        }
+        let cli = Cli::try_parse_from(["nidus", "backup", "-d", "/tmp/s", "--verify"]).unwrap();
+        match cli.command {
+            Command::Backup { verify, .. } => assert!(verify),
+            _ => panic!("expected Backup"),
+        }
+    }
+
+    #[test]
+    fn verify_parses_in() {
+        let cli = Cli::try_parse_from(["nidus", "verify", "-i", "/tmp/s.tar.gz"]).unwrap();
+        match cli.command {
+            Command::Verify { input } => assert_eq!(input, "/tmp/s.tar.gz"),
+            _ => panic!("expected Verify"),
+        }
+        let cli = Cli::try_parse_from(["nidus", "verify", "--in", "/tmp/s.tar.gz"]).unwrap();
+        match cli.command {
+            Command::Verify { input } => assert_eq!(input, "/tmp/s.tar.gz"),
+            _ => panic!("expected Verify"),
         }
     }
 

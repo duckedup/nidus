@@ -243,7 +243,7 @@ exactly the library's: each write batch is fsync'd before its response returns, 
 a `200` means the data is on disk. The storage model and search semantics are
 identical to the library: the server adds nothing and hides nothing.
 
-You can take a hot [backup](/guides/cli-and-server/#backup--restore) of a store
+You can take a hot [backup](/guides/cli-and-server/#backup-restore--verify) of a store
 while `nidus serve` is running: `nidus backup` does not take the writer lock.
 
 ### Getting write throughput

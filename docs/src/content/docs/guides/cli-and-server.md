@@ -376,20 +376,12 @@ instance per box and fan queries out client-side, merging the top-k yourself (so
 every instance shares one embedding space). See
 [running across a few boxes](/guides/multi-box/) for the recipe.
 
-## Backup & restore
+## Backup, restore & verify
 
 A store is just a directory, so you can always copy it by hand, but `nidus
-backup` packages the durable core (`data` + `log`) into a single compressed
-`.tar.gz` you can stash before an upgrade or hand to a cron job, and `nidus
-restore` brings it back.
-
-:::caution
-On a store using `--segment-max-rows`, the sealed segments (`manifest` + `seg-*`)
-are **not** included in the archive yet, so `nidus backup` is complete only for
-unsegmented stores. Back up a segmented store by copying the whole directory or
-bucket prefix. [#130](https://github.com/duckedup/nidus/issues/130) tracks making
-the archive segment-complete.
-:::
+backup` archives the whole durable object set (`data`, `log`, `manifest`, and
+every sealed `seg-*`) into a single compressed `.tar.gz` you can stash before
+an upgrade or hand to a cron job, and `nidus restore` brings it back.
 
 ```bash
 # Snapshot ./store into one portable archive.
@@ -426,10 +418,11 @@ nidus restore --in ./store.tar.gz --persistence s3://my-bucket/store --dir ./met
 ```
 
 The archive is an ordinary gzip-compressed tarball: `tar tzf store.tar.gz`
-lists the `data` and `log` files plus a small `nidus-backup.json` manifest
-(version, timestamp, dimension), so you can inspect or extract it with standard
-tools too. Restore reopens the store afterwards to confirm it loads, and never
-carries over a stale writer lock.
+lists `data`, `log`, `manifest`, and any sealed `seg-*` files, plus a small
+`nidus-backup.json` manifest (version, timestamp, dimension, and a per-object
+`{name, bytes, crc32}` baseline that `nidus verify` checks below), so you can
+inspect or extract it with standard tools too. Restore reopens the store
+afterwards to confirm it loads, and never carries over a stale writer lock.
 
 **Backup is a safe hot snapshot.** It does not take the writer lock, so it can
 run while a writer (including `nidus serve`) is busy. It captures the same
@@ -444,6 +437,60 @@ snapshot is a one-line cron entry:
 0 2 * * *  nidus backup --dir /srv/nidus/store --out /backups/$(date +\%F).tar.gz && \
            ls -1t /backups/store-*.tar.gz | tail -n +15 | xargs -r rm
 ```
+
+### Verify
+
+`nidus verify` proves an archive is restorable without restoring it into a
+real store: it extracts into a scratch location, never a real store, checks
+the archive's own bytes, and confirms the extracted store reopens cleanly.
+
+```bash
+nidus verify -i ./store.tar.gz
+```
+
+On success it prints a JSON report to stdout and exits `0`:
+
+```json
+{
+  "archive": "./store.tar.gz",
+  "dimension": 768,
+  "distance": "Cosine",
+  "collections": ["docs", "notes"],
+  "records": 15000,
+  "objects_checked": 5,
+  "archive_bytes": 10485760
+}
+```
+
+`objects_checked` is how many archived objects had their checksum rechecked.
+Archives written before 0.57 carry no checksum baseline, so it reads `0` and
+verify falls back to the structural check.
+
+On any mismatch it prints nothing to stdout, writes `error: …` to stderr, and
+exits `1`, so scripting against the exit code alone is safe:
+
+```bash
+nidus verify -i ./store.tar.gz || echo "backup is bad, alert on-call"
+```
+
+You can also verify a backup as part of taking it, so a bad upload or a
+truncated write is caught immediately rather than at restore time:
+
+```bash
+nidus backup --dir ./store -o ./store.tar.gz --verify
+```
+
+This takes the backup, then re-reads it from its destination (`./store.tar.gz`)
+and runs the same verification the standalone command does.
+
+**What verify proves, and what it does not.** It checks the archive's
+per-object CRC32 baseline recorded in `nidus-backup.json`, drives the gzip
+stream to EOF so its own trailer checksum fires too, and confirms the store
+reopens read-only with the expected dimension, distance, collections, and
+record count. It is not a semantic diff against the live source store, and it
+says nothing about a store corrupted in place on disk, only about the
+archive's own bytes. Archives written before nidus 0.57 predate the baseline;
+verify falls back to the structural check and reports `objects_checked: 0`.
 
 ## Over the network
 

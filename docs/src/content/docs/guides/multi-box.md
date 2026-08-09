@@ -158,7 +158,7 @@ connections busy per box costs far less than one at a time.
 ## Backups
 
 Each box backs itself up independently: `nidus backup` produces one archive per store (see
-[backup & restore](/guides/cli-and-server/#backup--restore)). Snapshot them on the same
+[backup & restore](/guides/cli-and-server/#backup-restore--verify)). Snapshot them on the same
 schedule and keep them together with the shard map: an archive restored onto the wrong box
 is not wrong exactly, but every query for its documents will go somewhere else.
 

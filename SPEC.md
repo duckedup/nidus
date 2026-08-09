@@ -1623,6 +1623,19 @@ minute — CI asserts it (§9, the build-time gate).**
   path / `file://` today, `s3://` once that backend lands); `nidus restore --in <loc>` GETs
   it and PUTs the objects into the target store. The capture order (`data` then `log`) plus
   the lock-free reader rule (§6.2) keep a hot snapshot consistent without a writer lock.
+- **Verify (built).** An archive is self-describing: `nidus-backup.json` carries a
+  per-object `{name, bytes, crc32}` baseline computed over the exact archived bytes.
+  `nidus verify -i <archive>` extracts to a scratch location (never a real store), checks
+  that baseline, drives the gzip stream to EOF so its own trailer CRC32 actually fires, and
+  reopens the extracted store read-only to confirm the expected dimension, distance,
+  collections, and record count; `nidus backup --verify` runs the same check right after
+  writing, reading the archive back from its destination rather than trusting the local
+  write. **The gap it does not close:** `src/data/*.rs` carries no checksum over vector row
+  bytes at all (only the 64-byte header's magic and version are validated), and `src/log/`
+  deliberately tolerates a CRC-bad tail record as a torn write (correct crash recovery,
+  §6.1). The archive-level CRC closes this for *archives*; a store corrupted in place on
+  disk still opens clean and returns wrong scores. Archives written before 0.57 predate the
+  baseline; verify falls back to the structural check and reports `objects_checked: 0`.
 
 ---
 

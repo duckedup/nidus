@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::backend::{Persistence, open_object_location};
 use crate::{Config, Nidus, OpenMode};
@@ -52,18 +52,40 @@ pub struct RestoreReport {
     pub records: usize,
 }
 
-/// The small JSON manifest embedded in each archive. Purely informational — it
-/// lets a human (or a future tool) see who/what/when made the backup without
-/// unpacking the binary `data`/`log`. Restore does not require it.
-#[derive(Serialize)]
+/// What `verify` found, printed as JSON by the CLI.
+#[derive(Debug, Serialize)]
+pub struct VerifyReport {
+    pub archive: String,
+    pub dimension: usize,
+    pub distance: String,
+    pub collections: Vec<String>,
+    pub records: usize,
+    pub objects_checked: usize,
+    pub archive_bytes: u64,
+}
+
+/// A stored object's size and CRC32, checked at `backup()` time and rechecked by `verify`.
+#[derive(Serialize, Deserialize)]
+struct ObjectSum {
+    name: String,
+    bytes: u64,
+    crc32: u32,
+}
+
+/// The small JSON manifest embedded in each archive: who/what/when, readable without
+/// unpacking the binary `data`/`log`. `objects` is load-bearing, not descriptive — it is
+/// the CRC baseline `restore`/`verify` check. An archive predating it still restores.
+#[derive(Serialize, Deserialize)]
 struct Manifest {
-    nidus_version: &'static str,
+    nidus_version: String,
     created_unix: u64,
     dimension: usize,
     distance: String,
     data_bytes: u64,
     log_bytes: u64,
     segments: usize,
+    #[serde(default)]
+    objects: Vec<ObjectSum>,
 }
 
 /// Snapshot the store at `source` into a gzip-compressed tar object at `out_location`. Both are
@@ -101,6 +123,17 @@ pub fn backup(source: &str, out_location: &str) -> Result<BackupReport> {
     let created_unix = now_unix();
     let segment_bytes: u64 = segments.iter().map(|(_, b)| b.len() as u64).sum();
 
+    // CRCs over the exact byte buffers already read above — race-free by construction,
+    // since nothing else can mutate these bytes between the read and the checksum.
+    let mut objects: Vec<ObjectSum> = vec![object_sum("data", &data)];
+    for (name, bytes) in &segments {
+        objects.push(object_sum(name, bytes));
+    }
+    if let Some(bytes) = &store_manifest {
+        objects.push(object_sum(crate::manifest::MANIFEST_KEY, bytes));
+    }
+    objects.push(object_sum("log", &log));
+
     // Build the whole gzip-tar archive in memory, then PUT it as one object. A
     // snapshot of a dev/small-scale store fits in RAM comfortably (SPEC §13.7).
     let mut archive: Vec<u8> = Vec::new();
@@ -118,13 +151,14 @@ pub fn backup(source: &str, out_location: &str) -> Result<BackupReport> {
         append_bytes(&mut tar, "log", &log, created_unix)?;
 
         let manifest = Manifest {
-            nidus_version: env!("CARGO_PKG_VERSION"),
+            nidus_version: env!("CARGO_PKG_VERSION").to_string(),
             created_unix,
             dimension,
             distance: format!("{distance:?}"),
             data_bytes: data.len() as u64,
             log_bytes: log.len() as u64,
             segments: segments.len(),
+            objects,
         };
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         append_bytes(&mut tar, MANIFEST, &manifest_bytes, created_unix)?;
@@ -163,6 +197,18 @@ pub fn restore(
     // traversal entry can never escape the store.
     let target = crate::open_persistence(target_location)?;
 
+    // Fully validate the archive before touching the target: a corrupt one must not
+    // leave a half-restored store behind, and must never pass silently (#152).
+    let (src, key) = open_object_location(in_location)?;
+    let archive = src
+        .get(&key)?
+        .with_context(|| format!("backup archive not found: {in_location}"))?;
+    let (objects, manifest) = read_archive(&archive)?;
+    check_baseline(&objects, manifest.as_ref())?;
+    if !objects.iter().any(|(name, _)| name == "data") {
+        bail!("backup archive contained no `data` object — not a nidus backup");
+    }
+
     if store_present(target.as_ref()) && !assume_yes && !confirm_overwrite(target_location)? {
         bail!("aborted: {target_location} already contains a store (pass -y/--yes to overwrite)");
     }
@@ -179,37 +225,7 @@ pub fn restore(
         }
     }
 
-    let (src, key) = open_object_location(in_location)?;
-    let archive = src
-        .get(&key)?
-        .with_context(|| format!("backup archive not found: {in_location}"))?;
-    let mut tar = tar::Archive::new(GzDecoder::new(&archive[..]));
-    let mut found_data = false;
-    for entry in tar.entries().context("malformed backup archive")? {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) if path.components().count() == 1 => n.to_string(),
-            _ => continue,
-        };
-        if is_store_object(&name) {
-            let mut buf = Vec::new();
-            entry
-                .read_to_end(&mut buf)
-                .with_context(|| format!("failed to read `{name}` from archive"))?;
-            target
-                .put(&name, &buf)
-                .with_context(|| format!("failed to write `{name}`"))?;
-            if name == "data" {
-                found_data = true;
-            }
-        }
-        // The report JSON and anything unexpected are ignored.
-    }
-
-    if !found_data {
-        bail!("backup archive contained no `data` object — not a nidus backup");
-    }
+    put_objects(target.as_ref(), &objects)?;
 
     // Leave a clean store: never carry over a stale writer lock.
     let _ = target.delete("lock");
@@ -241,6 +257,134 @@ pub fn restore(
     })
 }
 
+/// A store object's name and bytes, as carried in an archive.
+type Object = (String, Vec<u8>);
+
+/// Every store object in `archive`, plus its embedded report, read in one pass.
+/// Shared by `restore` and `verify` so both get the same traversal guard and gzip check.
+fn read_archive(archive: &[u8]) -> Result<(Vec<Object>, Option<Manifest>)> {
+    let mut tar = tar::Archive::new(GzDecoder::new(archive));
+    let mut objects: Vec<Object> = Vec::new();
+    let mut manifest = None;
+    for entry in tar.entries().context("malformed backup archive")? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) if path.components().count() == 1 => n.to_string(),
+            _ => continue,
+        };
+        if is_store_object(&name) {
+            // A repeated name would be checked once but written twice (last wins), so the
+            // bytes that land could be ones no CRC ever covered. Refuse instead.
+            if objects.iter().any(|(seen, _)| *seen == name) {
+                bail!("backup archive carries `{name}` more than once");
+            }
+            let mut buf = Vec::new();
+            entry
+                .read_to_end(&mut buf)
+                .with_context(|| format!("failed to read `{name}` from archive"))?;
+            objects.push((name, buf));
+        } else if name == MANIFEST {
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf)?;
+            manifest = Some(
+                serde_json::from_slice(&buf)
+                    .with_context(|| format!("archive's `{MANIFEST}` is not valid JSON"))?,
+            );
+        }
+    }
+    // GzDecoder checks its trailer CRC only on a read that hits true EOF (#152).
+    let mut rest = tar.into_inner();
+    std::io::copy(&mut rest, &mut std::io::sink())
+        .context("backup archive failed its gzip integrity check")?;
+    Ok((objects, manifest))
+}
+
+/// Recheck the archive's own CRC baseline, returning how many objects it covered.
+/// An archive written before 0.57 carries none; that is not a failure.
+fn check_baseline(objects: &[Object], manifest: Option<&Manifest>) -> Result<usize> {
+    let baseline = match manifest {
+        Some(m) if !m.objects.is_empty() => &m.objects,
+        _ => return Ok(0),
+    };
+    for sum in baseline {
+        let bytes = objects
+            .iter()
+            .find(|(name, _)| *name == sum.name)
+            .map(|(_, bytes)| bytes)
+            .with_context(|| {
+                format!("archive's baseline names `{}` but it is missing", sum.name)
+            })?;
+        let got = crc32fast::hash(bytes);
+        let got_len = bytes.len() as u64;
+        if got != sum.crc32 || got_len != sum.bytes {
+            bail!(
+                "archive object `{}` is corrupt: expected crc32 {:08x} ({} bytes), got {:08x} ({} bytes)",
+                sum.name,
+                sum.crc32,
+                sum.bytes,
+                got,
+                got_len
+            );
+        }
+    }
+    Ok(baseline.len())
+}
+
+/// Write the extracted objects into a store location.
+fn put_objects(target: &dyn Persistence, objects: &[Object]) -> Result<()> {
+    for (name, bytes) in objects {
+        target
+            .put(name, bytes)
+            .with_context(|| format!("failed to write `{name}`"))?;
+    }
+    Ok(())
+}
+
+/// Prove `in_location` is a restorable backup: drain the gzip stream, recheck every
+/// baseline CRC (if the archive carries one), and open the extracted store read-only.
+/// Never touches a real store — extraction lands in a `TempDir` cleaned up on every path.
+pub fn verify(in_location: &str) -> Result<VerifyReport> {
+    let (src, key) = open_object_location(in_location)?;
+    let archive = src
+        .get(&key)?
+        .with_context(|| format!("backup archive not found: {in_location}"))?;
+
+    let (objects, manifest) = read_archive(&archive)?;
+    let objects_checked = check_baseline(&objects, manifest.as_ref())?;
+    if !objects.iter().any(|(name, _)| name == "data") {
+        bail!("backup archive contained no `data` object — not a nidus backup");
+    }
+
+    let scratch = tempfile::TempDir::new().context("failed to create scratch dir")?;
+    let scratch_target = crate::open_persistence(&scratch.path().to_string_lossy())?;
+    put_objects(scratch_target.as_ref(), &objects)?;
+
+    let data = scratch_target
+        .get("data")?
+        .context("extracted store has no `data` object")?;
+    let (dimension, distance) = crate::data::header_from_bytes(&data)
+        .context("extracted data has no readable nidus header")?;
+    let scratch_location = scratch.path().to_string_lossy().into_owned();
+    let db = Nidus::open(
+        Config::new(".", dimension)
+            .distance(distance)
+            .persistence(&scratch_location)
+            .open_mode(OpenMode::ReadOnly),
+    )
+    .context("extracted store failed to open — the archive may be corrupt")?;
+
+    Ok(VerifyReport {
+        archive: in_location.to_string(),
+        dimension,
+        distance: format!("{distance:?}"),
+        collections: db.collections(),
+        records: db.footprint().doc_count,
+        objects_checked,
+        archive_bytes: archive.len() as u64,
+    })
+}
+
 /// A sortable default backup object name: `<dir-name>-<unix-secs>.tar.gz` (written to
 /// the current directory). Cron users template their own via `--out`.
 pub fn default_out_name(dir: &Path) -> String {
@@ -266,6 +410,15 @@ fn append_bytes<W: std::io::Write>(
     tar.append_data(&mut header, name, bytes)
         .with_context(|| format!("failed to archive `{name}`"))?;
     Ok(())
+}
+
+/// Compute a named object's checksum baseline for the embedded manifest.
+fn object_sum(name: &str, bytes: &[u8]) -> ObjectSum {
+    ObjectSum {
+        name: name.to_string(),
+        bytes: bytes.len() as u64,
+        crc32: crc32fast::hash(bytes),
+    }
 }
 
 /// Does the target backend already hold store objects we'd overwrite? Backend errors
@@ -299,6 +452,7 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::io::Read;
 
     use super::*;
     use crate::{Record, Scope, SearchOpts};
@@ -509,5 +663,224 @@ mod tests {
             stale.is_empty(),
             "stale segments survived the restore: {stale:?}"
         );
+    }
+
+    /// Corrupt the first tar entry's *content* and re-gzip losslessly, so every
+    /// structural layer stays valid: gzip's trailer, tar's header checksum, and the
+    /// deflate stream. Only the embedded CRC baseline can catch this (#152).
+    fn corrupt_entry_content(archive: &[u8], content_offset: usize) -> Vec<u8> {
+        let mut tar_bytes = Vec::new();
+        GzDecoder::new(archive).read_to_end(&mut tar_bytes).unwrap();
+        tar_bytes[512 + content_offset] ^= 0xFF;
+
+        let mut out = Vec::new();
+        let mut enc = GzEncoder::new(&mut out, Compression::default());
+        std::io::Write::write_all(&mut enc, &tar_bytes).unwrap();
+        enc.finish().unwrap();
+        out
+    }
+
+    /// Rebuild `archive` with its embedded `nidus-backup.json` stripped of the
+    /// `objects` baseline, simulating an archive written before #152.
+    fn strip_objects_baseline(archive: &[u8]) -> Vec<u8> {
+        let mut tar = tar::Archive::new(GzDecoder::new(archive));
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for entry in tar.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let name = entry
+                .path()
+                .unwrap()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap()
+                .to_string();
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf).unwrap();
+            entries.push((name, buf));
+        }
+
+        let mut out = Vec::new();
+        {
+            let gz = GzEncoder::new(&mut out, Compression::default());
+            let mut builder = tar::Builder::new(gz);
+            for (name, bytes) in &mut entries {
+                if name == MANIFEST {
+                    let mut v: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                    v.as_object_mut().unwrap().remove("objects");
+                    *bytes = serde_json::to_vec_pretty(&v).unwrap();
+                }
+                append_bytes(&mut builder, name, bytes, 0).unwrap();
+            }
+            let gz = builder.into_inner().unwrap();
+            gz.finish().unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn pristine_archive_verifies_and_reports_source() {
+        let src = tempfile::tempdir().unwrap();
+        let arc = tempfile::tempdir().unwrap();
+        let archive = arc.path().join("snap.tar.gz");
+        make_store(src.path());
+        backup(&src.path().to_string_lossy(), &archive.to_string_lossy()).unwrap();
+
+        let report = verify(&archive.to_string_lossy()).unwrap();
+        assert_eq!(report.dimension, 3);
+        assert_eq!(report.records, 2);
+        assert_eq!(report.collections, vec!["docs".to_string()]);
+        assert!(report.objects_checked > 0);
+    }
+
+    /// #152: corrupted vector bytes must fail `verify` even when every structural
+    /// layer still checks out — the case a bare "does it open?" check cannot see.
+    #[test]
+    fn corrupted_vector_content_fails_verify() {
+        let src = tempfile::tempdir().unwrap();
+        let arc = tempfile::tempdir().unwrap();
+        let archive = arc.path().join("snap.tar.gz");
+        make_store(src.path());
+        backup(&src.path().to_string_lossy(), &archive.to_string_lossy()).unwrap();
+
+        let bytes = std::fs::read(&archive).unwrap();
+        std::fs::write(&archive, corrupt_entry_content(&bytes, 70)).unwrap();
+
+        let err = verify(&archive.to_string_lossy()).unwrap_err().to_string();
+        assert!(err.contains("data") && err.contains("crc32"), "{err}");
+    }
+
+    /// A duplicate entry would be CRC-checked on its first copy and written from its
+    /// last, so the persisted bytes could be ones no baseline ever covered.
+    #[test]
+    fn duplicate_object_entry_is_refused() {
+        let src = tempfile::tempdir().unwrap();
+        let arc = tempfile::tempdir().unwrap();
+        let archive = arc.path().join("snap.tar.gz");
+        make_store(src.path());
+        backup(&src.path().to_string_lossy(), &archive.to_string_lossy()).unwrap();
+
+        // Rebuild with `data` appended a second time, corrupted.
+        let bytes = std::fs::read(&archive).unwrap();
+        let mut tar_bytes = Vec::new();
+        GzDecoder::new(&bytes[..])
+            .read_to_end(&mut tar_bytes)
+            .unwrap();
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for entry in tar::Archive::new(&tar_bytes[..]).entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let name = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf).unwrap();
+            entries.push((name, buf));
+        }
+        let mut dup = entries.iter().find(|(n, _)| n == "data").unwrap().clone();
+        dup.1[70] ^= 0xFF;
+        entries.push(dup);
+
+        let mut out = Vec::new();
+        {
+            let gz = GzEncoder::new(&mut out, Compression::default());
+            let mut builder = tar::Builder::new(gz);
+            for (name, bytes) in &entries {
+                append_bytes(&mut builder, name, bytes, 0).unwrap();
+            }
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        std::fs::write(&archive, out).unwrap();
+
+        let err = verify(&archive.to_string_lossy()).unwrap_err().to_string();
+        assert!(err.contains("more than once"), "{err}");
+    }
+
+    /// A flip that breaks the gzip stream itself must fail too, via the trailer CRC
+    /// the drain now reaches.
+    #[test]
+    fn bit_flip_in_compressed_body_fails_verify() {
+        let src = tempfile::tempdir().unwrap();
+        let arc = tempfile::tempdir().unwrap();
+        let archive = arc.path().join("snap.tar.gz");
+        make_store(src.path());
+        backup(&src.path().to_string_lossy(), &archive.to_string_lossy()).unwrap();
+
+        let mut bytes = std::fs::read(&archive).unwrap();
+        let offset = bytes.len() / 3;
+        bytes[offset] ^= 0x01;
+        std::fs::write(&archive, bytes).unwrap();
+
+        assert!(verify(&archive.to_string_lossy()).is_err());
+    }
+
+    /// #152 regression: `restore` on the same corrupted archive must also err, not
+    /// silently write corrupt vector bytes into the target store.
+    #[test]
+    fn restore_on_corrupted_archive_also_errs() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let arc = tempfile::tempdir().unwrap();
+        let archive = arc.path().join("snap.tar.gz");
+        make_store(src.path());
+        backup(&src.path().to_string_lossy(), &archive.to_string_lossy()).unwrap();
+
+        let bytes = std::fs::read(&archive).unwrap();
+        std::fs::write(&archive, corrupt_entry_content(&bytes, 70)).unwrap();
+
+        let restored = dst.path().join("store");
+        assert!(
+            restore(
+                &archive.to_string_lossy(),
+                &restored.to_string_lossy(),
+                true
+            )
+            .is_err()
+        );
+        // Validated before the target is touched, so nothing was half-written.
+        assert!(!restored.join("data").exists());
+    }
+
+    #[test]
+    fn truncated_archive_fails_verify() {
+        let src = tempfile::tempdir().unwrap();
+        let arc = tempfile::tempdir().unwrap();
+        let archive = arc.path().join("snap.tar.gz");
+        make_store(src.path());
+        backup(&src.path().to_string_lossy(), &archive.to_string_lossy()).unwrap();
+
+        let mut bytes = std::fs::read(&archive).unwrap();
+        bytes.truncate(bytes.len() - 8); // drop the gzip trailer
+        std::fs::write(&archive, bytes).unwrap();
+
+        assert!(verify(&archive.to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn segmented_store_verifies_clean() {
+        let src = tempfile::tempdir().unwrap();
+        let arc = tempfile::tempdir().unwrap();
+        let archive = arc.path().join("snap.tar.gz");
+        let rows = make_segmented_store(src.path());
+        backup(&src.path().to_string_lossy(), &archive.to_string_lossy()).unwrap();
+
+        let report = verify(&archive.to_string_lossy()).unwrap();
+        assert_eq!(report.records, rows.len());
+        assert!(report.objects_checked > 0);
+    }
+
+    /// Older archives (no `objects` baseline) still verify structurally, with
+    /// `objects_checked == 0` — nonzero exit is reserved for a real mismatch.
+    #[test]
+    fn archive_without_objects_baseline_still_verifies() {
+        let src = tempfile::tempdir().unwrap();
+        let arc = tempfile::tempdir().unwrap();
+        let archive = arc.path().join("snap.tar.gz");
+        make_store(src.path());
+        backup(&src.path().to_string_lossy(), &archive.to_string_lossy()).unwrap();
+
+        let bytes = std::fs::read(&archive).unwrap();
+        let stripped = strip_objects_baseline(&bytes);
+        std::fs::write(&archive, stripped).unwrap();
+
+        let report = verify(&archive.to_string_lossy()).unwrap();
+        assert_eq!(report.objects_checked, 0);
+        assert_eq!(report.records, 2);
     }
 }
