@@ -893,10 +893,9 @@ fn memory_subcommands_without_an_embedder_name_the_flag() {
     }
 }
 
-/// #140 through the real binary: `compact --expired` reclaims the entries whose
-/// `nidus.expires_at` has passed and leaves everything else alone. No embedder needed —
-/// `nidus.expires_at` is a plain attr an ordinary upsert can write, which is exactly why
-/// the sweep is not behind the `memory` feature.
+/// `compact --expired` through the real binary. No embedder needed: `nidus.expires_at`
+/// is a plain attr an ordinary upsert can write, which is why the sweep is not behind
+/// the `memory` feature.
 #[test]
 fn compact_expired_reclaims_only_past_entries() {
     let tmp = tempfile::tempdir().unwrap();
