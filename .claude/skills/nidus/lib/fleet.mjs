@@ -12,6 +12,9 @@ export function treeFindings(peers, self = {}) {
   const byDir = new Map()
 
   for (const p of peers) {
+    // A parked queue has no tree yet and that is not a defect — it is the backlog
+    // shape held for an owner who does not exist. Its tickets are still checked.
+    if (p.unassigned) continue
     const dir = normalize(p.dir)
     if (!dir) { findings.push(err('fleet-no-tree', p.name, 'no working directory known', 'Ask the peer for its cwd before dispatching; a peer with no tree of its own has nowhere to work.')); continue }
 

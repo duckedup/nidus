@@ -442,6 +442,15 @@ test('fleet: a peer with no known cwd cannot be dispatched', () => {
   eq(ids(fleet.treeFindings([{ name: 'a', dir: null }], SELF)), ['fleet-no-tree'], 'findings')
 })
 
+test('fleet: a parked queue has no tree and that is fine', () => {
+  eq(ids(fleet.treeFindings([{ name: 'backlog', dir: null, unassigned: true }], SELF)), [], 'findings')
+})
+
+test('fleet: a parked queue still has its tickets checked', () => {
+  const peers = [{ name: 'backlog', dir: null, unassigned: true, queue: [9] }]
+  eq(ids(fleet.issueFindings(peers, { 9: { state: 'CLOSED', linkedPrs: [] } })), ['fleet-issue-closed'], 'findings')
+})
+
 const OPEN = { state: 'OPEN', assignees: [], linkedPrs: [] }
 
 test('fleet: an open unclaimed queue is clear', () => {
