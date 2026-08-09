@@ -123,21 +123,31 @@ Needs blueprints. If none exist for this target, run **Spec** first (including i
 3. Fan out:
    `Workflow({ scriptPath: ".claude/skills/nidus/implement.workflow.js",
                args: { id, scratchDir, groups } })`
+   **Groups sequence state, not just timing.** A later group is handed every earlier patch and
+   applies them before it starts, because that dependency is the only reason it is a later
+   group. So put a blueprint in group N+1 exactly when it needs group N's code to exist —
+   "implement the thing" then "test the thing" is the usual split.
    Each agent is sonnet, runs in its own worktree, verifies itself (a nidus worktree is a
    complete checkout, so its lanes really do run), and returns a patch. Tell the user to watch
    with `/workflows`.
 4. **You merge — this is not delegated.** For each returned patch:
    `git apply --whitespace=nowarn <patch_file>`. On conflict, resolve it yourself or re-run
    that one unit; never abandon a patch silently.
-5. **Check scope before you trust the merge.** A patch is cut with `git add -A`, so it carries
+5. **A bug fix owes a deliberate fails-without-fix check.** CLAUDE.md requires the regression
+   test to be verified against unpatched code, and nothing in this pipeline proves it for you
+   any more: workers do not build, and later groups now start from earlier patches, so a test
+   can no longer fail by accident for want of the code it covers. Revert the fix in the merged
+   tree, watch the test go red, restore it. Once observed, say so — an unverified regression
+   test claimed as verified is worse than none.
+6. **Check scope before you trust the merge.** A patch is cut with `git add -A`, so it carries
    everything in that worktree, not just the blueprint's directory. The workflow returns
    `out_of_scope` per patch, but it is derived from the agent's own `files_changed` — confirm
    it against the patch itself (`git apply --numstat <patch_file>`) rather than believing it,
    and revert what does not belong. Then run the full lane set from `nidus-check lanes --json`
    against the merged tree: agents passing individually does not mean the merged result passes.
-6. Report failures from the workflow with their blockers and log paths, and ask whether to
+7. Report failures from the workflow with their blockers and log paths, and ask whether to
    investigate, skip, or abort.
-7. On success delete the blueprint files, then continue to **Review**.
+8. On success delete the blueprint files, then continue to **Review**.
 
 ## Review
 
@@ -299,6 +309,13 @@ collision detector you have.
 
 Demand three reports per ticket: **claimed**, **blocked or colliding**, **PR open with its
 number**. Ask for the file-level surface *before* they go deep, not after.
+
+When a peer reports a defect, **settle who files it before either of you does**. Both filing is
+the likely outcome otherwise — the peer is closest to the evidence, you are closest to the
+priority — and a duplicate left open describes a bug that is already fixed, which is the
+stale-tracker failure in the direction GitHub never nags about. Say "file it, I will set
+priority" or "I will file it, send me the numbers", then close the loser as a duplicate
+pointing at the survivor.
 
 ### 4. Sequence overlaps, do not race them
 
