@@ -548,6 +548,33 @@ test('fleet: rehydrate does not confuse #14 with #141', () => {
   eq(rows[0].state, 'queued', 'no false branch match')
 })
 
+test('fleet: a pushed remote branch counts as in-flight without a local worktree', () => {
+  const rows = fleet.rehydrate([{ name: 'peer', queue: [138] }], { 138: { state: 'OPEN', linkedPrs: [] } },
+    [MAIN], ['origin/austin/138-backup-verify'])
+  eq(rows[0].state, 'in-flight', 'state')
+  eq(rows[0].branch, 'origin/austin/138-backup-verify', 'branch')
+})
+
+test('fleet: a remote branch for #14 does not mark #141 in-flight', () => {
+  const rows = fleet.rehydrate([{ name: 'peer', queue: [141] }], { 141: { state: 'OPEN', linkedPrs: [] } },
+    [MAIN], ['origin/austin/14-something'])
+  eq(rows[0].state, 'queued', 'no false match')
+})
+
+test('fleet: a bundled sibling inherits the in-flight state', () => {
+  const peers = [{ name: 'peer', queue: [138, 152], bundles: [[138, 152]] }]
+  const issues = { 138: { state: 'OPEN', linkedPrs: [] }, 152: { state: 'OPEN', linkedPrs: [] } }
+  const rows = fleet.rehydrate(peers, issues, [MAIN], ['origin/austin/138-backup-verify'])
+  eq(rows.map(r => r.state), ['in-flight', 'in-flight'], 'both')
+  eq(rows[1].via, '138', 'names what it inherited from')
+})
+
+test('fleet: bundling does not invent progress when nothing has started', () => {
+  const peers = [{ name: 'peer', queue: [138, 152], bundles: [[138, 152]] }]
+  const issues = { 138: { state: 'OPEN', linkedPrs: [] }, 152: { state: 'OPEN', linkedPrs: [] } }
+  eq(fleet.rehydrate(peers, issues, [MAIN], []).map(r => r.state), ['queued', 'queued'], 'both queued')
+})
+
 test('fleet: an issue closed with no PR still reads as shipped', () => {
   const rows = fleet.rehydrate([{ name: 'a', queue: [9] }], { 9: { state: 'CLOSED', linkedPrs: [] } }, [MAIN])
   eq(rows[0].state, 'shipped', 'state')

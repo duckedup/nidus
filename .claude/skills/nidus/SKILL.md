@@ -274,9 +274,10 @@ GitHub and the worktree registry on each run, so the developer can `/clear` you 
 and one command rebuilds the picture. If you find yourself remembering who is on what, that
 belongs in the plan file.
 
-Rehydration sees worktrees of **this** clone. A peer in its own clone shows up from its issue
-and PR state alone, never as `in-flight` — one more reason owners in worktrees beat peers in
-clones.
+Evidence a ticket is moving, in order: a merged PR or closed issue, an open PR, a worktree or
+**remote branch** naming it, else `queued`. Declare `"bundles": [[138, 152]]` for tickets
+sharing one PR — only one of them names the branch, and without it the siblings read as
+untouched and get handed to someone else.
 
 `{"peers":[{"name":…,"dir":…,"self":true?,"queue":[…],"surface":{"<issue>":["path"]}}]}`.
 It catches shared trees, foreign remotes, dirty or stale peer checkouts, tickets that are
