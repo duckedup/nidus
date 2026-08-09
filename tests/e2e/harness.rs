@@ -423,6 +423,9 @@ pub struct RunningStdioServer {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     stderr: Arc<Mutex<Vec<String>>>,
+    /// Joined by [`wait`](Self::wait) so the drain finishes before stderr is read. `Drop`
+    /// must not join it — it kills the child, and a join there could hang a panicking test.
+    drain: Option<std::thread::JoinHandle<()>>,
 }
 
 #[cfg(feature = "mcp")]
@@ -475,7 +478,7 @@ impl StdioServer {
         // eventually block a chatty child.
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&stderr);
-        std::thread::spawn(move || {
+        let drain = std::thread::spawn(move || {
             for line in BufReader::new(pipe).lines().map_while(Result::ok) {
                 log.lock().expect("stderr log").push(line);
             }
@@ -486,6 +489,7 @@ impl StdioServer {
             stdin,
             stdout: BufReader::new(stdout),
             stderr,
+            drain: Some(drain),
         }
     }
 }
@@ -543,6 +547,12 @@ impl RunningStdioServer {
     /// the assertion form for a process expected to fail fast (e.g. a locked store).
     pub fn wait(mut self) -> (std::process::ExitStatus, String) {
         let status = self.child.wait().expect("wait for nidus mcp to exit");
+        // `child.wait()` returns the instant the process exits, which says nothing about the
+        // drain thread having read the pipe. Without this join the caller can see an empty
+        // stderr for a child that did write one (#104).
+        if let Some(drain) = self.drain.take() {
+            let _ = drain.join();
+        }
         (status, self.stderr())
     }
 }
