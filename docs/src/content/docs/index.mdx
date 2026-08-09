@@ -1,9 +1,9 @@
 ---
 title: nidus
-description: A small, pure-Rust all-in-one memory — remember text, recall the relevant bits. Built-in embedding (and optional summarization) over an exact-or-approximate vector store, or bring your own vectors. No FFI, no C, no SQL, no query engine.
+description: A small, pure-Rust all-in-one memory. Remember text, recall the relevant bits. Built-in embedding (and optional summarization) over an exact-or-approximate vector store, or bring your own vectors. No FFI, no C, no SQL, no query engine.
 template: splash
 hero:
-  tagline: Remember text, recall the relevant bits. A small, pure-Rust memory that embeds for you — or takes the vectors you already have — and answers by similarity from a single directory.
+  tagline: Remember text, recall the relevant bits. A small, pure-Rust memory that embeds for you (or takes the vectors you already have) and answers by similarity from a single directory.
   actions:
     - text: Get started
       link: /getting-started/
@@ -17,22 +17,22 @@ import { Code } from '@astrojs/starlight/components';
 
 <p class="lede not-content">
   <strong>nidus (Latin, "nest") is two things in one small, pure-Rust package.</strong>
-  It's a <strong>vector store</strong> — the storage-and-search core you build
-  semantic search, code indexing, RAG, and agent memory on — and an <strong>all-in-one
+  It's a <strong>vector store</strong> (the storage-and-search core you build
+  semantic search, code indexing, RAG, and agent memory on) and an <strong>all-in-one
   memory</strong> layered on top that embeds text for you, so you can remember natural
   language and recall the relevant bits. Bring your own vectors, or let nidus make
-  them. Not a database, no SQL, no query engine — sized for development and
+  them. Not a database, no SQL, no query engine; sized for development and
   small-scale use.
 </p>
 
-<Code code={`// Text in — nidus embeds it for you.
+<Code code={`// Text in: nidus embeds it for you.
 memory.remember(
     "notes", "login",
     "Users sign in with a bearer token.",
     attrs, RememberMode::Raw,
 ).await?;
 
-// Relevant text out — ranked by similarity.
+// Relevant text out, ranked by similarity.
 let hits = memory.recall("notes", "how do users sign in?", &RecallOpts {
     top_k: 5,
     ..Default::default()
@@ -44,22 +44,22 @@ let hits = memory.recall("notes", "how do users sign in?", &RecallOpts {
   <article class="feature" data-reveal>
     <span class="twig" aria-hidden="true">❧</span>
     <h3>Remember text, recall the relevant bits</h3>
-    <p>Hand nidus natural language and it embeds it for you — optionally summarizing first — with the provider you choose: Voyage, OpenAI, Ollama, Cohere, Gemini, Mistral, Jina, or any OpenAI-compatible endpoint. Already have vectors? The raw API is untouched — bring your own. The memory layer is opt-in and off by default, so the core stays lean.</p>
+    <p>Hand nidus natural language and it embeds it for you (optionally summarizing first) with the provider you choose: Voyage, OpenAI, Ollama, Cohere, Gemini, Mistral, Jina, or any OpenAI-compatible endpoint. Already have vectors? The raw API is untouched: bring your own. The memory layer is opt-in and off by default, so the core stays lean.</p>
   </article>
   <article class="feature" data-reveal style="--reveal-delay:0.04s">
     <span class="twig" aria-hidden="true">❧</span>
     <h3>Search by similarity, filter as you go</h3>
-    <p>Hand nidus a query and get the closest records back, ranked with scores — exact by default (100% recall at the scale it targets) by cosine, dot, or Euclidean, or an approximate index (HNSW/IVF) and int8/binary quantization when you want more speed. Store typed metadata beside every vector and narrow results before they score: equality, ranges, globs, sets, list containment, fuzzy and regex text matching, and boolean composition over all of them.</p>
+    <p>Hand nidus a query and get the closest records back, ranked with scores: exact by default (100% recall at the scale it targets) by cosine, dot, or Euclidean, or an approximate index (HNSW/IVF) and int8/binary quantization when you want more speed. Store typed metadata beside every vector and narrow results before they score: equality, ranges, globs, sets, list containment, fuzzy and regex text matching, and boolean composition over all of them.</p>
   </article>
   <article class="feature" data-reveal style="--reveal-delay:0.08s">
     <span class="twig" aria-hidden="true">❧</span>
     <h3>One directory, crash-safe</h3>
-    <p>A whole store is a single append-only directory, fsync'd per batch and CRC-checked. A crash loses at most the in-flight write, and a torn tail repairs itself the moment you reopen — nothing to back up but a folder.</p>
+    <p>A whole store is a single append-only directory, fsync'd per batch and CRC-checked. A crash loses at most the in-flight write, and a torn tail repairs itself the moment you reopen; nothing to back up but a folder.</p>
   </article>
   <article class="feature" data-reveal style="--reveal-delay:0.12s">
     <span class="twig" aria-hidden="true">❧</span>
     <h3>From a folder to the cloud</h3>
-    <p>Start against a local directory, then move the same store to S3, GCS, or Redis/Valkey by changing one URL — no migration, no rewrite. Begin on a laptop and grow into the cloud when you need to.</p>
+    <p>Start against a local directory, then move the same store to S3 or GCS by changing one URL, and add a shared Redis/Valkey memory tier when instances need a warm working set: no migration, no rewrite. Begin on a laptop and grow into the cloud when you need to.</p>
   </article>
 </div>
 
@@ -72,7 +72,7 @@ let hits = memory.recall("notes", "how do users sign in?", &RecallOpts {
   </a>
   <a class="next-card" href="/guides/remember-and-recall/" data-reveal style="--reveal-delay:0.06s">
     <span class="next-title">Remember &amp; recall</span>
-    <p>Let nidus embed text for you — pick a provider, remember, recall.</p>
+    <p>Let nidus embed text for you: pick a provider, remember, recall.</p>
   </a>
   <a class="next-card" href="/guides/how-it-works/" data-reveal style="--reveal-delay:0.06s">
     <span class="next-title">How it works</span>

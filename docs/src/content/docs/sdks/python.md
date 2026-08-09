@@ -1,19 +1,19 @@
 ---
 title: Python SDK
-description: "nidus on PyPI — the official Python client for nidus. Connect to a local or remote nidus server over HTTP, upsert, and search, with a sync client that needs nothing but the standard library."
+description: "nidus on PyPI: the official Python client for nidus. Connect to a local or remote nidus server over HTTP, upsert, and search, with a sync client that needs nothing but the standard library."
 ---
 
 [`nidus`](https://pypi.org/project/nidus/) is the official Python client for nidus. It
-drives a running [`nidus serve`](/guides/http-server/) instance over HTTP — local or
+drives a running [`nidus serve`](/guides/http-server/) instance over HTTP, local or
 remote.
 
 ```sh
-pip install nidus            # the sync client — pulls ZERO dependencies
+pip install nidus            # the sync client: pulls ZERO dependencies
 pip install 'nidus[async]'   # adds AsyncNidusClient (httpx)
 ```
 
 `NidusClient` is built on `urllib.request` from the standard library, so `pip install
-nidus` brings **nothing** else with it — the same zero-dependency posture the
+nidus` brings **nothing** else with it: the same zero-dependency posture the
 [JavaScript SDK](/sdks/javascript/) gets from the platform `fetch`. Only the async client
 needs a third-party HTTP stack, and it lives behind the `async` extra. Python 3.9+, typed
 (`py.typed` ships in the wheel).
@@ -24,7 +24,7 @@ nidus release. Match the two and the wire contract lines up.
 
 ## Connecting
 
-"Local vs remote" is just the base URL — point the client at a local `nidus serve` or any
+"Local vs remote" is just the base URL: point the client at a local `nidus serve` or any
 reachable host. When the server was started with a [token](/guides/http-server/), pass it
 as `token`.
 
@@ -45,7 +45,7 @@ db = NidusClient(
 ```
 
 Nothing is opened until the first request. The client is also a context manager, and the
-default `urllib` transport is connectionless — so `close()` only really matters once a
+default `urllib` transport is connectionless, so `close()` only really matters once a
 [pooled transport](#bulk-ingest-supply-a-pooled-transport) or the async client is in play.
 Using `with` means never having to remember which case you are in:
 
@@ -68,10 +68,10 @@ opaque `ModuleNotFoundError`. Either spelling of the import works:
 
 ```python
 from nidus.aio import AsyncNidusClient   # explicit
-import nidus; nidus.AsyncNidusClient     # lazy — resolved on first attribute access
+import nidus; nidus.AsyncNidusClient     # lazy: resolved on first attribute access
 ```
 
-`import nidus` itself never touches `httpx` — that is what keeps the dependency genuinely
+`import nidus` itself never touches `httpx`; that is what keeps the dependency genuinely
 optional instead of one every caller pays for.
 
 ```python
@@ -97,7 +97,7 @@ behaves identically.
 
 ## Upserting and searching
 
-`attrs` accept plain Python values — `str`, `int`, `bool`, lists of `str`, and `None` —
+`attrs` accept plain Python values (`str`, `int`, `bool`, lists of `str`, and `None`)
 and are normalized to nidus's [typed values](/reference/api/) for you. Results come back
 with `attrs` decoded to plain Python values.
 
@@ -107,7 +107,7 @@ db.create_collection("docs")
 db.upsert("docs", [
     {"id": "a", "vector": [0.1, 0.2, 0.3], "attrs": {"lang": "rust", "year": 2024}},
     {"id": "b", "vector": [0.4, 0.5, 0.6], "attrs": {"lang": "go", "year": 2023}},
-    # text-only doc — omit the vector
+    # text-only doc: omit the vector
     {"id": "c", "attrs": {"body": "vector stores are neat"}},
 ])
 
@@ -133,13 +133,13 @@ from nidus import v
 db.upsert("docs", [{"id": "d", "attrs": {"tags": v.list(["a", "b"]), "rank": v.int(7)}}])
 ```
 
-`v.nil()` is the explicit `Null` value — "set, and empty" — which is a different fact from
+`v.nil()` is the explicit `Null` value ("set, and empty"), which is a different fact from
 an absent key ("not set / not indexed"). The SDK keeps the two apart in both directions.
 
 ## Filtering
 
 Build an AND-filter with the `f.*` helpers. Each predicate is a positive assertion about a
-**present** attribute — an absent key matches nothing, including the negative predicates.
+**present** attribute: an absent key matches nothing, including the negative predicates.
 See [Search & filters](/guides/search/) for the full semantics.
 
 ```python
@@ -165,7 +165,7 @@ words** in Python, so `f.in_`, `f.not_in`, and `f.and_` are the JavaScript SDK's
 `f.notIn`, and `f.and`. Nothing else in the surface deviates.
 
 A `Filter` is just a `list` of predicates, AND-combined, so `f.and_(...)` is sugar for
-building that list — `filter=[f.eq("lang", "rust")]` is equally valid, and `[]` matches
+building that list; `filter=[f.eq("lang", "rust")]` is equally valid, and `[]` matches
 everything.
 
 ## Full-text and hybrid search
@@ -195,15 +195,22 @@ there is no meaningful floor to set. `rrf_k` and `candidates` tune the fusion.
 
 When the server is started with an embedder
 ([`nidus serve --embed-provider …`](/guides/remember-and-recall/)) you can send **text**
-and let the server embed it — no need to compute vectors client-side. `remember` embeds
+and let the server embed it: no need to compute vectors client-side. `remember` embeds
 and upserts; `recall` embeds the query and vector-searches.
 
 ```python
 # Embed "the quick brown fox" and store it under id "a"
 db.remember("notes", "a", "the quick brown fox", attrs={"tag": "x"})
 
+# Expire after an hour, and fold near-duplicates into the closest existing entry.
+# On a dedupe match, result.deduped is True and result.id names the entry the
+# write actually landed on.
+result = db.remember("notes", "a2", "the quick brown fox!",
+                     ttl_seconds=3600, dedupe_threshold=0.95)
+
 # Summarize first, then embed the summary (the server also needs --summarize-provider).
-# The stored record additionally carries `nidus.summary` and `nidus.source` attrs.
+# The stored record additionally carries the `nidus.summary` attr, with the raw
+# input in `nidus.text`.
 db.remember("notes", "b", long_article, mode="summarize")
 
 # Embed the query text and search, best first
@@ -212,12 +219,14 @@ hits = db.recall("notes", "quick fox", top_k=5, min_score=0.2, filter=[f.eq("tag
 
 Against a server started **without** an embedder both raise `NidusError` with status
 `400`, and the message names `--embed-provider`; `mode="summarize"` without a summarizer
-configured is likewise a `400`. The client only ever sends text — the embedding always
+configured is likewise a `400`. The client only ever sends text; the embedding always
 happens server-side.
 
 ## The rest of the API
 
-Every endpoint of the [HTTP API](/reference/http-api/) has a typed method:
+Every data-plane endpoint of the [HTTP API](/reference/http-api/) has a typed method
+(the ops probes `/ready`, `/cluster`, `/refresh`, and `/metrics` are for
+orchestrators and scrapers; hit them with plain HTTP):
 
 ```python
 db.collections()                    # list[str]
@@ -234,7 +243,7 @@ db.health()                         # bool
 
 Optional arguments all default to `None`, which means "omit the key" so the **server's**
 default applies (`top_k = 10`, `limit = 100`, `rrf_k = 60.0`, `candidates = 100`). Those
-numbers are deliberately not restated in Python — and it is why the defaults are `None`
+numbers are deliberately not restated in Python, and it is why the defaults are `None`
 rather than a number: `top_k=0` is a legitimate request for zero results, so `0` cannot
 double as "unset".
 
@@ -242,7 +251,7 @@ Two `None`s carry real information and are never flattened:
 
 - `stats().ann` is `None` when the store does exact brute-force search, as opposed to an
   `AnnInfo` full of defaults.
-- `Record.vector` is `None` — never `[]` — for a text-only document.
+- `Record.vector` is `None` (never `[]`) for a text-only document.
 
 ## Three things the client refuses to send
 
@@ -250,11 +259,11 @@ Python's type system cannot express two mistakes that produce a **well-formed** 
 server accepts and answers wrongly, so the SDK refuses them at the call site instead:
 
 ```python
-db.delete("docs", "a")          # TypeError: a str IS a Sequence[str] — this asked to
+db.delete("docs", "a")          # TypeError: a str IS a Sequence[str]; this asked to
                                 # delete the ids "a"... one character at a time
-db.search(query=vec, scope="docs")   # TypeError — same slip, five collections that
+db.search(query=vec, scope="docs")   # TypeError: same slip, five collections that
                                      # do not exist, an empty result and a 200
-f.in_("lang", "rust")           # TypeError — one predicate value per character
+f.in_("lang", "rust")           # TypeError: one predicate value per character
 db.delete_where("docs", [])     # ValueError: an empty filter matches EVERYTHING, so this
                                 # deleted the whole collection; use drop_collection
 ```
@@ -272,7 +281,7 @@ The honest cost of a standard-library-only client: `urllib.request` opens a **fr
 connection per request**. For interactive use that is invisible; over a long run of
 sequential upserts the handshakes are measurable overhead.
 
-The escape hatch is `transport=` — a callable
+The escape hatch is `transport=`: a callable
 `(method, url, headers, body, timeout) -> (status, text)`. Hand in one backed by `httpx`
 or `requests` and you get pooling, keep-alive, retries, or instrumentation, without the
 SDK taking on a dependency for everyone:
@@ -310,7 +319,7 @@ The same seam is what lets the SDK's own unit tests exercise every endpoint with
 and no socket.
 
 `AsyncNidusClient` takes the natural equivalent for its own stack: `transport=` there is
-an `httpx.AsyncBaseTransport` — a pre-tuned pool, or an `httpx.MockTransport` for tests.
+an `httpx.AsyncBaseTransport`: a pre-tuned pool, or an `httpx.MockTransport` for tests.
 It pools by default, so an async caller needs nothing extra for bulk ingest.
 
 Note also that batching is the bigger lever than pooling: `upsert` takes a list, and one
@@ -327,17 +336,17 @@ from nidus import NidusError
 try:
     db.upsert("docs", records)
 except NidusError as err:
-    if err.is_bad_request:      # 400 — e.g. a vector dimension mismatch
+    if err.is_bad_request:      # 400: e.g. a vector dimension mismatch
         ...
-    if err.is_locked:           # 409 — the writer lock is held by another process
+    if err.is_locked:           # 409: the writer lock is held by another process
         ...
     print(err.status, err.message)
 ```
 
-Also available: `is_read_only` (403), `is_out_of_capacity` (507 — `max_vector_bytes`
+Also available: `is_read_only` (403), `is_out_of_capacity` (507, `max_vector_bytes`
 exceeded, or OOM), and `is_transport_error`.
 
-A status of `0` is the sentinel for **no response at all** — connection refused, DNS
+A status of `0` is the sentinel for **no response at all**: connection refused, DNS
 failure, or the request exceeded `timeout`. Every nidus SDK uses the same sentinel, so
 "was this even reachable?" is answered identically in all of them.
 

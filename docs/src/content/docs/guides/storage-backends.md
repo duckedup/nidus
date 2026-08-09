@@ -1,11 +1,11 @@
 ---
 title: Storage backends
-description: Keep a store's durable data on local disk (the default), in Amazon S3 (or R2 / MinIO), or in Google Cloud Storage — chosen with a single location string.
+description: Keep a store's durable data on local disk (the default), in Amazon S3 (or R2 / MinIO), or in Google Cloud Storage, chosen with a single location string.
 ---
 
 By default, a nidus store is a folder on your local disk. You can instead keep its
-durable data in a cloud object store — **Amazon S3** (or any S3-compatible store like
-**Cloudflare R2** and **MinIO**) or **Google Cloud Storage** — by passing one location
+durable data in a cloud object store, **Amazon S3** (or any S3-compatible store like
+**Cloudflare R2** and **MinIO**) or **Google Cloud Storage**, by passing one location
 string. Nothing else about how you use nidus changes.
 
 ```bash
@@ -22,7 +22,7 @@ From the Rust library it is one builder call:
 ```rust
 use nidus::{Config, Nidus};
 
-// Local disk (the default — just a path):
+// Local disk (the default, just a path):
 let local = Nidus::open(Config::new("./store", 768))?;
 
 // Amazon S3:
@@ -31,8 +31,8 @@ let cloud = Nidus::open(Config::new("./meta", 768).persistence("s3://my-bucket/s
 ```
 
 That's the whole feature: **where the durable bytes live is a value, not a rebuild.**
-Search itself never touches the backend — nidus always scans an in-RAM copy of your
-vectors — so moving a store to the cloud changes startup and write cost, never search
+Search itself never touches the backend (nidus always scans an in-RAM copy of your
+vectors), so moving a store to the cloud changes startup and write cost, never search
 results or speed.
 
 ## Choosing a backend
@@ -49,7 +49,7 @@ back to local disk.
 ### Local files (the default)
 
 A store is a folder; each piece is a file inside it (`data`, `log`, and rebuildable
-caches). Writes are crash-safe and a second writer is locked out — see
+caches). Writes are crash-safe and a second writer is locked out. See
 [Storage & durability](/guides/storage/). Nothing to configure: just give a path.
 
 ```bash
@@ -59,7 +59,7 @@ nidus create --dir ./store --dim 768 docs
 ### Amazon S3 (and R2, MinIO)
 
 Point `--persistence` at an `s3://` bucket. Credentials come from the standard AWS
-environment variables — the same ones the AWS CLI uses:
+environment variables, the same ones the AWS CLI uses:
 
 ```bash
 export AWS_ACCESS_KEY_ID=…
@@ -73,17 +73,17 @@ nidus search --dir ./meta --dim 768 \
   --persistence s3://my-bucket/store docs -k 5 < query.json
 ```
 
-`AWS_SESSION_TOKEN` is used if set. Pass `--dim` when the store lives in the cloud — nidus
+`AWS_SESSION_TOKEN` is used if set. Pass `--dim` when the store lives in the cloud: nidus
 reads the local folder's header to learn the dimension, and there isn't one for a remote
 store.
 
 **Keyless credentials.** When `AWS_ACCESS_KEY_ID` is unset, nidus follows the standard AWS
 chain and fetches temporary credentials automatically, refreshing them before they expire:
 
-- **EKS / IRSA** — a pod with `AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE` (injected when
+- **EKS / IRSA**: a pod with `AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE` (injected when
   its ServiceAccount is annotated with a role) is exchanged at STS.
-- **ECS / Fargate** — the task-role endpoint (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`).
-- **EC2 instance role** — IMDSv2, tried last. Set `AWS_EC2_METADATA_DISABLED=true` to skip it.
+- **ECS / Fargate**: the task-role endpoint (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`).
+- **EC2 instance role**: IMDSv2, tried last. Set `AWS_EC2_METADATA_DISABLED=true` to skip it.
 
 So on EKS, ECS, or an EC2 instance you can leave the keys unset entirely.
 
@@ -115,7 +115,7 @@ durable, off-box storage with a one-line switch. The trade-offs:
 - **One writer.** The cloud writer lock is best-effort (a short-lived marker object), so a
   cloud-backed store assumes a single writer. For many concurrent writers, keep the store
   on local disk and [back it up](#backups) to the cloud instead.
-- **Search is identical.** Either way, search runs over local RAM — same results, same
+- **Search is identical.** Either way, search runs over local RAM: same results, same
   latency.
 
 This makes cloud backing a good fit for nidus's sweet spot: a personal- or small-team
@@ -124,7 +124,7 @@ store you want to keep somewhere durable and shareable, written occasionally.
 ## Backups
 
 A store is just a few files, so a backup is one `.tar.gz`. `nidus backup` reads a store
-and writes the archive to any location — a local path or a cloud bucket — and
+and writes the archive to any location (a local path or a cloud bucket), and
 `nidus restore` brings it back:
 
 ```bash
@@ -133,7 +133,7 @@ nidus backup  --dir ./store --out s3://my-bucket/backups/store.tar.gz
 nidus restore --in s3://my-bucket/backups/store.tar.gz --dir ./restored
 ```
 
-A backup is a safe hot snapshot — it doesn't take the writer lock, so it can run while a
+A backup is a safe hot snapshot: it doesn't take the writer lock, so it can run while a
 writer (or `nidus serve`) is busy. See the [command-line guide](/guides/cli-and-server/#backup--restore)
 for the full story.
 
@@ -141,14 +141,23 @@ for the full story.
 
 Whichever backend you choose, a store is the same small set of named pieces:
 
-| piece | what it is | survives a backup? |
+| piece | what it is | durable? |
 |---|---|---|
-| `data` | your vectors (the durable matrix) | **yes — required** |
-| `log`  | the record of every change | **yes — required** |
-| `ann`, `fts` | search-index caches | no — rebuilt automatically on open |
+| `data` | your vectors (the durable matrix) | **yes (required)** |
+| `log`  | the record of every change | **yes (required)** |
+| `manifest`, `seg-*` | the live segment set (stores using `segment_max_rows`) | **yes (required)** |
+| `ann`, `fts` | search-index caches | no, rebuilt automatically on open |
 
-Only `data` and `log` matter for durability; the caches can be deleted and are rebuilt
-from scratch when the store next opens, so a missing or stale cache is never a problem.
+`data`, `log`, and (on a segmented store) `manifest` + `seg-*` all matter for
+durability. The caches can be deleted and are rebuilt from scratch when the store next
+opens, so a missing or stale cache is never a problem.
+
+:::caution
+`nidus backup` currently archives only `data` and `log`, so on a store using
+`--segment-max-rows` it silently misses the sealed segments. Until
+[#130](https://github.com/duckedup/nidus/issues/130) lands, back up a segmented store
+by copying the whole directory (or bucket prefix) instead.
+:::
 
 ## Cooperating instances (cluster)
 
@@ -160,7 +169,7 @@ the *same* store: one writer and any number of read-only searchers. Turn it on w
 ```rust
 use nidus::{Config, Nidus, OpenMode};
 
-// The writer instance — holds the lease, takes writes.
+// The writer instance: holds the lease, takes writes.
 let mut writer = Nidus::open(
     Config::new("cluster-store", 768)
         .persistence("s3://my-bucket/store")
@@ -168,7 +177,7 @@ let mut writer = Nidus::open(
         .cluster(true),
 )?;
 
-// A search instance — read-only, no lock; tracks the writer.
+// A search instance: read-only, no lock; tracks the writer.
 let mut reader = Nidus::open(
     Config::new("cluster-store", 768)
         .persistence("s3://my-bucket/store")
@@ -189,29 +198,29 @@ How it works:
   (the object-store writer lock, evolved). It is renewed automatically at the start of every
   write batch, so an active writer keeps it indefinitely; if a writer goes silent past
   [`lock_ttl`](/reference/configuration/#lock_ttl) another may take over, and the original is
-  **fenced** — its next batch sees it no longer holds the lease. Beyond that per-batch check,
+  **fenced**: its next batch sees it no longer holds the lease. Beyond that per-batch check,
   every durable write is a **compare-and-swap**: each segment / log / manifest object is written
   only if it still matches the version this writer last saw (S3 `If-Match`, GCS
   `ifGenerationMatch`). So even a writer that stalls *mid-batch* past the TTL and is replaced has
-  its next write **refused** — it fails cleanly instead of clobbering the new writer's committed
+  its next write **refused**: it fails cleanly instead of clobbering the new writer's committed
   data. The intended deployment is still a single writer; a second exists only to take over a
   dead one.
 - **Many readers, refreshing.** Every commit advances the manifest version, so a `ReadOnly`
-  instance picks up the writer's changes with a single cheap [`refresh()`](/reference/api/#search--maintenance)
-  — no reopen. Call it on whatever cadence you like (per request, on a timer); it is a no-op
+  instance picks up the writer's changes with a single cheap [`refresh()`](/reference/api/#search--maintenance),
+  with no reopen. Call it on whatever cadence you like (per request, on a timer); it is a no-op
   when nothing changed. A refresh is incremental where it can be: it re-reads only the segment
   that grew (reusing the immutable ones) and, when a shared memory tier holds a current snapshot,
   adopts it instead of replaying the log.
 - **Required pieces.** Cluster mode needs **both** a shared object store *and* a shared memory
-  tier — a local-filesystem or process-RAM store is single-node by definition and is rejected
+  tier: a local-filesystem or process-RAM store is single-node by definition and is rejected
   with a clear error.
 
 This is deliberately small: there is no coordinator, no replication, and no rebalancing. The
-object store plus the versioned manifest *are* the coordination — the same architecture as a
+object store plus the versioned manifest *are* the coordination: the same architecture as a
 single node, just with more readers.
 
-Cluster mode scales *readers* over one dataset. If what you need is **capacity** — a corpus
-larger than one machine — that is a different shape and needs none of this: see
+Cluster mode scales *readers* over one dataset. If what you need is **capacity** (a corpus
+larger than one machine), that is a different shape and needs none of this: see
 [running across a few boxes](/guides/multi-box/).
 
 ## Writing your own backend
@@ -219,7 +228,7 @@ larger than one machine — that is a different shape and needs none of this: se
 The backends above are implementations of one small, synchronous Rust trait,
 `nidus::backend::Persistence` (whole-object `get`/`put`/`delete`/`list`, plus an optional
 native append for local files). If you want a store to live somewhere nidus doesn't ship
-— another object store, a database, a tmpfs — implement that trait. The full method
+(another object store, a database, a tmpfs), implement that trait. The full method
 surface is in the [API reference](/reference/api/); the trait is sync on purpose, so it
 drops straight into a `Box<dyn Persistence>` chosen at runtime.
 

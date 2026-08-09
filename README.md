@@ -1,56 +1,56 @@
 # nidus
 
 A small, pure-Rust **all-in-one memory**: remember text, recall the relevant bits.
-Hand it natural language and nidus embeds the text for you — optionally summarizing
-first — with the provider of your choice, or bring your own vectors. At its core
+Hand it natural language and nidus embeds the text for you (optionally summarizing
+first) with the provider of your choice, or bring your own vectors. At its core
 it's a vector store for development and small-scale use: exact-by-default
-nearest-neighbour search — cosine, dot, or Euclidean — over a single append-only
+nearest-neighbour search (cosine, dot, or Euclidean) over a single append-only
 directory, approximate (HNSW/IVF) when you opt in, with typed metadata filters and
 many logical collections sharing one embedding space. No SQL, no query engine, and
 a build measured in seconds, not minutes.
 
-> _nidus_ (Latin, "nest") — a small place where things are kept safe.
+> _nidus_ (Latin, "nest"): a small place where things are kept safe.
 
 ## Why it exists
 
 nidus is the memory layer for semantic-search, RAG, and indexing tools: remember
-text, recall the relevant bits. Classically that's a pipeline — chunk some source →
-embed each chunk → store the vectors + metadata → ask for nearest neighbours — and
+text, recall the relevant bits. Classically that's a pipeline (chunk some source →
+embed each chunk → store the vectors + metadata → ask for nearest neighbours), and
 nidus can own the whole thing (embedding, and optionally summarizing, built in) or
 just the storage-and-search core if you already have vectors. Either way, the
 obvious off-the-shelf options fail the **build-and-ship** test, not the
 functionality test:
 
 - **DuckDB** (via `libduckdb-sys`) bundles a large C++ source tree and compiles it
-  from scratch — multi-minute cold builds, a required C++ toolchain, a bloated
+  from scratch: multi-minute cold builds, a required C++ toolchain, a bloated
   binary, and FFI that can't run under Miri. A vector workload uses ~1% of it.
 - **LanceDB** is "written in Rust" yet still takes ~10 minutes to compile, because
-  it drags in Arrow + DataFusion (a full SQL engine) + a columnar format — hundreds
+  it drags in Arrow + DataFusion (a full SQL engine) + a columnar format: hundreds
   of crates to do `ORDER BY distance LIMIT k`.
 
-The workload is a *vector store, not a database*. nidus is that store — with an
-opt-in memory layer over it, off by default — so it **compiles in seconds** and
+The workload is a *vector store, not a database*. nidus is that store (with an
+opt-in memory layer over it, off by default), so it **compiles in seconds** and
 embeds as a normal Rust dependency.
 
 ### The constraints are the product
 
 The bar is **build-and-ship speed**, not zero-C absolutism. The enemy is the
-*multi-minute* C/C++ tree (DuckDB) or hundred-crate graph (LanceDB) — not a small,
+*multi-minute* C/C++ tree (DuckDB) or hundred-crate graph (LanceDB), not a small,
 fast dependency.
 
-- **Builds in seconds** — the whole crate, with every backend (local files, S3, GCS, and
+- **Builds in seconds**: the whole crate, with every backend (local files, S3, GCS, and
   the Redis/Valkey memory tier), compiles in seconds (CI asserts well under a minute). The
-  only native code is `ring` (the TLS used by the S3/GCS backends and `rediss://` — a small
+  only native code is `ring` (the TLS used by the S3/GCS backends and `rediss://`, a small
   C+asm compile); never a bundled C++ tree, vendored OpenSSL, or `aws-lc`. The Redis client
   is sync/pure-Rust (no tokio).
 - **Near-zero `unsafe` in our code** (`#![deny(unsafe_code)]`). The one exception is the
-  opt-in [`Config::mmap`](https://nidus.duckedup.org/reference/configuration/#mmap) path —
+  opt-in [`Config::mmap`](https://nidus.duckedup.org/reference/configuration/#mmap) path:
   a single scoped `mmap` call for serving large stores from disk; every other `unsafe` is a
   hard compile error.
-- **Pure-Rust core** — the local store and search path are pure Rust with no native
+- **Pure-Rust core**: the local store and search path are pure Rust with no native
   library; the cloud backends are sans-IO clients (`rusty-s3`/`tame-gcs`) over a small
   blocking HTTP client.
-- **Miri-checkable** — all of nidus's own logic, including the local file IO, runs
+- **Miri-checkable**: all of nidus's own logic, including the local file IO, runs
   under Miri (only the network TLS paths are excluded).
 
 ## Quick start
@@ -96,49 +96,49 @@ See [`examples/demo.rs`](examples/demo.rs) for an end-to-end run (`cargo run
 
 ## What it does
 
-- **Remember text, recall the relevant bits** *(opt-in)* — hand nidus natural
+- **Remember text, recall the relevant bits** *(opt-in)*: hand nidus natural
   language and it embeds it for you, optionally summarizing first, with a provider of
   your choice (Voyage, OpenAI, Ollama, Cohere, Gemini, Mistral, Jina, or any
   OpenAI-compatible endpoint), then answers queries by similarity. The raw `Vec<f32>`
-  API is untouched — bring your own vectors and skip it entirely. Off by default, so
+  API is untouched: bring your own vectors and skip it entirely. Off by default, so
   `cargo add nidus` stays a lean synchronous store. See the
   [remember & recall guide](https://nidus.duckedup.org/guides/remember-and-recall/).
-- **Exact or approximate search** — exact by default (100% recall, fast at the target
+- **Exact or approximate search**: exact by default (100% recall, fast at the target
   scale of ≤ a few million vectors, comfortably in RAM). Score by cosine, dot, or
   Euclidean (cosine the default; cosine vectors are unit-normalized on insert, so a
   score is plain similarity in `[-1, 1]`). Opt into an approximate index (HNSW or IVF)
   or int8 quantization to trade some recall for speed at larger scale.
-- **Scoped search** — query one collection, a subset, or the **whole store** in one
+- **Scoped search**: query one collection, a subset, or the **whole store** in one
   call, merged into a single ranking. Sound because every collection shares one
   embedding space (one pinned dimension).
-- **Typed metadata + filters** — attach `Str`/`Int`/`Float`/`Bool`/`List`/`DateTime`/
+- **Typed metadata + filters**: attach `Str`/`Int`/`Float`/`Bool`/`List`/`DateTime`/
   `Null` attributes and narrow results *before* they score: equality and sets, ranges,
   globs, list containment, fuzzy/token/phrase/regex text matching, and `All`/`Any`/`Not`
   boolean composition over any of them.
-- **Rank and shape the answer** — layer a recency decay over the store's metric, weight
+- **Rank and shape the answer**: layer a recency decay over the store's metric, weight
   the legs of a hybrid query, `ORDER BY` an attribute, cap hits per attribute value,
   project which attrs come back, paginate a documented total ordering, or ask a hit to
   `explain` itself with per-clause scores and highlighted fragments.
 - **Idempotent upserts** by caller-supplied id; `delete`, `delete_where`, per-
   collection metadata.
-- **Crash-safe & durable** — an append-only flat-`f32` `data` segment plus a framed,
+- **Crash-safe & durable**: an append-only flat-`f32` `data` segment plus a framed,
   CRC-checked op `log` (the commit record). A crash loses at most the in-flight
   batch; a torn tail is recovered on open. Cross-process readers get a consistent,
   lock-free snapshot (`OpenMode::ReadOnly`).
-- **Synchronous, runtime-agnostic** — the hot path is CPU-bound, so there's no async
+- **Synchronous, runtime-agnostic**: the hot path is CPU-bound, so there's no async
   core to lock you into a runtime. `Arc<RwLock<Nidus>>` gives concurrent searchers +
   one writer; async callers bridge with `spawn_blocking`.
 
 ## Command line & server
 
 The same crate ships an optional `nidus` binary: a CLI for working with a store
-directly, and `nidus serve`, an HTTP server exposing the full store — create,
-upsert, search, inspect, maintain — over JSON. The binary is built behind a `cli`
+directly, and `nidus serve`, an HTTP server exposing the full store (create,
+upsert, search, inspect, maintain) over JSON. The binary is built behind a `cli`
 feature, so `cargo add nidus` stays pure: the library never pulls the binary's
 dependencies.
 
 ```bash
-# Install — no Rust toolchain needed (prebuilt binary for your platform)
+# Install: no Rust toolchain needed (prebuilt binary for your platform)
 curl -fsSL https://raw.githubusercontent.com/duckedup/nidus/main/install.sh | sh
 # …or, with cargo: `cargo binstall nidus` / `cargo install nidus --features cli`
 
@@ -149,13 +149,13 @@ echo '[{"id":"a","vector":[1,0,0],"attrs":{}}]' | nidus upsert --dir ./store doc
 echo '[1,0,0]' | nidus search --dir ./store docs -k 5
 
 # Snapshot the whole store to one portable .tar.gz (safe while a writer runs),
-# and restore it — handy before an upgrade or as a cron job.
+# and restore it, handy before an upgrade or as a cron job.
 nidus backup  --dir ./store --out ./store.tar.gz
 nidus restore --in ./store.tar.gz --dir ./restored
 ```
 
-Or drive the same store over the network — no Rust toolchain on the client, just
-HTTP and JSON:
+Or drive the same store over the network (no Rust toolchain on the client, just
+HTTP and JSON):
 
 ```bash
 nidus serve --dir ./store --dim 3 --addr 127.0.0.1:7700
@@ -174,11 +174,11 @@ See the [command-line](https://nidus.duckedup.org/guides/cli-and-server/) and
 ## Performance
 
 Every vector store ships a benchmark proving it's the fastest, on synthetic data
-that looks nothing like your workload. It's a genre. Here's ours — and yes, we win
+that looks nothing like your workload. It's a genre. Here's ours, and yes, we win
 our own benchmark, that's how this works.
 
 Exact brute-force cosine KNN, 100k vectors, single thread, measured against
-DuckDB (`array_cosine_similarity`) and LanceDB (`bypass_vector_index`) — both pinned
+DuckDB (`array_cosine_similarity`) and LanceDB (`bypass_vector_index`), both pinned
 to the same exact search, so all three return the same neighbours. The harness
 computes its own independent ground truth and reports **recall@k** for every engine
 (including nidus), so none is trusted as the oracle. Numbers are query p50; lower is
@@ -192,11 +192,11 @@ better.
 | dim=768 | 100 | **8.57 ms** | 53.16 ms | 64.99 ms | 100% |
 
 All three are exact (recall 100%); nidus is the fastest in every cell while being the
-one that compiles in seconds. The kernel is plain safe Rust — an
+one that compiles in seconds. The kernel is plain safe Rust: an
 8-lane chunked dot the optimizer can vectorize, an allocation-free top-k scan, and a
 storage-order (prefetcher-friendly) sweep of the matrix. Reproduce with
 `just bench all` (see [`benchmarks/`](benchmarks/); the heavy DuckDB/LanceDB deps are
-quarantined off nidus's own build path). Synthetic data on an Apple Silicon laptop —
+quarantined off nidus's own build path). Synthetic data on an Apple Silicon laptop:
 useless, like all benchmarks, but there it is.
 
 ## On-disk layout
@@ -206,7 +206,7 @@ A store is a directory:
 ```
 <dir>/
   data    append-only, fixed-stride, row-major f32 matrix (header pins dimension)
-  log     append-only framed op stream: [len][bincode(Op)][crc32] — the commit record
+  log     append-only framed op stream: [len][bincode(Op)][crc32] (the commit record)
   lock    O_EXCL writer-exclusion lock file
 ```
 
@@ -226,7 +226,7 @@ let cfg = Config::new("/path/to/store", 768)
     .lock_ttl(Duration::from_secs(60));
 ```
 
-The store **location is always the caller's choice** — nidus contributes no path
+The store **location is always the caller's choice**: nidus contributes no path
 defaults, env vars, or hidden directories.
 
 ## Development
@@ -245,16 +245,16 @@ just serve ./store 768   # run `nidus serve` from the checkout
 The core recipes keep the seconds-long build path intact; the `cli` feature (which
 pulls clap + the tokio/axum stack) has its own opt-in recipes. Miri runs all of
 nidus's own logic, including the local file IO and the in-RAM object-store/memory-tier
-paths — only the network paths (S3/GCS TLS, the Redis socket) and the opt-in `mmap`
+paths; only the network paths (S3/GCS TLS, the Redis socket) and the opt-in `mmap`
 syscall are outside its reach.
 
 Rust 1.96+ (pinned via `rust-toolchain.toml`), edition 2024.
 
 ## Design
 
-The full design — data model, on-disk format, durability/concurrency model, the
-opt-in modes (approximate ANN/HNSW + IVF, scalar/binary quantization, memory-mapped
-larger-than-RAM stores), and the remaining deferred seams — lives in
+The full design, covering the data model, on-disk format, durability/concurrency
+model, the opt-in modes (approximate ANN/HNSW + IVF, scalar/binary quantization,
+memory-mapped larger-than-RAM stores), and the remaining deferred seams, lives in
 [`SPEC.md`](SPEC.md). Each module also carries its own contract in `src/<module>/SPEC.md`.
 
 ## License

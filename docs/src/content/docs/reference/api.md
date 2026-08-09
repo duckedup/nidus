@@ -1,6 +1,6 @@
 ---
 title: API reference
-description: The full nidus public surface — Nidus, Config, Record, Value, Filter, Predicate, Scope, SearchOpts, Projection, RankBy, Decay, LimitPer, OrderBy, AggregateOpts, FtsQuery, HybridOpts, ListOpts, Hit, Annotations, Footprint.
+description: The full nidus public surface (Nidus, Config, Record, Value, Filter, Predicate, Scope, SearchOpts, Projection, RankBy, Decay, LimitPer, OrderBy, AggregateOpts, FtsQuery, HybridOpts, ListOpts, Hit, Annotations, Footprint).
 ---
 
 The complete public API. All fallible methods return `anyhow::Result`. For the
@@ -8,7 +8,7 @@ generated rustdoc, run `cargo doc --open` in the repository.
 
 ## `Nidus`
 
-The open store. Synchronous — wrap in `Arc<RwLock<Nidus>>` for concurrent
+The open store. Synchronous: wrap in `Arc<RwLock<Nidus>>` for concurrent
 searchers plus one writer (see
 [Embedding in a host app](/guides/integrating/)).
 
@@ -18,7 +18,7 @@ searchers plus one writer (see
 | ------ | --------- | ----- |
 | `open` | `fn open(config: Config) -> Result<Self>` | Open, creating if absent. The full builder path. |
 | `open_dir` | `fn open_dir(dir: impl AsRef<Path>, dimension: usize) -> Result<Self>` | Shorthand for `open(Config::new(dir, dimension))`. |
-| `open_in_memory` | `fn open_in_memory(dimension: usize) -> Result<Self>` | No files, no lock — for tests and ephemeral use. |
+| `open_in_memory` | `fn open_in_memory(dimension: usize) -> Result<Self>` | No files, no lock; for tests and ephemeral use. |
 
 ### Introspection
 
@@ -27,7 +27,7 @@ searchers plus one writer (see
 | `dimension` | `fn dimension(&self) -> usize` | The pinned embedding dimension. |
 | `config` | `fn config(&self) -> &Config` | The config the store was opened with. |
 | `footprint` | `fn footprint(&self) -> Footprint` | A cheap snapshot of the vector footprint. |
-| `cluster_status` | `fn cluster_status(&self) -> ClusterStatus` | Role, writer-handle state, fencing token, commit counter, staleness — what [`GET /cluster`](/reference/http-api/#get-cluster) reports. |
+| `cluster_status` | `fn cluster_status(&self) -> ClusterStatus` | Role, writer-handle state, fencing token, commit counter, staleness (what [`GET /cluster`](/reference/http-api/#get-cluster) reports). |
 
 ### Collections
 
@@ -55,17 +55,17 @@ searchers plus one writer (see
 
 | Method | Signature | Notes |
 | ------ | --------- | ----- |
-| `list` | `fn list<'a>(&self, scope: impl Into<Scope<'a>>, opts: &ListOpts) -> Result<Vec<Hit>>` | Metadata-only query — no vector, returns filter-matched records in insertion order (or by [`ListOpts::order_by`](#orderby)); `offset`/`limit` paginate. |
+| `list` | `fn list<'a>(&self, scope: impl Into<Scope<'a>>, opts: &ListOpts) -> Result<Vec<Hit>>` | Metadata-only query: no vector, returns filter-matched records in insertion order (or by [`ListOpts::order_by`](#orderby)); `offset`/`limit` paginate. |
 | `search` | `fn search<'a>(&self, scope: impl Into<Scope<'a>>, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>` | Ranked search over a scope using the store's distance metric; `SearchOpts`'s `offset`/`top_k` paginate. |
 | `text_search` | `fn text_search<'a>(&self, scope: impl Into<Scope<'a>>, query: &FtsQuery, opts: &SearchOpts) -> Result<Vec<Hit>>` | [BM25 full-text search](/guides/search/#full-text-search-bm25) over one or more field clauses; `min_score` is a raw BM25 floor. |
 | `hybrid_search` | `fn hybrid_search<'a>(&self, scope: impl Into<Scope<'a>>, vector: &[f32], text: &FtsQuery, opts: &HybridOpts) -> Result<Vec<Hit>>` | [Hybrid vector + BM25](/guides/search/#hybrid-search-rrf), fused with Reciprocal Rank Fusion. |
-| `aggregate` | `fn aggregate<'a>(&self, scope: impl Into<Scope<'a>>, opts: &AggregateOpts) -> Result<Aggregation>` | [Count and sum](/guides/search/#aggregation) over a filter, straight off the in-memory index — no record is materialized. |
+| `aggregate` | `fn aggregate<'a>(&self, scope: impl Into<Scope<'a>>, opts: &AggregateOpts) -> Result<Aggregation>` | [Count and sum](/guides/search/#aggregation) over a filter, straight off the in-memory index; no record is materialized. |
 | `flush` | `fn flush(&mut self) -> Result<()>` | Force an fsync (relevant under `Fsync::OnFlush`). |
-| `deferred` | `fn deferred<T>(&mut self, f: impl FnOnce(&mut Nidus) -> Result<T>) -> Result<T>` | Run `f`'s mutations with their durable barrier deferred, so several can share one — see [group commit](/guides/how-it-works/#group-commit). **Report nothing successful until `commit` returns `Ok`**: until then the bytes are appended but not durable. |
-| `commit` | `fn commit(&mut self) -> Result<()>` | Take one barrier covering everything appended by `deferred` (fsync `data`, then `log`). A no-op when no barrier is owed, so the ordinary path pays nothing. Narrower than `flush` — no segment seal, no working-set publish. |
+| `deferred` | `fn deferred<T>(&mut self, f: impl FnOnce(&mut Nidus) -> Result<T>) -> Result<T>` | Run `f`'s mutations with their durable barrier deferred, so several can share one; see [group commit](/guides/how-it-works/#group-commit). **Report nothing successful until `commit` returns `Ok`**: until then the bytes are appended but not durable. |
+| `commit` | `fn commit(&mut self) -> Result<()>` | Take one barrier covering everything appended by `deferred` (fsync `data`, then `log`). A no-op when no barrier is owed, so the ordinary path pays nothing. Narrower than `flush`: no segment seal, no working-set publish. |
 | `compact` | `fn compact(&mut self) -> Result<()>` | Rewrite `data` to reclaim dead rows. |
-| `refresh` | `fn refresh(&mut self) -> Result<bool>` | Adopt a separate writer's newer committed state into a lock-free [`ReadOnly`](/reference/configuration/#openmode) handle without reopening — picks up appends, deletes, seals, and compactions at one consistent point. Returns `true` when newer state was adopted, `false` when already current (the cheap case) or for a `ReadWrite`/in-memory handle. See [refreshing a reader](/guides/storage/#refreshing-a-reader). |
-| `persist_index` | `fn persist_index(&mut self) -> Result<()>` | Write the [ANN index](#annconfig--annkind) to its `ann` cache so the next `open()` loads it instead of rebuilding the graph. Out-of-band (never on `upsert`/`flush`); no-op when ANN is off, in-memory, or read-only. `compact()` refreshes it too. |
+| `refresh` | `fn refresh(&mut self) -> Result<bool>` | Adopt a separate writer's newer committed state into a lock-free [`ReadOnly`](/reference/configuration/#openmode) handle without reopening; it picks up appends, deletes, seals, and compactions at one consistent point. Returns `true` when newer state was adopted, `false` when already current (the cheap case) or for a `ReadWrite`/in-memory handle. See [refreshing a reader](/guides/storage/#refreshing-a-reader). |
+| `persist_index` | `fn persist_index(&mut self) -> Result<()>` | Write the derived index caches: the [ANN index](#annconfig--annkind) to its `ann` cache and the full-text index to its `fts` cache, so the next `open()` loads them instead of rebuilding. Out-of-band (never on `upsert`/`flush`); no-op for whichever index is off, and when in-memory or read-only. `compact()` refreshes them too. |
 
 ## `Scope`
 
@@ -74,7 +74,7 @@ Which collections a search ranks over. Accepts `impl Into<Scope>`, so `&str` and
 
 ```rust
 pub enum Scope<'a> {
-    Collection(&'a str),       // one collection — the common, fast path
+    Collection(&'a str),       // one collection (the common, fast path)
     Collections(&'a [&'a str]), // a chosen subset
     All,                        // every collection in the store
 }
@@ -100,7 +100,7 @@ the `vector` field may be omitted, which deserializes to `None`.
 
 ## `Value`
 
-A typed metadata value. `Null` is **distinct from an absent key** — see
+A typed metadata value. `Null` is **distinct from an absent key**; see
 [typed metadata](/guides/search/#typed-metadata).
 
 ```rust
@@ -119,7 +119,7 @@ pub enum Value {
 `Ge("score", Float(0.5))` does not match a record storing `Int(1)`. `NaN` is unordered
 and unequal to itself, so it fails every predicate, `Eq("k", NaN)` included.
 
-`DateTime` is an absolute instant in UTC epoch milliseconds — there is no timezone and
+`DateTime` is an absolute instant in UTC epoch milliseconds: there is no timezone and
 no local-time form. It is distinct from `Int` so a filter or a recency ranking can tell
 a time from a number without relying on a naming convention.
 
@@ -127,7 +127,7 @@ a time from a number without relying on a naming convention.
 
 A `Filter` is a conjunction (AND) of predicates; an empty filter matches
 everything. Every *leaf* predicate is a positive assertion about a **present**
-attribute — a record lacking `key` matches no leaf predicate, including the negative
+attribute: a record lacking `key` matches no leaf predicate, including the negative
 (`Ne`/`NotIn`/`NotContains`) and range ones.
 
 ```rust
@@ -166,7 +166,7 @@ only: `Int` numerically, `Str` lexically, `Bool` as `false < true`. A cross-type
 non-orderable (`Null`, `List`) comparison never matches.
 
 `Contains`/`NotContains`/`ContainsAny` look inside a `List`, matching whole elements
-rather than substrings — `Contains("tags", "rust")` does not match `["rustacean"]`.
+rather than substrings: `Contains("tags", "rust")` does not match `["rustacean"]`.
 
 `All`/`Any`/`Not` are predicates over predicates, so arbitrary boolean shapes nest
 without `Filter` itself changing. Note `Not` differs from `Ne` on a **missing**
@@ -174,25 +174,25 @@ attribute: `Ne(k, v)` is false (it requires `k` present), while `Not(Eq(k, v))` 
 true. Use `Ne`/`NotIn`/`NotContains` to require presence, `Not` for set complement.
 
 The [text predicates](/guides/search/#text-predicates) read any text the attribute
-carries — a `Str` directly, a `List` element by element, matching when any *single*
+carries: a `Str` directly, a `List` element by element, matching when any *single*
 element does. `Fuzzy` counts characters, not bytes, over the plain three-operation
 Levenshtein distance (so a transposition costs 2) with both sides ASCII-case-folded; a
 budget above **8** is an error, not a clamp. The token family tokenizes at query time on a
-deliberately simpler rule than the FTS analyzer — maximal alphanumeric runs, ASCII-folded,
-**no stemming or stopword removal** — so `ContainsAllTokens("body", "run")` does not match
+deliberately simpler rule than the FTS analyzer (maximal alphanumeric runs, ASCII-folded,
+**no stemming or stopword removal**), so `ContainsAllTokens("body", "run")` does not match
 `"running"` while `text_search` does. `Regex` is anchored at both ends like `Glob` (`.*`
 opts back into a substring search), takes case-insensitivity from its own `(?i)` flag, and
 runs on a linear-time non-backtracking engine; an unparseable pattern is a caller-facing
-error. None of them is indexed — every one re-scans the attribute per row.
+error. None of them is indexed; every one re-scans the attribute per row.
 
 ## `Distance`
 
 The similarity / distance metric, set at store creation via `Config::distance`.
-Pinned in the data header — reopening with a different metric is an error.
+Pinned in the data header: reopening with a different metric is an error.
 
 ```rust
 pub enum Distance {
-    Cosine,      // default — vectors normalized on insert, score = dot(q, v)
+    Cosine,      // default: vectors normalized on insert, score = dot(q, v)
     Euclidean,   // raw vectors, score = −‖q − v‖²
     DotProduct,  // raw vectors, score = dot(q, v)
 }
@@ -217,7 +217,7 @@ pub struct SearchOpts {
 ```
 
 Implements `Default` (`offset: 0`, `exact: false`, `explain: false`,
-`projection: Projection::All`, `rank_by: None`, `limit_per: None`) —
+`projection: Projection::All`, `rank_by: None`, `limit_per: None`);
 `SearchOpts { top_k: 5, ..Default::default() }` is the idiomatic call. Reused by
 `text_search`, where `min_score` is a raw BM25 floor.
 
@@ -227,7 +227,7 @@ result is an empty `Vec`, not an error. See
 [paginating a search](/guides/search/#paginating-a-search).
 
 `exact: true` bypasses the ANN walk, the per-segment index, and the quantized first
-pass, running the exact brute-force scan for that one query — the index stays in place
+pass, running the exact brute-force scan for that one query; the index stays in place
 for every other. See [forcing an exact search](/guides/search/#forcing-an-exact-search).
 
 ## `RankBy` & `Decay`
@@ -244,25 +244,25 @@ pub struct Decay {
     pub field: String,  // timestamp attr: Value::DateTime or Value::Int, epoch millis
     pub origin: i64,    // "now", supplied by the caller so a ranking is reproducible
     pub scale: i64,     // the age (ms) at which the factor equals `decay`
-    pub decay: f32,     // factor at one `scale` of age — default 0.5 (a half-life)
-    pub lambda: f32,    // score a fully-decayed hit gives up — default 1.0
-    pub missing: f32,   // factor when the attr is absent/unusable — default 1.0
+    pub decay: f32,     // factor at one `scale` of age; default 0.5 (a half-life)
+    pub lambda: f32,    // score a fully-decayed hit gives up; default 1.0
+    pub missing: f32,   // factor when the attr is absent/unusable; default 1.0
 }
 ```
 
 Build one with `Decay::new(field, origin, scale)` plus `.decay(_)` / `.lambda(_)` /
-`.missing(_)`. The score is `base − lambda × (1 − decay^(age / scale))` — the penalty
+`.missing(_)`. The score is `base − lambda × (1 − decay^(age / scale))`: the penalty
 **subtracts**, which is what keeps it valid for `Euclidean` and `DotProduct` scores and
 for raw BM25, not just cosine.
 
-`missing` defaults to `1.0`, so a record with no timestamp is **not** penalized —
+`missing` defaults to `1.0`, so a record with no timestamp is **not** penalized;
 enabling decay never buries data that predates the field. `rank_by` does not force the
 exact path; over an ANN or quantized result set it reorders within an approximate
 candidate set. A ranked scan runs single-threaded.
 
 ## `LimitPer`
 
-A cap on how many hits may carry any one value of an attribute — see
+A cap on how many hits may carry any one value of an attribute; see
 [capping hits per attribute value](/guides/search/#capping-hits-per-attribute-value).
 
 ```rust
@@ -289,8 +289,8 @@ pub struct OrderBy {
 ```
 
 Build with `OrderBy::asc(field)` / `OrderBy::desc(field)`. Values that do not order against
-the first orderable one — a different variant, an unorderable `Null`/`List`, or an absent
-attribute — sort into one trailing bucket, which stays trailing when reversed.
+the first orderable one (a different variant, an unorderable `Null`/`List`, or an absent
+attribute) sort into one trailing bucket, which stays trailing when reversed.
 
 ## `AggregateOpts` & `Aggregation`
 
@@ -323,7 +323,7 @@ A missing or non-numeric value is skipped, not counted as zero.
 `group_by` splits the same single pass into one `Group` per distinct value while still
 reporting the whole-scope totals, so "how many per language, and how many overall" is one
 query. Groups are ordered by `count` descending with a deterministic tie-break. A `None`
-`value` is the group of records **missing** the attribute — distinct from those holding
+`value` is the group of records **missing** the attribute, distinct from those holding
 `Value::Null`, matching how the filter predicates treat absent versus null. Distinct values
 are capped at 10 000; past that, new values are dropped and `groups_truncated` is set rather
 than letting a short list pass for a complete one.
@@ -341,7 +341,7 @@ pub enum Projection {
 ```
 
 Build one with `Projection::include([...])` / `Projection::exclude([...])`. It is
-applied where a hit is materialized, so an excluded attr is never cloned — the payload
+applied where a hit is materialized, so an excluded attr is never cloned; the payload
 saving on a long-body collection is real. Ranking and scores are unaffected. An enum
 rather than two lists, so "include and exclude at once" cannot be expressed; the HTTP
 surface answers `400` for the wire form that sends both.
@@ -400,13 +400,13 @@ pub struct Fragment {
 // Builders: HighlightOpts::default().max_fragments(n).fragment_chars(n)
 ```
 
-Fragment offsets index the **original** text, not the analyzed tokens — a query for `run`
+Fragment offsets index the **original** text, not the analyzed tokens: a query for `run`
 highlights a document's `running`. Highlighting reads the stored value, so it is unaffected
 by [`Projection`](#projection). Note the two units differ: `fragment_chars` budgets
 **characters** (an excerpt is never cut mid-codepoint), while `spans` are **byte** offsets
 into the fragment.
 
-A `ClauseScore` carries a score but no rank — clauses are folded into one text score by
+A `ClauseScore` carries a score but no rank: clauses are folded into one text score by
 [`FtsCombine`](#ftsquery-ftsclause-ftscombine--language), so there is no per-clause ranking
 for a rank to name. A `LegScore` does carry one, because the fusion legs *are* ranked
 independently; only `hybrid_search` produces them.
@@ -430,7 +430,7 @@ pub struct HybridOpts {
 ```
 
 Implements `Default` (`top_k: 10`, `offset: 0`, `explain: false`, both weights `1.0`).
-`offset` pages the **fused** ranking, never a leg. There is no `min_score` — a fused RRF
+`offset` pages the **fused** ranking, never a leg. There is no `min_score`: a fused RRF
 score has no absolute scale. Both weights at `1.0` reproduce the unweighted fusion exactly;
 a non-finite or negative weight is refused. See
 [weighting the legs](/guides/search/#weighting-the-legs).
@@ -449,7 +449,7 @@ pub struct ListOpts {
 }
 ```
 
-Implements `Default` (`order_by: None`) — `ListOpts { limit: 20, ..Default::default() }`
+Implements `Default` (`order_by: None`); `ListOpts { limit: 20, ..Default::default() }`
 is the idiomatic call. Sorting runs over the whole match set before the page is cut, so
 `offset`/`limit` walk the sorted order.
 
@@ -489,7 +489,7 @@ pub struct Footprint {
     pub rows: u64,          // physical rows (live + not-yet-compacted dead)
     pub dead_rows: u64,     // reclaimable by compact()
     pub dimension: usize,
-    pub vector_bytes: u64,  // rows * dimension * 4 — what max_vector_bytes caps
+    pub vector_bytes: u64,  // rows * dimension * 4 (what max_vector_bytes caps)
     pub doc_count: usize,   // live documents across all collections
 }
 ```
@@ -516,7 +516,7 @@ pub struct Quantization {
 ```
 
 `Binary` keeps only each dimension's sign bit, which approximates *angular* similarity and
-discards magnitude — so it is not a sound ranking proxy for `DotProduct` or `Euclidean`,
+discards magnitude, so it is not a sound ranking proxy for `DotProduct` or `Euclidean`,
 and is rejected for those metrics. Being the coarser proxy, it defaults to a larger
 overscan than int8.
 

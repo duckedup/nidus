@@ -1,6 +1,6 @@
 ---
 title: HTTP API
-description: The endpoint-by-endpoint reference for a running nidus server — every route, its JSON body, a curl example, and the error codes.
+description: The endpoint-by-endpoint reference for a running nidus server (every route, its JSON body, a curl example, and the error codes).
 ---
 
 This is the endpoint reference for a running [`nidus serve`](/guides/http-server/). Every
@@ -10,7 +10,7 @@ server, set a bind address, and configure auth, see the
 
 **Base URL** is wherever the server is bound (the examples use `localhost:7700`).
 **Auth:** when the server is started with a token, every request except the probe endpoints
-(`GET /health`, `GET /ready`, `GET /metrics`) must send `Authorization: Bearer <token>` — see
+(`GET /health`, `GET /ready`, `GET /metrics`) must send `Authorization: Bearer <token>`; see
 [Authentication](/guides/http-server/#authentication).
 **Errors** return `{"error": "<message>"}` with a status code; see [Errors](#errors).
 **Correlation:** every response carries `X-Request-Id`. Send your own and nidus echoes it,
@@ -18,7 +18,7 @@ so the same id appears in your logs and the server's.
 
 | Method & path | Operation | Library method |
 | --- | --- | --- |
-| `GET /health` | liveness check — `503` only when unrecoverably broken (always unauthenticated) | — |
+| `GET /health` | liveness check: `503` only when unrecoverably broken (always unauthenticated) | – |
 | `GET /stats` | dimension, distance, ann config, collections, footprint | `dimension` / `footprint` |
 | `GET /collections` | list collection names | `collections` |
 | `POST /collections/{name}` | create a collection | `create_collection` |
@@ -30,7 +30,7 @@ so the same id appears in your logs and the server's.
 | `GET /collections/{name}/records` | every record in a collection | `get_all` |
 | `POST /collections/{name}/fts-schema` | declare full-text-indexed fields | `set_fts_schema` |
 | `POST /search` | nearest-neighbour search | `search` |
-| `POST /search/batch` | several queries in one round-trip, optionally RRF-fused | — |
+| `POST /search/batch` | several queries in one round-trip, optionally RRF-fused | – |
 | `POST /text-search` | BM25 full-text search | `text_search` |
 | `POST /hybrid-search` | fused vector + BM25 (RRF) | `hybrid_search` |
 | `POST /list` | metadata-only query (no vector) | `list` |
@@ -38,9 +38,9 @@ so the same id appears in your logs and the server's.
 | `POST /flush` | flush buffered writes to disk | `flush` |
 | `POST /compact` | reclaim dead rows and superseded log records | `compact` |
 | `POST /refresh` | adopt another instance's newer committed state | `refresh` |
-| `GET /ready` | whether this instance can serve (store open, not fenced, not stale) | — |
+| `GET /ready` | whether this instance can serve (store open, not fenced, not stale) | – |
 | `GET /cluster` | role, writer-handle state, fencing token, commit counter, staleness | `cluster_status` |
-| `GET /metrics` | Prometheus scrape — traffic, search path, lease counters (always unauthenticated) | — |
+| `GET /metrics` | Prometheus scrape: traffic, search path, lease counters (always unauthenticated) | – |
 
 ## Health & introspection
 
@@ -49,7 +49,7 @@ so the same id appears in your logs and the server's.
 Liveness probe. Returns `200` with the body `ok`. Always reachable without a
 token, so a load balancer or `docker healthcheck` needs no credential.
 
-Says almost nothing about the store — only that the process is up, answering, and not
+Says almost nothing about the store: only that the process is up, answering, and not
 *unrecoverably* broken. An instance waiting for the writer handle (see `/ready`) is alive,
 and killing it would be exactly wrong, so this keeps returning `200` throughout. So does an
 instance that is merely **busy**: a large upsert holds the store's write guard for the length
@@ -57,7 +57,7 @@ of the batch, which is normal work, not a fault.
 
 It returns `503` in exactly one case: the store's lock has been **poisoned** by a panic that
 unwound while the store was locked for writing. That leaves the in-RAM index possibly out of
-step with the durable bytes, and the condition never clears — every subsequent request would
+step with the durable bytes, and the condition never clears; every subsequent request would
 fail. The instance cannot recover on its own, so liveness fails and a supervisor restarts it;
 the durable data is intact and the fresh process rebuilds from it. In cluster mode that
 restart is also what releases the writer lease, letting a `--wait-for-lease` standby take over.
@@ -74,13 +74,13 @@ restart is also what releases the writer lease, letting a `--wait-for-lease` sta
 Readiness probe. `200` once this instance can actually serve; `503` otherwise. It fails for
 four distinct reasons, each of which should take an instance out of rotation:
 
-- **no store yet** — still starting, or a standby waiting for the writer handle;
-- **fenced** — this writer was superseded, so every write would fail and it must be replaced.
+- **no store yet**: still starting, or a standby waiting for the writer handle;
+- **fenced**: this writer was superseded, so every write would fail and it must be replaced.
   A writer notices this on its own lease-renewal timer, so it stops reporting ready even if no
   write arrives to discover it;
-- **stale** — a reader has gone longer than `--max-staleness` without verifying it is current
+- **stale**: a reader has gone longer than `--max-staleness` without verifying it is current
   (only when that bound is set);
-- **poisoned** — a panic left this instance unrecoverable, so it leaves the load balancer as
+- **poisoned**: a panic left this instance unrecoverable, so it leaves the load balancer as
   well as failing `/health` (see above).
 
 What does **not** make an instance unready is being **busy**. A large upsert holds the store's
@@ -89,7 +89,7 @@ writer stays in rotation while it works. This matters most where there is only o
 route to: dropping out mid-batch would take writes offline during exactly the operation the
 instance exists to perform.
 
-Also always reachable without a token — an orchestrator would read a `401` as "not ready"
+Also always reachable without a token: an orchestrator would read a `401` as "not ready"
 and never route to a healthy instance.
 
 Use this, not `/health`, to decide whether to send an instance traffic. The two differ
@@ -103,7 +103,7 @@ instance is waiting or still starting up.
 
 ### `GET /cluster`
 
-Who this instance is and how current it is — the introspection to reach for during an
+Who this instance is and how current it is: the introspection to reach for during an
 incident. Always unauthenticated-safe to scrape? No: unlike the probes, this one **does**
 require the token when one is configured.
 
@@ -122,7 +122,7 @@ require the token when one is configured.
 
 `role` is one of `Writer`, `Reader`, `ClusterWriter`, `ClusterReader`, `InMemory`.
 `lease_owner` is this instance's fencing token while it holds a cluster lease, and `null`
-otherwise — comparing it across instances answers "who is the writer right now".
+otherwise; comparing it across instances answers "who is the writer right now".
 `commit_version` is the manifest commit counter being served, so a reader behind the writer
 reports a lower number; the gap is replication lag. `staleness_secs` is `0` for a writer (it
 *is* the current state) and, for a reader, the age of its last successful refresh.
@@ -132,7 +132,7 @@ Every field is read from memory: no object-store round trip, so this is cheap to
 ### `GET /metrics`
 
 Prometheus text exposition (`text/plain; version=0.0.4`). Always reachable without a
-token — a scraper that got a `401` would report the target as down.
+token: a scraper that got a `401` would report the target as down.
 
 ```bash
 curl -s localhost:7700/metrics
@@ -155,7 +155,7 @@ scrape answers instantly even during a long write.
 
 ### `GET /stats`
 
-Store-wide introspection — the network equivalent of `nidus stats`.
+Store-wide introspection, the network equivalent of `nidus stats`.
 
 ```json
 {
@@ -242,7 +242,7 @@ curl -s -X POST localhost:7700/collections/docs/fts-schema \
 ```
 
 A field entry may also be an object, tuning BM25 and the analyzer for that field alone.
-Every key but `field` is optional and defaults to what the bare-name form gets — `k1`
+Every key but `field` is optional and defaults to what the bare-name form gets: `k1`
 1.2, `b` 0.75, `language` `"english"`, no ASCII folding, no token-length cap
 ([details](/guides/search/#tuning-a-field)):
 
@@ -260,7 +260,7 @@ curl -s -X POST localhost:7700/collections/docs/fts-schema \
 Insert or overwrite records by id. Each record is `{id, vector, attrs}`; `vector`
 length must match the store dimension, and may be **omitted** for a text-only document.
 `attrs` values are tagged: `{"Str": …}`, `{"Int": …}`, `{"Bool": …}`, `{"List": […]}`,
-`{"Float": …}`, `{"DateTime": …}` (epoch milliseconds) — and the unit variant `Null` is
+`{"Float": …}`, `{"DateTime": …}` (epoch milliseconds), and the unit variant `Null` is
 the bare string `"Null"`, not an object.
 
 `Float` and `Int` are distinct types and never cross-compare in a filter, so a whole
@@ -285,7 +285,7 @@ store back, and the call returns `400` having changed nothing.
 
 ### `POST /collections/{name}/delete`
 
-Delete by explicit ids, or by an attribute filter — supply `ids` **or** `filter`;
+Delete by explicit ids, or by an attribute filter: supply `ids` **or** `filter`;
 `filter` wins if both are present.
 
 ```bash
@@ -303,7 +303,7 @@ curl -s localhost:7700/collections/docs/delete \
 ### `GET /collections/{name}/records`
 
 Every live record in the collection (id, vector, attrs) as a JSON array. Useful
-for export or for re-embedding against a new model. There is no pagination here —
+for export or for re-embedding against a new model. There is no pagination here;
 use [`POST /list`](#post-list) when you want filtering or paging.
 
 ## Search & queries
@@ -328,7 +328,7 @@ curl -s localhost:7700/search \
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `query` | — (required) | query vector; length must equal the store dimension |
+| `query` | – (required) | query vector; length must equal the store dimension |
 | `scope` | all collections | collection names to search |
 | `top_k` | `10` | maximum hits to return |
 | `offset` | `0` | top-ranked hits to skip, for pagination |
@@ -340,7 +340,7 @@ curl -s localhost:7700/search \
 | `rank_by` | none | a [ranking expression](/guides/search/#ranking-by-recency) over the metric |
 | `limit_per` | none | cap hits per distinct value of an attribute |
 
-Returns hits ordered by `(score desc, collection, id)` — the tie-break is a guarantee,
+Returns hits ordered by `(score desc, collection, id)`; the tie-break is a guarantee,
 which is what makes paging coherent:
 
 ```json
@@ -349,18 +349,18 @@ which is what makes paging coherent:
 
 `offset` pages one ranking: `{"top_k": 20}` then `{"top_k": 20, "offset": 20}` tiles it
 with no gap and no overlap. An `offset` past the last hit returns `[]` rather than an
-error. `offset + top_k` may not exceed **10 000** — beyond that the request is a `400`,
+error. `offset + top_k` may not exceed **10 000**: beyond that the request is a `400`,
 never a silently shortened page. A page is stable only against an unchanging store;
 concurrent writes shift the ranking under a paged walk.
 
 `exact: true` runs the exact brute-force scan for that one request, bypassing the ANN
-walk, the per-segment index, and the quantized first pass — the store keeps its index for
+walk, the per-segment index, and the quantized first pass; the store keeps its index for
 every other query.
 
 `include_attributes` and `exclude_attributes` choose which attrs the hits carry; omit
 both for every attr, exactly as before. Sending **both** in one request is a `400`, not a
 precedence rule. The projection is applied where the hit is built, so an excluded attr is
-never serialized — which is the point on a collection of long text bodies.
+never serialized, which is the point on a collection of long text bodies.
 
 #### Ranking by recency
 
@@ -381,16 +381,16 @@ curl -s localhost:7700/search \
 
 | `Decay` field | Default | Meaning |
 | --- | --- | --- |
-| `field` | — (required) | timestamp attr: a `DateTime` or an `Int`, epoch milliseconds |
-| `origin` | — (required) | "now" in epoch ms; ages are measured back from here |
+| `field` | – (required) | timestamp attr: a `DateTime` or an `Int`, epoch milliseconds |
+| `origin` | – (required) | "now" in epoch ms; ages are measured back from here |
 | `scale` | `604800000` (7 days) | the age at which the factor equals `decay` |
-| `decay` | `0.5` | the factor at one `scale` of age — `0.5` makes `scale` a half-life |
+| `decay` | `0.5` | the factor at one `scale` of age (`0.5` makes `scale` a half-life) |
 | `lambda` | `1.0` | score a fully-decayed hit gives up |
-| `missing` | `1.0` | factor for a record with no usable timestamp — **no penalty** |
+| `missing` | `1.0` | factor for a record with no usable timestamp (**no penalty**) |
 
 The score is `base − lambda × (1 − decay^(age / scale))`. `missing` defaults to `1.0`, so
 enabling decay never buries records written before the field existed. `rank_by` does not
-force an exact scan — over an ANN or quantized result set it reorders within an approximate
+force an exact scan; over an ANN or quantized result set it reorders within an approximate
 candidate set. A malformed expression (a non-positive `scale`, a `decay` outside `(0, 1)`, a
 negative `lambda`) is a `400`.
 
@@ -410,8 +410,8 @@ is that no page carries more than `max` hits for one value.
 ### `POST /text-search`
 
 BM25 full-text search of declared fields. Returns the same hit shape as `/search`.
-Takes `scope`, `top_k`, `offset`, `filter`, `rank_by`, `limit_per`, `min_score` — here a
-**raw BM25** floor (not cosine) — the `include_attributes`/`exclude_attributes` projection,
+Takes `scope`, `top_k`, `offset`, `filter`, `rank_by`, `limit_per`, `min_score` (here a
+**raw BM25** floor, not cosine), the `include_attributes`/`exclude_attributes` projection,
 and the query itself in one of two spellings.
 
 ```bash
@@ -420,7 +420,7 @@ curl -s localhost:7700/text-search \
   -d '{"field": "body", "query": "running quickly", "scope": ["docs"], "top_k": 5}'
 ```
 
-Name several fields with `clauses` instead — each clause carries its own text:
+Name several fields with `clauses` instead; each clause carries its own text:
 
 ```bash
 curl -s localhost:7700/text-search \
@@ -437,19 +437,19 @@ curl -s localhost:7700/text-search \
 
 | field | default | meaning |
 | --- | --- | --- |
-| `field` + `query` | — | the single-clause spelling |
-| `clauses` | — | `[{field, query}, …]`, one entry per field searched |
+| `field` + `query` | – | the single-clause spelling |
+| `clauses` | – | `[{field, query}, …]`, one entry per field searched |
 | `combine` | `"Sum"` | `"Sum"` adds every matched clause's score; `"Max"` takes the strongest |
 | `explain` | `false` | report each matched clause's own BM25 score |
 | `highlight` | absent | `{}` for defaults, or `{"max_fragments": 2, "fragment_chars": 120}` |
 
 `field`+`query` and `clauses` are **mutually exclusive**, and an empty `clauses` list is a
-`400` — an empty result set would otherwise read as "no matches" rather than "no query".
+`400`: an empty result set would otherwise read as "no matches" rather than "no query".
 
 ### `POST /hybrid-search`
 
 Fuse a vector query and a BM25 text query with Reciprocal Rank Fusion. Takes `vector`
-plus the text leg — `field` + `text`, or the same `clauses` + `combine` as `/text-search` —
+plus the text leg (`field` + `text`, or the same `clauses` + `combine` as `/text-search`),
 plus `top_k`, `offset` (which pages the **fused** ranking, never a leg),
 `filter`, `rrf_k` (default 60), `candidates` (default 100), and `explain`/`highlight`.
 There is no `min_score` (a fused RRF score has no absolute scale).
@@ -462,7 +462,7 @@ curl -s localhost:7700/hybrid-search \
 ```
 
 `vector_weight` and `text_weight` (both default `1.0`) scale each leg's contribution to the
-fused score. Leaving them out — or sending `1.0` for both — reproduces the unweighted fusion
+fused score. Leaving them out (or sending `1.0` for both) reproduces the unweighted fusion
 exactly. A non-finite or negative weight is a `400`.
 
 ```bash
@@ -474,7 +474,7 @@ curl -s localhost:7700/hybrid-search \
 ### Annotations: why a hit matched
 
 `explain` and `highlight` add an `annotations` object to each hit. Both are opt-in, and the
-key is **absent** otherwise — an unannotated response is byte-for-byte what it always was.
+key is **absent** otherwise: an unannotated response is byte-for-byte what it always was.
 
 ```json
 {
@@ -495,13 +495,13 @@ key is **absent** otherwise — an unannotated response is byte-for-byte what it
 `vector`/`text` are the fusion legs' own rank and score, and appear only on
 `/hybrid-search`. `clauses` lists the clauses that actually matched, in query order.
 `spans` are `[start, end)` **byte** offsets into that fragment's `text`, covering the word
-as the document spells it — a query for `run` marks `running`. Highlighting reads the
+as the document spells it: a query for `run` marks `running`. Highlighting reads the
 stored text, so it still works on a field `include_attributes`/`exclude_attributes`
 dropped from the payload: that pairing (drop the long body, keep the snippet) is the point.
 
 ### `POST /list`
 
-Metadata-only query — no vector, no scoring. Same `scope` and `filter` as search,
+Metadata-only query: no vector, no scoring. Same `scope` and `filter` as search,
 plus `offset`/`limit` for pagination.
 
 ```bash
@@ -520,7 +520,7 @@ curl -s localhost:7700/list \
 when both are sent. The response shape matches search (hits with a `score` of `0`, since
 nothing is scored).
 
-`order_by` sorts by an attribute instead of storage order — ORDER BY with no vector query.
+`order_by` sorts by an attribute instead of storage order: ORDER BY with no vector query.
 Sorting runs over the whole match set before the page is cut, so `offset`/`limit` walk the
 sorted order.
 
@@ -530,9 +530,9 @@ curl -s localhost:7700/list \
   -d '{"order_by": {"field": "updated_at", "descending": true}, "limit": 20}'
 ```
 
-`descending` defaults to `false`. Values that do not order against the first orderable one —
-a different `Value` variant, an unorderable `Null`/`List`, or a record missing the attribute
-— sort into one trailing bucket, which stays trailing when reversed.
+`descending` defaults to `false`. Values that do not order against the first orderable one
+(a different `Value` variant, an unorderable `Null`/`List`, or a record missing the
+attribute) sort into one trailing bucket, which stays trailing when reversed.
 
 ### `POST /search/batch`
 
@@ -558,7 +558,7 @@ curl -s localhost:7700/search/batch \
 before any query runs, so a malformed leg answers `400` rather than returning a partial
 result that cannot be told apart from a complete one.
 
-Add `fuse` to merge the legs into a single ranking with the same RRF `/hybrid-search` uses —
+Add `fuse` to merge the legs into a single ranking with the same RRF `/hybrid-search` uses;
 the response then carries `fused` instead of `results`:
 
 ```bash
@@ -572,7 +572,7 @@ curl -s localhost:7700/search/batch \
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `queries` | — (required) | 1–16 search bodies, each shaped exactly like `/search` |
+| `queries` | – (required) | 1–16 search bodies, each shaped exactly like `/search` |
 | `fuse` | none | merge the legs into one ranking instead of returning them side by side |
 | `fuse.rrf_k` | `60` | RRF smoothing constant |
 | `fuse.weights` | all `1.0` | per-leg weights; must be empty or exactly as long as `queries` |
@@ -600,7 +600,7 @@ curl -s localhost:7700/aggregate \
 {"count": 12, "sums": {"bytes": {"Int": 40960}}}
 ```
 
-`count` is always reported; `sum` names attributes to total. Each total is a tagged value —
+`count` is always reported; `sum` names attributes to total. Each total is a tagged value:
 `Int` while every addend was an `Int`, `Float` once any `Float` joined. A missing or
 non-numeric value is skipped rather than counted as zero. A filter matching nothing answers
 `{"count": 0, ...}` rather than erroring.
@@ -626,15 +626,15 @@ curl -s localhost:7700/aggregate \
 ```
 
 Groups come back **largest first**, with ties broken deterministically so repeating a query
-repeats the order. A `null` `value` is the group of records **missing** the attribute — not
+repeats the order. A `null` `value` is the group of records **missing** the attribute, not
 the same as records holding a `Null`. `groups` is omitted entirely when no `group_by` was
 asked for, so an existing client sees the response it always saw. If the distinct values
 exceed the server's cap (10 000), later ones are dropped and `groups_truncated` is `true`.
 
 ### The `filter` grammar
 
-Every route that takes a `filter` — `/search`, `/text-search`, `/hybrid-search`, `/list`,
-`/aggregate`, and `/collections/{name}/delete` — takes the same one: a JSON array of
+Every route that takes a `filter` (`/search`, `/text-search`, `/hybrid-search`, `/list`,
+`/aggregate`, and `/collections/{name}/delete`) takes the same one: a JSON array of
 predicates, AND-combined. Each predicate is a single-key object naming the variant.
 
 | Group | Predicates |
@@ -695,7 +695,7 @@ curl -s -X POST localhost:7700/refresh   # → {"adopted": true}
 
 Reads are deliberately not made to refresh on their own: that would put a metadata fetch
 on every query, which is the opposite of what a read-heavy fan-out wants. Call this as
-often as your staleness tolerance requires. It is harmless anywhere else — an instance
+often as your staleness tolerance requires. It is harmless anywhere else: an instance
 that does its own writing already has the freshest state, and answers `{"adopted": false}`.
 
 ## Errors
@@ -721,5 +721,5 @@ A shed `503` carries `Retry-After: 1` and `{"retryable": true}` in the body. Not
 attempted and the store is untouched, so retrying after a brief backoff is correct.
 
 A `504` carries `{"retryable": false}`. The request *was* admitted and the work may still
-be running — a timeout frees the client, not the CPU — so an immediate retry piles a second
+be running (a timeout frees the client, not the CPU), so an immediate retry piles a second
 copy onto an instance that is already behind. Back off substantially, or don't retry.

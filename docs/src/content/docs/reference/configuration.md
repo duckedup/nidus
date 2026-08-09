@@ -1,10 +1,10 @@
 ---
 title: Configuration
-description: Every knob on nidus Config — distance metric, fsync policy, open mode, auto-compaction, lock TTL, and the max_vector_bytes ceiling.
+description: Every knob on nidus Config (distance metric, fsync policy, open mode, auto-compaction, lock TTL, and the max_vector_bytes ceiling).
 ---
 
 `Config` carries everything needed to open a store. Construct it with
-`Config::new(path, dimension)` — the two required fields — and adjust the rest
+`Config::new(path, dimension)` (the two required fields) and adjust the rest
 with chainable builder setters. The store **location is always the caller's
 choice**: nidus contributes no path defaults, env vars, or hidden directories.
 
@@ -35,49 +35,66 @@ let cfg = Config::new("/path/to/store", 768)
 
 ### `path`
 
-`PathBuf` — **required.** The store directory; created if absent.
+`PathBuf`, **required.** The store directory; created if absent.
 
 ### `dimension`
 
-`usize` — **required.** The pinned embedding dimension. It is written to the
-`data` header at creation and must match on every reopen — reopening with a
+`usize`, **required.** The pinned embedding dimension. It is written to the
+`data` header at creation and must match on every reopen: reopening with a
 different dimension is a hard error. One embedding space per store.
 
 ### `distance`
 
-[`Distance`](/reference/api/#distance) — default `Distance::Cosine`. The
+[`Distance`](/reference/api/#distance), default `Distance::Cosine`. The
 similarity / distance metric used for scoring. Like dimension, it is pinned in
-the data header at creation — reopening with a different metric is a hard error.
+the data header at creation; reopening with a different metric is a hard error.
 See [distance metrics](/guides/search/#distance-metrics) for details on each
 metric.
 
 ### `fsync`
 
-[`Fsync`](#fsync) — default `Fsync::PerBatch`. Durability granularity.
+[`Fsync`](#fsync), default `Fsync::PerBatch`. Durability granularity.
 
 ### `open_mode`
 
-[`OpenMode`](#openmode) — default `OpenMode::ReadWrite`. Whether this handle may
+[`OpenMode`](#openmode), default `OpenMode::ReadWrite`. Whether this handle may
 write (and thus takes the writer lock).
 
 ### `auto_compact`
 
-`Option<f32>` — default `Some(0.5)`. Dead-row ratio that triggers
+`Option<f32>`, default `Some(0.5)`. Dead-row ratio that triggers
 [compaction](/guides/storage/#compaction) on open. `None` disables auto-compaction
 (compact only via `compact()`).
 
 ### `lock_ttl`
 
-`Duration` — default 60s. The window after which a writer handle whose owner has gone
-silent may be reclaimed — a stale lock file left by a crashed single-node process, or, in
+`Duration`, default 60s. The window after which a writer handle whose owner has gone
+silent may be reclaimed: a stale lock file left by a crashed single-node process, or, in
 [cluster mode](/guides/storage-backends/#cooperating-instances-cluster), an unrenewed lease.
 
 In a cluster it is the **failover-latency knob**, and there is a tuning guide for it:
 [choosing `--lock-ttl`](/guides/cli-and-server/#choosing---lock-ttl).
 
+### `lease_wait`
+
+`LeaseWait`, default `Fail`. What a would-be writer does when another process already
+holds the writer lease: `Fail` returns an error immediately, `Timeout(Duration)` keeps
+trying for that long, and `Forever` waits indefinitely. `Forever` is what turns an
+extra `nidus serve` replica into a **hot standby**: it stays live (but not ready) and
+promotes itself the moment the incumbent's lease lapses. The CLI flag is
+`--wait-for-lease`.
+
+### `max_staleness`
+
+`Option<Duration>`, default `None`. A freshness bound for read-only instances: a
+reader whose adopted state is older than this reports **not ready** on `/ready` until
+a [`refresh()`](/reference/api/#nidus) catches it up. It governs routing, not
+correctness (reads still answer, from the stale snapshot). Pair it with the server's
+`--refresh-interval` to keep readers fresh unattended.
+
 ### `max_vector_bytes`
 
-`Option<u64>` — default `None` (no ceiling). A hard cap on the vector matrix
+`Option<u64>`, default `None` (no ceiling). A hard cap on the vector matrix
 (`rows * dimension * 4` bytes), enforced **before** allocating: `upsert` refuses
 a batch that would exceed it, and `open` refuses a `data` file already over it.
 
@@ -89,7 +106,7 @@ never fires. It counts physical rows including not-yet-compacted dead rows, so
 
 ### `quantization`
 
-`Option<Quantization>` — default `None` (disabled). When set, the store maintains an
+`Option<Quantization>`, default `None` (disabled). When set, the store maintains an
 in-memory compressed copy of all vectors and uses a two-pass search: quantized
 first-pass → f32 rerank. `Quantization::int8()` (4× smaller, any distance metric) or
 `Quantization::binary()` (32× smaller, **cosine only**), each with a `rescore` overscan
@@ -97,10 +114,10 @@ factor. See [quantization](/guides/search/#quantization) for details.
 
 ### `ann`
 
-`Option<AnnConfig>` — default `None` (disabled; exact search). When set,
+`Option<AnnConfig>`, default `None` (disabled; exact search). When set,
 the store builds an in-memory approximate-nearest-neighbour index and `search` walks
 it for an over-fetched candidate set, then applies the scope/filter/`min_score` and an
-exact f32 rerank — trading recall for speed when a scan over every vector is more than
+exact f32 rerank, trading recall for speed when a scan over every vector is more than
 you need. Two algorithms, via `AnnConfig::hnsw()` (a navigable small-world graph, the
 default) and `AnnConfig::ivf()` (k-means inverted lists). May be combined with
 `quantization` (a quantized index walk plus an exact f32 rerank). See
@@ -108,41 +125,42 @@ default) and `AnnConfig::ivf()` (k-means inverted lists). May be combined with
 
 ### `query_threads`
 
-`usize` — default `1` (single-threaded; no behavior change). When `> 1`, a single
+`usize`, default `1` (single-threaded; no behavior change). When `> 1`, a single
 large search is split across this many `std::thread::scope` workers to cut one
-query's latency — both the exact f32 scan and, when
+query's latency: both the exact f32 scan and, when
 [int8 quantization](/guides/search/#quantization) is on, its int8 first
 pass. The f32 scan is memory-bandwidth-bound (sublinear speedup); the int8 first
 pass is compute-bound and scales better with threads. Leave it at `1` if you already
-run concurrent searches under `Arc<RwLock<Nidus>>` — see
+run concurrent searches under `Arc<RwLock<Nidus>>`; see
 [two kinds of parallelism](/guides/integrating/#two-kinds-of-parallelism).
 
 When an [HNSW index](/guides/search/#approximate-search-ann) is enabled, `> 1` also
 parallelizes the from-scratch graph **build** (on `open` with no cache, and on
-`compact`) across this many threads — the expensive part of opening an ANN store.
+`compact`) across this many threads, the expensive part of opening an ANN store.
 Incremental `upsert` and the serial build at `1` are unchanged; note a parallel build
 is non-deterministic (insertion order varies), so a graph built with threads can
 differ slightly from the serial one (recall stays equivalent).
 
 ### `segment_max_rows`
 
-`Option<u64>` — default `None`. A store keeps its vectors in one or more **segments**
+`Option<u64>`, default `None`. A store keeps its vectors in one or more **segments**
 named by a small `manifest` (the first is the base `data` segment). When this is set,
 the active (appendable) segment is sealed into an **immutable** segment once it grows past
 this many rows, and a fresh active segment begins; the new manifest is published
-atomically (the commit point). `None` — the default — keeps the store a single segment,
+atomically (the commit point). `None`, the default, keeps the store a single segment,
 behaving exactly as it always has. A soft bound: a single `upsert` batch is never split,
 so a segment can exceed it by one batch. Most stores never need this; see
 [Storage](/guides/storage/#segments) for the on-disk picture.
 
 ### `segment_index_min_rows`
 
-`Option<u64>` — default `None`. Build a per-segment **IVF index** over each immutable
+`Option<u64>`, default `None`. Build a per-segment **IVF index** over each immutable
 segment that holds at least this many rows. `None` (the default) never indexes a segment,
-so every vector is brute-forced — **exact, 100% recall**, the zero-config local default.
-When set, a sealed segment with `≥ rows` vectors is IVF-indexed (built once at seal /
-compaction), while the **active** segment (the recent write tail) and any smaller sealed
-segment stay exhaustive. So "exact vs approximate" becomes a per-segment property that
+so every vector is brute-forced: **exact, 100% recall**, the zero-config local default.
+When set, a sealed segment with `≥ rows` vectors is IVF-indexed (built at seal /
+compaction and rebuilt on each `open()`; per-segment indexes are not persisted, unlike
+the `ann`/`fts` caches), while the **active** segment (the recent write tail) and any
+smaller sealed segment stay exhaustive. So "exact vs approximate" becomes a per-segment property that
 follows size: the fresh data is always exact, the cold bulk is indexed, and a search merges
 an exhaustive-tail scan with the cold segments' index walks into one ranking. Has no effect
 without [`segment_max_rows`](#segment_max_rows) (a store only gets immutable segments to
@@ -152,12 +170,12 @@ already covers every row). See
 
 ### `mmap`
 
-`bool` — default `false` (every segment held in RAM, unchanged). When `true`, each **immutable**
+`bool`, default `false` (every segment held in RAM, unchanged). When `true`, each **immutable**
 (sealed) segment is served from a read-only **memory-map** of its file instead of being read into
-RAM, while the **active** segment — which still takes appends — stays in RAM. The OS pages a cold
+RAM, while the **active** segment, which still takes appends, stays in RAM. The OS pages a cold
 segment in on touch, so a store can hold more vectors than fit in memory. This is nidus's one
 opt-in use of memory-mapping (an `mmap` syscall); search reads go through the same row accessor,
-so **results are identical to the all-RAM path** — exact, filter-respecting, and compatible with
+so **results are identical to the all-RAM path**: exact, filter-respecting, and compatible with
 quantization and the [ANN](#ann) / [per-segment](#segment_index_min_rows) indexes.
 
 Effective only for a **local-filesystem** store with sealed segments: it needs
@@ -169,30 +187,30 @@ is not. See [larger-than-RAM stores](/guides/storage/#larger-than-ram-memory-map
 
 ### `persistence`
 
-`String` — where the durable `data`/`log` bytes live (default `""` = local files under
+`String`: where the durable `data`/`log` bytes live (default `""` = local files under
 [`path`](#path)). An [`open_persistence`](/guides/storage-backends/) location: a path / `file://`,
 or `s3://<bucket>[/<prefix>]` / `gs://<bucket>[/<prefix>]` for a **live object-store-backed
-store** (each segment is rewritten as one whole object on flush — `O(object)`, suited to
+store** (each segment is rewritten as one whole object on flush; `O(object)`, suited to
 low write rates, under an advisory writer lock). With an object store, pass `dimension`
-explicitly — the remote header is not peeked. See [Storage backends](/guides/storage-backends/).
+explicitly: the remote header is not peeked. See [Storage backends](/guides/storage-backends/).
 
 ### `memory`
 
-`String` — where the in-RAM working set is *shared* (default `""`/`local`/`ram` = the
-process heap; nothing shared). A Redis-family URL — `redis://` / `rediss://` /
-`valkey://` / `valkeys://` / `keydb://` / `dragonfly://`, optionally `?prefix=<ns>` —
+`String`: where the in-RAM working set is *shared* (default `""`/`local`/`ram` = the
+process heap; nothing shared). A Redis-family URL (`redis://` / `rediss://` /
+`valkey://` / `valkeys://` / `keydb://` / `dragonfly://`, optionally `?prefix=<ns>`)
 publishes the serialized working set on `flush` and adopts it on `open`, so other workers
 skip the log replay. A rebuildable cache: an unreachable or evicted tier is never fatal.
 See [Memory stores](/guides/memory-stores/).
 
 ### `cluster`
 
-`bool` — default `false` (single-node). When `true`, several nidus processes cooperate over
+`bool`, default `false` (single-node). When `true`, several nidus processes cooperate over
 one **shared** backend: a single [`ReadWrite`](#openmode) writer holds a renewing **lease** and
 advances the store on every commit, while any number of [`ReadOnly`](#openmode) readers pick up
 its writes with [`refresh()`](/reference/api/#search--maintenance). It is rejected unless **both**
 [`persistence`](#persistence) is a shared object store (`s3://…`/`gs://…`) **and**
-[`memory`](#memory) is a shared tier (`redis://…`) — local files / process RAM are single-node
+[`memory`](#memory) is a shared tier (`redis://…`); local files / process RAM are single-node
 by definition. There is no coordinator, replication, or rebalancing; the object store plus the
 versioned manifest are the coordination. See
 [cooperating instances](/guides/storage-backends/#cooperating-instances-cluster).
@@ -207,7 +225,7 @@ pub enum Fsync {
 ```
 
 `PerBatch` loses at most the in-flight batch on a crash. `OnFlush` trades that
-guarantee for speed — useful for bulk loads you can afford to redo — and takes
+guarantee for speed (useful for bulk loads you can afford to redo) and takes
 *no* disk barrier per call, so the win is largest on small batches. See
 [the durability contract](/guides/storage/#the-durability-contract).
 
@@ -216,10 +234,10 @@ guarantee for speed — useful for bulk loads you can afford to redo — and tak
 ```rust
 pub enum OpenMode {
     ReadWrite,  // takes the writer lock; mutations allowed. Default.
-    ReadOnly,   // no lock taken; mutations rejected — for search-only processes
+    ReadOnly,   // no lock taken; mutations rejected (for search-only processes)
 }
 ```
 
-A `ReadOnly` handle reads a consistent, possibly-stale, lock-free snapshot — many
+A `ReadOnly` handle reads a consistent, possibly-stale, lock-free snapshot; many
 can coexist with a single writer. See
 [cross-process readers](/guides/storage/#cross-process-readers).

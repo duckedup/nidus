@@ -1,9 +1,9 @@
 ---
 title: Running across a few boxes
-description: Spread a corpus over several machines by running one independent nidus instance per box and fanning queries out from the client — no coordinator, no replication, nothing to operate.
+description: "Spread a corpus over several machines by running one independent nidus instance per box and fanning queries out from the client: no coordinator, no replication, nothing to operate."
 ---
 
-Suppose one machine is no longer enough — a handful of Mac Minis, a couple of old servers,
+Suppose one machine is no longer enough: a handful of Mac Minis, a couple of old servers,
 some spare VMs. You do not need a distributed system to use them. You need a **shard map and
 a merge**, and both live in your client.
 
@@ -13,7 +13,7 @@ stores of the same dimension share one embedding space**: a score from box 3 mea
 what a score from box 1 means, so ranking across them is just sorting.
 
 This is a **deployment pattern, not a product feature**. nidus ships nothing to support it,
-and that is deliberate — see [what this is not](#what-this-is-not).
+and that is deliberate (see [what this is not](#what-this-is-not)).
 
 ## When to use this instead of cluster mode
 
@@ -24,7 +24,7 @@ this harder than it is.
 | | Several boxes, fanned out *(this guide)* | [Cluster mode](/guides/storage-backends/#cooperating-instances-cluster) |
 | --- | --- | --- |
 | Stores | **N independent** stores, one per box | **One** shared store on S3/GCS |
-| Solves | **Capacity** — more RAM and more cores than one box has | **Read scale-out and failover** over one dataset |
+| Solves | **Capacity**: more RAM and more cores than one box has | **Read scale-out and failover** over one dataset |
 | Needs | Nothing. Local disks. | A shared object store **and** a shared memory tier |
 | Query | Client asks every box, merges | Any instance answers in full |
 | Who knows the layout | Your client | Nobody has to |
@@ -50,7 +50,7 @@ Two things worth doing up front, because they are annoying to retrofit:
 - **Give each box a token** (`--token`) and keep the fleet on a private network. Fan-out means
   every box is reachable from wherever your client runs. See
   [securing a deployment](/guides/http-server/#securing-a-deployment).
-- **Write down the shard map** — which ids live where — somewhere your client and your
+- **Write down the shard map** (which ids live where) somewhere your client and your
   ingest job both read. It is the only piece of state this design has, and losing track of it
   is the only way to lose data you cannot recover by re-indexing.
 
@@ -68,20 +68,20 @@ def box_for(doc_id: str) -> str:
     return BOXES[int.from_bytes(h, "big") % len(BOXES)]
 ```
 
-Hash the id when you have no better idea — it spreads evenly and needs no bookkeeping.
+Hash the id when you have no better idea: it spreads evenly and needs no bookkeeping.
 Prefer a *natural* boundary when you have one (per tenant, per repository, per year): it
 keeps related documents together, which means most filtered queries can skip boxes entirely,
 and it makes "drop that customer" a single `DELETE`.
 
 Adding a box changes a hash-based map's answer for most ids. There is no rebalancer, so a
-re-index is how you grow — plan for the corpus to be re-indexable, or use a natural
+re-index is how you grow: plan for the corpus to be re-indexable, or use a natural
 boundary and assign new boundaries to new boxes.
 
 ## Query: fan out, then merge
 
 Ask every box for the top `k`, concatenate, sort by score, keep `k`.
 
-**Taking `k` from each box and keeping the best `k` overall is exact** — not an
+**Taking `k` from each box and keeping the best `k` overall is exact**, not an
 approximation. A document can only be in the global top `k` if it is in its own box's top
 `k`, so nothing that belongs in the answer can be missed. (This holds for the whole-store
 ranking too, and for the same reason.)
@@ -121,7 +121,7 @@ def fan_out(boxes, body, token):
             try:
                 results.extend(fut.result())
             except Exception:
-                failed.append(box)          # partial answer — say so, do not hide it
+                failed.append(box)          # partial answer: say so, do not hide it
     results.sort(key=lambda h: -h["score"])
     return results[: body.get("top_k", 10)], failed
 ```
@@ -129,13 +129,13 @@ def fan_out(boxes, body, token):
 That `failed` list is the part worth writing yourself rather than borrowing. With no
 replication, a box that is down means its slice is **absent from the results**, and an
 answer missing a third of the corpus looks exactly like an answer where nothing matched.
-Decide explicitly which you want — fail the query, or return it flagged as partial — and
+Decide explicitly which you want (fail the query, or return it flagged as partial) and
 make the choice visible to whatever consumes it.
 
 Everything else fans out the same way. `POST /list` merges by concatenation (there is no
 score to sort by, so paginate per box or gather and re-page). `POST /text-search` and
-`POST /hybrid-search` return scores that are **only comparable within one box** — BM25 is
-scored against the local corpus statistics, and hybrid search fuses local ranks — so merging
+`POST /hybrid-search` return scores that are **only comparable within one box** (BM25 is
+scored against the local corpus statistics, and hybrid search fuses local ranks), so merging
 those by score is not sound the way vector search is. Fan them out per box and combine by
 rank if you need to.
 
@@ -149,7 +149,7 @@ simple:
   and overwrites in place rather than duplicating across the fleet.
 
 Deletes go to the owning box. If you have lost track of which box owns an id, sending the
-delete to every box is harmless — a delete of an absent id is a no-op.
+delete to every box is harmless: a delete of an absent id is a no-op.
 
 Give each box's write path room to work: writes to one instance are
 [group-committed](/guides/how-it-works/#group-commit), so a batch ingest that keeps a few
@@ -157,7 +157,7 @@ connections busy per box costs far less than one at a time.
 
 ## Backups
 
-Each box backs itself up independently — `nidus backup` produces one archive per store (see
+Each box backs itself up independently: `nidus backup` produces one archive per store (see
 [backup & restore](/guides/cli-and-server/#backup--restore)). Snapshot them on the same
 schedule and keep them together with the shard map: an archive restored onto the wrong box
 is not wrong exactly, but every query for its documents will go somewhere else.
@@ -165,7 +165,7 @@ is not wrong exactly, but every query for its documents will go somewhere else.
 ## What this is not
 
 This recipe is entirely yours to operate. nidus contributes no code to it, and the following
-are explicitly out of scope — not "not yet", but **not planned**, because building them is
+are explicitly out of scope: not "not yet", but **not planned**, because building them is
 how a small embeddable store turns into the managed cluster it exists as an alternative to:
 
 - **No coordinator or service discovery.** The list of boxes is a constant in your client.
