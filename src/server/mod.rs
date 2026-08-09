@@ -25,8 +25,8 @@ use tokio::net::TcpListener;
 use crate::{FtsField, FtsQuery, HybridOpts, ListOpts, Nidus, Record, Scope, SearchOpts};
 use dto::{
     AggregateRequest, AggregationDto, AnnDto, BatchFuse, BatchSearchRequest, BatchSearchResponse,
-    DeleteRequest, FootprintDto, FtsSchemaRequest, HitDto, HybridSearchRequest, ListRequest,
-    MAX_BATCH_QUERIES, MAX_TOP_K, SearchRequest, TextSearchRequest, UpsertRequest,
+    CompactRequest, DeleteRequest, FootprintDto, FtsSchemaRequest, HitDto, HybridSearchRequest,
+    ListRequest, MAX_BATCH_QUERIES, MAX_TOP_K, SearchRequest, TextSearchRequest, UpsertRequest,
 };
 
 // ── AI-ingest (memory) imports: only under the `memory` feature (pulled by the
@@ -1041,8 +1041,18 @@ async fn flush(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> 
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn compact(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
-    run_write(st, |db| db.compact()).await?;
+/// `POST /compact` — bodyless, `{}`, or `{"expired": true}` all accepted; a caller that never
+/// sends a body (every shipped SDK) must keep compacting, so the body is optional, not required.
+async fn compact(
+    State(st): State<AppState>,
+    body: Option<Json<CompactRequest>>,
+) -> Result<Json<JsonValue>, ApiError> {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    if req.expired {
+        run_write(st, |db| db.sweep_expired().map(|_| ())).await?;
+    } else {
+        run_write(st, |db| db.compact()).await?;
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1174,7 +1184,7 @@ async fn recall(
     let mut filter = filter;
     filter
         .0
-        .push(crate::memory::not_expired_predicate(crate::memory::now_ms()));
+        .push(crate::memory::not_expired_predicate(crate::meta::now_ms()));
     let opts = SearchOpts {
         top_k,
         min_score,
@@ -1448,6 +1458,17 @@ mod tests {
         Request::builder().uri(path).body(Body::empty()).unwrap()
     }
 
+    /// A genuinely bodyless POST — no `content-type`, no body — the shape every shipped SDK
+    /// and the documented bodyless `curl -X POST /compact` send. Distinct from `post(path,
+    /// json!({}))`, which sets `content-type: application/json` over an empty object.
+    fn post_no_body(path: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap()
+    }
+
     /// A client that never links the library can drive the whole lifecycle over
     /// HTTP: create → upsert → search → stats. Exercises the network-only surface
     /// the docs promise.
@@ -1497,6 +1518,131 @@ mod tests {
         assert_eq!(stats["ann"], JsonValue::Null); // exact search by default
         assert_eq!(stats["collections"], json!(["docs"]));
         assert_eq!(stats["footprint"]["doc_count"], 2);
+    }
+
+    /// A bodyless `POST /compact` — the shape every shipped SDK and the documented curl
+    /// example send — must keep reclaiming dead rows, not be rejected for lacking a body
+    /// (nidus-140). Asserts the `dead_rows` delta, not just the envelope: an envelope-only
+    /// check would pass against a handler that silently does nothing.
+    #[tokio::test]
+    async fn compact_with_no_body_still_reclaims_dead_rows() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post("/collections/docs", json!({})))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [{"id": "a", "vector": [1, 0, 0], "attrs": {}}]}),
+            ))
+            .await
+            .unwrap();
+        // Overwriting "a" leaves its old row dead.
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [{"id": "a", "vector": [0, 1, 0], "attrs": {}}]}),
+            ))
+            .await
+            .unwrap();
+
+        let stats = json_body(app.clone().oneshot(get("/stats")).await.unwrap()).await;
+        let dead_before = stats["footprint"]["dead_rows"].as_u64().unwrap();
+        assert!(dead_before > 0, "overwrite should have left a dead row");
+
+        let resp = app.clone().oneshot(post_no_body("/compact")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await, json!({"ok": true}));
+
+        let stats = json_body(app.oneshot(get("/stats")).await.unwrap()).await;
+        assert_eq!(stats["footprint"]["dead_rows"], 0);
+    }
+
+    /// `{}` (what none of the SDKs send today, but a client could) must behave identically
+    /// to a bodyless request — `expired` defaults to `false` either way.
+    #[tokio::test]
+    async fn compact_with_empty_json_body_still_reclaims_dead_rows() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post("/collections/docs", json!({})))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [{"id": "a", "vector": [1, 0, 0], "attrs": {}}]}),
+            ))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [{"id": "a", "vector": [0, 1, 0], "attrs": {}}]}),
+            ))
+            .await
+            .unwrap();
+
+        let stats = json_body(app.clone().oneshot(get("/stats")).await.unwrap()).await;
+        assert!(stats["footprint"]["dead_rows"].as_u64().unwrap() > 0);
+
+        let resp = app
+            .clone()
+            .oneshot(post("/compact", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await, json!({"ok": true}));
+
+        let stats = json_body(app.oneshot(get("/stats")).await.unwrap()).await;
+        assert_eq!(stats["footprint"]["dead_rows"], 0);
+    }
+
+    /// `{"expired": true}` sweeps entries whose `nidus.expires_at` has passed, on top of the
+    /// ordinary reclaim — asserted via the `doc_count` drop and a follow-up search, not just
+    /// the `{"ok": true}` envelope (there is otherwise zero coverage this actually deletes).
+    #[tokio::test]
+    async fn compact_with_expired_true_sweeps_past_ttl_entries() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post("/collections/docs", json!({})))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "stale", "vector": [1, 0, 0],
+                     "attrs": {"nidus.expires_at": {"DateTime": 1}}},
+                    {"id": "fresh", "vector": [0, 1, 0],
+                     "attrs": {"nidus.expires_at": {"DateTime": 99_999_999_999_999_i64}}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+
+        let stats = json_body(app.clone().oneshot(get("/stats")).await.unwrap()).await;
+        assert_eq!(stats["footprint"]["doc_count"], 2);
+
+        let resp = app
+            .clone()
+            .oneshot(post("/compact", json!({"expired": true})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await, json!({"ok": true}));
+
+        let stats = json_body(app.clone().oneshot(get("/stats")).await.unwrap()).await;
+        assert_eq!(stats["footprint"]["doc_count"], 1);
+
+        let resp = app
+            .clone()
+            .oneshot(post("/search", json!({"query": [0, 1, 0], "top_k": 10})))
+            .await
+            .unwrap();
+        let hits = json_body(resp).await;
+        assert_eq!(hits.as_array().unwrap().len(), 1);
+        assert_eq!(hits[0]["id"], "fresh");
     }
 
     /// A filter the caller wrote wrong is a bad request, not a server fault (nidus-oih).
