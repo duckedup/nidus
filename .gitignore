@@ -36,3 +36,6 @@ BLUEPRINT-*.md
 
 # ── retired bd/Dolt tracker residue (CLAUDE.md: never reinstall) ─────────────
 .beads/
+
+# coordinator dispatch state (see .claude/skills/nidus SKILL.md, Fleet)
+.claude/fleet-plan.json

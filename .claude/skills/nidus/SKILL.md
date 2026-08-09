@@ -263,8 +263,20 @@ working directory you do not know; never assume it.
 Write the plan and let the checker judge it. Never eyeball this:
 
 ```bash
-.claude/skills/nidus/bin/nidus-check fleet --plan <plan.json> [--json]
+.claude/skills/nidus/bin/nidus-check fleet            # state + findings
+.claude/skills/nidus/bin/nidus-check fleet --status   # just the derived state
 ```
+
+**`.claude/fleet-plan.json` is the only state you are allowed to keep in your head, so keep
+it on disk instead.** Write it on every dispatch change. Everything else — what is claimed,
+what has a PR, what already shipped, which trees exist, what collides — is derived from
+GitHub and the worktree registry on each run, so the developer can `/clear` you at any point
+and one command rebuilds the picture. If you find yourself remembering who is on what, that
+belongs in the plan file.
+
+Rehydration sees worktrees of **this** clone. A peer in its own clone shows up from its issue
+and PR state alone, never as `in-flight` — one more reason owners in worktrees beat peers in
+clones.
 
 `{"peers":[{"name":…,"dir":…,"self":true?,"queue":[…],"surface":{"<issue>":["path"]}}]}`.
 It catches shared trees, foreign remotes, dirty or stale peer checkouts, tickets that are

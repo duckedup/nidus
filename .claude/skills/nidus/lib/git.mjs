@@ -183,7 +183,9 @@ export function selfFacts() {
 // PR whose title or body carries a closing keyword for that number.
 export function issueFacts(numbers) {
   const out = {}
-  const raw = sh('gh pr list --state open --limit 200 --json number,title,body,state', { allowFail: true })
+  // --state all, because a merged PR is how a cleared coordinator learns a ticket
+  // already shipped. The open-PR detector filters for OPEN itself.
+  const raw = sh('gh pr list --state all --limit 200 --json number,title,body,state', { allowFail: true })
   let prs = []
   try { prs = JSON.parse(raw || '[]') } catch { prs = [] }
 

@@ -519,6 +519,31 @@ test('fleet: one peer holding a file across its own tickets is not an overlap', 
   eq(ids(fleet.overlapFindings(peers)), [], 'findings')
 })
 
+test('fleet: rehydrate derives shipped / in-review / in-flight / queued', () => {
+  const peers = [{ name: 'own-138', queue: [138, 139, 140, 141] }]
+  const issues = {
+    138: { state: 'CLOSED', assignees: [], linkedPrs: [{ number: 60, state: 'MERGED' }] },
+    139: { state: 'OPEN', assignees: [], linkedPrs: [{ number: 61, state: 'OPEN' }] },
+    140: { state: 'OPEN', assignees: [], linkedPrs: [] },
+    141: { state: 'OPEN', assignees: [], linkedPrs: [] },
+  }
+  const trees = [MAIN, { path: '/r/nidus/.claude/worktrees/x', branch: 'austin/140-sweep', isMain: false }]
+  const rows = fleet.rehydrate(peers, issues, trees)
+  eq(rows.map(r => `${r.issue}:${r.state}`), ['138:shipped', '139:in-review', '140:in-flight', '141:queued'], 'states')
+  eq(rows[0].pr, 60, 'merged pr surfaced')
+})
+
+test('fleet: rehydrate does not confuse #14 with #141', () => {
+  const trees = [MAIN, { path: '/r/nidus/.claude/worktrees/y', branch: 'austin/141-profile', isMain: false }]
+  const rows = fleet.rehydrate([{ name: 'a', queue: [14] }], { 14: { state: 'OPEN', linkedPrs: [] } }, trees)
+  eq(rows[0].state, 'queued', 'no false branch match')
+})
+
+test('fleet: an issue closed with no PR still reads as shipped', () => {
+  const rows = fleet.rehydrate([{ name: 'a', queue: [9] }], { 9: { state: 'CLOSED', linkedPrs: [] } }, [MAIN])
+  eq(rows[0].state, 'shipped', 'state')
+})
+
 export function selftest({ json = false } = {}) {
   const failures = []
   for (const c of cases) {
