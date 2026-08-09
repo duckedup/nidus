@@ -27,6 +27,8 @@ use crate::embed::{AnyEmbedder, EmbedConfig, EmbedProvider};
 use crate::summarize::{AnySummarizer, SummarizeConfig, SummarizeProvider};
 
 mod backup;
+#[cfg(feature = "memory")]
+mod memory;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -360,6 +362,12 @@ impl IngestArgs {
     /// omitted (the server then serves only the raw endpoints). Async because
     /// some adapters probe their dimension with a live call on construction.
     async fn embedder(&self) -> Result<Option<Arc<AnyEmbedder>>> {
+        Ok(self.build_embedder().await?.map(Arc::new))
+    }
+
+    /// The embedder itself, unwrapped. `serve`/`mcp` share one behind an `Arc`; the
+    /// `remember`/`recall` subcommands hand ownership to a `Memory` instead.
+    pub(super) async fn build_embedder(&self) -> Result<Option<AnyEmbedder>> {
         let Some(name) = self.embed_provider.as_deref() else {
             return Ok(None);
         };
@@ -376,12 +384,18 @@ impl IngestArgs {
         let embedder = AnyEmbedder::build(provider, config)
             .await
             .map_err(|e| anyhow::anyhow!("building embedder '{name}': {e}"))?;
-        Ok(Some(Arc::new(embedder)))
+        Ok(Some(embedder))
     }
 
     /// Build the summarizer from `--summarize-provider …`, or `None` when omitted.
     #[cfg(all(feature = "memory", feature = "summarize"))]
     async fn summarizer(&self) -> Result<Option<Arc<AnySummarizer>>> {
+        Ok(self.build_summarizer().await?.map(Arc::new))
+    }
+
+    /// The summarizer itself, unwrapped — `Memory::with_summarizer` takes ownership.
+    #[cfg(all(feature = "memory", feature = "summarize"))]
+    pub(super) async fn build_summarizer(&self) -> Result<Option<AnySummarizer>> {
         let Some(name) = self.summarize_provider.as_deref() else {
             return Ok(None);
         };
@@ -401,7 +415,7 @@ impl IngestArgs {
         let summarizer = AnySummarizer::build(provider, config)
             .await
             .map_err(|e| anyhow::anyhow!("building summarizer '{name}': {e}"))?;
-        Ok(Some(Arc::new(summarizer)))
+        Ok(Some(summarizer))
     }
 }
 
@@ -858,6 +872,49 @@ enum Command {
         #[command(flatten)]
         store: StoreArgs,
     },
+    /// Remember a fact: embed `text` (optionally summarizing first) and store it.
+    /// Needs an embedder — the same `--embed-*` flags (and `NIDUS_EMBED_*` envs) `serve` takes.
+    #[cfg(feature = "memory")]
+    Remember {
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(flatten)]
+        ingest: IngestArgs,
+        collection: String,
+        /// The text to remember.
+        text: String,
+        /// Id to store under. Omit to derive a stable one from the text, which makes
+        /// re-remembering the same fact idempotent instead of accumulating duplicates.
+        #[arg(long)]
+        id: Option<String>,
+        /// Extra attrs as a JSON object of typed values, e.g. '{"tag":{"Str":"ops"}}'.
+        #[arg(long)]
+        attrs: Option<String>,
+        /// Summarize the text first and embed the summary, storing both.
+        #[cfg(feature = "summarize")]
+        #[arg(long)]
+        summarize: bool,
+    },
+    /// Recall the nearest remembered text to `query`. Opens read-only, so it runs
+    /// alongside a `nidus serve` holding the writer lock.
+    #[cfg(feature = "memory")]
+    Recall {
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(flatten)]
+        ingest: IngestArgs,
+        collection: String,
+        /// The query text, embedded the same way the stored text was.
+        query: String,
+        #[arg(long, short = 'k', default_value_t = 10)]
+        top_k: usize,
+        /// Drop hits scoring at or below this cosine similarity.
+        #[arg(long)]
+        min_score: Option<f32>,
+        /// AND-filter as JSON (same form as `search --where`).
+        #[arg(long = "where")]
+        filter: Option<String>,
+    },
 }
 
 /// Parse-and-dispatch entry point used by `main`.
@@ -1210,6 +1267,36 @@ pub fn run(cli: Cli) -> Result<()> {
                 "footprint": FootprintDto::from(db.footprint()),
             }))
         }
+        #[cfg(feature = "memory")]
+        Command::Remember {
+            store,
+            ingest,
+            collection,
+            text,
+            id,
+            attrs,
+            #[cfg(feature = "summarize")]
+            summarize,
+        } => memory::remember(
+            store,
+            ingest,
+            collection,
+            text,
+            id,
+            attrs,
+            #[cfg(feature = "summarize")]
+            summarize,
+        ),
+        #[cfg(feature = "memory")]
+        Command::Recall {
+            store,
+            ingest,
+            collection,
+            query,
+            top_k,
+            min_score,
+            filter,
+        } => memory::recall(store, ingest, collection, query, top_k, min_score, filter),
     }
 }
 
@@ -1515,6 +1602,186 @@ mod tests {
             }
             _ => panic!("expected Serve"),
         }
+    }
+
+    /// `remember` takes the collection and text positionally and reuses `serve`'s ingest
+    /// flags, so a caller configures the embedder exactly one way across the whole CLI.
+    #[cfg(feature = "memory")]
+    #[test]
+    fn remember_parses_positionals_and_ingest_flags() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "remember",
+            "--dir",
+            "/tmp/s",
+            "--embed-provider",
+            "ollama",
+            "--embed-base-url",
+            "http://127.0.0.1:11434",
+            "--id",
+            "manual",
+            "--attrs",
+            r#"{"tag":{"Str":"ops"}}"#,
+            "notes",
+            "deploys run at noon",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Remember {
+                store,
+                ingest,
+                collection,
+                text,
+                id,
+                attrs,
+                ..
+            } => {
+                assert_eq!(store.dir, PathBuf::from("/tmp/s"));
+                assert_eq!(store.dim, None, "dimension comes from the embedder");
+                assert_eq!(ingest.embed_provider.as_deref(), Some("ollama"));
+                assert_eq!(
+                    ingest.embed_base_url.as_deref(),
+                    Some("http://127.0.0.1:11434")
+                );
+                assert_eq!(collection, "notes");
+                assert_eq!(text, "deploys run at noon");
+                assert_eq!(id.as_deref(), Some("manual"));
+                assert_eq!(attrs.as_deref(), Some(r#"{"tag":{"Str":"ops"}}"#));
+            }
+            _ => panic!("expected Remember"),
+        }
+    }
+
+    /// Without `--id` the id is left for the handler to derive from the text.
+    #[cfg(feature = "memory")]
+    #[test]
+    fn remember_without_an_id_leaves_it_unset() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "remember",
+            "--dir",
+            "/tmp/s",
+            "--embed-provider",
+            "ollama",
+            "notes",
+            "a fact",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Remember { id, attrs, .. } => {
+                assert_eq!(id, None);
+                assert_eq!(attrs, None);
+            }
+            _ => panic!("expected Remember"),
+        }
+    }
+
+    /// `--summarize` is a plain flag, present only when the summarizer is compiled in.
+    #[cfg(all(feature = "memory", feature = "summarize"))]
+    #[test]
+    fn remember_parses_the_summarize_flag() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "remember",
+            "--dir",
+            "/tmp/s",
+            "--embed-provider",
+            "ollama",
+            "--summarize-provider",
+            "anthropic",
+            "--summarize",
+            "notes",
+            "a long wall of text",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Remember {
+                summarize, ingest, ..
+            } => {
+                assert!(summarize);
+                assert_eq!(ingest.summarize_provider.as_deref(), Some("anthropic"));
+            }
+            _ => panic!("expected Remember"),
+        }
+    }
+
+    /// `recall` mirrors `search`'s query knobs (`-k`, `--min-score`, `--where`).
+    #[cfg(feature = "memory")]
+    #[test]
+    fn recall_parses_query_knobs() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "recall",
+            "--dir",
+            "/tmp/s",
+            "--embed-provider",
+            "ollama",
+            "-k",
+            "3",
+            "--min-score",
+            "0.4",
+            "--where",
+            r#"[{"Eq":["tag",{"Str":"ops"}]}]"#,
+            "notes",
+            "when do deploys run",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Recall {
+                collection,
+                query,
+                top_k,
+                min_score,
+                filter,
+                ..
+            } => {
+                assert_eq!(collection, "notes");
+                assert_eq!(query, "when do deploys run");
+                assert_eq!(top_k, 3);
+                assert_eq!(min_score, Some(0.4));
+                assert_eq!(filter.as_deref(), Some(r#"[{"Eq":["tag",{"Str":"ops"}]}]"#));
+            }
+            _ => panic!("expected Recall"),
+        }
+    }
+
+    /// `recall`'s `top_k` defaults to the same 10 `search` uses.
+    #[cfg(feature = "memory")]
+    #[test]
+    fn recall_defaults_top_k() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "recall",
+            "--dir",
+            "/tmp/s",
+            "--embed-provider",
+            "ollama",
+            "notes",
+            "q",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Recall {
+                top_k,
+                min_score,
+                filter,
+                ..
+            } => {
+                assert_eq!(top_k, 10);
+                assert_eq!(min_score, None);
+                assert_eq!(filter, None);
+            }
+            _ => panic!("expected Recall"),
+        }
+    }
+
+    /// Both subcommands need their two positionals: a collection with no text is a parse
+    /// error, not a remember of the empty string.
+    #[cfg(feature = "memory")]
+    #[test]
+    fn memory_subcommands_require_both_positionals() {
+        assert!(Cli::try_parse_from(["nidus", "remember", "--dir", "/tmp/s", "notes"]).is_err());
+        assert!(Cli::try_parse_from(["nidus", "recall", "--dir", "/tmp/s", "notes"]).is_err());
     }
 
     #[test]
