@@ -379,7 +379,7 @@ A sequence of records; each record is:
 [ len: u32 ][ payload: len bytes ][ crc32: u32 ]   (all little-endian)
 ```
 
-`crc32` covers the payload (table-based, hand-rolled, `crc.rs`). Payload is a
+`crc32` covers the payload (the `crc32fast` dep). Payload is a
 tagged op:
 
 | tag | op | payload |
@@ -398,7 +398,7 @@ tagged op:
   index. If the final record is short (truncated `len`/`payload`) or fails CRC, the
   log was torn by a crash mid-append → **truncate to the last good record** and
   continue. This is the crash-recovery mechanism.
-- Strings/maps/attrs use the explicit little-endian codec in `value.rs`
+- Strings/maps/attrs use the explicit little-endian codec in `model.rs`
   (`u32` length prefixes; `Value` tag byte + payload). No serde.
 
 ### 5.3 In-RAM state (rebuilt on open)
@@ -1249,21 +1249,22 @@ Child files see the parent's private items, so a split costs no extra `pub`.
 
 ```
 src/
-├── lib.rs        Public API (Nidus, Scope); #![forbid(unsafe_code)]; re-exports
+├── lib.rs        Public API (Nidus, Scope); #![deny(unsafe_code)] (one scoped allow:
+│                 the Mmap::map call in data/mmap.rs, §9); re-exports
 ├── config.rs     Config, Fsync, OpenMode, ann/quant/memory/persistence settings (§4.1)
-├── model.rs      Shared type vocabulary: Value, Record, Predicate/Filter, Op,
-│                 Distance, Quantization, AnnConfig, FtsQuery/FtsClause/FtsCombine
-│                 (pure defs + serde)
-├── crc.rs        table CRC32 (zero-dep)
+├── model.rs      Shared type vocabulary: Value (+ its little-endian codec), Record,
+│                 Predicate/Filter, Op, Distance, Quantization, AnnConfig,
+│                 FtsQuery/FtsClause/FtsCombine (pure defs + serde)
 ├── glob/         minimal * ? [..] matcher (§7.1)
 ├── filter/       Filter/Predicate evaluation against a record's attrs: mod.rs
 │                 (dispatch + per-query validate/prepare), text.rs (Levenshtein +
 │                 the filter tokenizer, §7.4), pattern.rs (regex + compile cache, §7.5)
 ├── search/       distance kernels (cosine/dot/euclidean; f32/int8/binary Hamming) +
 │                 bounded top-k heap + min_score; SearchOpts, Hit
-├── data/         segment store: mod.rs (DataSegment — header, append, row accessor;
-│                 the mmap seam) + segments.rs (Segments — the live segment set as one
-│                 dense global row space; seal/rewrite over the manifest, §14)
+├── data/         segment store: mod.rs (DataSegment — header, append, row accessor),
+│                 segments.rs (Segments — the live segment set as one dense global row
+│                 space; seal/rewrite over the manifest, §14), mmap.rs (the opt-in
+│                 memory-mapped accessor for sealed segments, §9)
 ├── manifest/     the manifest object: live-segment set + pins, [crc32][bincode],
 │                 atomic put = the seal/compaction commit point (§14.2)
 ├── log/          op-log codec (the WAL): len + payload + crc32, replay, torn-tail recovery
@@ -1276,37 +1277,57 @@ src/
 │                 span) + fold.rs + schema.rs (FtsField) + highlight.rs (fragments, §7.8)
 ├── annotate.rs   opt-in result annotations: LegScore/ClauseScore/Highlight/Fragment
 │                 + HighlightOpts (§7.8)
+├── fuse.rs       Reciprocal Rank Fusion for hybrid search (§7.6)
+├── cancel.rs     cooperative query cancellation: Cancel token + ambient scope
+├── metrics.rs    in-process counters/gauges (pub mod metrics; scraped by the server)
+├── diag.rs       levelled logfmt diagnostics to stderr (NIDUS_LOG)
 ├── backend/      pluggable storage & memory (§13): mod.rs (Persistence/Appender/
 │                 MemoryTier/BackendLock traits + URL routing), local.rs (LocalFs +
 │                 FileAppender), ram.rs (LocalRam + MemAppender), object.rs
 │                 (ObjectAppender + object_try_lock), cloud.rs (shared ureq Http),
-│                 s3.rs, gcs.rs, redis.rs, tests.rs
+│                 s3.rs, aws_creds.rs, gcs.rs, redis.rs, tests.rs
 └── store/        the integrator: mod.rs (Store type, open/in_memory ctors, lock +
                   ANN lifecycle glue), scoring.rs (scan kernels + parallel engine),
                   quant.rs (int8/binary state + quantized two-pass search), read.rs
-                  (accessors, exact + ANN search), text.rs (multi-clause BM25, hybrid
-                  fusion, annotations, §7.8), rank.rs (recency decay + ORDER BY,
-                  §7.6), aggregate.rs (count/sum + limit_per, §7.7), write.rs
-                  (upsert/delete/flush/compact), memtier.rs (working-set publish/
-                  adopt), tests.rs
+                  (accessors, exact + ANN search incl. the exact-prefilter fallback),
+                  text.rs (multi-clause BM25, hybrid fusion, annotations, §7.8),
+                  rank.rs (recency decay + ORDER BY, §7.6), aggregate.rs (count/sum +
+                  group_by + limit_per, §7.7), write.rs (upsert/delete/flush/compact),
+                  memtier.rs (working-set publish/adopt), tests.rs
+
+# ── AI ingest layer (feature-gated: embed-*/summarize-*/memory) ──
+├── embed/        Embedder trait + per-provider adapters: mod.rs, voyage.rs, openai.rs,
+│                 openai_compat.rs, ollama.rs, cohere.rs, gemini.rs, mistral.rs, jina.rs
+├── summarize/    Summarizer trait + adapters: mod.rs, anthropic.rs, openai.rs, prompts.rs
+├── memory.rs     Memory (remember/recall over a Nidus + an embedder); reserved
+│                 nidus.* attr vocabulary, recency stamps, the TTL read guard (§9)
+├── providers.rs  provider capability registry (Embed/Summarize)
+├── http.rs       shared HTTP retry infrastructure for the ingest adapters
 
 # ── `cli` feature only (the `nidus` binary, --features cli) ──
 ├── bin/nidus.rs  thin entry point: parse args → cli::run
 ├── cli/          clap subcommands over a store dir: mod.rs + backup.rs (snapshot)
-└── server/       axum/tokio HTTP wrapper over one Nidus: mod.rs + dto.rs (wire types)
+└── server/       axum/tokio HTTP wrapper over one Nidus: mod.rs (routes + handlers),
+                  dto.rs (wire types), auth.rs (bearer token), limits.rs (backpressure,
+                  deadlines, body-idle timeout), commit.rs (group commit), metrics.rs
+                  (Prometheus scrape + access log), mcp/ (the MCP 2026-07-28 adapter,
+                  `mcp` feature: mod.rs, args.rs, remember.rs, search.rs, hygiene.rs,
+                  admin.rs, stdio.rs)
 
-tests/            file-backed integration (temp dirs; #[cfg_attr(miri, ignore)] on fsync paths)
-examples/         demo.rs — end-to-end smoke: open → upsert → search (single + All scope)
+tests/            file-backed integration (temp dirs; #[cfg_attr(miri, ignore)] on fsync
+                  paths); tests/e2e/ drives the real binary (one test target, §11)
+examples/         demo.rs — end-to-end smoke: open → upsert → search (single + All
+                  scope); memory.rs — remember/recall over real providers (ingest features)
 ```
 
 Errors propagate via `anyhow::Result` everywhere (`anyhow!`/`bail!`/`.context()`),
 matching the common convention; no hand-rolled error enum.
 
 Build order (bottom-up, each with tests, keeping `cargo build` in seconds):
-`config → crc → model → glob → filter → search → data → log → lock → index_cache →
+`config → model → glob → filter → search → data → log → lock → index_cache →
 ann/fts → backend → manifest → store → lib` (the `data` segment aggregator and `manifest`
-sit over `backend`; the `cli`/`server` binary layers sit above `lib`,
-behind the `cli` feature). The shared type vocabulary in `model` is frozen as
+sit over `backend`; the ingest layer and the `cli`/`server` binary layers sit above
+`lib`, behind their features). The shared type vocabulary in `model` is frozen as
 signatures first so the modules above can be implemented independently and still
 compile together.
 
