@@ -57,15 +57,17 @@ jobs:
 
       # Build before starting anything, so a compile error reads as a compile
       # error instead of a confusing "server never reported an address".
+      # The embed/summarize features gate suites driven by hand-rolled TCP mocks — no
+      # real services — so leaving them off would silently compile them away (#111).
       - name: Build the test binary and the nidus binary
-        run: cargo test --features cli,mcp --test e2e --no-run
+        run: cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai --test e2e --no-run
 
       # Started via the same script `just e2e-services-up` runs, so a developer
       # reproducing a CI failure gets a byte-identical environment. Not GitHub
       # `services:` containers: those cannot pass a command to the image, and
       # minio needs `server /data`. The script waits for real readiness
       # (minio /health/live, valkey PING) rather than sleeping.
-      - name: Start minio + valkey
+      - name: Start minio + valkey + fake-gcs-server
         run: ./scripts/e2e-services.sh up
 
       # --include-ignored runs the cluster suite (#[ignore]d because it needs the
@@ -76,8 +78,12 @@ jobs:
       #
       # The tests' NIDUS_E2E_* defaults already match what the script starts, so
       # there is nothing to configure here — one less pair of values to drift.
+      # NIDUS_E2E_GCS_ENDPOINT opts the gs:// lane in — without it that one test
+      # skips itself, so the suite stays green for a developer without the emulator.
       - name: Run end-to-end tests
-        run: cargo test --features cli,mcp --test e2e -- --include-ignored --test-threads=2
+        run: cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai --test e2e -- --include-ignored --test-threads=2
+        env:
+          NIDUS_E2E_GCS_ENDPOINT: http://127.0.0.1:4650
 
       # Second leg: the same cluster suite against a 3-master Valkey CLUSTER, which
       # is the only way the tier client's slot routing and MOVED/ASK handling get
@@ -90,7 +96,7 @@ jobs:
       - name: Run cluster tests against Valkey Cluster
         run: |
           NIDUS_E2E_REDIS_URL="$(./scripts/e2e-services.sh cluster-url)" \
-            cargo test --features cli,mcp --test e2e cluster:: -- --ignored --test-threads=2
+            cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai --test e2e cluster:: -- --ignored --test-threads=2
 
       # A red run should be diagnosable from the log alone, without a rerun. The
       # harness already attaches each nidus process's stderr to its failure; these
@@ -103,6 +109,9 @@ jobs:
           echo "::endgroup::"
           echo "::group::valkey"
           docker logs nidus-e2e-valkey 2>&1 | tail -100 || true
+          echo "::endgroup::"
+          echo "::group::fake-gcs-server"
+          docker logs nidus-e2e-gcs 2>&1 | tail -100 || true
           echo "::endgroup::"
           echo "::group::valkey cluster"
           for c in nidus-e2e-valkey-c0 nidus-e2e-valkey-c1 nidus-e2e-valkey-c2; do

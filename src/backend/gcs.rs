@@ -33,7 +33,11 @@ pub struct Gcs {
     bucket: String,
     /// Key prefix within the bucket (`""` or `"a/b"`, never trailing-slashed).
     prefix: String,
-    auth: GcsAuth,
+    /// `None` in emulator mode — an emulator ignores tokens, and fetching one would
+    /// leave the emulator for the real token endpoint.
+    auth: Option<GcsAuth>,
+    /// `NIDUS_GCS_ENDPOINT`: base URL of a GCS emulator (fake-gcs-server) for the e2e lane.
+    endpoint: Option<String>,
     http: Http,
 }
 
@@ -60,22 +64,25 @@ impl Gcs {
                 None => None,
             },
         };
-        let auth = match key_json {
-            Some(json) => {
+        let endpoint = env("NIDUS_GCS_ENDPOINT");
+        let auth = match (&endpoint, key_json) {
+            (Some(_), _) => None,
+            (None, Some(json)) => {
                 let info = ServiceAccountInfo::deserialize(json)
                     .map_err(|e| anyhow::anyhow!("invalid GCS service-account key: {e}"))?;
                 let provider = ServiceAccountProvider::new(info).map_err(|e| {
                     anyhow::anyhow!("failed to initialise GCS service-account auth: {e}")
                 })?;
-                GcsAuth::ServiceAccount(provider)
+                Some(GcsAuth::ServiceAccount(provider))
             }
-            None => GcsAuth::Metadata(MetadataServerProvider::new(None)),
+            (None, None) => Some(GcsAuth::Metadata(MetadataServerProvider::new(None))),
         };
 
         Ok(Gcs {
             bucket: bucket.to_string(),
             prefix: prefix.to_string(),
             auth,
+            endpoint,
             http: Http::new(),
         })
     }
@@ -94,8 +101,9 @@ impl Gcs {
     /// provider this backend resolved.
     fn token(&self) -> Result<String> {
         match &self.auth {
-            GcsAuth::ServiceAccount(p) => token_from(p, &self.http),
-            GcsAuth::Metadata(p) => token_from(p, &self.http),
+            Some(GcsAuth::ServiceAccount(p)) => token_from(p, &self.http),
+            Some(GcsAuth::Metadata(p)) => token_from(p, &self.http),
+            None => bail!("GCS emulator mode has no token provider"),
         }
     }
 
@@ -108,12 +116,24 @@ impl Gcs {
     /// Like [`run_authed`](Self::run_authed) but also returns the response headers — the
     /// compare-and-swap path reads the object's generation (`x-goog-generation`) from them.
     fn run_authed_h(&self, req: http::Request<Vec<u8>>) -> Result<(u16, Vec<u8>, HeaderMap)> {
-        let token = self.token()?;
         let (mut parts, body) = req.into_parts();
-        parts.headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}")).context("build GCS auth header")?,
-        );
+        match &self.endpoint {
+            // Emulator mode: retarget the request's scheme+authority and skip auth.
+            Some(ep) => {
+                let pq = parts.uri.path_and_query().map_or("/", |p| p.as_str());
+                parts.uri = format!("{}{pq}", ep.trim_end_matches('/'))
+                    .parse()
+                    .context("build GCS emulator URI")?;
+            }
+            None => {
+                let token = self.token()?;
+                parts.headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {token}"))
+                        .context("build GCS auth header")?,
+                );
+            }
+        }
         self.http.run_h(http::Request::from_parts(parts, body))
     }
 
@@ -344,14 +364,16 @@ mod tests {
         let gcs = Gcs {
             bucket: "b".to_string(),
             prefix: "snapshots/nightly".to_string(),
-            auth: dummy_auth(),
+            auth: Some(dummy_auth()),
+            endpoint: None,
             http: Http::new(),
         };
         assert_eq!(gcs.name("snap.tar.gz"), "snapshots/nightly/snap.tar.gz");
         let flat = Gcs {
             bucket: "b".to_string(),
             prefix: String::new(),
-            auth: dummy_auth(),
+            auth: Some(dummy_auth()),
+            endpoint: None,
             http: Http::new(),
         };
         assert_eq!(flat.name("data"), "data");
@@ -362,7 +384,8 @@ mod tests {
         let gcs = Gcs {
             bucket: "my-bucket".to_string(),
             prefix: String::new(),
-            auth: dummy_auth(),
+            auth: Some(dummy_auth()),
+            endpoint: None,
             http: Http::new(),
         };
         let oid = gcs.object_id("data").unwrap();
@@ -378,7 +401,8 @@ mod tests {
         let gcs = Gcs {
             bucket: "my-bucket".to_string(),
             prefix: String::new(),
-            auth: dummy_auth(),
+            auth: Some(dummy_auth()),
+            endpoint: None,
             http: Http::new(),
         };
         let oid = gcs.object_id("lock").unwrap();
@@ -402,7 +426,8 @@ mod tests {
         let gcs = Gcs {
             bucket: "my-bucket".to_string(),
             prefix: String::new(),
-            auth: dummy_auth(),
+            auth: Some(dummy_auth()),
+            endpoint: None,
             http: Http::new(),
         };
         let oid = gcs.object_id("manifest").unwrap();
@@ -434,7 +459,8 @@ mod tests {
         let gcs = Gcs {
             bucket: "b".to_string(),
             prefix: String::new(),
-            auth: dummy_auth(),
+            auth: Some(dummy_auth()),
+            endpoint: None,
             http: Http::new(),
         };
         assert!(gcs.try_lock("lock", Duration::from_secs(1)).is_err());

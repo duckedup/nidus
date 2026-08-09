@@ -16,12 +16,15 @@ set -euo pipefail
 
 MINIO_NAME=nidus-e2e-minio
 VALKEY_NAME=nidus-e2e-valkey
+GCS_NAME=nidus-e2e-gcs
 MINIO_PORT=${MINIO_PORT:-9100}
 VALKEY_PORT=${VALKEY_PORT:-6479}
+GCS_PORT=${GCS_PORT:-4650}
 BUCKET=${NIDUS_E2E_S3_BUCKET:-nidus-test}
+GCS_BUCKET=${NIDUS_E2E_GCS_BUCKET:-nidus-test}
 
 down() {
-    docker rm -f "$MINIO_NAME" "$VALKEY_NAME" >/dev/null 2>&1 || true
+    docker rm -f "$MINIO_NAME" "$VALKEY_NAME" "$GCS_NAME" >/dev/null 2>&1 || true
 }
 
 up() {
@@ -33,6 +36,10 @@ up() {
         quay.io/minio/minio:latest server /data >/dev/null
     docker run -d --name "$VALKEY_NAME" -p "${VALKEY_PORT}:6379" \
         valkey/valkey:8-alpine >/dev/null
+    # `-scheme http`: the emulator defaults to HTTPS with a self-signed cert, which the
+    # backend's rustls would (rightly) refuse.
+    docker run -d --name "$GCS_NAME" -p "${GCS_PORT}:4443" \
+        fsouza/fake-gcs-server -scheme http >/dev/null
 
     # Wait for readiness rather than sleeping: an unready service is the classic
     # source of flaky integration CI.
@@ -62,11 +69,30 @@ up() {
         exit 1
     }
 
+    echo "waiting for fake-gcs-server on :${GCS_PORT} …"
+    for _ in $(seq 1 60); do
+        if curl -sf "http://127.0.0.1:${GCS_PORT}/storage/v1/b" >/dev/null; then
+            break
+        fi
+        sleep 0.5
+    done
+    curl -sf "http://127.0.0.1:${GCS_PORT}/storage/v1/b" >/dev/null || {
+        echo "fake-gcs-server never became ready; logs:" >&2
+        docker logs "$GCS_NAME" >&2 || true
+        exit 1
+    }
+
     # minio starts with no buckets. Under its filesystem backend a top-level
     # directory IS a bucket, which creates one without needing the `mc` client.
     docker exec "$MINIO_NAME" mkdir -p "/data/${BUCKET}"
+    # fake-gcs-server starts empty too; its JSON API creates the bucket directly.
+    curl -sf -X POST -H 'content-type: application/json' \
+        -d "{\"name\":\"${GCS_BUCKET}\"}" \
+        "http://127.0.0.1:${GCS_PORT}/storage/v1/b?project=e2e" >/dev/null
 
     echo "ready: minio :${MINIO_PORT} (minioadmin/minioadmin, bucket ${BUCKET}) + valkey :${VALKEY_PORT}"
+    echo "ready: fake-gcs-server :${GCS_PORT} (bucket ${GCS_BUCKET}) — run the gs:// lane with:"
+    echo "  NIDUS_E2E_GCS_ENDPOINT='http://127.0.0.1:${GCS_PORT}'"
 }
 
 # ── Valkey CLUSTER (slot routing / MOVED-ASK), a separate leg ────────────────
