@@ -1,8 +1,14 @@
 name: Docs
 
 # Build the Astro + Starlight docs site and publish to GitHub Pages.
-# Runs on merge to main when anything under docs/ (or this workflow) changes.
+# On a PR touching docs/ this builds only, as the gate (#148): the deploy runs on merge
+# to main. Gating here rather than in ci.yml keeps one copy of the build, so what a PR
+# proves is exactly what ships.
 on:
+  pull_request:
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
   push:
     branches: [main]
     paths:
@@ -16,10 +22,12 @@ permissions:
   pages: write
   id-token: write
 
-# One deploy at a time; let an in-flight production deploy finish.
+# One deploy at a time; let an in-flight production deploy finish. PR builds get their
+# own per-ref group so the gate never queues behind (or ahead of) a production deploy,
+# and a superseded push cancels its own stale build rather than the deploy's.
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('docs-pr-{0}', github.ref) || 'pages' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -36,7 +44,10 @@ jobs:
         with:
           bun-version: latest
 
+      # Pages steps are deploy-only. A fork PR gets a read-only token, so running them
+      # there would fail the gate for a reason that has nothing to do with the docs.
       - name: Configure Pages
+        if: github.event_name != 'pull_request'
         uses: actions/configure-pages@v6
 
       - name: Install dependencies
@@ -47,12 +58,14 @@ jobs:
         run: bunx --bun astro build
 
       - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v5
         with:
           path: docs/dist
 
   deploy:
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
