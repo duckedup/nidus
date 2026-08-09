@@ -106,6 +106,7 @@ function runFleet() {
     ...fleet.treeFindings(peers, self),
     ...fleet.issueFindings(peers, issues, { login: self.login }),
     ...fleet.overlapFindings(peers),
+    ...fleet.orphanFindings(git.worktrees(), peers, self),
   ]
 
   if (asJson) console.log(JSON.stringify({ self, peers, issues, findings }, null, 2))
@@ -126,8 +127,9 @@ const USAGE = `nidus-check — deterministic checks for this repo's laws and ver
 
   nidus-check fleet  --plan <file.json> [--json] [--strict]
       Is this dispatch safe? Shared working trees, foreign remotes, dirty or stale
-      peer clones, tickets that are closed/taken/already-PR'd or queued twice, and
-      files two peers both claim. The plan is
+      peer clones, tickets that are closed/taken/already-PR'd or queued twice,
+      files two peers both claim, and worktrees left behind by finished agents.
+      The plan is
       {"peers":[{"name":…,"dir":…,"queue":[…],"surface":{"<issue>":["path"]}}]}.
 
   nidus-check selftest

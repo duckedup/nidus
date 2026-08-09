@@ -108,6 +108,29 @@ export function overlapFindings(peers) {
   return findings
 }
 
+// Implementation agents get a worktree each, siblings of the peer's in the one
+// registry. Git stops them colliding; nothing stops them accumulating.
+export function orphanFindings(list = [], peers = [], self = {}) {
+  const claimed = new Set([normalize(self.dir), ...peers.map(p => normalize(p.dir))].filter(Boolean))
+  const findings = []
+
+  for (const w of list) {
+    if (w.isMain || claimed.has(normalize(w.path))) continue
+    const agent = /^worktree-agent-/.test(w.branch || '') || /\/agent-[0-9a-f]+$/.test(w.path)
+    const stuck = w.dirty || w.hasCommits
+    const how = stuck
+      ? `\`git worktree remove --force ${w.path}\` then \`git branch -D ${w.branch || '<branch>'}\` — it carries ${w.hasCommits ? 'commits' : 'uncommitted edits'}, so \`prune\` will not reclaim it.`
+      : `\`git worktree remove ${w.path}\`, or \`git worktree prune\` once the directory is gone.`
+    findings.push(warn(
+      agent ? 'fleet-orphan-agent-worktree' : 'fleet-unaccounted-worktree',
+      w.path,
+      agent ? 'implementation-agent worktree left behind' : `belongs to no peer in this plan (branch ${w.branch || 'detached'})`,
+      how,
+    ))
+  }
+  return findings
+}
+
 export function formatFleet(findings) {
   if (!findings.length) return 'Dispatch is clear. No tree, ticket or overlap findings.'
   const errors = findings.filter(f => f.severity === 'error')

@@ -476,6 +476,34 @@ test('fleet: a merged PR on the ticket does not warn', () => {
   eq(ids(fleet.issueFindings([{ name: 'a', queue: [9] }], issues)), [], 'findings')
 })
 
+const MAIN = { path: '/r/nidus', branch: 'main', isMain: true, dirty: false, hasCommits: false }
+const agentWt = (id, over = {}) => ({
+  path: `/r/nidus/.claude/worktrees/agent-${id}`, branch: `worktree-agent-${id}`,
+  isMain: false, dirty: false, hasCommits: false, ...over,
+})
+
+test('fleet: the main tree and declared peer trees are never orphans', () => {
+  const peer = { path: '/r/nidus/.claude/worktrees/x', branch: 'austin/141', isMain: false, dirty: false, hasCommits: false }
+  eq(ids(fleet.orphanFindings([MAIN, peer], [{ name: 'a', dir: '/r/nidus/.claude/worktrees/x' }], SELF)), [], 'findings')
+})
+
+test('fleet: an agent worktree nobody claims is an orphan', () => {
+  const found = fleet.orphanFindings([MAIN, agentWt('a0c1')], [], SELF)
+  eq(ids(found), ['fleet-orphan-agent-worktree'], 'findings')
+  eq(/prune/.test(found[0].detail), true, 'prune suggested when clean')
+})
+
+test('fleet: an orphan carrying commits says prune will not reclaim it', () => {
+  const found = fleet.orphanFindings([MAIN, agentWt('a0c1', { hasCommits: true })], [], SELF)
+  eq(/--force/.test(found[0].detail), true, 'force')
+  eq(/will not reclaim/.test(found[0].detail), true, 'explains why prune fails')
+})
+
+test('fleet: a non-agent worktree outside the plan is reported separately', () => {
+  const stray = { path: '/r/nidus/.claude/worktrees/old', branch: 'austin/99', isMain: false, dirty: false, hasCommits: false }
+  eq(ids(fleet.orphanFindings([MAIN, stray], [], SELF)), ['fleet-unaccounted-worktree'], 'findings')
+})
+
 test('fleet: two peers claiming one file is flagged for sequencing', () => {
   const peers = [
     { name: 'a', surface: { 139: ['src/cli/mod.rs'] } },

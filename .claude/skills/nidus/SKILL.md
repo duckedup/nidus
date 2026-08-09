@@ -200,9 +200,9 @@ copy of the object store for nothing. **Worktrees are the right unit**: one clon
 checkouts, everything still under the repo root.
 
 ```bash
-git worktree list                                     # what exists already
+git worktree list                                     # the registry, from anywhere in the clone
 git worktree add .claude/worktrees/<slug> -b austin/<n>-<slug> origin/main
-git worktree prune                                    # after a peer is done
+git worktree remove <path> && git branch -D <branch>  # once the ticket has shipped
 ```
 
 Provision the worktree yourself, then tell the peer to `EnterWorktree` with that `path`.
@@ -214,6 +214,23 @@ exists nowhere the peer can read, which is the same error wearing a citation. A 
 checkout predates it does not have the instruction yet; let it finish where it is. A peer
 already in its own clone of the same remote is *fine*, just wasteful, and never worth moving
 mid-ticket.
+
+**Nesting is flat, and git does the policing.** A peer that runs `implement` from inside its
+worktree spawns agents whose worktrees are *siblings* of its own, not children: `git worktree
+add` resolves against `--git-common-dir`, so every worktree in the clone lands in one registry
+that `git worktree list` shows from anywhere. You do not track them, and you do not need to.
+Git refuses to check one branch out twice (`fatal: '<branch>' is already used by worktree at
+…`) and refuses to reuse a path, so a collision is a hard error rather than silent corruption,
+and agents exchange **patches** through the scratch dir rather than touching each other's
+trees. Two costs are yours, though: `target/` is per-worktree, so N agents means N cold
+builds, and agent worktrees are cut from `origin/main`, so an agent never sees work the peer
+already committed to its ticket branch — that is what makes `implement` step 4's conflict
+resolution a real step and not a formality.
+
+**Clean up when a ticket ships**, because nothing else will. `git worktree prune` only
+reclaims worktrees whose directory is already gone, so any agent worktree carrying commits
+survives it forever and accumulates across a fleet. `nidus-check fleet` reports the orphans
+and tells you which need `--force`. Remove the worktree *and* its branch.
 
 ### 2. Roster, plan, check
 

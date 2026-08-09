@@ -150,13 +150,24 @@ export function treeFacts(dir) {
   }
 }
 
+// `prune` only reclaims worktrees whose directory is gone. One carrying commits or
+// edits survives it, so report both — they decide whether removal needs --force.
 export function worktrees(dir = process.cwd()) {
   const out = inDir(dir, 'worktree list --porcelain')
+  const main = inDir(dir, 'rev-parse --path-format=absolute --git-common-dir').replace(/\/\.git\/?$/, '')
   const list = []
   for (const block of out.split('\n\n')) {
     const path = block.match(/^worktree (.+)$/m)?.[1]
     if (!path) continue
-    list.push({ path, branch: block.match(/^branch refs\/heads\/(.+)$/m)?.[1] || null, detached: /^detached$/m.test(block) })
+    const isMain = path.replace(/\/+$/, '') === main.replace(/\/+$/, '')
+    list.push({
+      path,
+      branch: block.match(/^branch refs\/heads\/(.+)$/m)?.[1] || null,
+      detached: /^detached$/m.test(block),
+      isMain,
+      dirty: isMain ? false : inDir(path, 'status --porcelain --untracked-files=no') !== '',
+      hasCommits: isMain ? false : inDir(path, 'rev-list --count origin/main..HEAD') !== '0',
+    })
   }
   return list
 }
