@@ -559,6 +559,25 @@ test('fleet: two branches claiming one version is an error', () => {
   eq(ids(found), ['fleet-version-collision'], 'findings')
 })
 
+const BEHAV = [/^src\//, /^sdks\//, /^Cargo\.toml$/]
+
+test('fleet: a skill-only branch owes no bump and collides with nothing', () => {
+  const b = [{ ref: 'origin/s1', version: '0.56.1', changed: ['.claude/skills/nidus/SKILL.md'] },
+             { ref: 'origin/s2', version: '0.56.1', changed: ['docs/x.md'] }]
+  eq(ids(fleet.versionFindings(b, '0.56.1', new Set(['v0.56.1']), new Set(['s1', 's2']), BEHAV)), [], 'exempt')
+})
+
+test('fleet: a src-touching branch at a tagged version still fires', () => {
+  const b = [{ ref: 'origin/c', version: '0.56.1', changed: ['src/lib.rs'] }]
+  eq(ids(fleet.versionFindings(b, '0.56.1', new Set(['v0.56.1']), new Set(['c']), BEHAV)), ['fleet-version-released'], 'fires')
+})
+
+test('fleet: an exempt branch does not collide with a releasing one', () => {
+  const b = [{ ref: 'origin/s', version: '0.57.0', changed: ['docs/x.md'] },
+             { ref: 'origin/c', version: '0.57.0', changed: ['src/lib.rs'] }]
+  eq(ids(fleet.versionFindings(b, '0.56.1', new Set(), new Set(), BEHAV)), [], 'no phantom collision')
+})
+
 test('fleet: a long-landed branch below main is not in flight', () => {
   const stale = [{ ref: 'origin/old-a', version: '0.12.0' }, { ref: 'origin/old-b', version: '0.12.0' }]
   eq(ids(fleet.versionFindings(stale, '0.56.1', new Set())), [], 'squash-merged branches stay quiet')

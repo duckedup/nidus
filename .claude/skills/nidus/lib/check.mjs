@@ -118,7 +118,7 @@ function runFleet() {
     ...fleet.issueFindings(peers, issues, { login: self.login }),
     ...fleet.overlapFindings(peers),
     ...fleet.orphanFindings(trees, peers, self),
-    ...fleet.versionFindings(git.inflightVersions(), mainVersion(), git.releasedTags(), git.openPrRefs()),
+    ...fleet.versionFindings(git.inflightVersions(), mainVersion(), git.releasedTags(), git.openPrRefs(), laws.BEHAVIOURAL),
   ]
   const state = fleet.rehydrate(peers, issues, trees)
 

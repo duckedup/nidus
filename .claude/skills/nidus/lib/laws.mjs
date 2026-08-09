@@ -78,7 +78,7 @@ export function crateAttrWeakened(libText) {
 
 // ── 3/4. Version bump + the docs snippets that pin major.minor ──────────────
 
-const BEHAVIOURAL = [/^src\//, /^sdks\//, /^Cargo\.toml$/, /^Dockerfile$/, /^install\.sh$/]
+export const BEHAVIOURAL = [/^src\//, /^sdks\//, /^Cargo\.toml$/, /^Dockerfile$/, /^install\.sh$/]
 
 export const versionOf = t => (t.match(/^version\s*=\s*"([^"]+)"/m) || [])[1] || null
 const majorMinor = v => (v || '').split('.').slice(0, 2).join('.')

@@ -177,12 +177,15 @@ export function formatRehydrate(rows) {
 // "In flight" cannot mean "not an ancestor of main": squash merges rewrite the SHA,
 // so ~100 long-landed branches would qualify. It means an open PR, or a version
 // ahead of main — which is what a branch still going somewhere actually looks like.
-export function versionFindings(branches = [], mainVersion = null, tags = new Set(), openPrRefs = new Set()) {
+export function versionFindings(branches = [], mainVersion = null, tags = new Set(), openPrRefs = new Set(), behavioural = []) {
   const findings = []
   const byVersion = new Map()
-  const inflight = branches.filter(b =>
+  // A skill/docs/CI-only branch is not competing for a release, so it neither owes a
+  // bump nor collides with anything. Same exemption laws.versionBump already applies.
+  const releases = b => !behavioural.length || !b.changed || b.changed.some(f => behavioural.some(re => re.test(f)))
+  const inflight = branches.filter(b => releases(b) && (
     openPrRefs.has(b.ref) || openPrRefs.has(b.ref.replace(/^origin\//, '')) ||
-    (mainVersion && cmp(b.version, mainVersion) > 0))
+    (mainVersion && cmp(b.version, mainVersion) > 0)))
 
   for (const { ref, version } of inflight) {
     if (!byVersion.has(version)) byVersion.set(version, [])
