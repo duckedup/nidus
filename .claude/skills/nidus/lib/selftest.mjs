@@ -380,8 +380,38 @@ test('lanes: an SDK README does not run that SDK suite', () => {
 })
 
 test('lanes: each SDK gets its own lane', () => {
-  eq(lanes(['sdks/go/client.go']).run.map(l => l.recipe), ['cd sdks/go && go test ./...'], 'go')
-  eq(lanes(['sdks/python/src/nidus/client.py']).run.map(l => l.recipe), ['cd sdks/python && python -m pytest tests -k "not integration"'], 'py')
+  eq(lanes(['sdks/go/client.go']).run.length, 1, 'go')
+  eq(lanes(['sdks/python/src/nidus/client.py']).run.length, 1, 'py')
+  eq(lanes(['sdks/js/src/client.ts']).run.length, 1, 'js')
+})
+
+// An SDK change is the one case where the unit lanes are worth least: they run against a
+// mocked transport, so they pass just as happily against a shape the server never emits.
+test('lanes: an SDK change reports the real-server contract lane (#172)', () => {
+  for (const f of ['sdks/js/src/client.ts', 'sdks/go/client.go', 'sdks/python/src/nidus/client.py']) {
+    const manual = lanes([f]).manual.map(l => l.recipe).join('\n')
+    eq(/test:integration/.test(manual), true, `js integration suite named for ${f}`)
+    eq(/-tags integration/.test(manual), true, `go integration suite named for ${f}`)
+    eq(/test_integration\.py/.test(manual), true, `python integration suite named for ${f}`)
+  }
+})
+
+// The lane table's claim is "run this and you have run what CI runs". Each SDK's CI job
+// has steps beyond its test command, and a lane missing them is a subset wearing a total.
+test('lanes: each SDK lane runs every step its CI job runs (#172)', () => {
+  const recipeFor = f => lanes([f]).run.map(l => l.recipe).join('\n')
+  const js = recipeFor('sdks/js/src/client.ts')
+  for (const step of ['npm run typecheck', 'npm run test:unit', 'npm run build']) {
+    eq(js.includes(step), true, `js lane runs ${step}`)
+  }
+  const go = recipeFor('sdks/go/client.go')
+  for (const step of ['gofmt', 'go vet', 'go test']) {
+    eq(go.includes(step), true, `go lane runs ${step}`)
+  }
+  const py = recipeFor('sdks/python/src/nidus/client.py')
+  for (const step of ['ruff check', 'ruff format --check', 'mypy src', 'pytest']) {
+    eq(py.includes(step), true, `python lane runs ${step}`)
+  }
 })
 
 // ── fleet ──────────────────────────────────────────────────────────────────
