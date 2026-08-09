@@ -61,8 +61,8 @@ struct StoreArgs {
     #[arg(long, env = "NIDUS_READ_ONLY")]
     read_only: bool,
     /// Opt into an approximate-nearest-neighbour index: `hnsw` or `ivf`. Omit for exact brute-force
-    /// search (the default). Unlike `--dim`/`--distance`, the ANN choice is *not* stored in the
-    /// header — pass it on every open (including `serve`) where you want the index built/consulted.
+    /// search (the default), or to fall back to a recorded `configure` default (nidus-141) if any.
+    /// An explicit flag here always wins over a recorded default.
     #[arg(long, env = "NIDUS_ANN")]
     ann: Option<AnnKindArg>,
     /// HNSW: max neighbours per node above layer 0. Ignored without `--ann hnsw`.
@@ -104,11 +104,14 @@ struct StoreArgs {
     /// Memory-map immutable segments instead of holding them in RAM — lets a store
     /// exceed RAM on one node. Local filesystem + little-endian only; other segments
     /// fall back to a RAM load.
-    #[arg(long, env = "NIDUS_MMAP")]
+    #[arg(long, env = "NIDUS_MMAP", conflicts_with = "no_mmap")]
     mmap: bool,
+    /// Turn mmap off, overriding a recorded `configure --mmap` default (nidus-141).
+    #[arg(long, env = "NIDUS_NO_MMAP")]
+    no_mmap: bool,
     /// Quantize the search first pass for speed, then rerank the candidates in exact
     /// f32: `int8` (4× less memory traffic) or `binary` (32×, cosine only). Omit for
-    /// exact-only search. Like `--ann`, not stored in the header — pass it on every open.
+    /// exact-only search, or to fall back to a recorded `configure` default (nidus-141).
     #[arg(long, env = "NIDUS_QUANTIZATION")]
     quantization: Option<QuantArg>,
     /// Candidate over-fetch multiple for the quantized first pass (`top_k * rescore`
@@ -221,20 +224,29 @@ impl StoreArgs {
         let (dim, distance) = self.resolve()?;
         let mut cfg = Config::new(self.dir.clone(), dim)
             .distance(distance)
-            .ann(self.ann_config())
-            .quantization(self.quant_config())
             .persistence(self.persistence.clone().unwrap_or_default())
             .memory(self.memory.clone().unwrap_or_default())
             .cluster(self.cluster)
-            .mmap(self.mmap)
             .segment_max_rows(self.segment_max_rows)
             .segment_index_min_rows(self.segment_index_min_rows)
             .max_vector_bytes(self.max_vector_bytes)
             .open_mode(mode);
-        // The remaining knobs have non-`Option` defaults in `Config`, so only an
-        // explicitly-supplied flag may overwrite them.
+        // ann/quantization/query_threads/mmap are profile-eligible (nidus-141): only an
+        // explicitly-supplied flag may set them here, so an unset one leaves room for a
+        // recorded `configure` default to apply on open.
+        if self.ann.is_some() {
+            cfg = cfg.ann(self.ann_config());
+        }
+        if self.quantization.is_some() {
+            cfg = cfg.quantization(self.quant_config());
+        }
         if let Some(n) = self.query_threads {
             cfg = cfg.query_threads(n);
+        }
+        if self.no_mmap {
+            cfg = cfg.mmap(false);
+        } else if self.mmap {
+            cfg = cfg.mmap(true);
         }
         if let Some(f) = self.fsync {
             cfg = cfg.fsync(f.into());
@@ -855,6 +867,16 @@ enum Command {
         #[arg(long)]
         expired: bool,
     },
+    /// Record ann/quantization/query-threads/mmap flags as this store's open-time
+    /// defaults (nidus-141), so later opens need not repeat them. An explicit flag on a
+    /// later command still wins over the recorded default for that knob.
+    Configure {
+        #[command(flatten)]
+        store: StoreArgs,
+        /// Remove the recorded profile instead of writing one.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Snapshot a store into a single compressed archive (`.tar.gz`).
     Backup {
         /// Store directory to back up (the source when `--persistence` is omitted).
@@ -1280,6 +1302,24 @@ pub fn run(cli: Cli) -> Result<()> {
                 print_json(&serde_json::json!({ "ok": true }))
             }
         }
+        Command::Configure { store, clear } => {
+            if store.read_only {
+                bail!("--read-only was set, but configure mutates the store");
+            }
+            let cfg = store.config(OpenMode::ReadWrite)?;
+            let mut db = Nidus::open(cfg.clone())?;
+            if clear {
+                db.clear_open_profile()?;
+                print_json(&serde_json::json!({ "cleared": true }))
+            } else {
+                // Merge onto what is already recorded: `configure --quantization int8` must
+                // not erase an `--ann hnsw` from an earlier call. `--clear` is the way to reset.
+                let mut profile = db.open_profile().clone();
+                profile.overlay(&cfg.to_profile());
+                db.set_open_profile(&profile)?;
+                print_json(&serde_json::json!({ "recorded": profile }))
+            }
+        }
         Command::Backup {
             dir,
             persistence,
@@ -1310,6 +1350,9 @@ pub fn run(cli: Cli) -> Result<()> {
                 "dimension": db.dimension(),
                 "distance": format!("{:?}", db.config().distance),
                 "ann": db.config().ann.map(AnnDto::from),
+                "quantization": db.config().quantization,
+                "query_threads": db.config().query_threads,
+                "mmap": db.config().mmap,
                 "collections": db.collections(),
                 "footprint": FootprintDto::from(db.footprint()),
             }))
@@ -2327,6 +2370,88 @@ mod tests {
         assert_eq!(cfg.auto_compact, default.auto_compact);
         assert_eq!(cfg.lock_ttl, default.lock_ttl);
         assert_eq!(cfg.max_vector_bytes, default.max_vector_bytes);
+    }
+
+    /// `--mmap` and `--no-mmap` (nidus-141) must each reach `Config` distinguishably, and
+    /// neither passed must leave `mmap` unset-explicit so a recorded profile can still win.
+    #[test]
+    fn mmap_flag_forms() {
+        let cfg = serve_store(&["--mmap"])
+            .config(OpenMode::ReadWrite)
+            .expect("config");
+        assert!(cfg.mmap);
+        assert_eq!(cfg.to_profile().mmap, Some(true));
+
+        let cfg = serve_store(&["--no-mmap"])
+            .config(OpenMode::ReadWrite)
+            .expect("config");
+        assert!(!cfg.mmap);
+        assert_eq!(cfg.to_profile().mmap, Some(false));
+
+        let cfg = serve_store(&[])
+            .config(OpenMode::ReadWrite)
+            .expect("config");
+        assert!(!cfg.mmap);
+        assert_eq!(
+            cfg.to_profile().mmap,
+            None,
+            "unset mmap must leave room for a recorded profile"
+        );
+    }
+
+    #[test]
+    fn mmap_and_no_mmap_conflict() {
+        assert!(
+            Cli::try_parse_from([
+                "nidus",
+                "serve",
+                "--dir",
+                "/tmp/s",
+                "--dim",
+                "3",
+                "--mmap",
+                "--no-mmap"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn configure_command_parses_and_clears() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "configure",
+            "--dir",
+            "/tmp/s",
+            "--dim",
+            "3",
+            "--ann",
+            "hnsw",
+            "--quantization",
+            "int8",
+            "--query-threads",
+            "4",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::Configure { store, clear } => {
+                assert!(!clear);
+                let cfg = store.config(OpenMode::ReadWrite).expect("config");
+                let profile = cfg.to_profile();
+                assert!(profile.ann.is_some());
+                assert!(profile.quantization.is_some());
+                assert_eq!(profile.query_threads, Some(4));
+                assert_eq!(profile.mmap, None);
+            }
+            _ => panic!("expected Configure"),
+        }
+
+        let cli = Cli::try_parse_from(["nidus", "configure", "--dir", "/tmp/s", "--clear"])
+            .expect("parses");
+        match cli.command {
+            Command::Configure { clear, .. } => assert!(clear),
+            _ => panic!("expected Configure"),
+        }
     }
 
     #[test]

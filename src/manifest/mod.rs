@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::Persistence;
 use crate::model::Distance;
+use crate::profile::OpenProfile;
 
 /// The object key the manifest lives under within a store.
 pub(crate) const MANIFEST_KEY: &str = "manifest";
@@ -15,7 +16,8 @@ pub(crate) const MANIFEST_KEY: &str = "manifest";
 pub(crate) const BASE_SEGMENT: &str = "data";
 
 /// Manifest frame format version (bumped only on an incompatible payload change).
-const FORMAT_VERSION: u16 = 1;
+/// v2 appends `profile`; v1 manifests still decode, lifted with an empty profile.
+const FORMAT_VERSION: u16 = 2;
 
 /// The live-segment set + the pins needed to open them. Serialized as the `manifest` object.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +37,22 @@ pub(crate) struct Manifest {
     /// Phase-4 reader-refresh (a reader adopts a newer manifest when this advances); unused
     /// until then.
     pub version: u64,
+    /// Recorded open-time defaults (nidus-141). Added in v2; a lifted v1 manifest gets
+    /// [`OpenProfile::default`] (nothing recorded).
+    pub profile: OpenProfile,
+}
+
+/// The v1 manifest shape (six fields, no `profile`), bincode's positional format only lets a
+/// v1 buffer be told apart from v2 by first decoding into this shape and reading its version.
+/// Frozen: this is v1's exact historical layout, so editing it silently breaks reading old stores.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ManifestV1 {
+    format_version: u16,
+    dimension: u64,
+    distance: Distance,
+    segments: Vec<String>,
+    next_id: u64,
+    version: u64,
 }
 
 impl Manifest {
@@ -49,6 +67,7 @@ impl Manifest {
             segments: vec![BASE_SEGMENT.to_string()],
             next_id: 1,
             version: 1,
+            profile: OpenProfile::default(),
         }
     }
 
@@ -61,6 +80,7 @@ impl Manifest {
         segments: Vec<String>,
         next_id: u64,
         version: u64,
+        profile: OpenProfile,
     ) -> Manifest {
         Manifest {
             format_version: FORMAT_VERSION,
@@ -69,10 +89,12 @@ impl Manifest {
             segments,
             next_id,
             version,
+            profile,
         }
     }
 
-    /// Encode the manifest to its on-disk frame (`crc32` + bincode payload).
+    /// Encode the manifest to its on-disk frame (`crc32` + bincode payload). Always emits
+    /// the current [`FORMAT_VERSION`].
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         let payload = bincode::serialize(self).context("serialize manifest")?;
         let crc = crc32fast::hash(&payload);
@@ -82,7 +104,9 @@ impl Manifest {
         Ok(out)
     }
 
-    /// Decode a manifest frame, verifying the CRC and the format version.
+    /// Decode a manifest frame, verifying the CRC, then dispatching on the format version
+    /// (bincode is positional, not self-describing, so a v1 buffer runs out of bytes before
+    /// filling `profile` — that must be handled explicitly, not defaulted).
     pub(crate) fn decode(bytes: &[u8]) -> Result<Manifest> {
         if bytes.len() < 4 {
             bail!(
@@ -99,15 +123,27 @@ impl Manifest {
                  — the manifest object is corrupt"
             );
         }
-        let m: Manifest = bincode::deserialize(payload).context("deserialize manifest")?;
-        if m.format_version != FORMAT_VERSION {
-            bail!(
+        let v1: ManifestV1 = bincode::deserialize(payload).context("deserialize manifest")?;
+        match v1.format_version {
+            1 => Ok(Manifest {
+                format_version: v1.format_version,
+                dimension: v1.dimension,
+                distance: v1.distance,
+                segments: v1.segments,
+                next_id: v1.next_id,
+                version: v1.version,
+                profile: OpenProfile::default(),
+            }),
+            2 => {
+                let m: Manifest = bincode::deserialize(payload).context("deserialize manifest")?;
+                Ok(m)
+            }
+            other => bail!(
                 "manifest format version {} is not supported (expected {})",
-                m.format_version,
+                other,
                 FORMAT_VERSION
-            );
+            ),
         }
-        Ok(m)
     }
 
     /// Read the manifest object from `persistence`. `Ok(None)` when absent (a fresh or a
@@ -131,6 +167,7 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{AnnConfig, Quantization};
 
     #[test]
     fn fresh_names_the_base_segment() {
@@ -139,10 +176,11 @@ mod tests {
         assert_eq!(m.dimension, 8);
         assert_eq!(m.next_id, 1);
         assert_eq!(m.version, 1);
+        assert_eq!(m.profile, OpenProfile::default());
     }
 
     #[test]
-    fn encode_decode_round_trip() {
+    fn encode_decode_round_trip_empty_profile() {
         let m = Manifest {
             format_version: FORMAT_VERSION,
             dimension: 384,
@@ -150,10 +188,58 @@ mod tests {
             segments: vec!["data".into(), "seg-00000001".into(), "seg-00000002".into()],
             next_id: 3,
             version: 7,
+            profile: OpenProfile::default(),
         };
         let bytes = m.encode().unwrap();
         let back = Manifest::decode(&bytes).unwrap();
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn encode_decode_round_trip_populated_profile() {
+        let m = Manifest {
+            format_version: FORMAT_VERSION,
+            dimension: 384,
+            distance: Distance::Cosine,
+            segments: vec!["data".into()],
+            next_id: 1,
+            version: 1,
+            profile: OpenProfile {
+                ann: Some(AnnConfig::hnsw()),
+                quantization: Some(Quantization::int8()),
+                query_threads: Some(4),
+                mmap: Some(true),
+            },
+        };
+        let bytes = m.encode().unwrap();
+        let back = Manifest::decode(&bytes).unwrap();
+        assert_eq!(back, m);
+    }
+
+    /// The gap that would let a broken change go green: decode a hand-built v1 byte blob
+    /// (no `profile` field at all) and confirm it lifts into a v2 `Manifest` with an empty
+    /// profile, WITHOUT ever calling the current `encode` (which always emits v2).
+    #[test]
+    fn decode_lifts_a_hand_built_v1_blob() {
+        let v1 = ManifestV1 {
+            format_version: 1,
+            dimension: 8,
+            distance: Distance::Cosine,
+            segments: vec![BASE_SEGMENT.to_string()],
+            next_id: 1,
+            version: 1,
+        };
+        let payload = bincode::serialize(&v1).unwrap();
+        let crc = crc32fast::hash(&payload);
+        let mut bytes = Vec::with_capacity(4 + payload.len());
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+
+        let m = Manifest::decode(&bytes).unwrap();
+        assert_eq!(m.format_version, 1);
+        assert_eq!(m.dimension, 8);
+        assert_eq!(m.segments, vec![BASE_SEGMENT.to_string()]);
+        assert_eq!(m.profile, OpenProfile::default());
     }
 
     #[test]

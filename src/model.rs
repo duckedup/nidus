@@ -24,7 +24,7 @@ pub enum Distance {
 }
 
 /// Which quantization scheme the store maintains for the search first pass.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuantKind {
     /// int8 scalar quantization — 4× smaller than f32, valid for any distance metric.
     Int8,
@@ -37,7 +37,7 @@ pub enum QuantKind {
 /// Configuration for vector quantization. When enabled, the store maintains an
 /// in-memory quantized matrix for faster first-pass scoring, then re-ranks the top
 /// candidates using the original f32 vectors for accuracy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quantization {
     /// Which quantization scheme drives the first pass.
     pub kind: QuantKind,
@@ -82,7 +82,7 @@ impl Default for Quantization {
 /// Which approximate-nearest-neighbour index the store builds when ANN search is
 /// enabled via [`crate::Config::ann`]. ANN is an **opt-in** mode: with no `ann`
 /// configured, search is exact brute-force (the default), and none of this applies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AnnKind {
     /// Hierarchical Navigable Small World graph. Native incremental insert (matches
     /// nidus's append-only upsert), high recall, no training pass. The default.
@@ -96,7 +96,7 @@ pub enum AnnKind {
 /// Configuration for approximate-nearest-neighbour search. Set on [`crate::Config::ann`], the store
 /// maintains an in-RAM index and `search` walks it for an over-fetched candidate set, then applies
 /// scope/filter/`min_score` and an exact f32 rerank — recall traded for speed past brute force.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnnConfig {
     /// Which index drives the candidate walk.
     pub kind: AnnKind,

@@ -47,6 +47,7 @@ mod meta;
 // in-process by an embedding application (nidus-abx.4).
 pub mod metrics;
 mod model;
+mod profile;
 mod search;
 mod store;
 
@@ -103,6 +104,7 @@ pub use model::{
     OrderBy, Predicate, Projection, QuantKind, Quantization, RankBy, Record, Role, SearchOpts,
     Value,
 };
+pub use profile::OpenProfile;
 pub use store::Readiness;
 
 use std::collections::BTreeMap;
@@ -166,6 +168,24 @@ impl Nidus {
     /// The configuration this store was opened with.
     pub fn config(&self) -> &Config {
         self.store.config()
+    }
+
+    /// The store's currently recorded open-time profile (nidus-141) — see [`OpenProfile`].
+    pub fn open_profile(&self) -> &OpenProfile {
+        self.store.open_profile()
+    }
+
+    /// Record `p` as the store's open-time profile so every later [`open`](Self::open)
+    /// resolves ann/quantization/query_threads/mmap without re-passing them. An explicit
+    /// act, never implied by a single call's flags.
+    pub fn set_open_profile(&mut self, p: &OpenProfile) -> Result<()> {
+        self.store.set_open_profile(p)
+    }
+
+    /// Clear the recorded profile — later opens fall back to built-in defaults unless
+    /// overridden by an explicit [`Config`] flag.
+    pub fn clear_open_profile(&mut self) -> Result<()> {
+        self.store.clear_open_profile()
     }
 
     /// A cheap snapshot of the store's vector footprint — rows, dead rows,
