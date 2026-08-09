@@ -11,4 +11,6 @@ mod mcp;
 #[cfg(feature = "mcp")]
 mod memory_http;
 mod scale;
+#[cfg(all(feature = "mcp", feature = "embed-ollama"))]
+mod serve_dim;
 mod server;

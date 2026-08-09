@@ -892,3 +892,43 @@ fn memory_subcommands_without_an_embedder_name_the_flag() {
         );
     }
 }
+
+/// #140 through the real binary: `compact --expired` reclaims the entries whose
+/// `nidus.expires_at` has passed and leaves everything else alone. No embedder needed —
+/// `nidus.expires_at` is a plain attr an ordinary upsert can write, which is exactly why
+/// the sweep is not behind the `memory` feature.
+#[test]
+fn compact_expired_reclaims_only_past_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    let records = json!([
+        {"id": "past", "vector": [1, 0, 0],
+         "attrs": {"nidus.expires_at": {"DateTime": 1_000}}},
+        {"id": "future", "vector": [0, 1, 0],
+         "attrs": {"nidus.expires_at": {"DateTime": 32_503_680_000_000i64}}},
+        {"id": "never", "vector": [0, 0, 1], "attrs": {}}
+    ])
+    .to_string();
+    assert_eq!(
+        ok(&["upsert", "--dir", dir, "docs"], &records)["upserted"],
+        3
+    );
+
+    let out = ok(&["compact", "--dir", dir, "--expired"], "");
+    assert_eq!(out["swept"], 1, "only the past-expiry entry: {out}");
+
+    let remaining = ok(&["list", "--dir", dir, "docs"], "");
+    let mut ids: Vec<&str> = remaining
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|h| h["id"].as_str().expect("an id"))
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["future", "never"], "{remaining}");
+
+    let stats = ok(&["stats", "--dir", dir], "");
+    assert_eq!(stats["footprint"]["dead_rows"], 0, "swept: {stats}");
+}
