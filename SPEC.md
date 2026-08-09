@@ -1034,10 +1034,14 @@ build until a real need exists.
   no background threads and has no periodic sweep, so nothing else *can* hide an
   expired entry: a compaction-only design would leave expired entries recallable
   until whenever `compact` next ran, which is not expiry. The guard is a predicate
-  AND-ed into the caller's filter on every MCP read tool, in the true-complement
-  form `Not(Le(nidus.expires_at, now))` — a bare `Gt`/`Ge` is false on an absent
+  AND-ed into the caller's filter on every memory read — all MCP read tools,
+  `Memory::recall`, and HTTP `/recall` — in the true-complement form
+  `Not(Le(nidus.expires_at, now))` — a bare `Gt`/`Ge` is false on an absent
   key (§7 range semantics) and would silently hide every entry that never got a
   TTL. `get` bypasses `Filter` entirely, so it carries the same check by hand.
+  The raw store surfaces (`search`/`list`/`get_all` and their HTTP routes) stay
+  unguarded on purpose: TTL is a memory-layer contract, and raw access must see
+  what the store holds.
   Physical reclaim stays a separate, caller-triggered concern reached through
   `delete_where` + `compact` (§8); it is deliberately not new logic inside
   `compact`'s per-doc re-emission loop.
