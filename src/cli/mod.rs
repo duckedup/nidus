@@ -918,6 +918,18 @@ enum Command {
         #[arg(long = "in", short = 'i')]
         input: String,
     },
+    /// Verify every live segment's checksum sidecar against its on-disk bytes (#160):
+    /// a live-store integrity check, unlike `verify` (which checks a backup archive).
+    /// Exits non-zero, naming the segment, on the first mismatch found.
+    Check {
+        /// Store directory to check (the source when `--persistence` is omitted).
+        #[arg(long, short = 'd')]
+        dir: PathBuf,
+        /// Check a store at this persistence location instead of `--dir` — e.g.
+        /// `s3://bucket/store` or `gs://bucket/store`.
+        #[arg(long)]
+        persistence: Option<String>,
+    },
     /// Print store footprint and collections (JSON).
     Stats {
         #[command(flatten)]
@@ -1344,6 +1356,10 @@ pub fn run(cli: Cli) -> Result<()> {
             print_json(&backup::restore(&input, &target, yes)?)
         }
         Command::Verify { input } => print_json(&backup::verify(&input)?),
+        Command::Check { dir, persistence } => {
+            let source = persistence.unwrap_or_else(|| dir.to_string_lossy().into_owned());
+            print_json(&backup::check(&source)?)
+        }
         Command::Stats { store } => {
             let db = open(&store, false)?;
             print_json(&serde_json::json!({
@@ -2202,6 +2218,33 @@ mod tests {
         match cli.command {
             Command::Verify { input } => assert_eq!(input, "/tmp/s.tar.gz"),
             _ => panic!("expected Verify"),
+        }
+    }
+
+    #[test]
+    fn check_parses_dir_and_persistence() {
+        let cli = Cli::try_parse_from(["nidus", "check", "-d", "/tmp/s"]).unwrap();
+        match cli.command {
+            Command::Check { dir, persistence } => {
+                assert_eq!(dir, PathBuf::from("/tmp/s"));
+                assert_eq!(persistence, None);
+            }
+            _ => panic!("expected Check"),
+        }
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "check",
+            "-d",
+            "/tmp/s",
+            "--persistence",
+            "s3://bucket/store",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Check { persistence, .. } => {
+                assert_eq!(persistence.as_deref(), Some("s3://bucket/store"));
+            }
+            _ => panic!("expected Check"),
         }
     }
 

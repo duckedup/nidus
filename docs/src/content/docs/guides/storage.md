@@ -1,6 +1,6 @@
 ---
 title: Storage & durability
-description: The nidus on-disk format, the per-batch fsync contract, crash recovery, compaction, and lock-free cross-process readers.
+description: The nidus on-disk format, the per-batch fsync contract, crash recovery, checking a store for in-place corruption, compaction, and lock-free cross-process readers.
 ---
 
 nidus is durable by design with a tiny surface: two append-only files and a lock.
@@ -21,6 +21,7 @@ to share the in-memory index across processes via Redis, see
   log       append-only framed op stream: [len][bincode(Op)][crc32] (the commit record)
   lock      O_EXCL writer-exclusion lock file
   seg-…     additional immutable segments (only once a store seals past the threshold)
+  data.crc, seg-….crc   checksum sidecars for sealed segments, see "Checking for corruption" below
 ```
 
 All on-disk encoding is **little-endian and explicit**. Every `log` record is
@@ -72,6 +73,31 @@ Resource exhaustion never corrupts a store:
   where the kernel SIGKILLs before an allocation fails.
   [`Nidus::footprint()`](/reference/api/#footprint) is the introspection hook for
   deciding whether you can afford more data.
+
+## Checking for corruption
+
+Everything above protects against a crash mid-write. It says nothing about bytes that
+change after a successful write: a bad sector, a stray write from something else on the
+disk, a copy that dropped a byte. Before this, `data` and `seg-…` carried no checksum
+over the vector rows themselves (only the 64-byte header's magic and version were
+validated), so a flipped byte inside a row changed no row count and no header: the
+store opened cleanly and returned wrong scores forever.
+
+Every **sealed** segment (an immutable `seg-…`, or `data` once something else becomes
+the active segment) now gets a small sidecar object, `<segment>.crc`, stamped the
+moment the segment becomes immutable: at seal time, and again at compaction, which
+restamps the rewritten base segment and drops the sidecars of the segments it collapses
+away. [`nidus check`](/guides/cli-and-server/#checking-a-live-store) recomputes each
+sealed segment's checksum and compares it against its sidecar.
+
+A mismatch is real corruption, reported plainly and never silently recomputed and
+re-saved (doing that over already-corrupted bytes would just launder the corruption
+into a fresh, valid-looking checksum). What it does not cover, on purpose: a sidecar is
+only stamped once a segment is immutable, so rows appended to the still-open active
+segment since the last seal are unverified, not vouched-for-clean, until the next seal
+covers them. `log`'s own tolerance of a CRC-bad *tail* record as a torn write is
+deliberate crash recovery (above) and stays exactly as it is: this check does not touch
+it.
 
 ## Compaction
 

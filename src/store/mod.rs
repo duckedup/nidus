@@ -29,6 +29,7 @@ mod read;
 mod scoring;
 mod text;
 mod write;
+pub use write::SegmentReport;
 
 #[cfg(test)]
 mod tests;

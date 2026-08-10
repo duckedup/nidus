@@ -96,6 +96,7 @@ pub use backend::{
 };
 pub use cancel::Cancel;
 pub use config::{Config, Fsync, LeaseWait, OpenMode};
+pub use data::SegmentIntegrity;
 pub use fts::{Analyzer, FtsField, Language};
 pub use meta::META_EXPIRES_AT;
 pub use model::{
@@ -106,6 +107,7 @@ pub use model::{
 };
 pub use profile::OpenProfile;
 pub use store::Readiness;
+pub use store::SegmentReport;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -447,5 +449,12 @@ impl Nidus {
     /// `upsert`/`flush`, so call it before shutting down a long-lived handle; `compact()` also does.
     pub fn persist_index(&mut self) -> Result<()> {
         self.store.persist_index()
+    }
+
+    /// Check every live segment's vector bytes against its checksum sidecar (#160). Rows written
+    /// since the last [`flush`](Self::flush) are reported as *not covered* rather than verified,
+    /// and a mismatch is reported, never repaired: re-checksumming corrupt bytes would hide them.
+    pub fn verify_integrity(&mut self) -> Result<Vec<SegmentReport>> {
+        self.store.verify_integrity()
     }
 }

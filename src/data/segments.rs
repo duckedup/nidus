@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
-use super::{DataSegment, HEADER_LEN};
+use super::{DataSegment, HEADER_LEN, checksum};
 use crate::backend::{Persistence, appender_for};
 use crate::manifest::{BASE_SEGMENT, Manifest};
 use crate::model::Distance;
@@ -312,6 +312,19 @@ impl Segments {
             }
             None => DataSegment::in_memory_with(self.dimension(), self.distance),
         };
+
+        // Stamp the checksum sidecar for the segment this seal just made immutable — its
+        // row set is now final and will never be appended to again.
+        if let Some(p) = self.persistence.as_deref() {
+            let last = self.segs.len() - 1;
+            let dim = self.dimension();
+            let sealed_name = self.segs[last].name.clone();
+            let rows = self.segs[last].data.row_count();
+            let key = checksum::key(&sealed_name, dim, self.distance);
+            let crc = checksum::compute(&mut self.segs[last].data, rows)?;
+            checksum::save(p, &sealed_name, &key, rows, crc)?;
+        }
+
         self.next_id += 1;
         self.version += 1;
         self.base.push(new_base);
@@ -346,10 +359,47 @@ impl Segments {
             self.segs[0].data.rewrite(rows)?;
             self.segs[0].name = BASE_SEGMENT.to_string();
         }
+
+        // Restamp the rewritten base's sidecar — its old one is invalid the instant compaction
+        // changes the bytes — and drop the now-unreferenced segments' own sidecars with them.
+        if let Some(p) = self.persistence.as_deref() {
+            let dim = self.dimension();
+            let row_count = self.segs[0].data.row_count();
+            let key = checksum::key(BASE_SEGMENT, dim, self.distance);
+            let crc = checksum::compute(&mut self.segs[0].data, row_count)?;
+            checksum::save(p, BASE_SEGMENT, &key, row_count, crc)?;
+            for name in &dropped {
+                p.delete(&checksum::object_name(name))?;
+            }
+        }
+
         self.segs.truncate(1);
         self.base = vec![0];
         self.version += 1;
         Ok(dropped)
+    }
+
+    /// Verify every live segment's checksum sidecar, in segment order (last = active — normally
+    /// unverified, since a sidecar is only stamped once a segment becomes immutable). No
+    /// persistence backend means no sidecars, so every segment reports `NoChecksum`.
+    pub fn verify_checksums(&mut self) -> Result<Vec<checksum::SegmentIntegrity>> {
+        let dim = self.dimension();
+        let distance = self.distance;
+        let Some(p) = self.persistence.as_deref() else {
+            return Ok(self
+                .segs
+                .iter()
+                .map(|s| checksum::SegmentIntegrity::NoChecksum {
+                    rows_total: s.data.row_count(),
+                })
+                .collect());
+        };
+        let mut out = Vec::with_capacity(self.segs.len());
+        for seg in &mut self.segs {
+            let key = checksum::key(&seg.name, dim, distance);
+            out.push(checksum::verify(&mut seg.data, p, &seg.name, &key)?);
+        }
+        Ok(out)
     }
 
     /// A manifest snapshot of the current segment set — what seal/compaction persist. `profile`

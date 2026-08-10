@@ -4,6 +4,7 @@
 
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -18,13 +19,22 @@ use crate::{Config, Nidus, OpenMode};
 /// Embedded report entry name (informational; restore tolerates its absence).
 const MANIFEST: &str = "nidus-backup.json";
 
-/// Is `name` part of a store's durable object set? (`ann`/`fts` caches and `lock`
-/// are rebuildable/transient and deliberately excluded, #130.)
+/// Is `name` part of a store's durable object set? `ann`/`fts`/`lock` are
+/// rebuildable/transient and deliberately excluded (#130); a `.crc` sidecar is neither,
+/// so it is named explicitly here rather than relying on the `seg-` prefix by accident (#160).
 fn is_store_object(name: &str) -> bool {
     name == "data"
         || name == "log"
         || name == crate::manifest::MANIFEST_KEY
         || name.starts_with("seg-")
+        || name.ends_with(".crc")
+}
+
+/// `<segment>.crc`'s bytes, if the sidecar exists — absent for a segment that has never
+/// been sealed (the checksum is only stamped once a segment becomes immutable, #160).
+fn checksum_sidecar(src: &dyn Persistence, segment: &str) -> Result<Option<(String, Vec<u8>)>> {
+    let name = format!("{segment}.crc");
+    Ok(src.get(&name)?.map(|bytes| (name, bytes)))
 }
 
 /// What a backup recorded, printed as JSON by the CLI.
@@ -120,6 +130,18 @@ pub fn backup(source: &str, out_location: &str) -> Result<BackupReport> {
     let (dimension, distance) = crate::data::header_from_bytes(&data)
         .with_context(|| format!("{source} has no readable nidus header"))?;
 
+    // Each segment's `.crc` sidecar (#160): the checksum that makes the archived vector
+    // bytes independently verifiable, absent only for a segment never sealed.
+    let mut checksums: Vec<(String, Vec<u8>)> = Vec::new();
+    if let Some(entry) = checksum_sidecar(src.as_ref(), "data")? {
+        checksums.push(entry);
+    }
+    for name in &sealed {
+        if let Some(entry) = checksum_sidecar(src.as_ref(), name)? {
+            checksums.push(entry);
+        }
+    }
+
     let created_unix = now_unix();
     let segment_bytes: u64 = segments.iter().map(|(_, b)| b.len() as u64).sum();
 
@@ -127,6 +149,9 @@ pub fn backup(source: &str, out_location: &str) -> Result<BackupReport> {
     // since nothing else can mutate these bytes between the read and the checksum.
     let mut objects: Vec<ObjectSum> = vec![object_sum("data", &data)];
     for (name, bytes) in &segments {
+        objects.push(object_sum(name, bytes));
+    }
+    for (name, bytes) in &checksums {
         objects.push(object_sum(name, bytes));
     }
     if let Some(bytes) = &store_manifest {
@@ -142,6 +167,9 @@ pub fn backup(source: &str, out_location: &str) -> Result<BackupReport> {
         let mut tar = tar::Builder::new(gz);
         append_bytes(&mut tar, "data", &data, created_unix)?;
         for (name, bytes) in &segments {
+            append_bytes(&mut tar, name, bytes, created_unix)?;
+        }
+        for (name, bytes) in &checksums {
             append_bytes(&mut tar, name, bytes, created_unix)?;
         }
         // Verbatim bytes: the manifest is CRC-framed, so re-encoding it would break it.
@@ -213,12 +241,15 @@ pub fn restore(
         bail!("aborted: {target_location} already contains a store (pass -y/--yes to overwrite)");
     }
 
-    // Clear the target's segment state before writing: a pre-existing `manifest` or
-    // `seg-*` the archive does not carry would otherwise point at segments that no
-    // longer match the restored `data`/`log` (#130).
+    // Clear the target's segment state before writing: a pre-existing `manifest`, `seg-*`,
+    // or `.crc` sidecar the archive does not carry would otherwise point at (or vouch for)
+    // segments that no longer match the restored `data`/`log` (#130, #160).
     let _ = target.delete(crate::manifest::MANIFEST_KEY);
     if let Ok(existing) = target.list() {
-        for name in existing.iter().filter(|n| n.starts_with("seg-")) {
+        for name in existing
+            .iter()
+            .filter(|n| n.starts_with("seg-") || n.ends_with(".crc"))
+        {
             target
                 .delete(name)
                 .with_context(|| format!("failed to remove stale `{name}` at the target"))?;
@@ -382,6 +413,84 @@ pub fn verify(in_location: &str) -> Result<VerifyReport> {
         records: db.footprint().doc_count,
         objects_checked,
         archive_bytes: archive.len() as u64,
+    })
+}
+
+/// One segment's checksum status, as reported by `nidus check` (#160).
+#[derive(Debug, Serialize)]
+pub struct SegmentCheck {
+    pub name: String,
+    pub rows_covered: u64,
+    pub rows_total: u64,
+    /// `"verified"` (fully covered), `"partially_verified"` (a stamped sidecar plus an
+    /// unstamped tail — not a failure), or `"no_checksum"` (never sealed/stamped).
+    pub status: &'static str,
+}
+
+/// What `nidus check` found across every live segment, printed as JSON by the CLI.
+#[derive(Debug, Serialize)]
+pub struct CheckReport {
+    pub store: String,
+    pub segments: Vec<SegmentCheck>,
+}
+
+/// Verify every live segment's checksum sidecar against its current row bytes (#160),
+/// naming the segment and erring on the first mismatch. Opens segments directly and
+/// read-only, without a writer lock — safe alongside a running `nidus serve` (SPEC §6.2).
+pub fn check(source: &str) -> Result<CheckReport> {
+    let p = crate::open_persistence(source)?;
+    let manifest_bytes = p.get(crate::manifest::MANIFEST_KEY)?;
+    let data = p
+        .get("data")?
+        .with_context(|| format!("no nidus store at {source} (no `data` object)"))?;
+    let (dimension, distance) = crate::data::header_from_bytes(&data)
+        .with_context(|| format!("{source} has no readable nidus header"))?;
+    let manifest = match manifest_bytes {
+        Some(bytes) => crate::manifest::Manifest::decode(&bytes)
+            .with_context(|| format!("{source} has an unreadable `manifest` object"))?,
+        None => crate::manifest::Manifest::fresh(dimension, distance),
+    };
+
+    let persistence: Arc<dyn Persistence> = p.into();
+    let mut segs = crate::data::Segments::open(persistence, &manifest, None, false, false)?;
+    let integrities = segs.verify_checksums()?;
+
+    let mut segments = Vec::with_capacity(integrities.len());
+    for (name, integrity) in manifest.segments.iter().zip(integrities) {
+        segments.push(match integrity {
+            crate::data::SegmentIntegrity::Ok {
+                rows_covered,
+                rows_total,
+            } => SegmentCheck {
+                name: name.clone(),
+                rows_covered,
+                rows_total,
+                status: if rows_covered == rows_total {
+                    "verified"
+                } else {
+                    "partially_verified"
+                },
+            },
+            crate::data::SegmentIntegrity::NoChecksum { rows_total } => SegmentCheck {
+                name: name.clone(),
+                rows_covered: 0,
+                rows_total,
+                status: "no_checksum",
+            },
+            crate::data::SegmentIntegrity::Mismatch {
+                rows_covered,
+                expected,
+                actual,
+            } => bail!(
+                "segment `{name}` failed checksum verification: {rows_covered} rows covered, \
+                 expected crc32 {expected:#010x}, got {actual:#010x} — the segment is corrupt"
+            ),
+        });
+    }
+
+    Ok(CheckReport {
+        store: source.to_string(),
+        segments,
     })
 }
 
@@ -882,5 +991,125 @@ mod tests {
         let report = verify(&archive.to_string_lossy()).unwrap();
         assert_eq!(report.objects_checked, 0);
         assert_eq!(report.records, 2);
+    }
+
+    /// #160: `compact` stamps `data.crc` even for a default (unsegmented) store. The
+    /// sidecar must survive backup -> restore *and* the restored store must still verify
+    /// clean — surviving alone isn't enough, since a corrupt sidecar would also survive.
+    #[test]
+    fn restored_store_preserves_checksum_sidecar_and_verifies() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let archive = src.path().join("snap.tar.gz");
+
+        let mut db = Nidus::open(Config::new(src.path().to_path_buf(), 3)).unwrap();
+        db.upsert(
+            "docs",
+            &[rec("a", vec![1.0, 0.0, 0.0]), rec("b", vec![0.0, 1.0, 0.0])],
+        )
+        .unwrap();
+        db.compact().unwrap();
+        drop(db);
+        assert!(
+            src.path().join("data.crc").exists(),
+            "test premise: compact must stamp data.crc"
+        );
+
+        backup(&src.path().to_string_lossy(), &archive.to_string_lossy()).unwrap();
+        let restored = dst.path().join("store");
+        restore(
+            &archive.to_string_lossy(),
+            &restored.to_string_lossy(),
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            restored.join("data.crc").exists(),
+            "the checksum sidecar must survive the restore"
+        );
+        let report = check(&restored.to_string_lossy()).unwrap();
+        let data_seg = report.segments.iter().find(|s| s.name == "data").unwrap();
+        assert_eq!(
+            data_seg.status, "verified",
+            "restored data segment must verify clean: {report:?}"
+        );
+    }
+
+    /// A backup made before the sidecar landed on the target (stale `data.crc` from an
+    /// earlier store) must not survive a restore that overwrites `data` without one.
+    #[test]
+    fn restore_clears_a_stale_checksum_sidecar_the_archive_does_not_carry() {
+        let src = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let archive = src.path().join("snap.tar.gz");
+
+        // Target already has a stamped checksum from its own (different) data.
+        let mut old = Nidus::open(Config::new(target.path().to_path_buf(), 3)).unwrap();
+        old.upsert("docs", &[rec("z", vec![0.0, 0.0, 1.0])])
+            .unwrap();
+        old.compact().unwrap();
+        drop(old);
+        assert!(target.path().join("data.crc").exists());
+
+        // Construct an archive that carries no sidecar: flush stamps one, so drop it before
+        // backing up. That is the case a pre-#160 archive presents on restore.
+        make_store(src.path());
+        std::fs::remove_file(src.path().join("data.crc")).unwrap();
+        backup(&src.path().to_string_lossy(), &archive.to_string_lossy()).unwrap();
+
+        restore(
+            &archive.to_string_lossy(),
+            &target.path().to_string_lossy(),
+            true,
+        )
+        .unwrap();
+        assert!(
+            !target.path().join("data.crc").exists(),
+            "a stale sidecar from the old target content must not survive restore"
+        );
+    }
+
+    /// #160: `check` must exit non-zero (an `Err`, naming the segment) when a segment's
+    /// row bytes no longer match its stamped checksum.
+    #[test]
+    fn check_errs_naming_the_corrupt_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Nidus::open(Config::new(dir.path().to_path_buf(), 3)).unwrap();
+        db.upsert(
+            "docs",
+            &[rec("a", vec![1.0, 2.0, 3.0]), rec("b", vec![4.0, 5.0, 6.0])],
+        )
+        .unwrap();
+        db.compact().unwrap();
+        drop(db);
+        assert!(dir.path().join("data.crc").exists());
+
+        // Flip a byte inside the row region (past the 64-byte header) of `data`.
+        let path = dir.path().join("data");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[70] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = check(&dir.path().to_string_lossy())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("data"), "{err}");
+        assert!(err.contains("checksum"), "{err}");
+    }
+
+    /// A segment with no sidecar (one written before #160, or whose sidecar was lost) must be
+    /// reported honestly as `no_checksum` rather than as verified or as a failure. `flush`
+    /// stamps one, so the absent case is constructed by removing it.
+    #[test]
+    fn check_reports_no_checksum_for_a_never_stamped_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        make_store(dir.path());
+        std::fs::remove_file(dir.path().join("data.crc")).unwrap();
+
+        let report = check(&dir.path().to_string_lossy()).unwrap();
+        assert_eq!(report.segments.len(), 1);
+        assert_eq!(report.segments[0].name, "data");
+        assert_eq!(report.segments[0].status, "no_checksum");
     }
 }

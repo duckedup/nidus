@@ -4,17 +4,27 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use super::{Collection, DocEntry, Store, oom};
 use crate::backend::CasOutcome;
 use crate::config::{Fsync, OpenMode};
+use crate::data::SegmentIntegrity;
 use crate::filter;
 use crate::fts::FtsField;
 use crate::manifest::MANIFEST_KEY;
 use crate::model::{Distance, Filter, Op, Record, Value};
 use crate::profile::OpenProfile;
 use crate::search::normalize;
+
+/// One live segment's checksum-sidecar finding, named so a mismatch identifies exactly which
+/// segment's bytes disagree with its sidecar (#160). Order matches the manifest: oldest first,
+/// active (normally only partially covered) last.
+#[derive(Debug, Clone)]
+pub struct SegmentReport {
+    pub segment: String,
+    pub integrity: SegmentIntegrity,
+}
 
 impl Store {
     /// Reject mutations in ReadOnly mode and, in cluster mode, renew/fence the writer lease
@@ -586,10 +596,60 @@ impl Store {
         // Seal a large active-segment tail into an immutable segment (SPEC §14.4). No-op
         // unless `segment_max_rows` is set and the tail is over it.
         self.maybe_seal()?;
+        // Refresh the active segment's checksum sidecar (#160) — after the durable barrier
+        // above, never inside it. Best-effort: a save failure must not fail the flush, since
+        // the next flush simply covers more rows.
+        let _ = self.refresh_active_checksum();
         // Refresh the shared working set so peers skip a rebuild (SPEC §13.3). Best-effort
         // and a no-op without an external memory tier — never fails the durable flush.
         self.publish_working_set();
         Ok(())
+    }
+
+    /// Recompute and save the checksum sidecar for the *active* segment, covering its rows as
+    /// of right now — the same on-disk encoding `data::checksum` uses (private to
+    /// `crate::data`), so `Segments::verify_checksums` reads it unchanged. No-op in-memory/RO.
+    fn refresh_active_checksum(&mut self) -> Result<()> {
+        if self.in_memory || self.config.open_mode == OpenMode::ReadOnly {
+            return Ok(());
+        }
+        let Some(p) = self.persistence.clone() else {
+            return Ok(());
+        };
+        let name = self
+            .data
+            .manifest(self.open_profile.clone())
+            .segments
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow!("manifest names no segments"))?;
+        let dim = self.data.dimension();
+        let rows = self.data.active_rows();
+        let base = self.data.row_count() - rows;
+
+        let mut hasher = crc32fast::Hasher::new();
+        for r in base..base + rows {
+            for &f in self.data.row(r) {
+                hasher.update(&f.to_le_bytes());
+            }
+        }
+        let crc = hasher.finalize();
+
+        let key = crate::data::checksum_key(&name, dim, self.config.distance);
+        crate::data::checksum_save(p.as_ref(), &name, &key, rows, crc)
+    }
+
+    /// Verify every live segment's checksum sidecar (#160), most-recent (active) last. A
+    /// mismatch is reported, never repaired — recomputing over corrupted bytes would launder
+    /// the corruption. The public half; a `Nidus` wrapper in `src/lib.rs` is out of scope here.
+    pub fn verify_integrity(&mut self) -> Result<Vec<SegmentReport>> {
+        let names = self.data.manifest(self.open_profile.clone()).segments;
+        let integrities = self.data.verify_checksums()?;
+        Ok(names
+            .into_iter()
+            .zip(integrities)
+            .map(|(segment, integrity)| SegmentReport { segment, integrity })
+            .collect())
     }
 
     pub fn compact(&mut self) -> Result<()> {

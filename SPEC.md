@@ -1460,12 +1460,18 @@ byte objects** in two **classes**:
 | `log` | **source of truth** | no | append + fsync |
 | `ann` | derived cache | yes (from data/log) | atomic temp+fsync+rename, best-effort load |
 | `fts` | derived cache | yes (from data/log) | atomic temp+fsync+rename, best-effort load |
+| `data.crc` / `seg-NNNNNNNN.crc` | integrity sidecar | yes, but never rebuilt automatically | atomic whole-object write, stamped once at seal/compaction |
 
 - **Source of truth** (`data`, `log`) must be durable and is append-shaped — small,
   incremental streams.
 - **Derived caches** (`ann`, `fts`, the in-RAM quant matrices) are *reconstructable* from
   data/log; a missing/stale/corrupt cache is never fatal (§9, `index_cache.rs`). A backend
   may persist them or **drop and rebuild on open**.
+- **Integrity sidecars** (`data.crc`, one per sealed `seg-NNNNNNNN.crc`) sit in a third
+  class: unlike `ann`/`fts`, a *mismatch* is never silently discarded and rebuilt — doing
+  that over already-corrupted row bytes would launder the corruption into a fresh,
+  valid-looking checksum. A missing/stale one is only "unverified," never fatal, and is the
+  one derived object `nidus check` (§13.7) reads rather than rebuilds on demand.
 
 Only `data`+`log` must be shipped durably; the large, append-hostile HNSW graph is exactly
 the artifact a backend is free to discard. Members:
@@ -1644,12 +1650,33 @@ minute — CI asserts it (§9, the build-time gate).**
   reopens the extracted store read-only to confirm the expected dimension, distance,
   collections, and record count; `nidus backup --verify` runs the same check right after
   writing, reading the archive back from its destination rather than trusting the local
-  write. **The gap it does not close:** `src/data/*.rs` carries no checksum over vector row
-  bytes at all (only the 64-byte header's magic and version are validated), and `src/log/`
-  deliberately tolerates a CRC-bad tail record as a torn write (correct crash recovery,
-  §6.1). The archive-level CRC closes this for *archives*; a store corrupted in place on
-  disk still opens clean and returns wrong scores. Archives written before 0.57 predate the
-  baseline; verify falls back to the structural check and reports `objects_checked: 0`.
+  write. Archives written before 0.57 predate the baseline; verify falls back to the
+  structural check and reports `objects_checked: 0`. **What it covers, and what it always
+  left out:** the archive-level CRC is a claim about *archives*. It has never said anything
+  about a store that rots in place on local disk between backups — that is a separate gap,
+  closed separately by the checksum sidecars below, checked by `nidus check`, not by
+  `verify` growing a new mode.
+- **Live checksum sidecars (built, nidus-160).** Closes the in-place gap named above: before
+  this, `src/data/*.rs` validated only the 64-byte header's magic and version, never the
+  vector row bytes, so a flipped byte on disk changed no row count and no header and the
+  store opened clean and scored wrong forever. Now every **sealed** segment (`data` once
+  something supersedes it as active, and every `seg-NNNNNNNN`) gets a per-segment sidecar
+  object (`<segment>.crc`) stamped the instant it becomes immutable — at seal time
+  (`Segments::seal`) and again at compaction, which restamps the rewritten base and drops
+  the sidecars of the segments it collapses away. `nidus check` recomputes each sealed
+  segment's checksum and compares it to its sidecar; a mismatch is reported and never
+  silently recomputed-and-resaved (that would launder real corruption into a fresh,
+  valid-looking checksum — see `src/data/checksum.rs`). **What still does not hold, by
+  design:** a sidecar is stamped only when a segment goes immutable, not on every append, so
+  rows written to the still-open active segment after the last seal/compaction are
+  unverified rather than vouched-for-clean until the next seal covers them. `src/log/`'s
+  deliberate tolerance of a CRC-bad *tail* record as a torn write (§6.1, correct crash
+  recovery) is unchanged and out of scope for this check. This adds a new sidecar *object*
+  per segment; it changes nothing about the `data` segment's own byte layout (§5.1, §9's
+  "none changed the vector data layout" still holds). The backup archive's object set does
+  not capture the sidecar either (`src/cli/backup.rs`'s `is_store_object` excludes it, the
+  same way it excludes the `ann`/`fts` caches): a sidecar is read where it lives, by
+  `nidus check` against a live store, not by `nidus verify`/`restore` against an archive.
 
 ---
 

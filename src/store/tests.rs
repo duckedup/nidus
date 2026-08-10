@@ -6,8 +6,10 @@ use std::collections::BTreeMap;
 
 use super::quant::{BinState, Int8State, Quant};
 use super::scoring::PARALLEL_SCAN_WORK_FLOOR;
+use super::write::SegmentReport;
 use super::*;
 use crate::Fsync;
+use crate::data::SegmentIntegrity;
 use crate::model::{
     Filter, Hit, ListOpts, Predicate, Projection, Quantization, Record, SearchOpts, Value,
 };
@@ -7051,4 +7053,113 @@ fn set_open_profile_rejects_a_combination_that_could_never_open() {
     drop(store);
     Store::open(Config::new(&path, 3).distance(Distance::Euclidean))
         .expect("the store must still open: nothing unbuildable was persisted");
+}
+
+// ── Checksum sidecar integrity (#160) ──────────────────────────────────
+
+#[cfg_attr(miri, ignore)] // fsync
+#[test]
+fn flush_writes_a_checksum_sidecar_and_verify_comes_back_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let mut store = Store::open(Config::new(&path, 2)).unwrap();
+    store
+        .upsert("col", &[rec("a", vec![1.0, 0.0]), rec("b", vec![0.0, 1.0])])
+        .unwrap();
+    store.flush().unwrap();
+
+    let reports = store.verify_integrity().unwrap();
+    assert!(!reports.is_empty());
+    for r in &reports {
+        match r.integrity {
+            SegmentIntegrity::Ok {
+                rows_covered,
+                rows_total,
+            } => assert_eq!(
+                rows_covered, rows_total,
+                "segment {} should be fully covered right after flush",
+                r.segment
+            ),
+            other => panic!("segment {}: expected Ok, got {other:?}", r.segment),
+        }
+    }
+}
+
+/// Rows appended after the last `flush` (with no further flush) must be reported
+/// uncovered, not silently treated as verified.
+#[cfg_attr(miri, ignore)] // fsync
+#[test]
+fn verify_reports_rows_written_after_flush_as_uncovered() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let mut store = Store::open(Config::new(&path, 2)).unwrap();
+    store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+    store.flush().unwrap();
+
+    // Appended, but no flush after this — the sidecar must not claim to cover it.
+    store.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
+
+    let reports = store.verify_integrity().unwrap();
+    let active = reports.last().unwrap();
+    match active.integrity {
+        SegmentIntegrity::Ok {
+            rows_covered,
+            rows_total,
+        } => {
+            assert!(
+                rows_covered < rows_total,
+                "the row written after the last flush must be uncovered: \
+                 covered {rows_covered}, total {rows_total}"
+            );
+        }
+        other => panic!("expected a partial Ok, got {other:?}"),
+    }
+}
+
+/// LOAD-BEARING: flip a byte inside a flushed row, then reopen and verify. This must fail
+/// without group 1's checksum plumbing — a test that only asserted "verification ran"
+/// would pass even with a corrupted store, which is the exact shape SKILL.md warns about.
+#[cfg_attr(miri, ignore)] // fsync
+#[test]
+fn verify_reports_a_mismatch_naming_the_segment_after_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store
+            .upsert("col", &[rec("a", vec![1.0, 0.0]), rec("b", vec![0.0, 1.0])])
+            .unwrap();
+        store.flush().unwrap();
+    }
+
+    // Flip the file's last byte — inside the last row's bytes, past the header — after the
+    // store (and its sidecar) is closed, so a fresh open reads the corrupted bytes cleanly.
+    let data_path = path.join("data");
+    let mut bytes = std::fs::read(&data_path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    std::fs::write(&data_path, &bytes).unwrap();
+
+    let mut store = Store::open(Config::new(&path, 2).open_mode(OpenMode::ReadOnly)).unwrap();
+    let reports = store.verify_integrity().unwrap();
+    let mismatch = reports
+        .iter()
+        .find(|r| matches!(r.integrity, SegmentIntegrity::Mismatch { .. }))
+        .unwrap_or_else(|| panic!("expected a mismatch, got {reports:?}"));
+    assert_eq!(mismatch.segment, "data");
+}
+
+#[test]
+fn segment_report_field_shape() {
+    // Pure-logic sanity check on the report type itself (Miri-clean): a report just
+    // pairs a segment name with the checksum finding, nothing more.
+    let report = SegmentReport {
+        segment: "data".to_string(),
+        integrity: SegmentIntegrity::NoChecksum { rows_total: 0 },
+    };
+    assert_eq!(report.segment, "data");
+    assert!(matches!(
+        report.integrity,
+        SegmentIntegrity::NoChecksum { rows_total: 0 }
+    ));
 }
