@@ -416,6 +416,16 @@ mmap (`src/data/mmap.rs`) — so check §9 rather than trusting a list here.
 - **Commit style**: emoji prefix + short description (e.g. `🪺 op-log codec`).
 - **Issue tracking**: beads — run `bd ready` for available work.
 - **Branch workflow**: one branch per issue or bundled epic, push for PR review.
+- **The merge queue is what makes parallel PRs safe, so keep it fed.** Each PR is
+  retested against `main` *plus the entries queued ahead of it*, which is the only
+  thing that catches two individually-green PRs that are jointly broken (#135 and
+  #137 each passed, then broke `main` together until #146). The mechanism is
+  fragile in one specific way: a queued PR builds on a temporary
+  `gh-readonly-queue/**` ref and fires a **`merge_group`** event, so any workflow
+  owning a required check MUST list `merge_group:` under `on:`. A required check
+  that does not run there never reports and the entry stalls until it is ejected —
+  the queue looks broken when it is really just waiting. Adding a required check
+  and adding its `merge_group` trigger are one change, never two.
 - **CLOSE THE TICKET YOURSELF WHEN THE PR MERGES — NOTHING AUTO-CLOSES.** A
   `Closes nidus-186` line in a PR body is documentation and nothing more: GitHub
   cannot close a bead, so the trailer that used to do the work now only *looks*

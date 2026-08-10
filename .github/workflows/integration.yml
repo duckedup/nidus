@@ -9,14 +9,15 @@ name: Integration
 # about the pure library + feature lanes — fast, service-free, and unaffected by a
 # container hiccup.
 #
-# This is intended to be a REQUIRED status check on pull requests. Adding it here
-# only makes it *run*; marking it required is a branch-protection setting in the
-# repository configuration. Until that is flipped, a red run is advisory.
+# Both jobs here are REQUIRED status checks on pull requests, and required checks
+# must also run on merge_group or a queued PR stalls waiting for a report that
+# never comes.
 
 on:
   pull_request:
   push:
     branches: [main]
+  merge_group:
 
 concurrency:
   group: integration-${{ github.ref }}
