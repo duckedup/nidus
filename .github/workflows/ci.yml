@@ -1,9 +1,13 @@
 name: CI
 
+# merge_group is not optional once the queue is on: a queued PR is built on a
+# temporary gh-readonly-queue ref, and a required check that does not run there
+# never reports, so the entry stalls until it is ejected.
 on:
   pull_request:
   push:
     branches: [main]
+  merge_group:
 
 concurrency:
   group: ci-${{ github.ref }}
