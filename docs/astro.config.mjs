@@ -97,6 +97,7 @@ export default defineConfig({
         {
           label: "Reference",
           items: [
+            { label: "CLI", link: "/reference/cli/" },
             { label: "API", link: "/reference/api/" },
             { label: "Configuration", link: "/reference/configuration/" },
             { label: "Performance", link: "/reference/performance/" },

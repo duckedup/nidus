@@ -71,6 +71,78 @@ searchers plus one writer (see
 | `set_open_profile` | `fn set_open_profile(&mut self, p: &OpenProfile) -> Result<()>` | Record `p` as this store's open-time default for `ann`/`quantization`/`query_threads`/`mmap`, so a later `open()` with no explicit setting for a knob picks it up. Build `p` with [`Config::to_profile`](#config), which captures only the knobs that config set explicitly. Replaces the recorded profile wholesale, so merge onto `open_profile()` first if you mean to add one knob. Rejected on a read-only store, and rejected if the resulting combination could not be opened. |
 | `clear_open_profile` | `fn clear_open_profile(&mut self) -> Result<()>` | Remove the recorded profile. Later opens fall back to built-in defaults unless a knob is set explicitly. |
 
+## `Cancel`
+
+A shared "stop what you are doing" flag for cooperative cancellation of a long scan,
+e.g. what the HTTP server installs to enforce a request deadline. Cheap to clone:
+every clone shares one signal.
+
+```rust
+pub struct Cancel(/* shared atomic flag */);
+
+impl Cancel {
+    pub fn new() -> Cancel;
+    pub fn cancel(&self);             // signal every holder to stop; idempotent
+    pub fn is_cancelled(&self) -> bool;
+    pub fn scope<T>(&self, f: impl FnOnce() -> T) -> T;
+}
+```
+
+`scope` installs this token as the ambient cancellation signal for the current thread
+for the duration of `f`, restoring whatever was installed before (including across a
+panic in `f`). The scan kernels check the ambient token every few thousand rows and
+bail out with an error once it is cancelled, so cancellation is prompt rather than
+instant, and never taxes the common uncancelled case with a per-row check.
+
+## `Role` & `ClusterStatus`
+
+What this instance is within a store, and how current it is. `Nidus::cluster_status`
+(see [Introspection](#introspection)) returns a snapshot of both; the same facts back
+[`GET /cluster`](/reference/http-api/#get-cluster).
+
+```rust
+pub enum Role {
+    Writer,        // sole writer of a single-node store, holds the plain writer lock
+    Reader,        // read-only opener of a single-node store, holds no lock
+    ClusterWriter, // cluster writer, holds the renewable, fenced writer lease
+    ClusterReader, // cluster reader, lock-free, advances via refresh()
+    InMemory,      // in-memory store: no durability, no lock, no peers
+}
+
+pub struct ClusterStatus {
+    pub role: Role,
+    pub cluster: bool,               // whether cluster mode is on (Config::cluster)
+    pub holds_writer_handle: bool,   // this instance believes it holds the writer handle
+    pub fenced: bool,                // superseded: every subsequent write will fail
+    pub lease_owner: Option<String>, // our fencing token while holding a cluster lease
+    pub commit_version: u64,         // the manifest commit counter this instance is serving
+    pub staleness_secs: u64,         // seconds since this instance last took up newer state
+}
+```
+
+`fenced` latches once observed, because the condition is permanent: a fenced writer
+never regains the lease, it has to reopen. `staleness_secs` is always `0` for a
+writer (its own state is current by definition); for a reader it is the age of its
+last successful `refresh()`, or of its open if it has never refreshed. Comparing
+`commit_version` across instances shows replication lag.
+
+## `LeaseWait`
+
+What a would-be writer does when another instance already holds the writer handle,
+under [`OpenMode::ReadWrite`](/reference/configuration/#open_mode). Set via
+[`Config::lease_wait`](/reference/configuration/#lease_wait).
+
+```rust
+pub enum LeaseWait {
+    Fail,               // fail immediately on contention (the default)
+    Timeout(Duration),  // retry until acquired, or fail after this long
+    Forever,            // retry indefinitely
+}
+```
+
+`Forever` is what turns an extra `nidus serve` replica into a hot standby: it stays
+live (but not ready) and promotes itself the moment the incumbent's lease lapses.
+
 ## `Scope`
 
 Which collections a search ranks over. Accepts `impl Into<Scope>`, so `&str` and
@@ -376,6 +448,36 @@ pub enum Language { English }     // the analyzer; extensible (US English today)
 several, with `.combine(...)` and `.highlight(...)` builders. See
 [searching several fields at once](/guides/search/#searching-several-fields-at-once).
 
+## `FtsField` & `Analyzer`
+
+The declared shape of one full-text-indexed field: BM25 tuning plus its analyzer.
+Passed to [`create_collection_with_fts` / `set_fts_schema`](#collections); see
+[tuning a field](/guides/search/#tuning-a-field).
+
+```rust
+pub struct FtsField {
+    pub field: String,     // the attribute to index (a Str, or a List joined with spaces)
+    pub k1: f32,           // BM25 term-frequency saturation (default 1.2)
+    pub b: f32,            // BM25 length normalization, 0 = none, 1 = full (default 0.75)
+    pub analyzer: Analyzer,
+}
+
+pub struct Analyzer {
+    pub language: Language,           // picks the stopword set + stemmer (English today)
+    pub ascii_folding: bool,          // fold Latin diacritics before stemming
+    pub max_token_len: Option<usize>, // drop tokens longer than this many chars; None keeps every token
+}
+
+// Builders: FtsField::new(field), .k1(_), .b(_), .analyzer(_), .language(_),
+//           .ascii_folding(_), .max_token_len(_)
+// Analyzer builders: .language(_), .ascii_folding(_), .max_token_len(_)
+// `&str` converts to FtsField::new(field) via `From`.
+```
+
+An analyzer is applied identically at index and query time, so a query term matches
+a stored term only when both were analyzed the same way. `max_token_len` guards
+against a base64 blob or a minified bundle inflating the term dictionary.
+
 ## `HighlightOpts`, `Annotations` & friends
 
 The opt-in [explanation of a hit](/guides/search/#explaining-a-hit).
@@ -575,3 +677,190 @@ Each `None` means "nothing recorded for this knob," not "explicitly off": there 
 no recorded-off state for these four, only recorded-on or absent. A store that has
 never been configured has an all-`None` profile and behaves exactly as before this
 existed.
+
+## `Memory`, `RememberOpts`, `RecallOpts`, `RememberMode` & `Remembered`
+
+A text-native memory API layered over [`Nidus`](#nidus) and an embedder:
+`remember(text)` writes a record, `recall(query_text)` searches by meaning. Gated on
+the `memory` feature (`= embed`); see [remember and recall](/guides/remember-and-recall/).
+
+```rust
+pub struct Memory { /* db + embedder (+ summarizer) */ }
+
+impl Memory {
+    pub fn new(db: Nidus, embedder: AnyEmbedder) -> Self;
+    #[cfg(feature = "summarize")]
+    pub fn with_summarizer(mut self, summarizer: AnySummarizer) -> Self;
+    pub async fn remember(&mut self, collection: &str, id: &str, text: &str, opts: RememberOpts) -> Result<Remembered>;
+    pub async fn recall(&self, collection: &str, query_text: &str, opts: &RecallOpts) -> Result<Vec<Hit>>;
+    pub fn db(&self) -> &Nidus;       // the raw Vec<f32> API escape hatch
+    pub fn db_mut(&mut self) -> &mut Nidus;
+    pub fn into_inner(self) -> Nidus; // drops the embedder/summarizer
+}
+
+pub enum RememberMode {
+    Raw,                    // embed the text as given (the default)
+    #[cfg(feature = "summarize")]
+    Summarize,               // summarize first, embed the summary, store it under META_SUMMARY
+}
+
+pub struct RememberOpts {
+    pub mode: RememberMode,
+    pub attrs: BTreeMap<String, Value>, // reserved nidus.* recency keys are dropped before stamping
+    pub ttl_seconds: Option<i64>,       // seconds until expiry, counted from the write; None never expires
+    pub dedupe_threshold: Option<f32>,  // cosine floor above which a write redirects onto the nearest existing entry
+}
+
+pub struct Remembered {
+    pub id: String,      // the record actually written; not the requested id when deduped
+    pub deduped: bool,    // whether dedupe_threshold matched and redirected the write
+    pub upserted: usize,  // rows the upsert touched
+}
+
+pub struct RecallOpts {
+    pub top_k: usize,           // 0 means "use the default" (10)
+    pub min_score: f32,         // drop hits scoring below this cosine similarity; 0.0 applies no floor
+    pub filter: Option<Filter>, // optional pre-scoring metadata filter
+}
+```
+
+`RememberOpts`/`RecallOpts`/`Remembered` all implement `Default`/the usual derives, so
+`RememberOpts { ttl_seconds: Some(3600), ..Default::default() }` is the idiomatic call.
+`RememberMode::Raw` embeds and stores the text as given; `Summarize` needs a summarizer
+attached via `with_summarizer` and additionally requires the `summarize` feature.
+
+### Memory metadata keys
+
+Attr and collection-meta keys `remember`/`recall` stamp and read. All gated on
+`memory` except `META_EXPIRES_AT`, which lives ungated in `src/meta.rs` so
+[`Nidus::sweep_expired`](#nidus) compiles in every build, `memory` feature or not.
+
+| Const | Key | Note |
+| ----- | --- | ---- |
+| `META_TEXT` | `nidus.text` | the raw remembered text, stamped on every `remember` write regardless of mode |
+| `META_CREATED_AT` | `nidus.created_at` | `Value::DateTime`; carried forward unchanged on a dedup update-in-place |
+| `META_UPDATED_AT` | `nidus.updated_at` | `Value::DateTime`; set to the write time on every write |
+| `META_EMBEDDER` | `nidus.embedder` | collection meta: the `"provider/model"` identity of the embedder that produced its vectors |
+| `META_DIM` | `nidus.dim` | collection meta: the embedding dimension, as a decimal string |
+| `META_SUMMARY` | `nidus.summary` | `summarize` feature. The generated summary text when `RememberMode::Summarize` is used, i.e. what was actually embedded |
+| `META_SOURCE` | `nidus.source` | `summarize` feature. **Legacy and read-only**: no longer stamped by any surface. `META_TEXT` carries the raw source text now; this is kept only so records written before nidus-133 remain readable |
+| `META_EXPIRES_AT` | `nidus.expires_at` | ungated. `Value::DateTime` after which an entry is expired; absent means it never expires. Consulted by `Nidus::sweep_expired` |
+
+## `Persistence`, `Appender`, `BackendLock` & `MemoryTier`
+
+The pluggable storage and shared-memory-tier seam (SPEC §13): implement one of these
+traits to plug in a backend nidus doesn't ship. See
+[writing your own storage backend](/guides/storage-backends/#writing-your-own-backend)
+and [writing your own memory store](/guides/memory-stores/#writing-your-own-memory-store).
+
+```rust
+pub trait Persistence: Send + Sync {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;
+    fn delete(&self, key: &str) -> Result<()>;
+    fn list(&self) -> Result<Vec<String>>;
+    fn try_lock(&self, key: &str, ttl: Duration) -> Result<Option<Box<dyn BackendLock>>>;
+
+    // Optional; every one defaults to "not supported" (see the notes below).
+    fn appender(&self, key: &str) -> Result<Option<Box<dyn Appender>>>;
+    fn try_create_exclusive(&self, key: &str, bytes: &[u8]) -> Result<Option<bool>>;
+    fn get_cas(&self, key: &str) -> Result<Option<(Vec<u8>, Option<String>)>>;
+    fn put_cas(&self, key: &str, bytes: &[u8], expected: Option<&str>) -> Result<CasOutcome>;
+    fn local_path(&self, key: &str) -> Option<PathBuf>;
+    fn has_native_lock(&self) -> bool;
+    fn supports_cas(&self) -> bool;
+}
+```
+
+Whole named byte objects in two classes: source-of-truth (`data`/`log`, never
+reconstructable) and derived caches (`ann`/`fts`, droppable, rebuilt on a stale or
+torn load). Only the first five methods are required; the rest default to "not
+supported" (`appender` → `None`, `put_cas` → `CasOutcome::Unsupported`,
+`local_path` → `None`, `has_native_lock` → `true`, `supports_cas` → `false`), so a
+minimal backend still works everywhere except cluster mode, which needs a real
+`get_cas`/`put_cas`.
+
+```rust
+pub trait Appender: Send + Sync {
+    fn len(&self) -> Result<u64>;
+    fn is_empty(&self) -> Result<bool>;   // default: len()? == 0
+    fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()>;
+    fn append(&mut self, bytes: &[u8]) -> Result<()>;
+    fn truncate_to(&mut self, offset: u64) -> Result<()>;
+    fn sync(&mut self) -> Result<()>;
+    fn rewrite(&mut self, bytes: &[u8]) -> Result<()>;
+    fn read_to_end(&mut self, out: &mut Vec<u8>) -> Result<()>; // provided over read_exact_at
+
+    // Required: len, read_exact_at, append, truncate_to, sync, rewrite.
+}
+
+pub trait BackendLock: Send + Sync {}
+
+pub trait MemoryTier: Send + Sync {
+    fn load(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    fn store(&self, key: &str, bytes: &[u8], ttl: Option<Duration>) -> Result<()>;
+}
+```
+
+`Appender` is a durable, append-shaped byte stream: the native local-filesystem
+capability `data` and `log` need (append is atomic, rolling back to the length
+before the call on a partial write; `rewrite` is the atomic whole-file replace
+`compact` uses). Object-store backends do not implement it; nidus wraps them in an
+in-RAM `ObjectAppender` that rewrites the whole object on `sync` instead.
+
+`BackendLock` is a held backend lock, released on `Drop`; the concrete guard owns
+whatever the backend needs to release (a lock file, a conditional-PUT marker).
+
+`MemoryTier` is where the in-RAM working set is held so it can be shared across
+processes and reloaded without a rebuild (SPEC §13.3). Deliberately rebuildable: an
+empty or evicted tier is never fatal, since the persistence tier is the source of
+truth. `Arc<dyn MemoryTier>` (or `Arc<LocalRam>`) itself implements `MemoryTier`, so
+several stores can publish to and adopt from one shared instance.
+
+## `LocalFs`, `LocalRam`, `CasOutcome`, `open_persistence` & `open_memory_tier`
+
+The bundled backend implementations and the two location-string dispatchers used to
+pick one at runtime.
+
+```rust
+pub struct LocalFs { /* rooted at a directory */ }
+impl LocalFs {
+    pub fn new(dir: impl Into<PathBuf>) -> Result<LocalFs>; // creates dir (+ parents) if absent
+    pub fn dir(&self) -> &Path;
+}
+
+pub struct LocalRam { /* a Mutex<HashMap<String, Vec<u8>>> */ }
+impl LocalRam {
+    pub fn new() -> LocalRam; // also Default; a fresh, empty tier
+}
+
+pub enum CasOutcome {
+    Written(Option<String>), // committed; the new CAS token, when the backend reports one cheaply
+    Stale,                   // precondition failed: lost the race, not an error
+    Unsupported,              // this backend offers no compare-and-swap
+}
+
+pub fn open_persistence(location: &str) -> Result<Box<dyn Persistence>>;
+pub fn open_memory_tier(location: &str) -> Result<Box<dyn MemoryTier>>;
+```
+
+`LocalFs` is the default `Persistence` backend, and the one every other backend is
+checked against: each object is a file `<dir>/<key>`, whole-object writes are
+atomic, and `try_lock` reuses the same `O_EXCL` lock file as the plain single-node
+path. `LocalRam` is the trivial `MemoryTier`: shared between threads of one
+process, never across processes.
+
+`open_persistence` dispatches a location string to a backend: `s3://…` and
+`gs://…`/`gcs://…` to the S3/GCS backends, anything else (`file://<path>` or a bare
+path) to `LocalFs`. `open_memory_tier` dispatches `""`/`"local"`/`"ram"` to
+`LocalRam`, and a Redis-family URL (`redis://`, `rediss://`, `valkey://`,
+`valkeys://`, `keydb://`, `dragonfly://`) to a Redis-backed tier; anything else is
+an error.
+
+Cluster mode's writer lease (`ClusterLease`, and its non-owning `LeaseRenewer`) are
+concrete types over a `Persistence` backend, not traits: `ClusterLease::acquire`
+mints a fenced, heartbeated lease, `renew()` re-stamps it before each write batch
+and fails once another writer has taken over, and `is_lease_lost` classifies that
+failure (a `LeaseLost` error) out of the `anyhow` chain so a caller can tell it apart
+from a transient backend failure. `ClusterLease::renewer` hands out a `LeaseRenewer`
+that can keep the lease warm from a background task without being able to release it.

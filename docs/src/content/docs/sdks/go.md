@@ -193,6 +193,56 @@ hybrid, err := db.HybridSearch(ctx, nidus.HybridSearchRequest{
 `1/(rrf_k + rank + 1)`, so an `RRFK` of `0` is the maximally top-heavy weighting, and a
 `Candidates` of `0` fuses exactly `TopK` deep with no over-fetch.
 
+## Batch search and aggregation
+
+`BatchSearch` answers several vector queries in one round-trip (16 max), saving a hop
+per query when one question is fanned into several phrasings:
+
+```go
+queries := []nidus.SearchRequest{
+    {Query: []float32{0.1, 0.2, 0.3}, TopK: 5},
+    {Query: []float32{0.4, 0.5, 0.6}, TopK: 5,
+        Filter: nidus.And(nidus.Eq("lang", "rust"))},
+}
+results, err := db.BatchSearch(ctx, nidus.BatchSearchRequest{Queries: queries})
+for _, hits := range results {
+    _ = hits
+}
+
+// Merge every leg into one ranking via reciprocal rank fusion
+fused, err := db.BatchSearch(ctx, nidus.BatchSearchRequest{
+    Queries: queries,
+    Fuse:    &nidus.BatchFuse{},
+})
+```
+
+With `Fuse` set the answer is still `[][]Hit`, holding the single fused ranking as its
+one element, so indexing does not change shape with the flag. `BatchFuse.Weights` must
+be empty or exactly as long as `Queries`.
+
+`Aggregate` counts the records a filter matches and sums the named attributes,
+answered from the in-RAM index alone: no record is built and no vector is read.
+
+```go
+totals, err := db.Aggregate(ctx, nidus.AggregateRequest{
+    Scope:  []string{"docs"},
+    Filter: nidus.And(nidus.Eq("lang", "rust")),
+    Sum:    []string{"year"},
+})
+fmt.Println(totals.Count, totals.Sums["year"])
+
+// One Group per distinct GroupBy value, alongside the unchanged whole-scope totals
+byLang, err := db.Aggregate(ctx, nidus.AggregateRequest{
+    Sum: []string{"year"}, GroupBy: "lang",
+})
+for _, g := range byLang.Groups {
+    fmt.Println(g.Value, g.Count, g.Sums)
+}
+```
+
+A missing or non-numeric value is skipped rather than counted as zero, so a field
+nothing matched sums to `0`.
+
 ## Remembering and recalling
 
 When the server is started with an embedder (`nidus serve --embed-provider …`), you can
@@ -227,6 +277,12 @@ hits, err := db.Recall(ctx, "notes", "quick fox", nidus.RecallOptions{
     Filter:   nidus.And(nidus.Eq("tag", "x")),
 })
 ```
+
+`Remember` returns a `RememberResult` (`ID`, `Upserted`, `Deduped`): `ID` is the record
+that actually changed, which is not always the one passed in, and `Upserted` is the row
+count from the underlying write. See
+[Parity across the surfaces](/guides/remember-and-recall/#parity-across-the-surfaces)
+for how these semantics line up with the other SDKs and the MCP surface.
 
 Two different failures are worth telling apart when these do not work. A **`404` with no
 message** means the server binary was built without the `memory` feature, so `/remember`

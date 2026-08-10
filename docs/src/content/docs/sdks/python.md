@@ -191,6 +191,44 @@ hybrid_hits = db.hybrid_search(
 `hybrid_search` takes no `min_score`: its score is a fused RRF rank, not a similarity, so
 there is no meaningful floor to set. `rrf_k` and `candidates` tune the fusion.
 
+## Batch search and aggregation
+
+`batch_search` answers several vector queries in one round-trip (16 max), saving a hop
+per query when one question is fanned into several phrasings:
+
+```python
+queries = [
+    {"query": [0.1, 0.2, 0.3], "top_k": 5},
+    {"query": [0.4, 0.5, 0.6], "top_k": 5, "filter": [f.eq("lang", "rust")]},
+]
+results = db.batch_search(queries)
+for hits in results:
+    ...
+
+# Merge every leg into one ranking via reciprocal rank fusion
+fused = db.batch_search(queries, fuse=True, rrf_k=60.0)[0]
+```
+
+With `fuse=True` the answer is still a list, holding the single fused ranking as its
+one element, so indexing does not change shape with the flag. `weights` must be empty
+or exactly as long as `queries`.
+
+`aggregate` counts the records a filter matches and sums the named attributes,
+answered from the in-RAM index alone: no record is built and no vector is read.
+
+```python
+totals = db.aggregate(scope=["docs"], filter=[f.eq("lang", "rust")], sum=["year"])
+print(totals.count, totals.sums["year"])
+
+# One Group per distinct group_by value, alongside the unchanged whole-scope totals
+by_lang = db.aggregate(sum=["year"], group_by="lang")
+for group in by_lang.groups:
+    print(group.value, group.count, group.sums)
+```
+
+A missing or non-numeric value is skipped rather than counted as zero, so a field
+nothing matched sums to `0`.
+
 ## Remembering and recalling
 
 When the server is started with an embedder
@@ -216,6 +254,12 @@ db.remember("notes", "b", long_article, mode="summarize")
 # Embed the query text and search, best first
 hits = db.recall("notes", "quick fox", top_k=5, min_score=0.2, filter=[f.eq("tag", "x")])
 ```
+
+`remember` returns a `RememberResult` (`id`, `upserted`, `deduped`): `id` is the record
+that actually changed, which is not always the one passed in, and `upserted` is the
+row count from the underlying write. See
+[Parity across the surfaces](/guides/remember-and-recall/#parity-across-the-surfaces)
+for how these semantics line up with the other SDKs and the MCP surface.
 
 Against a server started **without** an embedder both raise `NidusError` with status
 `400`, and the message names `--embed-provider`; `mode="summarize"` without a summarizer

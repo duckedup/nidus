@@ -87,6 +87,74 @@ curl -s localhost:7700/stats
 That is a complete vector store over the network: no Rust toolchain on the client,
 nothing but HTTP and JSON.
 
+## Text-native ingest
+
+The routes above take and return raw vectors: you embed on the client, in
+whatever language you like, and send the result. `nidus serve` can also embed,
+and optionally summarize, text itself, which is what powers
+`POST /collections/{name}/remember` and `/recall`: text in, ranked text out, with
+the vector math handled on the server. See
+[remember & recall](/guides/remember-and-recall/) for the request and response
+shapes, and [MCP](/guides/mcp/) for the same layer exposed as agent tools at
+`/mcp`.
+
+Configure an embedder with `--embed-provider` and, optionally, a summarizer with
+`--summarize-provider`. Both take the same shape of flags: a provider name, a
+model, an API key, and a base-URL override, each with a matching `NIDUS_*`
+environment variable (see the embed and summarize rows in the
+[environment table](#configuration-from-the-environment) below). The
+[CLI reference](/reference/cli/) is canonical for the exact provider list and
+per-flag syntax; here is the shape:
+
+```bash
+nidus serve --dir ./store \
+  --embed-provider voyage --embed-model voyage-3.5 --embed-api-key "$VOYAGE_API_KEY" \
+  --summarize-provider anthropic --summarize-api-key "$ANTHROPIC_API_KEY"
+```
+
+Omit `--embed-provider` and the server still starts, serving only the raw vector
+routes; `/remember` and `/recall` then answer `400` (see below). A base-URL
+override matters most for `openai-compat` and self-hosted gateways, which have no
+default endpoint to fall back to.
+
+### Feature gating
+
+`--embed-*` and `--summarize-*` exist only in a build compiled with the `memory`
+feature, which the `serve` feature umbrella pulls in along with every provider:
+`serve = ["cli", "memory", "embed-all", "summarize-all", "mcp"]`. A plain
+`cargo install nidus --features cli` binary has no `--embed-provider` flag at
+all: clap rejects it as unrecognised. `cargo binstall nidus` and the binaries
+`release.yml` publishes are both built with `--features serve`, so the shipped
+binary always has every provider; building your own with `--features cli` alone
+does not.
+
+### Failure modes
+
+- **No embedder configured.** `/remember` and `/recall` both answer `400`, with a
+  message naming `--embed-provider` (`missing_embedder_error` in
+  `src/server/mod.rs`).
+- **`mode: "summarize"` with no summarizer.** A separate `400`, naming
+  `--summarize-provider` instead.
+- **Dimension pinning.** A store's embedding dimension is fixed at creation, and
+  the whole store shares one embedding space. If the configured embedder's
+  dimension does not match, the write is refused, but unlike a raw-vector
+  dimension mismatch (which is a `400`) this one surfaces as a `500`: the error
+  message does not match the string the HTTP layer's error classifier checks for
+  on the raw-vector path, so it falls through to the generic server-fault status.
+  Point `--embed-provider` / `--embed-model` at the dimension the store was
+  created with, or start a new store.
+- **Cross-model recall.** A collection remembers which embedder first wrote to it
+  (provider and model). Recalling into it with a different embedder is refused
+  with `409 Conflict`, even at the same dimension, because a same-dimension,
+  different-model space still ranks nonsense.
+- **Retries against the provider.** Every embed and summarize call goes through
+  the shared retry layer in `src/http.rs`: exponential backoff
+  (`base_delay_ms * 2^attempt`), retrying on `429` and the common transient
+  `5xx` statuses (`500`, `502`, `503`, `529`) for the hosted providers, or any
+  `5xx` for Ollama specifically, since it is local and has no rate limit to
+  respect. Retries are bounded (three attempts) and not configurable by flag;
+  exhausting them fails the request rather than queuing the text for later.
+
 ## Authentication
 
 The server is unauthenticated by default, which is fine on `127.0.0.1`. The moment
@@ -151,7 +219,8 @@ server {
 ```
 
 On Kubernetes, the equivalent is an `Ingress` with a TLS secret in front of the
-chart's `Service`; see the [Kubernetes guide](/guides/kubernetes/).
+chart's `Service`; see [Ingress and TLS](/guides/kubernetes/#ingress-and-tls) in
+the Kubernetes guide.
 
 ### What the token model is, and is not
 
@@ -387,24 +456,112 @@ Every `nidus serve` flag also reads from a matching `NIDUS_*` environment variab
 so the server can be configured without a command line at all, the natural fit for
 a container or an orchestrator. An explicit flag always wins over the variable.
 
-| Variable | Flag | Purpose |
-| --- | --- | --- |
-| `NIDUS_DIR` | `--dir` | Store directory (unused, but still required, with an object store) |
-| `NIDUS_DIM` | `--dim` | Embedding dimension (required to create a store, unless `--embed-provider` supplies one) |
-| `NIDUS_DISTANCE` | `--distance` | `cosine` \| `euclidean` \| `dot` |
-| `NIDUS_PERSISTENCE` | `--persistence` | Where durable bytes live: `s3://…`, `gs://…`, or a local path |
-| `NIDUS_MEMORY` | `--memory` | Shared working set: `redis://…` (or `valkey://…`, …) |
-| `NIDUS_ADDR` | `--addr` | Bind address (default `127.0.0.1:7700`) |
-| `NIDUS_TOKEN` | `--token` | Bearer token for auth |
-| `NIDUS_MAX_BODY_BYTES` | `--max-body-bytes` | Request/upsert size limit |
-| `NIDUS_MAX_CONCURRENT_REQUESTS` | `--max-concurrent-requests` | In-flight cap; past it, `503` (`0` = auto) |
-| `NIDUS_READ_TIMEOUT` | `--read-timeout` | Read deadline in seconds (`0` = none) |
-| `NIDUS_WRITE_TIMEOUT` | `--write-timeout` | Write deadline in seconds (`0` = none) |
-| `NIDUS_BODY_IDLE_TIMEOUT` | `--body-idle-timeout` | Abandon a stalled request body after N seconds (`0` = none) |
-| `NIDUS_LOG` | (none) | Log level: `error` \| `warn` \| `info` \| `debug` \| `trace` \| `off` |
-| `NIDUS_READ_ONLY` | `--read-only` | Serve without the writer lock |
-| `NIDUS_ANN`, `NIDUS_ANN_*` | `--ann`, `--ann-*` | Approximate-index selection and tuning |
-| `NIDUS_REQUIRE_REMOTE` | `--require-remote` | Refuse to start on a local-only store (see below) |
+This table is the operator-facing surface: every variable, grouped by what it
+governs, with its flag and default. The [CLI reference](/reference/cli/) is
+canonical for **per-flag syntax** (value types, allowed strings, and how each flag
+notes its own env binding); come here for the full picture and go there for the
+detail on one flag.
+
+### Store and open
+
+| Variable | Flag | What it does | Default |
+| --- | --- | --- | --- |
+| `NIDUS_DIR` | `--dir` | Store directory (created on first write; unused, but still required, with an object store) | (required) |
+| `NIDUS_DIM` | `--dim` | Embedding dimension. Required to create a store, unless `--embed-provider` supplies one | inferred from an existing store |
+| `NIDUS_DISTANCE` | `--distance` | `cosine` \| `euclidean` \| `dot` | `cosine` (on create) |
+| `NIDUS_PERSISTENCE` | `--persistence` | Where durable bytes live: `s3://…`, `gs://…`, or a local path | local files under `--dir` |
+| `NIDUS_MEMORY` | `--memory` | Shared in-RAM working set: `redis://…` (or `valkey://…`, `keydb://…`, `dragonfly://…`) | process-local |
+| `NIDUS_FSYNC` | `--fsync` | `per-batch` (durable per call) or `on-flush` (faster, weaker) | `per-batch` |
+| `NIDUS_MMAP` | `--mmap` | Memory-map immutable segments instead of holding them in RAM | off |
+| `NIDUS_NO_MMAP` | `--no-mmap` | Force mmap off, overriding a recorded `configure --mmap` default | off |
+| `NIDUS_QUERY_THREADS` | `--query-threads` | Worker threads splitting one query's scan (unrelated to serving concurrency) | `1` (serial) |
+| `NIDUS_MAX_VECTOR_BYTES` | `--max-vector-bytes` | Refuse to open a store whose vector matrix would exceed this many bytes | no ceiling |
+| `NIDUS_SEGMENT_MAX_ROWS` | `--segment-max-rows` | Seal the active segment once it reaches this many rows | never seal (one growing segment) |
+| `NIDUS_SEGMENT_INDEX_MIN_ROWS` | `--segment-index-min-rows` | Minimum rows for a sealed segment to get its own IVF index | never index (exact brute-force) |
+| `NIDUS_AUTO_COMPACT` | `--auto-compact` | Rewrite the data matrix once this fraction of rows is dead | `0.5` |
+| `NIDUS_NO_AUTO_COMPACT` | `--no-auto-compact` | Never auto-compact; reclaim dead rows only on an explicit `compact` | off |
+
+### Server, bind, and auth
+
+| Variable | Flag | What it does | Default |
+| --- | --- | --- | --- |
+| `NIDUS_ADDR` | `--addr` | Bind address | `127.0.0.1:7700` |
+| `NIDUS_TOKEN` | `--token` | Bearer token for auth | none (unauthenticated) |
+| `NIDUS_READ_ONLY` | `--read-only` | Open without taking the writer lock; rejects mutations | off |
+
+### Limits and backpressure
+
+See [Backpressure](#backpressure) above for how these interact.
+
+| Variable | Flag | What it does | Default |
+| --- | --- | --- | --- |
+| `NIDUS_MAX_BODY_BYTES` | `--max-body-bytes` | Request/upsert size limit; a body over it gets `413` | 256 MiB |
+| `NIDUS_MAX_CONCURRENT_REQUESTS` | `--max-concurrent-requests` | In-flight cap; past it, requests are shed with `503` | `0` (auto: 8× CPU cores, floored at 64) |
+| `NIDUS_READ_TIMEOUT` | `--read-timeout` | Read deadline in seconds (search, list, stats); `0` disables | `30` |
+| `NIDUS_WRITE_TIMEOUT` | `--write-timeout` | Write deadline in seconds (upsert, delete, compact); `0` disables | `600` |
+| `NIDUS_BODY_IDLE_TIMEOUT` | `--body-idle-timeout` | Abandon a request body that stops delivering data; `0` disables | `15` |
+
+### Cluster and lease
+
+See the [Kubernetes guide](/guides/kubernetes/) for running several instances.
+
+| Variable | Flag | What it does | Default |
+| --- | --- | --- | --- |
+| `NIDUS_CLUSTER` | `--cluster` | Run as one of several cooperating instances over a shared object-store `--persistence` and Redis-family `--memory` tier | off |
+| `NIDUS_LOCK_TTL` | `--lock-ttl` | Seconds before another process may reclaim a stale writer lock (also the writer-lease window in `--cluster` mode) | `60` |
+| `NIDUS_WAIT_FOR_LEASE` | `--wait-for-lease` | Wait as a standby for the writer handle instead of exiting; bare flag means forever | unset (exit immediately if held) |
+| `NIDUS_REQUIRE_REMOTE` | `--require-remote` | Refuse to start unless persistence and memory are both remote | off |
+| `NIDUS_MAX_STALENESS` | `--max-staleness` | Fail the readiness probe once a `--read-only` instance has gone this many seconds without verifying it is current | no bound |
+| `NIDUS_REFRESH_INTERVAL` | `--refresh-interval` | Auto-refresh this instance every N seconds instead of relying on `POST /refresh` | no auto-refresh |
+
+### ANN (approximate search)
+
+| Variable | Flag | What it does | Default |
+| --- | --- | --- | --- |
+| `NIDUS_ANN` | `--ann` | `hnsw` or `ivf`; omit for exact brute-force | none (exact) |
+| `NIDUS_ANN_M` | `--ann-m` | HNSW: max neighbours per node above layer 0 | `16` |
+| `NIDUS_ANN_EF_CONSTRUCTION` | `--ann-ef-construction` | HNSW: build-time beam width | `200` |
+| `NIDUS_ANN_EF_SEARCH` | `--ann-ef-search` | HNSW: search-time beam width | `64` |
+| `NIDUS_ANN_N_LISTS` | `--ann-n-lists` | IVF: number of k-means lists (`0` = auto `~sqrt(n)`) | `0` (auto) |
+| `NIDUS_ANN_N_PROBE` | `--ann-n-probe` | IVF: lists probed per query | `8` |
+| `NIDUS_ANN_OVERSCAN` | `--ann-overscan` | Candidate over-fetch multiple (`top_k * overscan`) before post-filter and rerank; both kinds | `4` |
+| `NIDUS_ANN_SEED` | `--ann-seed` | Build PRNG seed for a deterministic index; both kinds | fixed default seed |
+
+### Quantization
+
+| Variable | Flag | What it does | Default |
+| --- | --- | --- | --- |
+| `NIDUS_QUANTIZATION` | `--quantization` | Quantize the first search pass: `int8` (4× less memory traffic) or `binary` (32×, cosine only), reranked in exact f32 | none (exact-only) |
+| `NIDUS_QUANT_RESCORE` | `--quant-rescore` | Candidate over-fetch multiple for the quantized first pass, reranked in f32 | `4` (int8) / `16` (binary) |
+
+### Embed
+
+`memory` feature only (folded into `serve`); see [Text-native ingest](#text-native-ingest) above.
+
+| Variable | Flag | What it does | Default |
+| --- | --- | --- | --- |
+| `NIDUS_EMBED_PROVIDER` | `--embed-provider` | `voyage`, `openai`, `ollama`, `cohere`, `gemini`, `mistral`, `jina`, or `openai-compat`. Omit to serve only the raw vector endpoints | none |
+| `NIDUS_EMBED_MODEL` | `--embed-model` | Embedding model | provider's default (`openai-compat` has none; pass one) |
+| `NIDUS_EMBED_API_KEY` | `--embed-api-key` | API key for the embedding provider (some, e.g. Ollama, need none) | none |
+| `NIDUS_EMBED_BASE_URL` | `--embed-base-url` | Base-URL override (required for `openai-compat` and self-hosted gateways) | provider's default endpoint |
+
+### Summarize
+
+`memory` + `summarize` features (both folded into `serve`); enables `mode: "summarize"` on `/remember`.
+
+| Variable | Flag | What it does | Default |
+| --- | --- | --- | --- |
+| `NIDUS_SUMMARIZE_PROVIDER` | `--summarize-provider` | `anthropic` or `openai`. Omit for raw-embed only | none |
+| `NIDUS_SUMMARIZE_MODEL` | `--summarize-model` | Summarizer model | provider's default |
+| `NIDUS_SUMMARIZE_API_KEY` | `--summarize-api-key` | API key for the summarizer provider | none |
+| `NIDUS_SUMMARIZE_BASE_URL` | `--summarize-base-url` | Base-URL override | provider's default endpoint |
+
+### Other
+
+`NIDUS_LOG` sets the [log level](#logs) (`error` \| `warn` \| `info` \| `debug` \|
+`trace` \| `off`, default `info`); it is read directly rather than bound through
+clap, so it has no `--flag` form. The legacy `NIDUS_LEASE_DEBUG=1` still works and
+now means `NIDUS_LOG=debug`.
 
 Cloud credentials come from the [standard environment](/guides/storage-backends/)
 for each backend (`AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS`, …).
