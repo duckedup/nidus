@@ -1,8 +1,16 @@
-// Git/gh IO for the checker. Kept apart from lanes.mjs and laws.mjs so those stay
+// Git/gh/bd IO for the checker. Kept apart from lanes.mjs and laws.mjs so those stay
 // pure functions over text and the selftest never needs a repository.
 
 import { execSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
+
+// Beads kept the GitHub numbers, so `#186` and `nidus-186` are the same ticket and the
+// checker still canonicalises refs as `#<n>`.
+export const BEAD_PREFIX = 'nidus'
+
+// Only `closed` is done. `in_progress`/`blocked` are open work, and `deferred` reports
+// as itself so a dispatch against one says "is deferred" rather than "is closed".
+const beadState = s => (s === 'closed' ? 'CLOSED' : s === 'deferred' ? 'DEFERRED' : 'OPEN')
 
 export function sh(cmd, { allowFail = false } = {}) {
   try {
@@ -124,12 +132,13 @@ export function mentionedIssues(t) {
     text += '\n' + sh(`git log --format=%s ${range}`, { allowFail: true })
   }
   if (t.pr) text += `\n${t.pr.title || ''}`
-  return new Set(text.match(/#\d+/g) || [])
+  const refs = Array.from(text.matchAll(/(?:#|nidus-)(\d+)/g), m => `#${m[1]}`)
+  return new Set(refs)
 }
 
 // Refs/Part of/See: the author has stated this issue's disposition without claiming to
 // close it. Read from the bodies, where such a trailer is actually written.
-const ACK_RE = /\b(?:refs?|part of|see)\s+#(\d+)/gi
+const ACK_RE = /\b(?:refs?|part of|see)\s+(?:#|nidus-)(\d+)/gi
 
 export function acknowledgedIssues(t) {
   let text = t.pr ? t.pr.body || '' : ''
@@ -140,14 +149,15 @@ export function acknowledgedIssues(t) {
   return new Set(Array.from(text.matchAll(ACK_RE), m => `#${m[1]}`))
 }
 
-// GitHub's own closing keywords; anything else is a mention that will NOT close.
+// A closing keyword now only states intent — GitHub cannot close a bead, so these are
+// the claims `unclosedTickets` holds the author to at `bd close` time.
 export function closingIssues(t) {
   let text = t.pr ? t.pr.body || '' : ''
   if (t.base) {
     const range = t.head ? `${t.base}..${t.head}` : `${t.base}..HEAD`
     text += '\n' + sh(`git log --format=%b ${range}`, { allowFail: true })
   }
-  const re = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)/gi
+  const re = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+(?:#|nidus-)(\d+)/gi
   return new Set(Array.from(text.matchAll(re), m => `#${m[1]}`))
 }
 
@@ -202,8 +212,17 @@ export function selfFacts() {
   }
 }
 
-// gh has no linked-PR field on an issue, so derive it the way GitHub does: an open
-// PR whose title or body carries a closing keyword for that number.
+// Issues live in beads; PRs still live on GitHub. `bd show --json` returns an array.
+const bead = n => {
+  try {
+    const raw = sh(`bd show ${BEAD_PREFIX}-${n} --json`, { allowFail: true })
+    const j = JSON.parse(raw)
+    return Array.isArray(j) ? (j[0] || null) : (j && j.id ? j : null)
+  } catch { return null }
+}
+
+// Nothing links a bead to a PR, so derive it the way GitHub used to: a PR whose title
+// or body carries a closing keyword for that ticket, in either `#186` or `nidus-186` form.
 export function issueFacts(numbers) {
   const out = {}
   // --state all, because a merged PR is how a cleared coordinator learns a ticket
@@ -213,18 +232,16 @@ export function issueFacts(numbers) {
   try { prs = JSON.parse(raw || '[]') } catch { prs = [] }
 
   for (const n of numbers) {
-    const meta = sh(`gh issue view ${n} --json number,state,assignees`, { allowFail: true })
-    if (!meta) continue
-    try {
-      const j = JSON.parse(meta)
-      const re = new RegExp(`\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+#${n}\\b`, 'i')
-      out[String(n)] = {
-        number: j.number,
-        state: j.state,
-        assignees: (j.assignees || []).map(a => a.login),
-        linkedPrs: prs.filter(p => re.test(`${p.title}\n${p.body || ''}`)).map(p => ({ number: p.number, state: p.state })),
-      }
-    } catch { /* unparseable — the missing-issue detector reports it */ }
+    const j = bead(n)
+    if (!j) continue
+    const re = new RegExp(`\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+(?:#${n}|${BEAD_PREFIX}-${n})\\b`, 'i')
+    out[String(n)] = {
+      number: Number(n),
+      state: beadState(j.status),
+      status: j.status,
+      assignees: j.assignee ? [j.assignee] : [],
+      linkedPrs: prs.filter(p => re.test(`${p.title}\n${p.body || ''}`)).map(p => ({ number: p.number, state: p.state })),
+    }
   }
   return out
 }
@@ -232,11 +249,8 @@ export function issueFacts(numbers) {
 export function issueTitles(refs) {
   const out = {}
   for (const r of refs) {
-    const raw = sh(`gh issue view ${r.slice(1)} --json title,state`, { allowFail: true })
-    try {
-      const j = JSON.parse(raw)
-      if (j.state === 'OPEN') out[r] = j.title
-    } catch { /* closed, missing, or gh unavailable — not a finding */ }
+    const j = bead(r.slice(1))
+    if (j && beadState(j.status) === 'OPEN') out[r] = j.title
   }
   return out
 }

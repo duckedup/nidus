@@ -22,7 +22,7 @@
 .idea/
 .vscode/
 
-# ── Retired tracker (migrated to GitHub Issues) ──────────────────────────────
+# ── Stray database files (the tracker's own live under .beads/) ──────────────
 .dolt/
 *.db
 
@@ -34,8 +34,10 @@
 # skipped cleanup can never land one in a commit.
 BLUEPRINT-*.md
 
-# ── retired bd/Dolt tracker residue (CLAUDE.md: never reinstall) ─────────────
-.beads/
+# ── beads tracker ───────────────────────────────────────────────────────────
+# NOT `.beads/` — the config a fresh clone needs to find the shared issue
+# database is tracked. `.beads/.gitignore` governs what inside it is runtime.
+.beads-credential-key
 
 # coordinator dispatch state (see .claude/skills/nidus SKILL.md, Fleet)
 .claude/fleet-plan.json

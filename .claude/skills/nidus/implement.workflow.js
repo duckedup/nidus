@@ -87,7 +87,7 @@ Rules:
 - Read whatever you need to get the slice right, and say so in notes if the blueprint looks
   wrong or depends on a sibling slice. Reporting a suspicion costs nothing; guessing costs a
   merge conflict.
-- Track work in GitHub Issues, never with markdown checklists.
+- Track work in beads (\`bd\`), never with markdown checklists.
 ${prior ? `\nYOUR PRIOR ATTEMPT FAILED — fix exactly this, do not start over:\n${prior}\n` : ''}
 When the blueprint is implemented and its lanes pass, write your patch:
     git add -A && git diff --cached > ${patchFile}

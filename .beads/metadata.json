@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "nidus",
+  "project_id": "52b5acf7-07a2-4f50-9a30-59a8cb7d66c1"
+}
