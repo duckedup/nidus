@@ -1,28 +1,38 @@
 # Agent Instructions
 
-This project tracks work in **GitHub Issues** on `duckedup/nidus`, via the `gh` CLI.
+This project tracks work in **beads**, via the `bd` CLI. GitHub Issues is retired as of
+2026-08-10 — do not file there.
 
-> **Architecture in one line:** issue state lives on GitHub, not in the repo, so a
-> checkout carries no tracker data and there is nothing to sync, export, or import.
-> `gh` is the only interface.
+> **Architecture in one line:** issue state lives in a Dolt database under `.beads/`,
+> which is local and gitignored, and is shared by pushing it to `refs/dolt/data` on
+> this repo's own `origin`. So `bd dolt push` is as load-bearing as `git push` — your
+> commit does not carry your issue changes.
 >
-> This replaced an embedded beads/Dolt tracker whose exporter rewrote the whole issue
-> file from each branch's local database — so any branch could silently revert
-> another's closes, and one did (#83). It is fully retired: never reinstall it or its
-> git hooks. The pre-migration issues remain in this repository's git history.
+> A fresh clone runs **`just bd-setup`** to pull the database down (needs the `dolt` CLI:
+> `brew install dolt`). Never `bd init` here — it mints a new identity and can force-push
+> over everyone else's history. A git worktree needs nothing: it shares the main clone's
+> database automatically.
+>
+> An earlier version of this tracker committed its JSONL export and rewrote it from each
+> branch's local database, so any branch could silently revert another's closes, and one
+> did (#83). That is why `.beads/issues.jsonl` is gitignored and `export.git-add` is off:
+> the shared state is the Dolt ref, never a tracked file.
 
 ## Quick Reference
 
 ```bash
-gh issue list --state open            # Find available work
-gh issue view <n>                     # View issue details
-gh issue edit <n> --add-assignee @me  # Claim work
-gh issue close <n>                    # Complete work
-gh issue create --title=… --body=…    # File new work
+bd ready                              # Find available work (open, nothing blocking it)
+bd show nidus-186                     # View issue details
+bd update nidus-186 --claim           # Claim work
+bd close nidus-186 --reason "…"       # Complete work
+bd create "title" -t task -p 2        # File new work
+just bd-sync                          # Publish + collect issue state (do NOT skip)
 ```
 
-Priority is a `p0`–`p4` label; type is an `epic`/`bug`/`feature`/`task`/`decision`
-label. A child of an epic names its parent in the body (`Part of #12`).
+Issues kept their GitHub numbers through the migration: `#186` is `nidus-186`. Priority
+is a first-class field (`bd priority`) and also a `p0`–`p4` label; type is
+`epic`/`bug`/`feature`/`task`/`decision`. Epics use dependency links —
+`bd dep add <child> <parent> --type parent-child`, then `bd children <epic>`.
 
 ## Non-Interactive Shell Commands
 
@@ -48,24 +58,25 @@ cp -rf source dest          # NOT: cp -r source dest
 - `apt-get` - use `-y` flag
 - `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
-## Close the ticket in the PR that ships it
+## Close the ticket yourself when the PR merges
 
-`Closes #<n>` belongs in the PR body that ships the work — never a later cleanup pass.
-If the PR ships the fix, close it there; reopen if review changes the outcome.
+**Nothing auto-closes any more.** A `Closes nidus-186` line in a PR body is
+documentation only — GitHub cannot close a bead, so a trailer that used to do the work
+now merely looks like it did. Closing is `bd close nidus-186 --reason "…"` followed by
+`bd dolt push`, as part of shipping.
 
-The hazard runs the opposite way from the one that made this a law. The old tracker
-hid finished-but-open tickets from every routine check; GitHub hides nothing, so that
-direction nags on its own. What `Closes` adds is the reverse lie — it fires on merge
-whether or not the work survived review, so a gutted PR still closes its issue. Both
-are the tracker asserting what the tree does not support. Before opening a PR, re-read
-every `Closes` line and confirm the diff actually finishes that issue; downgrade it to
-`Refs #<n>` if it does not.
+This law has been broken in both directions and they are the same failure. The old
+tracker hid finished-but-open tickets from every routine check; GitHub's auto-close then
+introduced the reverse lie, firing on merge whether or not the work survived review, so
+a gutted PR still closed its issue. Both are the tracker asserting what the tree does not
+support. The manual close makes the first direction the live risk again: before you
+close, confirm the merged diff actually finishes that issue.
 
 (Full rationale, with the incident that prompted it, is in `CLAUDE.md` §Conventions.)
 
 ## Rules
 
-- Use GitHub Issues for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Use beads for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
 - Durable knowledge goes in the issue that owns it, or in `SPEC.md` — do NOT use MEMORY.md files
 
 ## Session Completion
@@ -79,13 +90,13 @@ every `Closes` line and confirm the diff actually finishes that issue; downgrade
 3. **Update issue status** - Close finished work, update in-progress items
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
+   bd dolt push                 # issue state — a separate ref, NOT carried by git push
    git pull --rebase
    git push
    git status  # MUST show "up to date with origin"
    ```
-   Issue state lives on GitHub, not in the repo, so nothing extra ships with the
-   commit — but a `Closes #<n>` line only fires when the PR merges, so close
-   anything the PR does not itself close.
+   Issue state is not in your commit, so `git push` does not carry it: closing a ticket
+   and pushing the branch still leaves the close on your machine. Push both.
 5. **Clean up** - Clear stashes, prune remote branches
 6. **Verify** - All changes committed AND pushed
 7. **Hand off** - Provide context for next session

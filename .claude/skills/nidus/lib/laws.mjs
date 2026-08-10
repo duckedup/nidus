@@ -303,8 +303,8 @@ export function unclosedTickets(mentioned = new Set(), closing = new Set(), titl
   return Array.from(mentioned)
     .filter(ref => !closing.has(ref) && !acknowledged.has(ref) && titles[ref])
     .map(ref => finding('stale-ticket', 'warn', 'PR body', 1,
-      `${ref} is worked by this change but no Closes line will close it`,
-      `"${titles[ref]}". CLAUDE.md: close the ticket in the PR that ships it. Add "Closes ${ref}" to the PR body, or leave it as Refs if this change does not finish it.`))
+      `${ref} is worked by this change but nothing states it will be closed`,
+      `"${titles[ref]}". CLAUDE.md: close the ticket that ships. Add "Closes nidus-${ref.slice(1)}" to the PR body, or "Refs" if this change does not finish it. Nothing auto-closes — on merge, run bd close nidus-${ref.slice(1)} and bd dolt push.`))
 }
 
 export const LAW_IDS = [

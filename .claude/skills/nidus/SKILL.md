@@ -1,6 +1,6 @@
 ---
 name: nidus
-description: Carry work from a thought to a shipped PR — assess whether it belongs, research and blueprint it, implement it with parallel agents, review it, ship it, or coordinate a fleet of peer sessions doing all of that. Use when the user invokes /nidus with a subcommand (fit, spec, implement, review, ship, fleet) or with a GitHub issue number or description.
+description: Carry work from a thought to a shipped PR — assess whether it belongs, research and blueprint it, implement it with parallel agents, review it, ship it, or coordinate a fleet of peer sessions doing all of that. Use when the user invokes /nidus with a subcommand (fit, spec, implement, review, ship, fleet) or with an issue number (beads, e.g. nidus-186 or #186) or description.
 argument-hint: "[fit|spec|implement|review|ship|fleet] <issue number | description | PR number | who does what>"
 model: opus
 allowed-tools: [Read, Write, Edit, Bash, Grep, Glob, Agent, Workflow, AskUserQuestion, ReportFindings, TodoWrite, ListAgents, SendMessage, EnterWorktree, ExitWorktree]
@@ -39,11 +39,13 @@ tree — that is the cheapest useful thing.
 ## Preflight (every subcommand except `review` and `fit`)
 
 1. `git branch --show-current`. Never work on `main`.
-2. Resolve the target. If it matches `#?\d+`, `gh issue view <n>`; read the title, body,
-   labels, and comments. If `gh issue view` cannot find it, say so and ask whether to
-   proceed from the description alone — do not invent the issue's contents.
+2. Resolve the target. If it matches `#?\d+` or `nidus-\d+`, `bd show nidus-<n>`; read the
+   title, description, labels, and comments (`bd comments nidus-<n>`). Issues kept their
+   GitHub numbers, so `#186` and `nidus-186` are the same ticket. If `bd show` cannot find
+   it, say so and ask whether to proceed from the description alone — do not invent the
+   issue's contents.
 3. If the target is a description with no issue, file one before writing code
-   (`gh issue create --title=… --body=… --label=…`) and `gh issue edit <n> --add-assignee @me`.
+   (`bd create "…" -t <type> -p <0-4> -d "…"`) and `bd update nidus-<n> --claim`.
 4. If not already on a branch for this work, create `austin/<n>-<slug>` (3–5 word kebab
    slug) from an up-to-date `main`. If the tree is dirty, ask before touching it: stash and
    branch, commit here first, or stop.
@@ -52,12 +54,13 @@ tree — that is the cheapest useful thing.
 
 Feature thought work, before any spec: is this the right fit, does it make sense, would
 users use it? Read-only — no branch, no blueprints, no code. The target is an idea (a
-description, or an issue number to resolve with `gh issue view`).
+description, or an issue number to resolve with `bd show`).
 
 1. **Check it is not already decided.** Search open and closed issues
-   (`gh issue list --search`, including `label:decision`), SPEC §9's shipped/deferred/
-   DECIDED entries, and `.beads/issues.jsonl` (the frozen archive) for prior art. A
-   rejected idea returning without new evidence gets the old answer, cited.
+   (`bd search "<terms>"`, `bd list --all --label decision`) and SPEC §9's
+   shipped/deferred/DECIDED entries for prior art — the migration carried the closed
+   history across, so a rejected idea is still findable. One returning without new
+   evidence gets the old answer, cited.
 2. **Gap or feature?** If the product already implies the capability (a doc describes it,
    a surface half-has it, sibling surfaces have it and this one lacks it), it is a **gap**:
    skip fit, file it as a `task`/`bug` with the evidence, done. Fit is for genuinely new
@@ -186,10 +189,12 @@ against `main`; a path → those files; nothing → the working tree.
    If `major.minor` changed, update the `nidus = "M.m"` snippet in `README.md` and
    `docs/src/content/docs/getting-started.md`. Never touch `charts/nidus/Chart.yaml` or the
    SDK version files — CI stamps those and commits them back.
-3. **Close the issue in this PR** — put `Closes #<n>` in the PR body so the merge closes
-   it, not a later pass. `Closes` fires on merge whether or not the work survived review,
-   so re-read every such line against the diff first and downgrade it to `Refs #<n>` if
-   this change does not actually finish the issue.
+3. **State the close, then perform it.** Put `Closes nidus-<n>` in the PR body — but that
+   line no longer *does* anything, because GitHub cannot close a bead. Re-read every such
+   line against the diff and downgrade it to `Refs nidus-<n>` if this change does not
+   finish the issue. Then, once the PR merges, actually close it:
+   `bd close nidus-<n> --reason "shipped in #<pr>"` followed by `bd dolt push`. A PR that
+   merges with the bead left open is the failure this step exists to prevent.
 4. **Commit.** Subject `🪺 <area>: <terse description>` — an emoji prefix and the area, no
    issue or PR number (the squash merge appends `(#<pr>)`; a second `(#<n>)` for the issue
    would be unreadable next to it). The issue ref belongs in the PR body.
@@ -201,11 +206,12 @@ against `main`; a path → those files; nothing → the working tree.
    Counting `git log` yourself is right, but count **25+ top-level commits**: a small window
    over a squash-merge repo shows the sub-commits preserved *inside* one PR's squash message,
    which reads exactly like a convention and is not one.
-5. **Push.** `git pull --rebase` then `git push -u origin <branch>`. Issue state lives on
-   GitHub, so nothing tracker-related ships with the commit.
+5. **Push both.** `git pull --rebase` then `git push -u origin <branch>`, and `bd dolt push`
+   for the issue state. Nothing tracker-related rides along in the commit, so a `git push`
+   alone leaves every claim and close on your machine.
 6. **Offer the PR** with `AskUserQuestion` — open it, or stop with the branch pushed. When
    opening: `gh pr create --assignee @me`, title = the commit subject verbatim, body = what
-   changed and why plus `Closes #<n>`. Print the URL.
+   changed and why plus `Closes nidus-<n>`. Print the URL.
 
 Ask before the commit. Never commit or push without the user choosing to.
 
@@ -309,8 +315,8 @@ Write the plan and let the checker judge it. Never eyeball this:
 
 **`.claude/fleet-plan.json` is the only state you are allowed to keep in your head, so keep
 it on disk instead.** Write it on every dispatch change. Everything else — what is claimed,
-what has a PR, what already shipped, which trees exist, what collides — is derived from
-GitHub and the worktree registry on each run, so the developer can `/clear` you at any point
+what has a PR, what already shipped, which trees exist, what collides — is derived from the
+tracker, GitHub's PRs and the worktree registry on each run, so the developer can `/clear` you at any point
 and one command rebuilds the picture. If you find yourself remembering who is on what, that
 belongs in the plan file.
 
@@ -332,10 +338,10 @@ surface or you re-cut the queue.
 
 Every dispatch message carries all of: the tickets and their PR grouping, the order, `/nidus
 implement` then `/nidus review` on their own diff before opening the PR, the worktree path,
-`gh issue edit <n> --add-assignee @me`, and CLAUDE.md's shipping laws (bump `Cargo.toml`, audit
-every `Closes #<n>` against the diff, no em dashes in user-facing prose). Name who else is
-working where and on what — a peer that knows the shape of the other branches is the cheapest
-collision detector you have.
+`bd update nidus-<n> --claim`, and CLAUDE.md's shipping laws (bump `Cargo.toml`, audit every
+`Closes` line against the diff, close the bead yourself on merge, no em dashes in user-facing
+prose). Name who else is working where and on what — a peer that knows the shape of the other
+branches is the cheapest collision detector you have.
 
 Demand three reports per ticket: **claimed**, **blocked or colliding**, **PR open with its
 number**. Ask for the file-level surface *before* they go deep, not after.
@@ -356,9 +362,9 @@ recycle a version freed by a cancelled ticket without re-checking the tree first
 When a peer reports a defect, **settle who files it before either of you does**. Both filing is
 the likely outcome otherwise — the peer is closest to the evidence, you are closest to the
 priority — and a duplicate left open describes a bug that is already fixed, which is the
-stale-tracker failure in the direction GitHub never nags about. Say "file it, I will set
-priority" or "I will file it, send me the numbers", then close the loser as a duplicate
-pointing at the survivor.
+stale-tracker failure nothing nags about. Say "file it, I will set priority" or "I will file
+it, send me the numbers", then `bd duplicate <loser> --of <survivor>`, which closes the loser
+pointing at the survivor. (`bd find-duplicates` catches what slips through.)
 
 ### 4. Sequence overlaps, do not race them
 
@@ -394,8 +400,9 @@ back to the user.
 - Blueprints are `BLUEPRINT-<id>.md`; they are transient, gitignored, and deleted once
   implemented. `SPEC.md` is the product spec and is never touched by this skill.
 - Never cross a gate the user has not approved, and never commit to `main`.
-- Track work in GitHub Issues. No TodoWrite lists, no markdown checklists, no MEMORY.md —
-  durable knowledge goes in the issue that owns it, or in `SPEC.md`.
+- Track work in beads (`bd`). No TodoWrite lists, no markdown checklists, no MEMORY.md —
+  durable knowledge goes in the issue that owns it, or in `SPEC.md`. Issue state is not in
+  the repo: `bd dolt push` publishes it, `bd bootstrap` sets up a fresh clone.
 - Implementation agents are sonnet in worktrees; merging, verifying, and reviewing stay on
   the main thread so one context has seen the whole change.
 - `nidus-check` is the source of truth for lanes, laws and dispatch safety. If it is wrong, fix

@@ -360,3 +360,20 @@ bench-crit *ARGS:
 
 # ── Project setup ────────────────────────────────────────────────────────────
 
+# NOT `bd init` — that mints a new identity and can force-push over the team's history
+# (`bd help init-safety`); bootstrap adopts what the remote already has. A worktree needs
+# none of this, it shares the main clone's database.
+# Fresh clone: pull the shared issue database from refs/dolt/data on origin
+bd-setup:
+    @command -v dolt >/dev/null || (echo "dolt CLI required to clone the database: brew install dolt" && exit 1)
+    bd bootstrap --yes
+    git config beads.role maintainer
+    chmod 700 .beads
+
+# `git push` does NOT carry issue state — the database rides a separate ref — so this is
+# the tracker half of finishing a session.
+# Publish and collect issue state (bd dolt pull, then push)
+bd-sync:
+    bd dolt pull
+    bd dolt push
+
