@@ -83,7 +83,7 @@ pub struct Remembered {
 pub struct RecallOpts {
     /// Maximum number of hits. `0` means "use the default" ([`DEFAULT_TOP_K`]).
     pub top_k: usize,
-    /// Drop hits scoring at or below this cosine similarity. `0.0` (the default)
+    /// Drop hits scoring below this cosine similarity. `0.0` (the default)
     /// applies no floor.
     pub min_score: f32,
     /// Optional pre-scoring metadata filter.

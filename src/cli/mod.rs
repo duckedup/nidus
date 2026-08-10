@@ -978,7 +978,7 @@ enum Command {
         query: String,
         #[arg(long, short = 'k', default_value_t = 10)]
         top_k: usize,
-        /// Drop hits scoring at or below this cosine similarity.
+        /// Drop hits scoring below this cosine similarity.
         #[arg(long)]
         min_score: Option<f32>,
         /// AND-filter as JSON (same form as `search --where`).
