@@ -89,10 +89,13 @@ What IS tracked in git is the handful of config files that let a fresh clone fin
 that database (`.beads/config.yaml`, `.beads/metadata.json`, `.beads/.gitignore`,
 `.beads/hooks/`). Everything else under `.beads/` is runtime.
 
-**In a fresh clone, run `bd bootstrap`** — it reads the tracked config, clones the
-database from `refs/dolt/data`, and you have the issues. This requires the `dolt`
-CLI on PATH (`brew install dolt`); `bd` alone can push but cannot clone. A
-**worktree** needs none of this: it shares the main clone's database directly.
+**In a fresh clone, run `just bd-setup`** — `bd bootstrap` plus the role and
+permissions bd asks for. It reads the tracked config, clones the database from
+`refs/dolt/data`, and you have the issues. This requires the `dolt` CLI on PATH
+(`brew install dolt`); `bd` alone can push but cannot clone. Never `bd init` against
+this repo: it mints a new identity and can force-push over everyone else's history
+(`bd help init-safety`). A **worktree** needs none of this — it shares the main
+clone's database directly. `just bd-sync` is pull-then-push when you finish.
 
 ### Rules
 

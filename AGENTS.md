@@ -8,8 +8,9 @@ This project tracks work in **beads**, via the `bd` CLI. GitHub Issues is retire
 > this repo's own `origin`. So `bd dolt push` is as load-bearing as `git push` — your
 > commit does not carry your issue changes.
 >
-> A fresh clone runs **`bd bootstrap`** to pull the database down (needs the `dolt` CLI:
-> `brew install dolt`). A git worktree needs nothing — it shares the main clone's
+> A fresh clone runs **`just bd-setup`** to pull the database down (needs the `dolt` CLI:
+> `brew install dolt`). Never `bd init` here — it mints a new identity and can force-push
+> over everyone else's history. A git worktree needs nothing: it shares the main clone's
 > database automatically.
 >
 > An earlier version of this tracker committed its JSONL export and rewrote it from each
@@ -25,7 +26,7 @@ bd show nidus-186                     # View issue details
 bd update nidus-186 --claim           # Claim work
 bd close nidus-186 --reason "…"       # Complete work
 bd create "title" -t task -p 2        # File new work
-bd dolt push                          # Publish issue changes (do NOT skip)
+just bd-sync                          # Publish + collect issue state (do NOT skip)
 ```
 
 Issues kept their GitHub numbers through the migration: `#186` is `nidus-186`. Priority
