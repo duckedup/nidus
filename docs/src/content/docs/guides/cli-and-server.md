@@ -1,6 +1,6 @@
 ---
 title: Command line
-description: "Use nidus from the terminal with the `nidus` binary: create, upsert, search, inspect, back up, and restore a store directory."
+description: "Use nidus from the terminal with the `nidus` binary: create, upsert, search, inspect, back up, restore, and check a store directory."
 ---
 
 Besides the Rust library, nidus ships a `nidus` binary: a command-line tool for
@@ -161,9 +161,12 @@ nidus configure  --dir ./store --ann hnsw
 # Snapshot the whole store to one portable .tar.gz, and restore it
 nidus backup     --dir ./store --out ./store.tar.gz
 nidus restore    --in ./store.tar.gz --dir ./restored
+
+# Verify sealed segments against their checksum sidecars, in place, no archive involved
+nidus check      --dir ./store
 ```
 
-Read-only commands (`search`, `list`, `get`, `collections`, `stats`, and
+Read-only commands (`search`, `list`, `get`, `collections`, `stats`, `check`, and
 `backup`) open the store without taking the writer lock, so they can run
 alongside a writer such as a running server.
 
@@ -537,6 +540,51 @@ record count. It is not a semantic diff against the live source store, and it
 says nothing about a store corrupted in place on disk, only about the
 archive's own bytes. Archives written before nidus 0.57 predate the baseline;
 verify falls back to the structural check and reports `objects_checked: 0`.
+For a store's own bytes on disk between backups, see `nidus check` below.
+
+## Checking a live store
+
+`nidus verify` proves an archive is restorable. It says nothing about the
+working store on disk right now, between backups, because a store corrupted
+in place (a bad sector, a stray write from something else) still opens
+cleanly and returns wrong scores: nothing about it changes the row count or
+the header. `nidus check` closes that gap, in place, with no archive step:
+
+```bash
+nidus check --dir ./store
+```
+
+Every **sealed** segment (a `seg-…` file, or `data` once something else
+becomes the active segment) carries a small sidecar object, `<segment>.crc`,
+written the moment the segment becomes immutable. `check` recomputes each
+sealed segment's checksum and compares it against its sidecar, then reports
+one entry per segment: whether it matched, how many rows the sidecar covers
+versus how many the segment now holds, and whether the sidecar is missing or
+unusable. It exits `1` on any mismatch, so you can script against the exit
+code the same way as `verify`:
+
+```bash
+nidus check --dir ./store || echo "store is corrupted, alert on-call"
+```
+
+**What it does and does not cover.** A checksum is stamped only when a
+segment becomes immutable (seal or compaction), never on every append, so a
+segment can legitimately show fewer covered rows than it holds: the
+difference is the tail written to the active segment since the last seal,
+which is unverified, not vouched-for-clean, until the next seal covers it. A
+store with no sealed segments yet (nothing has grown past
+[`segment_max_rows`](/reference/configuration/#segment_max_rows)) reports
+every segment as having no sidecar at all, which means unverified, not
+corrupt. `check` never recomputes and re-saves a checksum on its own: doing
+that over already-corrupted bytes would launder the corruption into a fresh,
+valid-looking checksum, so a real mismatch stays reported until you
+investigate and, if you choose to, rebuild the segment yourself (compaction
+restamps it). `check` also does not cover `log`, whose own tolerance of a
+CRC-bad *tail* record is deliberate crash recovery (see [Storage &
+durability](/guides/storage/#the-durability-contract)), not corruption. It is
+a different tool from `verify` for a different question: `verify` asks "is
+this archive restorable," `check` asks "has this store's disk rotted since
+its last seal."
 
 ## Over the network
 

@@ -6,8 +6,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::backend::Appender;
 use crate::model::Distance;
 
+mod checksum;
 mod mmap;
 mod segments;
+pub use checksum::SegmentIntegrity;
+// Shared so the writer in `store` cannot drift from the verifier here: object naming and
+// the validity key are on-disk encoding, and a second copy of them would diverge silently.
+pub(crate) use checksum::{key as checksum_key, save as checksum_save};
 pub use mmap::MappedSegment;
 pub use segments::Segments;
 
