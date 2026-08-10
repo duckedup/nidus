@@ -73,8 +73,8 @@ jobs:
       # --include-ignored runs the cluster suite (#[ignore]d because it needs the
       # services above) alongside the service-free server suite, so this job is a
       # complete statement about e2e health on its own. The server suite also runs
-      # in ci.yml's test-cli lane; the few seconds of overlap are worth not having
-      # this check depend on another workflow.
+      # in ci.yml's `test` job (its `cli` step); the few seconds of overlap are worth
+      # not having this check depend on another workflow.
       #
       # The tests' NIDUS_E2E_* defaults already match what the script starts, so
       # there is nothing to configure here — one less pair of values to drift.
