@@ -26,6 +26,30 @@ query p50; lower is better.
 All three are exact (recall 100%); nidus is the fastest in every cell while being
 the one that compiles in seconds with zero FFI.
 
+### Text search, hybrid, and rank_by
+
+Single-threaded, same machine as above: 10,000 documents at dim 384, each 32 tokens
+drawn from a 300-term Zipf-weighted vocabulary, one FTS field on the default
+analyzer.
+
+| bench                                      |    time |
+| ------------------------------------------- | ------: |
+| text_search, single hot term                | 1.08 ms |
+| text_search, multi-term                     | 1.13 ms |
+| hybrid, candidates=50                       | 1.82 ms |
+| hybrid, candidates=100                      | 1.89 ms |
+| hybrid, candidates=400                      | 2.38 ms |
+| rank_by recency decay, without (baseline)   |  530 µs |
+| rank_by recency decay, with                 | 1.26 ms |
+
+Term count barely moves the text-search cost: a multi-term query is only marginally
+dearer than a single hot term. Hybrid's `candidates` sweep is the actionable knob:
+going 8× deeper (50 → 400) costs about 1.3×, so buying fusion recall is cheap.
+`rank_by`'s recency-decay expression is the expensive lever here, roughly
+**2.4×**ing a single-threaded vector search at this size (530 µs → 1.26 ms); read
+it as that with/without delta rather than an absolute, and note it is
+single-threaded (`query_threads` unset).
+
 ## Why it's fast
 
 The scoring kernel is plain safe Rust the optimizer can vectorize:
@@ -73,6 +97,19 @@ paired with the int8 first pass, which has the compute headroom to scale. They'r
 honest latency wins for the right workload, measured by benchmarks you can run
 yourself.
 
+### `persist_index` is manual, not automatic
+
+`persist_index` is the only writer of the on-disk ANN and FTS caches, and it is
+strictly out-of-band: it is **never** called from `upsert` or `flush`. It fires
+only from `compact()` (best-effort, so a persist failure never fails the
+compaction), the public `Nidus::persist_index`, and `nidus serve`/`nidus mcp`'s
+clean-shutdown path, which persists right after a final flush. A long-running
+writer that never compacts and never calls it pays a full index rebuild on the
+next `open`. Per-segment IVF indexes are never persisted at all and rebuild on
+every open, a real startup cost at scale. See [index cache
+lifecycle](/guides/how-it-works/#index-cache-lifecycle) for the full watermark
+and staleness contract.
+
 ## The target regime
 
 nidus is tuned for **exact** search at the scale where a full scan wins: up to a
@@ -93,6 +130,8 @@ approximate variants' recall and latency on your own shapes.
 just bench all                  # cross-engine parity table (nidus vs DuckDB vs LanceDB)
 just bench-quant                # int8 quantization recall & speed sweep
 just bench-crit parallel_search # query_threads scaling (criterion)
+cargo bench -p nidus-bench --bench nidus_regression -- 'text_search|hybrid|rank_by'
+                                 # text search, hybrid, and rank_by (criterion)
 ```
 
 The heavy DuckDB/LanceDB dependencies are **quarantined off nidus's own build

@@ -21,8 +21,12 @@ import { Code } from '@astrojs/starlight/components';
   semantic search, code indexing, RAG, and agent memory on) and an <strong>all-in-one
   memory</strong> layered on top that embeds text for you, so you can remember natural
   language and recall the relevant bits. Bring your own vectors, or let nidus make
-  them. Not a database, no SQL, no query engine; sized for development and
-  small-scale use.
+  them. Reach either from outside a Rust process too: run it as an
+  <a href="/guides/http-server/">HTTP server</a>, point any MCP client at it as
+  <a href="/guides/mcp/">agent memory</a>, or connect with the
+  <a href="/sdks/javascript/">JavaScript</a>, <a href="/sdks/go/">Go</a>, or
+  <a href="/sdks/python/">Python</a> SDK. Not a database, no SQL, no query engine;
+  sized for development and small-scale use.
 </p>
 
 <Code code={`// Text in: nidus embeds it for you.

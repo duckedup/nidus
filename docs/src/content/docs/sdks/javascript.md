@@ -40,9 +40,9 @@ const db = new NidusClient({
 
 ## Upserting and searching
 
-`attrs` accept plain JS values (strings, integers, booleans, string arrays, and `null`)
-and are normalized to nidus's typed values for you. Results come back with `attrs`
-decoded to plain JS values.
+`attrs` accept plain JS values (strings, integers, booleans, string arrays, `Date`, and
+`null`) and are normalized to nidus's typed values for you. Results come back with
+`attrs` decoded to plain JS values.
 
 ```ts
 await db.createCollection("docs");
@@ -60,15 +60,29 @@ for (const hit of hits) {
 }
 ```
 
-For an explicit attribute type, use the `v.*` helpers (`v.str`, `v.int`, `v.bool`,
-`v.list`, `v.nil`), useful to disambiguate, e.g., an integer from a float-free number.
+JS has one `number` type, so a plain number is normalized to `Int` or `Float` by
+`Number.isInteger`: a whole-numbered measurement lands as an `Int`, and a `Float` range
+filter then skips exactly those records. For an explicit type, use the `v.*` helpers
+(`v.str`, `v.int`, `v.float`, `v.bool`, `v.list`, `v.datetime`, `v.nil`):
 
 ```ts
 import { v } from "@duckedup/nidus";
 await db.upsert("docs", [
-  { id: "d", attrs: { tags: v.list(["a", "b"]), score: v.int(7) } },
+  {
+    id: "d",
+    attrs: {
+      tags: v.list(["a", "b"]),
+      score: v.float(7), // pinned to Float even though it is whole-numbered
+      seen: v.datetime(new Date()), // or a raw epoch-millisecond number
+    },
+  },
 ]);
 ```
+
+`v.nil()` is the explicit `Null` value ("set, and empty"), a different fact from an
+absent key ("not set / not indexed"). The SDK keeps the two apart in both directions:
+a decoded `Date` (from `v.datetime`) re-encodes to the same `DateTime`, never a plain
+number, so a round trip through `attrs` never demotes an instant to an `Int`.
 
 ## Filtering
 
@@ -91,8 +105,9 @@ const hits = await db.search({
 });
 ```
 
-Predicates: `eq`, `ne`, `glob`, `iglob`, `in`, `notIn`, `lt`, `le`, `gt`, `ge`.
-`iglob` is `glob` with ASCII case folded on both sides.
+Predicates: `eq`, `ne`, `glob`, `iglob`, `in`, `notIn`, `lt`, `le`, `gt`, `ge`, `contains`,
+`notContains`, `containsAny`, `all`, `any`, `not`. `iglob` is `glob` with ASCII case
+folded on both sides.
 
 ## Full-text and hybrid search
 
@@ -117,18 +132,163 @@ const hybrid = await db.hybridSearch({
 });
 ```
 
+Both accept `clauses` (a `TextClause[]`, each `{ field, query }`) instead of a single
+`field`/`query`, folded by `combine` (`"Sum"` by default, or `"Max"`). Naming the field
+both ways at once is a `400`.
+
+## Remembering and recalling
+
+When the server is started with an embedder
+([`nidus serve --embed-provider …`](/guides/remember-and-recall/)) you can send **text**
+and let the server embed it: no need to compute vectors client-side. `remember` embeds
+and upserts; `recall` embeds the query and vector-searches.
+
+```ts
+// Embed "the quick brown fox" and store it under id "a"
+await db.remember("notes", "a", "the quick brown fox", { attrs: { tag: "x" } });
+
+// Expire after an hour, and fold near-duplicates into the closest existing entry.
+// On a dedupe match, result.deduped is true and result.id names the entry the
+// write actually landed on, which may differ from the id you passed.
+const result = await db.remember("notes", "a2", "the quick brown fox!", {
+  ttlSeconds: 3600,
+  dedupeThreshold: 0.95,
+});
+
+// Summarize first, then embed the summary (the server also needs --summarize-provider).
+// The stored record additionally carries the `nidus.summary` attr, with the raw
+// input in `nidus.text`.
+await db.remember("notes", "b", longArticle, { mode: "summarize" });
+
+// Embed the query text and search, best first
+const hits = await db.recall("notes", "quick fox", {
+  topK: 5,
+  minScore: 0.2,
+  filter: f.and(f.eq("tag", "x")),
+});
+```
+
+Against a server started **without** an embedder both throw `NidusError` with status
+`400`, and the message names `--embed-provider`; `mode: "summarize"` without a
+summarizer configured is likewise a `400`. The client only ever sends text; the
+embedding always happens server-side. Read `result.id` off the return value rather than
+assuming the id you passed, since `dedupeThreshold` can redirect the write.
+
+## Batch search and fusion
+
+`batchSearch` answers several vector queries in one round trip (16 max), and can fuse
+them into a single ranking via the same Reciprocal Rank Fusion `hybridSearch` runs
+across a vector and a text leg, here across N query legs instead.
+
+```ts
+// One ranking per query, in request order
+const [rustHits, goHits] = await db.batchSearch({
+  queries: [
+    { query: rustVec, topK: 5, filter: f.and(f.eq("lang", "rust")) },
+    { query: goVec, topK: 5, filter: f.and(f.eq("lang", "go")) },
+  ],
+});
+
+// Fuse the two legs into ONE ranking instead
+const [fused] = await db.batchSearch({
+  queries: [{ query: rustVec, topK: 20 }, { query: goVec, topK: 20 }],
+  fuse: { rrfK: 60, weights: [2, 1], topK: 10 },
+});
+```
+
+`batchSearch` always returns `Hit[][]`: without `fuse` it is one array per query in
+request order; with `fuse` it is a single-entry array holding the one fused ranking, so
+the return shape stays uniform either way. The server validates the whole batch before
+running any leg, so a malformed query fails the call rather than returning a partial
+answer that cannot be told apart from a real one. `weights` must be empty or exactly as
+long as `queries`.
+
+## Aggregating
+
+`aggregate` counts the records matching a filter and sums named attributes, answered
+straight from the in-RAM index: no record is built and no vector is read.
+
+```ts
+const totals = await db.aggregate({
+  scope: ["docs"],
+  filter: f.and(f.eq("lang", "rust")),
+  sum: ["stars"],
+});
+// { count, sums: { stars } }
+
+// One row per distinct value of an attribute, alongside the whole-scope totals
+const byLang = await db.aggregate({
+  scope: ["docs"],
+  sum: ["stars"],
+  groupBy: "lang",
+});
+// { count, sums, groups: [{ value, count, sums }, ...], groupsTruncated? }
+```
+
+`groups[].value` is `null` for the records *missing* the `groupBy` attribute, a
+different bucket from records holding an explicit `Null`. `groupsTruncated` is present
+(and `true`) only when distinct values outran the server's cap and later ones were
+dropped.
+
+## Pagination, ranking, and projections
+
+These knobs are shared across the search family (`SearchOptions`, `TextSearchOptions`,
+`ListOptions`) wherever they apply:
+
+```ts
+const hits = await db.search({
+  query: [0.1, 0.2, 0.3],
+  topK: 10,
+  offset: 10, // skip this many top-ranked hits, for pagination (offset + topK ≤ 10000)
+  exact: true, // force the exact scan for this query, bypassing any ANN index
+  includeAttributes: ["lang", "year"], // or excludeAttributes; sending both is a 400
+  rankBy: {
+    decay: {
+      field: "updatedAt", // a DateTime attr, or an Int of epoch ms
+      origin: new Date(),
+      scale: 7 * 24 * 60 * 60 * 1000, // half-life of one week
+    },
+  },
+  limitPer: { field: "sourceFile", max: 2 }, // at most 2 hits per sourceFile
+});
+
+// list() sorts by an attribute instead of storage order
+await db.list({ scope: ["docs"], orderBy: { field: "year", descending: true } });
+
+// explain and highlight are text/hybrid-search only
+const explained = await db.textSearch({
+  field: "body",
+  query: "vector store",
+  explain: true, // report each leg's / clause's own score in hit.annotations
+  highlight: { maxFragments: 2, fragmentChars: 120 }, // or `true` for the defaults
+});
+console.log(explained[0].annotations?.highlights);
+```
+
+`rankBy`'s `decay` subtracts a recency penalty from the base score
+(`score = base - lambda * (1 - decay ^ (age / scale))`), so it stays meaningful even for
+a metric whose scores are negative or unbounded. `limitPer` thins an already-ranked
+result rather than searching deeper to refill the cap, so it is approximate. `highlight`
+reads the stored text, so it still works on a field a projection dropped.
+
 ## The rest of the API
 
 Every data-plane endpoint of the [HTTP API](/reference/http-api/) has a typed method.
-The ops probes are typed too, with one exception: `ready()`, `cluster()`, and
-`refresh()` each have a method, while `/metrics` stays unwrapped since it is a
-scraper's endpoint, not something application code calls. `ready()` returns a
-verdict rather than throwing when the server reports not-ready, so a `503` is
-something you branch on, not something you catch. The memory layer is fully typed
-too: `db.remember()` (with `ttlSeconds` and `dedupeThreshold` options and a
-`RememberResult` return) and `db.recall()`, plus `db.batchSearch()` and
-`db.aggregate()`; a fuller walkthrough of those is coming to this page
-([#132](https://github.com/duckedup/nidus/issues/132)).
+The three SDKs are kept in lockstep on purpose, stated as policy in the Go client's own
+header comment (`sdks/go/client.go`):
+
+> The surface mirrors the JavaScript SDK (sdks/js/src/client.ts) endpoint for
+> endpoint, deliberately: the SDKs are meant to be reviewable side by side, so a
+> method exists here if and only if it exists there, which is why /ready, /cluster
+> and /refresh shipped to all three SDKs together. /metrics remains the one route
+> still absent, out of scope until it moves the same way.
+
+So `ready()`, `cluster()`, and `refresh()` are each a typed method today, same as every
+other endpoint. `/metrics` is the sole deliberate exception across all three SDKs: it
+answers Prometheus text, not JSON, which is a scraper's format rather than something
+application code parses. `ready()` returns a verdict rather than throwing when the
+server reports not-ready, so a `503` is something you branch on, not something you
+catch.
 
 ```ts
 await db.collections();                  // string[]
@@ -143,7 +303,7 @@ await db.dropCollection("docs");
 await db.health();                       // boolean
 const r = await db.ready();              // { ready, role, staleness_secs }
 if (!r.ready) console.warn(r.reason);    // a 503 is an answer, not a throw
-await db.cluster();                      // role, lease state, commit version
+await db.cluster();                      // role, lease state, fencing, commit version
 await db.refresh();                      // boolean: did it adopt newer state
 ```
 
@@ -160,7 +320,9 @@ try {
 } catch (err) {
   if (err instanceof NidusError) {
     if (err.isBadRequest) {/* e.g. vector dimension mismatch (400) */}
+    if (err.isReadOnly) {/* the store is read-only (403) */}
     if (err.isLocked) {/* the writer lock is held elsewhere (409) */}
+    if (err.isOutOfCapacity) {/* max_vector_bytes exceeded, or OOM (507) */}
     console.error(err.status, err.message);
   }
 }

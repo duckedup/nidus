@@ -41,6 +41,13 @@ so the same id appears in your logs and the server's.
 | `GET /ready` | whether this instance can serve (store open, not fenced, not stale) | – |
 | `GET /cluster` | role, writer-handle state, fencing token, commit counter, staleness | `cluster_status` |
 | `GET /metrics` | Prometheus scrape: traffic, search path, lease counters (always unauthenticated) | – |
+| `POST /collections/{name}/remember`* | text in, optionally summarize, embed, and upsert | – |
+| `POST /collections/{name}/recall`* | text in, embed, and search with TTL filtering | `search` |
+| `/mcp`** | the Model Context Protocol surface, nested inside this router | – |
+
+\* Present only in a `memory`-featured build (the `serve` umbrella; absent from a plain
+`--features cli` build). See [Memory](#memory-remember--recall) below.
+\*\* Needs the `mcp` feature on top of `memory`. See [`/mcp`](#mcp) below.
 
 ## Health & introspection
 
@@ -666,6 +673,102 @@ present, `Not` is a true complement. A filter is validated once per query, befor
 is scanned, so an unparseable `Regex` or a `Fuzzy` budget above 8 is **refused with an
 error** rather than quietly matching nothing. See
 [Search & filters](/guides/search/#filters) for the full semantics.
+
+## Memory (remember & recall)
+
+Two text-native routes over the same store: send text, not vectors, and the server embeds
+(and optionally summarizes) it for you. Both are compiled in only under the `memory`
+feature, which is part of the `serve` umbrella and therefore present in the prebuilt
+`cargo binstall` binary. A `cargo install nidus --features cli` build has **neither** route;
+hitting them there is a `404`, not a `400`. See the
+[remember & recall guide](/guides/remember-and-recall/) for setup (an embedder, optionally a
+summarizer) and [parity across the surfaces](/guides/remember-and-recall/#parity-across-the-surfaces)
+for how these two routes compare to the Rust API, the CLI, and the MCP tools below.
+
+### `POST /collections/{name}/remember`
+
+Store a piece of text: embed it (summarizing first if asked), then upsert it under the
+given id.
+
+```bash
+curl -s localhost:7700/collections/notes/remember \
+  -H 'content-type: application/json' \
+  -d '{"id": "note-1", "text": "the deploy window moved to Fridays",
+       "attrs": {"project": {"Str": "nidus"}}, "ttl_seconds": 604800}'
+# → {"ok": true, "upserted": 1, "id": "note-1", "deduped": false}
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `id` | – (required) | the record id to write. Unlike the MCP `remember` tool, nothing here derives one for you; omit it and the request is a `400` |
+| `text` | – (required) | the text to remember |
+| `mode` | `"raw"` | `"raw"` embeds the text as given; `"summarize"` summarizes first and embeds the summary (needs a summarizer) |
+| `attrs` | `{}` | structured metadata stored alongside the text |
+| `ttl_seconds` | none (never expires) | seconds until this entry expires, counted from the moment it is written |
+| `dedupe_threshold` | none (dedup disabled) | cosine-similarity floor above which this write updates the nearest existing entry instead of inserting a near-duplicate |
+
+The response is `{"ok": true, "upserted": <n>, "id": "<id>", "deduped": <bool>}`.
+**`id` and `deduped` are not an echo of what you sent.** When `dedupe_threshold` is set and
+an existing entry scores above it, the write updates that entry in place instead of
+inserting a competing near-duplicate, `deduped` comes back `true`, and `id` is the id of
+the entry that was actually written, which may differ from the `id` you sent. Read `id` out
+of the response rather than assuming it matches the request.
+
+`mode: "summarize"` stamps the generated summary into `nidus.summary` in `attrs`,
+alongside the original text.
+
+Errors: no embedder configured at serve time is a `400` naming `--embed-provider`;
+`mode: "summarize"` with no summarizer configured is a separate `400` naming
+`--summarize-provider`.
+
+### `POST /collections/{name}/recall`
+
+Search by meaning: embed the query text, then rank the collection against it.
+
+```bash
+curl -s localhost:7700/collections/notes/recall \
+  -H 'content-type: application/json' \
+  -d '{"query": "when do we deploy", "top_k": 5,
+       "filter": [{"Eq": ["project", {"Str": "nidus"}]}]}'
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `query` | – (required) | query text; embedded server-side |
+| `top_k` | `10` | maximum hits to return |
+| `min_score` | none | drop hits scoring below this cosine similarity |
+| `filter` | none | AND of predicates applied before scoring |
+
+Returns the same `HitDto` shape as `/search`: an array of `{collection, id, score, attrs}`.
+
+**TTL filtering applies here, and only here, of the routes on this page.** `/recall`
+AND-s a not-expired predicate into your filter, so an entry past its `ttl_seconds` never
+comes back from this route. `/search`, `/list`, `/text-search`, and `/hybrid-search` apply
+no such predicate: an expired-but-unswept memory is still visible to those general-purpose
+routes unless you filter `nidus.expires_at` yourself. Do not read TTL as a store-wide
+property; it is a `/recall`-specific (and MCP-tool-specific) read filter, not a deletion.
+
+Errors: no embedder configured is the same `400` as `/remember`. Recalling against a
+collection embedded by a different provider/model is also refused, since the vectors would
+not be comparable.
+
+## `/mcp`
+
+`nidus serve` also answers the [Model Context Protocol](https://modelcontextprotocol.io)
+at `/mcp`, behind the `mcp` feature (also folded into the `serve` umbrella). It is
+`nest_service`'d **inside** the same middleware stack as every route above, not layered
+separately, so it inherits the body limit, backpressure, bearer auth, and metrics rather
+than reimplementing any of them: a token required elsewhere on this server is required at
+`/mcp` too.
+
+Nine tools, all text-native: `remember`, `recall`, `text_search`, `hybrid_search`,
+`list_collections`, `stats`, `forget`, `get`, `browse`. **No tool takes a raw vector**:
+every argument is natural language, which is deliberate, since a model cannot emit a raw
+float array as a tool call, and `tests/e2e/mcp/` asserts the surface stays that way.
+
+This page does not restate the tool schemas, the transport details, or protocol
+negotiation; see the [MCP guide](/guides/mcp/) for those, including the stdio transport
+(`nidus mcp`) that does not go through this HTTP surface at all.
 
 ## Maintenance
 

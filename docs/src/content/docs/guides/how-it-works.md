@@ -131,6 +131,71 @@ chunked dot product, an allocation-free top-k scan, and a storage-order
 (prefetcher-friendly) sweep of the matrix. See
 [Performance](/reference/performance/) for the numbers.
 
+## Index cache lifecycle
+
+Two derived structures are cached to disk on top of `data`/`log`: the ANN graph/lists
+and the FTS postings. A third, per-segment IVF, deliberately is not. None of the three
+is ever the source of truth, so every path that reads a cache treats a bad read as a
+signal to rebuild, never as an error.
+
+### One codec, one rule: a bad load returns `Ok(None)`
+
+Both caches serialize through the same framed codec (`src/index_cache.rs`): magic
+bytes, a version, a watermark, a caller-supplied validity key, the payload, and a
+CRC32. `load` decodes and checks all of it, and on any mismatch, missing object, or
+torn tail it returns `Ok(None)`, never `Err`. So "the cache is corrupt" and "the cache
+is absent" are the same event to every caller: fall back to rebuilding from `data`/`log`.
+
+### The ANN cache: query-time knobs excluded from the validity key
+
+`src/ann/persist.rs`'s `validity_key` folds in the ANN kind, distance metric,
+quantization, dimension, `m`, `ef_construction`, `n_lists`, and seed: change any of
+those and the cache is stale, discarded, and rebuilt. It deliberately excludes
+`ef_search`, `n_probe`, and `overscan`, the knobs that only steer a query over an
+already-built structure. Raising `ef_search` to tune recall never invalidates the
+on-disk graph; only a change to how the structure is built does.
+
+### The FTS cache: watermarked by the log offset
+
+`persist_fts` and `load_or_build_fts` (`src/store/mod.rs`) key the cache on the FTS
+schema and analyzer/BM25 params, and watermark it with the log offset at persist time.
+On open, the cache is adopted only when that watermark equals the store's current log
+offset exactly: any write since the last persist makes it stale, and the whole index
+is rebuilt from the replayed docs rather than incrementally caught up.
+
+### `persist_index` is out-of-band: never called from upsert or flush
+
+`Store::persist_index` is the only thing that writes either cache to disk, and it is
+explicit by design. Nothing in the `upsert` or `flush` path calls it. What does:
+
+- `compact()` calls it best-effort, via `let _ =`: a persist failure must not fail the
+  compaction, since the cache is derived and disposable.
+- The public `Nidus::persist_index` API, for a caller that wants it written on its own
+  schedule.
+- The clean-shutdown path shared by both `nidus serve` (HTTP) and `nidus mcp` (stdio),
+  which flushes and then persists the index as the process exits, also best-effort.
+
+So a long-running writer that never compacts and never shuts down cleanly (and never
+calls `persist_index` directly) keeps both indexes in RAM only. The next open finds no
+cache, or a stale one, and pays a full rebuild.
+
+### Per-segment IVF is never cached at all
+
+`build_segment_indexes` (`src/store/mod.rs`) is the one derived structure with no
+`index_cache` path whatsoever. It recomputes from scratch on every open, on a
+lock-free reader's `refresh`, and on every `compact`; a single freshly sealed segment
+takes the cheaper incremental `index_just_sealed` instead. None of these paths write
+anything to disk. At small scale this is invisible; with `Config::segment_index_min_rows`
+set on a large store it is not, since every one of those rebuilds pays a full,
+k-means-driven IVF build over every eligible segment, on every restart.
+
+The only tests behind any of the above are in-memory codec round-trips
+(`src/index_cache.rs`, `src/ann/persist.rs`): corrupt CRC, key mismatch, config
+mismatch, a truncated buffer, and a roundtrip-and-searches-the-same check. Nothing
+drives `persist_index` over HTTP and asserts that a stale cache gets rebuilt rather
+than served, so there is no e2e test of this lifecycle: the claims above come from
+reading the source, not from a test suite.
+
 ## What it deliberately is not
 
 - **Exact by default.** The default search compares every in-scope vector: 100%

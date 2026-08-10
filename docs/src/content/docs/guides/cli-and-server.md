@@ -12,6 +12,10 @@ The binary is optional. The library has no dependency on it: `cargo add nidus`
 pulls in only the pure-Rust core. The binary is built behind a `cli` feature, so
 its extra dependencies are compiled only when you ask for them.
 
+This page is a tour, with worked examples. For every subcommand and flag, its
+`NIDUS_*` environment variable, and which Cargo feature unlocks it, see the
+[CLI reference](/reference/cli/).
+
 ## Install
 
 The fastest path needs **no Rust toolchain**: one command fetches a prebuilt

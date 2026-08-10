@@ -217,8 +217,8 @@ dedupe, or BM25 over remembered text from Rust today, write through a
 - **`Raw`** embeds the text exactly as given. Best when the text is already the
   right size and shape for retrieval.
 - **`Summarize`** first runs the text through a summarizer, embeds the
-  **summary**, and stores *both* the summary and the original source alongside
-  the record (under the `nidus.summary` and `nidus.source` attrs) so a hit stays
+  **summary**, and stores *both* the summary and the original text alongside
+  the record (under the `nidus.summary` and `nidus.text` attrs) so a hit stays
   explainable back to what you ingested. Use it for long or noisy inputs where a
   dense summary is a better embedding target than the raw text.
 
@@ -300,6 +300,60 @@ that requires a key without one, or pointing at a host that is down, returns a
 `Config`, `Backend`, `Api { status, body }`, and `Decode` variants), not a panic.
 Transient failures (HTTP 429 and 5xx) are retried with backoff before the error
 surfaces. Match on the variant to decide whether to fall back, retry, or fail.
+
+## Parity across the surfaces
+
+`remember`/`recall` exist on four surfaces: the Rust `Memory` API you have been reading
+about, the HTTP `/remember` + `/recall` routes, the MCP memory tools, and the `nidus
+remember`/`nidus recall` CLI subcommands. They agree on almost everything, but not
+everything, and the differences are exactly the places callers get burned. Verify
+against source rather than assuming one surface behaves like another.
+
+| | Rust `Memory` | HTTP | MCP | CLI |
+|---|---|---|---|---|
+| `ttl_seconds` | `RememberOpts.ttl_seconds` | `RememberRequest.ttl_seconds` | `remember` arg `ttl_seconds` | `--ttl-seconds` |
+| `dedupe_threshold` | `RememberOpts.dedupe_threshold` | `RememberRequest.dedupe_threshold` | `remember` arg `dedupe_threshold` | `--dedupe-threshold` |
+| `nidus.text` | stamped on every write | stamped on every write | stamped on every write | stamped on every write |
+| `nidus.source` | never stamped (legacy) | never stamped (legacy) | never stamped (legacy) | never stamped (legacy) |
+| Derived ids | no, `id` is required | no, `id` is required | yes, from content when omitted | yes, from content when omitted |
+| TTL-on-read | only `Memory::recall` | only `/recall` | `recall`, `get`, `browse`, `text_search`, `hybrid_search` | only `recall` |
+
+A couple of things the table cannot show:
+
+- `ttl_seconds` counts from the moment of the write, not from whenever a caller
+  happens to read the entry back.
+- `dedupe_threshold` is a cosine floor: a write that lands within it of an existing
+  entry updates that entry in place instead of inserting a competitor, so the id you
+  get back may not be the id you sent.
+
+### Derived ids are not universal
+
+`Memory::remember` and the HTTP `RememberRequest` both take `id` as a required
+string; there is no server-side derivation, so an omitted id is a caller error on
+either surface. The MCP `remember` tool and the `nidus remember` CLI subcommand
+both derive a stable id from the text when the caller omits one, using the same
+`DefaultHasher`-based scheme, so the same fact written from either entry point lands
+on the same record instead of accumulating duplicates. This is why the CLI gets its
+own column above rather than being folded into "Rust": it behaves like MCP here, not
+like the library it is built on.
+
+### `nidus.text` is always stamped; `nidus.source` never is
+
+Every surface stamps `nidus.text` with the raw remembered text on every write,
+regardless of `Raw` or `Summarize` mode. `nidus.source` is not written by any
+surface. It is a legacy attr, kept only so records written before the fix in
+nidus-133 remain readable; do not expect a current write to produce it.
+
+### TTL-on-read is not store-wide
+
+The not-expired filter is only AND-ed into the memory-shaped read paths: `/recall`
+over HTTP, `Memory::recall` in Rust and in the `nidus recall` CLI subcommand built
+on it, and the `recall`, `get`, `browse`, `text_search`, and `hybrid_search` tools
+over MCP. It is never applied to the generic vector-search, list, full-text, or
+hybrid-search routes, over either HTTP (`/search`, `/list`, `/text-search`,
+`/hybrid-search`) or the CLI (`search`, `list`, `text-search`, `hybrid-search`). A
+record with a past `nidus.expires_at` that has not yet been swept is invisible to
+`recall` but still returned by a plain search against the same collection.
 
 ## Run the example
 

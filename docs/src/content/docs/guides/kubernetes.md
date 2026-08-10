@@ -64,18 +64,47 @@ helm install my-nidus oci://ghcr.io/duckedup/charts/nidus -f values.yaml
 
 ## Single writer
 
-`nidus serve` is a **single writer**: it holds an exclusive lease on the shared
-backend. With the default values, keep `replicaCount: 1`; a bare extra replica loses
-the lock race and crash-loops. To run more than one pod, use the chart's cluster
-values (`nidus.cluster: true` with object-store persistence and a Redis-family
-memory tier): `nidus.waitForLease: true` turns extra replicas into **hot standbys**
-that promote themselves when the writer dies, and read-only replicas can serve
-searches behind their own Service. See the deployment-modes section of the chart's
-`values.yaml` for the three supported topologies. The Deployment defaults to the
-`Recreate` strategy: a rollout terminates the old writer first, and because the image
-handles `SIGTERM` it flushes and releases its lease on the way out, so the
-replacement acquires it immediately instead of waiting out the lock TTL. (With
-`waitForLease: true`, RollingUpdate becomes viable too.)
+`nidus serve` is a **single writer**: exactly one instance holds the writer handle
+on the shared backend at a time. What the extra replicas do depends on how you
+configure them:
+
+- **Default** (`replicaCount: 1`): one writer, no standby. Simplest, and correct.
+- **Hot standby**: set `replicaCount` greater than 1 *and* `nidus.waitForLease:
+  true`. The losers stay up waiting for the writer handle instead of exiting, and
+  one is promoted within about `nidus.lockTtl` of the writer dying. They report NOT
+  ready while waiting, so the Service routes only to the active writer.
+- **`replicaCount` greater than 1 without `waitForLease`: don't.** The extra pods
+  lose the lock race and crash-loop, which is an alert, not a design.
+
+Standby promotion needs cluster mode (`nidus.cluster: true`), which in turn needs a
+shared object store *and* a shared memory tier: a local-disk store is single-node by
+definition.
+
+### Read-only readers
+
+A reader replica does not compete for the writer lease at all; it just needs to
+stay current with what the writer commits. Two knobs on `nidus` control that:
+
+- `refreshInterval` refreshes every N seconds so the reader stays current without a
+  sidecar calling `POST /refresh` (`0` means never, the default).
+- `maxStaleness` fails readiness if the reader ever falls more than N seconds
+  behind (`0` means no bound, the default).
+
+Set both on reader replicas: the interval keeps them fresh, and the bound takes a
+reader out of the Service if refreshing ever stops.
+
+### Rolling updates
+
+The Deployment defaults to `updateStrategy.type: Recreate`, not `RollingUpdate`: the
+old writer must terminate, releasing its lock on `SIGTERM`, before the replacement
+starts, or the new pod hits a held-lock error.
+
+With `nidus.waitForLease: true`, `RollingUpdate` becomes viable, since the incoming
+pod waits for the handle rather than failing: the old writer releases on `SIGTERM`
+and the new one is promoted. `Recreate` stays the default because it is correct in
+every configuration, and because a rolling update trades a brief write outage for
+one that is briefer but harder to reason about. Change the strategy deliberately,
+not by default.
 
 ## Authenticating to the backends
 
@@ -138,6 +167,44 @@ SealedSecrets, the External Secrets Operator, and similar. Inline values
 (`credentials.inline`, `auth.token`) are written to a chart-managed Secret and are
 handy for a quick start. The library guides cover the same credentials for the
 [object stores](/guides/storage-backends/) and the [memory tier](/guides/memory-stores/).
+
+## Ingress and TLS
+
+nidus serves plain HTTP: there is no in-process TLS. This is where TLS terminates.
+The chart's `ClusterIP` Service is safe as long as it stays in-cluster, but the
+moment you expose it with an Ingress, an empty `tls: []` publishes the bearer token
+and every vector in cleartext to anything on the path. Populate `tls` whenever
+`ingress.enabled` is true.
+
+```yaml
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "256m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+  hosts:
+    - host: nidus.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - hosts: [nidus.example.com]
+      secretName: nidus-tls   # cert-manager, or a Secret you manage
+```
+
+Two more things worth setting on the ingress rather than in nidus:
+
+- A **proxy body-size limit** matching `nidus.maxBodyBytes`. Most ingress
+  controllers default to 1 MiB and will reject an upsert long before nidus sees it
+  (`nginx.ingress.kubernetes.io/proxy-body-size` on nginx).
+- A **proxy read timeout** at least as long as `nidus.writeTimeout`, or the proxy
+  will cut off a legitimate large upsert mid-batch
+  (`nginx.ingress.kubernetes.io/proxy-read-timeout` on nginx).
+
+Keep `/metrics` off any public host: it exposes traffic shape (never collection
+names or data), and it is deliberately unauthenticated so a scraper is not reported
+as down.
 
 ## Verify
 
