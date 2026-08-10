@@ -446,7 +446,10 @@ jobs:
   # merely references, so it would fail most PRs and get switched off.
   checker-laws:
     name: nidus-check laws
-    if: github.event_name == 'pull_request'
+    # A required check must report on merge_group too, and a merge group has no PR
+    # number — hence the two modes below. Still skipped on push: main's own history
+    # is not a diff to hold to the laws.
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     steps:
       # Full history: the laws compare a merge base to a head, and a shallow clone has
@@ -457,10 +460,18 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
-      # `--pr` over `--base`: it reads the PR's real base ref rather than assuming main,
-      # and fetches what it needs itself. It also gives the ticket laws the PR body,
-      # which is where a `Closes` line actually lives.
+      # `--pr` where there is one: it reads the PR's real base ref rather than assuming
+      # main, and gives the ticket laws the PR body, where a `Closes` line actually lives.
+      # A merge group has neither, so it falls back to the diff against its base.
       - name: Check repo laws
         env:
           GH_TOKEN: ${{ github.token }}
-        run: .claude/skills/nidus/bin/nidus-check laws --pr ${{ github.event.pull_request.number }}
+        run: |
+          if [ -n "${{ github.event.pull_request.number }}" ]; then
+            .claude/skills/nidus/bin/nidus-check laws --pr ${{ github.event.pull_request.number }}
+          else
+            base="${{ github.event.merge_group.base_ref }}"
+            base="origin/${base#refs/heads/}"
+            git fetch --quiet origin "${base#origin/}"
+            .claude/skills/nidus/bin/nidus-check laws --base "$base"
+          fi
