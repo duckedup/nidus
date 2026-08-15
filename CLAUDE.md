@@ -89,13 +89,24 @@ What IS tracked in git is the handful of config files that let a fresh clone fin
 that database (`.beads/config.yaml`, `.beads/metadata.json`, `.beads/.gitignore`,
 `.beads/hooks/`). Everything else under `.beads/` is runtime.
 
-**In a fresh clone, run `just bd-setup`** — `bd bootstrap` plus the role and
-permissions bd asks for. It reads the tracked config, clones the database from
-`refs/dolt/data`, and you have the issues. This requires the `dolt` CLI on PATH
-(`brew install dolt`); `bd` alone can push but cannot clone. Never `bd init` against
-this repo: it mints a new identity and can force-push over everyone else's history
-(`bd help init-safety`). A **worktree** needs none of this — it shares the main
-clone's database directly. `just bd-sync` is pull-then-push when you finish.
+**In a fresh clone, run `just bd-setup`** — it reads the tracked config, recovers the
+database from `refs/dolt/data`, wires the remote, and you have the issues. This
+requires the `dolt` CLI on PATH (`brew install dolt`); `bd` alone can push but cannot
+clone. It is safe to re-run: an existing database is left untouched, because it may
+hold work that was never pushed.
+
+**It is deliberately NOT `bd bootstrap`** (`scripts/bd-setup.sh` does that job
+directly). Bootstrap reads the tracked `sync.remote`, rejects its `git+ssh://` form as
+"not a Dolt remote", and so never reaches its own `refs/dolt/data` branch — leaving a
+fresh clone with an **empty** tracker and no error naming the cause (nidus-1oq). That
+silence is the danger: an empty database reads as divergent history, and the recovery
+`bd dolt pull` then offers is `bd dolt push --force`, which would force-push nothing
+over everyone's issues. If you ever see that prompt, stop.
+
+Never `bd init` against this repo either: it mints a new identity and can force-push
+over everyone else's history (`bd help init-safety`). A **worktree** needs none of
+this — it shares the main clone's database directly. `just bd-sync` is pull-then-push
+when you finish.
 
 ### Rules
 
