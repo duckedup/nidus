@@ -418,7 +418,8 @@ impl Nidus {
     }
 
     /// Delete every entry whose `nidus.expires_at` has passed, then reclaim the rows.
-    /// Read-time expiry is unchanged; this is the deliberate, caller-triggered reclaim.
+    /// One all-or-nothing batch across every collection (nidus-166); `compact` follows as its
+    /// own op, so a failed reclaim still leaves the deletes durable and the store consistent.
     pub fn sweep_expired(&mut self) -> Result<usize> {
         let now = meta::now_ms();
         // Bare `Le`, not `not_expired_predicate`'s `Not(Le)`: an absent `expires_at`
@@ -427,10 +428,7 @@ impl Nidus {
             META_EXPIRES_AT.to_string(),
             Value::DateTime(now),
         )]);
-        let mut swept = 0;
-        for collection in self.collections() {
-            swept += self.delete_where(&collection, &filter)?;
-        }
+        let swept = self.store.delete_where_all(&filter)?;
         if swept > 0 {
             self.compact()?;
         }

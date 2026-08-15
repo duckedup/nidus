@@ -581,6 +581,86 @@ impl Store {
         self.delete(collection, &refs)
     }
 
+    /// Delete across *every* collection as one all-or-nothing batch (nidus-166). Looping
+    /// `delete_where` instead renews the cluster lease per collection, so a transient renewal
+    /// failure mid-loop left earlier collections deleted while the caller was told it failed.
+    pub fn delete_where_all(&mut self, filter: &Filter) -> Result<usize> {
+        self.check_writable()?;
+
+        // Phase 1: collect every match up front — pure, so an empty sweep touches nothing.
+        let mut targets: Vec<(String, Vec<String>)> = Vec::new();
+        for (name, col) in &self.collections {
+            let ids: Vec<String> = col
+                .docs
+                .iter()
+                .filter(|(_, entry)| filter::matches(filter, &entry.attrs))
+                .map(|(id, _)| id.clone())
+                .collect();
+            if !ids.is_empty() {
+                targets.push((name.clone(), ids));
+            }
+        }
+        if targets.is_empty() {
+            return Ok(0);
+        }
+
+        let log_mark = self.log.offset()?;
+
+        // Phase 2: append every Delete record, rolling the log back as a unit on failure.
+        // Deletes append no vectors, so the log is the only file to unwind.
+        for (collection, ids) in &targets {
+            for id in ids {
+                let op = Op::Delete {
+                    collection: collection.clone(),
+                    id: id.clone(),
+                };
+                if let Err(e) = self.log.append(&op) {
+                    self.log
+                        .truncate_to(log_mark)
+                        .context("rollback log after failed sweep")?;
+                    return Err(e);
+                }
+            }
+        }
+
+        // Phase 3: durable barrier (or defer it to commit()/flush()). Before the in-RAM
+        // commit, so a sync failure unwinds to a store that never saw the sweep.
+        if let Err(e) = self.maybe_sync() {
+            self.log
+                .truncate_to(log_mark)
+                .context("rollback log after failed sweep sync")?;
+            return Err(e);
+        }
+
+        // Phase 4: commit to the in-RAM index — infallible, both files are durable.
+        let mut count = 0usize;
+        for (collection, ids) in &targets {
+            let Some(col) = self.collections.get_mut(collection) else {
+                continue;
+            };
+            for id in ids {
+                let Some(old) = col.docs.remove(id) else {
+                    continue;
+                };
+                // Only a rowed doc leaves a reclaimable data row.
+                if old.row.is_some() {
+                    self.dead_rows += 1;
+                }
+                self.fts.remove_doc(collection, id);
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            self.invalidate_scan_order();
+            if self.fts.is_active() {
+                self.fts_dirty = true;
+            }
+        }
+
+        Ok(count)
+    }
+
     pub fn flush(&mut self) -> Result<()> {
         self.check_writable()?;
         self.data.sync()?;

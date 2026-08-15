@@ -5044,6 +5044,52 @@ mod object_backed {
             .expect_err("the barrier is still owed and retried");
         assert!(err.to_string().contains("lease lost"), "{err}");
     }
+
+    /// **A scope-wide delete that fails mid-flight deletes nothing (nidus-166).**
+    #[test]
+    fn a_failed_scope_wide_delete_leaves_every_collection_intact() {
+        let raw = Arc::new(InMemObjectStore::default());
+        let backend: Arc<dyn Persistence> = raw.clone();
+        let tier = Arc::new(LocalRam::new());
+        let mut w = cluster_writer(&backend, &tier);
+
+        let expired =
+            BTreeMap::from([(crate::meta::META_EXPIRES_AT.to_string(), Value::DateTime(1))]);
+        for c in ["a", "b"] {
+            w.create_collection(c).unwrap();
+            w.upsert(
+                c,
+                &[rec_with(
+                    &format!("{c}-1"),
+                    vec![1.0, 0.0, 0.0],
+                    expired.clone(),
+                )],
+            )
+            .unwrap();
+        }
+
+        // Someone else advances the manifest, so this writer's CAS token is stale and the
+        // sweep's durable barrier fails *after* its log records are appended.
+        let m = backend.get("manifest").unwrap().unwrap();
+        backend.put("manifest", &m).unwrap();
+
+        let filter = Filter(vec![Predicate::Le(
+            crate::meta::META_EXPIRES_AT.to_string(),
+            Value::DateTime(i64::MAX),
+        )]);
+        w.delete_where_all(&filter)
+            .expect_err("a failed barrier must fail the whole sweep");
+
+        // Looping `delete_where` instead renewed the lease per collection and committed each
+        // to RAM before its barrier, so "a" was already gone while the caller saw an error.
+        for c in ["a", "b"] {
+            assert_eq!(
+                w.collections.get(c).unwrap().docs.len(),
+                1,
+                "collection {c} must be untouched by a failed sweep"
+            );
+        }
+    }
 }
 
 // ── Cooperative cancellation ────────────────────────────────────────────────
