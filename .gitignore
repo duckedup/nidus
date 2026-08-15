@@ -39,5 +39,9 @@ BLUEPRINT-*.md
 # database is tracked. `.beads/.gitignore` governs what inside it is runtime.
 .beads-credential-key
 
+# bd's embedded-dolt gate lock — written at the repo root, so `.beads/.gitignore`
+# does not cover it
+*.gate.lock
+
 # coordinator dispatch state (see .claude/skills/nidus SKILL.md, Fleet)
 .claude/fleet-plan.json
