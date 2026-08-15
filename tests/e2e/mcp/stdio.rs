@@ -90,6 +90,35 @@ fn tools_list_matches_http_order() {
     );
 }
 
+/// The same `NidusMcp` answers both transports, so resources/prompts must not have forked
+/// by transport either — the sibling of `tools_list_matches_http_order` above.
+#[test]
+fn resources_and_prompts_match_over_stdio() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = StdioServer::new(dir.path(), 3).spawn();
+    handshake(&mut server);
+
+    let resp = server.request(&request(2, "resources/templates/list", json!({})));
+    let listed = result(&resp);
+    let templates = listed["resourceTemplates"]
+        .as_array()
+        .expect("resourceTemplates array");
+    assert_eq!(templates.len(), 1, "{listed}");
+    assert_eq!(
+        templates[0]["uriTemplate"], "nidus://collections/{collection}/entries/{id}",
+        "stdio's entry template must match HTTP's: {listed}"
+    );
+
+    let resp = server.request(&request(3, "prompts/list", json!({})));
+    let listed = result(&resp);
+    let prompts = listed["prompts"].as_array().expect("prompts array");
+    assert_eq!(prompts.len(), 1, "{listed}");
+    assert_eq!(
+        prompts[0]["name"], "recall_then_answer",
+        "stdio's prompt name must match HTTP's: {listed}"
+    );
+}
+
 /// A held writer lock is a multi-client problem stdio does not solve — the design is that a
 /// second local session fails immediately rather than queueing behind the first.
 #[test]

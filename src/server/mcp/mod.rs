@@ -8,8 +8,10 @@ use rmcp::{
     ErrorData as McpError, ServerHandler,
     model::{
         CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
-        Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
-        Tool,
+        GetPromptRequestParams, GetPromptResponse, Implementation, ListPromptsResult,
+        ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ServerCapabilities,
+        ServerInfo, Tool,
     },
     service::RequestContext,
     transport::{
@@ -22,9 +24,12 @@ use super::{AppState, dto::HitDto};
 mod admin;
 mod args;
 mod hygiene;
+mod prompts;
 mod remember;
+mod resources;
 mod search;
 mod stdio;
+mod uri;
 
 use args::TOOLS_TTL_MS;
 
@@ -113,25 +118,33 @@ fn hits_content(hits: Vec<HitDto>) -> CallToolResult {
 
 impl ServerHandler for NidusMcp {
     fn get_info(&self) -> ServerInfo {
-        // Tools only: every nidus op is one fast synchronous call, so there is nothing to
-        // subscribe to and nothing long-running to hand back a task handle for.
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            // NOT `Implementation::from_build_env()` — that reads `CARGO_PKG_*` as expanded
-            // inside rmcp, reporting `rmcp 3.1.1` instead of this store. Pinned by e2e.
-            .with_server_info(Implementation::new(
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION"),
-            ))
-            .with_instructions(
-                "nidus is a vector store used here as long-term memory. Use `remember` to \
+        // Tools, resources, and prompts: every nidus op is one fast synchronous call, so
+        // there is nothing to subscribe to and nothing long-running to hand back a task
+        // handle for — subscriptions and tasks stay out for that same reason.
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_prompts()
+                .build(),
+        )
+        // NOT `Implementation::from_build_env()` — that reads `CARGO_PKG_*` as expanded
+        // inside rmcp, reporting `rmcp 3.1.1` instead of this store. Pinned by e2e.
+        .with_server_info(Implementation::new(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(
+            "nidus is a vector store used here as long-term memory. Use `remember` to \
                  store text worth keeping and `recall` to find it again by meaning. \
                  `text_search` matches exact wording instead, and `hybrid_search` does both \
                  at once. Call `list_collections` if you do not know which collection to \
                  use, or `browse` to see what a collection already holds before adding to \
                  it. Use `get` to check a specific id, and `forget` to correct or remove a \
                  memory that turned out wrong. Pass natural language throughout — never \
-                 vectors.",
-            )
+                 vectors. Memories are also addressable as `nidus://` resources, and \
+                 `recall_then_answer` is a prompt that runs the recall for you.",
+        )
     }
 
     async fn list_tools(
@@ -169,5 +182,69 @@ impl ServerHandler for NidusMcp {
         // Always `Complete`: the `InputRequired` and `Task` variants of the MRTR envelope
         // never apply, since every tool has what it needs and returns in one round trip.
         Ok(CallToolResponse::Complete(result))
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(
+            ListResourcesResult::with_all_items(self.list_resources().await?)
+                .with_ttl_ms(resources::RESOURCES_TTL_MS)
+                .with_cache_scope(CacheScope::Public),
+        )
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        Ok(
+            ListResourceTemplatesResult::with_all_items(resources::templates())
+                .with_ttl_ms(resources::RESOURCES_TTL_MS)
+                .with_cache_scope(CacheScope::Public),
+        )
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<rmcp::RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let contents = self.read_resource(&request.uri).await?;
+        // Always `Complete`, for the same reason `call_tool` is: a resource read here
+        // never needs a client round trip to finish.
+        Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
+            contents,
+        )))
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        Ok(ListPromptsResult::with_all_items(prompts::prompts())
+            .with_ttl_ms(prompts::PROMPTS_TTL_MS)
+            .with_cache_scope(CacheScope::Public))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<rmcp::RoleServer>,
+    ) -> Result<GetPromptResponse, McpError> {
+        let args = request.arguments.unwrap_or_default();
+        let result = match request.name.as_ref() {
+            "recall_then_answer" => self.get_prompt(&args).await,
+            other => Err(McpError::invalid_params(
+                format!("unknown prompt `{other}`"),
+                None,
+            )),
+        }?;
+        // Always `Complete`, for the same reason `call_tool` is.
+        Ok(GetPromptResponse::Complete(result))
     }
 }

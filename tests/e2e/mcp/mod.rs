@@ -7,7 +7,9 @@ mod dedupe;
 mod filters;
 mod hygiene;
 mod lifecycle;
+mod prompts;
 mod recency;
+mod resources;
 mod stdio;
 pub(super) mod support;
 
@@ -138,17 +140,33 @@ fn discover_advertises_protocol_and_tools() {
          deployed clients: {versions:?}"
     );
 
-    // Tools are the only claimed capability; anything else here has no implementation.
-    assert!(
-        result["capabilities"]["tools"].is_object(),
-        "tools capability should be advertised: {result}"
-    );
-    for absent in ["resources", "prompts", "logging"] {
+    // Tools, resources, and prompts are all implemented now; logging has no implementation.
+    for present in ["tools", "resources", "prompts"] {
         assert!(
-            result["capabilities"][absent].is_null(),
-            "{absent} must not be advertised — nothing implements it: {result}"
+            result["capabilities"][present].is_object(),
+            "{present} capability should be advertised: {result}"
         );
     }
+    assert!(
+        result["capabilities"]["logging"].is_null(),
+        "logging must not be advertised — nothing implements it: {result}"
+    );
+
+    // Advertising a notification nothing ever sends is worse than not offering it: every
+    // nidus op is one fast synchronous call, so there is nothing to subscribe to and
+    // nothing whose list ever changes out from under a cached client.
+    assert_ne!(
+        result["capabilities"]["resources"]["subscribe"], true,
+        "resources/subscribe must not be advertised: {result}"
+    );
+    assert_ne!(
+        result["capabilities"]["resources"]["listChanged"], true,
+        "resources listChanged must not be advertised: {result}"
+    );
+    assert_ne!(
+        result["capabilities"]["prompts"]["listChanged"], true,
+        "prompts listChanged must not be advertised: {result}"
+    );
 }
 
 /// `tools/list` returns every tool, in a stable order, with the mandatory cache hints.
@@ -397,6 +415,42 @@ fn memory_tools_without_an_embedder_fail_as_a_server_fault() {
     let code = body["error"]["code"].as_i64();
     assert_eq!(
         code,
+        Some(-32603),
+        "a missing embedder is an internal error, not invalid params: {body}"
+    );
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("--embed-provider"),
+        "the error must name the flag that fixes it: {message}"
+    );
+}
+
+/// The prompt degrades exactly like `remember`/`recall`: needing an embedder on a server
+/// without one is a server fault, not a caller mistake a retry can fix.
+#[test]
+fn prompts_without_an_embedder_fail_as_a_server_fault() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+
+    let (status, body) = mcp(
+        &server,
+        "prompts/get",
+        Some("recall_then_answer"),
+        &rpc(
+            1,
+            "prompts/get",
+            json!({
+                "name": "recall_then_answer",
+                "arguments": {"question": "anything", "collection": "notes"}
+            }),
+        ),
+    );
+    assert_eq!(
+        status, 200,
+        "a server fault stays HTTP 200 with the error in the envelope: {body}"
+    );
+    assert_eq!(
+        body["error"]["code"].as_i64(),
         Some(-32603),
         "a missing embedder is an internal error, not invalid params: {body}"
     );
