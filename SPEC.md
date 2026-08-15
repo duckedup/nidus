@@ -1041,7 +1041,18 @@ build until a real need exists.
   keep answering health probes while a standby waits — so a second process on the
   same directory exits immediately, naming the lock conflict. A stdio session
   skips `limits.rs`/`metrics.rs` entirely (both are axum `.layer()`-only): one
-  local client needs neither an admission cap nor a scrape endpoint.
+  local client needs neither an admission cap nor a scrape endpoint. The same
+  handler also serves resources and prompts over both transports: collections are
+  concrete resources and entries a resource template, both under the
+  `nidus://collections/…` scheme, percent-encoded so an arbitrary name stays one
+  path segment and the URI survives the `Mcp-Name` header without base64. A URI
+  names a collection plus a record id, never a row offset, so it stays stable
+  across `compact()`. One prompt, `recall_then_answer`, runs the recall
+  server-side. Subscriptions, `list_changed` notifications, and tasks stay out,
+  for the reason already given above: nidus runs no background threads, so
+  nothing can notify. The read-time TTL guard (below) covers the resource reads
+  too, including the by-hand check on the direct entry lookup, for the same
+  reason `get` needs one.
 - **Agent-memory write path (nidus-k28.7/.5/.6).** `remember` provisions on first
   write (collection plus a default full-text schema over `nidus.text`, gated on
   `Nidus::has_fts_schema` — `set_fts_schema` rebuilds the field index from every
@@ -1326,7 +1337,7 @@ src/
                   deadlines, body-idle timeout), commit.rs (group commit), metrics.rs
                   (Prometheus scrape + access log), mcp/ (the MCP 2026-07-28 adapter,
                   `mcp` feature: mod.rs, args.rs, remember.rs, search.rs, hygiene.rs,
-                  admin.rs, stdio.rs)
+                  admin.rs, stdio.rs, resources.rs, prompts.rs, uri.rs)
 
 tests/            file-backed integration (temp dirs; #[cfg_attr(miri, ignore)] on fsync
                   paths); tests/e2e/ drives the real binary (one test target, §11)

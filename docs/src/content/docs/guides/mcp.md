@@ -167,12 +167,75 @@ let an agent check what is already there: `get` looks up one id directly,
 and `browse` lists a collection's contents (optionally filtered) so a model
 can spot a near-duplicate before adding one.
 
+## Resources and prompts
+
+A tool call is something the model decides to make on its own. A resource is
+something a user or client can browse and mention directly instead, so a
+stored memory can be pulled into context by name rather than found by search.
+
+### Resources
+
+Two kinds of resource, both under one URI scheme:
+
+```
+nidus://collections/<collection>
+nidus://collections/<collection>/entries/<id>
+```
+
+Both `<collection>` and `<id>` are percent-encoded, so a name containing a
+slash stays one path segment. A URI is stable: it names the collection and
+the record id rather than a row offset, so it keeps working across restarts
+and `compact`.
+
+Reading a collection returns a bounded page of its entries, as a JSON object
+with an `entries` array and a `truncated` flag. Each listed entry carries its
+own URI, so you can go straight from a collection to one of its entries
+without building the URI yourself. When `truncated` is true there are more
+entries than fit on the page, and `browse` pages further from there. Reading
+an entry returns its id and attributes. Neither read ever returns the vector,
+matching every tool on this page.
+
+Expiry applies here too: an expired entry is absent from a collection read,
+and its entry URI does not resolve, the same as every other memory surface
+(see "Expiry and duplicates" above).
+
+### The `recall_then_answer` prompt
+
+`recall_then_answer` takes a `question` and a `collection` (and an optional
+`top_k`), runs the recall server-side, and hands back the matching memories
+already assembled into a message with an instruction to answer from them and
+cite the ids used. It needs the server to have an embedder, the same as
+`recall`, so start it with `--embed-provider` set.
+
+### Reading a resource
+
+This mirrors the `server/discover` example below, but with the method set to
+`resources/read` and the `Mcp-Name` header carrying the URI: that header is
+mandatory for a resource read, and a request without it is rejected.
+
+```bash
+curl -s localhost:7700/mcp \
+  -H 'content-type: application/json' \
+  -H 'accept: application/json, text/event-stream' \
+  -H 'mcp-protocol-version: 2026-07-28' \
+  -H 'mcp-method: resources/read' \
+  -H 'mcp-name: nidus://collections/notes/entries/falcon' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{
+        "uri":"nidus://collections/notes/entries/falcon",
+        "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                 "io.modelcontextprotocol/clientCapabilities":{}}}}'
+```
+
+Every request carries `_meta` with both a `protocolVersion` and a
+`clientCapabilities` object. There is no handshake over HTTP, so a request
+missing either is rejected with `-32602`.
+
 ## What it does not do
 
-The surface is deliberately small. There are no MCP resources, prompts,
-subscriptions, or tasks: every nidus operation is a fast synchronous call, so
-there is nothing to subscribe to and nothing long-running to hand back a task
-handle for. Record-level hygiene is exposed (`forget`, `get`, `browse`), and
+The surface is deliberately small. There are no MCP subscriptions or tasks:
+every nidus operation is a fast synchronous call, so there is nothing to
+subscribe to and nothing long-running to hand back a task handle for.
+Record-level hygiene is exposed (`forget`, `get`, `browse`), and
 `remember` provisions a collection on first write, but the rest of
 collection-level lifecycle (reconfiguring or dropping one) and store
 maintenance (`compact`, `flush`) are not: those remain operator actions,
@@ -218,5 +281,6 @@ curl -s localhost:7700/mcp \
   -H 'mcp-protocol-version: 2026-07-28' \
   -H 'mcp-method: server/discover' \
   -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{
-        "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}'
+        "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                 "io.modelcontextprotocol/clientCapabilities":{}}}}'
 ```

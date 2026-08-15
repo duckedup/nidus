@@ -201,7 +201,9 @@ backpressure, bearer auth, and metrics rather than reimplementing any of them. T
 things there are load-bearing and easy to break: the tool surface is **text-native**
 (no tool may take a raw `vector` — a model cannot emit one, and `tests/e2e/mcp/`
 asserts it), and tool schemas are **hand-written JSON**, never `schemars`-derived,
-because the descriptions drive tool-selection quality. Verify with
+because the descriptions drive tool-selection quality. The same holds for resources
+and prompts: resource content and prompt messages carry `{id, attrs}`, never a
+vector. Verify with
 `cargo clippy --all-targets --features mcp -- -D warnings` and `just test-e2e`.
 
 When you touch `src/cli/`, `src/server/`, or `src/bin/`, gate it on the `cli`
@@ -326,7 +328,7 @@ src/
                   #   auth.rs, limits.rs, commit.rs, metrics.rs
                   # server/mcp/ = the MCP 2026-07-28 surface at /mcp (`mcp` feature):
                   #   mod.rs, remember.rs, search.rs, admin.rs, hygiene.rs, args.rs,
-                  #   stdio.rs (the stdio transport)
+                  #   stdio.rs (the stdio transport), resources.rs, prompts.rs, uri.rs
 ```
 
 SPEC.md §10 carries the same map with more detail on each module's contract; when the
