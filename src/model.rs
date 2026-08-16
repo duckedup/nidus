@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::annotate::{Annotations, HighlightOpts};
+use crate::findex::FilterIndexField;
 use crate::fts::{FtsField, Language};
 
 /// The similarity / distance metric used for scoring. Pinned at store creation
@@ -773,6 +774,9 @@ pub struct Footprint {
     pub vector_bytes: u64,
     /// Live documents across all collections.
     pub doc_count: usize,
+    /// Approximate heap held by the opt-in filter index (SPEC §7.4). Zero when no
+    /// collection declares one — the other half of that feature's cost trade.
+    pub filter_index_bytes: u64,
 }
 
 /// What an instance is within a store, for [`ClusterStatus`].
@@ -862,6 +866,13 @@ pub enum Op {
         collection: String,
         fields: Vec<FtsField>,
     },
+    /// Declare a collection's filter-indexed fields (SPEC §7.4/§7.5). Replayed on open to
+    /// rebuild the index; re-emitted by `compact`. Appended at the end for the same
+    /// forward-compatibility reason as `UpsertText`.
+    SetFilterIndex {
+        collection: String,
+        fields: Vec<FilterIndexField>,
+    },
 }
 
 #[cfg(test)]
@@ -872,7 +883,7 @@ mod tests {
     fn appending_variants_did_not_renumber_the_existing_ones() {
         // bincode tags a variant by its **declaration index**, so inserting one anywhere
         // but the end silently reinterprets every op in every store's existing log.
-        let cases: [(Op, u32); 8] = [
+        let cases: [(Op, u32); 9] = [
             (
                 Op::CreateCollection {
                     collection: "c".into(),
@@ -930,12 +941,44 @@ mod tests {
                 },
                 7,
             ),
+            (
+                Op::SetFilterIndex {
+                    collection: "c".into(),
+                    fields: vec![FilterIndexField::new("body")],
+                },
+                8,
+            ),
         ];
         for (op, want) in cases {
             let bytes = bincode::serialize(&op).unwrap();
             let tag = u32::from_le_bytes(bytes[..4].try_into().unwrap());
             assert_eq!(tag, want, "{op:?} must stay variant {want}");
         }
+    }
+
+    #[test]
+    fn a_filter_index_op_round_trips() {
+        let op = Op::SetFilterIndex {
+            collection: "docs".into(),
+            fields: vec![
+                FilterIndexField::new("body"),
+                FilterIndexField::new("title").trigrams(false),
+            ],
+        };
+        let bytes = bincode::serialize(&op).unwrap();
+        assert_eq!(bincode::deserialize::<Op>(&bytes).unwrap(), op);
+    }
+
+    #[test]
+    fn a_log_written_before_the_filter_index_still_decodes() {
+        // The forward-compatibility direction that matters: a newer nidus reading an older
+        // log. Bytes produced without the new variant must decode unchanged.
+        let old = Op::SetFtsFields {
+            collection: "docs".into(),
+            fields: vec![FtsField::new("body")],
+        };
+        let bytes = bincode::serialize(&old).unwrap();
+        assert_eq!(bincode::deserialize::<Op>(&bytes).unwrap(), old);
     }
 
     #[test]

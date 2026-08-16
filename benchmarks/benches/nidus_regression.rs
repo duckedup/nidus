@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use nidus::{
-    Config, Decay, Distance, Filter, Fsync, FtsField, FtsQuery, HybridOpts, Nidus, Predicate,
-    QuantKind, Quantization, RankBy, Record, SearchOpts, Value,
+    Config, Decay, Distance, Filter, FilterIndexField, Fsync, FtsField, FtsQuery, HybridOpts,
+    Nidus, Predicate, QuantKind, Quantization, RankBy, Record, SearchOpts, Value,
 };
 use nidus_bench::data;
 use std::hint::black_box;
@@ -137,6 +137,31 @@ fn build_text_store(n: usize, dim: usize) -> Nidus {
     let mut db = Nidus::open_in_memory(dim).expect("open in-memory");
     db.set_fts_schema("bench", &[FtsField::new("text")])
         .expect("set fts schema");
+    let recs: Vec<Record> = (0..n)
+        .map(|i| {
+            let mut attrs = BTreeMap::new();
+            attrs.insert("text".to_string(), Value::Str(texts[i].clone()));
+            Record {
+                id: i.to_string(),
+                vector: Some(ds.vectors[i * dim..(i + 1) * dim].to_vec()),
+                attrs,
+            }
+        })
+        .collect();
+    db.upsert("bench", &recs).expect("upsert");
+    db
+}
+
+/// `build_text_store` plus a filter-index declaration on the same `text` field, declared
+/// before the upsert so indexing is incremental rather than a backfill.
+fn build_filter_indexed_store(n: usize, dim: usize) -> Nidus {
+    let ds = data::generate(SEED, n, dim, 0);
+    let texts = text_corpus(SEED, n);
+    let mut db = Nidus::open_in_memory(dim).expect("open in-memory");
+    db.set_fts_schema("bench", &[FtsField::new("text")])
+        .expect("set fts schema");
+    db.set_filter_index("bench", &[FilterIndexField::new("text")])
+        .expect("set filter index");
     let recs: Vec<Record> = (0..n)
         .map(|i| {
             let mut attrs = BTreeMap::new();
@@ -397,6 +422,7 @@ fn bench_filter_predicates(c: &mut Criterion) {
     let mut group = c.benchmark_group("filter_predicates");
     let (n, dim) = (10_000usize, 384usize);
     let db = build_text_store(n, dim);
+    let indexed = build_filter_indexed_store(n, dim);
     let query_vec = data::generate(SEED ^ 1, 1, dim, 0).vectors;
 
     // `fuzzy` skips the whole DP when the needle's length is more than `max_edits` from the
@@ -456,10 +482,39 @@ fn bench_filter_predicates(c: &mut Criterion) {
             filter,
             ..Default::default()
         };
+        // Same query against an unindexed and a filter-indexed store. The two baselines
+        // are unaffected by the index and act as this machine's drift control.
+        for (suffix, store) in [("", &db), ("_indexed", &indexed)] {
+            group.bench_with_input(
+                BenchmarkId::from_parameter(format!("{label}{suffix}")),
+                &(),
+                |b, _| {
+                    b.iter(|| {
+                        let hits = store.search("bench", black_box(&query_vec), &opts).unwrap();
+                        black_box(hits);
+                    })
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+/// The ingest cost of declaring a filter index — the price side of the trade, published
+/// rather than footnoted.
+fn bench_filter_index_ingest(c: &mut Criterion) {
+    let mut group = c.benchmark_group("filter_index_ingest");
+    let (n, dim) = (10_000usize, 384usize);
+    group.throughput(Throughput::Elements(n as u64));
+    for (label, indexed) in [("plain", false), ("filter_indexed", true)] {
         group.bench_with_input(BenchmarkId::from_parameter(label), &(), |b, _| {
             b.iter(|| {
-                let hits = db.search("bench", black_box(&query_vec), &opts).unwrap();
-                black_box(hits);
+                let db = if indexed {
+                    build_filter_indexed_store(n, dim)
+                } else {
+                    build_text_store(n, dim)
+                };
+                black_box(db.footprint());
             })
         });
     }
@@ -475,6 +530,7 @@ criterion_group!(
     bench_text_search,
     bench_hybrid,
     bench_rank_by,
-    bench_filter_predicates
+    bench_filter_predicates,
+    bench_filter_index_ingest
 );
 criterion_main!(benches);

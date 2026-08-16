@@ -3990,6 +3990,7 @@ dependencies = [
  "memmap2",
  "redis",
  "regex",
+ "regex-syntax",
  "reqwest",
  "rmcp",
  "rusty-s3",

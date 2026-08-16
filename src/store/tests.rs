@@ -642,6 +642,8 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         ann_dirty: false,
         fts: crate::fts::Fts::default(),
         fts_dirty: false,
+        findex: Default::default(),
+        findex_dirty: false,
         in_memory: true,
         row_to_doc: Vec::new(),
         scan_order: std::sync::RwLock::new(None),
@@ -4044,7 +4046,7 @@ fn a_legacy_fts_schema_op_replays_with_the_default_params() {
             fields: vec![("body".to_string(), Language::English)],
         },
     ];
-    let (collections, _dead, fts) = Store::replay_ops(ops, 0);
+    let (collections, _dead, fts, _findex) = Store::replay_ops(ops, 0);
     assert!(collections.contains_key("docs"));
     let decl = fts.schema_for("docs").expect("legacy schema restored");
     assert_eq!(decl, &[FtsField::new("body")]);

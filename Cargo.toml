@@ -135,6 +135,11 @@ crc32fast = "1"
 # defend against. Pure Rust, no C, no native linking.
 regex = "1"
 
+# Required-literal extraction for the filter index (nidus-89): narrowing `Predicate::Regex`
+# needs the parsed HIR, which `regex` does not re-export. Already compiled in this tree —
+# both `regex` and `regex-automata` depend on it — so a direct dep adds no build time.
+regex-syntax = "0.8"
+
 # Storage-backend deps (SPEC §13), in the DEFAULT build. The cloud clients are
 # sans-IO (build + sign requests; no transport, no async) — `rusty-s3` (Sigv4 = pure
 # RustCrypto HMAC) and `tame-gcs`/`tame-oauth` (GCS + OAuth2 service-account JWT) —

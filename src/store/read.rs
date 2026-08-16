@@ -106,6 +106,7 @@ impl Store {
             dimension,
             vector_bytes: rows * dimension as u64 * 4,
             doc_count,
+            filter_index_bytes: self.findex.heap_bytes() as u64,
         }
     }
 
@@ -178,6 +179,20 @@ impl Store {
             let Some(col) = self.collections.get(col_name) else {
                 continue;
             };
+            // Narrow through the filter index when it can help, then verify each survivor
+            // exactly as the full walk does — the index proposes, `filter::matches` decides.
+            if let Some(ids) = filter::candidate_ids(&self.findex, col_name, &opts.filter) {
+                for id in ids {
+                    let Some((id, entry)) = col.docs.get_key_value(&id) else {
+                        continue;
+                    };
+                    if !filter::matches(&opts.filter, &entry.attrs) {
+                        continue;
+                    }
+                    scan.push((entry.row, col_name, id.as_str()));
+                }
+                continue;
+            }
             for (id, entry) in &col.docs {
                 if !filter::matches(&opts.filter, &entry.attrs) {
                     continue;
@@ -304,6 +319,14 @@ impl Store {
         scan.try_reserve(scan_cap)
             .map_err(|_| oom("search scan buffer", scan_cap))?;
 
+        // Try the filter index first. It applies to whole-store and subset scope alike,
+        // and it only reports success when every in-scope collection could be narrowed —
+        // a partial narrowing would silently omit the collections it skipped.
+        if self.narrowed_scan(collections, filter, &mut scan) {
+            scan.sort_unstable_by_key(|&(row, _, _)| row);
+            return f(&mut scan);
+        }
+
         if scan_cap == self.scannable_doc_count() {
             // Whole-store scope: draw from the cached row-sorted order (no per-query
             // sort). The cache covers every live doc, so every entry is in scope.
@@ -351,6 +374,50 @@ impl Store {
             scan.sort_unstable_by_key(|&(row, _, _)| row);
             f(&mut scan)
         }
+    }
+
+    /// Fill `scan` from the filter index, or report `false` and leave it untouched.
+    ///
+    /// All-or-nothing across the scope on purpose: if one collection cannot be narrowed the
+    /// caller must walk everything, because a scan built from the others would be missing
+    /// that collection's matches entirely.
+    fn narrowed_scan<'b>(
+        &'b self,
+        collections: &[&'b str],
+        filter: &Filter,
+        scan: &mut Vec<(u64, &'b str, &'b str)>,
+    ) -> bool {
+        if !self.findex.is_active() {
+            return false;
+        }
+        let mut narrowed: Vec<(&'b str, Vec<String>)> = Vec::new();
+        for &col_name in collections {
+            if !self.collections.contains_key(col_name) {
+                continue;
+            }
+            match filter::candidate_ids(&self.findex, col_name, filter) {
+                Some(ids) => narrowed.push((col_name, ids)),
+                None => return false,
+            }
+        }
+        for (col_name, ids) in narrowed {
+            let Some(col) = self.collections.get(col_name) else {
+                continue;
+            };
+            for id in ids {
+                let Some((id, entry)) = col.docs.get_key_value(&id) else {
+                    continue;
+                };
+                let Some(row) = entry.row else { continue };
+                // The index narrows; this decides. Skipping it would ship the
+                // over-approximation straight to the caller.
+                if !filter::matches(filter, &entry.attrs) {
+                    continue;
+                }
+                scan.push((row, col_name, id.as_str()));
+            }
+        }
+        true
     }
 
     // ── Search ──────────────────────────────────────────────────────────────────

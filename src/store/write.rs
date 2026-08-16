@@ -11,6 +11,7 @@ use crate::backend::CasOutcome;
 use crate::config::{Fsync, OpenMode};
 use crate::data::SegmentIntegrity;
 use crate::filter;
+use crate::findex::FilterIndexField;
 use crate::fts::FtsField;
 use crate::manifest::{BASE_SEGMENT, MANIFEST_KEY};
 use crate::model::{Distance, Filter, Op, Record, Value};
@@ -229,6 +230,10 @@ impl Store {
                 self.fts.drop_collection(name);
                 self.fts_dirty = true;
             }
+            if self.findex.is_active() {
+                self.findex.drop_collection(name);
+                self.findex_dirty = true;
+            }
             self.log.append(&Op::DropCollection {
                 collection: name.to_string(),
             })?;
@@ -267,6 +272,40 @@ impl Store {
             self.fts.index_doc(collection, id, attrs);
         }
         self.fts_dirty = true;
+        Ok(())
+    }
+
+    /// Declare `collection`'s filter-indexed fields (SPEC §7.4/§7.5), then build the index
+    /// from its live docs. Settable any time; redeclaring rebuilds. An empty `fields` drops
+    /// the declaration, which is how a caller turns the index off.
+    pub fn set_filter_index(
+        &mut self,
+        collection: &str,
+        fields: &[FilterIndexField],
+    ) -> Result<()> {
+        self.check_writable()?;
+        // Validate before the log append: an unusable declaration persisted here would be
+        // replayed on every subsequent open.
+        crate::findex::validate(fields)?;
+        self.collections
+            .entry(collection.to_string())
+            .or_insert_with(Collection::new);
+        self.log.append(&Op::SetFilterIndex {
+            collection: collection.to_string(),
+            fields: fields.to_vec(),
+        })?;
+        self.maybe_sync()?;
+        self.findex.set_schema(collection, fields);
+        // Docs written before the declaration are not in the index; build from them now
+        // (sorted ids → reproducible docnums). Empty for a brand-new collection.
+        let col = &self.collections[collection];
+        let mut ids: Vec<&String> = col.docs.keys().collect();
+        ids.sort();
+        for id in ids {
+            let attrs = &col.docs[id].attrs;
+            self.findex.index_doc(collection, id, attrs);
+        }
+        self.findex_dirty = true;
         Ok(())
     }
 
@@ -469,6 +508,7 @@ impl Store {
         let col = self.collections.get_mut(collection).unwrap();
         let ann_on = self.ann.is_some();
         let fts_on = self.fts.is_active();
+        let findex_on = self.findex.is_active();
         let mut new_owners: Vec<(u64, String)> = Vec::new();
         let mut count = 0usize;
         for (id, row, attrs) in staged {
@@ -480,6 +520,11 @@ impl Store {
             // schema). Done before the attrs move into the index. O(batch).
             if fts_on {
                 self.fts.index_doc(collection, &id, &attrs);
+            }
+            // A missed upsert here is a silently wrong query result, not a slow one: the
+            // doc would never become a candidate. A missed delete is only a false positive.
+            if findex_on {
+                self.findex.index_doc(collection, &id, &attrs);
             }
             // Overwriting a *rowed* doc leaves its old row dead.
             if let Some(old) = col.docs.insert(id, DocEntry { row, attrs })
@@ -538,6 +583,7 @@ impl Store {
             }
             // Tombstone the doc in any FTS field indexes (no-op when none).
             self.fts.remove_doc(collection, id);
+            self.findex.remove_doc(collection, id);
             self.log.append(&Op::Delete {
                 collection: collection.to_string(),
                 id: id.to_string(),
@@ -551,6 +597,9 @@ impl Store {
             self.invalidate_scan_order();
             if self.fts.is_active() {
                 self.fts_dirty = true;
+            }
+            if self.findex.is_active() {
+                self.findex_dirty = true;
             }
         }
 
@@ -647,6 +696,7 @@ impl Store {
                     self.dead_rows += 1;
                 }
                 self.fts.remove_doc(collection, id);
+                self.findex.remove_doc(collection, id);
                 count += 1;
             }
         }
@@ -655,6 +705,9 @@ impl Store {
             self.invalidate_scan_order();
             if self.fts.is_active() {
                 self.fts_dirty = true;
+            }
+            if self.findex.is_active() {
+                self.findex_dirty = true;
             }
         }
 
@@ -790,6 +843,14 @@ impl Store {
                 });
             }
 
+            // Re-emit the filter-index schema too, or a post-compact replay loses it.
+            if let Some(fields) = self.findex.schema_for(col_name) {
+                log_ops.push(Op::SetFilterIndex {
+                    collection: col_name.clone(),
+                    fields: fields.to_vec(),
+                });
+            }
+
             // Assign new rows to live docs (sorted by id for determinism).
             let mut doc_ids: Vec<&String> = col.docs.keys().collect();
             doc_ids.sort();
@@ -878,6 +939,7 @@ impl Store {
         //     docnums). Reads attrs, so it is unaffected by the row renumbering. Done
         //     before persist so the refreshed `fts` cache matches the rewritten log.
         self.rebuild_fts();
+        self.rebuild_findex();
 
         // 5d. Refresh both on-disk caches. Best effort: a persist failure must not fail
         //     the compaction (the caches are derived).
