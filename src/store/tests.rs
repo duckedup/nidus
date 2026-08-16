@@ -3526,6 +3526,89 @@ fn compaction_drops_stale_segment_sidecars() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // 512-row k-means over a real file-backed store: too slow under Miri.
+fn compaction_stale_sidecar_would_wreck_recall() {
+    // The measured counterpart to `compaction_drops_stale_segment_sidecars`: a genuinely built
+    // index at a scale where `n_probe` (8) covers only part of the ~23 lists, so adopting one
+    // fitted to the pre-compaction vectors probes the wrong lists and recall is what pays.
+    let (rows, dim, k) = (512usize, 32usize, 10usize);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let cfg = || {
+        Config::new(&path, dim)
+            .distance(Distance::Cosine)
+            .auto_compact(None)
+            .segment_max_rows(Some(rows as u64))
+            .segment_index_min_rows(Some(256))
+    };
+    let fill = |s: &mut Store, vs: &[Vec<f32>]| {
+        let recs: Vec<Record> = vs
+            .iter()
+            .enumerate()
+            .map(|(i, v)| rec(&format!("d{i}"), v.clone()))
+            .collect();
+        for batch in recs.chunks(128) {
+            s.upsert("col", batch).unwrap();
+        }
+        s.flush().unwrap();
+    };
+
+    // One extra vector past `rows`: it lands in the fresh active segment and is what pushes
+    // the base over the seal threshold at exactly `rows`.
+    let old = random_unit_vectors(rows + 1, dim, 21);
+    let new = random_unit_vectors(rows + 1, dim, 22);
+    let queries = random_unit_vectors(30, dim, 23);
+
+    // 1. Fill with the OLD vectors, seal + index the base, and write its sidecar.
+    let mut s = Store::open(cfg()).unwrap();
+    fill(&mut s, &old);
+    assert_eq!(s.data.segment_ranges()[0], (0, rows as u64));
+    s.persist_index().unwrap();
+    assert!(path.join("data.ivf").exists());
+
+    // 2. Empty the store and compact: `data` is rewritten in place, so its sidecar now
+    //    describes vectors the store no longer holds.
+    let ids: Vec<String> = (0..=rows).map(|i| format!("d{i}")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    s.delete("col", &refs).unwrap();
+    s.compact().unwrap();
+
+    // 3. Refill with the NEW vectors so the base reseals at exactly the `(base, rows)` the
+    //    old sidecar was keyed under. No `persist_index` — nothing may rewrite it.
+    fill(&mut s, &new);
+    assert_eq!(s.data.segment_ranges()[0], (0, rows as u64));
+    drop(s);
+
+    // 4. Reopen: the only point where a surviving sidecar is adopted.
+    let reopened = Store::open(cfg()).unwrap();
+    let truth = exact_store(dim, &new);
+    let recall = mean_recall(&reopened, &truth, &queries, k);
+
+    // Calibrate against a store that reached the same contents without ever compacting, so the
+    // bound tracks IVF's own recall at this probe ratio rather than a hardcoded number.
+    let ref_dir = tempfile::tempdir().unwrap();
+    let ref_path = ref_dir.path().join("store");
+    let ref_cfg = || {
+        Config::new(&ref_path, dim)
+            .distance(Distance::Cosine)
+            .auto_compact(None)
+            .segment_max_rows(Some(rows as u64))
+            .segment_index_min_rows(Some(256))
+    };
+    let mut r = Store::open(ref_cfg()).unwrap();
+    fill(&mut r, &new);
+    drop(r);
+    let baseline = mean_recall(&Store::open(ref_cfg()).unwrap(), &truth, &queries, k);
+
+    // Measured: 0.770 both sides with the fix, 0.337 through the compaction path without it.
+    assert!(
+        recall >= baseline - 0.02,
+        "recall@{k} = {recall:.3} through the compaction path vs {baseline:.3} without \
+         compacting — a stale sidecar was adopted over the rewritten vectors"
+    );
+}
+
+#[test]
 #[cfg_attr(miri, ignore)] // fsync: a real file-backed store
 fn a_corrupt_segment_sidecar_rebuilds() {
     let dir = tempfile::tempdir().unwrap();
