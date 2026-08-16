@@ -40,8 +40,8 @@ from .types import (
     Aggregation,
     Batch,
     ClusterStatus,
-    FtsClause,
     FilterIndexField,
+    FtsClause,
     FtsField,
     HighlightOpts,
     Hits,
@@ -186,9 +186,7 @@ class AsyncNidusClient:
         ``ContainsTokenSequence`` and ``Regex``. This changes how fast those predicates run,
         never what they return. Pass an empty sequence to drop the declaration.
         """
-        await self._request(
-            "POST", _wire.filter_index_path(name), _wire.filter_index_body(fields)
-        )
+        await self._request("POST", _wire.filter_index_path(name), _wire.filter_index_body(fields))
 
     # ── Search ───────────────────────────────────────────────────────────────────────
     #

@@ -186,9 +186,10 @@ def test_full_lifecycle(server: str) -> None:
         # ── filter index ─────────────────────────────────────────────────────────────
         # Declaring one must change nothing a caller can observe except speed, so the
         # assertion is that the same predicate answers the same way with it in place.
-        before = [h.id for h in db.list(scope=["docs"], filter=[f.contains_all_tokens("lang", "rust")])]
+        tokens_filter = [f.contains_all_tokens("lang", "rust")]
+        before = [h.id for h in db.list(scope=["docs"], filter=tokens_filter)]
         db.set_filter_index("docs", ["lang"])
-        after = [h.id for h in db.list(scope=["docs"], filter=[f.contains_all_tokens("lang", "rust")])]
+        after = [h.id for h in db.list(scope=["docs"], filter=tokens_filter)]
         assert before == after
         assert db.stats().footprint.filter_index_bytes > 0
         # Per-field structures and the empty-list drop both reach the server.
