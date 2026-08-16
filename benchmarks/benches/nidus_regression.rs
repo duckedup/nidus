@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use nidus::{
-    Config, Decay, Distance, Fsync, FtsField, FtsQuery, HybridOpts, Nidus, QuantKind, Quantization,
-    RankBy, Record, SearchOpts, Value,
+    Config, Decay, Distance, Filter, Fsync, FtsField, FtsQuery, HybridOpts, Nidus, Predicate,
+    QuantKind, Quantization, RankBy, Record, SearchOpts, Value,
 };
 use nidus_bench::data;
 use std::hint::black_box;
@@ -390,6 +390,82 @@ fn bench_rank_by(c: &mut Criterion) {
     group.finish();
 }
 
+/// The un-indexed filter predicates of SPEC §7.4/§7.5, each as a full filtered scan. The two
+/// baselines are the measurement: nidus-89 asks whether these predicates *dominate* a scan,
+/// which is a ratio against an unfiltered and a cheap-predicate run, not an absolute.
+fn bench_filter_predicates(c: &mut Criterion) {
+    let mut group = c.benchmark_group("filter_predicates");
+    let (n, dim) = (10_000usize, 384usize);
+    let db = build_text_store(n, dim);
+    let query_vec = data::generate(SEED ^ 1, 1, dim, 0).vectors;
+
+    // `fuzzy` skips the whole DP when the needle's length is more than `max_edits` from the
+    // attribute's, so a short needle would time the pre-check and never the cost we are here
+    // for. Perturb one real document instead: same length class, one edit away from a hit.
+    let doc = text_corpus(SEED, n)[0].clone();
+    let fuzzy_needle = format!("{}x", &doc[..doc.len() - 1]);
+
+    let cases: Vec<(&str, Filter)> = vec![
+        ("baseline_no_filter", Filter::default()),
+        (
+            "baseline_glob",
+            Filter(vec![Predicate::Glob("text".into(), "*term0*".into())]),
+        ),
+        (
+            "contains_all_tokens_1",
+            Filter(vec![Predicate::ContainsAllTokens(
+                "text".into(),
+                "term0".into(),
+            )]),
+        ),
+        (
+            "contains_all_tokens_4",
+            Filter(vec![Predicate::ContainsAllTokens(
+                "text".into(),
+                "term0 term5 term20 term100".into(),
+            )]),
+        ),
+        (
+            "contains_any_token_4",
+            Filter(vec![Predicate::ContainsAnyToken(
+                "text".into(),
+                "term0 term5 term20 term100".into(),
+            )]),
+        ),
+        (
+            "contains_token_sequence_3",
+            Filter(vec![Predicate::ContainsTokenSequence(
+                "text".into(),
+                "term0 term5 term20".into(),
+            )]),
+        ),
+        (
+            "fuzzy_1_edit",
+            Filter(vec![Predicate::Fuzzy("text".into(), fuzzy_needle, 1)]),
+        ),
+        (
+            "regex_literal",
+            Filter(vec![Predicate::Regex("text".into(), ".*term0 .*".into())]),
+        ),
+    ];
+
+    group.throughput(Throughput::Elements(n as u64));
+    for (label, filter) in cases {
+        let opts = SearchOpts {
+            top_k: 10,
+            filter,
+            ..Default::default()
+        };
+        group.bench_with_input(BenchmarkId::from_parameter(label), &(), |b, _| {
+            b.iter(|| {
+                let hits = db.search("bench", black_box(&query_vec), &opts).unwrap();
+                black_box(hits);
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_search,
@@ -398,6 +474,7 @@ criterion_group!(
     bench_write_path,
     bench_text_search,
     bench_hybrid,
-    bench_rank_by
+    bench_rank_by,
+    bench_filter_predicates
 );
 criterion_main!(benches);
