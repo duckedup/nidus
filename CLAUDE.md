@@ -2,6 +2,13 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+## Communication style
+
+Be direct, short, and straight to the point. Lead with the answer or the result, then only
+the detail that changes what the reader does next. No preamble, no restating the request,
+no summarising work the diff already shows. Say plainly when something failed or was
+skipped — brevity is not a licence to omit bad news.
+
 ## Core Foundation: Speed, Testing, Stable
 
 Three commitments every change is judged against (SPEC §1 — trading one away is a

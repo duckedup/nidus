@@ -12,7 +12,7 @@ use crate::config::{Fsync, OpenMode};
 use crate::data::SegmentIntegrity;
 use crate::filter;
 use crate::fts::FtsField;
-use crate::manifest::MANIFEST_KEY;
+use crate::manifest::{BASE_SEGMENT, MANIFEST_KEY};
 use crate::model::{Distance, Filter, Op, Record, Value};
 use crate::profile::OpenProfile;
 use crate::search::normalize;
@@ -841,6 +841,13 @@ impl Store {
                 let _ = p.delete(name);
             }
         }
+
+        // 2b. Drop every per-segment IVF sidecar, the dropped segments' and the base's alike.
+        //     `rewrite` replaced the base's bytes in place at the same base row, so its old
+        //     sidecar would key-match a later seal at the same row count (nidus-143).
+        let mut stale: Vec<String> = dropped.clone();
+        stale.push(BASE_SEGMENT.to_string());
+        self.delete_seg_index_sidecars(&stale);
 
         // 3. Update in-RAM DocEntry rows.
         for update in updates {
