@@ -40,14 +40,31 @@ pub(crate) fn levenshtein_ascii_ci(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// Split text into ASCII-case-folded runs of alphanumerics. Deliberately simpler than the
-/// FTS analyzer — no stemming, no stopwords — because these are *filter* predicates, where
-/// a term either is or is not present, not ranking.
-pub(crate) fn tokenize(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_ascii_lowercase())
-        .collect()
+/// Runs of alphanumerics, borrowed and **unfolded** — folding is the comparison's job
+/// (`eq_ignore_ascii_case`), so a scan allocates nothing per row. Simpler than the FTS
+/// analyzer on purpose: no stemming, no stopwords, since a filter term is present or not.
+pub(crate) fn tokens(text: &str) -> impl Iterator<Item = &str> + Clone {
+    text.split(is_separator).filter(is_nonempty)
+}
+
+/// Named rather than inline so the `tokens` iterator stays `Clone` — the sequence walk below
+/// restarts from cloned cursors.
+fn is_separator(c: char) -> bool {
+    !c.is_alphanumeric()
+}
+
+fn is_nonempty(token: &&str) -> bool {
+    !token.is_empty()
+}
+
+/// True iff `have` opens with every token of `want`. An empty `want` is vacuously true,
+/// which is `ContainsTokenSequence`'s empty-query identity.
+fn starts_with_tokens<'h, 'w>(
+    mut have: impl Iterator<Item = &'h str>,
+    want: impl Iterator<Item = &'w str>,
+) -> bool {
+    want.into_iter()
+        .all(|w| have.next().is_some_and(|h| h.eq_ignore_ascii_case(w)))
 }
 
 /// [`crate::Predicate::Fuzzy`]. The length pre-check is not just a speed-up: it skips the
@@ -63,38 +80,44 @@ pub(super) fn fuzzy(value: Option<&Value>, needle: &str, max_edits: usize) -> bo
 /// [`crate::Predicate::ContainsAllTokens`]. An empty query matches any present text
 /// attribute, the same vacuous-truth identity `All([])` takes.
 pub(super) fn contains_all_tokens(value: Option<&Value>, query: &str) -> bool {
-    let want = tokenize(query);
     any_text(value, |text| {
-        let have = tokenize(text);
-        want.iter().all(|w| have.contains(w))
+        tokens(query).all(|w| tokens(text).any(|h| h.eq_ignore_ascii_case(w)))
     })
 }
 
 /// [`crate::Predicate::ContainsAnyToken`]. An empty query matches nothing, the identity
 /// `Any([])` and an empty `In` set already take.
 pub(super) fn contains_any_token(value: Option<&Value>, query: &str) -> bool {
-    let want = tokenize(query);
     any_text(value, |text| {
-        let have = tokenize(text);
-        want.iter().any(|w| have.contains(w))
+        tokens(query).any(|w| tokens(text).any(|h| h.eq_ignore_ascii_case(w)))
     })
 }
 
-/// [`crate::Predicate::ContainsTokenSequence`]: the query's tokens as a consecutive,
-/// in-order run. A phrase never spans two `List` elements — each element is its own text.
+/// [`crate::Predicate::ContainsTokenSequence`]: the query's tokens as a consecutive, in-order
+/// run, never spanning two `List` elements. Restarts at every token — a single cursor reset on
+/// mismatch would miss `"a a b"` inside `"a a a b"`.
 pub(super) fn contains_token_sequence(value: Option<&Value>, query: &str) -> bool {
-    let want = tokenize(query);
     any_text(value, |text| {
-        if want.is_empty() {
-            return true;
+        let mut cursor = tokens(text);
+        loop {
+            if starts_with_tokens(cursor.clone(), tokens(query)) {
+                return true;
+            }
+            if cursor.next().is_none() {
+                return false;
+            }
         }
-        tokenize(text).windows(want.len()).any(|w| w == want)
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{levenshtein_ascii_ci, tokenize};
+    use super::{contains_all_tokens, contains_token_sequence, levenshtein_ascii_ci, tokens};
+    use crate::model::Value;
+
+    fn toks(text: &str) -> Vec<&str> {
+        tokens(text).collect()
+    }
 
     // ── Levenshtein ──────────────────────────────────────────────────────────────
 
@@ -160,30 +183,60 @@ mod tests {
     #[test]
     fn tokenizer_splits_on_punctuation_and_whitespace() {
         assert_eq!(
-            tokenize("the quick, brown\tfox!"),
+            toks("the quick, brown\tfox!"),
             ["the", "quick", "brown", "fox"]
         );
     }
 
     #[test]
-    fn tokenizer_folds_ascii_case() {
-        assert_eq!(tokenize("Rust AND Go"), ["rust", "and", "go"]);
-    }
-
-    #[test]
     fn tokenizer_drops_empty_runs() {
-        assert!(tokenize("   ---   ").is_empty());
-        assert_eq!(tokenize("--a--b--"), ["a", "b"]);
+        assert!(toks("   ---   ").is_empty());
+        assert_eq!(toks("--a--b--"), ["a", "b"]);
     }
 
     #[test]
     fn tokenizer_keeps_digits_and_splits_underscores() {
-        assert_eq!(tokenize("src_main2.rs"), ["src", "main2", "rs"]);
+        assert_eq!(toks("src_main2.rs"), ["src", "main2", "rs"]);
     }
 
     #[test]
     fn tokenizer_does_not_stem_or_drop_stopwords() {
         // The FTS analyzer would stem "running" and drop "the"; a filter must not.
-        assert_eq!(tokenize("the running"), ["the", "running"]);
+        assert_eq!(toks("the running"), ["the", "running"]);
+    }
+
+    #[test]
+    fn tokenizer_borrows_the_text_verbatim_and_folds_nothing() {
+        // Folding moved to the comparison; the tokens themselves are slices of `text`.
+        assert_eq!(toks("Rust AND Go"), ["Rust", "AND", "Go"]);
+    }
+
+    // ── Case folding, now the comparison's job ───────────────────────────────────
+
+    #[test]
+    fn token_matching_folds_ascii_case_on_both_sides() {
+        let v = Value::Str("Rust AND Go".into());
+        assert!(contains_all_tokens(Some(&v), "rust go"));
+        assert!(contains_all_tokens(Some(&v), "RUST Go"));
+        assert!(contains_token_sequence(Some(&v), "rust AND go"));
+    }
+
+    #[test]
+    fn token_matching_does_not_fold_non_ascii_case() {
+        // Mirrors `ascii_case_is_folded_but_non_ascii_is_not`: a locale-dependent fold
+        // would mean different things on different machines.
+        let v = Value::Str("café".into());
+        assert!(contains_all_tokens(Some(&v), "café"));
+        assert!(!contains_all_tokens(Some(&v), "CAFÉ"));
+    }
+
+    // ── Sequence restart ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_sequence_is_retried_from_every_token_not_just_the_first() {
+        // A single cursor reset to the start of `want` on mismatch fails this: it consumes
+        // both leading "a"s, mismatches "b" against the third "a", and never retries.
+        let v = Value::Str("a a a b".into());
+        assert!(contains_token_sequence(Some(&v), "a a b"));
     }
 }
