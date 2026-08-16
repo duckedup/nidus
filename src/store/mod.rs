@@ -188,6 +188,10 @@ pub struct Store {
     /// is brute-forced (always the active one). Empty when per-segment indexing is off or a
     /// global `ann` covers every row. The brute-force-tail / indexed-cold split, SPEC §14.3.
     seg_indexes: Vec<Option<IvfIndex>>,
+    /// Position-aligned with `seg_indexes`: that slot's index is not yet in its `<segment>.ivf`
+    /// sidecar. Freshly built ⇒ dirty; adopted from the sidecar ⇒ clean, so a repeated
+    /// `persist_index` writes nothing.
+    seg_index_dirty: Vec<bool>,
     /// The in-RAM ANN index has unpersisted changes (rows inserted since the last
     /// `persist_index`/load). Lets `persist_index` skip a redundant write and tracks
     /// whether the on-disk `ann` cache is current. Meaningless when ANN is off.
@@ -429,6 +433,7 @@ impl Store {
             quant,
             ann,
             seg_indexes: Vec::new(),
+            seg_index_dirty: Vec::new(),
             ann_dirty: false,
             fts,
             fts_dirty: false,
@@ -535,6 +540,7 @@ impl Store {
             quant,
             ann,
             seg_indexes: Vec::new(),
+            seg_index_dirty: Vec::new(),
             ann_dirty: false,
             fts: Fts::default(),
             fts_dirty: false,
@@ -1032,6 +1038,7 @@ impl Store {
         }
         self.persist_ann()?;
         self.persist_fts()?;
+        self.persist_seg_indexes()?;
         Ok(())
     }
 
@@ -1144,11 +1151,12 @@ impl Store {
         AnnConfig::ivf()
     }
 
-    /// Rebuild the per-segment IVF indexes over the current segment set: one per immutable segment
-    /// at or above `segment_index_min_rows`, `None` for the active and smaller ones. O(indexed
-    /// rows), for `open` and `compact`; a single seal takes the cheaper `index_just_sealed`.
+    /// Load-or-build the per-segment IVF indexes: one per immutable segment at or above
+    /// `segment_index_min_rows`, each adopting its `<segment>.ivf` sidecar when valid and running
+    /// k-means otherwise. For `open`/`refresh`/`compact`; a seal takes `index_just_sealed`.
     fn build_segment_indexes(&mut self) {
         self.seg_indexes = Vec::new();
+        self.seg_index_dirty = Vec::new();
         if !self.seg_indexing_on() {
             return;
         }
@@ -1157,24 +1165,110 @@ impl Store {
         // covers every live row of the segments we are about to index.
         self.rebuild_row_to_doc();
         let ranges = self.data.segment_ranges();
+        let names = self.data.segment_names();
         let active = ranges.len() - 1;
         let cfg = Self::segment_ivf_config();
         let dim = self.data.dimension();
         let distance = self.config.distance;
         let workers = self.config.query_threads;
+        // Cloned so the sidecar reads below do not hold a borrow of `self`.
+        let persistence = self.persistence.clone();
         let walk = Walk::exact(&self.data, distance);
         let mut indexes: Vec<Option<IvfIndex>> = Vec::with_capacity(ranges.len());
+        let mut dirty: Vec<bool> = Vec::with_capacity(ranges.len());
         for (i, &(base, rows)) in ranges.iter().enumerate() {
-            if i != active && rows >= min {
-                let mut ix = IvfIndex::new(cfg, dim, distance);
-                let segment_rows: Vec<u64> = (base..base + rows).collect();
-                ix.build(&walk, &segment_rows, workers);
-                indexes.push(Some(ix));
-            } else {
+            if i == active || rows < min {
                 indexes.push(None);
+                dirty.push(false);
+                continue;
+            }
+            // A valid sidecar skips the k-means entirely; anything else (absent, stale,
+            // corrupt, or a read error) falls through to a rebuild — it is only a cache.
+            let slot = crate::ann::SegmentSlot {
+                name: &names[i],
+                base,
+                rows,
+            };
+            let cached = persistence.as_deref().and_then(|p| {
+                crate::ann::load_segment_index(p, slot, dim, distance, &cfg)
+                    .ok()
+                    .flatten()
+            });
+            match cached {
+                Some(ix) => {
+                    indexes.push(Some(ix));
+                    dirty.push(false);
+                }
+                None => {
+                    let mut ix = IvfIndex::new(cfg, dim, distance);
+                    let segment_rows: Vec<u64> = (base..base + rows).collect();
+                    ix.build(&walk, &segment_rows, workers);
+                    indexes.push(Some(ix));
+                    dirty.push(true);
+                }
             }
         }
         self.seg_indexes = indexes;
+        self.seg_index_dirty = dirty;
+    }
+
+    /// Write every dirty per-segment IVF index to its `<segment>.ivf` sidecar so the next `open`
+    /// skips the k-means. Out-of-band with the rest of [`Self::persist_index`] — never on the
+    /// commit path (SPEC §14.4). A sealed segment is immutable, so its sidecar never goes stale.
+    fn persist_seg_indexes(&mut self) -> Result<()> {
+        if self.seg_indexes.is_empty() {
+            return Ok(());
+        }
+        let Some(p) = self.persistence.clone() else {
+            return Ok(());
+        };
+        let ranges = self.data.segment_ranges();
+        let names = self.data.segment_names();
+        // A restructure since the last build leaves these misaligned; the next
+        // `build_segment_indexes` re-establishes it, so skip rather than mis-name a sidecar.
+        if ranges.len() != self.seg_indexes.len() || self.seg_index_dirty.len() != ranges.len() {
+            return Ok(());
+        }
+        let cfg = Self::segment_ivf_config();
+        let dim = self.data.dimension();
+        let distance = self.config.distance;
+        for (i, &(base, rows)) in ranges.iter().enumerate() {
+            let Some(ix) = self.seg_indexes[i].as_ref() else {
+                continue;
+            };
+            if !self.seg_index_dirty[i] {
+                continue;
+            }
+            let slot = crate::ann::SegmentSlot {
+                name: &names[i],
+                base,
+                rows,
+            };
+            crate::ann::save_segment_index(p.as_ref(), slot, dim, distance, &cfg, ix)?;
+            self.seg_index_dirty[i] = false;
+        }
+        Ok(())
+    }
+
+    /// Drop the per-segment IVF sidecars for `names`. Called at compaction: `rewrite` replaces the
+    /// base segment's bytes **in place** at the same base, so a surviving sidecar could be adopted
+    /// over the wrong vectors after a later seal (nidus-143). Best-effort per object.
+    fn delete_seg_index_sidecars(&self, names: &[String]) {
+        let Some(p) = self.persistence.as_deref() else {
+            return;
+        };
+        for name in names {
+            let object = crate::ann::segment_object_name(name);
+            if let Err(e) = p.delete(&object) {
+                crate::diag::diag!(
+                    crate::diag::Level::Warn,
+                    "segment",
+                    "failed to delete stale segment index sidecar",
+                    "object" => object,
+                    "err" => format!("{e:#}"),
+                );
+            }
+        }
     }
 
     /// After a seal, index the just-sealed segment if it meets the threshold and append a `None`
@@ -1186,7 +1280,7 @@ impl Store {
         }
         let ranges = self.data.segment_ranges();
         let sealed = ranges.len() - 2; // the seal pushed a new active; this just froze.
-        if self.seg_indexes.len() != sealed + 1 {
+        if self.seg_indexes.len() != sealed + 1 || self.seg_index_dirty.len() != sealed + 1 {
             // Not aligned to the pre-seal segment count — rebuild defensively.
             self.build_segment_indexes();
             return;
@@ -1208,8 +1302,12 @@ impl Store {
         } else {
             None
         };
+        // Built here, never read from a sidecar — this segment was active until now, so no
+        // sidecar for it can exist. Dirty until the next out-of-band `persist_index`.
+        self.seg_index_dirty[sealed] = built.is_some();
         self.seg_indexes[sealed] = built;
         self.seg_indexes.push(None);
+        self.seg_index_dirty.push(false);
     }
 
     // ── FTS index lifecycle ───────────────────────────────────────────────────────

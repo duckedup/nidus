@@ -1788,10 +1788,17 @@ have far lower roundtrip count and write-amplification against object storage th
 pointer-chasing graph, and they rebuild cleanly per immutable segment. nidus reuses the
 existing `ivf.rs` for the per-segment index.
 
-*(Built with a deliberate seam: per-segment IVF indexes are **rebuilt on `open`** from the
-immutable segments rather than cached to their own objects — IVF's k-means build is cheap.
-Persisting per-segment indexes as cache objects, parallel/quantized per-segment walks, and a
-background segment-merge step are additive follow-ups over this same format.)
+Each indexed segment caches to its own `<segment>.ivf` object through the shared
+`index_cache` codec, beside the `<segment>.crc` sidecar — keyed on the segment's name, its
+global row range, and the IVF tuning, so a cache can never be adopted at the wrong range.
+`open` and `refresh` adopt a valid sidecar and skip the k-means; anything else (absent,
+stale, corrupt) rebuilds, since it is only a cache. Sidecars are written **out of band** by
+`persist_index()`, never on the commit path (§14.4). Sealed segments are immutable, so a
+sidecar goes stale only at compaction — which rewrites the base segment's bytes in place at
+the same base row, so compaction deletes every per-segment sidecar, the base's included.
+
+*(Still deferred over this same format: parallel/quantized per-segment walks and a background
+segment-merge step.)*
 
 ### 14.4 Writes: log first, index asynchronously
 

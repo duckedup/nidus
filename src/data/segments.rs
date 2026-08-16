@@ -229,6 +229,12 @@ impl Segments {
             .collect()
     }
 
+    /// Segment object names in global-row order, positionally aligned with
+    /// [`segment_ranges`](Self::segment_ranges) — the handle a per-segment sidecar is named by.
+    pub fn segment_names(&self) -> Vec<String> {
+        self.segs.iter().map(|s| s.name.clone()).collect()
+    }
+
     /// Number of live segments (last is the active one).
     #[cfg(test)]
     pub fn segment_count(&self) -> usize {

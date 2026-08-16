@@ -638,6 +638,7 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         quant: None,
         ann: None,
         seg_indexes: Vec::new(),
+        seg_index_dirty: Vec::new(),
         ann_dirty: false,
         fts: crate::fts::Fts::default(),
         fts_dirty: false,
@@ -3305,6 +3306,352 @@ fn mmap_with_per_segment_index_keeps_recall() {
         recall >= 0.80,
         "mmap + per-segment IVF recall@{k} = {recall:.3}, expected >= 0.80"
     );
+}
+
+// ── Per-segment IVF sidecars (nidus-143) ────────────────────────────────────
+
+/// A file-backed segmented store at `path`: seals every 8 rows, indexes any sealed
+/// segment with >= 4 rows. Mirrors `segmented_store` but on a real backend, so the
+/// `<segment>.ivf` sidecars actually exist.
+fn segmented_on_disk(path: &std::path::Path, dim: usize) -> Store {
+    Store::open(
+        Config::new(path, dim)
+            .distance(Distance::Cosine)
+            .auto_compact(None)
+            .segment_max_rows(Some(8))
+            .segment_index_min_rows(Some(4)),
+    )
+    .unwrap()
+}
+
+/// Fill `s` with `n` deterministic unit vectors, in batches small enough to seal repeatedly.
+fn fill_segmented(s: &mut Store, dim: usize, n: usize, seed: u64) -> Vec<Vec<f32>> {
+    let data = random_unit_vectors(n, dim, seed);
+    let recs: Vec<Record> = data
+        .iter()
+        .enumerate()
+        .map(|(i, v)| rec(&format!("d{i}"), v.clone()))
+        .collect();
+    for batch in recs.chunks(4) {
+        s.upsert("col", batch).unwrap();
+    }
+    s.flush().unwrap();
+    data
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // fsync: a real file-backed store
+fn segment_ivf_sidecars_are_written_and_reloaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let dim = 8;
+    let (data, sidecars) = {
+        let mut s = segmented_on_disk(&path, dim);
+        let data = fill_segmented(&mut s, dim, 40, 7);
+        let indexed = s.seg_indexes.iter().filter(|x| x.is_some()).count();
+        assert!(indexed >= 2, "expected several indexed cold segments");
+        s.persist_index().unwrap();
+        let names = s.data.segment_names();
+        let sidecars: Vec<std::path::PathBuf> = names
+            .iter()
+            .zip(&s.seg_indexes)
+            .filter(|(_, ix)| ix.is_some())
+            .map(|(n, _)| path.join(format!("{n}.ivf")))
+            .collect();
+        assert_eq!(sidecars.len(), indexed);
+        for f in &sidecars {
+            assert!(f.exists(), "sidecar {f:?} written");
+        }
+        (data, sidecars)
+    };
+
+    let q = data[3].clone();
+    let ids = |s: &Store| -> Vec<String> {
+        s.search(&["col"], &q, &default_opts(10))
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect()
+    };
+
+    // Reopen: every cold segment's index comes off its sidecar, so none is dirty.
+    let from_cache = {
+        let reopened = segmented_on_disk(&path, dim);
+        assert_eq!(
+            reopened.seg_indexes.iter().filter(|x| x.is_some()).count(),
+            sidecars.len()
+        );
+        assert!(
+            reopened.seg_index_dirty.iter().all(|d| !d),
+            "an adopted sidecar must not be marked dirty (it would be rewritten every persist)"
+        );
+        ids(&reopened)
+    };
+
+    // Results match the rebuilt-from-scratch store: adopting the cache changes nothing.
+    for f in &sidecars {
+        std::fs::remove_file(f).unwrap();
+    }
+    let rebuilt = segmented_on_disk(&path, dim);
+    assert!(
+        rebuilt.seg_index_dirty.iter().any(|&d| d),
+        "with no sidecar every index is freshly built, hence dirty"
+    );
+    assert_eq!(from_cache, ids(&rebuilt));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // fsync: a real file-backed store
+fn a_planted_sidecar_is_actually_adopted() {
+    // Proves adoption, not "the store opened": an adopted *empty* index offers no candidates
+    // while still excluding its rows from the exhaustive tail, so that segment's docs vanish
+    // — an observable a rebuild cannot produce.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let dim = 8;
+    let mut s = segmented_on_disk(&path, dim);
+    let data = fill_segmented(&mut s, dim, 40, 11);
+    let ranges = s.data.segment_ranges();
+    let names = s.data.segment_names();
+    let victim = s
+        .seg_indexes
+        .iter()
+        .position(Option::is_some)
+        .expect("a cold segment is indexed");
+    let (base, rows) = ranges[victim];
+    let p = s.persistence.clone().unwrap();
+    let slot = crate::ann::SegmentSlot {
+        name: &names[victim],
+        base,
+        rows,
+    };
+    crate::ann::save_segment_index(
+        p.as_ref(),
+        slot,
+        dim,
+        Distance::Cosine,
+        &AnnConfig::ivf(),
+        &IvfIndex::new(AnnConfig::ivf(), dim, Distance::Cosine), // never built: no lists
+    )
+    .unwrap();
+    drop(s);
+
+    // Every doc in the victim segment's row range must now be unreachable.
+    let reopened = segmented_on_disk(&path, dim);
+    let all: Vec<String> = reopened
+        .search(&["col"], &data[0], &default_opts(40))
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(
+        all.len() as u64,
+        40 - rows,
+        "the planted empty index must swallow exactly its own segment's rows"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // fsync: a real file-backed store
+fn compaction_drops_stale_segment_sidecars() {
+    // Regression (nidus-143): `rewrite` replaces the base's bytes in place at base 0, so a
+    // surviving `data.ivf` key-matches a later seal at the same row count. The plant makes that
+    // adoption observable — a real stale index holds the same rows and only degrades recall.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let dim = 8;
+    let base_sidecar = path.join("data.ivf");
+
+    let mut s = segmented_on_disk(&path, dim);
+    let data = fill_segmented(&mut s, dim, 40, 13);
+    let (base, rows) = s.data.segment_ranges()[0];
+    assert_eq!(base, 0, "the base segment always starts at row 0");
+    // Plant an empty-but-valid index over the base segment, keyed exactly as a later reseal
+    // at the same row count will be.
+    let p = s.persistence.clone().unwrap();
+    let slot = crate::ann::SegmentSlot {
+        name: "data",
+        base,
+        rows,
+    };
+    crate::ann::save_segment_index(
+        p.as_ref(),
+        slot,
+        dim,
+        Distance::Cosine,
+        &AnnConfig::ivf(),
+        &IvfIndex::new(AnnConfig::ivf(), dim, Distance::Cosine),
+    )
+    .unwrap();
+    assert!(base_sidecar.exists());
+
+    // Delete everything past the base segment so compaction collapses to one segment, then compact.
+    let doomed: Vec<String> = (rows as usize..40).map(|i| format!("d{i}")).collect();
+    let refs: Vec<&str> = doomed.iter().map(String::as_str).collect();
+    s.delete("col", &refs).unwrap();
+    s.compact().unwrap();
+    assert!(
+        !base_sidecar.exists(),
+        "compaction must delete the base segment's stale IVF sidecar"
+    );
+    drop(s);
+
+    // Re-fill so `data` seals again at the same `(base, rows)` the plant was keyed for.
+    let mut s = segmented_on_disk(&path, dim);
+    assert_eq!(
+        s.data.segment_ranges()[0].1,
+        rows,
+        "reseals at the same size"
+    );
+    let refill: Vec<Record> = (0..32)
+        .map(|i| rec(&format!("n{i}"), data[i % data.len()].clone()))
+        .collect();
+    for batch in refill.chunks(4) {
+        s.upsert("col", batch).unwrap();
+    }
+    s.flush().unwrap();
+    assert_eq!(s.data.segment_ranges()[0], (base, rows));
+    drop(s);
+
+    // A surviving plant would be adopted here and swallow the base segment's rows.
+    let reopened = segmented_on_disk(&path, dim);
+    let hits = reopened
+        .search(&["col"], &data[0], &default_opts(64))
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        rows as usize + 32,
+        "every live doc must still be reachable"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // 512-row k-means over a real file-backed store: too slow under Miri.
+fn compaction_stale_sidecar_would_wreck_recall() {
+    // The measured counterpart to `compaction_drops_stale_segment_sidecars`: a genuinely built
+    // index at a scale where `n_probe` (8) covers only part of the ~23 lists, so adopting one
+    // fitted to the pre-compaction vectors probes the wrong lists and recall is what pays.
+    let (rows, dim, k) = (512usize, 32usize, 10usize);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let cfg = || {
+        Config::new(&path, dim)
+            .distance(Distance::Cosine)
+            .auto_compact(None)
+            .segment_max_rows(Some(rows as u64))
+            .segment_index_min_rows(Some(256))
+    };
+    let fill = |s: &mut Store, vs: &[Vec<f32>]| {
+        let recs: Vec<Record> = vs
+            .iter()
+            .enumerate()
+            .map(|(i, v)| rec(&format!("d{i}"), v.clone()))
+            .collect();
+        for batch in recs.chunks(128) {
+            s.upsert("col", batch).unwrap();
+        }
+        s.flush().unwrap();
+    };
+
+    // One extra vector past `rows`: it lands in the fresh active segment and is what pushes
+    // the base over the seal threshold at exactly `rows`.
+    let old = random_unit_vectors(rows + 1, dim, 21);
+    let new = random_unit_vectors(rows + 1, dim, 22);
+    let queries = random_unit_vectors(30, dim, 23);
+
+    // 1. Fill with the OLD vectors, seal + index the base, and write its sidecar.
+    let mut s = Store::open(cfg()).unwrap();
+    fill(&mut s, &old);
+    assert_eq!(s.data.segment_ranges()[0], (0, rows as u64));
+    s.persist_index().unwrap();
+    assert!(path.join("data.ivf").exists());
+
+    // 2. Empty the store and compact: `data` is rewritten in place, so its sidecar now
+    //    describes vectors the store no longer holds.
+    let ids: Vec<String> = (0..=rows).map(|i| format!("d{i}")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    s.delete("col", &refs).unwrap();
+    s.compact().unwrap();
+
+    // 3. Refill with the NEW vectors so the base reseals at exactly the `(base, rows)` the
+    //    old sidecar was keyed under. No `persist_index` — nothing may rewrite it.
+    fill(&mut s, &new);
+    assert_eq!(s.data.segment_ranges()[0], (0, rows as u64));
+    drop(s);
+
+    // 4. Reopen: the only point where a surviving sidecar is adopted.
+    let reopened = Store::open(cfg()).unwrap();
+    let truth = exact_store(dim, &new);
+    let recall = mean_recall(&reopened, &truth, &queries, k);
+
+    // Calibrate against a store that reached the same contents without ever compacting, so the
+    // bound tracks IVF's own recall at this probe ratio rather than a hardcoded number.
+    let ref_dir = tempfile::tempdir().unwrap();
+    let ref_path = ref_dir.path().join("store");
+    let ref_cfg = || {
+        Config::new(&ref_path, dim)
+            .distance(Distance::Cosine)
+            .auto_compact(None)
+            .segment_max_rows(Some(rows as u64))
+            .segment_index_min_rows(Some(256))
+    };
+    let mut r = Store::open(ref_cfg()).unwrap();
+    fill(&mut r, &new);
+    drop(r);
+    let baseline = mean_recall(&Store::open(ref_cfg()).unwrap(), &truth, &queries, k);
+
+    // Measured: 0.770 both sides with the fix, 0.337 through the compaction path without it.
+    assert!(
+        recall >= baseline - 0.02,
+        "recall@{k} = {recall:.3} through the compaction path vs {baseline:.3} without \
+         compacting — a stale sidecar was adopted over the rewritten vectors"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // fsync: a real file-backed store
+fn a_corrupt_segment_sidecar_rebuilds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let dim = 8;
+    let mut s = segmented_on_disk(&path, dim);
+    let data = fill_segmented(&mut s, dim, 40, 17);
+    s.persist_index().unwrap();
+    let clean: Vec<String> = s
+        .search(&["col"], &data[0], &default_opts(40))
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    drop(s);
+
+    // Flip a payload byte in every sidecar: the CRC must reject them and open must rebuild.
+    let mut corrupted = 0;
+    for entry in std::fs::read_dir(&path).unwrap() {
+        let f = entry.unwrap().path();
+        if f.extension().and_then(|e| e.to_str()) != Some("ivf") {
+            continue;
+        }
+        let mut bytes = std::fs::read(&f).unwrap();
+        let last = bytes.len() - 5; // inside the payload, before the trailing crc32
+        bytes[last] ^= 0xFF;
+        std::fs::write(&f, &bytes).unwrap();
+        corrupted += 1;
+    }
+    assert!(corrupted > 0, "there were sidecars to corrupt");
+
+    let reopened = segmented_on_disk(&path, dim);
+    assert!(
+        reopened.seg_index_dirty.iter().any(|&d| d),
+        "a rejected sidecar means the index was rebuilt, hence dirty"
+    );
+    let got: Vec<String> = reopened
+        .search(&["col"], &data[0], &default_opts(40))
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(got, clean);
 }
 
 // ── Full-text search (BM25) ─────────────────────────────────────────────────

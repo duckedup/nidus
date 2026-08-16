@@ -12,7 +12,10 @@ mod persist;
 
 pub(crate) use hnsw::HnswGraph;
 pub(crate) use ivf::IvfIndex;
-pub(crate) use persist::{load as load_index, save as save_index};
+pub(crate) use persist::{
+    SegmentSlot, load as load_index, load_segment as load_segment_index, save as save_index,
+    save_segment as save_segment_index, segment_object_name,
+};
 
 /// Borrowed view of an index's durable state, for zero-copy serialization on save.
 /// Mirrors [`AnnSnapshot`] but holds references so a snapshot write never clones the

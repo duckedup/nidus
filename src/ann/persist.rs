@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::ann::{Ann, AnnSnapshot};
+use crate::ann::{Ann, AnnSnapshot, IvfIndex};
 use crate::backend::Persistence;
 use crate::index_cache;
 use crate::model::{AnnConfig, AnnKind, Distance, QuantKind};
@@ -86,6 +86,85 @@ pub(crate) fn load(
     let key = validity_key(dim, distance, cfg, quant);
     Ok(index_cache::load::<AnnSnapshot>(p, ANN_OBJECT, &key)?
         .map(|(snap, covered)| (Ann::from_snapshot(*cfg, dim, distance, snap), covered)))
+}
+
+// ── Per-segment IVF sidecars (SPEC §14.3) ────────────────────────────────────────
+
+/// The sidecar object name for one segment's IVF index: `seg-00000001` -> `seg-00000001.ivf`.
+/// Sits beside `checksum`'s `<segment>.crc` on the same backend.
+pub(crate) fn segment_object_name(segment: &str) -> String {
+    format!("{segment}.ivf")
+}
+
+/// Which segment a sidecar belongs to: its object name and its **global row range**. Bundled
+/// rather than passed positionally because `base` and `rows` are both `u64` — a swap would
+/// compile and silently key the cache to the wrong rows.
+#[derive(Clone, Copy)]
+pub(crate) struct SegmentSlot<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) base: u64,
+    pub(crate) rows: u64,
+}
+
+/// Binds a sidecar to one segment's identity **and its global row range**: IVF lists hold
+/// global physical rows, so a cache adopted at a different `(base, rows)` would point at the
+/// wrong vectors. `n_probe` is excluded for the same reason as [`validity_key`].
+pub(crate) fn segment_validity_key(
+    slot: SegmentSlot<'_>,
+    dim: usize,
+    distance: Distance,
+    cfg: &AnnConfig,
+) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 4 + 8 + 8 + 8 + slot.name.len());
+    k.push(distance_to_byte(distance));
+    k.extend_from_slice(&(dim as u32).to_le_bytes());
+    k.extend_from_slice(&(cfg.n_lists as u32).to_le_bytes());
+    k.extend_from_slice(&cfg.seed.to_le_bytes());
+    k.extend_from_slice(&slot.base.to_le_bytes());
+    k.extend_from_slice(&slot.rows.to_le_bytes());
+    k.extend_from_slice(slot.name.as_bytes());
+    k
+}
+
+/// Save one sealed segment's IVF index as its `<segment>.ivf` sidecar. Whole-object `put`,
+/// so it is atomic; the watermark is the segment's own row count.
+pub(crate) fn save_segment(
+    p: &dyn Persistence,
+    slot: SegmentSlot<'_>,
+    dim: usize,
+    distance: Distance,
+    cfg: &AnnConfig,
+    ix: &IvfIndex,
+) -> Result<()> {
+    let key = segment_validity_key(slot, dim, distance, cfg);
+    index_cache::save(
+        p,
+        &segment_object_name(slot.name),
+        &key,
+        slot.rows,
+        &ix.snapshot_ref(),
+    )
+}
+
+/// Load one segment's IVF sidecar when valid for exactly this `(slot, dim, distance, cfg)`.
+/// `Ok(None)` — never an error — when absent, stale, or corrupt, and the caller rebuilds.
+/// A non-IVF payload is treated as no cache.
+pub(crate) fn load_segment(
+    p: &dyn Persistence,
+    slot: SegmentSlot<'_>,
+    dim: usize,
+    distance: Distance,
+    cfg: &AnnConfig,
+) -> Result<Option<IvfIndex>> {
+    let key = segment_validity_key(slot, dim, distance, cfg);
+    let loaded =
+        index_cache::load::<AnnSnapshot>(p, &segment_object_name(slot.name), &key)?.map(|(s, _)| s);
+    Ok(match loaded {
+        Some(AnnSnapshot::Ivf { centroids, lists }) => {
+            Some(IvfIndex::from_parts(*cfg, dim, distance, centroids, lists))
+        }
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -187,6 +266,118 @@ mod tests {
         assert!(decode_bytes(&bytes, 2, Distance::Euclidean, &cfg).is_none());
         // Different dim → None.
         assert!(decode_bytes(&bytes, 4, Distance::Cosine, &cfg).is_none());
+    }
+
+    // ── Per-segment sidecars (nidus-143) ─────────────────────────────────────
+
+    /// A segment sidecar round-trip through `frame`/`decode` only — no filesystem, so it
+    /// runs under Miri, exactly like the whole-index tests above.
+    fn seg_roundtrip(
+        ix: &IvfIndex,
+        segment: &str,
+        base: u64,
+        rows: u64,
+        dim: usize,
+        cfg: &AnnConfig,
+    ) -> Vec<u8> {
+        let slot = SegmentSlot {
+            name: segment,
+            base,
+            rows,
+        };
+        let key = segment_validity_key(slot, dim, Distance::Cosine, cfg);
+        index_cache::frame(&key, rows, &ix.snapshot_ref()).unwrap()
+    }
+
+    fn seg_decode(
+        bytes: &[u8],
+        segment: &str,
+        base: u64,
+        rows: u64,
+        dim: usize,
+        cfg: &AnnConfig,
+    ) -> Option<IvfIndex> {
+        let slot = SegmentSlot {
+            name: segment,
+            base,
+            rows,
+        };
+        let key = segment_validity_key(slot, dim, Distance::Cosine, cfg);
+        match index_cache::decode::<AnnSnapshot>(bytes, &key) {
+            Some((AnnSnapshot::Ivf { centroids, lists }, _)) => Some(IvfIndex::from_parts(
+                *cfg,
+                dim,
+                Distance::Cosine,
+                centroids,
+                lists,
+            )),
+            _ => None,
+        }
+    }
+
+    fn built_segment_index(data: &Segments, rows: u64, cfg: AnnConfig) -> IvfIndex {
+        let mut ix = IvfIndex::new(cfg, data.dimension(), Distance::Cosine);
+        ix.build(
+            &Walk::exact(data, Distance::Cosine),
+            &(0..rows).collect::<Vec<_>>(),
+            1,
+        );
+        ix
+    }
+
+    #[test]
+    fn segment_sidecar_roundtrips_and_searches_the_same() {
+        let rows: Vec<Vec<f32>> = (0..20)
+            .map(|i| {
+                let t = i as f32 / 20.0;
+                vec![t.cos(), t.sin()]
+            })
+            .collect();
+        let data = seg(2, &rows);
+        let cfg = AnnConfig::ivf().n_lists(4);
+        let ix = built_segment_index(&data, 20, cfg);
+        let walk = Walk::exact(&data, Distance::Cosine);
+        let before = ix.search(&walk, &rows[5], 5);
+
+        let bytes = seg_roundtrip(&ix, "seg-00000001", 0, 20, 2, &cfg);
+        let restored = seg_decode(&bytes, "seg-00000001", 0, 20, 2, &cfg).unwrap();
+        assert_eq!(before, restored.search(&walk, &rows[5], 5));
+    }
+
+    #[test]
+    fn segment_sidecar_is_bound_to_its_segment_and_row_range() {
+        let data = seg(2, &[vec![1.0, 0.0], vec![0.0, 1.0]]);
+        let cfg = AnnConfig::ivf().n_lists(2);
+        let ix = built_segment_index(&data, 2, cfg);
+        let bytes = seg_roundtrip(&ix, "seg-00000001", 8, 2, 2, &cfg);
+
+        assert!(seg_decode(&bytes, "seg-00000001", 8, 2, 2, &cfg).is_some());
+        // A different segment name, base, or row count must all reject: IVF lists hold
+        // *global* rows, so adopting at the wrong range would point at other vectors.
+        assert!(seg_decode(&bytes, "seg-00000002", 8, 2, 2, &cfg).is_none());
+        assert!(seg_decode(&bytes, "seg-00000001", 0, 2, 2, &cfg).is_none());
+        assert!(seg_decode(&bytes, "seg-00000001", 8, 3, 2, &cfg).is_none());
+        assert!(seg_decode(&bytes, "seg-00000001", 8, 2, 4, &cfg).is_none());
+        // Different IVF tuning → different lists → reject.
+        let other = AnnConfig::ivf().n_lists(3);
+        assert!(seg_decode(&bytes, "seg-00000001", 8, 2, 2, &other).is_none());
+    }
+
+    #[test]
+    fn segment_sidecar_object_name_sits_beside_the_checksum() {
+        assert_eq!(segment_object_name("data"), "data.ivf");
+        assert_eq!(segment_object_name("seg-00000007"), "seg-00000007.ivf");
+    }
+
+    #[test]
+    fn corrupt_segment_sidecar_is_rejected() {
+        let data = seg(2, &[vec![1.0, 0.0], vec![0.0, 1.0]]);
+        let cfg = AnnConfig::ivf().n_lists(2);
+        let ix = built_segment_index(&data, 2, cfg);
+        let mut bytes = seg_roundtrip(&ix, "data", 0, 2, 2, &cfg);
+        let last = bytes.len() - 5; // inside the payload, before the trailing crc32
+        bytes[last] ^= 0xFF;
+        assert!(seg_decode(&bytes, "data", 0, 2, 2, &cfg).is_none());
     }
 
     #[test]
