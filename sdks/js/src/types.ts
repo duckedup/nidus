@@ -364,6 +364,23 @@ export interface FtsField {
   maxTokenLen?: number;
 }
 
+/**
+ * One entry of {@link NidusClient.setFilterIndex}'s `fields`: the attribute to index for
+ * the text predicates (`Fuzzy`, `ContainsAllTokens`, `ContainsAnyToken`,
+ * `ContainsTokenSequence`, `Regex`), plus which structures to build for it. Both default
+ * to `true`, so pass the bare field name unless you want to leave one out.
+ *
+ * Declaring an index changes how fast those predicates run, never what they return.
+ */
+export interface FilterIndexField {
+  /** The attribute to index. */
+  field: string;
+  /** Token postings, serving the three token predicates (default `true`). */
+  tokens?: boolean;
+  /** Character trigrams, serving `Fuzzy` and `Regex` (default `true`). */
+  trigrams?: boolean;
+}
+
 /** {@link TextQuerySpelling} for hybrid search, whose single form spells the text `text`. */
 export type HybridQuerySpelling =
   | { field: string; text: string; clauses?: never; combine?: never }

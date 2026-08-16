@@ -180,6 +180,21 @@ like an unnormalizable value. `Regex` is compiled server-side and anchored at bo
 so use `.*` to opt into a substring search — and an unparseable pattern comes back as a
 request error, not a Go one.
 
+## Indexing the text predicates
+
+Fuzzy, ContainsAllTokens, ContainsAnyToken, ContainsTokenSequence and Regex are scanned per
+record by default. Declaring a filter index makes them a lot faster and changes no results
+at all: the index proposes candidates and the predicate still decides.
+
+```go
+if err := db.SetFilterIndex(ctx, "docs", []string{"body"}); err != nil { /* … */ }
+// SetFilterIndexFields is the same call with per-field control over which structures
+// are built, so a tag field can skip the trigrams that serve Fuzzy and Regex.
+```
+
+It is opt-in per collection and per field, and it costs write time and memory. Documents
+already written are indexed as part of the call; passing no fields drops the declaration.
+
 ## Full-text and hybrid search
 
 ```go

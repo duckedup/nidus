@@ -247,14 +247,8 @@ impl Nidus {
         self.store.set_fts_schema(collection, fields)
     }
 
-    /// Declare which attribute fields of `collection` are indexed for the text predicates
-    /// (`Fuzzy`, `ContainsAllTokens`, `ContainsAnyToken`, `ContainsTokenSequence`, `Regex`).
-    /// Opt-in and off by default; redeclaring rebuilds, and an empty `fields` turns it off.
-    ///
-    /// **This changes how fast those predicates run, never what they return.** The index
-    /// proposes candidate documents and the predicate itself still decides, so results are
-    /// identical either way. The cost is paid at write time and in RAM (see
-    /// [`footprint`](Self::footprint)).
+    /// Opt-in index for the text predicates of SPEC §7.4/§7.5, per field. Changes their
+    /// **speed, never their results**; costs write time and RAM. Empty `fields` turns it off.
     ///
     /// ```
     /// # use nidus::{FilterIndexField, Nidus};

@@ -71,12 +71,9 @@ impl TrigramPostings {
     }
 }
 
-/// The minimum trigrams a string within `max_edits` of `needle` must share with it.
-///
-/// A single edit (substitution, insertion or deletion) destroys **at most 3** trigrams,
-/// since a character participates in at most 3 windows. So `|trigrams(needle)| - 3*d` is a
-/// sound lower bound. `None` means the bound is vacuous (`<= 0`) and no narrowing is
-/// possible — the caller must scan everything rather than narrow to nothing.
+/// The minimum trigrams a string within `max_edits` of `needle` must share with it: one
+/// edit destroys at most 3 windows, so `|trigrams(needle)| - 3*d` is sound. `None` means
+/// the bound is vacuous and the caller must scan everything rather than narrow to nothing.
 pub(crate) fn fuzzy_threshold(needle: &str, max_edits: usize) -> Option<usize> {
     let n = distinct_trigrams(needle).len();
     n.checked_sub(3usize.saturating_mul(max_edits))
@@ -150,9 +147,8 @@ mod tests {
     }
 
     /// Every string reachable from `word` in at most `d` single edits. Generating the
-    /// neighbourhood directly is what makes this test bite: enumerating a whole small
-    /// alphabet instead only reaches needles too short for the bound to be non-vacuous, so
-    /// the `3` in `3*d` was never actually exercised (a 2*d bound passed that version).
+    /// neighbourhood is what makes this bite: a small-alphabet sweep only reaches needles
+    /// too short for the bound to matter, and a wrong `2*d` bound passed that version.
     fn edit_neighborhood(word: &str, d: usize, alphabet: &[char]) -> BTreeSet<String> {
         let mut frontier = BTreeSet::from([word.to_string()]);
         let mut all = frontier.clone();

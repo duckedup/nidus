@@ -198,12 +198,9 @@ impl Findex {
             .get(&(collection.to_string(), field.to_string()))
     }
 
-    /// Candidate **ids** for one leaf predicate, or `None` to scan everything.
-    ///
-    /// `limit` is the point past which narrowing stops paying, and it is checked against a
-    /// cheap bound on the posting lists *before* any list is materialised: a hot term
-    /// otherwise costs a full candidate build only to be thrown away, which measured 20-30%
-    /// *slower* than the unindexed scan.
+    /// Candidate ids for one leaf predicate, or `None` to scan everything. `limit` is
+    /// checked against a cheap posting-list bound *before* any list is built: a hot term
+    /// otherwise costs a full candidate build only to be discarded (measured 20-30% slower).
     pub(crate) fn candidate_ids(
         &self,
         collection: &str,
@@ -274,10 +271,9 @@ impl Findex {
                 let idx = self.index_for(collection, key).filter(|i| i.cfg_trigrams)?;
                 let threshold = trigram::fuzzy_threshold(needle, *max_edits)?;
                 let want = trigram::distinct_trigrams(needle);
-                // No cheap pre-bound here on purpose. `sum(len)/threshold` is sound but far
-                // too loose over a shared-prefix vocabulary, and applying it gave the whole
-                // 66x Fuzzy win back. The build is cheap next to the DP it saves, so this
-                // one predicate pays for the count and lets the post-check decide.
+                // No cheap pre-bound: `sum(len)/threshold` is sound but so loose over a
+                // shared-prefix vocabulary that it gave the whole 66x win back. The count
+                // is cheap next to the DP it saves, so the post-check decides instead.
                 Some((idx, idx.trigrams.at_least(&want, threshold)))
             }
             Predicate::Regex(key, pattern) => {

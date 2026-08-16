@@ -22,11 +22,14 @@ use axum::{
 use serde_json::{Value as JsonValue, json};
 use tokio::net::TcpListener;
 
-use crate::{FtsField, FtsQuery, HybridOpts, ListOpts, Nidus, Record, Scope, SearchOpts};
+use crate::{
+    FilterIndexField, FtsField, FtsQuery, HybridOpts, ListOpts, Nidus, Record, Scope, SearchOpts,
+};
 use dto::{
     AggregateRequest, AggregationDto, AnnDto, BatchFuse, BatchSearchRequest, BatchSearchResponse,
-    CompactRequest, DeleteRequest, FootprintDto, FtsSchemaRequest, HitDto, HybridSearchRequest,
-    ListRequest, MAX_BATCH_QUERIES, MAX_TOP_K, SearchRequest, TextSearchRequest, UpsertRequest,
+    CompactRequest, DeleteRequest, FilterIndexRequest, FootprintDto, FtsSchemaRequest, HitDto,
+    HybridSearchRequest, ListRequest, MAX_BATCH_QUERIES, MAX_TOP_K, SearchRequest,
+    TextSearchRequest, UpsertRequest,
 };
 
 // ── AI-ingest (memory) imports: only under the `memory` feature (pulled by the
@@ -426,6 +429,7 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/collections/{name}/delete", post(delete_records))
         .route("/collections/{name}/records", get(records))
         .route("/collections/{name}/fts-schema", post(set_fts_schema))
+        .route("/collections/{name}/filter-index", post(set_filter_index))
         .route("/search", post(search))
         .route("/search/batch", post(search_batch))
         .route("/text-search", post(text_search))
@@ -963,6 +967,22 @@ async fn set_fts_schema(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// `POST /collections/{name}/filter-index` — declare the fields indexed for the text
+/// predicates. Speed only: results are identical with or without it.
+async fn set_filter_index(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<FilterIndexRequest>,
+) -> Result<Json<JsonValue>, ApiError> {
+    run_write(st, move |db| {
+        let decl: Vec<FilterIndexField> =
+            req.fields.into_iter().map(FilterIndexField::from).collect();
+        db.set_filter_index(&name, &decl)
+    })
+    .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn text_search(
     State(st): State<AppState>,
     Json(req): Json<TextSearchRequest>,
@@ -1355,11 +1375,12 @@ fn classify(err: &anyhow::Error) -> StatusCode {
         StatusCode::SERVICE_UNAVAILABLE
     } else if msg.contains("does not match store dimension")
         || msg.contains("fts field")
+        || msg.contains("filter index")
         || msg.contains("full-text query")
         || msg.contains(crate::store::BAD_QUERY)
     {
-        // A rejected FTS schema, a clause-less text query, or a malformed ranking knob:
-        // bad request bodies, not server faults.
+        // A rejected FTS or filter-index declaration, a clause-less text query, or a
+        // malformed ranking knob: bad request bodies, not server faults.
         StatusCode::BAD_REQUEST
     } else if msg.contains("read-only store") {
         StatusCode::FORBIDDEN
@@ -2156,6 +2177,72 @@ mod tests {
         let app = ranked_router().await;
         let body = json!({"sum": ["bytes"], "group_by": ""});
         let resp = app.oneshot(post("/aggregate", body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Declaring the filter index must actually take effect, so this asserts a subsequent
+    /// query's results rather than the 200 — the route responding says nothing.
+    #[tokio::test]
+    async fn declaring_a_filter_index_takes_effect_and_changes_no_results() {
+        for fields in [
+            json!(["body"]),
+            json!([{"field": "body", "trigrams": false}]),
+        ] {
+            let app = test_router(3);
+            let resp = app
+                .clone()
+                .oneshot(post(
+                    "/collections/docs/filter-index",
+                    json!({ "fields": fields }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            app.clone()
+                .oneshot(post(
+                    "/collections/docs/upsert",
+                    json!({"records": [
+                        {"id": "a", "vector": [1, 0, 0], "attrs": {"body": {"Str": "quantum physics"}}},
+                        {"id": "b", "vector": [0, 1, 0], "attrs": {"body": {"Str": "classical optics"}}}
+                    ]}),
+                ))
+                .await
+                .unwrap();
+
+            let resp = app
+                .oneshot(post(
+                    "/list",
+                    json!({"scope": ["docs"], "filter": [
+                        {"ContainsAllTokens": ["body", "quantum"]}
+                    ]}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let hits = json_body(resp).await;
+            let ids: Vec<&str> = hits
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, ["a"], "fields = {fields}");
+        }
+    }
+
+    /// Both structures off would index nothing while reading as indexed — a caller mistake,
+    /// so a 400 rather than a silently inert declaration.
+    #[tokio::test]
+    async fn a_filter_index_field_indexing_nothing_is_a_bad_request() {
+        let app = test_router(3);
+        let resp = app
+            .oneshot(post(
+                "/collections/docs/filter-index",
+                json!({"fields": [{"field": "body", "tokens": false, "trigrams": false}]}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 

@@ -377,10 +377,8 @@ impl Store {
     }
 
     /// Fill `scan` from the filter index, or report `false` and leave it untouched.
-    ///
-    /// All-or-nothing across the scope on purpose: if one collection cannot be narrowed the
-    /// caller must walk everything, because a scan built from the others would be missing
-    /// that collection's matches entirely.
+    /// All-or-nothing: a scan built from only the narrowable collections would be missing
+    /// the others' matches entirely.
     fn narrowed_scan<'b>(
         &'b self,
         collections: &[&'b str],

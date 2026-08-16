@@ -41,6 +41,7 @@ from .types import (
     Batch,
     ClusterStatus,
     FtsClause,
+    FilterIndexField,
     FtsField,
     HighlightOpts,
     Hits,
@@ -175,6 +176,19 @@ class AsyncNidusClient:
         mapping tunes ``k1``, ``b``, or the analyzer for that field alone.
         """
         await self._request("POST", _wire.fts_schema_path(name), _wire.fts_schema_body(fields))
+
+    async def set_filter_index(
+        self, name: str, fields: Sequence[Union[str, FilterIndexField]]
+    ) -> None:
+        """Declare which attribute fields are indexed for the text predicates.
+
+        Covers ``Fuzzy``, ``ContainsAllTokens``, ``ContainsAnyToken``,
+        ``ContainsTokenSequence`` and ``Regex``. This changes how fast those predicates run,
+        never what they return. Pass an empty sequence to drop the declaration.
+        """
+        await self._request(
+            "POST", _wire.filter_index_path(name), _wire.filter_index_body(fields)
+        )
 
     # ── Search ───────────────────────────────────────────────────────────────────────
     #

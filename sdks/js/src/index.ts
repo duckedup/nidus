@@ -21,6 +21,7 @@ export type {
   DecodedRecord,
   DecodedValue,
   Filter,
+  FilterIndexField,
   Footprint,
   Fragment,
   FtsCombine,

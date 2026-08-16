@@ -292,7 +292,10 @@ src/
 │                 #   Quantization, AnnConfig, FtsQuery/FtsClause/… (pure defs + serde)
 ├── glob/         # minimal * ? [..] matcher (covers the GLOB subset callers use, SPEC §7.1)
 ├── filter/       # filter evaluation: mod.rs (dispatch + per-query validate/prepare),
-│                 #   text.rs (Levenshtein + the filter tokenizer, §7.4), pattern.rs (regex, §7.5)
+│                 #   text.rs (Levenshtein + the filter tokenizer, §7.4), pattern.rs (regex, §7.5),
+│                 #   narrow.rs (walk a whole filter through the filter index, §7.4.1)
+├── findex/       # the opt-in filter index (§7.4.1) — narrows the text predicates, never
+│                 #   answers them: tokens.rs, trigram.rs, literal.rs, schema.rs, persist.rs
 ├── search/       # distance kernels (cosine/dot/euclidean, f32 + int8 + binary Hamming)
 │                 #   + bounded top-k heap + min_score
 ├── data/         # the vector segments: mod.rs (DataSegment — header, append, row accessor),

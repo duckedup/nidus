@@ -961,3 +961,75 @@ fn sealed_segments_and_mmap_survive_a_restart_with_identical_ranking() {
         "footprint must match across the restart"
     );
 }
+
+/// The filter index over the real binary, across a restart. The assertion is a *result*,
+/// not a status code: a query whose answer would change if the declaration were lost on
+/// reopen or if the index narrowed away a real match.
+#[test]
+fn filter_index_declared_over_http_survives_a_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let server = Server::new(dir.path(), 3).start();
+        assert_eq!(
+            server
+                .post(
+                    "/collections/docs/filter-index",
+                    &json!({"fields": ["body"]}),
+                )
+                .0,
+            200
+        );
+        assert_eq!(
+            server
+                .post(
+                    "/collections/docs/upsert",
+                    &json!({"records": [
+                        {"id": "a", "vector": [1, 0, 0], "attrs": {"body": {"Str": "zebra quagga"}}},
+                        {"id": "b", "vector": [0, 1, 0], "attrs": {"body": {"Str": "okapi bongo"}}}
+                    ]}),
+                )
+                .0,
+            200
+        );
+        assert_eq!(server.post("/flush", &json!({})).0, 200);
+        assert!(server.shutdown(), "server should exit cleanly");
+    }
+
+    // A fresh process replays the log, so the declaration must come back with it. Results
+    // alone cannot prove that — the index is designed to change none — so assert the one
+    // externally visible signal that it is live.
+    let server = Server::new(dir.path(), 3).start();
+    let (status, stats) = server.get("/stats");
+    assert_eq!(status, 200);
+    assert!(
+        stats["footprint"]["filter_index_bytes"]
+            .as_u64()
+            .expect("field present")
+            > 0,
+        "the declaration must survive the restart: {stats}"
+    );
+    for (query, want) in [("zebra", "a"), ("okapi", "b")] {
+        let (status, hits) = server.post(
+            "/list",
+            &json!({"scope": ["docs"], "filter": [{"ContainsAllTokens": ["body", query]}]}),
+        );
+        assert_eq!(status, 200);
+        let ids: Vec<&str> = hits
+            .as_array()
+            .expect("list returns an array")
+            .iter()
+            .map(|h| h["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, [want], "query {query} after restart");
+    }
+
+    // Fuzzy is the predicate the index exists for; it must still be exact.
+    let (status, hits) = server.post(
+        "/list",
+        &json!({"scope": ["docs"], "filter": [{"Fuzzy": ["body", "zebra quaggb", 1]}]}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(hits.as_array().map(Vec::len), Some(1));
+    assert_eq!(hits[0]["id"], "a");
+}

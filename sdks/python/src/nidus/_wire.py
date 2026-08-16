@@ -59,6 +59,7 @@ from .types import (
     Footprint,
     Fragment,
     FtsClause,
+    FilterIndexField,
     FtsField,
     Group,
     Highlight,
@@ -123,6 +124,10 @@ def records_path(name: str) -> str:
 
 def fts_schema_path(name: str) -> str:
     return f"{collection_path(name)}/fts-schema"
+
+
+def filter_index_path(name: str) -> str:
+    return f"{collection_path(name)}/filter-index"
 
 
 def remember_path(name: str) -> str:
@@ -235,6 +240,42 @@ def _fts_field(spec: Union[str, FtsField]) -> Union[str, dict[str, Any]]:
         )
     body: dict[str, Any] = {"field": str(knobs["field"])}
     body.update({k: knobs[k] for k in _FTS_FIELD_KNOBS if k in knobs})
+    return body
+
+
+#: The knobs a :class:`~nidus.FilterIndexField` may carry.
+_FILTER_INDEX_KNOBS = ("tokens", "trigrams")
+
+
+def filter_index_body(fields: Sequence[Union[str, FilterIndexField]]) -> dict[str, Any]:
+    """Body for the filter-index declaration. A bare name and a knob-less mapping match.
+
+    An unknown key raises rather than being dropped: both knobs default to *on* server
+    side, so a misspelled ``trigram`` would leave the structure enabled and report success.
+    """
+    _guards.reject_bare_string(fields, "set_filter_index(name, fields)")
+    return {"fields": [_filter_index_field(f) for f in fields]}
+
+
+def _filter_index_field(
+    spec: Union[str, FilterIndexField],
+) -> Union[str, dict[str, Any]]:
+    if isinstance(spec, str):
+        return spec
+    if not isinstance(spec, Mapping) or "field" not in spec:
+        raise TypeError(
+            "set_filter_index(name, fields) expects each field to be a name or a mapping "
+            f"with a 'field' key, got {spec!r}"
+        )
+    knobs: Mapping[str, Any] = spec
+    unknown = set(knobs) - {"field", *_FILTER_INDEX_KNOBS}
+    if unknown:
+        raise TypeError(
+            f"set_filter_index(name, fields): unknown key(s) {sorted(unknown)} — "
+            f"expected any of {sorted(_FILTER_INDEX_KNOBS)}"
+        )
+    body: dict[str, Any] = {"field": str(knobs["field"])}
+    body.update({k: knobs[k] for k in _FILTER_INDEX_KNOBS if k in knobs})
     return body
 
 
@@ -648,6 +689,7 @@ def decode_footprint(payload: Any) -> Footprint:
         dimension=int(payload["dimension"]),
         vector_bytes=int(payload["vector_bytes"]),
         doc_count=int(payload["doc_count"]),
+        filter_index_bytes=int(payload.get("filter_index_bytes", 0)),
     )
 
 

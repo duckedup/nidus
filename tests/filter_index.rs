@@ -455,9 +455,8 @@ fn a_field_indexing_nothing_is_rejected() {
 }
 
 // ── File-backed: persistence, corruption, staleness ───────────────────────────────
-//
-// Every case below opens a real store, so each carries a Miri ignore for the fsync
-// syscalls Miri does not implement. The in-memory cases above stay Miri-clean.
+// Each case opens a real store, so each carries a Miri ignore for the fsync syscalls
+// Miri lacks. The in-memory cases above stay Miri-clean.
 
 use nidus::Config;
 

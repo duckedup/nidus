@@ -41,6 +41,7 @@ searchers plus one writer (see
 | `set_meta` | `fn set_meta(&mut self, collection: &str, meta: BTreeMap<String, String>) -> Result<()>` | |
 | `create_collection_with_fts` | `fn create_collection_with_fts(&mut self, name: &str, fields: &[FtsField]) -> Result<()>` | Create + declare [full-text fields](/guides/search/#full-text-search-bm25) up front (incremental from the first upsert). |
 | `set_fts_schema` | `fn set_fts_schema(&mut self, collection: &str, fields: &[FtsField]) -> Result<()>` | Declare/redeclare full-text fields any time; indexes existing docs once. Each [`FtsField`](/guides/search/#tuning-a-field) carries its own `k1`, `b`, and `Analyzer`. |
+| `set_filter_index` | `fn set_filter_index(&mut self, collection: &str, fields: &[FilterIndexField]) -> Result<()>` | Declare/redeclare [filter-indexed fields](/guides/search/#indexing-the-text-predicates) any time; indexes existing docs once. Speeds up the text predicates, changes no results. Empty list drops it. |
 
 ### Records
 

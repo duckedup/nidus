@@ -364,6 +364,40 @@ func (c *Client) SetFtsFields(ctx context.Context, name string, fields []FtsFiel
 	return c.request(ctx, http.MethodPost, collPath(name, "/fts-schema"), body, nil)
 }
 
+// SetFilterIndex declares which attribute fields are indexed for the text predicates
+// (Fuzzy, ContainsAllTokens, ContainsAnyToken, ContainsTokenSequence, Regex). Fields
+// already written are indexed as part of applying the declaration.
+//
+// This changes how fast those predicates run, never what they return: the index proposes
+// candidate documents and the predicate itself still decides. The cost is paid at write
+// time and in memory. Passing no fields drops the declaration.
+//
+// Every field gets both index structures. Use [Client.SetFilterIndexFields] to build only
+// one of them for a field.
+func (c *Client) SetFilterIndex(ctx context.Context, name string, fields []string) error {
+	if fields == nil {
+		fields = []string{}
+	}
+	body := struct {
+		Fields []string `json:"fields"`
+	}{fields}
+	return c.request(ctx, http.MethodPost, collPath(name, "/filter-index"), body, nil)
+}
+
+// SetFilterIndexFields is [Client.SetFilterIndex] with per-field control over which
+// structures are built. It hits the same endpoint: the server accepts a bare field name or
+// a field object, and a [FilterIndexField] whose knobs are all unset encodes to the same
+// defaults.
+func (c *Client) SetFilterIndexFields(ctx context.Context, name string, fields []FilterIndexField) error {
+	if fields == nil {
+		fields = []FilterIndexField{}
+	}
+	body := struct {
+		Fields []FilterIndexField `json:"fields"`
+	}{fields}
+	return c.request(ctx, http.MethodPost, collPath(name, "/filter-index"), body, nil)
+}
+
 // ── Search ──────────────────────────────────────────────────────────────────
 
 // Search runs a vector nearest-neighbour query, best-first.

@@ -287,6 +287,12 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 		{"SetFtsSchema", `{"ok":true}`, http.MethodPost, "/collections/docs/fts-schema", func(c *Client) error {
 			return c.SetFtsSchema(ctx, "docs", []string{"body"})
 		}},
+		{"SetFilterIndex", `{"ok":true}`, http.MethodPost, "/collections/docs/filter-index", func(c *Client) error {
+			return c.SetFilterIndex(ctx, "docs", []string{"body"})
+		}},
+		{"SetFilterIndexFields", `{"ok":true}`, http.MethodPost, "/collections/docs/filter-index", func(c *Client) error {
+			return c.SetFilterIndexFields(ctx, "docs", []FilterIndexField{{Field: "body"}})
+		}},
 		{"SetFtsFields", `{"ok":true}`, http.MethodPost, "/collections/docs/fts-schema", func(c *Client) error {
 			return c.SetFtsFields(ctx, "docs", []FtsField{{Field: "body"}})
 		}},
@@ -2257,5 +2263,41 @@ func TestRememberResultReportsTheRecordActuallyWritten(t *testing.T) {
 	}
 	if out.ID != "a" || out.Deduped {
 		t.Errorf("result = %+v, want the requested id and Deduped false", out)
+	}
+}
+
+// TestSetFilterIndexFieldsOmitsUnsetKnobs — the server defaults both structures to true,
+// so an unset knob must be absent from the body rather than sent as false, which would
+// silently turn a structure off.
+func TestSetFilterIndexFieldsOmitsUnsetKnobs(t *testing.T) {
+	fake := &capture{reply: `{"ok":true}`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if err := db.SetFilterIndexFields(ctx, "docs", []FilterIndexField{{Field: "body"}}); err != nil {
+		t.Fatalf("SetFilterIndexFields failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"fields":[{"field":"body"}]}` {
+		t.Errorf("body = %s, want only the field name", body)
+	}
+
+	off := false
+	err := db.SetFilterIndexFields(ctx, "docs", []FilterIndexField{
+		{Field: "body", Trigrams: &off},
+	})
+	if err != nil {
+		t.Fatalf("SetFilterIndexFields failed: %v", err)
+	}
+	want := `{"fields":[{"field":"body","trigrams":false}]}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+
+	// A nil slice is the lawful empty declaration, which drops the index.
+	if err := db.SetFilterIndex(ctx, "docs", nil); err != nil {
+		t.Fatalf("SetFilterIndex failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"fields":[]}` {
+		t.Errorf("body = %s, want an empty field list", body)
 	}
 }
