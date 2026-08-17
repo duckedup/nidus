@@ -762,12 +762,57 @@ the union across elements. Every other `Value` variant offers nothing, so — li
 identities: `ContainsAllTokens` with no tokens is `true` for any present text attribute
 (as `All([])` is), `ContainsAnyToken` with none is `false` (as `Any([])` is).
 
-**Cost, stated plainly: there is no index behind any of this.** Every predicate here
-re-tokenizes or re-scans the attribute for **each record the scan visits** — O(attribute
+**Cost, stated plainly: by default there is no index behind any of this.** Every predicate
+here re-tokenizes or re-scans the attribute for **each record the scan visits** — O(attribute
 length) per row for the token predicates, and O(needle × attribute) for the `Fuzzy` DP
 (skipped outright when the two lengths differ by more than the budget). That is fine at the
 scale nidus targets and it is *not* fine as a substitute for full-text search over a large
-corpus; reach for `text_search` when the field is a document. Indexing them is future work.
+corpus; reach for `text_search` when the field is a document.
+
+Measured, at 10k documents of 32 tokens over 384-d vectors, the predicate costs 30-294× the
+entire vector scan it filters — `Fuzzy` being the far end. That is why the index below
+exists, and the numbers are the reason it was built rather than deferred a third time.
+
+#### 7.4.1 The opt-in filter index
+
+`set_filter_index(collection, fields)` declares which attribute fields are indexed for the
+five predicates of §7.4/§7.5. **Off by default**, per collection and per field, recorded in
+the op log as `SetFilterIndex` so the declaration survives reopen, and cached on disk under
+`findex` through the §14 `index_cache` codec (a missing, stale or corrupt cache rebuilds and
+is never fatal).
+
+**The index narrows; it never answers.** A query asks it for candidate documents, and it
+returns a *superset* of the true matches; the ordinary evaluator then runs unchanged over
+the survivors and decides. So results are identical whether or not a field is indexed — the
+declaration buys speed and costs write time and RAM, and nothing else. An over-approximation
+is a performance bug; an under-approximation would be a wrong answer, so every construct that
+cannot narrow soundly declines and the full scan runs.
+
+Two structures, both derived and rebuildable:
+
+- **Raw-token postings** serve `ContainsAllTokens`, `ContainsAnyToken` and
+  `ContainsTokenSequence`. Built with the *filter* tokenizer, unstemmed. The FTS index
+  (§9) cannot be reused for this: its postings are keyed by the **stemmed** term, and they
+  carry no positions, so a phrase predicate could not be served even if the analyzers agreed.
+  Ordering is not indexed either — a phrase narrows on "all its tokens present" and the
+  evaluator checks adjacency.
+- **Character trigrams** serve `Fuzzy` and `Regex`. `Fuzzy` uses the standard edit bound: a
+  string within `d` edits of the needle shares at least `|trigrams(needle)| − 3d` of them,
+  because one edit destroys at most three windows. When that bound is vacuous (`≤ 0`, the
+  case for a short needle or a wide budget) there is no narrowing and the scan runs. `Regex`
+  extracts the literals **every** match must contain and requires their trigrams; a pattern
+  with no such literal (`.*`, `a|b`) declines.
+
+Declining is common and deliberate. A hot term whose posting list already covers much of the
+collection is rejected from the list lengths alone, before any candidate set is built, because
+narrowing that does not narrow is slower than not trying. Negation never narrows at all: the
+complement of a superset is a *subset*, which would drop real matches. Nor does a disjunction
+with even one un-indexable branch.
+
+Measured against the same corpus: `Fuzzy` 91.6 ms → 1.37 ms (67×), `ContainsAllTokens` with
+four terms 4.78 ms → 0.24 ms (20×), `ContainsTokenSequence` 6.56 ms → 1.00 ms (6.6×). Cases
+where the index declines land within noise of the unindexed scan, and ingest roughly doubles
+(53 ms → 114 ms for 10k documents). `Footprint::filter_index_bytes` reports the RAM.
 
 ### 7.5 Regular expressions
 
@@ -1283,7 +1328,11 @@ src/
 ├── glob/         minimal * ? [..] matcher (§7.1)
 ├── filter/       Filter/Predicate evaluation against a record's attrs: mod.rs
 │                 (dispatch + per-query validate/prepare), text.rs (Levenshtein +
-│                 the filter tokenizer, §7.4), pattern.rs (regex + compile cache, §7.5)
+│                 the filter tokenizer, §7.4), pattern.rs (regex + compile cache, §7.5),
+│                 narrow.rs (walking a whole filter through the index, §7.4.1)
+├── findex/       the opt-in filter index (§7.4.1): tokens.rs (raw-token postings),
+│                 trigram.rs (char trigrams + the Fuzzy edit bound), literal.rs
+│                 (required-literal extraction for Regex), schema.rs, persist.rs
 ├── search/       distance kernels (cosine/dot/euclidean; f32/int8/binary Hamming) +
 │                 bounded top-k heap + min_score; SearchOpts, Hit
 ├── data/         segment store: mod.rs (DataSegment — header, append, row accessor),

@@ -282,6 +282,33 @@ describe("NidusClient request shaping", () => {
     });
   });
 
+  it("sends a bare filter-index field name unchanged", async () => {
+    const { fn, calls } = mockFetch({ ok: true });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.setFilterIndex("docs", ["body"]);
+    expect(calls[0]!.url).toBe("http://x/collections/docs/filter-index");
+    expect(calls[0]!.json).toEqual({ fields: ["body"] });
+  });
+
+  it("omits unset filter-index knobs, since the server defaults them to true", async () => {
+    const { fn, calls } = mockFetch({ ok: true });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.setFilterIndex("docs", [
+      "title",
+      { field: "body", trigrams: false },
+    ]);
+    expect(calls[0]!.json).toEqual({
+      fields: ["title", { field: "body", trigrams: false }],
+    });
+  });
+
+  it("sends an empty filter-index declaration to drop the index", async () => {
+    const { fn, calls } = mockFetch({ ok: true });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.setFilterIndex("docs", []);
+    expect(calls[0]!.json).toEqual({ fields: [] });
+  });
+
   it("omits the ranking knobs unless asked, and maps them to snake_case", async () => {
     const { fn, calls } = mockFetch([]);
     const db = new NidusClient({ baseUrl: "http://x", fetch: fn });

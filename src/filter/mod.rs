@@ -1,7 +1,13 @@
 //! Filter evaluation against a record's attributes. Contract: see the root `SPEC.md` §7, §7.1.
 
+mod narrow;
 mod pattern;
 mod text;
+
+pub(crate) use narrow::candidate_ids;
+#[cfg(test)]
+pub(crate) use text::levenshtein_ascii_ci;
+pub(crate) use text::tokens;
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;

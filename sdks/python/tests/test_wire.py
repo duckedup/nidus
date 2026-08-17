@@ -104,6 +104,7 @@ def test_prune_drops_only_none_valued_keys() -> None:
         (_wire.delete_path, "/collections/docs/delete"),
         (_wire.records_path, "/collections/docs/records"),
         (_wire.fts_schema_path, "/collections/docs/fts-schema"),
+        (_wire.filter_index_path, "/collections/docs/filter-index"),
         (_wire.remember_path, "/collections/docs/remember"),
         (_wire.recall_path, "/collections/docs/recall"),
     ],
@@ -595,6 +596,33 @@ def test_fts_schema_body_refuses_a_misspelled_knob() -> None:
         _wire.fts_schema_body([{"field": "body", "asciiFolding": True}])  # type: ignore[list-item]
     with pytest.raises(TypeError, match="'field' key"):
         _wire.fts_schema_body([{"k1": 1.5}])  # type: ignore[list-item]
+
+
+def test_filter_index_body() -> None:
+    assert _wire.filter_index_body(["body", "title"]) == {"fields": ["body", "title"]}
+    assert _wire.filter_index_body([]) == {"fields": []}
+
+
+def test_filter_index_body_carries_per_field_structures() -> None:
+    """A mapping travels as an object; the two forms mix in one call."""
+    assert _wire.filter_index_body(["title", {"field": "body", "trigrams": False}]) == {
+        "fields": ["title", {"field": "body", "trigrams": False}]
+    }
+    # An unset knob is omitted, so a knob-less mapping is the bare name in object form.
+    assert _wire.filter_index_body([{"field": "body"}]) == {"fields": [{"field": "body"}]}
+    # Explicit False must survive: both structures default to on server side, so sending
+    # nothing and sending False mean opposite things.
+    assert _wire.filter_index_body([{"field": "body", "tokens": False}]) == {
+        "fields": [{"field": "body", "tokens": False}]
+    }
+
+
+def test_filter_index_body_refuses_a_misspelled_knob() -> None:
+    """Both knobs default to on, so a typo would leave the structure enabled and say ok."""
+    with pytest.raises(TypeError, match="trigram"):
+        _wire.filter_index_body([{"field": "body", "trigram": False}])  # type: ignore[list-item]
+    with pytest.raises(TypeError, match="'field' key"):
+        _wire.filter_index_body([{"tokens": True}])  # type: ignore[list-item]
 
 
 def test_meta_body_is_the_bare_map() -> None:

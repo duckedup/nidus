@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Aggregation, AnnConfig, AnnKind, Annotations, Filter, Footprint, FtsClause, FtsCombine,
-    FtsField, HighlightOpts, Hit, Language, LimitPer, ListOpts, OrderBy, Projection, RankBy,
-    Record, Value,
+    Aggregation, AnnConfig, AnnKind, Annotations, Filter, FilterIndexField, Footprint, FtsClause,
+    FtsCombine, FtsField, HighlightOpts, Hit, Language, LimitPer, ListOpts, OrderBy, Projection,
+    RankBy, Record, Value,
 };
 
 /// Body of `POST /collections/{name}/upsert`.
@@ -313,6 +313,56 @@ pub struct FtsSchemaRequest {
     pub fields: Vec<FtsFieldDto>,
 }
 
+/// One entry of [`FilterIndexRequest::fields`]: a bare field name, or an object naming the
+/// field plus which structures to build. `untagged` for the same reason as [`FtsFieldDto`]:
+/// `{"fields": ["text"]}` is the common form and must stay valid.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum FilterIndexFieldDto {
+    /// `"text"` — both structures.
+    Name(String),
+    /// `{"field": "text", "trigrams": false}` — either knob, independently.
+    Spec {
+        field: String,
+        #[serde(default)]
+        tokens: Option<bool>,
+        #[serde(default)]
+        trigrams: Option<bool>,
+    },
+}
+
+impl From<FilterIndexFieldDto> for FilterIndexField {
+    fn from(dto: FilterIndexFieldDto) -> Self {
+        match dto {
+            FilterIndexFieldDto::Name(field) => FilterIndexField::new(field),
+            FilterIndexFieldDto::Spec {
+                field,
+                tokens,
+                trigrams,
+            } => {
+                let f = FilterIndexField::new(field);
+                // Absent means "leave this one alone", matching `FtsFieldDto`.
+                let f = match tokens {
+                    Some(on) => f.tokens(on),
+                    None => f,
+                };
+                match trigrams {
+                    Some(on) => f.trigrams(on),
+                    None => f,
+                }
+            }
+        }
+    }
+}
+
+/// Body of `POST /collections/{name}/filter-index`: the attribute fields to index for the
+/// text predicates, each a name or a `{field, tokens, trigrams}` object. An empty `fields`
+/// drops the declaration.
+#[derive(Debug, Deserialize)]
+pub struct FilterIndexRequest {
+    pub fields: Vec<FilterIndexFieldDto>,
+}
+
 /// Body of `POST /list`. Metadata-only query (no vector). An empty `scope`
 /// lists from every collection. `offset` skips matches for pagination.
 #[derive(Debug, Deserialize)]
@@ -460,6 +510,10 @@ pub struct FootprintDto {
     pub dimension: usize,
     pub vector_bytes: u64,
     pub doc_count: usize,
+    /// Memory held by the opt-in filter index; `0` when no collection declares one. The
+    /// only externally observable evidence that a declaration is live, since the index
+    /// deliberately changes no query's results.
+    pub filter_index_bytes: u64,
 }
 
 impl From<Footprint> for FootprintDto {
@@ -470,6 +524,7 @@ impl From<Footprint> for FootprintDto {
             dimension: f.dimension,
             vector_bytes: f.vector_bytes,
             doc_count: f.doc_count,
+            filter_index_bytes: f.filter_index_bytes,
         }
     }
 }

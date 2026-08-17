@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::MemoryTier;
 use crate::config::Config;
+use crate::findex::{FilterIndexField, Findex};
 use crate::fts::{Fts, FtsField};
 
 use super::{Collection, Store};
@@ -20,6 +21,9 @@ const WORKING_SET_OBJECT: &str = "workingset";
 /// One FTS collection's declared schema in the snapshot.
 type SchemaEntry<'a> = (&'a str, &'a [FtsField]);
 
+/// One filter-index collection's declared schema in the snapshot.
+type FindexEntry<'a> = (&'a str, &'a [FilterIndexField]);
+
 /// The borrowing view serialized on publish — no clone of the index.
 #[derive(Serialize)]
 struct WorkingSetRef<'a> {
@@ -27,6 +31,9 @@ struct WorkingSetRef<'a> {
     dead_rows: u64,
     collections: &'a HashMap<String, Collection>,
     fts_schemas: Vec<SchemaEntry<'a>>,
+    /// Appended last: bincode is positional, so a new field must go at the end or every
+    /// existing snapshot decodes as garbage.
+    findex_schemas: Vec<FindexEntry<'a>>,
 }
 
 /// The owned form decoded on adopt. Its field order/types must mirror [`WorkingSetRef`]
@@ -37,6 +44,8 @@ struct WorkingSet {
     dead_rows: u64,
     collections: HashMap<String, Collection>,
     fts_schemas: Vec<(String, Vec<FtsField>)>,
+    #[serde(default)]
+    findex_schemas: Vec<(String, Vec<FilterIndexField>)>,
 }
 
 /// A working set adopted from the tier, ready to become the store's in-RAM index.
@@ -46,13 +55,17 @@ impl AdoptedIndex {
     /// Decompose into the pieces [`Store::open`] assembles: collections, dead-row count,
     /// and the FTS index with its schemas restored (postings are rebuilt afterwards by
     /// `load_or_build_fts`, exactly as on the replay path).
-    pub(super) fn into_parts(self) -> (HashMap<String, Collection>, usize, Fts) {
+    pub(super) fn into_parts(self) -> (HashMap<String, Collection>, usize, Fts, Findex) {
         let ws = self.0;
         let mut fts = Fts::default();
         for (collection, fields) in &ws.fts_schemas {
             fts.set_schema(collection, fields);
         }
-        (ws.collections, ws.dead_rows as usize, fts)
+        let mut findex = Findex::default();
+        for (collection, fields) in &ws.findex_schemas {
+            findex.set_schema(collection, fields);
+        }
+        (ws.collections, ws.dead_rows as usize, fts, findex)
     }
 }
 
@@ -111,11 +124,21 @@ impl Store {
                     .map(|fields| (name.as_str(), fields))
             })
             .collect();
+        let findex_schemas: Vec<FindexEntry<'_>> = self
+            .collections
+            .keys()
+            .filter_map(|name| {
+                self.findex
+                    .schema_for(name)
+                    .map(|fields| (name.as_str(), fields))
+            })
+            .collect();
         let snapshot = WorkingSetRef {
             data_rows: self.data.row_count(),
             dead_rows: self.dead_rows as u64,
             collections: &self.collections,
             fts_schemas,
+            findex_schemas,
         };
         let key = working_set_key(&self.config);
         let watermark = self.log.offset()?;
@@ -163,6 +186,7 @@ mod tests {
             dead_rows: 0,
             collections: &cols,
             fts_schemas: Vec::new(),
+            findex_schemas: Vec::new(),
         };
         let buf = crate::index_cache::frame(key, watermark, &snapshot).unwrap();
         tier.store(WORKING_SET_OBJECT, &buf, None).unwrap();
@@ -176,7 +200,7 @@ mod tests {
 
         // Exact match on key + watermark + data_rows → adopted.
         let adopted = try_adopt(Some(&tier), key, 1, 100).unwrap();
-        let (cols, dead, _fts) = adopted.expect("matching snapshot adopts").into_parts();
+        let (cols, dead, _fts, _findex) = adopted.expect("matching snapshot adopts").into_parts();
         assert_eq!(dead, 0);
         assert!(cols["col"].docs.contains_key("doc1"));
 

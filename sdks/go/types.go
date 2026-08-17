@@ -333,6 +333,21 @@ type FtsField struct {
 	MaxTokenLen  *int     `json:"max_token_len,omitempty"`
 }
 
+// A FilterIndexField is one entry of a [Client.SetFilterIndexFields] declaration: the
+// attribute to index for the text predicates (Fuzzy, ContainsAllTokens, ContainsAnyToken,
+// ContainsTokenSequence, Regex), plus which structures to build for it.
+//
+// Both knobs are pointers for the omit-vs-zero reason described at the top of this file:
+// the server defaults both to true, so &false is a meaningful override and nil means
+// "leave it alone". Tokens drives the token predicates, Trigrams drives Fuzzy and Regex.
+//
+// Declaring an index changes how fast those predicates run, never what they return.
+type FilterIndexField struct {
+	Field    string `json:"field"`
+	Tokens   *bool  `json:"tokens,omitempty"`
+	Trigrams *bool  `json:"trigrams,omitempty"`
+}
+
 // An FtsClause is one clause of a multi-field text query: an indexed field and the raw
 // query text for it, so title:"rust" plus body:"async runtime" is a single query.
 type FtsClause struct {

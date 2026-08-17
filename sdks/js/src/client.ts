@@ -14,6 +14,7 @@ import type {
   ClusterStatus,
   DecodedRecord,
   Filter,
+  FilterIndexField,
   FtsField,
   HighlightOptions,
   Hit,
@@ -205,6 +206,24 @@ export class NidusClient {
   ): Promise<void> {
     await this.request("POST", `/collections/${enc(name)}/fts-schema`, {
       fields: fields.map(encodeFtsField),
+    });
+  }
+
+  /**
+   * Declare which attribute fields are indexed for the text predicates (`Fuzzy`,
+   * `ContainsAllTokens`, `ContainsAnyToken`, `ContainsTokenSequence`, `Regex`). Fields
+   * already written are indexed as part of applying the declaration.
+   *
+   * This changes how fast those predicates run, never what they return: the index
+   * proposes candidate documents and the predicate itself still decides. The cost is
+   * paid at write time and in memory. Pass an empty array to drop the declaration.
+   */
+  async setFilterIndex(
+    name: string,
+    fields: (string | FilterIndexField)[],
+  ): Promise<void> {
+    await this.request("POST", `/collections/${enc(name)}/filter-index`, {
+      fields: fields.map(encodeFilterIndexField),
     });
   }
 
@@ -588,6 +607,20 @@ function encodeFtsField(f: string | FtsField): unknown {
     language: f.language,
     ascii_folding: f.asciiFolding,
     max_token_len: f.maxTokenLen,
+  });
+}
+
+/**
+ * Encode one `setFilterIndex` field, on the same bare-name-or-object rule as
+ * {@link encodeFtsField}. Pruning matters here: the server defaults both structures to
+ * `true`, so sending an explicit `undefined` would be indistinguishable from `false`.
+ */
+function encodeFilterIndexField(f: string | FilterIndexField): unknown {
+  if (typeof f === "string") return f;
+  return prune({
+    field: f.field,
+    tokens: f.tokens,
+    trigrams: f.trigrams,
   });
 }
 

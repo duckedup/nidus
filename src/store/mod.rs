@@ -15,6 +15,7 @@ use crate::backend::{
 };
 use crate::config::{Config, LeaseWait, OpenMode};
 use crate::data::Segments;
+use crate::findex::Findex;
 use crate::fts::{Fts, FtsField};
 use crate::log::OpLog;
 use crate::manifest::{MANIFEST_KEY, Manifest};
@@ -203,6 +204,11 @@ pub struct Store {
     /// The in-RAM FTS index has changes not yet written to the `fts` cache (mirrors
     /// `ann_dirty`). Meaningless when FTS is inactive.
     fts_dirty: bool,
+    /// Opt-in filter index for the text predicates (SPEC §7.4/§7.5), keyed per declared
+    /// `(collection, field)`. Inert until a collection declares one.
+    findex: Findex,
+    /// The in-RAM filter index has changes not yet written to the `findex` cache.
+    findex_dirty: bool,
     /// True for in-memory stores (no backing directory) — they never persist the ANN
     /// cache. `open`ed (file-backed) stores set this false.
     in_memory: bool,
@@ -405,7 +411,7 @@ impl Store {
         let key = memtier::working_set_key(&config);
         let adopted = memtier::try_adopt(memory.as_deref(), &key, row_count, watermark)?;
         let from_tier = adopted.is_some();
-        let (collections, dead_rows, fts) = match adopted {
+        let (collections, dead_rows, fts, findex) = match adopted {
             Some(index) => index.into_parts(),
             None => Self::replay_ops(ops, row_count),
         };
@@ -437,6 +443,8 @@ impl Store {
             ann_dirty: false,
             fts,
             fts_dirty: false,
+            findex,
+            findex_dirty: false,
             in_memory: false,
             row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
@@ -480,6 +488,7 @@ impl Store {
         //    rebuild it from the replayed docs (the schema was restored during replay).
         //    A no-op when no collection declares FTS.
         store.load_or_build_fts()?;
+        store.load_or_build_findex()?;
 
         // 10. Auto-compact for FTS tombstone pressure too: text-only docs occupy no data rows, so
         //     step 6 cannot see their churn and dead postings would grow without bound. Checked
@@ -544,6 +553,8 @@ impl Store {
             ann_dirty: false,
             fts: Fts::default(),
             fts_dirty: false,
+            findex: Findex::default(),
+            findex_dirty: false,
             in_memory: true,
             row_to_doc: Vec::new(),
             scan_order: std::sync::RwLock::new(None),
@@ -649,7 +660,7 @@ impl Store {
         let (log, ops) = OpLog::open_with(appender_for(&persistence, "log", false)?)?;
         let watermark = log.offset()?;
         let key = memtier::working_set_key(&self.config);
-        let (collections, dead_rows, fts) =
+        let (collections, dead_rows, fts, findex) =
             match memtier::try_adopt(self.memory.as_deref(), &key, row_count, watermark)? {
                 Some(index) => index.into_parts(),
                 None => Self::replay_ops(ops, row_count),
@@ -667,6 +678,7 @@ impl Store {
         self.collections = collections;
         self.dead_rows = dead_rows;
         self.fts = fts;
+        self.findex = findex;
         self.loaded_log_offset = watermark;
         self.row_to_doc = Vec::new();
         self.invalidate_scan_order();
@@ -708,6 +720,7 @@ impl Store {
         self.load_or_build_ann()?;
         self.build_segment_indexes();
         self.load_or_build_fts()?;
+        self.load_or_build_findex()?;
 
         self.last_verified
             .store(mono_millis(), std::sync::atomic::Ordering::Release);
@@ -843,10 +856,14 @@ impl Store {
     /// Replay the decoded log `ops` into the in-RAM index — the source of truth when no shared
     /// snapshot is adopted. Returns collections, dead-row count, and the FTS index with schemas
     /// restored. `Upsert`s past the data file are ignored (the lock-free reader rule, §6.2).
-    fn replay_ops(ops: Vec<Op>, row_count: u64) -> (HashMap<String, Collection>, usize, Fts) {
+    fn replay_ops(
+        ops: Vec<Op>,
+        row_count: u64,
+    ) -> (HashMap<String, Collection>, usize, Fts, Findex) {
         let mut collections: HashMap<String, Collection> = HashMap::new();
         let mut dead_rows: usize = 0;
         let mut fts = Fts::default();
+        let mut findex = Findex::default();
 
         for op in ops {
             match op {
@@ -934,9 +951,17 @@ impl Store {
                         .or_insert_with(Collection::new);
                     fts.set_schema(&collection, &fields);
                 }
+                Op::SetFilterIndex { collection, fields } => {
+                    // As above: the collection exists implicitly and the postings are
+                    // (re)built from the live docs once replay finishes.
+                    collections
+                        .entry(collection.clone())
+                        .or_insert_with(Collection::new);
+                    findex.set_schema(&collection, &fields);
+                }
             }
         }
-        (collections, dead_rows, fts)
+        (collections, dead_rows, fts, findex)
     }
 
     // ── ANN index lifecycle ─────────────────────────────────────────────────────
@@ -1039,6 +1064,7 @@ impl Store {
         self.persist_ann()?;
         self.persist_fts()?;
         self.persist_seg_indexes()?;
+        self.persist_findex()?;
         Ok(())
     }
 
@@ -1336,5 +1362,75 @@ impl Store {
         }
         // The rebuilt index isn't on disk yet.
         self.fts_dirty = true;
+    }
+
+    // ── Filter index lifecycle ────────────────────────────────────────────────────
+
+    /// Persist the filter index to the `findex` cache if dirty. Keyed on the declared
+    /// schema, watermarked by the log offset, so open adopts it only when nothing has been
+    /// written since. Mirrors [`persist_fts`](Self::persist_fts).
+    fn persist_findex(&mut self) -> Result<()> {
+        if !self.findex.is_active() || !self.findex_dirty {
+            return Ok(());
+        }
+        let watermark = self.log.offset()?;
+        let Some(p) = self.persistence.as_deref() else {
+            return Ok(());
+        };
+        crate::findex::save(p, &self.findex, watermark)?;
+        self.findex_dirty = false;
+        Ok(())
+    }
+
+    /// On `open`: adopt the `findex` cache when valid for the current schema *and* its
+    /// watermark matches the log offset. Otherwise rebuild from the replayed docs. A stale
+    /// or corrupt cache rebuilds and is never fatal.
+    fn load_or_build_findex(&mut self) -> Result<()> {
+        if !self.findex.is_active() {
+            return Ok(());
+        }
+        let key = self.findex.cache_key();
+        let current = self.log.offset()?;
+        let loaded = {
+            let Some(p) = self.persistence.as_deref() else {
+                self.rebuild_findex();
+                return Ok(());
+            };
+            crate::findex::load(p, &key)?
+        };
+        if let Some((cached, watermark)) = loaded
+            && watermark == current
+        {
+            self.findex = cached;
+            self.findex_dirty = false;
+            return Ok(());
+        }
+        self.rebuild_findex();
+        Ok(())
+    }
+
+    /// Rebuild the filter index from all live docs — on `open` after replay, and after
+    /// `compact` renumbers. Deterministic order (sorted collection, then id) so docnums are
+    /// reproducible. No-op when the index is inactive.
+    fn rebuild_findex(&mut self) {
+        if !self.findex.is_active() {
+            return;
+        }
+        self.findex.clear_indexes();
+        let mut col_names: Vec<String> = self.collections.keys().cloned().collect();
+        col_names.sort();
+        for col_name in &col_names {
+            if self.findex.schema_for(col_name).is_none() {
+                continue;
+            }
+            let col = &self.collections[col_name];
+            let mut ids: Vec<&String> = col.docs.keys().collect();
+            ids.sort();
+            for id in ids {
+                let attrs = &col.docs[id].attrs;
+                self.findex.index_doc(col_name, id, attrs);
+            }
+        }
+        self.findex_dirty = true;
     }
 }

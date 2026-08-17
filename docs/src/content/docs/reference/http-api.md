@@ -29,6 +29,7 @@ so the same id appears in your logs and the server's.
 | `POST /collections/{name}/delete` | delete by ids or by filter | `delete` / `delete_where` |
 | `GET /collections/{name}/records` | every record in a collection | `get_all` |
 | `POST /collections/{name}/fts-schema` | declare full-text-indexed fields | `set_fts_schema` |
+| `POST /collections/{name}/filter-index` | declare filter-indexed fields | `set_filter_index` |
 | `POST /search` | nearest-neighbour search | `search` |
 | `POST /search/batch` | several queries in one round-trip, optionally RRF-fused | – |
 | `POST /text-search` | BM25 full-text search | `text_search` |
@@ -261,6 +262,34 @@ Every key but `field` is optional and defaults to what the bare-name form gets: 
 curl -s -X POST localhost:7700/collections/docs/fts-schema \
   -H 'content-type: application/json' \
   -d '{"fields": ["title", {"field": "body", "k1": 1.5, "b": 0.3, "ascii_folding": true}]}'
+# → {"ok": true}
+```
+
+### `POST /collections/{name}/filter-index`
+
+Declare which attribute fields are indexed for the text predicates (`Fuzzy`,
+`ContainsAllTokens`, `ContainsAnyToken`, `ContainsTokenSequence`, `Regex`). Documents
+already written are indexed as part of the declaration; see
+[Indexing the text predicates](/guides/search/#indexing-the-text-predicates).
+
+This changes how fast those predicates run, never what they return.
+
+```bash
+curl -s -X POST localhost:7700/collections/docs/filter-index \
+  -H 'content-type: application/json' \
+  -d '{"fields": ["body"]}'
+# → {"ok": true}
+```
+
+A field entry may also be an object, choosing which structures to build. Both `tokens`
+(the three token predicates) and `trigrams` (`Fuzzy` and `Regex`) default to `true`, and
+a field with both off is rejected as a `400`. An empty `fields` list drops the
+declaration:
+
+```bash
+curl -s -X POST localhost:7700/collections/docs/filter-index \
+  -H 'content-type: application/json' \
+  -d '{"fields": ["title", {"field": "tag", "trigrams": false}]}'
 # → {"ok": true}
 ```
 

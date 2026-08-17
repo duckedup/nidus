@@ -3976,7 +3976,7 @@ dependencies = [
 
 [[package]]
 name = "nidus"
-version = "0.63.1"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3990,6 +3990,7 @@ dependencies = [
  "memmap2",
  "redis",
  "regex",
+ "regex-syntax",
  "reqwest",
  "rmcp",
  "rusty-s3",

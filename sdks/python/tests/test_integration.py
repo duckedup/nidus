@@ -183,6 +183,20 @@ def test_full_lifecycle(server: str) -> None:
         assert [h.id for h in db.list(scope=["docs"], filter=[f.ne("lang", "rust")])] == ["b"]
         assert db.list(scope=["docs"], filter=[f.eq("missing", "x")]) == []
 
+        # ── filter index ─────────────────────────────────────────────────────────────
+        # Declaring one must change nothing a caller can observe except speed, so the
+        # assertion is that the same predicate answers the same way with it in place.
+        tokens_filter = [f.contains_all_tokens("lang", "rust")]
+        before = [h.id for h in db.list(scope=["docs"], filter=tokens_filter)]
+        db.set_filter_index("docs", ["lang"])
+        after = [h.id for h in db.list(scope=["docs"], filter=tokens_filter)]
+        assert before == after
+        assert db.stats().footprint.filter_index_bytes > 0
+        # Per-field structures and the empty-list drop both reach the server.
+        db.set_filter_index("docs", [{"field": "lang", "trigrams": False}])
+        db.set_filter_index("docs", [])
+        assert db.stats().footprint.filter_index_bytes == 0
+
         # ── text search ──────────────────────────────────────────────────────────────
         db.set_fts_schema("notes", ["body"])
         assert (

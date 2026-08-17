@@ -181,6 +181,24 @@ bool↔bool, datetime↔datetime as instants). A range predicate against a misma
 matches nothing, which is the usual reason a filter mysteriously returns no rows — and
 `f.gt("score", 2)` against a `Float` attribute is exactly that mismatch.
 
+## Indexing the text predicates
+
+`f.fuzzy`, `f.contains_all_tokens`, `f.contains_any_token`, `f.contains_token_sequence` and
+`f.regex` are scanned per record by default. Declaring a filter index makes them a lot
+faster and changes no results at all: the index proposes candidates and the predicate still
+decides.
+
+```python
+db.set_filter_index("docs", ["body"])
+# Per-field: only the token predicates on `tag`, no fuzzy or regex.
+db.set_filter_index("docs", ["body", {"field": "tag", "trigrams": False}])
+# An empty list drops it.
+db.set_filter_index("docs", [])
+```
+
+It is opt-in per collection and per field, and it costs write time and memory. Documents
+already written are indexed as part of the call. `AsyncNidusClient` has the same method.
+
 ## Full-text and hybrid search
 
 ```python

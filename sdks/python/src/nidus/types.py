@@ -170,6 +170,9 @@ class Footprint:
     dimension: int
     vector_bytes: int
     doc_count: int
+    #: Memory held by the opt-in filter index; ``0`` when none is declared. Defaulted so a
+    #: client stays compatible with a server that predates the field.
+    filter_index_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -280,6 +283,26 @@ class FtsField(_FtsFieldRequired, total=False):
     language: str
     ascii_folding: bool
     max_token_len: int
+
+
+class _FilterIndexFieldRequired(TypedDict):
+    """The one key every filter-index field must carry (so the rest can be optional)."""
+
+    field: str
+
+
+class FilterIndexField(_FilterIndexFieldRequired, total=False):
+    """One entry of a :meth:`~nidus.NidusClient.set_filter_index` declaration: the attribute
+    to index for the text predicates (``Fuzzy``, ``ContainsAllTokens``, ``ContainsAnyToken``,
+    ``ContainsTokenSequence``, ``Regex``), plus which structures to build for it.
+
+    Both structures default to on, so ``{"field": "body"}`` means exactly what the bare
+    string ``"body"`` means. Declaring an index changes how fast those predicates run,
+    never what they return.
+    """
+
+    tokens: bool
+    trigrams: bool
 
 
 class FtsClause(TypedDict):

@@ -32,6 +32,7 @@ mod data;
 // wants from us is a `Result`, not our log stream, so the macro stays `pub(crate)`.
 mod diag;
 mod filter;
+mod findex;
 mod fts;
 // Reciprocal Rank Fusion over several ranked legs, keeping each leg's own rank/score.
 mod fuse;
@@ -97,6 +98,7 @@ pub use backend::{
 pub use cancel::Cancel;
 pub use config::{Config, Fsync, LeaseWait, OpenMode};
 pub use data::SegmentIntegrity;
+pub use findex::FilterIndexField;
 pub use fts::{Analyzer, FtsField, Language};
 pub use meta::META_EXPIRES_AT;
 pub use model::{
@@ -243,6 +245,27 @@ impl Nidus {
     /// ```
     pub fn set_fts_schema(&mut self, collection: &str, fields: &[FtsField]) -> Result<()> {
         self.store.set_fts_schema(collection, fields)
+    }
+
+    /// Opt-in index for the text predicates of SPEC §7.4/§7.5, per field. Changes their
+    /// **speed, never their results**; costs write time and RAM. Empty `fields` turns it off.
+    ///
+    /// ```
+    /// # use nidus::{FilterIndexField, Nidus};
+    /// # fn main() -> nidus::Result<()> {
+    /// # let mut db = Nidus::open_in_memory(3)?;
+    /// db.set_filter_index("docs", &[
+    ///     FilterIndexField::new("body"),
+    ///     FilterIndexField::new("tag").trigrams(false),
+    /// ])?;
+    /// # Ok(()) }
+    /// ```
+    pub fn set_filter_index(
+        &mut self,
+        collection: &str,
+        fields: &[FilterIndexField],
+    ) -> Result<()> {
+        self.store.set_filter_index(collection, fields)
     }
 
     pub fn drop_collection(&mut self, name: &str) -> Result<()> {

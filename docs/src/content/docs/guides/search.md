@@ -393,13 +393,59 @@ Empty queries take the usual identities: `ContainsAllTokens` with no tokens matc
 present text attribute (as `All(vec![])` does), `ContainsAnyToken` with none matches
 nothing (as `Any(vec![])` does).
 
-:::caution[There is no index behind these]
+:::caution[By default there is no index behind these]
 Every predicate here re-tokenizes or re-scans the attribute for **each record the scan
 visits**: O(attribute length) per row for the token family, and O(needle × attribute) for
 the `Fuzzy` DP. That is fine at the scale nidus targets, and it is *not* a substitute for
 full-text search over a large corpus. When the field is a document, reach for
-[`text_search`](#full-text-search-bm25), which does have an index.
+[`text_search`](#full-text-search-bm25), which has an index of its own.
+
+For the filtering case, [`set_filter_index`](#indexing-the-text-predicates) below makes
+these predicates a lot faster without changing a single result.
 :::
+
+<a id="indexing-the-text-predicates"></a>
+
+### Indexing the text predicates
+
+Declaring a filter index on a field speeds up all five predicates above. It is **opt-in,
+per collection and per field**, and off until you ask for it:
+
+```rust
+use nidus::FilterIndexField;
+
+db.set_filter_index("docs", &[
+    FilterIndexField::new("body"),
+    // Only the token predicates for this one: no Fuzzy or Regex on tags.
+    FilterIndexField::new("tag").trigrams(false),
+])?;
+```
+
+Documents already written are indexed as part of the declaration, so you can add one to an
+existing collection. Passing an empty list drops it again.
+
+**The index changes how fast a query runs, never what it returns.** It proposes candidate
+documents and the predicate itself still decides, so an indexed field and an unindexed one
+give identical results. That is what makes it safe to turn on for a field you are unsure
+about.
+
+What it costs: the index is built as you write and held in memory. On a 10,000 document
+corpus of 32 tokens each, ingest roughly doubled (53 ms to 114 ms) and
+`footprint().filter_index_bytes` reports the memory in use.
+
+What it saves, on the same corpus:
+
+| Predicate | Unindexed | Indexed |
+| --- | --- | --- |
+| `Fuzzy` (1 edit) | 91.6 ms | 1.4 ms |
+| `ContainsAllTokens` (4 terms) | 4.8 ms | 0.2 ms |
+| `ContainsTokenSequence` (3 terms) | 6.6 ms | 1.0 ms |
+
+Some queries will not speed up, and that is the index working as intended. When a term
+appears in much of the collection there is nothing to narrow, so nidus skips the index and
+runs the ordinary scan (those cases measured within noise of the unindexed times). The same
+happens for a `Regex` with no required literal such as `.*`, for a `Fuzzy` whose edit budget
+is wide relative to a short needle, and for anything under a `Not`.
 
 ### Combining predicates
 

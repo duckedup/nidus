@@ -120,6 +120,23 @@ f.regex("path", "src/.*\\.rs");           // anchored at both ends, like f.glob
 `f.regex` uses Rust's `regex` syntax, not JavaScript's: no backreferences and no
 lookaround. Prefix it with `(?i)` for case-insensitive matching.
 
+## Indexing the text predicates
+
+`fuzzy`, `containsAllTokens`, `containsAnyToken`, `containsTokenSequence` and `regex` are
+scanned per record by default. Declaring a filter index makes them a lot faster and changes
+no results at all: the index proposes candidates and the predicate still decides.
+
+```ts
+await db.setFilterIndex("docs", ["body"]);
+// Per-field: only the token predicates on `tag`, no fuzzy or regex.
+await db.setFilterIndex("docs", ["body", { field: "tag", trigrams: false }]);
+// An empty list drops it.
+await db.setFilterIndex("docs", []);
+```
+
+It is opt-in per collection and per field, and it costs write time and memory. Documents
+already written are indexed as part of the call.
+
 ## Full-text and hybrid search
 
 ```ts
