@@ -508,6 +508,7 @@ See the [Kubernetes guide](/guides/kubernetes/) for running several instances.
 | Variable | Flag | What it does | Default |
 | --- | --- | --- | --- |
 | `NIDUS_CLUSTER` | `--cluster` | Run as one of several cooperating instances over a shared object-store `--persistence` and Redis-family `--memory` tier | off |
+| `NIDUS_NO_CLUSTER` | `--no-cluster` | Run standalone: the explicit off for `--cluster` | off |
 | `NIDUS_LOCK_TTL` | `--lock-ttl` | Seconds before another process may reclaim a stale writer lock (also the writer-lease window in `--cluster` mode) | `60` |
 | `NIDUS_WAIT_FOR_LEASE` | `--wait-for-lease` | Wait as a standby for the writer handle instead of exiting; bare flag means forever | unset (exit immediately if held) |
 | `NIDUS_REQUIRE_REMOTE` | `--require-remote` | Refuse to start unless persistence and memory are both remote | off |

@@ -99,8 +99,12 @@ struct StoreArgs {
     memory: Option<String>,
     /// Run as one of several cooperating instances over a *shared* store (SPEC §14.6):
     /// requires an object-store `--persistence` **and** a Redis-family `--memory` tier.
-    #[arg(long, env = "NIDUS_CLUSTER")]
+    #[arg(long, env = "NIDUS_CLUSTER", conflicts_with = "no_cluster")]
     cluster: bool,
+    /// Run standalone — the explicit off a bare `--cluster` bool cannot express, so a
+    /// recorded default can be turned back off for one command (nidus-171).
+    #[arg(long, env = "NIDUS_NO_CLUSTER")]
+    no_cluster: bool,
     /// Memory-map immutable segments instead of holding them in RAM — lets a store
     /// exceed RAM on one node. Local filesystem + little-endian only; other segments
     /// fall back to a RAM load.
@@ -226,7 +230,6 @@ impl StoreArgs {
             .distance(distance)
             .persistence(self.persistence.clone().unwrap_or_default())
             .memory(self.memory.clone().unwrap_or_default())
-            .cluster(self.cluster)
             .segment_max_rows(self.segment_max_rows)
             .segment_index_min_rows(self.segment_index_min_rows)
             .max_vector_bytes(self.max_vector_bytes)
@@ -247,6 +250,11 @@ impl StoreArgs {
             cfg = cfg.mmap(false);
         } else if self.mmap {
             cfg = cfg.mmap(true);
+        }
+        if self.no_cluster {
+            cfg = cfg.cluster(false);
+        } else if self.cluster {
+            cfg = cfg.cluster(true);
         }
         if let Some(f) = self.fsync {
             cfg = cfg.fsync(f.into());
@@ -2439,6 +2447,43 @@ mod tests {
             cfg.to_profile().mmap,
             None,
             "unset mmap must leave room for a recorded profile"
+        );
+    }
+
+    /// `--no-cluster` (nidus-171) is the explicit off a bare `--cluster` bool could never
+    /// express, so a persisted cluster default stays overridable for a single command.
+    #[test]
+    fn cluster_flag_forms() {
+        let cfg = serve_store(&["--cluster"])
+            .config(OpenMode::ReadWrite)
+            .expect("config");
+        assert!(cfg.cluster);
+
+        let cfg = serve_store(&["--no-cluster"])
+            .config(OpenMode::ReadWrite)
+            .expect("config");
+        assert!(!cfg.cluster);
+
+        let cfg = serve_store(&[])
+            .config(OpenMode::ReadWrite)
+            .expect("config");
+        assert!(!cfg.cluster);
+    }
+
+    #[test]
+    fn cluster_and_no_cluster_conflict() {
+        assert!(
+            Cli::try_parse_from([
+                "nidus",
+                "serve",
+                "--dir",
+                "/tmp/s",
+                "--dim",
+                "3",
+                "--cluster",
+                "--no-cluster"
+            ])
+            .is_err()
         );
     }
 

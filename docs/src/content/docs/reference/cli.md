@@ -61,6 +61,7 @@ one, where a mismatch is a hard error.
 | `--persistence <LOCATION>` | `NIDUS_PERSISTENCE` | Where the durable bytes live: a path/`file://` (default) or `s3://…`/`gs://…`. |
 | `--memory <LOCATION>` | `NIDUS_MEMORY` | Share the in-RAM working set: `local` (default) or a `redis://…`-family URL. |
 | `--cluster` | `NIDUS_CLUSTER` | Run as one of several cooperating instances over a shared backend. |
+| `--no-cluster` | `NIDUS_NO_CLUSTER` | Run standalone: the explicit off for `--cluster`. |
 | `--mmap` | `NIDUS_MMAP` | Memory-map immutable segments instead of holding them in RAM. |
 | `--no-mmap` | `NIDUS_NO_MMAP` | Turn mmap off, overriding a recorded `configure --mmap` default. |
 | `--quantization <int8\|binary>` | `NIDUS_QUANTIZATION` | Quantize the search first pass, then rerank in exact f32. |
