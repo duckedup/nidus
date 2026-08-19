@@ -545,6 +545,7 @@ See the [Kubernetes guide](/guides/kubernetes/) for running several instances.
 | `NIDUS_EMBED_MODEL` | `--embed-model` | Embedding model | provider's default (`openai-compat` has none; pass one) |
 | `NIDUS_EMBED_API_KEY` | `--embed-api-key` | API key for the embedding provider (some, e.g. Ollama, need none) | none |
 | `NIDUS_EMBED_BASE_URL` | `--embed-base-url` | Base-URL override (required for `openai-compat` and self-hosted gateways) | provider's default endpoint |
+| `NIDUS_EMBED_DIMENSION` | `--embed-dimension` | Non-native embedding width, for Voyage Matryoshka models only (256, 512, 1024, 2048) | the model's native width |
 
 ### Summarize
 

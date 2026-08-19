@@ -372,6 +372,10 @@ struct IngestArgs {
     /// and self-hosted gateways).
     #[arg(long, env = "NIDUS_EMBED_BASE_URL")]
     embed_base_url: Option<String>,
+    /// Ask for a narrower/wider embedding than the model's native width
+    /// (Voyage Matryoshka models: 256, 512, 1024, 2048). Omit for native.
+    #[arg(long, env = "NIDUS_EMBED_DIMENSION")]
+    embed_dimension: Option<usize>,
 
     /// Summarizer provider enabling `mode: "summarize"` on `/remember`:
     /// anthropic or openai. Omit for raw-embed only.
@@ -416,6 +420,9 @@ impl IngestArgs {
         }
         if let Some(u) = &self.embed_base_url {
             config = config.base_url(u);
+        }
+        if let Some(d) = self.embed_dimension {
+            config = config.output_dimension(d);
         }
         let embedder = AnyEmbedder::build(provider, config)
             .await
@@ -1711,7 +1718,34 @@ mod tests {
                 );
                 assert_eq!(ingest.embed_api_key.as_deref(), Some("sk-test"));
                 assert_eq!(ingest.embed_base_url, None);
+                assert_eq!(ingest.embed_dimension, None);
             }
+            _ => panic!("expected Serve"),
+        }
+    }
+
+    /// `--embed-dimension` parses; the adapter then reports it as
+    /// `Embedder::dimension`, which is what `apply_embedder_dim` pins `--dim` to.
+    #[cfg(feature = "memory")]
+    #[test]
+    fn serve_parses_embed_dimension() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "serve",
+            "--dir",
+            "/tmp/s",
+            "--embed-provider",
+            "voyage",
+            "--embed-model",
+            "voyage-4",
+            "--embed-api-key",
+            "k",
+            "--embed-dimension",
+            "512",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Serve { ingest, .. } => assert_eq!(ingest.embed_dimension, Some(512)),
             _ => panic!("expected Serve"),
         }
     }

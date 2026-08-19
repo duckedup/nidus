@@ -95,6 +95,7 @@ the binary was built with the `memory` feature (the `serve` umbrella). With no
 | `--embed-model <MODEL>` | `NIDUS_EMBED_MODEL` | Embedding model. Defaults to the provider's default (`openai-compat` has none). |
 | `--embed-api-key <KEY>` | `NIDUS_EMBED_API_KEY` | API key for the embedding provider (some, e.g. Ollama, need none). |
 | `--embed-base-url <URL>` | `NIDUS_EMBED_BASE_URL` | Base-URL override (required for `openai-compat` and self-hosted gateways). |
+| `--embed-dimension <N>` | `NIDUS_EMBED_DIMENSION` | Ask for a non-native embedding width. Voyage Matryoshka models (the `voyage-4` family, `voyage-3-large`, `voyage-3.5`, `voyage-3.5-lite`, `voyage-code-3`) accept 256, 512, 1024, or 2048. Other providers reject the flag. |
 | `--summarize-provider <NAME>` | `NIDUS_SUMMARIZE_PROVIDER` | Summarizer provider enabling `mode: "summarize"`: `anthropic` or `openai`. Needs the `summarize` feature. |
 | `--summarize-model <MODEL>` | `NIDUS_SUMMARIZE_MODEL` | Summarizer model. Defaults to the provider's default. |
 | `--summarize-api-key <KEY>` | `NIDUS_SUMMARIZE_API_KEY` | API key for the summarizer provider. |

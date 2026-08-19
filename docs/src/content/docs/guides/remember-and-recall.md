@@ -92,6 +92,25 @@ let embedder = AnyEmbedder::build(
 | Jina | `embed-jina` | `EmbedProvider::Jina` | `jina-embeddings-v3` |
 | OpenAI-compatible | `embed-openai-compat` | `EmbedProvider::OpenAiCompat` | *(none: set a model)* |
 
+Voyage's current generation is the **Voyage 4** family (`voyage-4-large`,
+`voyage-4`, `voyage-4-lite`, `voyage-code-4`, and the open-weight
+`voyage-4-nano`): 1024 dimensions natively, a 32K-token context, and Matryoshka
+truncation to 256, 512, or 2048 via `EmbedConfig::output_dimension` (the
+`--embed-dimension` flag). The default model is still `voyage-3`, so nothing
+re-embeds itself under you; pass `--embed-model voyage-4` to opt in. Since the
+store pins its dimension at creation, choose the width before the first upsert.
+
+```rust
+let cfg = EmbedConfig::new("voyage-4-large")
+    .api_key(std::env::var("VOYAGE_API_KEY")?)
+    .output_dimension(256);
+```
+
+Asking for a width a model cannot honour is an error, not a silent fallback:
+fixed-width Voyage models and every non-Voyage provider reject
+`output_dimension` at construction rather than pinning the store to a dimension
+the API will not fill.
+
 The **OpenAI-compatible** adapter is the catch-all: point its `base_url` at any
 service that speaks the standard `/v1/embeddings` shape: Azure OpenAI, Together,
 Fireworks, vLLM, LiteLLM, DeepInfra, and so on. It has no default model, so pass
