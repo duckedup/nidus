@@ -23,7 +23,8 @@ use serde_json::{Value as JsonValue, json};
 use tokio::net::TcpListener;
 
 use crate::{
-    FilterIndexField, FtsField, FtsQuery, HybridOpts, ListOpts, Nidus, Record, Scope, SearchOpts,
+    FilterIndexField, FtsField, FtsQuery, HybridOpts, ListOpts, Nidus, Record, RerankOpts, Scope,
+    SearchOpts,
 };
 use dto::{
     AggregateRequest, AggregationDto, AnnDto, BatchFuse, BatchSearchRequest, BatchSearchResponse,
@@ -40,6 +41,16 @@ use crate::embed::{AnyEmbedder, Embedder};
 use crate::summarize::{AnySummarizer, SummarizeOpts, Summarizer};
 #[cfg(feature = "memory")]
 use dto::{RecallRequest, RememberRequest};
+
+// ── Rerank (opt-in cross-encoder stage) imports: applies to `/search`/`/hybrid-search`
+// too, unlike `summarize`. Only `rerank_hits` is used — the `&Nidus`-holding
+// `search_reranked`/`hybrid_reranked` wrappers would hold the store lock across the await.
+#[cfg(feature = "rerank")]
+use crate::Hit;
+#[cfg(feature = "rerank")]
+use crate::rerank::{AnyReranker, rerank_hits};
+#[cfg(feature = "rerank")]
+use dto::RerankRequest;
 
 /// How `nidus serve` is configured beyond the store itself.
 pub struct ServeConfig {
@@ -86,6 +97,11 @@ pub struct ServeConfig {
     /// `None`, a summarize request answers `400`.
     #[cfg(all(feature = "memory", feature = "summarize"))]
     pub summarizer: Option<Arc<AnySummarizer>>,
+    /// Optional reranker for the opt-in cross-encoder stage on `/search`, `/hybrid-search`,
+    /// and `/collections/{name}/recall`. `None` makes a request asking for it answer `400`
+    /// naming `--rerank-provider`, never a silent pass-through.
+    #[cfg(feature = "rerank")]
+    pub reranker: Option<Arc<AnyReranker>>,
 }
 
 /// How `nidus mcp` (the stdio transport) is configured beyond the store itself. No
@@ -100,6 +116,9 @@ pub struct StdioConfig {
     /// Optional summarizer enabling `summarize: true` on `remember`.
     #[cfg(all(feature = "memory", feature = "summarize"))]
     pub summarizer: Option<Arc<AnySummarizer>>,
+    /// Optional reranker, as in [`ServeConfig`]. `None` makes a rerank request answer `400`.
+    #[cfg(feature = "rerank")]
+    pub reranker: Option<Arc<AnyReranker>>,
     /// How often to renew the cluster writer lease, as in [`ServeConfig`]. An interactive
     /// session idles far longer than `lock_ttl` between writes, so without this a peer
     /// reclaims the lease and the next write finds itself fenced.
@@ -137,6 +156,9 @@ struct AppState {
     /// Shared summarizer for `mode: "summarize"`; `None` disables it (→ `400`).
     #[cfg(all(feature = "memory", feature = "summarize"))]
     summarizer: Option<Arc<AnySummarizer>>,
+    /// Shared reranker for the opt-in cross-encoder stage; `None` disables it (→ `400`).
+    #[cfg(feature = "rerank")]
+    reranker: Option<Arc<AnyReranker>>,
 }
 
 /// Bind the address, open the store, and serve until a shutdown signal (Ctrl-C /
@@ -164,6 +186,8 @@ where
         embedder: cfg.embedder,
         #[cfg(all(feature = "memory", feature = "summarize"))]
         summarizer: cfg.summarizer,
+        #[cfg(feature = "rerank")]
+        reranker: cfg.reranker,
     };
     let renew_every = cfg.lease_renew_interval;
     let app = router(state.clone(), cfg.max_body_bytes);
@@ -320,6 +344,8 @@ where
         embedder: cfg.embedder,
         #[cfg(all(feature = "memory", feature = "summarize"))]
         summarizer: cfg.summarizer,
+        #[cfg(feature = "rerank")]
+        reranker: cfg.reranker,
     };
     spawn_lease_renewal(slot.clone(), cfg.lease_renew_interval);
 
@@ -769,7 +795,20 @@ async fn search(
     State(st): State<AppState>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
-    let (scope, query, opts) = plan_search(req)?;
+    let SearchPlan {
+        scope,
+        query,
+        opts,
+        rerank_query,
+    } = plan_search(req)?;
+    #[cfg(feature = "rerank")]
+    if let Some(rerank_query) = rerank_query {
+        let reranker = st.reranker.clone().ok_or_else(missing_reranker_error)?;
+        let hits = rerank_search_and_finish(st, reranker, scope, query, rerank_query, opts).await?;
+        return Ok(Json(hits.into_iter().map(HitDto::from).collect()));
+    }
+    #[cfg(not(feature = "rerank"))]
+    let _ = rerank_query;
     let hits = run_read(st, move |db| {
         scoped(&scope, |s| db.search(s, &query, &opts))
     })
@@ -777,11 +816,54 @@ async fn search(
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
 }
 
-/// Turn one wire `SearchRequest` into the pieces `db.search` needs, running every check that
-/// can 400 **before** any query executes — a batch must not half-run and then reject leg 7.
-fn plan_search(req: SearchRequest) -> Result<(Vec<String>, Vec<f32>, SearchOpts), ApiError> {
+/// Widen the search to [`store::rerank::rerank_depth`] inside `run_read`, await the reranker
+/// **outside** it (network IO must never be held under the store lock), then cut the caller's
+/// real page via the promoted `Store::finish` in a second, lock-brief `run_read`.
+#[cfg(feature = "rerank")]
+async fn rerank_search_and_finish(
+    st: AppState,
+    reranker: Arc<AnyReranker>,
+    scope: Vec<String>,
+    query: Vec<f32>,
+    rerank_query: String,
+    opts: SearchOpts,
+) -> Result<Vec<Hit>, ApiError> {
+    let rerank_opts = opts.rerank.clone().unwrap_or_default();
+    let widened = SearchOpts {
+        top_k: crate::store::rerank::rerank_depth(&opts),
+        offset: 0,
+        limit_per: None,
+        ..opts.clone()
+    };
+    let hits = run_read(st.clone(), move |db| {
+        scoped(&scope, |s| db.search(s, &query, &widened))
+    })
+    .await?;
+    let reranked = rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts).await?;
+    run_read(st, move |db| Ok(db.store().finish(reranked, &opts))).await
+}
+
+/// One wire `SearchRequest` resolved into what `db.search` needs. `rerank_query` is carried
+/// separately because it is only used outside `run_read`, and is `None` when unreranked.
+struct SearchPlan {
+    scope: Vec<String>,
+    query: Vec<f32>,
+    opts: SearchOpts,
+    rerank_query: Option<String>,
+}
+
+/// Turn one wire `SearchRequest` into a [`SearchPlan`], running every check that can 400
+/// **before** any query executes — a batch must not half-run and then reject leg 7.
+fn plan_search(req: SearchRequest) -> Result<SearchPlan, ApiError> {
     check_page(req.offset, req.top_k)?;
     let projection = check_projection(req.include_attributes, req.exclude_attributes)?;
+    #[cfg(feature = "rerank")]
+    let (rerank, rerank_query) = match check_rerank(req.rerank, None)? {
+        Some((ro, q)) => (Some(ro), Some(q)),
+        None => (None, None),
+    };
+    #[cfg(not(feature = "rerank"))]
+    let (rerank, rerank_query): (Option<RerankOpts>, Option<String>) = (None, None);
     let opts = SearchOpts {
         top_k: req.top_k,
         offset: req.offset,
@@ -793,8 +875,16 @@ fn plan_search(req: SearchRequest) -> Result<(Vec<String>, Vec<f32>, SearchOpts)
         explain: false,
         rank_by: req.rank_by,
         limit_per: req.limit_per,
+        rerank,
     };
-    Ok((req.scope, req.query, opts))
+    #[cfg(feature = "rerank")]
+    check_rerank_depth(&opts)?;
+    Ok(SearchPlan {
+        scope: req.scope,
+        query: req.query,
+        opts,
+        rerank_query,
+    })
 }
 
 /// `POST /search/similar`: "more like this" over the vector already stored at
@@ -816,6 +906,9 @@ async fn search_similar(
         explain: false,
         rank_by: req.rank_by,
         limit_per: req.limit_per,
+        // No rerank here: a cross-encoder scores (query text, candidate) pairs, and
+        // more-like-this starts from a stored vector with no query text to score against.
+        rerank: None,
     };
     let scope = if req.scope.is_empty() {
         vec![req.collection.clone()]
@@ -851,6 +944,15 @@ async fn search_batch(
     if let Some(f) = &fuse {
         check_fuse(f, queries.len())?;
     }
+    // Rerank is not supported on `/search/batch` in v1 (root blueprint, decision 5): reject
+    // rather than silently ignore, so a caller asking for it never mistakes plain metric
+    // order for a reranked one.
+    #[cfg(feature = "rerank")]
+    if queries.iter().any(|q| q.rerank.is_some()) {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "rerank is not supported on /search/batch queries"
+        )));
+    }
     let plans = queries
         .into_iter()
         .map(plan_search)
@@ -861,7 +963,7 @@ async fn search_batch(
     let legs = run_read(st, move |db| {
         plans
             .iter()
-            .map(|(scope, query, opts)| scoped(scope, |s| db.search(s, query, opts)))
+            .map(|p| scoped(&p.scope, |s| db.search(s, &p.query, &p.opts)))
             .collect::<anyhow::Result<Vec<_>>>()
     })
     .await?;
@@ -1085,28 +1187,82 @@ async fn hybrid_search(
         highlight,
         vector_weight,
         text_weight,
+        #[cfg(feature = "rerank")]
+        rerank,
     } = req;
     let clauses = check_clauses(field, text, clauses)?;
+    #[cfg(feature = "rerank")]
+    let (rerank, rerank_query) = match check_rerank(rerank, None)? {
+        Some((ro, q)) => (Some(ro), Some(q)),
+        None => (None, None),
+    };
+    #[cfg(not(feature = "rerank"))]
+    let (rerank, rerank_query): (Option<RerankOpts>, Option<String>) = (None, None);
+    let opts = HybridOpts {
+        top_k,
+        offset,
+        filter,
+        rrf_k,
+        candidates,
+        explain,
+        vector_weight,
+        text_weight,
+        rerank,
+    };
+    #[cfg(feature = "rerank")]
+    check_rerank_hybrid_depth(&opts)?;
+    let q = FtsQuery {
+        clauses,
+        combine,
+        highlight,
+    };
+
+    #[cfg(feature = "rerank")]
+    if let Some(rerank_query) = rerank_query {
+        let reranker = st.reranker.clone().ok_or_else(missing_reranker_error)?;
+        let hits =
+            rerank_hybrid_and_finish(st, reranker, scope, vector, q, rerank_query, opts).await?;
+        return Ok(Json(hits.into_iter().map(HitDto::from).collect()));
+    }
+    #[cfg(not(feature = "rerank"))]
+    let _ = rerank_query;
+
     let hits = run_read(st, move |db| {
-        let opts = HybridOpts {
-            top_k,
-            offset,
-            filter,
-            rrf_k,
-            candidates,
-            explain,
-            vector_weight,
-            text_weight,
-        };
-        let q = FtsQuery {
-            clauses,
-            combine,
-            highlight,
-        };
         scoped(&scope, |s| db.hybrid_search(s, &vector, &q, &opts))
     })
     .await?;
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+}
+
+/// Hybrid analogue of [`rerank_search_and_finish`]: widen inside `run_read`, rerank outside
+/// it, then cut the page via the promoted `Store::finish_hybrid`.
+#[cfg(feature = "rerank")]
+async fn rerank_hybrid_and_finish(
+    st: AppState,
+    reranker: Arc<AnyReranker>,
+    scope: Vec<String>,
+    vector: Vec<f32>,
+    q: FtsQuery,
+    rerank_query: String,
+    opts: HybridOpts,
+) -> Result<Vec<Hit>, ApiError> {
+    let rerank_opts = opts.rerank.clone().unwrap_or_default();
+    let overscan = rerank_opts.overscan.max(1);
+    let widened = HybridOpts {
+        top_k: opts
+            .offset
+            .saturating_add(opts.top_k)
+            .saturating_mul(overscan),
+        offset: 0,
+        candidates: opts.candidates.saturating_mul(overscan),
+        ..opts.clone()
+    };
+    let hits = run_read(st.clone(), move |db| {
+        scoped(&scope, |s| db.hybrid_search(s, &vector, &q, &widened))
+    })
+    .await?;
+    let reranked = rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts).await?;
+    run_read(st, move |db| Ok(db.store().finish_hybrid(reranked, &opts))).await
 }
 
 async fn flush(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
@@ -1245,7 +1401,18 @@ async fn recall(
         top_k,
         min_score,
         filter,
+        #[cfg(feature = "rerank")]
+        rerank,
     } = req;
+    // The rerank query defaults to the recall query itself (decision: `rerank: {}` is a
+    // valid minimal form here, unlike `/search`, which has no text of its own to fall back to).
+    #[cfg(feature = "rerank")]
+    let (rerank_opts, rerank_query) = match check_rerank(rerank, Some(query.as_str()))? {
+        Some((ro, q)) => (Some(ro), Some(q)),
+        None => (None, None),
+    };
+    #[cfg(not(feature = "rerank"))]
+    let (rerank_opts, rerank_query): (Option<RerankOpts>, Option<String>) = (None, None);
 
     // Embed the query off-lock (network IO), then search under the read lock.
     let vector = embedder
@@ -1262,14 +1429,58 @@ async fn recall(
         top_k,
         min_score,
         filter,
+        rerank: rerank_opts,
         ..Default::default()
     };
+    #[cfg(feature = "rerank")]
+    check_rerank_depth(&opts)?;
+
+    #[cfg(feature = "rerank")]
+    if let Some(rerank_query) = rerank_query {
+        let reranker = st.reranker.clone().ok_or_else(missing_reranker_error)?;
+        let hits =
+            rerank_recall_and_finish(st, reranker, name, embedder, vector, rerank_query, opts)
+                .await?;
+        return Ok(Json(hits.into_iter().map(HitDto::from).collect()));
+    }
+    #[cfg(not(feature = "rerank"))]
+    let _ = rerank_query;
+
     let hits = run_read(st, move |db| {
         crate::memory::guard_recall_identity(db, embedder.as_ref(), &name)?;
         db.search(name.as_str(), &vector, &opts)
     })
     .await?;
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+}
+
+/// Recall analogue of [`rerank_search_and_finish`]: the identity guard runs inside both
+/// `run_read`s (widen and tail), same as the unreranked path above.
+#[cfg(all(feature = "memory", feature = "rerank"))]
+async fn rerank_recall_and_finish(
+    st: AppState,
+    reranker: Arc<AnyReranker>,
+    name: String,
+    embedder: Arc<AnyEmbedder>,
+    vector: Vec<f32>,
+    rerank_query: String,
+    opts: SearchOpts,
+) -> Result<Vec<Hit>, ApiError> {
+    let rerank_opts = opts.rerank.clone().unwrap_or_default();
+    let widened = SearchOpts {
+        top_k: crate::store::rerank::rerank_depth(&opts),
+        offset: 0,
+        limit_per: None,
+        ..opts.clone()
+    };
+    let name_for_widen = name.clone();
+    let hits = run_read(st.clone(), move |db| {
+        crate::memory::guard_recall_identity(db, embedder.as_ref(), &name_for_widen)?;
+        db.search(name_for_widen.as_str(), &vector, &widened)
+    })
+    .await?;
+    let reranked = rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts).await?;
+    run_read(st, move |db| Ok(db.store().finish(reranked, &opts))).await
 }
 
 /// The `400` returned when a memory route is hit but no embedder was configured
@@ -1279,6 +1490,89 @@ fn missing_embedder_error() -> ApiError {
     ApiError::bad_request(anyhow::anyhow!(
         "nidus serve was started without an embedder; pass --embed-provider … to enable /remember and /recall"
     ))
+}
+
+/// The `400` returned when a request asks for reranking but the server was started
+/// without a reranker — never a `500`, and never a silent unreranked pass-through.
+#[cfg(feature = "rerank")]
+fn missing_reranker_error() -> ApiError {
+    ApiError::bad_request(anyhow::anyhow!(
+        "nidus serve was started without a reranker; pass --rerank-provider … to enable reranking"
+    ))
+}
+
+/// Validate an optional [`RerankRequest`] into ([`RerankOpts`], query text), or a `400`.
+/// `rerank: None` is `Ok(None)` unconditionally. `default_query` back-fills an empty
+/// `rerank.query` (recall's own text); `/search` passes `None`, having no text of its own.
+#[cfg(feature = "rerank")]
+fn check_rerank(
+    rerank: Option<RerankRequest>,
+    default_query: Option<&str>,
+) -> Result<Option<(RerankOpts, String)>, ApiError> {
+    let Some(r) = rerank else { return Ok(None) };
+    let query = if !r.query.is_empty() {
+        r.query
+    } else {
+        default_query.unwrap_or_default().to_string()
+    };
+    if query.is_empty() {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "rerank.query must not be empty"
+        )));
+    }
+    let mut opts = RerankOpts::default();
+    if let Some(overscan) = r.overscan {
+        if overscan == 0 {
+            return Err(ApiError::bad_request(anyhow::anyhow!(
+                "rerank.overscan must be at least 1"
+            )));
+        }
+        opts.overscan = overscan;
+    }
+    if let Some(attr) = r.text_attr {
+        opts.text_attr = attr;
+    }
+    Ok(Some((opts, query)))
+}
+
+/// Refuse a rerank candidate window past [`MAX_TOP_K`]: past this the store would have to rank,
+/// and the provider score, an unreasonable depth. Reuses `rerank_depth`'s real formula
+/// (`limit_per`'s overfetch included) rather than approximating it a second time.
+#[cfg(feature = "rerank")]
+fn check_rerank_depth(opts: &SearchOpts) -> Result<(), ApiError> {
+    if opts.rerank.is_none() {
+        return Ok(());
+    }
+    let depth = crate::store::rerank::rerank_depth(opts);
+    if depth > MAX_TOP_K {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "rerank over top_k {} (offset {}) asks for a candidate depth of {depth}, exceeding \
+             the maximum of {MAX_TOP_K}",
+            opts.top_k,
+            opts.offset
+        )));
+    }
+    Ok(())
+}
+
+/// Hybrid analogue of [`check_rerank_depth`]: `HybridOpts` has no `limit_per`, so the depth is
+/// just `(offset + top_k) * overscan`.
+#[cfg(feature = "rerank")]
+fn check_rerank_hybrid_depth(opts: &HybridOpts) -> Result<(), ApiError> {
+    let Some(r) = &opts.rerank else { return Ok(()) };
+    let depth = opts
+        .offset
+        .saturating_add(opts.top_k)
+        .saturating_mul(r.overscan.max(1));
+    if depth > MAX_TOP_K {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "rerank over top_k {} (offset {}) asks for a candidate depth of {depth}, exceeding \
+             the maximum of {MAX_TOP_K}",
+            opts.top_k,
+            opts.offset
+        )));
+    }
+    Ok(())
 }
 
 /// Run a **read** operation on a blocking task under a shared lock — concurrent
@@ -1482,6 +1776,8 @@ fn test_state(db: Option<Nidus>) -> AppState {
         embedder: None,
         #[cfg(all(feature = "memory", feature = "summarize"))]
         summarizer: None,
+        #[cfg(feature = "rerank")]
+        reranker: None,
     }
 }
 
@@ -3488,13 +3784,13 @@ mod memory_tests {
     /// The fixed embedding every mock response carries — a 3-dim vector, so the
     /// backing store is opened at dimension 3. A stored doc and any query embed
     /// to the *same* vector, so recall scores it ~1.0.
-    const EMBED_BODY: &str = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
-    const DIM: usize = 3;
+    pub(super) const EMBED_BODY: &str = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
+    pub(super) const DIM: usize = 3;
 
     /// A multi-connection HTTP/1.1 mock: accepts forever on a background thread, drains each
     /// request, and replies with `EMBED_BODY`. Unlike the one-shot `embed::testutil` mock, it
-    /// survives the several calls a remember→recall flow makes.
-    fn spawn_embed_mock() -> String {
+    /// survives the several calls a remember→recall flow makes; `pub(super)` for `rerank_tests`.
+    pub(super) fn spawn_embed_mock() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
         let addr = listener.local_addr().expect("mock addr");
         thread::spawn(move || {
@@ -3711,5 +4007,303 @@ mod memory_tests {
         assert_eq!(q.query, "find me");
         assert_eq!(q.top_k, 10);
         assert!(q.min_score.is_none());
+    }
+}
+
+// ── Rerank-route tests (the `rerank` feature) ────────────────────────────────
+// Drive `/search`, `/hybrid-search`, and `/collections/{name}/recall` against a real
+// `AnyReranker::Voyage` over an in-process mock; gated like `memory_tests`, on one concrete provider.
+#[cfg(all(test, feature = "rerank-voyage"))]
+mod rerank_tests {
+    use super::*;
+    use crate::rerank::testutil::mock_once;
+    use crate::rerank::{AnyReranker, RerankConfig, RerankProvider};
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::ServiceExt; // for `oneshot`
+
+    const DIM: usize = 3;
+
+    async fn json_body(resp: Response) -> JsonValue {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn post(path: &str, body: JsonValue) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// A reranker mock that reports these three scores back to whatever candidate
+    /// documents it is called with, in input order: metric-worst first.
+    const INVERTING_SCORES: &str = r#"{"data":[{"index":0,"relevance_score":0.1},{"index":1,"relevance_score":0.5},{"index":2,"relevance_score":0.9}]}"#;
+
+    /// A router whose `reranker` is a real `AnyReranker::Voyage` pointed at a one-shot
+    /// mock that answers `resp_body` to the single rerank call each test issues.
+    fn router_with_mock_reranker(resp_body: &str) -> Router {
+        let server = mock_once(200, resp_body);
+        let reranker = AnyReranker::build(
+            RerankProvider::Voyage,
+            RerankConfig::new("mock-rerank")
+                .api_key("k")
+                .base_url(&server.base_url),
+        )
+        .unwrap();
+        let db = Nidus::open_in_memory(DIM).unwrap();
+        let state = AppState {
+            reranker: Some(Arc::new(reranker)),
+            ..test_state(Some(db))
+        };
+        router(state, 16 * 1024 * 1024)
+    }
+
+    /// A router with NO reranker configured — a rerank request must answer `400`.
+    fn router_without_reranker() -> Router {
+        let state = test_state(Some(Nidus::open_in_memory(DIM).unwrap()));
+        router(state, 16 * 1024 * 1024)
+    }
+
+    /// Three orthogonal-vector docs so a query of `[1,0,0]` scores `a` highest and ties
+    /// `b`/`c` at zero — the plain metric order is `a, b, c` (ties break on id).
+    async fn upsert_three(app: &Router) {
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "a", "vector": [1, 0, 0], "attrs": {"nidus.text": {"Str": "doc-a"}}},
+                    {"id": "b", "vector": [0, 1, 0], "attrs": {"nidus.text": {"Str": "doc-b"}}},
+                    {"id": "c", "vector": [0, 0, 1], "attrs": {"nidus.text": {"Str": "doc-c"}}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    fn ids(hits: &JsonValue) -> Vec<String> {
+        hits.as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// A rerank request with no reranker configured is a `400` naming the flag, not a
+    /// `500` and not a silent unreranked pass-through.
+    #[tokio::test]
+    async fn rerank_without_a_configured_reranker_is_400() {
+        let app = router_without_reranker();
+        upsert_three(&app).await;
+        let resp = app
+            .oneshot(post(
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": 3, "rerank": {"query": "q"}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(resp).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("--rerank-provider"),
+            "message names the flag: {body}"
+        );
+    }
+
+    /// The reranked order must actually flip the metric baseline, not merely succeed —
+    /// a `200` is true whether or not reranking ran.
+    #[tokio::test]
+    async fn rerank_changes_the_returned_order_over_http() {
+        let baseline_app = router_without_reranker();
+        upsert_three(&baseline_app).await;
+        let resp = baseline_app
+            .oneshot(post("/search", json!({"query": [1, 0, 0], "top_k": 3})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let baseline = ids(&json_body(resp).await);
+        assert_eq!(baseline, vec!["a", "b", "c"]);
+
+        let app = router_with_mock_reranker(INVERTING_SCORES);
+        upsert_three(&app).await;
+        let resp = app
+            .oneshot(post(
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": 3, "rerank": {"query": "best doc"}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let reranked = ids(&json_body(resp).await);
+        assert_ne!(
+            reranked, baseline,
+            "rerank must flip the order: {reranked:?}"
+        );
+        assert_eq!(reranked, vec!["c", "b", "a"]);
+    }
+
+    /// No `rerank` field on the request body is byte-identical to the pre-rerank shape —
+    /// the additive-wire claim.
+    #[tokio::test]
+    async fn a_request_without_a_rerank_field_is_unchanged() {
+        let app = router_without_reranker();
+        upsert_three(&app).await;
+        let resp = app
+            .oneshot(post("/search", json!({"query": [1, 0, 0], "top_k": 3})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(ids(&json_body(resp).await), vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn rerank_with_an_empty_query_is_400() {
+        let app = router_without_reranker();
+        upsert_three(&app).await;
+        let resp = app
+            .oneshot(post(
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": 3, "rerank": {"query": ""}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn overscan_zero_is_400() {
+        let app = router_without_reranker();
+        upsert_three(&app).await;
+        let resp = app
+            .oneshot(post(
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": 3, "rerank": {"query": "q", "overscan": 0}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Declare the `nidus.text` FTS field then upsert the three docs (mirrors
+    /// `fts_and_hybrid_over_http`: the text leg needs a declared field to match against).
+    async fn setup_hybrid_docs(app: &Router) {
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/docs/fts-schema",
+                json!({"fields": ["nidus.text"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        upsert_three(app).await;
+    }
+
+    fn hybrid_search_body(rerank: Option<JsonValue>) -> JsonValue {
+        let mut body = json!({
+            "vector": [1, 0, 0],
+            "field": "nidus.text",
+            "text": "doc",
+            "top_k": 3,
+        });
+        if let Some(r) = rerank {
+            body["rerank"] = r;
+        }
+        body
+    }
+
+    /// The same order-flip as `/search`, over `/hybrid-search`'s fused ranking. The mock always
+    /// scores candidate position 0 lowest and position 2 highest, so — whatever the fused
+    /// pre-rerank order actually is — the reranked order must be its exact reverse.
+    #[tokio::test]
+    async fn rerank_changes_the_returned_order_over_hybrid_search() {
+        let baseline_app = router_without_reranker();
+        setup_hybrid_docs(&baseline_app).await;
+        let resp = baseline_app
+            .oneshot(post("/hybrid-search", hybrid_search_body(None)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut baseline = ids(&json_body(resp).await);
+        assert_eq!(baseline.len(), 3);
+
+        let app = router_with_mock_reranker(INVERTING_SCORES);
+        setup_hybrid_docs(&app).await;
+        let resp = app
+            .oneshot(post(
+                "/hybrid-search",
+                hybrid_search_body(Some(json!({"query": "best doc"}))),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let reranked = ids(&json_body(resp).await);
+        baseline.reverse();
+        assert_eq!(
+            reranked, baseline,
+            "rerank must reverse the pre-rerank fused order"
+        );
+    }
+
+    /// The same order-flip, over `/collections/{name}/recall` — the `memory` route whose
+    /// `rerank.query` defaults to the recall query itself.
+    #[cfg(all(feature = "memory", feature = "embed-openai-compat"))]
+    #[tokio::test]
+    async fn rerank_changes_the_returned_order_over_recall() {
+        use crate::embed::{EmbedConfig, EmbedProvider};
+
+        // Every text embeds to the same fixed vector (`super::memory_tests::EMBED_BODY`), so
+        // the plain metric order is a dead tie broken on id: `a, b, c`.
+        let embed_base = super::memory_tests::spawn_embed_mock();
+        let embedder = AnyEmbedder::build(
+            EmbedProvider::OpenAiCompat,
+            EmbedConfig::new("mock-model").base_url(embed_base),
+        )
+        .await
+        .expect("build mock embedder");
+        let server = mock_once(200, INVERTING_SCORES);
+        let reranker = AnyReranker::build(
+            RerankProvider::Voyage,
+            RerankConfig::new("mock-rerank")
+                .api_key("k")
+                .base_url(&server.base_url),
+        )
+        .unwrap();
+        let db = Nidus::open_in_memory(super::memory_tests::DIM).unwrap();
+        let state = AppState {
+            embedder: Some(Arc::new(embedder)),
+            reranker: Some(Arc::new(reranker)),
+            ..test_state(Some(db))
+        };
+        let app = router(state, 16 * 1024 * 1024);
+
+        for (id, text) in [("a", "doc-a"), ("b", "doc-b"), ("c", "doc-c")] {
+            let resp = app
+                .clone()
+                .oneshot(post(
+                    "/collections/notes/remember",
+                    json!({"id": id, "text": text}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let resp = app
+            .oneshot(post(
+                "/collections/notes/recall",
+                json!({"query": "anything", "top_k": 3, "rerank": {}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(ids(&json_body(resp).await), vec!["c", "b", "a"]);
     }
 }

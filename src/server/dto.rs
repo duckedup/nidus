@@ -73,6 +73,25 @@ pub struct SearchRequest {
     /// Cap hits per distinct value of an attribute: `{"field": "path", "max": 2}`.
     #[serde(default)]
     pub limit_per: Option<LimitPer>,
+    /// Opt into the cross-encoder rerank stage. `None` (the default, and the only shape an
+    /// old client ever sends) leaves the metric ranking untouched.
+    #[cfg(feature = "rerank")]
+    #[serde(default)]
+    pub rerank: Option<RerankRequest>,
+}
+
+/// The opt-in cross-encoder stage on a search request. `query` back-fills from the request's
+/// own text where one exists (`/collections/{name}/recall`); `/search` and `/hybrid-search`
+/// carry no text of their own, so an empty `query` there is a `400`.
+#[cfg(feature = "rerank")]
+#[derive(Debug, Deserialize)]
+pub struct RerankRequest {
+    #[serde(default)]
+    pub query: String,
+    #[serde(default)]
+    pub overscan: Option<usize>,
+    #[serde(default)]
+    pub text_attr: Option<String>,
 }
 
 /// Body of `POST /search/similar`: "more like this" over the vector already stored at
@@ -259,6 +278,10 @@ pub struct HybridSearchRequest {
     /// Weight on the BM25 leg's RRF contribution.
     #[serde(default = "default_weight")]
     pub text_weight: f32,
+    /// Opt into the cross-encoder rerank stage over the fused ranking.
+    #[cfg(feature = "rerank")]
+    #[serde(default)]
+    pub rerank: Option<RerankRequest>,
 }
 
 fn default_weight() -> f32 {
@@ -505,6 +528,11 @@ pub struct RecallRequest {
     pub min_score: Option<f32>,
     #[serde(default)]
     pub filter: Filter,
+    /// Opt into the cross-encoder rerank stage. An omitted or empty `rerank.query` falls
+    /// back to `query` above, so `{"rerank": {}}` is a valid minimal form here.
+    #[cfg(feature = "rerank")]
+    #[serde(default)]
+    pub rerank: Option<RerankRequest>,
 }
 
 /// Serializable mirror of [`crate::Hit`] (which carries no serde derive).

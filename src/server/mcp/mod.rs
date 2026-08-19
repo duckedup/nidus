@@ -91,6 +91,20 @@ impl NidusMcp {
             )
         })
     }
+
+    /// The configured reranker, or an `internal_error` naming the flag — mirrors
+    /// [`Self::embedder`]. A `rerank: true` argument with no reranker configured must fail
+    /// loudly here rather than silently returning the un-reranked order.
+    #[cfg(feature = "rerank")]
+    fn reranker(&self) -> Result<Arc<crate::rerank::AnyReranker>, McpError> {
+        self.state.reranker.clone().ok_or_else(|| {
+            McpError::internal_error(
+                "this nidus server was started without a reranker, so it cannot rerank; \
+                 restart it with --rerank-provider … to enable rerank",
+                None,
+            )
+        })
+    }
 }
 
 /// The tool list. Order must stay stable — reordering invalidates every client's cached

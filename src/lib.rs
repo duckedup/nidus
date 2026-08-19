@@ -63,11 +63,11 @@ pub mod server;
 // ── AI ingest layer (epic nidus-54l) — all behind off-by-default features ────
 // The async edge: text-native `remember`/`recall` on top of the sync store
 // core, which depends on NONE of this. See Cargo.toml `[features]`.
-#[cfg(any(feature = "embed", feature = "summarize"))]
+#[cfg(any(feature = "embed", feature = "summarize", feature = "rerank"))]
 mod http;
-// Provider capability registry (Embed | Summarize): the single source of truth
-// the embed/summarize factories consult before dispatching.
-#[cfg(any(feature = "embed", feature = "summarize"))]
+// Provider capability registry (Embed | Summarize | Rerank): the single source of truth
+// the embed/summarize/rerank factories consult before dispatching.
+#[cfg(any(feature = "embed", feature = "summarize", feature = "rerank"))]
 pub mod providers;
 // Embedding abstraction + provider adapters + runtime `AnyEmbedder` selection.
 #[cfg(feature = "embed")]
@@ -75,6 +75,11 @@ pub mod embed;
 // Single-shot summarization abstraction + provider adapters.
 #[cfg(feature = "summarize")]
 pub mod summarize;
+// Hosted cross-encoder reranking: `Reranker` + `AnyReranker` + adapters, mirroring `embed`.
+// The pure ranking logic (window, passthrough, re-sort) lives unconditionally in
+// `store::rerank`; only the async provider call sits behind this feature.
+#[cfg(feature = "rerank")]
+pub mod rerank;
 // Text-native memory API: `remember(text)` / `recall(query_text)`. Gated on the
 // `memory` feature (= `embed`) so building a bare provider (e.g. `embed-voyage`)
 // does not require this module to exist.
@@ -102,10 +107,10 @@ pub use findex::FilterIndexField;
 pub use fts::{Analyzer, FtsField, Language};
 pub use meta::META_EXPIRES_AT;
 pub use model::{
-    AggregateOpts, Aggregation, AnnConfig, AnnKind, ClusterStatus, Decay, Distance, Filter,
-    Footprint, FtsClause, FtsCombine, FtsQuery, Group, Hit, HybridOpts, LimitPer, ListOpts,
-    OrderBy, Predicate, Projection, QuantKind, Quantization, RankBy, Record, Role, SearchOpts,
-    Value,
+    AggregateOpts, Aggregation, AnnConfig, AnnKind, ClusterStatus, DEFAULT_RERANK_OVERSCAN, Decay,
+    Distance, Filter, Footprint, FtsClause, FtsCombine, FtsQuery, Group, Hit, HybridOpts, LimitPer,
+    ListOpts, OrderBy, Predicate, Projection, QuantKind, Quantization, RankBy, Record, RerankOpts,
+    Role, SearchOpts, Value,
 };
 pub use profile::OpenProfile;
 pub use store::Readiness;
@@ -167,6 +172,14 @@ impl Nidus {
     /// The pinned embedding dimension.
     pub fn dimension(&self) -> usize {
         self.store.dimension()
+    }
+
+    /// Escape hatch for edge-of-crate wrappers (`crate::rerank`'s async free functions) that
+    /// need the store's promoted ranking tails (`Store::finish`/`finish_hybrid`) without
+    /// duplicating the page-cut contract (SPEC §7). Not part of the public API.
+    #[cfg_attr(not(feature = "rerank"), allow(dead_code))]
+    pub(crate) fn store(&self) -> &store::Store {
+        &self.store
     }
 
     /// The configuration this store was opened with.
