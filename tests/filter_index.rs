@@ -135,6 +135,13 @@ fn filters(seed: u64, n: usize) -> Vec<Filter> {
         .collect()
 }
 
+/// Volume for the randomized differential tests: the native number, or a smaller one under
+/// Miri, which interprets every step (this file was 53 of the lane's 65 minutes, against
+/// 0.24s natively). The `test` job still draws the full volume on every PR (nidus-2r7).
+const fn scale(native: usize, miri: usize) -> usize {
+    if cfg!(miri) { miri } else { native }
+}
+
 // ── Fixtures ──────────────────────────────────────────────────────────────────────
 
 fn build(records: &[Record], indexed: bool) -> Nidus {
@@ -162,12 +169,12 @@ fn query_vec() -> Vec<f32> {
 /// store with the index and one without: identical hits, order and scores.
 #[test]
 fn indexed_and_unindexed_results_are_identical() {
-    for seed in [1u64, 2, 3, 5, 8, 13, 21, 34] {
-        let records = docs(seed, 60);
+    for &seed in [1u64, 2, 3, 5, 8, 13, 21, 34].iter().take(scale(8, 2)) {
+        let records = docs(seed, scale(60, 12));
         let plain = build(&records, false);
         let indexed = build(&records, true);
 
-        for filter in filters(seed, 40) {
+        for filter in filters(seed, scale(40, 6)) {
             let opts = SearchOpts {
                 top_k: 10,
                 filter: filter.clone(),
@@ -203,9 +210,9 @@ fn indexed_and_unindexed_results_are_identical() {
 /// `delete_where` shares the filter path, so it shares the risk.
 #[test]
 fn delete_where_removes_the_same_documents_either_way() {
-    for seed in [4u64, 6, 9] {
-        let records = docs(seed, 40);
-        for filter in filters(seed, 20) {
+    for &seed in [4u64, 6, 9].iter().take(scale(3, 1)) {
+        let records = docs(seed, scale(40, 10));
+        for filter in filters(seed, scale(20, 4)) {
             let mut plain = build(&records, false);
             let mut indexed = build(&records, true);
             let a = plain.delete_where("c", &filter).expect("plain delete");
