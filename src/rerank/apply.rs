@@ -7,7 +7,7 @@ use anyhow::bail;
 
 use super::Reranker;
 use crate::model::RerankOpts;
-use crate::store::rerank::{apply_scores, candidate_texts, rerank_depth};
+use crate::store::rerank::{apply_scores, candidate_texts, retrim, widened_opts};
 use crate::{FtsQuery, Hit, HybridOpts, Nidus, Result, Scope, SearchOpts};
 
 /// Rerank an already-ranked `hits` set: extract candidate texts, score them with `reranker`,
@@ -55,14 +55,10 @@ pub async fn search_reranked<'a, R: Reranker>(
     // `limit_per` is dropped here and re-applied once, post-rerank, via `Store::finish` below
     // (decision 3): capping the pre-rerank window would freeze the group winners at their
     // metric order, defeating the point of reranking them.
-    let widened = SearchOpts {
-        top_k: rerank_depth(opts),
-        offset: 0,
-        limit_per: None,
-        ..opts.clone()
-    };
+    let (widened, kept) = widened_opts(opts);
     let hits = db.search(scope, query_vector, &widened)?;
-    let reranked = rerank_hits(reranker, query_text, hits, &rerank_opts).await?;
+    let mut reranked = rerank_hits(reranker, query_text, hits, &rerank_opts).await?;
+    retrim(&mut reranked, opts, kept);
     Ok(db.store().finish(reranked, opts))
 }
 
@@ -193,6 +189,48 @@ mod tests {
             out[0].score, 4.0,
             "the rerank score replaces the cosine one"
         );
+    }
+
+    /// Both halves in one test (nidus-d6z): order-only would pass a widen that forgot to
+    /// re-trim, attrs-only would pass an implementation that never widened at all.
+    #[tokio::test]
+    async fn a_projection_without_the_text_attr_still_reranks_and_still_hides_it() {
+        let db = store();
+        let opts = SearchOpts {
+            top_k: 4,
+            projection: crate::Projection::include(["group"]),
+            rerank: Some(RerankOpts::default()),
+            ..Default::default()
+        };
+        let out = search_reranked(&db, &LenReranker, "docs", &[1.0, 0.0], "q", &opts)
+            .await
+            .unwrap();
+        assert_eq!(ids(&out), vec!["d", "c", "b", "a"], "rerank must still run");
+        for h in &out {
+            assert!(
+                !h.attrs.contains_key(META_TEXT),
+                "the forced text attr must be trimmed back out: {:?}",
+                h.attrs
+            );
+            assert!(h.attrs.contains_key("group"), "the caller's attr survives");
+        }
+    }
+
+    /// The mirror of the above: a projection that *asks* for the text attr keeps it.
+    #[tokio::test]
+    async fn a_projection_that_asks_for_the_text_attr_keeps_it() {
+        let db = store();
+        let opts = SearchOpts {
+            top_k: 4,
+            projection: crate::Projection::include([META_TEXT]),
+            rerank: Some(RerankOpts::default()),
+            ..Default::default()
+        };
+        let out = search_reranked(&db, &LenReranker, "docs", &[1.0, 0.0], "q", &opts)
+            .await
+            .unwrap();
+        assert_eq!(ids(&out), vec!["d", "c", "b", "a"]);
+        assert!(out[0].attrs.contains_key(META_TEXT));
     }
 
     /// The whole point of the over-fetch window: a record outside the plain `top_k` finishes

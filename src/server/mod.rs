@@ -829,17 +829,13 @@ async fn rerank_search_and_finish(
     opts: SearchOpts,
 ) -> Result<Vec<Hit>, ApiError> {
     let rerank_opts = opts.rerank.clone().unwrap_or_default();
-    let widened = SearchOpts {
-        top_k: crate::store::rerank::rerank_depth(&opts),
-        offset: 0,
-        limit_per: None,
-        ..opts.clone()
-    };
+    let (widened, kept) = crate::store::rerank::widened_opts(&opts);
     let hits = run_read(st.clone(), move |db| {
         scoped(&scope, |s| db.search(s, &query, &widened))
     })
     .await?;
-    let reranked = rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts).await?;
+    let mut reranked = rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts).await?;
+    crate::store::rerank::retrim(&mut reranked, &opts, kept);
     run_read(st, move |db| Ok(db.store().finish(reranked, &opts))).await
 }
 
@@ -1467,19 +1463,15 @@ async fn rerank_recall_and_finish(
     opts: SearchOpts,
 ) -> Result<Vec<Hit>, ApiError> {
     let rerank_opts = opts.rerank.clone().unwrap_or_default();
-    let widened = SearchOpts {
-        top_k: crate::store::rerank::rerank_depth(&opts),
-        offset: 0,
-        limit_per: None,
-        ..opts.clone()
-    };
+    let (widened, kept) = crate::store::rerank::widened_opts(&opts);
     let name_for_widen = name.clone();
     let hits = run_read(st.clone(), move |db| {
         crate::memory::guard_recall_identity(db, embedder.as_ref(), &name_for_widen)?;
         db.search(name_for_widen.as_str(), &vector, &widened)
     })
     .await?;
-    let reranked = rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts).await?;
+    let mut reranked = rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts).await?;
+    crate::store::rerank::retrim(&mut reranked, &opts, kept);
     run_read(st, move |db| Ok(db.store().finish(reranked, &opts))).await
 }
 
@@ -4147,6 +4139,34 @@ mod rerank_tests {
             "rerank must flip the order: {reranked:?}"
         );
         assert_eq!(reranked, vec!["c", "b", "a"]);
+    }
+
+    /// `include_attributes` that drops the text attr must not silently disable the rerank
+    /// (nidus-d6z). Both halves: the order still flips, and the response still honours the
+    /// projection. Asserting only one would pass a half-fix.
+    #[tokio::test]
+    async fn a_narrow_projection_still_reranks_over_http() {
+        let app = router_with_mock_reranker(INVERTING_SCORES);
+        upsert_three(&app).await;
+        let resp = app
+            .oneshot(post(
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": 3,
+                       "include_attributes": ["kind"],
+                       "rerank": {"query": "best doc"}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(ids(&body), vec!["c", "b", "a"], "rerank must still run");
+        for hit in body.as_array().expect("hit array") {
+            let attrs = hit["attrs"].as_object().expect("attrs object");
+            assert!(
+                !attrs.contains_key(crate::model::META_TEXT),
+                "the forced text attr must not leak into the response: {attrs:?}"
+            );
+        }
     }
 
     /// No `rerank` field on the request body is byte-identical to the pre-rerank shape —
