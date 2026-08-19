@@ -473,7 +473,7 @@ detail on one flag.
 | `NIDUS_MEMORY` | `--memory` | Shared in-RAM working set: `redis://…` (or `valkey://…`, `keydb://…`, `dragonfly://…`) | process-local |
 | `NIDUS_FSYNC` | `--fsync` | `per-batch` (durable per call) or `on-flush` (faster, weaker) | `per-batch` |
 | `NIDUS_MMAP` | `--mmap` | Memory-map immutable segments instead of holding them in RAM | off |
-| `NIDUS_NO_MMAP` | `--no-mmap` | Force mmap off, overriding a recorded `configure --mmap` default | off |
+| `NIDUS_NO_MMAP` | `--no-mmap` | Force mmap off, overriding a recorded `configure --mmap` default or a `NIDUS_MMAP` set in a shared env block | off |
 | `NIDUS_QUERY_THREADS` | `--query-threads` | Worker threads splitting one query's scan (unrelated to serving concurrency) | `1` (serial) |
 | `NIDUS_MAX_VECTOR_BYTES` | `--max-vector-bytes` | Refuse to open a store whose vector matrix would exceed this many bytes | no ceiling |
 | `NIDUS_SEGMENT_MAX_ROWS` | `--segment-max-rows` | Seal the active segment once it reaches this many rows | never seal (one growing segment) |
@@ -508,7 +508,7 @@ See the [Kubernetes guide](/guides/kubernetes/) for running several instances.
 | Variable | Flag | What it does | Default |
 | --- | --- | --- | --- |
 | `NIDUS_CLUSTER` | `--cluster` | Run as one of several cooperating instances over a shared object-store `--persistence` and Redis-family `--memory` tier | off |
-| `NIDUS_NO_CLUSTER` | `--no-cluster` | Run standalone: the explicit off for `--cluster` | off |
+| `NIDUS_NO_CLUSTER` | `--no-cluster` | Run standalone: the explicit off for `--cluster`, and it wins over a `NIDUS_CLUSTER` set in a shared env block | off |
 | `NIDUS_LOCK_TTL` | `--lock-ttl` | Seconds before another process may reclaim a stale writer lock (also the writer-lease window in `--cluster` mode) | `60` |
 | `NIDUS_WAIT_FOR_LEASE` | `--wait-for-lease` | Wait as a standby for the writer handle instead of exiting; bare flag means forever | unset (exit immediately if held) |
 | `NIDUS_REQUIRE_REMOTE` | `--require-remote` | Refuse to start unless persistence and memory are both remote | off |
@@ -546,6 +546,7 @@ See the [Kubernetes guide](/guides/kubernetes/) for running several instances.
 | `NIDUS_EMBED_API_KEY` | `--embed-api-key` | API key for the embedding provider (some, e.g. Ollama, need none) | none |
 | `NIDUS_EMBED_BASE_URL` | `--embed-base-url` | Base-URL override (required for `openai-compat` and self-hosted gateways) | provider's default endpoint |
 | `NIDUS_EMBED_DIMENSION` | `--embed-dimension` | Non-native embedding width, for Voyage Matryoshka models only (256, 512, 1024, 2048) | the model's native width |
+| `NIDUS_STRICT_EMBEDDER_IDENTITY` | `--strict-embedder-identity` | Refuse a recall against a collection with no pinned embedder identity, instead of warning about it | off (warn) |
 
 ### Summarize
 

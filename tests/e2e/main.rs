@@ -5,6 +5,7 @@ mod cli;
 mod harness;
 
 mod cluster;
+mod env_flags;
 mod hardening;
 #[cfg(feature = "mcp")]
 mod mcp;

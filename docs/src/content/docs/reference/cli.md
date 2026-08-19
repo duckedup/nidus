@@ -76,6 +76,16 @@ one, where a mismatch is a hard error.
 | `--wait-for-lease [<SECONDS>]` | `NIDUS_WAIT_FOR_LEASE` | Wait for the writer handle instead of exiting; becomes a standby. Bare flag waits forever. |
 | `--max-staleness <SECONDS>` | `NIDUS_MAX_STALENESS` | Fail the readiness probe once a `--read-only` instance is this stale. |
 | `--max-vector-bytes <N>` | `NIDUS_MAX_VECTOR_BYTES` | Refuse to open a store whose vector matrix would exceed this many bytes. |
+| `--strict-embedder-identity` | `NIDUS_STRICT_EMBEDDER_IDENTITY` | Refuse a recall against a collection with no pinned embedder, instead of warning. |
+
+### Turning a flag back off
+
+Each `--no-…` flag is the explicit off for its positive twin, and it wins wherever the
+positive one came from: a value recorded by `nidus configure`, an inherited
+`NIDUS_CLUSTER`/`NIDUS_MMAP`/`NIDUS_AUTO_COMPACT` in a shared environment block, or a
+default. That is what makes one pod in a Deployment able to run standalone without
+editing the env block it shares. Typing both sides on the same command line is still
+refused, since only there is the contradiction something you wrote yourself.
 
 See [Configuration](/reference/configuration/) for what each of these does to the
 open store, and [Approximate search (ANN)](/guides/cli-and-server/#approximate-search-ann)

@@ -286,6 +286,16 @@ that on two axes:
   before it corrupts a collection's ranking. To switch models, use a separate
   collection.
 
+A collection written straight through `upsert`, by nidus or by any other tool,
+carries no `nidus.embedder` at all, so neither check has anything to compare: a
+recall with a mismatched embedder returns plausible-looking scores from two
+different spaces. That case logs a warning (once per collection and embedder) and
+otherwise proceeds, since refusing it would break every store built on raw
+upserts. Set `Config::strict_embedder_identity` (`--strict-embedder-identity`,
+`NIDUS_STRICT_EMBEDDER_IDENTITY`) to refuse instead: an unpinned collection then
+errors on recall, and a `remember` into one that already holds rows errors rather
+than stamping nidus's own identity onto vectors it did not produce.
+
 ## The escape hatch: bring your own vector
 
 `Memory` is strictly additive. The underlying `Nidus` store (with its raw,
