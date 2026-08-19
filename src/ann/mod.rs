@@ -308,6 +308,15 @@ impl Ann {
         }
     }
 
+    /// Retune `ef_search`/`n_probe` in place; never rebuilds (persist.rs's validity
+    /// key excludes these as query-time-only tunables).
+    pub(crate) fn set_query_params(&mut self, cfg: &AnnConfig) {
+        match self {
+            Ann::Hnsw(g) => g.set_query_params(cfg),
+            Ann::Ivf(i) => i.set_query_params(cfg),
+        }
+    }
+
     /// Rebuild a live index from a decoded snapshot. The kind must match `cfg.kind`
     /// (the caller validates this against the file header first).
     pub(crate) fn from_snapshot(

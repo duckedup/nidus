@@ -62,6 +62,11 @@ impl IvfIndex {
         }
     }
 
+    /// Retune the query-time probe width in place; the lists themselves are untouched.
+    pub(crate) fn set_query_params(&mut self, cfg: &AnnConfig) {
+        self.n_probe = cfg.n_probe.max(1);
+    }
+
     // IVF build is already cheap (k-means over a fixed iteration count, ~seconds even
     // at scale), so it stays serial; `_workers` keeps the signature uniform with HNSW.
     pub(crate) fn build(&mut self, walk: &Walk, live_rows: &[u64], _workers: usize) {

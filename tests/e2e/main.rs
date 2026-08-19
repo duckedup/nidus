@@ -16,3 +16,4 @@ mod scale;
 #[cfg(all(feature = "mcp", feature = "embed-ollama"))]
 mod serve_dim;
 mod server;
+mod tune;

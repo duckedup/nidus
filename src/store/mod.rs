@@ -1053,6 +1053,16 @@ impl Store {
         Ok(())
     }
 
+    /// Retune `ef_search`/`n_probe`/`overscan` in place. Never rebuilds: these are query-time-only
+    /// tunables excluded from the persisted-cache validity key (`ann/persist.rs`), so the built
+    /// structure stays exactly as it was.
+    pub(crate) fn retune_ann(&mut self, cfg: AnnConfig) {
+        self.config.ann = Some(cfg);
+        if let Some(ann) = self.ann.as_mut() {
+            ann.set_query_params(&cfg);
+        }
+    }
+
     /// Write the ANN index to its `ann` cache so the next `open` skips the rebuild. Out-of-band by
     /// design — called explicitly or by `compact`, *never* on the `upsert`/`flush` path. No-op when
     /// ANN is off, the store is in-memory or read-only, or nothing changed.

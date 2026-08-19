@@ -124,6 +124,23 @@ additive over the same append-only file; exact search is unchanged when it is of
 The benchmark above measures the exact path; run `just bench-ann` to sweep the
 approximate variants' recall and latency on your own shapes.
 
+## Benchmarks vs. `nidus tune`
+
+The numbers on this page and `nidus tune` (see [Measuring recall against your own
+data](/guides/search/#measuring-recall-against-your-own-data)) measure two
+different things, and it is easy to conflate them:
+
+- **`benchmarks/`** measures **throughput on synthetic data** across engines
+  (nidus, DuckDB, LanceDB), on shapes chosen to be reproducible and comparable.
+  It answers "how fast is nidus in general, relative to the alternatives."
+- **`nidus tune`** measures **recall and latency against your own store**: it
+  samples your actual vectors, not a synthetic distribution, and reports what an
+  `ef_search`/`n_probe`/`overscan` setting costs and buys *for that data*. It
+  answers "what should I set these to, here."
+
+Use the benchmarks to decide whether nidus fits at all; use `tune` once it does,
+to pick settings for the collection you actually have.
+
 ## Reproduce it
 
 ```bash
