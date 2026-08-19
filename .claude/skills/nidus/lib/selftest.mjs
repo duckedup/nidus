@@ -440,7 +440,7 @@ test('laws: the empty scope is reported even when another finding is present', (
 const CARGO = v => `[package]\nname = "nidus"\nversion = "${v}"\n`
 
 test('laws: a version below origin/main is caught (#173)', () => {
-  const out = laws.versionBackwards(CARGO('0.59.0'), CARGO('0.60.0'), ['Cargo.toml'])
+  const out = laws.versionBackwards(CARGO('0.58.0'), CARGO('0.59.0'), CARGO('0.60.0'), ['Cargo.toml'])
   eq(out.length, 1, 'one finding')
   eq(out[0].id, 'version-backwards', 'id')
   eq(out[0].severity, 'error', 'error, not a warning')
@@ -452,19 +452,34 @@ test('laws: the backwards case slips past versionBump and docsVersionSync (#173)
   const base = CARGO('0.60.0'), head = CARGO('0.59.0')
   eq(laws.versionBump(base, head, ['src/lib.rs']).length, 0, 'versionBump sees a bump')
   eq(laws.docsVersionSync(base, head, { 'README.md': 'nidus = "0.59"' }).length, 0, 'snippet matches head')
-  eq(laws.versionBackwards(head, CARGO('0.60.0'), ['Cargo.toml']).length, 1, 'only the new law catches it')
+  eq(laws.versionBackwards(base, head, CARGO('0.60.0'), ['Cargo.toml']).length, 1, 'only the new law catches it')
 })
 
-test('laws: a version at or above origin/main is fine', () => {
-  eq(laws.versionBackwards(CARGO('0.61.0'), CARGO('0.60.0'), ['Cargo.toml']).length, 0, 'ahead')
-  eq(laws.versionBackwards(CARGO('0.60.0'), CARGO('0.60.0'), ['Cargo.toml']).length, 0, 'equal')
-  eq(laws.versionBackwards(CARGO('0.10.0'), CARGO('0.9.0'), ['Cargo.toml']).length, 0, 'numeric, not lexical')
+test('laws: only a version strictly above origin/main is fine', () => {
+  eq(laws.versionBackwards(CARGO('0.60.0'), CARGO('0.61.0'), CARGO('0.60.0'), ['Cargo.toml']).length, 0, 'ahead')
+  eq(laws.versionBackwards(CARGO('0.9.0'), CARGO('0.10.0'), CARGO('0.9.0'), ['Cargo.toml']).length, 0, 'numeric, not lexical')
+})
+
+// nidus-7nk: #213 bumped 0.67->0.68 while #212 took 0.68 and merged first, so v0.68.0
+// already existed and release.yml skipped every publish job. The law ran in CI and passed,
+// because it allowed equality. Equality is the collision, not a safe no-op.
+test('laws: a version equal to origin/main is caught (nidus-7nk)', () => {
+  const out = laws.versionBackwards(CARGO('0.67.0'), CARGO('0.68.0'), CARGO('0.68.0'), ['Cargo.toml'])
+  eq(out.length, 1, 'one finding')
+  eq(out[0].id, 'version-backwards', 'id')
+  eq(out[0].severity, 'error', 'error, not a warning')
+})
+
+// The reason equality was originally allowed: a branch may edit Cargo.toml for a
+// dependency and never claim a version. Gating on base !== head keeps that clean.
+test('laws: a dependency-only Cargo.toml edit at the same version is fine (nidus-7nk)', () => {
+  eq(laws.versionBackwards(CARGO('0.68.0'), CARGO('0.68.0'), CARGO('0.68.0'), ['Cargo.toml']).length, 0, 'version never claimed')
 })
 
 // A branch that never touches Cargo.toml cannot move the version backwards: the merge
 // keeps main's value. Firing there would nag every skill-only PR into a false bump.
 test('laws: an untouched Cargo.toml is not a backwards version', () => {
-  eq(laws.versionBackwards(CARGO('0.58.0'), CARGO('0.60.0'), ['.claude/skills/nidus/SKILL.md']).length, 0, 'not touched')
+  eq(laws.versionBackwards(CARGO('0.58.0'), CARGO('0.59.0'), CARGO('0.60.0'), ['.claude/skills/nidus/SKILL.md']).length, 0, 'not touched')
 })
 
 // The lanes half of #173, and the more dangerous half: a missing lane costs the
