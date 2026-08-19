@@ -109,6 +109,10 @@ pub struct Config {
     /// holding a heartbeated lease and advancing the manifest per commit, plus any number of
     /// `ReadOnly` readers picking its writes up via `refresh`. Default `false`.
     pub cluster: bool,
+    /// Refuse a memory recall against a collection carrying no pinned embedder identity
+    /// (`nidus.embedder`) rather than warning about it — the un-pinned collection an
+    /// external writer leaves behind cannot be checked for embedder agreement (nidus-8ki).
+    pub strict_embedder_identity: bool,
     /// Which of the profile-eligible knobs were set explicitly via a builder call, so
     /// [`Config::apply_profile`] knows an explicit setter must beat a recorded default.
     explicit: ExplicitFlags,
@@ -148,6 +152,7 @@ impl Config {
             persistence: String::new(),
             memory: String::new(),
             cluster: false,
+            strict_embedder_identity: false,
             explicit: ExplicitFlags::default(),
         }
     }
@@ -267,6 +272,13 @@ impl Config {
     /// See [`cluster`](Self::cluster).
     pub fn cluster(mut self, on: bool) -> Self {
         self.cluster = on;
+        self
+    }
+
+    /// Refuse, rather than warn, when a memory recall names a collection with no pinned
+    /// embedder identity. See [`strict_embedder_identity`](Self::strict_embedder_identity).
+    pub fn strict_embedder_identity(mut self, on: bool) -> Self {
+        self.strict_embedder_identity = on;
         self
     }
 

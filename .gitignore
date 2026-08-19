@@ -45,3 +45,6 @@ BLUEPRINT-*.md
 
 # coordinator dispatch state (see .claude/skills/nidus SKILL.md, Fleet)
 .claude/fleet-plan.json
+
+# wdpkr's local index/state directory, written when nidus is pointed at a wdpkr store
+.wdpkr/

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, bail};
 
+use crate::diag::diag;
 use crate::embed::{AnyEmbedder, Embedder, embedder_identity};
 use crate::meta::now_ms;
 use crate::{Filter, FtsField, Hit, META_EXPIRES_AT, Nidus, Predicate, Record, SearchOpts, Value};
@@ -272,6 +273,11 @@ pub(crate) fn ensure_collection_and_pin<E: Embedder>(
     match meta.get(META_EMBEDDER) {
         Some(existing) => bail_if_identity_differs(collection, existing, &identity)?,
         None => {
+            // Pinning a collection that already holds rows claims vectors we did not embed,
+            // which would silence the recall guard for good — so flag it first (nidus-8ki).
+            if collection_has_rows(db, collection)? {
+                unpinned_collection(db, collection, &identity, "write")?;
+            }
             meta.insert(META_EMBEDDER.to_string(), identity);
             meta.insert(META_DIM.to_string(), store_dim.to_string());
             db.set_meta(collection, meta)?;
@@ -284,6 +290,15 @@ pub(crate) fn ensure_collection_and_pin<E: Embedder>(
         db.set_fts_schema(collection, &default_fts_fields())?;
     }
     Ok(())
+}
+
+/// Whether `collection` already holds rows. Counted from the in-RAM index, so this is a
+/// map walk rather than a scan of the vectors.
+fn collection_has_rows(db: &Nidus, collection: &str) -> anyhow::Result<bool> {
+    Ok(db
+        .aggregate(collection, &crate::AggregateOpts::default())?
+        .count
+        > 0)
 }
 
 /// Bail if `collection` was pinned to a different embedder than `identity`.
@@ -403,17 +418,73 @@ pub(crate) fn commit_remember<E: Embedder>(
 }
 
 /// Recall-side identity guard: refuse a recall whose embedder differs from the one `collection` was
-/// written with, since even a same-dimension mismatch returns meaningless cross-space rankings. A
-/// collection with no pinned embedder — never written through `Memory` — imposes no constraint.
+/// written with, since even a same-dimension mismatch returns meaningless cross-space rankings. An
+/// unpinned collection cannot be checked, so it warns — or refuses under strict mode (nidus-8ki).
 pub(crate) fn guard_recall_identity<E: Embedder>(
     db: &Nidus,
     embedder: &E,
     collection: &str,
 ) -> anyhow::Result<()> {
-    if let Some(existing) = db.get_meta(collection).get(META_EMBEDDER) {
-        bail_if_identity_differs(collection, existing, &embedder_identity(embedder))?;
+    let identity = embedder_identity(embedder);
+    match db.get_meta(collection).get(META_EMBEDDER) {
+        Some(existing) => bail_if_identity_differs(collection, existing, &identity)?,
+        None if db.has_collection(collection) => {
+            unpinned_collection(db, collection, &identity, "recall")?;
+        }
+        None => {}
     }
     Ok(())
+}
+
+/// A collection nidus never wrote through `Memory` carries no embedder identity, so a recall
+/// against it cannot be checked: scores come back plausible whether or not the spaces agree.
+/// Strict mode refuses; otherwise warn once per collection+embedder, since recall is hot.
+fn unpinned_collection(
+    db: &Nidus,
+    collection: &str,
+    identity: &str,
+    op: &str,
+) -> anyhow::Result<()> {
+    if db.config().strict_embedder_identity {
+        bail!(
+            "collection '{collection}' has no pinned embedder ('{META_EMBEDDER}' collection meta), \
+             so this {op} with '{identity}' cannot be checked for embedder agreement; it was \
+             written outside nidus's memory API — pin it, use a separate collection, or turn \
+             strict-embedder-identity off to allow the {op} anyway"
+        );
+    }
+    if warn_once(collection, identity) {
+        diag!(
+            crate::diag::Level::Warn,
+            "memory",
+            "collection has no pinned embedder; cross-embedder results would look plausible",
+            "collection" => collection,
+            "embedder" => identity,
+            "op" => op,
+        );
+    }
+    Ok(())
+}
+
+/// Whether this `(collection, embedder)` pair still owes a warning. Bounded so a caller
+/// naming arbitrary collections cannot grow the set without limit; past the cap every
+/// occurrence warns, which is noisy rather than silent.
+fn warn_once(collection: &str, identity: &str) -> bool {
+    const CAP: usize = 256;
+    static WARNED: std::sync::Mutex<Option<std::collections::BTreeSet<String>>> =
+        std::sync::Mutex::new(None);
+    let key = format!("{collection}\0{identity}");
+    let Ok(mut guard) = WARNED.lock() else {
+        return true;
+    };
+    let seen = guard.get_or_insert_with(std::collections::BTreeSet::new);
+    if seen.contains(&key) {
+        return false;
+    }
+    if seen.len() < CAP {
+        seen.insert(key);
+    }
+    true
 }
 
 /// Embed `query_text` as a query and run a vector search mapped from `opts`.
@@ -514,6 +585,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Nidus::open_dir(dir.path(), dim).unwrap();
         (dir, db)
+    }
+
+    /// A store opened with `strict_embedder_identity`, the opt-in that turns the unpinned
+    /// collection from a warning into a refusal.
+    fn open_tmp_strict(dim: usize) -> (tempfile::TempDir, Nidus) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::Config::new(dir.path(), dim).strict_embedder_identity(true);
+        let db = Nidus::open(cfg).unwrap();
+        (dir, db)
+    }
+
+    /// A collection written straight through `upsert`, the way an external tool does it:
+    /// rows, no `nidus.embedder` meta.
+    fn upsert_unpinned(db: &mut Nidus, collection: &str, dim: usize) {
+        db.create_collection(collection).unwrap();
+        let vector = vec![0.5_f32; dim];
+        db.upsert(
+            collection,
+            &[Record::new("foreign", vector, BTreeMap::new())],
+        )
+        .unwrap();
     }
 
     /// A `RememberMode::Raw` write through the real path — exactly what `Memory::remember`
@@ -781,6 +873,92 @@ mod tests {
         recall_with(&db, &emb_v1, "notes", "hello", &RecallOpts::default())
             .await
             .unwrap();
+    }
+
+    /// The warning is once per collection+embedder: recall is a hot path, and a line per
+    /// query would be dropped by whoever set `NIDUS_LOG=error` to escape it.
+    #[test]
+    fn warn_once_repeats_only_for_a_new_collection_or_embedder() {
+        assert!(warn_once("warn-once-notes", "fake/v1"));
+        assert!(!warn_once("warn-once-notes", "fake/v1"));
+        assert!(warn_once("warn-once-notes", "fake/v2"));
+        assert!(warn_once("warn-once-other", "fake/v1"));
+    }
+
+    /// nidus-8ki: a collection written by an external tool carries no `nidus.embedder`, so
+    /// the identity guard has nothing to compare. It must not pass silently — under the strict
+    /// setting the recall is refused outright.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // file-backed via open_tmp_strict; `memory` is off in the Miri lane.
+    async fn strict_mode_refuses_recall_on_an_unpinned_collection() {
+        let (_dir, mut db) = open_tmp_strict(8);
+        upsert_unpinned(&mut db, "notes", 8);
+
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        let err = recall_with(&db, &emb, "notes", "hello", &RecallOpts::default())
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no pinned embedder") && msg.contains(META_EMBEDDER),
+            "the message should name the missing pin: {msg}"
+        );
+    }
+
+    /// The default stays permissive — refusing every raw-upsert store would break existing
+    /// callers — so the same recall succeeds, having only warned via `diag`.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // file-backed via open_tmp; also `memory` is off in the Miri lane.
+    async fn an_unpinned_collection_still_recalls_by_default() {
+        let (_dir, mut db) = open_tmp(8);
+        upsert_unpinned(&mut db, "notes", 8);
+
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        recall_with(&db, &emb, "notes", "hello", &RecallOpts::default())
+            .await
+            .expect("an unpinned collection warns, it does not refuse");
+    }
+
+    /// Strict mode also refuses to *pin* a collection that already holds foreign rows: doing so
+    /// would claim vectors nidus never embedded and silence the recall guard from then on.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // file-backed via open_tmp_strict; `memory` is off in the Miri lane.
+    async fn strict_mode_refuses_to_pin_a_populated_unpinned_collection() {
+        let (_dir, mut db) = open_tmp_strict(8);
+        upsert_unpinned(&mut db, "notes", 8);
+
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        let err = remember_raw(&mut db, &emb, "notes", "a", "hello", BTreeMap::new())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no pinned embedder"),
+            "the write should name the missing pin: {err}"
+        );
+        assert!(
+            !db.get_meta("notes").contains_key(META_EMBEDDER),
+            "a refused write must not have stamped the identity anyway"
+        );
+    }
+
+    /// An *empty* collection is nobody's foreign data, so strict mode still lets the first
+    /// `remember` create and pin it — the flag guards adoption, not creation.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // file-backed via open_tmp_strict; `memory` is off in the Miri lane.
+    async fn strict_mode_still_pins_a_fresh_collection() {
+        let (_dir, mut db) = open_tmp_strict(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+
+        remember_raw(&mut db, &emb, "notes", "a", "hello", BTreeMap::new())
+            .await
+            .expect("a fresh collection is nobody else's data");
+        assert_eq!(
+            db.get_meta("notes").get(META_EMBEDDER).map(String::as_str),
+            Some("fake/v1")
+        );
+        recall_with(&db, &emb, "notes", "hello", &RecallOpts::default())
+            .await
+            .expect("the collection is pinned now, so recall is checkable");
     }
 
     #[tokio::test]

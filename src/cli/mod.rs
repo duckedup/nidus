@@ -6,7 +6,10 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{
+    ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, error::ErrorKind,
+    parser::ValueSource,
+};
 use serde::Serialize;
 
 use crate::server::dto::{AnnDto, FootprintDto, HitDto};
@@ -39,6 +42,68 @@ mod memory;
 pub struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// The `--x` / `--no-x` pairs, by clap arg id. Each `--no-` side wins on precedence
+/// (see [`StoreArgs::config`]); typing both is still a conflict, but only when *both*
+/// were typed on the command line (nidus-ixw).
+const OFF_FLAG_PAIRS: [(&str, &str); 3] = [
+    ("cluster", "no_cluster"),
+    ("mmap", "no_mmap"),
+    ("auto_compact", "no_auto_compact"),
+];
+
+impl Cli {
+    /// Parse the process arguments, exiting with clap's own usage message on error.
+    /// Not `Parser::parse`: the on/off pairs need a conflict check clap's
+    /// `conflicts_with` cannot express (nidus-ixw).
+    pub fn parse_checked() -> Cli {
+        Cli::try_parse_checked(std::env::args_os()).unwrap_or_else(|e| e.exit())
+    }
+
+    fn try_parse_checked<I, T>(argv: I) -> Result<Cli, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let mut cmd = <Cli as CommandFactory>::command();
+        let matches = cmd.try_get_matches_from_mut(argv)?;
+        reject_both_typed(&mut cmd, &matches)?;
+        <Cli as FromArgMatches>::from_arg_matches(&matches)
+    }
+}
+
+/// Reject an on/off pair whose two sides were *both* typed on the command line, at any
+/// subcommand depth. An env-set default is not "typed", so `--no-x` still overrides it —
+/// which is the whole reason `conflicts_with` had to go.
+fn reject_both_typed(cmd: &mut clap::Command, matches: &ArgMatches) -> Result<(), clap::Error> {
+    let mut level = matches;
+    loop {
+        for (on, off) in OFF_FLAG_PAIRS {
+            if typed(level, on) && typed(level, off) {
+                return Err(cmd.error(
+                    ErrorKind::ArgumentConflict,
+                    format!(
+                        "the argument '--{}' cannot be used with '--{}'",
+                        off.replace('_', "-"),
+                        on.replace('_', "-")
+                    ),
+                ));
+            }
+        }
+        match level.subcommand() {
+            Some((_, sub)) => level = sub,
+            None => return Ok(()),
+        }
+    }
+}
+
+/// Whether `id` got its value from this command line, as opposed to an env var, a default,
+/// or not at all. The `ids` scan keeps `value_source` from panicking on a subcommand that
+/// does not carry the arg at all.
+fn typed(matches: &ArgMatches, id: &str) -> bool {
+    matches.ids().any(|i| i.as_str() == id)
+        && matches!(matches.value_source(id), Some(ValueSource::CommandLine))
 }
 
 /// Store location, shared by every subcommand. For an existing store the dimension and distance
@@ -99,18 +164,20 @@ struct StoreArgs {
     memory: Option<String>,
     /// Run as one of several cooperating instances over a *shared* store (SPEC §14.6):
     /// requires an object-store `--persistence` **and** a Redis-family `--memory` tier.
-    #[arg(long, env = "NIDUS_CLUSTER", conflicts_with = "no_cluster")]
+    #[arg(long, env = "NIDUS_CLUSTER")]
     cluster: bool,
     /// Run standalone — the explicit off a bare `--cluster` bool cannot express, so a
-    /// recorded default can be turned back off for one command (nidus-171).
+    /// recorded default can be turned back off for one command (nidus-171). Wins over
+    /// `--cluster` from any source, including a `NIDUS_CLUSTER` env default (nidus-ixw).
     #[arg(long, env = "NIDUS_NO_CLUSTER")]
     no_cluster: bool,
     /// Memory-map immutable segments instead of holding them in RAM — lets a store
     /// exceed RAM on one node. Local filesystem + little-endian only; other segments
     /// fall back to a RAM load.
-    #[arg(long, env = "NIDUS_MMAP", conflicts_with = "no_mmap")]
+    #[arg(long, env = "NIDUS_MMAP")]
     mmap: bool,
-    /// Turn mmap off, overriding a recorded `configure --mmap` default (nidus-141).
+    /// Turn mmap off, overriding a recorded `configure --mmap` default (nidus-141) or a
+    /// `NIDUS_MMAP` env default (nidus-ixw).
     #[arg(long, env = "NIDUS_NO_MMAP")]
     no_mmap: bool,
     /// Quantize the search first pass for speed, then rerank the candidates in exact
@@ -141,9 +208,10 @@ struct StoreArgs {
     #[arg(long, env = "NIDUS_FSYNC")]
     fsync: Option<FsyncArg>,
     /// Rewrite the data matrix when this fraction of rows is dead (default `0.5`).
-    #[arg(long, env = "NIDUS_AUTO_COMPACT", conflicts_with = "no_auto_compact")]
+    #[arg(long, env = "NIDUS_AUTO_COMPACT")]
     auto_compact: Option<f32>,
-    /// Never auto-compact; reclaim dead rows only on an explicit `compact`.
+    /// Never auto-compact; reclaim dead rows only on an explicit `compact`. Wins over
+    /// `--auto-compact` from any source, including its env default (nidus-ixw).
     #[arg(long, env = "NIDUS_NO_AUTO_COMPACT")]
     no_auto_compact: bool,
     /// Seconds before another process may reclaim a stale writer lock (default `60`).
@@ -169,6 +237,11 @@ struct StoreArgs {
     /// overcommit guard (SPEC §6.6). Omit for no ceiling.
     #[arg(long, env = "NIDUS_MAX_VECTOR_BYTES")]
     max_vector_bytes: Option<u64>,
+    /// Refuse a memory recall against a collection with no pinned `nidus.embedder` identity
+    /// instead of only warning — the unverifiable case an external writer leaves behind,
+    /// where a mismatched embedder returns plausible-looking scores (nidus-8ki).
+    #[arg(long, env = "NIDUS_STRICT_EMBEDDER_IDENTITY")]
+    strict_embedder_identity: bool,
 }
 
 impl StoreArgs {
@@ -263,6 +336,9 @@ impl StoreArgs {
             cfg = cfg.auto_compact(None);
         } else if let Some(ratio) = self.auto_compact {
             cfg = cfg.auto_compact(Some(ratio));
+        }
+        if self.strict_embedder_identity {
+            cfg = cfg.strict_embedder_identity(true);
         }
         if let Some(secs) = self.lock_ttl {
             cfg = cfg.lock_ttl(std::time::Duration::from_secs(secs));
@@ -2436,6 +2512,25 @@ mod tests {
         assert_eq!(cfg.max_vector_bytes, Some(4096));
     }
 
+    /// The strict-embedder-identity opt-in has to reach `Config`, since the guard it arms
+    /// lives in the library and reads it off the open store (nidus-8ki).
+    #[test]
+    fn strict_embedder_identity_reaches_config() {
+        let cfg = serve_store(&["--strict-embedder-identity"])
+            .config(OpenMode::ReadWrite)
+            .expect("config");
+        assert!(cfg.strict_embedder_identity);
+
+        let cfg = serve_store(&[])
+            .config(OpenMode::ReadWrite)
+            .expect("config");
+        assert!(
+            !cfg.strict_embedder_identity,
+            "the default must stay permissive: refusing every raw-upsert store would \
+             break existing callers"
+        );
+    }
+
     /// With none of the new flags passed, `Config`'s own defaults must survive — a
     /// flag defaulting to `Some(..)` would silently change behaviour for everyone.
     #[test]
@@ -2504,38 +2599,45 @@ mod tests {
         assert!(!cfg.cluster);
     }
 
+    /// Both sides of a pair on one command line is a contradiction the user typed, so it
+    /// stays an error — the check moved off `conflicts_with`, it did not go away (nidus-ixw).
     #[test]
-    fn cluster_and_no_cluster_conflict() {
-        assert!(
-            Cli::try_parse_from([
-                "nidus",
-                "serve",
-                "--dir",
-                "/tmp/s",
-                "--dim",
-                "3",
-                "--cluster",
-                "--no-cluster"
+    fn both_sides_of_an_off_pair_on_the_command_line_conflict() {
+        for (on, off) in [
+            ("--cluster", "--no-cluster"),
+            ("--mmap", "--no-mmap"),
+            ("--auto-compact=0.25", "--no-auto-compact"),
+        ] {
+            let err = Cli::try_parse_checked([
+                "nidus", "serve", "--dir", "/tmp/s", "--dim", "3", on, off,
             ])
-            .is_err()
+            .expect_err("both sides typed should conflict");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+            assert!(
+                err.to_string().contains(off),
+                "the message should name the flag pair: {err}"
+            );
+        }
+    }
+
+    /// The same conflict at a non-`serve` subcommand depth, since `StoreArgs` is flattened
+    /// into every one of them and the check walks the matches to find it.
+    #[test]
+    fn off_pair_conflict_is_caught_on_any_subcommand() {
+        assert!(
+            Cli::try_parse_checked(["nidus", "stats", "--dir", "/tmp/s", "--mmap", "--no-mmap"])
+                .is_err()
         );
     }
 
+    /// One side alone parses, whichever side it is — the conflict must not fire on the
+    /// single-flag case that every existing invocation uses.
     #[test]
-    fn mmap_and_no_mmap_conflict() {
-        assert!(
-            Cli::try_parse_from([
-                "nidus",
-                "serve",
-                "--dir",
-                "/tmp/s",
-                "--dim",
-                "3",
-                "--mmap",
-                "--no-mmap"
-            ])
-            .is_err()
-        );
+    fn one_side_of_an_off_pair_parses_fine() {
+        for flag in ["--cluster", "--no-cluster", "--mmap", "--no-mmap"] {
+            Cli::try_parse_checked(["nidus", "serve", "--dir", "/tmp/s", "--dim", "3", flag])
+                .unwrap_or_else(|e| panic!("{flag} alone should parse: {e}"));
+        }
     }
 
     #[test]
@@ -2646,9 +2748,9 @@ mod tests {
             .expect("config");
         assert_eq!(cfg.auto_compact, Some(0.25));
 
-        // Setting a ratio and disabling at once is contradictory, so clap refuses it.
+        // Setting a ratio and disabling at once is contradictory, so the parse refuses it.
         assert!(
-            Cli::try_parse_from([
+            Cli::try_parse_checked([
                 "nidus",
                 "serve",
                 "--dir",

@@ -27,7 +27,8 @@ let cfg = Config::new("/path/to/store", 768)
     .mmap(false)                     // memory-map immutable segments, not RAM (default: off)
     .persistence("")                 // durable bytes: "" = local; "s3://…"/"gs://…"
     .memory("")                      // shared working set: "" = local; "redis://…"
-    .cluster(false);                 // instances over a shared backend (default: off)
+    .cluster(false)                  // instances over a shared backend (default: off)
+    .strict_embedder_identity(false); // refuse recall on an unpinned collection (default: warn)
 # let _ = cfg;
 ```
 
@@ -214,6 +215,18 @@ its writes with [`refresh()`](/reference/api/#search--maintenance). It is reject
 by definition. There is no coordinator, replication, or rebalancing; the object store plus the
 versioned manifest are the coordination. See
 [cooperating instances](/guides/storage-backends/#cooperating-instances-cluster).
+
+### `strict_embedder_identity`
+
+`bool`, default `false`. The memory layer pins the embedder's `provider/model` identity into
+each collection it writes (`nidus.embedder` meta) and refuses a mismatched one. A collection
+written straight through `upsert`, by nidus or by another tool, has no such pin, so nothing can
+be compared: a recall with the wrong embedder returns plausible-looking scores across two
+spaces. By default that logs a warning (once per collection and embedder) and proceeds, since
+refusing it would break every store built on raw upserts. Set this to `true` and the unverifiable
+case is an error instead: recall against an unpinned collection fails, and `remember` into one
+that already holds rows fails rather than claiming those vectors as nidus's own. See
+[remember and recall](/guides/remember-and-recall/#dimension-and-embedder-identity-pinning).
 
 ## `Fsync`
 
