@@ -250,6 +250,24 @@ def test_full_lifecycle(server: str) -> None:
         assert stats.footprint.dimension == 3
 
 
+def test_search_similar_excludes_the_source_but_keeps_a_true_duplicate(server: str) -> None:
+    """ "More like this" over a real store: the source id never comes back, a duplicate does."""
+    with NidusClient(server, timeout=10.0) as db:
+        db.upsert(
+            "docs",
+            [
+                {"id": "a", "vector": [1.0, 0.0, 0.0], "attrs": {"lang": "rust"}},
+                {"id": "dup", "vector": [1.0, 0.0, 0.0], "attrs": {"lang": "rust"}},
+                {"id": "b", "vector": [0.0, 1.0, 0.0], "attrs": {"lang": "go"}},
+            ],
+        )
+        hits = db.search_similar(collection="docs", id="a", top_k=10)
+        ids = [h.id for h in hits]
+        assert "a" not in ids
+        assert "dup" in ids
+        assert ids[0] == "dup"
+
+
 def test_a_server_error_arrives_as_a_nidus_error(server: str) -> None:
     """The error path over a real socket: the server's own message, with its status."""
     with NidusClient(server, timeout=10.0) as db:

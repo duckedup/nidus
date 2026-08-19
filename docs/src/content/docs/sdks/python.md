@@ -136,6 +136,25 @@ db.upsert("docs", [{"id": "d", "attrs": {"tags": v.list(["a", "b"]), "rank": v.i
 `v.nil()` is the explicit `Null` value ("set, and empty"), which is a different fact from
 an absent key ("not set / not indexed"). The SDK keeps the two apart in both directions.
 
+## Similar records ("more like this")
+
+`search_similar` runs a search using the vector already stored at a record, instead of
+a query you supply yourself:
+
+```python
+hits = db.search_similar("docs", "a", top_k=5)
+```
+
+Takes the same keyword options as `search` (`top_k`, `offset`, `min_score`, `filter`,
+`exact`, `rank_by`, `limit_per`), plus `scope`: which collections to search, defaulting
+to the source record's own collection rather than every collection in the store the
+way a plain `search`'s omitted scope does.
+
+The source record is never in its own results, dropped by id after ranking, not by a
+score cutoff, so a genuine duplicate of it (also scoring near 1.0) still comes back. A
+collection/id pair naming no record, or a record with no stored vector (a text-only
+entry), raises `NidusError` naming the id and the reason, not an empty result.
+
 ## Filtering
 
 Build an AND-filter with the `f.*` helpers. Each predicate is a positive assertion about a

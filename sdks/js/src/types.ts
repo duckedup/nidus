@@ -315,6 +315,28 @@ export interface SearchOptions extends ProjectionOptions, RankingOptions {
 }
 
 /**
+ * Options for {@link NidusClient.searchSimilar}. `collection`/`id` name the source
+ * record; an empty/omitted `scope` searches the source's own collection (not every
+ * collection — the one place this differs from {@link NidusClient.search}). The source
+ * record is never in the results.
+ */
+export interface SimilarSearchOptions extends ProjectionOptions, RankingOptions {
+  collection: string;
+  id: string;
+  scope?: string[];
+  topK?: number;
+  /** Skip this many top-ranked hits, for pagination. `offset + topK` may not exceed 10000. */
+  offset?: number;
+  minScore?: number;
+  filter?: Filter;
+  /**
+   * Force the exact scan for this query, bypassing any ANN index and the
+   * quantized first pass. The index stays in place for every other query.
+   */
+  exact?: boolean;
+}
+
+/**
  * The two accepted spellings of a text query: one `field` plus its `query`, or a list of
  * `clauses` each carrying its own text. Sending both, or an empty list, is a `400` — an
  * empty result would otherwise read as "no matches" rather than "no query".

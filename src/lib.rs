@@ -380,6 +380,22 @@ impl Nidus {
         self.store.search(&refs, query, opts)
     }
 
+    /// "More like this": search a [`Scope`] with the vector already stored at
+    /// `collection`/`id`, dropping that source record from the results. `scope` need not be
+    /// `collection` itself — one embedding space means any scope can be searched.
+    pub fn search_similar<'a>(
+        &self,
+        scope: impl Into<Scope<'a>>,
+        collection: &str,
+        id: &str,
+        opts: &SearchOpts,
+    ) -> Result<Vec<Hit>> {
+        filter::validate(&opts.filter)?;
+        let names = self.scope_names(scope);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.store.search_similar(&refs, collection, id, opts)
+    }
+
     /// Full-text (BM25) search over a [`Scope`], merged into one ranking. Requires the field to be
     /// declared in the collection's FTS schema. Reuses [`SearchOpts`], but `min_score` here is a raw
     /// BM25 floor rather than a cosine one; text-only and vector-bearing docs are both eligible.

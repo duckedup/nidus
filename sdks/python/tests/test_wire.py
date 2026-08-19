@@ -262,6 +262,45 @@ def test_a_bare_string_projection_is_refused() -> None:
         _wire.search_body([1.0], include_attributes="title")  # type: ignore[arg-type]
 
 
+def test_similar_body_omits_unset_optionals_but_keeps_scope_and_filter() -> None:
+    """The default case: only ``collection``/``id``, plus the two empties."""
+    assert _wire.similar_body("notes", "a") == {
+        "collection": "notes",
+        "id": "a",
+        "scope": [],
+        "filter": [],
+    }
+
+
+def test_similar_body_full() -> None:
+    """Every option set, in the server's ``snake_case`` spelling."""
+    assert _wire.similar_body(
+        "notes",
+        "a",
+        scope=["notes"],
+        top_k=5,
+        offset=10,
+        min_score=0.1,
+        filter=f.and_(f.eq("lang", "rust")),
+        exact=True,
+    ) == {
+        "collection": "notes",
+        "id": "a",
+        "scope": ["notes"],
+        "top_k": 5,
+        "offset": 10,
+        "min_score": 0.1,
+        "filter": [{"Eq": ["lang", {"Str": "rust"}]}],
+        "exact": True,
+    }
+
+
+def test_similar_body_sends_an_explicit_zero_top_k() -> None:
+    """``top_k=None`` is omitted; ``top_k=0`` is sent as ``0``, same rule as ``search_body``."""
+    assert "top_k" not in _wire.similar_body("notes", "a", top_k=None)
+    assert _wire.similar_body("notes", "a", top_k=0)["top_k"] == 0
+
+
 def test_text_search_body() -> None:
     """BM25 over one field; ``min_score`` here is a raw BM25 floor, still optional."""
     assert _wire.text_search_body("body", "fox") == {

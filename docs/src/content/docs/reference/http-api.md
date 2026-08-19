@@ -31,6 +31,7 @@ so the same id appears in your logs and the server's.
 | `POST /collections/{name}/fts-schema` | declare full-text-indexed fields | `set_fts_schema` |
 | `POST /collections/{name}/filter-index` | declare filter-indexed fields | `set_filter_index` |
 | `POST /search` | nearest-neighbour search | `search` |
+| `POST /search/similar` | "more like this" using a stored record's own vector | `search_similar` |
 | `POST /search/batch` | several queries in one round-trip, optionally RRF-fused | – |
 | `POST /text-search` | BM25 full-text search | `text_search` |
 | `POST /hybrid-search` | fused vector + BM25 (RRF) | `hybrid_search` |
@@ -446,6 +447,40 @@ Records **missing** the attribute share one group, and the value is read from th
 record, so `exclude_attributes` cannot lift the cap. The cap is exact only within an
 over-fetch window, so a capped page may come back shorter than `top_k`; what is guaranteed
 is that no page carries more than `max` hits for one value.
+
+### `POST /search/similar`
+
+"More like this": search using the vector already stored at `collection`/`id`, instead of
+a caller-supplied `query`. Otherwise it takes the same fields as `POST /search`.
+
+```bash
+curl -s localhost:7700/search/similar \
+  -H 'content-type: application/json' \
+  -d '{"collection": "docs", "id": "a1", "top_k": 5}'
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `collection` | – (required) | collection the source record lives in |
+| `id` | – (required) | id of the record to search with |
+| `scope` | the source's own collection | collection names to search |
+| `top_k` | `10` | maximum hits to return |
+| `offset` | `0` | top-ranked hits to skip, for pagination |
+| `min_score` | none | drop hits scoring below this similarity |
+| `filter` | none | AND of predicates applied before scoring |
+| `exact` | `false` | force the exact scan, bypassing any index and quantization |
+| `include_attributes` | all attrs | return only these attrs |
+| `exclude_attributes` | all attrs | return every attr but these |
+| `rank_by` | none | a [ranking expression](/guides/search/#ranking-by-recency) over the metric |
+| `limit_per` | none | cap hits per distinct value of an attribute |
+
+The one difference from `/search`: an omitted or empty `scope` searches only the source's
+own collection, not every collection in the store.
+
+The source record is always excluded from its own results, by `(collection, id)` identity
+rather than by score, so a genuine duplicate of the source (also scoring near 1.0) still
+comes back. `collection`/`id` naming no record, or a record with no stored vector to search
+with (a text-only entry), is a `400` naming the id and the reason, not an empty result.
 
 ### `POST /text-search`
 

@@ -121,6 +121,20 @@ describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
     expect(stats.footprint.doc_count).toBe(2);
   });
 
+  it("searchSimilar finds a near neighbour and excludes the source record", async () => {
+    await db.upsert("docs", [
+      { id: "c", vector: [0.9, 0.1, 0], attrs: { lang: "rust-ish" } },
+    ]);
+
+    const hits = await db.searchSimilar({ collection: "docs", id: "a", topK: 10 });
+    expect(hits.some((h) => h.id === "a")).toBe(false);
+    expect(hits.some((h) => h.id === "c")).toBe(true);
+
+    // This suite shares one server, and a later case asserts the exact contents
+    // of `docs`, so the fixture must not outlive the test that added it.
+    expect(await db.delete("docs", { ids: ["c"] })).toBe(1);
+  });
+
   it("filters, text search, and hybrid search", async () => {
     await db.setFtsSchema("notes", ["body"]);
     await db.upsert("notes", [

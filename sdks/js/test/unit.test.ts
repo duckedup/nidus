@@ -259,6 +259,35 @@ describe("NidusClient request shaping", () => {
     });
   });
 
+  it("sends searchSimilar to /search/similar with camelCase mapped to snake_case", async () => {
+    const { fn, calls } = mockFetch([
+      { collection: "docs", id: "b", score: 0.8, attrs: { lang: { Str: "rust" } } },
+    ]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const hits = await db.searchSimilar({
+      collection: "docs",
+      id: "a",
+      topK: 5,
+      minScore: 0.1,
+      filter: f.and(f.eq("lang", "rust")),
+    });
+    expect(calls[0]!.url).toBe("http://x/search/similar");
+    expect(calls[0]!.json).toEqual({
+      collection: "docs",
+      id: "a",
+      scope: [],
+      top_k: 5,
+      min_score: 0.1,
+      filter: [{ Eq: ["lang", { Str: "rust" }] }],
+    });
+    expect(hits[0]).toEqual({
+      collection: "docs",
+      id: "b",
+      score: 0.8,
+      attrs: { lang: "rust" },
+    });
+  });
+
   it("sends a bare fts field name unchanged", async () => {
     const { fn, calls } = mockFetch({ ok: true });
     const db = new NidusClient({ baseUrl: "http://x", fetch: fn });

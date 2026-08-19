@@ -38,7 +38,8 @@ serve` below when several clients need to share one.
 
 Pass `--read-only` to open without taking that lock: any number of read-only
 sessions can run alongside a writer. `recall`, `text_search`, `hybrid_search`,
-`get`, and `browse` all work; `remember` and `forget` fail, since they write.
+`get`, `browse`, and `related` all work; `remember` and `forget` fail, since
+they write.
 
 ## Over HTTP (`nidus serve`)
 
@@ -96,6 +97,7 @@ client's writes rather than each client racing for its own.
 | `forget` | Remove memories by id or by metadata filter. Irreversible. |
 | `get` | Fetch one memory by id: its id and attrs, never its vector. |
 | `browse` | List a collection's contents, bounded and optionally filtered, without a query. |
+| `related` | Find entries like one you already have, using its own stored vector as the query. |
 
 Every one of them takes **natural language, never vectors**. That is deliberate:
 a model cannot write a 1024-float array as a tool argument, so the raw
@@ -147,7 +149,7 @@ embedded) while `nidus.text` still holds your original.
 `remember` takes two optional arguments that shape what accumulates:
 
 - **`ttl_seconds`** gives the entry a lifetime. Past it, the entry stops coming
-  back from `recall`, `text_search`, `hybrid_search`, `browse`, and `get`.
+  back from `recall`, `text_search`, `hybrid_search`, `browse`, `get`, and `related`.
 - **`dedupe_threshold`** (0–1) turns on a similarity check at write time. If an
   existing entry in the collection scores above the threshold against the new
   text, that entry is updated in place instead of a competing near-duplicate
@@ -166,6 +168,14 @@ as "remove everything in the collection". Before writing, `get` and `browse`
 let an agent check what is already there: `get` looks up one id directly,
 and `browse` lists a collection's contents (optionally filtered) so a model
 can spot a near-duplicate before adding one.
+
+`related` takes a `collection` and an `id` instead of query text: it searches
+with the vector already stored at that entry, in the same collection, and the
+source entry is never included in its own results. A genuine near-duplicate of
+the source **is** still returned, since exclusion is by id rather than by
+score, which makes `related` a way to surface a duplicate that a `dedupe_threshold`
+write missed. An expired source, or an id naming no entry, is refused rather
+than answered with an empty list.
 
 ## Resources and prompts
 

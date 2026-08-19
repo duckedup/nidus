@@ -316,6 +316,10 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 			})
 			return err
 		}},
+		{"SearchSimilar", `[]`, http.MethodPost, "/search/similar", func(c *Client) error {
+			_, err := c.SearchSimilar(ctx, SimilarRequest{Collection: "docs", ID: "a"})
+			return err
+		}},
 		{"List", `[]`, http.MethodPost, "/list", func(c *Client) error {
 			_, err := c.List(ctx, ListRequest{Scope: []string{"docs"}})
 			return err
@@ -561,6 +565,41 @@ func TestExactAndProjectionAreAdditive(t *testing.T) {
 	}
 	if body := fake.sentBody(t); body != `{"limit":5,"exclude_attributes":["body"]}` {
 		t.Errorf("body = %s, want exclude_attributes", body)
+	}
+}
+
+// TestSearchSimilarSendsIDNotQuery pins the one thing that distinguishes SimilarRequest
+// from SearchRequest on the wire: no query vector, but collection and id instead. Zero-
+// valued options must stay omitted, exactly as they do on Search.
+func TestSearchSimilarSendsIDNotQuery(t *testing.T) {
+	fake := &capture{reply: `[{"collection":"docs","id":"b","score":0.9,"attrs":{}}]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	hits, err := db.SearchSimilar(ctx, SimilarRequest{Collection: "docs", ID: "a"})
+	if err != nil {
+		t.Fatalf("SearchSimilar failed: %v", err)
+	}
+	if snap := fake.snapshot(); snap.method != http.MethodPost || snap.path != "/search/similar" {
+		t.Errorf("request = %s %s, want POST /search/similar", snap.method, snap.path)
+	}
+	if body := fake.sentBody(t); body != `{"collection":"docs","id":"a"}` {
+		t.Errorf("body = %s, want only collection and id", body)
+	}
+	if len(hits) != 1 || hits[0].ID != "b" {
+		t.Fatalf("hits = %+v, want one hit for id b", hits)
+	}
+
+	if _, err := db.SearchSimilar(ctx, SimilarRequest{
+		Collection: "docs", ID: "a", Scope: []string{"docs", "notes"}, TopK: 5, Offset: 2,
+		MinScore: f32(0), Exact: true,
+	}); err != nil {
+		t.Fatalf("SearchSimilar failed: %v", err)
+	}
+	want := `{"collection":"docs","id":"a","scope":["docs","notes"],"top_k":5,"offset":2,` +
+		`"min_score":0,"exact":true}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
 	}
 }
 

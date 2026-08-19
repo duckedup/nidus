@@ -91,6 +91,7 @@ STATS = "/stats"
 COLLECTIONS = "/collections"
 SEARCH = "/search"
 SEARCH_BATCH = "/search/batch"
+SIMILAR = "/search/similar"
 TEXT_SEARCH = "/text-search"
 HYBRID_SEARCH = "/hybrid-search"
 LIST = "/list"
@@ -303,6 +304,44 @@ def search_body(
     return prune(
         {
             "query": _guards.float_sequence(query, "search(query=...)"),
+            "scope": _scope(scope),
+            "top_k": top_k,
+            "offset": offset,
+            "min_score": min_score,
+            "filter": list(filter) if filter is not None else [],
+            "exact": exact,
+            **_projection(include_attributes, exclude_attributes),
+            "rank_by": rank_by,
+            "limit_per": _limit_per(limit_per),
+        }
+    )
+
+
+def similar_body(
+    collection: str,
+    id: str,  # noqa: A002
+    scope: Optional[Sequence[str]] = None,
+    top_k: Optional[int] = None,
+    offset: Optional[int] = None,
+    min_score: Optional[float] = None,
+    filter: Optional[Filter] = None,  # noqa: A002
+    exact: Optional[bool] = None,
+    include_attributes: Optional[Sequence[str]] = None,
+    exclude_attributes: Optional[Sequence[str]] = None,
+    rank_by: Optional[RankBy] = None,
+    limit_per: Optional[LimitPer] = None,
+) -> dict[str, Any]:
+    """Body for ``POST /search/similar`` ("more like this" over an existing record).
+
+    ``scope`` is sent as ``[]`` when unset, same spelling as :func:`search_body` — but here
+    the empty value means the source's *own* collection, not every collection, which is the
+    one place this route's defaulting differs from ``/search``. Every other knob prunes
+    exactly as it does there.
+    """
+    return prune(
+        {
+            "collection": collection,
+            "id": id,
             "scope": _scope(scope),
             "top_k": top_k,
             "offset": offset,

@@ -84,6 +84,25 @@ absent key ("not set / not indexed"). The SDK keeps the two apart in both direct
 a decoded `Date` (from `v.datetime`) re-encodes to the same `DateTime`, never a plain
 number, so a round trip through `attrs` never demotes an instant to an `Int`.
 
+## Similar records ("more like this")
+
+`searchSimilar` runs a search using the vector already stored at a record, instead of
+a query you supply yourself:
+
+```ts
+const hits = await db.searchSimilar("docs", "a", { topK: 5 });
+```
+
+Takes the same options as `search` (`topK`, `offset`, `minScore`, `filter`, `exact`,
+`includeAttributes`/`excludeAttributes`, `rankBy`, `limitPer`), plus `scope`: which
+collections to search, defaulting to the source record's own collection rather than
+every collection in the store the way a plain `search`'s omitted scope does.
+
+The source record is never in its own results, dropped by id after ranking, not by a
+score cutoff, so a genuine duplicate of it (also scoring near 1.0) still comes back. A
+`collection`/id pair naming no record, or a record with no stored vector (a text-only
+entry), throws a `NidusError` naming the id and the reason, not an empty result.
+
 ## Filtering
 
 Build an AND-filter with the `f.*` helpers. Each predicate is a positive assertion about

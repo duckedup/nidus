@@ -258,6 +258,47 @@ class NidusClient:
             ),
         )
 
+    def search_similar(
+        self,
+        *,
+        collection: str,
+        id: str,  # noqa: A002
+        scope: Optional[Sequence[str]] = None,
+        top_k: Optional[int] = None,
+        offset: Optional[int] = None,
+        min_score: Optional[float] = None,
+        filter: Optional[Filter] = None,  # noqa: A002
+        exact: Optional[bool] = None,
+        include_attributes: Optional[Sequence[str]] = None,
+        exclude_attributes: Optional[Sequence[str]] = None,
+        rank_by: Optional[RankBy] = None,
+        limit_per: Optional[LimitPer] = None,
+    ) -> Hits:
+        """Records most like the one already stored at ``collection``/``id``.
+
+        The source record itself is never in the results; a true duplicate of it is. An
+        omitted ``scope`` searches the source's own collection, not every collection — the
+        one place this differs from :meth:`search`. Every other argument behaves exactly as
+        it does there.
+        """
+        return self._search(
+            _wire.SIMILAR,
+            _wire.similar_body(
+                collection,
+                id,
+                scope=scope,
+                top_k=top_k,
+                offset=offset,
+                min_score=min_score,
+                filter=filter,
+                exact=exact,
+                include_attributes=include_attributes,
+                exclude_attributes=exclude_attributes,
+                rank_by=rank_by,
+                limit_per=limit_per,
+            ),
+        )
+
     def text_search(
         self,
         *,
