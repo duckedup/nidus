@@ -21,9 +21,12 @@ env:
   # Incremental artifacts are large and single-run-only — they just bloat the
   # cache. CI builds clean each run, so disable incremental compilation.
   CARGO_INCREMENTAL: "0"
-  # The queue re-tests to catch PRs that are green alone but broken together, which only
-  # the compile/test lanes can see; the rest re-run identical work against an identical
-  # tree. Guarded per STEP, never by a job-level `if`: a required check must still report.
+  # The queue rebuilds to catch PRs that are green alone but broken together, which only a
+  # compile of the merged tree can see; everything else re-runs identical work against an
+  # identical tree. `test` and `Miri` are in the second group on purpose — they are the two
+  # slowest lanes, and the queue's entries are serialized, so their cost is paid per entry
+  # while `clippy` + `release` already compile every feature set of the combined tree.
+  # Guarded per STEP, never by a job-level `if`: a required check must still report.
   QUEUE_LITE: ${{ github.event_name == 'merge_group' }}
 
 jobs:
@@ -120,8 +123,10 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
+        if: ${{ env.QUEUE_LITE != 'true' }}
 
       - uses: actions/cache@v5
+        if: ${{ env.QUEUE_LITE != 'true' }}
         with:
           path: |
             ~/.cargo/registry/index
@@ -133,15 +138,16 @@ jobs:
             ${{ runner.os }}-cargo-test-
 
       - name: pure library (default features)
+        if: ${{ env.QUEUE_LITE != 'true' }}
         run: cargo test
       - name: cli
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.QUEUE_LITE != 'true' }}
         run: cargo test --features cli
       - name: serve
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.QUEUE_LITE != 'true' }}
         run: cargo test --features serve
       - name: ingest
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.QUEUE_LITE != 'true' }}
         run: cargo test --features memory,embed-all,summarize-all
 
   release:

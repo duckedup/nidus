@@ -449,14 +449,19 @@ mmap (`src/data/mmap.rs`) — so check §9 rather than trusting a list here.
   that does not run there never reports and the entry stalls until it is ejected —
   the queue looks broken when it is really just waiting. Adding a required check
   and adding its `merge_group` trigger are one change, never two.
-  **What the queue re-runs is narrowed on purpose:** only `fmt`, `clippy`, `test`
-  and `release` do real work there. The other eleven required checks still trigger
-  on `merge_group` and still report — they short-circuit via a per-step
+  **What the queue re-runs is narrowed on purpose:** only `fmt`, `clippy` and
+  `release` do real work there. Every other required check still triggers on
+  `merge_group` and still reports — each short-circuits via a per-step
   `if: env.QUEUE_LITE != 'true'` guard, never a job-level `if`, because a job that
   is skipped outright is exactly the check that never reports. So the rule above is
-  unchanged: the trigger is mandatory, the *work* is what got trimmed. The trade is
-  deliberate — a pair of PRs that are jointly broken only in e2e, Miri, or an SDK
-  lane will now land, and `main`'s own push build is what catches it.
+  unchanged: the trigger is mandatory, the *work* is what got trimmed. `test` and
+  `Miri` are excluded because queue entries are serialized and those are the two
+  slowest lanes, so their cost is paid per entry; what the queue still buys is
+  `clippy` + `release` compiling **every feature set of the merged tree**, which is
+  where two individually-green PRs usually collide (#135 + #137 was a compile
+  break). The trade is deliberate and it is now wider: a pair of PRs that is
+  jointly broken only at *test* time — a unit test, e2e, Miri, an SDK lane — will
+  land, and `main`'s own push build is what catches it.
 - **CLOSE THE TICKET YOURSELF WHEN THE PR MERGES — NOTHING AUTO-CLOSES.** A
   `Closes nidus-186` line in a PR body is documentation and nothing more: GitHub
   cannot close a bead, so the trailer that used to do the work now only *looks*
