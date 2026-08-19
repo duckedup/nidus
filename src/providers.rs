@@ -5,6 +5,7 @@
 pub enum Capability {
     Embed,
     Summarize,
+    Rerank,
 }
 
 impl Capability {
@@ -13,6 +14,7 @@ impl Capability {
         match self {
             Capability::Embed => "embed",
             Capability::Summarize => "summarize",
+            Capability::Rerank => "rerank",
         }
     }
 }
@@ -27,7 +29,7 @@ pub struct ProviderInfo {
 pub const PROVIDERS: &[ProviderInfo] = &[
     ProviderInfo {
         name: "voyage",
-        capabilities: &[Capability::Embed],
+        capabilities: &[Capability::Embed, Capability::Rerank],
     },
     ProviderInfo {
         name: "openai",
@@ -39,7 +41,7 @@ pub const PROVIDERS: &[ProviderInfo] = &[
     },
     ProviderInfo {
         name: "cohere",
-        capabilities: &[Capability::Embed],
+        capabilities: &[Capability::Embed, Capability::Rerank],
     },
     ProviderInfo {
         name: "gemini",
@@ -92,6 +94,7 @@ mod tests {
     #[test]
     fn voyage_embeds_but_does_not_summarize() {
         assert!(supports("voyage", Capability::Embed));
+        assert!(supports("voyage", Capability::Rerank));
         assert!(!supports("voyage", Capability::Summarize));
     }
 
@@ -111,6 +114,7 @@ mod tests {
     fn unknown_provider_supports_nothing() {
         assert!(!supports("does-not-exist", Capability::Embed));
         assert!(!supports("does-not-exist", Capability::Summarize));
+        assert!(!supports("does-not-exist", Capability::Rerank));
         assert!(!is_known("does-not-exist"));
     }
 
@@ -137,5 +141,21 @@ mod tests {
             names_with(Capability::Summarize),
             vec!["openai", "anthropic"]
         );
+    }
+
+    #[test]
+    fn names_with_lists_rerankers_in_registry_order() {
+        assert_eq!(names_with(Capability::Rerank), vec!["voyage", "cohere"]);
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn rerank_provider_names_match_registry() {
+        for name in names_with(Capability::Rerank) {
+            assert!(
+                crate::rerank::RerankProvider::from_name(name).is_some(),
+                "registry name {name} has no RerankProvider"
+            );
+        }
     }
 }

@@ -26,9 +26,10 @@ pub const META_SUMMARY: &str = "nidus.summary";
 /// the raw text — kept so records written before #133 remain readable.
 #[cfg(feature = "summarize")]
 pub const META_SOURCE: &str = "nidus.source";
-/// Attr key holding the raw remembered text, stamped on every `remember` write
-/// regardless of mode (nidus-k28.7).
-pub const META_TEXT: &str = "nidus.text";
+/// Attr key holding the raw remembered text, stamped on every `remember` write regardless of
+/// mode (nidus-k28.7). Canonical definition moved to `model::META_TEXT` (nidus-4ss, so
+/// `RerankOpts::default` can reach it outside this feature); re-exported so the path is unchanged.
+pub use crate::model::META_TEXT;
 /// Attr key holding the `Value::DateTime` (UTC epoch ms) an entry was first written.
 /// Carries forward unchanged on a dedup update-in-place.
 pub const META_CREATED_AT: &str = "nidus.created_at";

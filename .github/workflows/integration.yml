@@ -67,7 +67,7 @@ jobs:
       # real services — so leaving them off would silently compile them away (#111).
       - name: Build the test binary and the nidus binary
         if: ${{ env.QUEUE_LITE != 'true' }}
-        run: cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai --test e2e --no-run
+        run: cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e --no-run
 
       # Started via the same script `just e2e-services-up` runs, so a developer
       # reproducing a CI failure gets a byte-identical environment. Not GitHub
@@ -90,7 +90,7 @@ jobs:
       # skips itself, so the suite stays green for a developer without the emulator.
       - name: Run end-to-end tests
         if: ${{ env.QUEUE_LITE != 'true' }}
-        run: cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai --test e2e -- --include-ignored --test-threads=2
+        run: cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e -- --include-ignored --test-threads=2
         env:
           NIDUS_E2E_GCS_ENDPOINT: http://127.0.0.1:4650
 
@@ -107,7 +107,7 @@ jobs:
         if: ${{ env.QUEUE_LITE != 'true' }}
         run: |
           NIDUS_E2E_REDIS_URL="$(./scripts/e2e-services.sh cluster-url)" \
-            cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai --test e2e cluster:: -- --ignored --test-threads=2
+            cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e cluster:: -- --ignored --test-threads=2
 
       # A red run should be diagnosable from the log alone, without a rerun. The
       # harness already attaches each nidus process's stderr to its failure; these

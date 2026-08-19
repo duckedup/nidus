@@ -599,7 +599,9 @@ reliable guard there is to refuse work *before* allocating:
   `min_score` filters during selection. `f32` isn't `Ord`: scores are ordered with
   `f32::total_cmp`, and `NaN` is treated as the lowest possible score so it never
   displaces a real result. `normalize` leaves a zero / non-finite / near-zero
-  (`< ~1e-12`) vector unchanged, so it scores 0 against everything.
+  (`< ~1e-12`) vector unchanged, so it scores 0 against everything. `min_score` is
+  evaluated pre-rerank, on the metric's own scale: an opt-in [`RerankOpts`] score (§9)
+  replaces `Hit::score` afterward, on the provider's own unrelated scale.
 - **Ranking is a total order — a contract, not an implementation detail.** Results are
   ordered by `(score descending, collection ascending, id ascending)`. The tie-break is
   applied *inside* the bounded heap, not only when sorting the survivors, so which of two
@@ -660,7 +662,10 @@ reliable guard there is to refuse work *before* allocating:
   layers a recency decay over the metric (subtracting an age penalty, so it holds for every
   `Distance` and for BM25), `HybridOpts::vector_weight`/`text_weight` weight the fused legs,
   and `ListOpts::order_by` is a plain ORDER BY with no vector query at all. A query that sets
-  none of them returns exactly what it returned before they existed. **Result diversity** is
+  none of them returns exactly what it returned before they existed. `SearchOpts::rerank`
+  (§9) is the odd one out: it does not layer over the metric like the others, it *replaces*
+  it, on the reranking provider's own scale, over the candidate window `rank_by` and
+  `min_score` already ran on. **Result diversity** is
   `SearchOpts::limit_per` — a cap on hits per attribute value, exact only within an over-fetch
   window (§7.7). Aggregation (`count`/`sum`) is answered without materializing a record.
 - **`search_similar` is "more like this" by record id** (nidus-9gs): it looks up
@@ -1238,6 +1243,22 @@ build until a real need exists.
   RAM path — exact, filter-respecting, ANN/quant-compatible. (Compaction of a mapped store
   materializes the live set in RAM like any compaction, so it is bounded by RAM even when the
   store is not.)
+- **Hosted cross-encoder reranking (nidus-4ss, 2026-08).** An opt-in post-ranking stage,
+  distinct from the quantized int8-scan-then-f32-rescore pass above: `SearchOpts`/
+  `HybridOpts` gain `rerank: Option<RerankOpts>` (pure data, unconditional, no new deps),
+  and the pure over-fetch/passthrough/re-sort tail lives unconditionally in
+  `store::rerank`, so `just ci`/`just miri` cover it with no provider compiled in. The
+  async provider call (`crate::rerank`, behind the `rerank`/`rerank-voyage`/`rerank-cohere`
+  features, mirroring `embed`/`summarize`) runs strictly **after** the store's own top-k
+  selection over an over-fetched window (`overscan`, default 10), so it composes with ANN,
+  quantization, and hybrid RRF without any of them changing. A candidate missing its text
+  attr (default `nidus.text`) is passed through unranked rather than failing the query,
+  appended after the reranked hits in original metric order. `limit_per` is re-applied
+  post-rerank so a diversity cap survives the reordering; `min_score`/`rank_by` are
+  cosine-scale and run pre-rerank. Wired into HTTP (`rerank` on `/search`,
+  `/hybrid-search`, `/collections/{name}/recall`, additive over the wire) and MCP (a
+  `rerank` boolean plus `rerank_overscan` on `recall`/`text_search`/`hybrid_search`, since
+  those tools already carry the query as text). No on-disk format change.
 
 ### Still deferred (designed-for, not built)
 
@@ -1268,8 +1289,10 @@ were evaluated against turbopuffer's surface and answered separately:
   this; the branch is closed.
 - **Multi-vector late interaction (ColBERT-style) — deferred as a rerank-only feature.**
   The useful form scores a candidate set produced by ordinary dense retrieval, so it
-  belongs on the rerank seam, not in the segment format. It needs no format change if
-  scoped that way, and it should not be built until a caller wants it.
+  belongs on the hosted cross-encoder rerank seam (`crate::rerank`, shipped nidus-4ss,
+  above), not in the segment format. It needs no format change scoped that way, and it
+  should not be built until a caller wants it: this ticket built the seam it was
+  deferred onto, not late interaction itself.
 - **Sparse vectors (`SparseKNN`) — deferred, and deliberately not built now.** The byte
   format could carry them additively, but the surrounding cost is out of proportion to
   demand: a breaking `Record` change, a second `Op` append, a working-set key bump that
@@ -1382,15 +1405,20 @@ src/
                   text.rs (multi-clause BM25, hybrid fusion, annotations, §7.8),
                   rank.rs (recency decay + ORDER BY, §7.6), aggregate.rs (count/sum +
                   group_by + limit_per, §7.7), write.rs (upsert/delete/flush/compact),
-                  memtier.rs (working-set publish/adopt), tests.rs
+                  memtier.rs (working-set publish/adopt), rerank.rs (pure over-fetch/
+                  passthrough/re-sort tail, unconditional, §9), tests.rs
 
-# ── AI ingest layer (feature-gated: embed-*/summarize-*/memory) ──
+# ── AI ingest layer (feature-gated: embed-*/summarize-*/rerank-*/memory) ──
 ├── embed/        Embedder trait + per-provider adapters: mod.rs, voyage.rs, openai.rs,
 │                 openai_compat.rs, ollama.rs, cohere.rs, gemini.rs, mistral.rs, jina.rs
 ├── summarize/    Summarizer trait + adapters: mod.rs, anthropic.rs, openai.rs, prompts.rs
+├── rerank/       Reranker trait + AnyReranker (hosted cross-encoders, `rerank` feature):
+│                 mod.rs, apply.rs (async free fns over &Nidus), voyage.rs, cohere.rs.
+│                 The pure over-fetch/passthrough/re-sort tail is unconditional, in
+│                 store/rerank.rs (§9)
 ├── memory.rs     Memory (remember/recall over a Nidus + an embedder); reserved
 │                 nidus.* attr vocabulary, recency stamps, the TTL read guard (§9)
-├── providers.rs  provider capability registry (Embed/Summarize)
+├── providers.rs  provider capability registry (Embed/Summarize/Rerank)
 ├── http.rs       shared HTTP retry infrastructure for the ingest adapters
 
 # ── `cli` feature only (the `nidus` binary, --features cli) ──

@@ -21,11 +21,15 @@ use crate::{
 
 // AI-ingest (memory) wiring for `serve`: only under the `memory` feature (pulled
 // by the `serve` umbrella). A plain `cli` build has no `--embed-provider` flags.
-#[cfg(feature = "memory")]
+#[cfg(any(feature = "memory", feature = "rerank"))]
 use std::sync::Arc;
 
 #[cfg(feature = "memory")]
 use crate::embed::{AnyEmbedder, EmbedConfig, EmbedProvider, Embedder};
+#[cfg(feature = "rerank")]
+use crate::rerank::AnyReranker;
+#[cfg(all(feature = "memory", feature = "rerank"))]
+use crate::rerank::{RerankConfig, RerankProvider};
 #[cfg(all(feature = "memory", feature = "summarize"))]
 use crate::summarize::{AnySummarizer, SummarizeConfig, SummarizeProvider};
 
@@ -470,6 +474,24 @@ struct IngestArgs {
     #[cfg(all(feature = "memory", feature = "summarize"))]
     #[arg(long, env = "NIDUS_SUMMARIZE_BASE_URL")]
     summarize_base_url: Option<String>,
+
+    /// Rerank provider for the opt-in cross-encoder stage: voyage or cohere. Omit to
+    /// serve without reranking (a request asking for it then answers 400).
+    #[cfg(feature = "rerank")]
+    #[arg(long, env = "NIDUS_RERANK_PROVIDER")]
+    rerank_provider: Option<String>,
+    /// Rerank model. Defaults to the provider's default when omitted.
+    #[cfg(feature = "rerank")]
+    #[arg(long, env = "NIDUS_RERANK_MODEL")]
+    rerank_model: Option<String>,
+    /// API key for the rerank provider.
+    #[cfg(feature = "rerank")]
+    #[arg(long, env = "NIDUS_RERANK_API_KEY")]
+    rerank_api_key: Option<String>,
+    /// Base-URL override for the rerank provider.
+    #[cfg(feature = "rerank")]
+    #[arg(long, env = "NIDUS_RERANK_BASE_URL")]
+    rerank_base_url: Option<String>,
 }
 
 #[cfg(feature = "memory")]
@@ -535,6 +557,34 @@ impl IngestArgs {
             .await
             .map_err(|e| anyhow::anyhow!("building summarizer '{name}': {e}"))?;
         Ok(Some(summarizer))
+    }
+
+    /// Build the reranker from `--rerank-provider …`, or `None` when omitted.
+    #[cfg(feature = "rerank")]
+    async fn reranker(&self) -> Result<Option<Arc<AnyReranker>>> {
+        Ok(self.build_reranker()?.map(Arc::new))
+    }
+
+    /// The reranker itself, unwrapped — shared behind an `Arc` by `serve`/`mcp`.
+    #[cfg(feature = "rerank")]
+    pub(super) fn build_reranker(&self) -> Result<Option<AnyReranker>> {
+        let Some(name) = self.rerank_provider.as_deref() else {
+            return Ok(None);
+        };
+        let provider = RerankProvider::from_name(name).ok_or_else(|| {
+            anyhow::anyhow!("unknown rerank provider '{name}' (--rerank-provider)")
+        })?;
+        // An empty model lets `AnyReranker::build` fill the provider default.
+        let mut config = RerankConfig::new(self.rerank_model.clone().unwrap_or_default());
+        if let Some(k) = &self.rerank_api_key {
+            config = config.api_key(k);
+        }
+        if let Some(u) = &self.rerank_base_url {
+            config = config.base_url(u);
+        }
+        let reranker = AnyReranker::build(provider, config)
+            .map_err(|e| anyhow::anyhow!("building reranker '{name}': {e}"))?;
+        Ok(Some(reranker))
     }
 }
 
@@ -1448,6 +1498,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 explain: query.explain,
                 vector_weight,
                 text_weight,
+                ..Default::default()
             };
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
             let hits = if refs.is_empty() {
@@ -1729,6 +1780,12 @@ fn serve(
     let embedder = rt.block_on(ingest.embedder())?;
     #[cfg(all(feature = "memory", feature = "summarize"))]
     let summarizer = rt.block_on(ingest.summarizer())?;
+    #[cfg(all(feature = "memory", feature = "rerank"))]
+    let reranker = rt.block_on(ingest.reranker())?;
+    // The `--rerank-*` flags live on `IngestArgs` (the `memory` feature), so a `rerank`
+    // build without `memory` has no flags to read: always serve without reranking.
+    #[cfg(all(feature = "rerank", not(feature = "memory")))]
+    let reranker: Option<Arc<AnyReranker>> = None;
 
     #[cfg(feature = "memory")]
     store.apply_embedder_dim(embedder.as_deref())?;
@@ -1754,6 +1811,8 @@ fn serve(
         embedder,
         #[cfg(all(feature = "memory", feature = "summarize"))]
         summarizer,
+        #[cfg(feature = "rerank")]
+        reranker,
     };
     rt.block_on(crate::server::serve(move || Nidus::open(open_config), cfg))
 }
@@ -1777,6 +1836,10 @@ fn mcp(mut store: StoreArgs, #[cfg(feature = "memory")] ingest: IngestArgs) -> R
     let embedder = rt.block_on(ingest.embedder())?;
     #[cfg(all(feature = "memory", feature = "summarize"))]
     let summarizer = rt.block_on(ingest.summarizer())?;
+    #[cfg(all(feature = "memory", feature = "rerank"))]
+    let reranker = rt.block_on(ingest.reranker())?;
+    #[cfg(all(feature = "rerank", not(feature = "memory")))]
+    let reranker: Option<Arc<AnyReranker>> = None;
 
     #[cfg(feature = "memory")]
     store.apply_embedder_dim(embedder.as_deref())?;
@@ -1787,6 +1850,8 @@ fn mcp(mut store: StoreArgs, #[cfg(feature = "memory")] ingest: IngestArgs) -> R
         embedder,
         #[cfg(all(feature = "memory", feature = "summarize"))]
         summarizer,
+        #[cfg(feature = "rerank")]
+        reranker,
         // A third of the lease TTL, as in `serve`.
         lease_renew_interval: open_config.lock_ttl / 3,
     };
@@ -1923,6 +1988,93 @@ mod tests {
             }
             _ => panic!("expected Serve"),
         }
+    }
+
+    /// The `--rerank-*` flags parse into `IngestArgs` alongside the embed/summarize
+    /// families, mirroring `serve_parses_ingest_flags`.
+    #[cfg(all(feature = "memory", feature = "rerank"))]
+    #[test]
+    fn serve_parses_rerank_flags() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "serve",
+            "--dir",
+            "/tmp/s",
+            "--dim",
+            "3",
+            "--rerank-provider",
+            "voyage",
+            "--rerank-model",
+            "rerank-2.5",
+            "--rerank-api-key",
+            "sk-test",
+            "--rerank-base-url",
+            "https://example.test",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Serve { ingest, .. } => {
+                assert_eq!(ingest.rerank_provider.as_deref(), Some("voyage"));
+                assert_eq!(ingest.rerank_model.as_deref(), Some("rerank-2.5"));
+                assert_eq!(ingest.rerank_api_key.as_deref(), Some("sk-test"));
+                assert_eq!(
+                    ingest.rerank_base_url.as_deref(),
+                    Some("https://example.test")
+                );
+            }
+            _ => panic!("expected Serve"),
+        }
+    }
+
+    /// With no `--rerank-provider`, `IngestArgs::rerank_provider` is `None` and
+    /// `build_reranker` returns `Ok(None)` (the server then serves without reranking).
+    #[cfg(all(feature = "memory", feature = "rerank"))]
+    #[test]
+    fn serve_without_rerank_flags_is_none() {
+        let cli = Cli::try_parse_from(["nidus", "serve", "--dir", "/tmp/s", "--dim", "3"]).unwrap();
+        match cli.command {
+            Command::Serve { ingest, .. } => {
+                assert_eq!(ingest.rerank_provider, None);
+                assert!(ingest.build_reranker().unwrap().is_none());
+            }
+            _ => panic!("expected Serve"),
+        }
+    }
+
+    /// `--rerank-provider` is declared with clap's `env = "NIDUS_RERANK_PROVIDER"`, like every
+    /// other ingest flag — checked here via introspection rather than mutating process env.
+    #[cfg(all(feature = "memory", feature = "rerank"))]
+    #[test]
+    fn rerank_provider_arg_has_the_expected_env_var() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let arg = cmd
+            .find_subcommand("serve")
+            .expect("serve subcommand")
+            .get_arguments()
+            .find(|a| a.get_long() == Some("rerank-provider"))
+            .expect("--rerank-provider registered");
+        assert_eq!(
+            arg.get_env().and_then(|e| e.to_str()),
+            Some("NIDUS_RERANK_PROVIDER")
+        );
+    }
+
+    /// An unknown `--rerank-provider` is rejected with a message naming the flag,
+    /// mirroring the embed/summarize provider checks.
+    #[cfg(all(feature = "memory", feature = "rerank"))]
+    #[test]
+    fn unknown_rerank_provider_names_the_flag() {
+        let ingest = IngestArgs {
+            rerank_provider: Some("not-a-provider".to_string()),
+            ..Default::default()
+        };
+        // let-else rather than `unwrap_err`, which would need `Debug` on `AnyReranker` —
+        // a public impl its sibling `AnyEmbedder` deliberately does not carry.
+        let Err(err) = ingest.build_reranker() else {
+            panic!("an unknown --rerank-provider must be rejected");
+        };
+        assert!(err.to_string().contains("--rerank-provider"));
     }
 
     /// `remember` takes the collection and text positionally and reuses `serve`'s ingest

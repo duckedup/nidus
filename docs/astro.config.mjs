@@ -70,6 +70,7 @@ export default defineConfig({
             { label: "Storage backends", link: "/guides/storage-backends/" },
             { label: "Memory stores", link: "/guides/memory-stores/" },
             { label: "Search & filters", link: "/guides/search/" },
+            { label: "Reranking", link: "/guides/rerank/" },
             { label: "Remember & recall", link: "/guides/remember-and-recall/" },
             { label: "MCP (agent memory)", link: "/guides/mcp/" },
             { label: "Automatic memory", link: "/guides/automatic-memory/" },

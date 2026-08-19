@@ -7597,6 +7597,395 @@ fn a_degenerate_cap_is_refused() {
     }
 }
 
+// ── Rerank (`crate::store::rerank`) — pure logic, exercised through `Store` ─────────────
+// The async provider call lives behind the `rerank` feature; these run on the default lane,
+// standing in for it with a length-keyed fake so the test picks which candidate wins.
+
+use crate::model::RerankOpts;
+
+fn texted(id: &str, vector: Vec<f32>, text: &str) -> Record {
+    rec_with(
+        id,
+        vector,
+        BTreeMap::from([("nidus.text".to_string(), Value::Str(text.to_string()))]),
+    )
+}
+
+fn rerank_opts(top_k: usize) -> SearchOpts {
+    SearchOpts {
+        top_k,
+        rerank: Some(RerankOpts::default()),
+        ..Default::default()
+    }
+}
+
+/// Runs the pure rerank stage over an already metric-ranked `hits` set, standing in for
+/// `crate::rerank::rerank_hits` plus the promoted tail: a fake score keyed on text length, so
+/// the metric-worst candidate wins by being given the longest text.
+fn reranked(store: &Store, hits: Vec<Hit>, opts: &SearchOpts) -> Vec<Hit> {
+    let text_attr = opts
+        .rerank
+        .as_ref()
+        .expect("opts.rerank must be set")
+        .text_attr
+        .clone();
+    let (texts, passthrough) = super::rerank::candidate_texts(&hits, &text_attr);
+    let candidate_idx: Vec<usize> = (0..hits.len())
+        .filter(|i| !passthrough.contains(i))
+        .collect();
+    let scored: Vec<(usize, f32)> = candidate_idx
+        .into_iter()
+        .zip(texts.iter().map(|t| t.len() as f32))
+        .collect();
+    store.finish(
+        super::rerank::apply_scores(hits, &scored, passthrough),
+        opts,
+    )
+}
+
+/// Same, but for a fused hybrid ranking (`HybridOpts` has no `limit_per`, so the tail is
+/// `finish_hybrid` rather than `finish`).
+fn reranked_hybrid(store: &Store, hits: Vec<Hit>, opts: &HybridOpts) -> Vec<Hit> {
+    let text_attr = opts
+        .rerank
+        .as_ref()
+        .expect("opts.rerank must be set")
+        .text_attr
+        .clone();
+    let (texts, passthrough) = super::rerank::candidate_texts(&hits, &text_attr);
+    let candidate_idx: Vec<usize> = (0..hits.len())
+        .filter(|i| !passthrough.contains(i))
+        .collect();
+    let scored: Vec<(usize, f32)> = candidate_idx
+        .into_iter()
+        .zip(texts.iter().map(|t| t.len() as f32))
+        .collect();
+    store.finish_hybrid(
+        super::rerank::apply_scores(hits, &scored, passthrough),
+        opts,
+    )
+}
+
+fn cosine_docs() -> Store {
+    let mut store = Store::in_memory(2).unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                texted("d0", vec![1.0, 0.0], "a"),
+                texted("d1", vec![0.99, 0.02], "bb"),
+                texted("d2", vec![0.9, 0.2], "ccc"),
+            ],
+        )
+        .unwrap();
+    store
+}
+
+#[test]
+fn rerank_reorders_by_provider_score() {
+    let store = cosine_docs();
+    let opts = rerank_opts(3);
+    let hits = store.search(&["docs"], &[1.0, 0.0], &opts).unwrap();
+    assert_eq!(
+        hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["d0", "d1", "d2"],
+        "metric order, before reranking"
+    );
+    let out = reranked(&store, hits, &opts);
+    assert_eq!(
+        out.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["d2", "d1", "d0"],
+        "the metric-worst candidate (longest text) now ranks first"
+    );
+}
+
+#[test]
+fn rerank_widens_the_candidate_window() {
+    let mut store = Store::in_memory(2).unwrap();
+    let texts = ["a", "aa", "aaa", "aaaa", "aaaaa"];
+    let recs: Vec<Record> = (0..5)
+        .map(|i| {
+            let angle = 0.05 * i as f32;
+            texted(&format!("d{i}"), vec![1.0 - angle, angle], texts[i])
+        })
+        .collect();
+    store.upsert("docs", &recs).unwrap();
+
+    let plain_hits = store
+        .search(&["docs"], &[1.0, 0.0], &default_opts(2))
+        .unwrap();
+    assert_eq!(
+        plain_hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["d0", "d1"],
+        "without widening only the metric-best two are seen"
+    );
+
+    let opts = SearchOpts {
+        top_k: 2,
+        rerank: Some(RerankOpts {
+            overscan: 5,
+            text_attr: "nidus.text".to_string(),
+        }),
+        ..Default::default()
+    };
+    let widened = store
+        .search(
+            &["docs"],
+            &[1.0, 0.0],
+            &SearchOpts {
+                top_k: super::rerank::rerank_depth(&opts),
+                ..opts.clone()
+            },
+        )
+        .unwrap();
+    assert_eq!(widened.len(), 5, "the window now covers the whole corpus");
+    let out = reranked(&store, widened, &opts);
+    assert_eq!(out.len(), 2, "top_k still caps the final page");
+    assert_eq!(
+        out[0].id, "d4",
+        "metric-worst (longest text) now finishes first, having been outside the plain page"
+    );
+}
+
+#[test]
+fn a_record_with_no_text_attr_is_passed_through_unranked() {
+    let mut null_attrs = BTreeMap::new();
+    null_attrs.insert("nidus.text".to_string(), Value::Null);
+    let mut int_attrs = BTreeMap::new();
+    int_attrs.insert("nidus.text".to_string(), Value::Int(3));
+    let mut store = Store::in_memory(2).unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                texted("has_text", vec![0.9, 0.1], "hello"),
+                rec("absent", vec![0.8, 0.2]),
+                rec_with("nullish", vec![0.7, 0.3], null_attrs),
+                rec_with("nonstr", vec![0.6, 0.4], int_attrs),
+                texted("empty", vec![1.0, 0.0], ""),
+            ],
+        )
+        .unwrap();
+    let opts = rerank_opts(5);
+    let hits = store.search(&["docs"], &[1.0, 0.0], &opts).unwrap();
+    let metric_order: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+
+    let out = reranked(&store, hits.clone(), &opts);
+    assert_eq!(
+        out[0].id, "has_text",
+        "the only candidate with usable text ranks first"
+    );
+    let passthrough_ids: Vec<&str> = out[1..].iter().map(|h| h.id.as_str()).collect();
+    let expected: Vec<&str> = metric_order
+        .iter()
+        .filter(|id| id.as_str() != "has_text")
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        passthrough_ids, expected,
+        "absent/Null/non-Str/empty-string all pass through in original metric order"
+    );
+    for h in &out[1..] {
+        let original = hits.iter().find(|o| o.id == h.id).unwrap();
+        assert_eq!(
+            h.score, original.score,
+            "passthrough score untouched: {}",
+            h.id
+        );
+    }
+}
+
+#[test]
+fn rerank_applies_over_an_ann_result_set() {
+    let mut store = Store::in_memory_cfg(
+        Config::new("/dev/null/in-memory", 2)
+            .auto_compact(None)
+            .ann(Some(AnnConfig::hnsw())),
+    )
+    .unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                texted("d0", vec![1.0, 0.0], "a"),
+                texted("d1", vec![0.9, 0.1], "bb"),
+            ],
+        )
+        .unwrap();
+    let opts = rerank_opts(2);
+    let hits = store.search(&["docs"], &[1.0, 0.0], &opts).unwrap();
+    assert_eq!(hits[0].id, "d0", "ANN still returns the metric-best first");
+    let out = reranked(&store, hits, &opts);
+    assert_eq!(
+        out[0].id, "d1",
+        "reranking still applies over the ANN result set, without forcing exact"
+    );
+}
+
+#[test]
+fn rerank_preserves_the_collection_id_tie_break() {
+    let mut store = Store::in_memory(2).unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                texted("z", vec![1.0, 0.0], "aa"),
+                texted("a", vec![0.99, 0.02], "bb"),
+            ],
+        )
+        .unwrap();
+    let opts = rerank_opts(2);
+    let hits = store.search(&["docs"], &[1.0, 0.0], &opts).unwrap();
+    let out = reranked(&store, hits, &opts);
+    assert_eq!(out[0].score, out[1].score, "equal-length texts tie exactly");
+    assert_eq!(
+        out.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["a", "z"],
+        "ties break on (collection, id) ascending, same as the metric path"
+    );
+}
+
+#[test]
+fn limit_per_survives_a_rerank() {
+    let mut store = Store::in_memory(2).unwrap();
+    let mk = |id: &str, angle: f32, file: &str, text: &str| {
+        rec_with(
+            id,
+            vec![1.0 - angle, angle],
+            BTreeMap::from([
+                ("file".to_string(), Value::Str(file.to_string())),
+                ("nidus.text".to_string(), Value::Str(text.to_string())),
+            ]),
+        )
+    };
+    store
+        .upsert(
+            "docs",
+            &[
+                mk("a1", 0.01, "a.rs", "a"),
+                mk("a2", 0.05, "a.rs", "aaaa"),
+                mk("b1", 0.02, "b.rs", "bb"),
+                mk("b2", 0.06, "b.rs", "bbb"),
+            ],
+        )
+        .unwrap();
+    let opts = SearchOpts {
+        top_k: 4,
+        limit_per: Some(LimitPer::new("file", 1)),
+        rerank: Some(RerankOpts::default()),
+        ..Default::default()
+    };
+
+    let plain = store.search(&["docs"], &[1.0, 0.0], &opts).unwrap();
+    assert_eq!(
+        plain.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["a1", "b1"],
+        "the plain metric cap, for contrast"
+    );
+
+    // The candidate gather for rerank drops `limit_per` (re-applied post-rerank, decision 3):
+    // capping it here would freeze each group's winner at metric order.
+    let widened = store
+        .search(
+            &["docs"],
+            &[1.0, 0.0],
+            &SearchOpts {
+                top_k: super::rerank::rerank_depth(&opts),
+                limit_per: None,
+                ..opts.clone()
+            },
+        )
+        .unwrap();
+    let out = reranked(&store, widened, &opts);
+    assert_eq!(
+        out.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["a2", "b2"],
+        "limit_per re-applied AFTER rerank keeps the reranked winner per group"
+    );
+}
+
+#[test]
+fn min_score_applies_before_rerank() {
+    let store = cosine_docs();
+    let opts = SearchOpts {
+        top_k: 3,
+        min_score: Some(0.98),
+        rerank: Some(RerankOpts::default()),
+        ..Default::default()
+    };
+    let hits = store.search(&["docs"], &[1.0, 0.0], &opts).unwrap();
+    assert!(
+        hits.iter().all(|h| h.id != "d2"),
+        "d2's cosine score is below min_score, so it never enters the rerank window: {hits:?}"
+    );
+    let out = reranked(&store, hits, &opts);
+    assert!(
+        out.iter().all(|h| h.id != "d2"),
+        "reranking cannot resurrect a hit min_score already excluded"
+    );
+}
+
+#[test]
+fn rerank_of_a_hybrid_ranking() {
+    let mut store = Store::in_memory(2).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    let mk = |id: &str, vector: Vec<f32>, body: &str, text: &str| {
+        rec_with(
+            id,
+            vector,
+            BTreeMap::from([
+                ("body".to_string(), Value::Str(body.to_string())),
+                ("nidus.text".to_string(), Value::Str(text.to_string())),
+            ]),
+        )
+    };
+    store
+        .upsert(
+            "docs",
+            &[
+                mk("d0", vec![1.0, 0.0], "quantum physics", "a"),
+                mk("d1", vec![0.9, 0.1], "quantum physics", "aaaa"),
+            ],
+        )
+        .unwrap();
+    let opts = HybridOpts {
+        top_k: 2,
+        rerank: Some(RerankOpts::default()),
+        ..Default::default()
+    };
+    let fused = store
+        .hybrid_search(
+            &["docs"],
+            &[1.0, 0.0],
+            &FtsQuery::new("body", "quantum"),
+            &opts,
+        )
+        .unwrap();
+    assert_eq!(fused[0].id, "d0", "d0 wins the plain fused ranking");
+    let out = reranked_hybrid(&store, fused, &opts);
+    assert_eq!(
+        out[0].id, "d1",
+        "reranking still applies over a fused RRF result set"
+    );
+}
+
+#[test]
+fn a_nan_rerank_score_does_not_poison_the_order() {
+    let store = cosine_docs();
+    let opts = rerank_opts(3);
+    let hits = store.search(&["docs"], &[1.0, 0.0], &opts).unwrap();
+    let scored = vec![(0, f32::NAN), (1, 2.0), (2, 1.0)];
+    let out = super::rerank::apply_scores(hits, &scored, vec![]);
+    let out = store.finish(out, &opts);
+    assert_eq!(
+        out.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["d1", "d2", "d0"],
+        "a NaN score sorts last, never displacing a real result"
+    );
+}
+
 /// Regression, review finding: `refresh` re-merged onto the already-merged config, so
 /// `p.ann.or(self.ann)` reproduced the stale value and a cleared knob never retracted.
 #[cfg_attr(miri, ignore)] // fsync

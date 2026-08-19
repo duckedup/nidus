@@ -59,6 +59,18 @@ pub(super) fn optional_top_k(args: &Map<String, JsonValue>) -> Result<usize, Mcp
     Ok(k)
 }
 
+/// An optional boolean argument, defaulting to `false` when absent.
+pub(super) fn optional_bool(args: &Map<String, JsonValue>, key: &str) -> Result<bool, McpError> {
+    match args.get(key) {
+        None | Some(JsonValue::Null) => Ok(false),
+        Some(JsonValue::Bool(b)) => Ok(*b),
+        Some(_) => Err(McpError::invalid_params(
+            format!("`{key}` must be a boolean"),
+            None,
+        )),
+    }
+}
+
 /// An optional float argument.
 pub(super) fn optional_f32(
     args: &Map<String, JsonValue>,

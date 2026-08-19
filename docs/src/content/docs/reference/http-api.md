@@ -380,6 +380,30 @@ curl -s localhost:7700/search \
 | `exclude_attributes` | all attrs | return every attr but these |
 | `rank_by` | none | a [ranking expression](/guides/search/#ranking-by-recency) over the metric |
 | `limit_per` | none | cap hits per distinct value of an attribute |
+| `rerank` | none | re-score the candidate window with a hosted cross-encoder; see below |
+
+Omitting `rerank` leaves the response byte-identical to a nidus without the feature.
+`rerank` is only compiled in under the `rerank` feature (part of the `serve` umbrella);
+requesting it against a build without a `--rerank-provider` configured is a `400` naming
+the flag, never a silent pass-through of the un-reranked order.
+
+```json
+{"query": [1, 0, 0], "top_k": 5,
+ "rerank": {"query": "how do users sign in", "overscan": 10, "text_attr": "nidus.text"}}
+```
+
+| `rerank` field | Default | Meaning |
+| --- | --- | --- |
+| `query` | – (required) | the text the cross-encoder reads against each candidate; `/search` carries no text of its own, so this is required here |
+| `overscan` | `10` | retrieve `top_k * overscan` candidates before reranking |
+| `text_attr` | `"nidus.text"` | which attr holds each candidate's text |
+
+A candidate missing `text_attr` (or holding a non-`Str`/empty value there) is passed
+through unranked: it keeps its original metric score and lands after every successfully
+reranked hit, in its original relative order. `min_score` and `rank_by` are cosine-scale
+and run before reranking; the reranked score afterward is on the provider's own scale, not
+cosine. `limit_per` is re-applied after reranking. See the
+[reranking guide](/guides/rerank/) for the full behaviour.
 
 Returns hits ordered by `(score desc, collection, id)`; the tie-break is a guarantee,
 which is what makes paging coherent:
@@ -539,6 +563,12 @@ curl -s localhost:7700/hybrid-search \
 `vector_weight` and `text_weight` (both default `1.0`) scale each leg's contribution to the
 fused score. Leaving them out (or sending `1.0` for both) reproduces the unweighted fusion
 exactly. A non-finite or negative weight is a `400`.
+
+`/hybrid-search` also takes the same `rerank` field as `/search` (`query` required,
+`overscan` default `10`, `text_attr` default `"nidus.text"`): the fused RRF ranking is the
+candidate window it reranks. See [the `/search` entry above](#post-search) and the
+[reranking guide](/guides/rerank/) for the field shape and the passthrough/score-scale
+rules, which apply here unchanged.
 
 ```bash
 curl -s localhost:7700/hybrid-search \
@@ -802,8 +832,15 @@ curl -s localhost:7700/collections/notes/recall \
 | `top_k` | `10` | maximum hits to return |
 | `min_score` | none | drop hits scoring below this cosine similarity |
 | `filter` | none | AND of predicates applied before scoring |
+| `rerank` | none | re-score the candidate window with a hosted cross-encoder; see below |
 
 Returns the same `HitDto` shape as `/search`: an array of `{collection, id, score, attrs}`.
+
+`rerank` takes the same `overscan`/`text_attr` fields as [`/search`](#post-search), but
+`query` is optional here: an omitted or empty `rerank.query` falls back to the request's
+own `query` above, so `{"rerank": {}}` is a valid minimal form. This is the one route where
+reranking has nothing extra to ask for, since the recall query is already the text a
+cross-encoder needs.
 
 **TTL filtering applies here, and only here, of the routes on this page.** `/recall`
 AND-s a not-expired predicate into your filter, so an entry past its `ttl_seconds` never

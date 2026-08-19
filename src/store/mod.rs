@@ -27,6 +27,7 @@ mod memtier;
 mod quant;
 mod rank;
 mod read;
+pub(crate) mod rerank;
 mod scoring;
 mod text;
 mod write;

@@ -137,6 +137,30 @@ pub(crate) fn per_text_embedder_server(
         .start()
 }
 
+/// A persistent mock answering the Cohere `/v2/rerank` wire shape (`src/rerank/cohere.rs`).
+/// `documents` arrive in metric order (best first) and the store re-sorts descending by
+/// score, so a score *increasing* with `index` (worst metric match scores highest) inverts.
+#[cfg(feature = "rerank-cohere")]
+pub(crate) fn mock_reranker_inverting() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock reranker");
+    let addr = listener.local_addr().expect("mock reranker addr");
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let body = read_request_body(&mut stream);
+            let n = serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|v| v["documents"].as_array().map(|d| d.len()))
+                .unwrap_or(0);
+            let results: Vec<Value> = (0..n)
+                .map(|i| json!({ "index": i, "relevance_score": (i + 1) as f64 }))
+                .collect();
+            let response = json!({ "results": results }).to_string();
+            write_json_response(stream, &response);
+        }
+    });
+    format!("http://{addr}")
+}
+
 /// Cosine similarity, used only to phrase the acceptance criterion below in the same terms
 /// the store scores with.
 fn cosine(a: &[f32], b: &[f32]) -> f32 {

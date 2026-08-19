@@ -12,6 +12,8 @@ mod mcp;
 #[cfg(feature = "mcp")]
 mod memory_http;
 mod profile;
+#[cfg(all(feature = "mcp", feature = "embed-ollama", feature = "rerank-cohere"))]
+mod rerank;
 mod scale;
 #[cfg(all(feature = "mcp", feature = "embed-ollama"))]
 mod serve_dim;

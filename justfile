@@ -75,7 +75,7 @@ test-cli:
 # The embed/summarize features gate suites driven by hand-rolled TCP mocks — no real
 # services — so leaving them off would silently compile those suites away (#111).
 test-e2e *FILTER:
-    cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai --test e2e {{ FILTER }}
+    cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e {{ FILTER }}
 
 # Start the services the cluster e2e tests need (real S3 + real Redis-family tier).
 # The container definitions live in scripts/e2e-services.sh — one source of truth,
@@ -97,7 +97,7 @@ test-e2e-valkey-cluster *FILTER:
     ./scripts/e2e-services.sh up-cluster
     trap './scripts/e2e-services.sh down-cluster' EXIT
     NIDUS_E2E_REDIS_URL="$(./scripts/e2e-services.sh cluster-url)" \
-        cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai --test e2e cluster::{{ FILTER }} -- --ignored --test-threads=2
+        cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e cluster::{{ FILTER }} -- --ignored --test-threads=2
 
 # Cluster e2e: several real `nidus serve` processes over a shared object store and
 # memory tier. #[ignore]d by default (they need the services above), so run them
@@ -105,7 +105,7 @@ test-e2e-valkey-cluster *FILTER:
 # Override the endpoints with NIDUS_E2E_S3_ENDPOINT / NIDUS_E2E_S3_BUCKET /
 # NIDUS_E2E_S3_KEY / NIDUS_E2E_S3_SECRET / NIDUS_E2E_REDIS_URL.
 test-e2e-cluster *FILTER:
-    cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai --test e2e cluster::{{ FILTER }} -- --ignored --test-threads=2
+    cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e cluster::{{ FILTER }} -- --ignored --test-threads=2
 
 # Release build of the `nidus` binary
 build-cli:
@@ -182,11 +182,22 @@ test-summarize:
 # Pre-PR checks for the summarize features: format clean, no clippy warnings, tests green
 ci-summarize: fmt-check lint-summarize test-summarize
 
+# Lint the rerank feature set (base infra + every provider adapter)
+lint-rerank:
+    cargo clippy --all-targets --features rerank-all -- -D warnings
+
+# Test the rerank feature set (base infra + every provider adapter)
+test-rerank:
+    cargo test --features rerank-all
+
+# Pre-PR checks for the rerank features: format clean, no clippy warnings, tests green
+ci-rerank: fmt-check lint-rerank test-rerank
+
 # Pre-PR checks for the FULL ingest layer (memory + every embedder + summarizer): build, lint, test
 ci-ingest: fmt-check
-    cargo clippy --all-targets --features memory,embed-all,summarize-all -- -D warnings
-    cargo test --features memory,embed-all,summarize-all
-    cargo build --release --features memory,embed-all,summarize-all
+    cargo clippy --all-targets --features memory,embed-all,summarize-all,rerank-all -- -D warnings
+    cargo test --features memory,embed-all,summarize-all,rerank-all
+    cargo build --release --features memory,embed-all,summarize-all,rerank-all
 
 # ── Docs site (Astro + Starlight, in docs/) ─────────────────────────────────
 

@@ -13,7 +13,9 @@ use super::{ScanOrder, Store, oom};
 use crate::ann::Walk;
 use crate::config::Config;
 use crate::filter;
-use crate::model::{AnnConfig, Distance, Filter, Footprint, Hit, ListOpts, Projection, SearchOpts};
+use crate::model::{
+    AnnConfig, Distance, Filter, Footprint, Hit, HybridOpts, ListOpts, Projection, SearchOpts,
+};
 use crate::search::{TopK, dot, euclidean_neg_sq, normalize};
 
 /// How deep a search path must rank: one page (`offset + top_k`), multiplied by the over-fetch
@@ -75,12 +77,22 @@ impl Store {
     /// The ONE tail every ranked surface funnels through: thin the over-fetched ranking by the
     /// per-value cap, cut the page, hold `top_k`. Capping must precede pagination — capping a
     /// page would move the boundary rather than diversify what crosses it.
-    pub(super) fn finish(&self, ranked: Vec<Hit>, opts: &SearchOpts) -> Vec<Hit> {
+    pub(crate) fn finish(&self, ranked: Vec<Hit>, opts: &SearchOpts) -> Vec<Hit> {
         let capped = match &opts.limit_per {
             Some(cap) => self.cap_per_value(ranked, cap),
             None => ranked,
         };
         let mut hits = paginate(capped, opts.offset);
+        hits.truncate(opts.top_k);
+        hits
+    }
+
+    /// The hybrid tail for an already-fused `Vec<Hit>`: no `limit_per` on `HybridOpts`, so
+    /// just the page cut (SPEC §7). Used by `crate::rerank`'s async wrapper post-rerank;
+    /// `hybrid_search` itself cuts inline, since its fused list still carries per-leg detail.
+    #[cfg_attr(not(feature = "rerank"), allow(dead_code))]
+    pub(crate) fn finish_hybrid(&self, ranked: Vec<Hit>, opts: &HybridOpts) -> Vec<Hit> {
+        let mut hits = paginate(ranked, opts.offset);
         hits.truncate(opts.top_k);
         hits
     }

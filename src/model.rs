@@ -585,6 +585,33 @@ impl LimitPer {
     }
 }
 
+/// Attr key holding the raw remembered text. Canonical home is here (unconditional) so
+/// [`RerankOpts::default`] can reference it without the `memory` feature; `memory::META_TEXT`
+/// re-exports this constant so its public path is unchanged.
+pub const META_TEXT: &str = "nidus.text";
+
+/// Default overscan (see [`RerankOpts::overscan`]): a `top_k=10` query reranks 100 candidates.
+pub const DEFAULT_RERANK_OVERSCAN: usize = 10;
+
+/// The post-ranking cross-encoder stage (SPEC §7). Plain config: the reranker itself is
+/// async and lives at the edge in `crate::rerank`, never in a `SearchOpts`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RerankOpts {
+    /// Multiplier on the page depth for the candidate window. Clamped to >= 1.
+    pub overscan: usize,
+    /// Attr carrying each candidate's text. Defaults to `nidus.text`.
+    pub text_attr: String,
+}
+
+impl Default for RerankOpts {
+    fn default() -> Self {
+        Self {
+            overscan: DEFAULT_RERANK_OVERSCAN,
+            text_attr: META_TEXT.to_string(),
+        }
+    }
+}
+
 /// What [`crate::Nidus::aggregate`] computes over the filter-matching records. Answered from
 /// the in-RAM index alone: no [`Record`] is built and no vector is read.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -637,7 +664,9 @@ pub struct SearchOpts {
     pub offset: usize,
     /// Pre-scoring metadata filter (applied before the dot product).
     pub filter: Filter,
-    /// Drop results scoring below this cosine similarity.
+    /// Drop results scoring below this value, on the metric's own scale (cosine similarity,
+    /// unless a different [`Distance`] or leg applies). Evaluated **pre-rerank**: a
+    /// [`RerankOpts`]-scored hit replaces `Hit::score` afterward, on an unrelated scale.
     pub min_score: Option<f32>,
     /// Force the exact brute-force scan for *this* query, bypassing the ANN walk, the segment
     /// indexes, and the quantized first pass. A guaranteed-exact answer over a narrow subset
@@ -654,6 +683,9 @@ pub struct SearchOpts {
     pub rank_by: Option<RankBy>,
     /// Cap the hits carrying any one value of an attribute. `None` (the default) is uncapped.
     pub limit_per: Option<LimitPer>,
+    /// Rerank the candidate window with a hosted cross-encoder (`crate::rerank`, feature-gated).
+    /// `None` (the default) leaves the metric ranking untouched.
+    pub rerank: Option<RerankOpts>,
 }
 
 /// Query parameters for a metadata-only listing (no vector scoring).
@@ -707,6 +739,9 @@ pub struct HybridOpts {
     pub vector_weight: f32,
     /// Weight on the BM25 leg's RRF contribution. Default `1.0`.
     pub text_weight: f32,
+    /// Rerank the fused candidate window with a hosted cross-encoder (`crate::rerank`,
+    /// feature-gated). `None` (the default) leaves the RRF ranking untouched.
+    pub rerank: Option<RerankOpts>,
 }
 
 impl Default for HybridOpts {
@@ -718,6 +753,7 @@ impl Default for HybridOpts {
             rrf_k: 60.0,
             candidates: 100,
             explain: false,
+            rerank: None,
             vector_weight: 1.0,
             text_weight: 1.0,
         }

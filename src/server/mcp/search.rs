@@ -14,7 +14,9 @@ use crate::meta::now_ms;
 use crate::{Filter, HybridOpts, SearchOpts};
 
 use super::NidusMcp;
-use super::args::{api_error, optional_f32, optional_top_k, required_str, tool};
+use super::args::{
+    api_error, optional_bool, optional_f32, optional_top_k, optional_usize, required_str, tool,
+};
 use super::{HitDto, hits_content};
 
 /// A tagged [`crate::Value`]: `{"Str": "x"}`, `{"Int": 5}`, `{"Float": 1.5}`, `{"Bool":
@@ -151,6 +153,72 @@ pub(super) fn parse_filter(args: &Map<String, JsonValue>) -> Result<Option<Filte
     }
 }
 
+/// Parse `rerank`/`rerank_overscan` into a [`crate::RerankOpts`], or `None` when unset.
+/// `rerank_overscan` alone (without `rerank: true`) is ignored. Unconditional: `RerankOpts`
+/// is plain data, needing no rerank feature to compile or run.
+pub(super) fn parse_rerank(
+    args: &Map<String, JsonValue>,
+) -> Result<Option<crate::RerankOpts>, McpError> {
+    if !optional_bool(args, "rerank")? {
+        return Ok(None);
+    }
+    let mut opts = crate::RerankOpts::default();
+    if let Some(overscan) = optional_usize(args, "rerank_overscan")? {
+        if overscan == 0 {
+            return Err(McpError::invalid_params(
+                "`rerank_overscan` must be at least 1",
+                None,
+            ));
+        }
+        opts.overscan = overscan;
+    }
+    Ok(Some(opts))
+}
+
+/// Refuse a rerank candidate window past [`crate::server::dto::MAX_TOP_K`] — past this the
+/// store would rank, and the provider score, an unreasonable depth. Reuses `rerank_depth`'s
+/// real formula rather than approximating it a second time.
+fn check_rerank_search_depth(opts: &SearchOpts) -> Result<(), McpError> {
+    if opts.rerank.is_none() {
+        return Ok(());
+    }
+    let depth = crate::store::rerank::rerank_depth(opts);
+    if depth > crate::server::dto::MAX_TOP_K {
+        return Err(McpError::invalid_params(
+            format!(
+                "rerank over top_k {} asks for a candidate depth of {depth}, exceeding the maximum of {}",
+                opts.top_k,
+                crate::server::dto::MAX_TOP_K
+            ),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Hybrid analogue of [`check_rerank_search_depth`]: `HybridOpts` has no `limit_per`, so the
+/// depth is just `(offset + top_k) * overscan`.
+fn check_rerank_hybrid_depth(opts: &HybridOpts) -> Result<(), McpError> {
+    let Some(r) = &opts.rerank else {
+        return Ok(());
+    };
+    let depth = opts
+        .offset
+        .saturating_add(opts.top_k)
+        .saturating_mul(r.overscan.max(1));
+    if depth > crate::server::dto::MAX_TOP_K {
+        return Err(McpError::invalid_params(
+            format!(
+                "rerank over top_k {} asks for a candidate depth of {depth}, exceeding the maximum of {}",
+                opts.top_k,
+                crate::server::dto::MAX_TOP_K
+            ),
+            None,
+        ));
+    }
+    Ok(())
+}
+
 /// AND unit 1's not-expired guard into a caller's filter — never replacing it. Dropping
 /// either half while merging is an easy, silent bug: the caller's own predicates could
 /// vanish, or an expired entry could leak back into results (D4/D5, `nidus-k28`).
@@ -158,6 +226,26 @@ pub(super) fn with_ttl_guard(filter: Option<Filter>) -> Filter {
     let mut filter = filter.unwrap_or_default();
     filter.0.push(not_expired_predicate(now_ms()));
     filter
+}
+
+/// `rerank`: opt into the cross-encoder post-ranking stage, shared by `recall`,
+/// `text_search`, and `hybrid_search`. A plain boolean, not an object: the query text is
+/// already a required argument on every one of these tools.
+fn rerank_bool_schema() -> JsonValue {
+    json!({
+        "type": "boolean",
+        "description": "Re-score the top candidates with a cross-encoder, which reads the query and each candidate together and is markedly more accurate than embedding similarity alone. Costs one extra provider call. Use it when precision matters more than latency."
+    })
+}
+
+/// `rerank_overscan`: how many times `top_k` candidates to widen the search to before
+/// reranking. Ignored unless `rerank: true` is also set.
+fn rerank_overscan_schema() -> JsonValue {
+    json!({
+        "type": "integer",
+        "description": "How many times `top_k` candidates to retrieve before reranking. Higher finds more, costs more. Defaults to 10.",
+        "minimum": 1
+    })
 }
 
 pub(super) fn tools() -> Vec<Tool> {
@@ -189,7 +277,9 @@ pub(super) fn tools() -> Vec<Tool> {
                         "type": "number",
                         "description": "Drop results scoring below this. Scores are cosine similarity in [-1, 1]; around 0.7 is a reasonable floor for \"actually relevant\"."
                     },
-                    "filter": filter_schema()
+                    "filter": filter_schema(),
+                    "rerank": rerank_bool_schema(),
+                    "rerank_overscan": rerank_overscan_schema()
                 },
                 "required": ["collection", "query"],
                 "additionalProperties": false
@@ -221,7 +311,9 @@ pub(super) fn tools() -> Vec<Tool> {
                         "description": "How many results to return.",
                         "minimum": 1
                     },
-                    "filter": filter_schema()
+                    "filter": filter_schema(),
+                    "rerank": rerank_bool_schema(),
+                    "rerank_overscan": rerank_overscan_schema()
                 },
                 "required": ["collection", "field", "query"],
                 "additionalProperties": false
@@ -253,7 +345,9 @@ pub(super) fn tools() -> Vec<Tool> {
                         "description": "How many results to return.",
                         "minimum": 1
                     },
-                    "filter": filter_schema()
+                    "filter": filter_schema(),
+                    "rerank": rerank_bool_schema(),
+                    "rerank_overscan": rerank_overscan_schema()
                 },
                 "required": ["collection", "field", "query"],
                 "additionalProperties": false
@@ -312,6 +406,7 @@ impl NidusMcp {
         let top_k = optional_top_k(args)?;
         let min_score = optional_f32(args, "min_score")?;
         let filter = parse_filter(args)?;
+        let rerank = parse_rerank(args)?;
 
         let vector = embedder
             .embed_query(&query)
@@ -322,8 +417,28 @@ impl NidusMcp {
             top_k,
             min_score,
             filter: with_ttl_guard(filter),
+            rerank,
             ..Default::default()
         };
+        check_rerank_search_depth(&opts)?;
+
+        #[cfg(feature = "rerank")]
+        if opts.rerank.is_some() {
+            let reranker = self.reranker()?;
+            let hits = self
+                .rerank_recall_and_finish(reranker, embedder, collection, vector, query, opts)
+                .await?;
+            return Ok(hits_content(hits.into_iter().map(HitDto::from).collect()));
+        }
+        #[cfg(not(feature = "rerank"))]
+        if opts.rerank.is_some() {
+            return Err(McpError::invalid_params(
+                "this nidus server was built without rerank support (the `rerank` feature); \
+                 `rerank` is unavailable",
+                None,
+            ));
+        }
+
         let hits = crate::server::run_read(self.state.clone(), move |db| {
             // Recalling with a different embedder than wrote the collection returns
             // nonsense, so the same guard the HTTP route uses refuses it.
@@ -345,14 +460,35 @@ impl NidusMcp {
         let query = required_str(args, "query")?;
         let top_k = optional_top_k(args)?;
         let filter = parse_filter(args)?;
+        let rerank = parse_rerank(args)?;
+
+        let opts = SearchOpts {
+            top_k,
+            filter: with_ttl_guard(filter),
+            rerank,
+            ..Default::default()
+        };
+        check_rerank_search_depth(&opts)?;
+        let q = crate::FtsQuery::new(field, query.clone());
+
+        #[cfg(feature = "rerank")]
+        if opts.rerank.is_some() {
+            let reranker = self.reranker()?;
+            let hits = self
+                .rerank_text_search_and_finish(reranker, collection, q, query, opts)
+                .await?;
+            return Ok(hits_content(hits.into_iter().map(HitDto::from).collect()));
+        }
+        #[cfg(not(feature = "rerank"))]
+        if opts.rerank.is_some() {
+            return Err(McpError::invalid_params(
+                "this nidus server was built without rerank support (the `rerank` feature); \
+                 `rerank` is unavailable",
+                None,
+            ));
+        }
 
         let hits = crate::server::run_read(self.state.clone(), move |db| {
-            let opts = SearchOpts {
-                top_k,
-                filter: with_ttl_guard(filter),
-                ..Default::default()
-            };
-            let q = crate::FtsQuery::new(field, query);
             db.text_search(crate::Scope::Collections(&[collection.as_str()]), &q, &opts)
         })
         .await
@@ -371,6 +507,7 @@ impl NidusMcp {
         let query = required_str(args, "query")?;
         let top_k = optional_top_k(args)?;
         let filter = parse_filter(args)?;
+        let rerank = parse_rerank(args)?;
 
         // The one divergence from `POST /hybrid-search`, which takes a caller-supplied
         // `vector`: embedding the query text gives the same fusion from an argument a model
@@ -380,15 +517,35 @@ impl NidusMcp {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        // `rrf_k`/`candidates` stay default: fusion knobs mean nothing to a model, so
+        // exposing them adds ways to get worse results and none to get better ones.
+        let opts = HybridOpts {
+            top_k,
+            filter: with_ttl_guard(filter),
+            rerank,
+            ..Default::default()
+        };
+        check_rerank_hybrid_depth(&opts)?;
+        let q = crate::FtsQuery::new(field, query.clone());
+
+        #[cfg(feature = "rerank")]
+        if opts.rerank.is_some() {
+            let reranker = self.reranker()?;
+            let hits = self
+                .rerank_hybrid_and_finish(reranker, collection, vector, q, query, opts)
+                .await?;
+            return Ok(hits_content(hits.into_iter().map(HitDto::from).collect()));
+        }
+        #[cfg(not(feature = "rerank"))]
+        if opts.rerank.is_some() {
+            return Err(McpError::invalid_params(
+                "this nidus server was built without rerank support (the `rerank` feature); \
+                 `rerank` is unavailable",
+                None,
+            ));
+        }
+
         let hits = crate::server::run_read(self.state.clone(), move |db| {
-            // `rrf_k`/`candidates` stay default: fusion knobs mean nothing to a model, so
-            // exposing them adds ways to get worse results and none to get better ones.
-            let opts = HybridOpts {
-                top_k,
-                filter: with_ttl_guard(filter),
-                ..Default::default()
-            };
-            let q = crate::FtsQuery::new(field, query);
             db.hybrid_search(
                 crate::Scope::Collections(&[collection.as_str()]),
                 &vector,
@@ -437,5 +594,262 @@ impl NidusMcp {
         .map_err(api_error)?;
 
         Ok(hits_content(hits.into_iter().map(HitDto::from).collect()))
+    }
+}
+
+/// The async half of MCP rerank: widen inside `run_read`, rerank outside it (network IO
+/// must never sit under the store lock), then cut the page via the promoted
+/// `Store::finish`/`finish_hybrid` — mirrors `crate::server`'s HTTP analogue, inlined here.
+#[cfg(feature = "rerank")]
+impl NidusMcp {
+    async fn rerank_recall_and_finish(
+        &self,
+        reranker: std::sync::Arc<crate::rerank::AnyReranker>,
+        embedder: std::sync::Arc<crate::embed::AnyEmbedder>,
+        collection: String,
+        vector: Vec<f32>,
+        rerank_query: String,
+        opts: SearchOpts,
+    ) -> Result<Vec<crate::Hit>, McpError> {
+        let rerank_opts = opts.rerank.clone().unwrap_or_default();
+        let widened = SearchOpts {
+            top_k: crate::store::rerank::rerank_depth(&opts),
+            offset: 0,
+            limit_per: None,
+            ..opts.clone()
+        };
+        let hits = crate::server::run_read(self.state.clone(), move |db| {
+            crate::memory::guard_recall_identity(db, embedder.as_ref(), &collection)?;
+            db.search(collection.as_str(), &vector, &widened)
+        })
+        .await
+        .map_err(api_error)?;
+        let reranked =
+            crate::rerank::rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts)
+                .await
+                .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        crate::server::run_read(self.state.clone(), move |db| {
+            Ok(db.store().finish(reranked, &opts))
+        })
+        .await
+        .map_err(api_error)
+    }
+
+    async fn rerank_text_search_and_finish(
+        &self,
+        reranker: std::sync::Arc<crate::rerank::AnyReranker>,
+        collection: String,
+        q: crate::FtsQuery,
+        rerank_query: String,
+        opts: SearchOpts,
+    ) -> Result<Vec<crate::Hit>, McpError> {
+        let rerank_opts = opts.rerank.clone().unwrap_or_default();
+        let widened = SearchOpts {
+            top_k: crate::store::rerank::rerank_depth(&opts),
+            offset: 0,
+            limit_per: None,
+            ..opts.clone()
+        };
+        let hits = crate::server::run_read(self.state.clone(), move |db| {
+            db.text_search(
+                crate::Scope::Collections(&[collection.as_str()]),
+                &q,
+                &widened,
+            )
+        })
+        .await
+        .map_err(api_error)?;
+        let reranked =
+            crate::rerank::rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts)
+                .await
+                .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        crate::server::run_read(self.state.clone(), move |db| {
+            Ok(db.store().finish(reranked, &opts))
+        })
+        .await
+        .map_err(api_error)
+    }
+
+    async fn rerank_hybrid_and_finish(
+        &self,
+        reranker: std::sync::Arc<crate::rerank::AnyReranker>,
+        collection: String,
+        vector: Vec<f32>,
+        q: crate::FtsQuery,
+        rerank_query: String,
+        opts: HybridOpts,
+    ) -> Result<Vec<crate::Hit>, McpError> {
+        let rerank_opts = opts.rerank.clone().unwrap_or_default();
+        let overscan = rerank_opts.overscan.max(1);
+        let widened = HybridOpts {
+            top_k: opts
+                .offset
+                .saturating_add(opts.top_k)
+                .saturating_mul(overscan),
+            offset: 0,
+            candidates: opts.candidates.saturating_mul(overscan),
+            ..opts.clone()
+        };
+        let hits = crate::server::run_read(self.state.clone(), move |db| {
+            db.hybrid_search(
+                crate::Scope::Collections(&[collection.as_str()]),
+                &vector,
+                &q,
+                &widened,
+            )
+        })
+        .await
+        .map_err(api_error)?;
+        let reranked =
+            crate::rerank::rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts)
+                .await
+                .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        crate::server::run_read(self.state.clone(), move |db| {
+            Ok(db.store().finish_hybrid(reranked, &opts))
+        })
+        .await
+        .map_err(api_error)
+    }
+}
+
+// Every test here drives the rerank stage, so the module as a whole is rerank-gated: under
+// a plain `mcp` build its imports would be unused rather than merely untested.
+#[cfg(all(test, feature = "rerank"))]
+mod tests {
+    use super::*;
+
+    /// Both rerank tests below need this; gated the same as the narrower of the two
+    /// (`rerank-voyage` implies `rerank`) so it is never dead code on its own.
+    fn obj(v: JsonValue) -> Map<String, JsonValue> {
+        match v {
+            JsonValue::Object(m) => m,
+            _ => panic!("expected a JSON object"),
+        }
+    }
+
+    /// A rerank request against a server with no reranker configured is a typed error
+    /// naming the flag, never a silent unreranked pass-through. Uses `text_search`, which
+    /// needs no embedder, to isolate the reranker-missing path.
+    #[tokio::test]
+    async fn rerank_without_a_configured_reranker_is_an_error() {
+        let mut db = crate::Nidus::open_in_memory(3).unwrap();
+        db.set_fts_schema("notes", &[crate::FtsField::new("body")])
+            .unwrap();
+        let mcp = NidusMcp::new(crate::server::test_state(Some(db)));
+
+        let err = mcp
+            .text_search(&obj(json!({
+                "collection": "notes",
+                "field": "body",
+                "query": "anything",
+                "rerank": true
+            })))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("--rerank-provider"),
+            "error must name the flag: {}",
+            err.message
+        );
+    }
+
+    /// `recall`'s rerank stage over an in-process mock cross-encoder: three docs that tie
+    /// on cosine (mocked embedder returns the same vector for everything) come back
+    /// reordered by the mock's scores, proving the stage actually ran.
+    #[cfg(all(
+        feature = "memory",
+        feature = "embed-openai-compat",
+        feature = "rerank-voyage"
+    ))]
+    #[tokio::test]
+    async fn recall_with_rerank_changes_the_order() {
+        use crate::embed::{AnyEmbedder, EmbedConfig, EmbedProvider};
+        use crate::rerank::testutil::mock_once;
+        use crate::rerank::{AnyReranker, RerankConfig, RerankProvider};
+
+        const INVERTING_SCORES: &str = r#"{"data":[{"index":0,"relevance_score":0.1},
+            {"index":1,"relevance_score":0.5},{"index":2,"relevance_score":0.9}]}"#;
+
+        let embed_base = crate::server::memory_tests::spawn_embed_mock();
+        let embedder = AnyEmbedder::build(
+            EmbedProvider::OpenAiCompat,
+            EmbedConfig::new("mock-model").base_url(embed_base),
+        )
+        .await
+        .expect("build mock embedder");
+        let mock = mock_once(200, INVERTING_SCORES);
+        let reranker = AnyReranker::build(
+            RerankProvider::Voyage,
+            RerankConfig::new("mock-rerank")
+                .api_key("k")
+                .base_url(&mock.base_url),
+        )
+        .unwrap();
+
+        let mut db = crate::Nidus::open_in_memory(crate::server::memory_tests::DIM).unwrap();
+        // Every doc gets the same vector (a dead cosine tie, broken on id: a, b, c) so any
+        // reordering in the result can only be the rerank stage's doing.
+        for id in ["a", "b", "c"] {
+            let mut attrs = std::collections::BTreeMap::new();
+            attrs.insert(
+                crate::META_TEXT.to_string(),
+                crate::Value::Str(format!("doc-{id}")),
+            );
+            db.upsert(
+                "notes",
+                &[crate::Record::new(id, vec![0.1, 0.2, 0.3], attrs)],
+            )
+            .unwrap();
+        }
+        let state = crate::server::AppState {
+            embedder: Some(std::sync::Arc::new(embedder)),
+            reranker: Some(std::sync::Arc::new(reranker)),
+            ..crate::server::test_state(Some(db))
+        };
+        let mcp = NidusMcp::new(state);
+
+        let baseline = mcp
+            .recall(&obj(
+                json!({"collection": "notes", "query": "anything", "top_k": 3}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_of(baseline),
+            vec!["a", "b", "c"],
+            "pre-rerank order is the id tie-break"
+        );
+
+        let reranked = mcp
+            .recall(&obj(
+                json!({"collection": "notes", "query": "anything", "top_k": 3, "rerank": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_of(reranked),
+            vec!["c", "b", "a"],
+            "rerank must reverse the tied order"
+        );
+    }
+
+    /// Pull the `id` list out of a search tool's rendered JSON content.
+    #[cfg(all(
+        feature = "memory",
+        feature = "embed-openai-compat",
+        feature = "rerank-voyage"
+    ))]
+    fn ids_of(result: CallToolResult) -> Vec<String> {
+        let rmcp::model::ContentBlock::Text(text) =
+            result.content.into_iter().next().expect("content block")
+        else {
+            panic!("expected text content");
+        };
+        let hits: JsonValue = serde_json::from_str(&text.text).expect("hits JSON");
+        hits.as_array()
+            .expect("hits array")
+            .iter()
+            .map(|h| h["id"].as_str().expect("id").to_string())
+            .collect()
     }
 }

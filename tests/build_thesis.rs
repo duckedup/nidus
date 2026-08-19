@@ -7,7 +7,7 @@
 
 /// DEFAULT build: none of the AI-ingest features are enabled, so the async edge
 /// (reqwest/tokio/hyper) is not compiled. This test only exists on the pure lane.
-#[cfg(not(any(feature = "embed", feature = "summarize")))]
+#[cfg(not(any(feature = "embed", feature = "summarize", feature = "rerank")))]
 #[test]
 fn default_build_is_pure() {
     // Base infra features — both gate `dep:reqwest` + `dep:tokio`.
@@ -16,6 +16,7 @@ fn default_build_is_pure() {
         !cfg!(feature = "summarize"),
         "summarize must be off by default"
     );
+    assert!(!cfg!(feature = "rerank"), "rerank must be off by default");
 
     // Headline memory surface + umbrellas.
     assert!(!cfg!(feature = "memory"), "memory must be off by default");
@@ -39,6 +40,14 @@ fn default_build_is_pure() {
     assert!(!cfg!(feature = "embed-openai-compat"));
     assert!(!cfg!(feature = "summarize-anthropic"));
     assert!(!cfg!(feature = "summarize-openai"));
+
+    // Rerank umbrella + provider adapters, mirroring the embed/summarize checks above.
+    assert!(
+        !cfg!(feature = "rerank-all"),
+        "rerank-all must be off by default"
+    );
+    assert!(!cfg!(feature = "rerank-voyage"));
+    assert!(!cfg!(feature = "rerank-cohere"));
 }
 
 // ── Ingest lane: the feature-implication graph that wires the async edge. ──────
@@ -100,13 +109,20 @@ const _: () = {
     assert!(cfg!(feature = "summarize-openai"));
 };
 
+/// The `rerank-all` umbrella must turn on every shipped reranker.
+#[cfg(feature = "rerank-all")]
+const _: () = {
+    assert!(cfg!(feature = "rerank-voyage"));
+    assert!(cfg!(feature = "rerank-cohere"));
+};
+
 /// On the ingest lane, at least one base edge is present — a sanity anchor so the
 /// file has a live `#[test]` under `--features …` too (not just `const _` checks).
-#[cfg(any(feature = "embed", feature = "summarize"))]
+#[cfg(any(feature = "embed", feature = "summarize", feature = "rerank"))]
 #[test]
 fn ingest_lane_enables_the_async_edge() {
     assert!(
-        cfg!(feature = "embed") || cfg!(feature = "summarize"),
+        cfg!(feature = "embed") || cfg!(feature = "summarize") || cfg!(feature = "rerank"),
         "ingest lane must enable at least one async-edge base feature"
     );
 }
