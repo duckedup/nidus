@@ -76,6 +76,9 @@ pub struct EmbedConfig {
     pub base_url: Option<String>,
     /// Extra request headers applied to every call (e.g. gateway auth).
     pub extra_headers: Vec<(String, String)>,
+    /// Ask for a non-native embedding width (Matryoshka truncation). Only
+    /// providers/models that advertise it accept this; `None` means native.
+    pub output_dimension: Option<usize>,
 }
 
 impl EmbedConfig {
@@ -85,6 +88,7 @@ impl EmbedConfig {
             api_key: String::new(),
             base_url: None,
             extra_headers: Vec::new(),
+            output_dimension: None,
         }
     }
 
@@ -100,6 +104,11 @@ impl EmbedConfig {
 
     pub fn header(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
         self.extra_headers.push((k.into(), v.into()));
+        self
+    }
+
+    pub fn output_dimension(mut self, d: usize) -> Self {
+        self.output_dimension = Some(d);
         self
     }
 }
@@ -163,6 +172,12 @@ impl EmbedProvider {
             EmbedProvider::Jina => "jina-embeddings-v3",
             EmbedProvider::OpenAiCompat => "",
         }
+    }
+
+    /// Whether the adapter honours [`EmbedConfig::output_dimension`]. Voyage's
+    /// Matryoshka models are the only ones wired for it today.
+    pub fn supports_output_dimension(&self) -> bool {
+        matches!(self, EmbedProvider::Voyage)
     }
 }
 
@@ -261,6 +276,14 @@ impl AnyEmbedder {
         let mut config = config;
         if config.model.is_empty() {
             config.model = provider.default_model().to_string();
+        }
+        // Reject centrally rather than in seven adapters: a silently-dropped
+        // output_dimension would pin a store to the wrong width.
+        if config.output_dimension.is_some() && !provider.supports_output_dimension() {
+            return Err(EmbedError::Config(format!(
+                "provider '{}' does not support output_dimension",
+                provider.as_str()
+            )));
         }
 
         // Each arm compiles exactly one `#[cfg]` tail-block: the real
@@ -711,6 +734,34 @@ mod tests {
                 EmbedProvider::from_name(name).is_some(),
                 "registry name {name} has no EmbedProvider"
             );
+        }
+    }
+
+    #[test]
+    fn only_voyage_advertises_output_dimension() {
+        assert!(EmbedProvider::Voyage.supports_output_dimension());
+        for p in [
+            EmbedProvider::OpenAi,
+            EmbedProvider::Ollama,
+            EmbedProvider::Cohere,
+            EmbedProvider::Gemini,
+            EmbedProvider::Mistral,
+            EmbedProvider::Jina,
+            EmbedProvider::OpenAiCompat,
+        ] {
+            assert!(!p.supports_output_dimension(), "{}", p.as_str());
+        }
+    }
+
+    #[tokio::test]
+    async fn build_rejects_output_dimension_a_provider_cannot_honour() {
+        let cfg = EmbedConfig::new("text-embedding-3-small")
+            .api_key("k")
+            .output_dimension(256);
+        match AnyEmbedder::build(EmbedProvider::OpenAi, cfg).await {
+            Err(EmbedError::Config(m)) => assert!(m.contains("output_dimension"), "{m}"),
+            Err(other) => panic!("expected Config error, got {other:?}"),
+            Ok(_) => panic!("expected output_dimension to be rejected"),
         }
     }
 
