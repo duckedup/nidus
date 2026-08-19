@@ -125,6 +125,11 @@ impl HnswGraph {
         }
     }
 
+    /// Retune the query-time walk width in place; the graph itself is untouched.
+    pub(crate) fn set_query_params(&mut self, cfg: &AnnConfig) {
+        self.ef_search = cfg.ef_search.max(1);
+    }
+
     pub(crate) fn build(&mut self, walk: &Walk, live_rows: &[u64], workers: usize) {
         self.rows.clear();
         self.links.clear();

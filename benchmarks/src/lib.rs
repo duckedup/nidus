@@ -1,10 +1,11 @@
 //! nidus-bench — cross-engine exact-KNN performance-parity harness.
 
-use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+
+pub use nidus::recall_at_k;
 
 pub mod data;
 pub mod engines;
@@ -125,9 +126,9 @@ pub fn run_engine<E: VectorStore>(
     })
 }
 
-/// The harness's **independent** exact top-k per query, by full brute-force cosine in f64
-/// — the unbiased ground truth for recall. Computed straight from the raw dataset, never
-/// from an engine's output, so it doesn't privilege whichever engine we compare against.
+/// The harness's **independent** exact top-k per query, by full brute-force cosine in f64.
+/// Computed straight from the raw dataset, never from an engine's output, so nidus is
+/// never its own oracle when measured against DuckDB/LanceDB (b44c2de) — not shared.
 pub fn exact_ground_truth(data: &Dataset, top_k: usize) -> Vec<Vec<u64>> {
     let dim = data.dim;
     let n = data.n();
@@ -167,19 +168,4 @@ pub fn exact_ground_truth(data: &Dataset, top_k: usize) -> Vec<Vec<u64>> {
             scored.into_iter().take(top_k).map(|(_, id)| id).collect()
         })
         .collect()
-}
-
-/// recall@k = mean over queries of |returned ∩ truth| / |truth|.
-pub fn recall_at_k(returned: &[Vec<u64>], truth: &[Vec<u64>]) -> f64 {
-    let q = returned.len().min(truth.len());
-    if q == 0 {
-        return 1.0;
-    }
-    let mut acc = 0.0;
-    for i in 0..q {
-        let t: HashSet<u64> = truth[i].iter().copied().collect();
-        let hit = returned[i].iter().filter(|id| t.contains(id)).count();
-        acc += hit as f64 / truth[i].len().max(1) as f64;
-    }
-    acc / q as f64
 }

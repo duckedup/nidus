@@ -743,6 +743,25 @@ derived data: deleting the `ann` or `fts` file only costs a one-time rebuild.
   rerank over those candidates restores accuracy. Recall runs a little below the
   exact-walk index, so widen `ef_search`/`n_probe` and `overscan` if you need it back.
 
+### Measuring recall against your own data
+
+"Raise `ef_search`/`n_probe` and `overscan`" is easy advice to give and hard to act
+on without a number: raise them how far, for what recall, at what latency cost?
+`nidus tune --dir <DIR>` answers that against the store you actually have, instead
+of a synthetic dataset. It samples queries from the store's own vectors, runs each
+one twice (once exact, once through the configured ANN/quantization path), and
+reports recall@k and latency for every setting in the sweep, ending in a
+recommended `Config`.
+
+```bash
+nidus tune --dir ./my-store --ef-search 32,64,128,256 --target-recall 0.95
+```
+
+Because a sampled query is itself a stored vector, it has a guaranteed distance-0
+match against itself; `tune` drops that self-hit before scoring on both legs, so
+the reported recall is not flattered by it. See the [`tune` reference](/reference/cli/#tune)
+for the full flag list, and `nidus configure` for persisting the recommendation.
+
 ## Per-segment indexing at scale
 
 `Config::ann` above is a **single global** index over every row. There is a second,

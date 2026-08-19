@@ -51,6 +51,9 @@ mod model;
 mod profile;
 mod search;
 mod store;
+// Recall/latency sweep over a caller's own store (nidus-sk9). Ungated: it must run
+// under `just miri` and ship to every `cargo add nidus`, not just the `cli` feature.
+mod tune;
 
 // The `nidus` binary's guts (CLI + `nidus serve`). Compiled only under the
 // non-default `cli` feature, so library consumers never see them and the core
@@ -115,6 +118,7 @@ pub use model::{
 pub use profile::OpenProfile;
 pub use store::Readiness;
 pub use store::SegmentReport;
+pub use tune::{TuneCell, TuneOpts, TuneReport, recall_at_k, tune};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -506,5 +510,10 @@ impl Nidus {
     /// and a mismatch is reported, never repaired: re-checksumming corrupt bytes would hide them.
     pub fn verify_integrity(&mut self) -> Result<Vec<SegmentReport>> {
         self.store.verify_integrity()
+    }
+
+    /// Retune `ef_search`/`n_probe`/`overscan` in place for the `tune` sweep — no rebuild.
+    pub(crate) fn retune_ann(&mut self, cfg: AnnConfig) {
+        self.store.retune_ann(cfg)
     }
 }

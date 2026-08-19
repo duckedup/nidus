@@ -36,6 +36,7 @@ use crate::summarize::{AnySummarizer, SummarizeConfig, SummarizeProvider};
 mod backup;
 #[cfg(feature = "memory")]
 mod memory;
+mod tune;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -1117,6 +1118,40 @@ enum Command {
         #[command(flatten)]
         store: StoreArgs,
     },
+    /// Sweep `ef_search`/`n_probe`/`overscan` (and optionally quantization) against the
+    /// store's own vectors and report recall@k, latency, and a recommended `Config`.
+    /// Opens read-only, so it runs alongside a `nidus serve` holding the writer lock.
+    Tune {
+        #[command(flatten)]
+        store: StoreArgs,
+        /// Collection to sample and search over. Omit to sweep the whole store.
+        #[arg(long)]
+        collection: Option<String>,
+        /// `k` in recall@k, and `top_k` for every search the sweep runs.
+        #[arg(long, short = 'k', default_value_t = 10)]
+        top_k: usize,
+        /// How many stored vectors to sample as queries.
+        #[arg(long, default_value_t = 200)]
+        sample: usize,
+        /// HNSW `ef_search` values to sweep, comma-separated. Ignored for `--ann ivf`.
+        #[arg(long = "ef-search", value_delimiter = ',')]
+        ef_search: Vec<usize>,
+        /// IVF `n_probe` values to sweep, comma-separated. Ignored for `--ann hnsw`.
+        #[arg(long = "n-probe", value_delimiter = ',')]
+        n_probe: Vec<usize>,
+        /// Overscan values to sweep, comma-separated, crossed with the above.
+        #[arg(long, value_delimiter = ',')]
+        overscan: Vec<usize>,
+        /// Also sweep none/int8/binary quantization — each value forces a rebuild.
+        #[arg(long)]
+        sweep_quantization: bool,
+        /// Minimum recall@k a cell must clear to be recommended by lowest p50 latency.
+        #[arg(long, default_value_t = 0.95)]
+        target_recall: f64,
+        /// SplitMix64 seed for the deterministic query sample.
+        #[arg(long)]
+        seed: Option<u64>,
+    },
     /// Remember a fact: embed `text` (optionally summarizing first) and store it.
     /// Needs an embedder — the same `--embed-*` flags (and `NIDUS_EMBED_*` envs) `serve` takes.
     #[cfg(feature = "memory")]
@@ -1601,6 +1636,29 @@ pub fn run(cli: Cli) -> Result<()> {
                 "footprint": FootprintDto::from(db.footprint()),
             }))
         }
+        Command::Tune {
+            store,
+            collection,
+            top_k,
+            sample,
+            ef_search,
+            n_probe,
+            overscan,
+            sweep_quantization,
+            target_recall,
+            seed,
+        } => tune::run(
+            store,
+            collection,
+            top_k,
+            sample,
+            ef_search,
+            n_probe,
+            overscan,
+            sweep_quantization,
+            target_recall,
+            seed,
+        ),
         #[cfg(feature = "memory")]
         Command::Remember {
             store,
@@ -2637,6 +2695,116 @@ mod tests {
                 assert_eq!(persistence.as_deref(), Some("s3://bucket/store"));
             }
             _ => panic!("expected Check"),
+        }
+    }
+
+    #[test]
+    fn tune_parses_comma_separated_lists() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "tune",
+            "-d",
+            "/tmp/s",
+            "--ef-search",
+            "32,64,128",
+            "--n-probe",
+            "4,8,16,32",
+            "--overscan",
+            "2,4,8",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Tune {
+                ef_search,
+                n_probe,
+                overscan,
+                ..
+            } => {
+                assert_eq!(ef_search, vec![32, 64, 128]);
+                assert_eq!(n_probe, vec![4, 8, 16, 32]);
+                assert_eq!(overscan, vec![2, 4, 8]);
+            }
+            _ => panic!("expected Tune"),
+        }
+    }
+
+    #[test]
+    fn tune_defaults_land_where_documented() {
+        let cli = Cli::try_parse_from(["nidus", "tune", "-d", "/tmp/s"]).unwrap();
+        match cli.command {
+            Command::Tune {
+                collection,
+                top_k,
+                sample,
+                ef_search,
+                n_probe,
+                overscan,
+                sweep_quantization,
+                target_recall,
+                seed,
+                ..
+            } => {
+                assert_eq!(collection, None);
+                assert_eq!(top_k, 10);
+                assert_eq!(sample, 200);
+                assert!(ef_search.is_empty());
+                assert!(n_probe.is_empty());
+                assert!(overscan.is_empty());
+                assert!(!sweep_quantization);
+                assert_eq!(target_recall, 0.95);
+                assert_eq!(seed, None);
+            }
+            _ => panic!("expected Tune"),
+        }
+    }
+
+    #[test]
+    fn tune_sweep_quantization_flag_flips() {
+        let cli =
+            Cli::try_parse_from(["nidus", "tune", "-d", "/tmp/s", "--sweep-quantization"]).unwrap();
+        match cli.command {
+            Command::Tune {
+                sweep_quantization, ..
+            } => assert!(sweep_quantization),
+            _ => panic!("expected Tune"),
+        }
+    }
+
+    #[test]
+    fn tune_parses_collection_top_k_target_recall_and_seed() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "tune",
+            "-d",
+            "/tmp/s",
+            "--collection",
+            "docs",
+            "-k",
+            "20",
+            "--sample",
+            "50",
+            "--target-recall",
+            "0.9",
+            "--seed",
+            "7",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Tune {
+                collection,
+                top_k,
+                sample,
+                target_recall,
+                seed,
+                ..
+            } => {
+                assert_eq!(collection.as_deref(), Some("docs"));
+                assert_eq!(top_k, 20);
+                assert_eq!(sample, 50);
+                assert_eq!(target_recall, 0.9);
+                assert_eq!(seed, Some(7));
+            }
+            _ => panic!("expected Tune"),
         }
     }
 

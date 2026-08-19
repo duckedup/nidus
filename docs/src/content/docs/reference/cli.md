@@ -7,10 +7,10 @@ Every flag the `nidus` binary accepts, generated from `nidus --help` and each su
 own `--help`. For a guided tour with worked examples, see the [command-line
 guide](/guides/cli-and-server/); this page is the exhaustive reference.
 
-The binary has **24 subcommands**: `serve`, `mcp`, `collections`, `create`, `drop`,
+The binary has **25 subcommands**: `serve`, `mcp`, `collections`, `create`, `drop`,
 `upsert`, `search`, `similar`, `aggregate`, `list`, `set-fts-schema`, `text-search`,
 `hybrid-search`, `get`, `delete`, `compact`, `configure`, `backup`, `restore`,
-`verify`, `check`, `stats`, `remember`, `recall`.
+`verify`, `check`, `stats`, `tune`, `remember`, `recall`.
 
 ## Feature gating
 
@@ -19,7 +19,7 @@ binary was built:
 
 | Install | Command | Surface |
 | --- | --- | --- |
-| `cargo binstall nidus` (prebuilt), or the install script | n/a | Everything below: all 23 subcommands, every `--embed-*`/`--summarize-*` flag, `mcp`, `remember`, `recall` |
+| `cargo binstall nidus` (prebuilt), or the install script | n/a | Everything below: all 25 subcommands, every `--embed-*`/`--summarize-*` flag, `mcp`, `remember`, `recall` |
 | `cargo install nidus --features cli` | build from source | No `mcp`, `remember`, or `recall` subcommand, and `serve` has **no** `--embed-*`/`--summarize-*` flags |
 
 The prebuilt binaries (`cargo binstall`, the install script, and the release
@@ -378,6 +378,32 @@ See [Checking a live store](/guides/cli-and-server/#checking-a-live-store).
 
 Print store footprint and collections as JSON. Usage:
 `nidus stats [OPTIONS] --dir <DIR>`. No flags beyond the store flags.
+
+### `tune`
+
+Sweep `ef_search`/`n_probe`/`overscan` (and, optionally, quantization) against the
+store's own vectors, scoring each candidate setting with recall@k measured against
+the same binary's exact search, and print a recommended `Config`. Opens read-only,
+so it runs alongside a `nidus serve` holding the writer lock. Usage:
+`nidus tune [OPTIONS] --dir <DIR>`.
+
+| Flag | Env | Description |
+| --- | --- | --- |
+| `--collection <NAME>` | none | Sample from this collection only. Omit to sample the whole store. |
+| `-k, --top-k <N>` | none | `k` in recall@k (default `10`). |
+| `--sample <N>` | none | Number of sampled queries (default `200`). |
+| `--ef-search <LIST>` | none | Comma-separated `ef_search` values to sweep (HNSW). |
+| `--n-probe <LIST>` | none | Comma-separated `n_probe` values to sweep (IVF). |
+| `--overscan <LIST>` | none | Comma-separated overscan values to sweep (both ANN kinds). |
+| `--sweep-quantization` | none | Also sweep `none`/`int8`/`binary`. Forces an index rebuild per cell, unlike the other flags above. |
+| `--target-recall <F>` | none | Recall@k the recommendation must clear (default `0.95`). |
+| `--seed <U64>` | none | Sampling seed, for a reproducible sweep. |
+
+Each sampled query is a vector already in the store, so it has a guaranteed
+distance-0 match against itself; `tune` drops that self-hit from both the exact and
+approximate results before scoring, and the output says so in words rather than
+reporting a flattered number. The result is print-only: it names `nidus configure`
+as the way to persist the recommendation, but never writes to the store itself.
 
 ### `remember` (`memory` feature)
 
