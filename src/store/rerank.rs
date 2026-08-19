@@ -12,13 +12,76 @@
 use std::cmp::Ordering;
 
 use super::read::depth;
-use crate::model::{Hit, SearchOpts, Value};
+use crate::model::{Hit, Projection, SearchOpts, Value};
 
 /// How deep to rank before reranking: one page (`read::depth`) times the overscan, so a
 /// `top_k=N` query sees `N * overscan` candidates to rerank over.
 pub(crate) fn rerank_depth(opts: &SearchOpts) -> usize {
     let overscan = opts.rerank.as_ref().map(|r| r.overscan.max(1)).unwrap_or(1);
     depth(opts).saturating_mul(overscan)
+}
+
+/// The pre-rerank fetch's opts: [`rerank_depth`] deep, unpaginated, `limit_per` deferred, and
+/// the text attr force-included — `hits_from_topk` projects before a `Hit` exists, so
+/// inheriting a projection that drops it would silently skip the rerank (nidus-d6z).
+pub(crate) fn widened_opts(opts: &SearchOpts) -> (SearchOpts, bool) {
+    let text_attr = opts
+        .rerank
+        .as_ref()
+        .map(|r| r.text_attr.as_str())
+        .unwrap_or(crate::model::META_TEXT);
+    let already_kept = projection_carries(&opts.projection, text_attr);
+    let projection = if already_kept {
+        opts.projection.clone()
+    } else {
+        force_include(&opts.projection, text_attr)
+    };
+    let widened = SearchOpts {
+        top_k: rerank_depth(opts),
+        offset: 0,
+        limit_per: None,
+        projection,
+        ..opts.clone()
+    };
+    (widened, already_kept)
+}
+
+/// Whether `p` would already carry `field`.
+fn projection_carries(p: &Projection, field: &str) -> bool {
+    match p {
+        Projection::All => true,
+        Projection::Include(keys) => keys.iter().any(|k| k == field),
+        Projection::Exclude(keys) => !keys.iter().any(|k| k == field),
+    }
+}
+
+/// `p` widened to carry `field`. Only called when it does not already.
+fn force_include(p: &Projection, field: &str) -> Projection {
+    match p {
+        Projection::All => Projection::All,
+        Projection::Include(keys) => {
+            let mut keys = keys.clone();
+            keys.push(field.to_string());
+            Projection::Include(keys)
+        }
+        Projection::Exclude(keys) => {
+            Projection::Exclude(keys.iter().filter(|k| *k != field).cloned().collect())
+        }
+    }
+}
+
+/// Undo [`widened_opts`]'s force-include, so the response honours the projection the caller
+/// actually asked for. A no-op when their projection already carried the attr.
+pub(crate) fn retrim(hits: &mut [Hit], opts: &SearchOpts, already_kept: bool) {
+    if already_kept {
+        return;
+    }
+    let Some(r) = opts.rerank.as_ref() else {
+        return;
+    };
+    for h in hits.iter_mut() {
+        h.attrs.remove(&r.text_attr);
+    }
 }
 
 /// Split `hits` into the candidate texts (non-empty `Value::Str` under `text_attr`, in order)

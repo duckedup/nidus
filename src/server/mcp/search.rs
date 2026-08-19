@@ -612,22 +612,18 @@ impl NidusMcp {
         opts: SearchOpts,
     ) -> Result<Vec<crate::Hit>, McpError> {
         let rerank_opts = opts.rerank.clone().unwrap_or_default();
-        let widened = SearchOpts {
-            top_k: crate::store::rerank::rerank_depth(&opts),
-            offset: 0,
-            limit_per: None,
-            ..opts.clone()
-        };
+        let (widened, kept) = crate::store::rerank::widened_opts(&opts);
         let hits = crate::server::run_read(self.state.clone(), move |db| {
             crate::memory::guard_recall_identity(db, embedder.as_ref(), &collection)?;
             db.search(collection.as_str(), &vector, &widened)
         })
         .await
         .map_err(api_error)?;
-        let reranked =
+        let mut reranked =
             crate::rerank::rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts)
                 .await
                 .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        crate::store::rerank::retrim(&mut reranked, &opts, kept);
         crate::server::run_read(self.state.clone(), move |db| {
             Ok(db.store().finish(reranked, &opts))
         })
@@ -644,12 +640,7 @@ impl NidusMcp {
         opts: SearchOpts,
     ) -> Result<Vec<crate::Hit>, McpError> {
         let rerank_opts = opts.rerank.clone().unwrap_or_default();
-        let widened = SearchOpts {
-            top_k: crate::store::rerank::rerank_depth(&opts),
-            offset: 0,
-            limit_per: None,
-            ..opts.clone()
-        };
+        let (widened, kept) = crate::store::rerank::widened_opts(&opts);
         let hits = crate::server::run_read(self.state.clone(), move |db| {
             db.text_search(
                 crate::Scope::Collections(&[collection.as_str()]),
@@ -659,10 +650,11 @@ impl NidusMcp {
         })
         .await
         .map_err(api_error)?;
-        let reranked =
+        let mut reranked =
             crate::rerank::rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts)
                 .await
                 .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        crate::store::rerank::retrim(&mut reranked, &opts, kept);
         crate::server::run_read(self.state.clone(), move |db| {
             Ok(db.store().finish(reranked, &opts))
         })
