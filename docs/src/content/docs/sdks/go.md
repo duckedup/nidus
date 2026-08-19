@@ -138,6 +138,25 @@ string. When you *do* want the loose map, ask for it:
 plain := hit.Attrs.Decode() // map[string]any: string, int64, bool, []string, nil
 ```
 
+## Similar records ("more like this")
+
+`SearchSimilar` runs a search using the vector already stored at a record, instead of
+a query you supply yourself:
+
+```go
+hits, err := db.SearchSimilar(ctx, nidus.SimilarRequest{Collection: "docs", ID: "a", TopK: 5})
+```
+
+Takes the same fields as `SearchRequest` (`TopK`, `Offset`, `MinScore`, `Filter`,
+`Exact`, `RankBy`, `LimitPer`), plus `Scope`: which collections to search, defaulting
+to the source record's own collection rather than every collection in the store the
+way a plain `Search`'s empty `Scope` does.
+
+The source record is never in its own results, dropped by id after ranking, not by a
+score cutoff, so a genuine duplicate of it (also scoring near 1.0) still comes back. A
+`Collection`/`ID` pair naming no record, or a record with no stored vector (a
+text-only entry), returns an error naming the id and the reason, not an empty result.
+
 ## Filtering
 
 Build an AND-filter with the predicate constructors. Each predicate is a positive

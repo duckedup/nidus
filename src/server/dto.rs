@@ -75,6 +75,36 @@ pub struct SearchRequest {
     pub limit_per: Option<LimitPer>,
 }
 
+/// Body of `POST /search/similar`: "more like this" over the vector already stored at
+/// `collection`/`id`. Unlike [`SearchRequest`], an empty `scope` means the source's own
+/// collection rather than every collection.
+#[derive(Debug, Deserialize)]
+pub struct SimilarRequest {
+    pub collection: String,
+    pub id: String,
+    /// Which collections to search. Empty defaults to the source's own collection.
+    #[serde(default)]
+    pub scope: Vec<String>,
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub min_score: Option<f32>,
+    #[serde(default)]
+    pub filter: Filter,
+    #[serde(default)]
+    pub exact: bool,
+    #[serde(default)]
+    pub include_attributes: Option<Vec<String>>,
+    #[serde(default)]
+    pub exclude_attributes: Option<Vec<String>>,
+    #[serde(default)]
+    pub rank_by: Option<RankBy>,
+    #[serde(default)]
+    pub limit_per: Option<LimitPer>,
+}
+
 /// Most queries one batch may carry. Matches turbopuffer's documented cap; the point is that
 /// ONE request, holding one concurrency permit under one deadline, cannot buy unbounded scan.
 pub(super) const MAX_BATCH_QUERIES: usize = 16;

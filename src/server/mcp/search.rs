@@ -1,5 +1,5 @@
-//! The three read-only search tools — `recall`, `text_search`, `hybrid_search` — and the
-//! metadata `filter` they share (nidus-k28.3).
+//! The four read-only search tools — `recall`, `text_search`, `hybrid_search`, `related` —
+//! and the metadata `filter` they share (nidus-k28.3).
 
 use rmcp::{
     ErrorData as McpError,
@@ -262,6 +262,45 @@ pub(super) fn tools() -> Vec<Tool> {
     ]
 }
 
+/// `related`'s schema, kept separate from [`tools`] so [`super::tools`] can register it
+/// last in the overall list without disturbing this module's own three-tool order.
+pub(super) fn related_tool() -> Tool {
+    tool(
+        "related",
+        "Find entries related to one you already have, using an existing entry as the \
+         query instead of new text. Use this to follow a thread from a known memory, or \
+         to check for a near-duplicate before writing a new one — an entry with nearly \
+         identical content to the source will come back as a top hit. The source is \
+         looked up by id and is never included in its own results.",
+        json!({
+            "$defs": filter_defs(),
+            "type": "object",
+            "properties": {
+                "collection": {
+                    "type": "string",
+                    "description": "Which collection the source entry lives in; also where it searches."
+                },
+                "id": {
+                    "type": "string",
+                    "description": "The id of the entry to find things related to."
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "How many results to return. Defaults to the server's configured value.",
+                    "minimum": 1
+                },
+                "min_score": {
+                    "type": "number",
+                    "description": "Drop results scoring below this. Scores are cosine similarity in [-1, 1]; around 0.7 is a reasonable floor for \"actually relevant\"."
+                },
+                "filter": filter_schema()
+            },
+            "required": ["collection", "id"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 impl NidusMcp {
     pub(super) async fn recall(
         &self,
@@ -356,6 +395,43 @@ impl NidusMcp {
                 &q,
                 &opts,
             )
+        })
+        .await
+        .map_err(api_error)?;
+
+        Ok(hits_content(hits.into_iter().map(HitDto::from).collect()))
+    }
+
+    /// "More like this": search using an already-stored entry instead of embedding new
+    /// text. `search_similar` already names a missing/text-only source; the not-expired
+    /// check here is the one thing a direct id lookup skips, the way `get`'s does.
+    pub(super) async fn related(
+        &self,
+        args: &Map<String, JsonValue>,
+    ) -> Result<CallToolResult, McpError> {
+        let collection = required_str(args, "collection")?;
+        let id = required_str(args, "id")?;
+        let top_k = optional_top_k(args)?;
+        let min_score = optional_f32(args, "min_score")?;
+        let filter = parse_filter(args)?;
+
+        let hits = crate::server::run_read(self.state.clone(), move |db| {
+            if let Some(source) = db.get(&collection, &id) {
+                let guard = Filter(vec![not_expired_predicate(now_ms())]);
+                if !crate::filter::matches(&guard, &source.attrs) {
+                    anyhow::bail!(
+                        "{}: record `{collection}/{id}` has expired and cannot be used as a query",
+                        crate::store::BAD_QUERY
+                    );
+                }
+            }
+            let opts = SearchOpts {
+                top_k,
+                min_score,
+                filter: with_ttl_guard(filter),
+                ..Default::default()
+            };
+            db.search_similar(collection.as_str(), collection.as_str(), id.as_str(), &opts)
         })
         .await
         .map_err(api_error)?;

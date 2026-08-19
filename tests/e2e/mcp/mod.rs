@@ -9,6 +9,7 @@ mod hygiene;
 mod lifecycle;
 mod prompts;
 mod recency;
+mod related;
 mod resources;
 mod stdio;
 pub(super) mod support;
@@ -197,6 +198,7 @@ fn tools_list_is_complete_ordered_and_cacheable() {
             "forget",
             "get",
             "browse",
+            "related",
         ],
         "tool list changed — if this is deliberate, append rather than reorder"
     );

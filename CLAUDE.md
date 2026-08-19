@@ -540,6 +540,16 @@ docs (`docs/src/content/docs/getting-started.md`) and `README.md` to match (e.g.
 `major.minor` (a patch bump like `0.12.1 → 0.12.2` leaves `nidus = "0.12"` correct).
 Those `[dependencies]` examples must not lag the released crate.
 
+**A feature ships whole, in ONE PR — core, HTTP, CLI, MCP, all three SDKs, docs.**
+Nidus has one capability surface, not six that drift. A change that adds a server route
+also adds its `sdks/js`, `sdks/go` and `sdks/python` method, its MCP tool where the
+text-native rule allows one, its CLI subcommand, and its entry in the HTTP/CLI/MCP
+reference. Do not split the SDKs into a follow-up and do not ask whether they are in
+scope: they are. A partial surface is the failure this law exists to prevent, because
+the missing half is invisible from inside the PR that shipped the first half. If a leg
+genuinely cannot ship (a surface where the capability makes no sense), say which and why
+in the PR body rather than leaving it silently absent.
+
 **The client SDKs ship at the crate's version — and you do NOT hand-edit theirs
 either.** Every SDK under `sdks/` is released at `Cargo.toml`'s `version`, so "which
 nidus does this client speak to" is answerable from the version alone. `release.yml`

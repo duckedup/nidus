@@ -341,6 +341,46 @@ fn bad_invocations_exit_nonzero_with_a_useful_message() {
     assert!(err.contains("dimension"), "{err}");
 }
 
+/// `similar` searches the vector already stored at COLLECTION/ID, defaulting scope to
+/// that same collection and dropping the source record from the results.
+#[test]
+fn similar_finds_the_nearest_neighbour_and_excludes_the_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(
+        &["upsert", "--dir", dir, "docs"],
+        &json!([
+            {"id": "a", "vector": [1.0, 0.0, 0.0], "attrs": {}},
+            {"id": "b", "vector": [0.8, 0.6, 0.0], "attrs": {}},
+            {"id": "c", "vector": [0.0, 0.0, 1.0], "attrs": {}}
+        ])
+        .to_string(),
+    );
+
+    let hits = ok(&["similar", "--dir", dir, "docs", "a"], "");
+    let hit_ids = ids(&hits);
+    assert!(!hit_ids.contains(&"a".to_string()), "{hits}");
+    assert!(hit_ids.contains(&"b".to_string()), "{hits}");
+}
+
+/// A text-only source record has no vector to search with, so `similar` refuses rather
+/// than scanning garbage, naming the id and the reason on stderr.
+#[test]
+fn similar_on_a_text_only_source_exits_nonzero_with_the_reason() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(
+        &["upsert", "--dir", dir, "docs"],
+        &json!([{"id": "t1", "attrs": {"kind": {"Str": "note"}}}]).to_string(),
+    );
+
+    let err = fails(&["similar", "--dir", dir, "docs", "t1"], "");
+    assert!(err.contains("t1"), "should name the record: {err}");
+    assert!(err.contains("text-only"), "should say why: {err}");
+}
+
 /// Read subcommands open read-only, so they never contend with a running `nidus serve`
 /// writer. Only two real processes over one directory can prove that.
 #[test]

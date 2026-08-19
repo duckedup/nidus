@@ -316,6 +316,27 @@ type Projection struct {
 	ExcludeAttributes []string `json:"exclude_attributes,omitempty"`
 }
 
+// A SimilarRequest is a "more like this" query: neighbours of a record already stored
+// under Collection/ID, rather than of a caller-supplied query vector. The source record
+// is never in the results, but a true duplicate of it is.
+//
+// It mirrors [SearchRequest] field for field, minus Query, plus Collection and ID. An
+// empty Scope searches the source's own collection — the one place this differs from
+// [SearchRequest], where an empty Scope searches every collection.
+type SimilarRequest struct {
+	Collection string    `json:"collection"`
+	ID         string    `json:"id"`
+	Scope      []string  `json:"scope,omitempty"`
+	TopK       int       `json:"top_k,omitempty"`     // 0 takes the server's default
+	Offset     int       `json:"offset,omitempty"`    // skip this many top-ranked hits
+	MinScore   *float32  `json:"min_score,omitempty"` // nil is "no floor"; &0 is a floor of zero
+	Filter     Filter    `json:"filter,omitempty"`
+	Exact      bool      `json:"exact,omitempty"`
+	RankBy     *RankBy   `json:"rank_by,omitempty"`
+	LimitPer   *LimitPer `json:"limit_per,omitempty"`
+	Projection
+}
+
 // An FtsField is one entry of a [Client.SetFtsFields] schema: the attribute to
 // full-text index, plus the BM25 and analyzer knobs to override for it.
 //

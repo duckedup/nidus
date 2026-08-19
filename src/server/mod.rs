@@ -28,7 +28,7 @@ use crate::{
 use dto::{
     AggregateRequest, AggregationDto, AnnDto, BatchFuse, BatchSearchRequest, BatchSearchResponse,
     CompactRequest, DeleteRequest, FilterIndexRequest, FootprintDto, FtsSchemaRequest, HitDto,
-    HybridSearchRequest, ListRequest, MAX_BATCH_QUERIES, MAX_TOP_K, SearchRequest,
+    HybridSearchRequest, ListRequest, MAX_BATCH_QUERIES, MAX_TOP_K, SearchRequest, SimilarRequest,
     TextSearchRequest, UpsertRequest,
 };
 
@@ -432,6 +432,7 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/collections/{name}/filter-index", post(set_filter_index))
         .route("/search", post(search))
         .route("/search/batch", post(search_batch))
+        .route("/search/similar", post(search_similar))
         .route("/text-search", post(text_search))
         .route("/hybrid-search", post(hybrid_search))
         .route("/list", post(list))
@@ -794,6 +795,39 @@ fn plan_search(req: SearchRequest) -> Result<(Vec<String>, Vec<f32>, SearchOpts)
         limit_per: req.limit_per,
     };
     Ok((req.scope, req.query, opts))
+}
+
+/// `POST /search/similar`: "more like this" over the vector already stored at
+/// `collection`/`id`. An empty `scope` searches only the source's own collection, unlike plain
+/// `search` where an empty scope means every collection.
+async fn search_similar(
+    State(st): State<AppState>,
+    Json(req): Json<SimilarRequest>,
+) -> Result<Json<Vec<HitDto>>, ApiError> {
+    check_page(req.offset, req.top_k)?;
+    let projection = check_projection(req.include_attributes, req.exclude_attributes)?;
+    let opts = SearchOpts {
+        top_k: req.top_k,
+        offset: req.offset,
+        min_score: req.min_score,
+        filter: req.filter,
+        exact: req.exact,
+        projection,
+        explain: false,
+        rank_by: req.rank_by,
+        limit_per: req.limit_per,
+    };
+    let scope = if req.scope.is_empty() {
+        vec![req.collection.clone()]
+    } else {
+        req.scope
+    };
+    let (collection, id) = (req.collection, req.id);
+    let hits = run_read(st, move |db| {
+        scoped(&scope, |s| db.search_similar(s, &collection, &id, &opts))
+    })
+    .await?;
+    Ok(Json(hits.into_iter().map(HitDto::from).collect()))
 }
 
 /// `POST /search/batch`: answer up to [`MAX_BATCH_QUERIES`] vector queries in one round-trip,
@@ -1842,6 +1876,202 @@ mod tests {
             json!([]),
             "an offset past the end is an empty page"
         );
+    }
+
+    /// "More like this": the source record must not reappear in its own results, and the
+    /// nearest real neighbour must rank first.
+    #[tokio::test]
+    async fn search_similar_over_http_excludes_source_and_ranks_neighbour_first() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "src", "vector": [1, 0, 0], "attrs": {}},
+                    {"id": "near", "vector": [0.9, 0.1, 0.0], "attrs": {}},
+                    {"id": "far", "vector": [0, 1, 0], "attrs": {}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        let resp = app
+            .oneshot(post(
+                "/search/similar",
+                json!({"collection": "docs", "id": "src", "top_k": 10}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        let ids: Vec<&str> = hits
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap())
+            .collect();
+        assert!(!ids.contains(&"src"), "source must not self-match: {ids:?}");
+        assert_eq!(hits[0]["id"], "near");
+    }
+
+    /// A byte-identical duplicate is a real neighbour, not the source — it must still come
+    /// back, and score ~1.0.
+    #[tokio::test]
+    async fn search_similar_over_http_keeps_a_true_duplicate() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "src", "vector": [1, 0, 0], "attrs": {}},
+                    {"id": "dup", "vector": [1, 0, 0], "attrs": {}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        let resp = app
+            .oneshot(post(
+                "/search/similar",
+                json!({"collection": "docs", "id": "src", "top_k": 10}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        assert_eq!(hits.as_array().unwrap().len(), 1);
+        assert_eq!(hits[0]["id"], "dup");
+        assert!((hits[0]["score"].as_f64().unwrap() - 1.0).abs() < 1e-6);
+    }
+
+    /// A text-only source has no vector to search from; the store's `BAD_QUERY`-marked
+    /// error must classify as a client fault, and the body must carry the reason.
+    #[tokio::test]
+    async fn search_similar_over_http_on_text_only_source_is_bad_request() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [{"id": "t1", "attrs": {"kind": {"Str": "note"}}}]}),
+            ))
+            .await
+            .unwrap();
+        let resp = app
+            .oneshot(post(
+                "/search/similar",
+                json!({"collection": "docs", "id": "t1"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = json_body(resp).await["error"].as_str().unwrap().to_string();
+        assert!(err.contains("t1"), "{err}");
+    }
+
+    /// An id that names no record at all is a client fault too, and distinct in wording from
+    /// the text-only case above.
+    #[tokio::test]
+    async fn search_similar_over_http_on_unknown_id_is_bad_request() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [{"id": "src", "vector": [1, 0, 0], "attrs": {}}]}),
+            ))
+            .await
+            .unwrap();
+        let resp = app
+            .oneshot(post(
+                "/search/similar",
+                json!({"collection": "docs", "id": "ghost"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = json_body(resp).await["error"].as_str().unwrap().to_string();
+        assert!(err.contains("ghost"), "{err}");
+    }
+
+    /// Same ceiling as `/search`: `offset + top_k` past `MAX_TOP_K` is refused, not clamped.
+    #[tokio::test]
+    async fn search_similar_over_http_offset_past_max_top_k_is_bad_request() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [{"id": "src", "vector": [1, 0, 0], "attrs": {}}]}),
+            ))
+            .await
+            .unwrap();
+        let resp = app
+            .oneshot(post(
+                "/search/similar",
+                json!({"collection": "docs", "id": "src", "top_k": 10, "offset": MAX_TOP_K}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = json_body(resp).await["error"].as_str().unwrap().to_string();
+        assert!(err.contains("offset"), "{err}");
+    }
+
+    /// An omitted `scope` must search only the source's own collection — the one place this
+    /// route differs from `/search`, where an empty scope means every collection. Without this
+    /// test the default could regress to `All` without anything going red.
+    #[tokio::test]
+    async fn search_similar_over_http_scope_defaults_to_source_collection() {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post("/collections/a", json!({})))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post("/collections/b", json!({})))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/collections/a/upsert",
+                json!({"records": [{"id": "src", "vector": [1, 0, 0], "attrs": {}}]}),
+            ))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/collections/b/upsert",
+                // Nearer than any neighbour in "a" would be, so a wrongly-`All` default
+                // would surface it and this test would fail.
+                json!({"records": [{"id": "nearer", "vector": [1, 0, 0], "attrs": {}}]}),
+            ))
+            .await
+            .unwrap();
+
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/search/similar",
+                json!({"collection": "a", "id": "src", "top_k": 10}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        assert_eq!(
+            hits.as_array().unwrap().len(),
+            0,
+            "default scope must stay within \"a\", which has no other record: {hits:?}"
+        );
+
+        let resp = app
+            .oneshot(post(
+                "/search/similar",
+                json!({"collection": "a", "id": "src", "top_k": 10, "scope": ["a", "b"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        assert_eq!(hits.as_array().unwrap().len(), 1);
+        assert_eq!(hits[0]["collection"], "b");
+        assert_eq!(hits[0]["id"], "nearer");
     }
 
     /// Projection is opt-in over the wire: an omitted pair is every attr, `include_attributes`

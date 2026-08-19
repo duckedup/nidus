@@ -47,6 +47,7 @@ export type {
   RememberOptions,
   RememberResult,
   SearchOptions,
+  SimilarSearchOptions,
   Stats,
   TextClause,
   TextQuerySpelling,

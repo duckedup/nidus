@@ -426,6 +426,13 @@ func (c *Client) HybridSearch(ctx context.Context, req HybridSearchRequest) ([]H
 	return c.hits(ctx, "/hybrid-search", req)
 }
 
+// SearchSimilar returns the records most like an existing one, found by id rather than by
+// a query vector. The source record is never in the results, but a true duplicate of it is.
+// An empty Scope searches the source's own collection.
+func (c *Client) SearchSimilar(ctx context.Context, req SimilarRequest) ([]Hit, error) {
+	return c.hits(ctx, "/search/similar", req)
+}
+
 // List returns records by metadata alone — no query vector — paginated by Offset and
 // Limit, in storage order unless ListRequest.OrderBy says otherwise. Hit.Score is not
 // meaningful here; there is nothing being scored.

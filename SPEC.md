@@ -207,6 +207,10 @@ impl Nidus {
     // `scope` accepts `impl Into<Scope>`, so a bare &str / &[&str] also works.
     pub fn search(&self, scope: Scope, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>;
 
+    // "more like this": search `scope` with the vector already stored at `collection`/`id`,
+    // dropping that source record from the results (§7).
+    pub fn search_similar(&self, scope: Scope, collection: &str, id: &str, opts: &SearchOpts) -> Result<Vec<Hit>>;
+
     // count + sum over a filter, straight off the in-RAM index — no Record built (§7.7)
     pub fn aggregate(&self, scope: Scope, opts: &AggregateOpts) -> Result<Aggregation>;
 
@@ -659,6 +663,17 @@ reliable guard there is to refuse work *before* allocating:
   none of them returns exactly what it returned before they existed. **Result diversity** is
   `SearchOpts::limit_per` — a cap on hits per attribute value, exact only within an over-fetch
   window (§7.7). Aggregation (`count`/`sum`) is answered without materializing a record.
+- **`search_similar` is "more like this" by record id** (nidus-9gs): it looks up
+  `collection`/`id`'s stored vector — already unit-scaled, so no re-normalization and no
+  caller round-trip — and searches `scope` with it exactly as `search` would. The source
+  record is dropped from the results by **`(collection, id)` identity, never a score
+  test**: a genuine duplicate also scores ~1.0 and must still come back, which is the
+  near-duplicate-review use case. The drop happens before the page is cut (one extra
+  slot is ranked, `offset + top_k + 1` deep), or a page would come back short. A
+  text-only source (no vector) is an error naming the record; a missing id is a
+  distinct error. With `Config::ann`/`Config::quantization` engaged, the result
+  inherits that path's approximation same as any other query (`opts.exact` is the
+  escape hatch, §7 above).
 - **Filters** (`Filter` = AND of `Predicate`s) are evaluated against `attrs` before
   scoring: `Eq` (typed equality), `Ne` (typed inequality), `Glob` / `IGlob` (pattern
   match on a `Str` attr, case-sensitive and ASCII-case-insensitive, §7.1), `In` /

@@ -169,6 +169,209 @@ fn search_ranking_order() {
     assert!(hits[0].score > hits[1].score);
 }
 
+// ── search_similar: "more like this" by record id ──────────────────────────
+
+#[test]
+fn search_similar_excludes_the_source_record() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert(
+            "col",
+            &[
+                rec("src", vec![1.0, 0.0, 0.0]),
+                rec("near", vec![0.9, 0.1, 0.0]),
+                rec("far", vec![0.0, 1.0, 0.0]),
+            ],
+        )
+        .unwrap();
+    let hits = store
+        .search_similar(&["col"], "col", "src", &default_opts(10))
+        .unwrap();
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert!(!ids.contains(&"src"), "source record must not self-match");
+    assert!(ids.contains(&"near"), "a real neighbour must be returned");
+    assert_eq!(hits[0].id, "near", "nearest neighbour ranks first");
+}
+
+#[test]
+fn search_similar_keeps_a_true_duplicate() {
+    // Written as a score test (score < 1.0 - eps) this would wrongly drop the duplicate too;
+    // exclusion must be by (collection, id) identity alone.
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert(
+            "col",
+            &[
+                rec("src", vec![1.0, 0.0, 0.0]),
+                rec("dup", vec![1.0, 0.0, 0.0]),
+            ],
+        )
+        .unwrap();
+    let hits = store
+        .search_similar(&["col"], "col", "src", &default_opts(10))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "dup");
+    assert!(
+        (hits[0].score - 1.0).abs() < 1e-6,
+        "byte-identical duplicate must still score ~1.0"
+    );
+}
+
+#[test]
+fn search_similar_on_a_text_only_record_errors_with_the_reason() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert("col", &[text_rec("t1", attrs_one("kind", "note"))])
+        .unwrap();
+    let err = store
+        .search_similar(&["col"], "col", "t1", &default_opts(10))
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("t1"), "message should name the record: {msg}");
+    assert!(msg.contains("text-only"), "message should say why: {msg}");
+}
+
+#[test]
+fn search_similar_on_an_unknown_id_errors_distinctly() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert("col", &[rec("src", vec![1.0, 0.0, 0.0])])
+        .unwrap();
+    let err = store
+        .search_similar(&["col"], "col", "ghost", &default_opts(10))
+        .unwrap_err();
+    let text_only_err = {
+        store
+            .upsert("col", &[text_rec("t1", attrs_one("kind", "note"))])
+            .unwrap();
+        store
+            .search_similar(&["col"], "col", "t1", &default_opts(10))
+            .unwrap_err()
+    };
+    assert_ne!(
+        err.to_string(),
+        text_only_err.to_string(),
+        "a missing id and a text-only record must report distinct reasons"
+    );
+}
+
+#[test]
+fn search_similar_returns_a_full_page() {
+    // Without the over-fetch slot, ranking only `top_k` deep and then dropping the (always
+    // top-ranked) source would return one hit short of a full page.
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert(
+            "col",
+            &[
+                rec("src", vec![1.0, 0.0, 0.0]),
+                rec("n1", vec![0.9, 0.1, 0.0]),
+                rec("n2", vec![0.8, 0.2, 0.0]),
+                rec("n3", vec![0.7, 0.3, 0.0]),
+                rec("n4", vec![0.6, 0.4, 0.0]),
+            ],
+        )
+        .unwrap();
+    let hits = store
+        .search_similar(&["col"], "col", "src", &default_opts(3))
+        .unwrap();
+    assert_eq!(hits.len(), 3, "a full page of 3, not 2");
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, vec!["n1", "n2", "n3"]);
+}
+
+#[test]
+fn search_similar_pages_without_the_source() {
+    // offset=1 must land on the second-best *neighbour*, proving the source was dropped
+    // before the offset was applied, not after.
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert(
+            "col",
+            &[
+                rec("src", vec![1.0, 0.0, 0.0]),
+                rec("n1", vec![0.9, 0.1, 0.0]),
+                rec("n2", vec![0.8, 0.2, 0.0]),
+                rec("n3", vec![0.7, 0.3, 0.0]),
+            ],
+        )
+        .unwrap();
+    let opts = SearchOpts {
+        top_k: 1,
+        offset: 1,
+        ..Default::default()
+    };
+    let hits = store.search_similar(&["col"], "col", "src", &opts).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "n2");
+}
+
+#[test]
+fn search_similar_can_cross_collections() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert("a", &[rec("src", vec![1.0, 0.0, 0.0])])
+        .unwrap();
+    store
+        .upsert(
+            "b",
+            &[
+                rec("near", vec![0.9, 0.1, 0.0]),
+                rec("far", vec![0.0, 1.0, 0.0]),
+            ],
+        )
+        .unwrap();
+    let hits = store
+        .search_similar(&["a", "b"], "a", "src", &default_opts(10))
+        .unwrap();
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert!(!ids.contains(&"src"));
+    assert_eq!(hits[0].collection, "b");
+    assert_eq!(hits[0].id, "near");
+}
+
+/// The source always ranks first at 1.0, so capping before it is dropped spends its own
+/// value's quota and starves the genuine neighbour sharing that value.
+#[test]
+fn search_similar_does_not_let_the_source_spend_its_own_limit_per_slot() {
+    let mut store = Store::in_memory(3).unwrap();
+    let mut attrs = BTreeMap::new();
+    attrs.insert("cat".to_string(), Value::Str("x".to_string()));
+    store
+        .upsert(
+            "col",
+            &[
+                rec_with("src", vec![1.0, 0.0, 0.0], attrs.clone()),
+                rec_with("near", vec![0.99, 0.1, 0.0], attrs),
+                rec_with("far", vec![0.0, 1.0, 0.0], {
+                    let mut m = BTreeMap::new();
+                    m.insert("cat".to_string(), Value::Str("y".to_string()));
+                    m
+                }),
+            ],
+        )
+        .unwrap();
+
+    let opts = SearchOpts {
+        top_k: 10,
+        limit_per: Some(crate::model::LimitPer::new("cat", 1)),
+        ..Default::default()
+    };
+    let hits = store.search_similar(&["col"], "col", "src", &opts).unwrap();
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert!(!ids.contains(&"src"), "source must be excluded: {ids:?}");
+    assert!(
+        ids.contains(&"near"),
+        "the cap's one `cat=x` slot belongs to the nearest real neighbour, not to the \
+         already-excluded source: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"far"),
+        "the other group is unaffected: {ids:?}"
+    );
+}
+
 #[test]
 fn upsert_is_idempotent_by_id() {
     let mut store = Store::in_memory(3).unwrap();

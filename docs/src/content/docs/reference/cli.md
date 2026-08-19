@@ -7,8 +7,8 @@ Every flag the `nidus` binary accepts, generated from `nidus --help` and each su
 own `--help`. For a guided tour with worked examples, see the [command-line
 guide](/guides/cli-and-server/); this page is the exhaustive reference.
 
-The binary has **23 subcommands**: `serve`, `mcp`, `collections`, `create`, `drop`,
-`upsert`, `search`, `aggregate`, `list`, `set-fts-schema`, `text-search`,
+The binary has **24 subcommands**: `serve`, `mcp`, `collections`, `create`, `drop`,
+`upsert`, `search`, `similar`, `aggregate`, `list`, `set-fts-schema`, `text-search`,
 `hybrid-search`, `get`, `delete`, `compact`, `configure`, `backup`, `restore`,
 `verify`, `check`, `stats`, `remember`, `recall`.
 
@@ -181,6 +181,22 @@ Nearest-neighbour search; the query vector is a JSON array of floats. Usage:
 | `--rank-by <EXPR>` | none | Ranking expression as JSON, e.g. a recency-decay expression. |
 | `--limit-per <ATTR>` | none | Cap hits per distinct value of this attribute; needs `--limit-per-max`. |
 | `--limit-per-max <N>` | none | Maximum hits kept per distinct `--limit-per` value. |
+
+### `similar`
+
+"More like this": nearest-neighbour search using the vector already stored at
+`COLLECTION`/`ID`, instead of a caller-supplied query vector. Usage:
+`nidus similar [OPTIONS] --dir <DIR> <COLLECTION> <ID>`. Takes the same flags as
+`search` above, plus:
+
+| Flag | Env | Description |
+| --- | --- | --- |
+| `--scope <COLLECTION>` | none | Collections to search (repeatable); omit to search only the source's own collection. |
+
+The source record is always excluded from its own results, by id rather than by
+score, so a genuine duplicate of the source still comes back. `COLLECTION`/`ID`
+naming no record, or a record with no stored vector (a text-only entry), is an error
+naming the reason, not an empty result.
 
 ### `aggregate`
 

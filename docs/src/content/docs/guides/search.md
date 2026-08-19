@@ -57,6 +57,37 @@ dimension is pinned at store creation, so a vector in `code` and a vector in
 `docs` are directly comparable: one ranking over both is meaningful, not a
 category error.
 
+## More like this
+
+`search_similar` runs an ordinary search using the vector already stored at a
+record, instead of a query you supply yourself:
+
+```rust
+use nidus::{Scope, SearchOpts};
+
+let opts = SearchOpts { top_k: 10, ..Default::default() };
+let hits = db.search_similar(Scope::Collections(&["docs"]), "docs", "a1", &opts)?;
+# anyhow::Ok(())
+```
+
+A few things about it are worth knowing up front, because they are easy to get
+surprised by otherwise:
+
+- **The source record is never in its own results.** It is dropped by
+  `(collection, id)` identity, after ranking, not by a score threshold.
+- **A genuine duplicate is still returned.** Exclusion is by id, so a second
+  record that happens to hold the same vector as the source scores near 1.0 and
+  comes back like any other neighbour.
+- **An omitted `scope` searches the source's own collection**, not the whole
+  store, which is the one place this call differs from a plain `search`.
+- **A text-only record (no vector) is an error**, naming the id and the reason,
+  not an empty result: there is nothing to search with.
+- It searches with the stored, unit-scaled vector, so only its direction
+  matters, exactly like any other search.
+
+Every other `SearchOpts` field (`filter`, `min_score`, `exact`, projections,
+`rank_by`, `limit_per`) works the same as it does for `search`.
+
 ## Scoring
 
 `SearchOpts` controls the ranking:

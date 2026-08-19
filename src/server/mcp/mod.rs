@@ -100,6 +100,9 @@ fn tools() -> Vec<Tool> {
     v.extend(search::tools());
     v.extend(admin::tools());
     v.extend(hygiene::tools());
+    // `related` is defined in `search.rs` but registered here, last, so it does not shift
+    // the position of any tool that predates it (SEP-2549).
+    v.push(search::related_tool());
     v
 }
 
@@ -141,9 +144,10 @@ impl ServerHandler for NidusMcp {
                  at once. Call `list_collections` if you do not know which collection to \
                  use, or `browse` to see what a collection already holds before adding to \
                  it. Use `get` to check a specific id, and `forget` to correct or remove a \
-                 memory that turned out wrong. Pass natural language throughout — never \
-                 vectors. Memories are also addressable as `nidus://` resources, and \
-                 `recall_then_answer` is a prompt that runs the recall for you.",
+                 memory that turned out wrong. Use `related` to find entries like one you \
+                 already have, by id rather than a new query. Pass natural language \
+                 throughout — never vectors. Memories are also addressable as `nidus://` \
+                 resources, and `recall_then_answer` is a prompt that runs the recall for you.",
         )
     }
 
@@ -152,7 +156,7 @@ impl ServerHandler for NidusMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<rmcp::RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        // Unpaginated: nine tools fit any client's budget.
+        // Unpaginated: ten tools fit any client's budget.
         Ok(ListToolsResult::with_all_items(tools())
             .with_ttl_ms(TOOLS_TTL_MS)
             .with_cache_scope(CacheScope::Public))
@@ -174,6 +178,7 @@ impl ServerHandler for NidusMcp {
             "forget" => self.forget(&args).await,
             "get" => self.get(&args).await,
             "browse" => self.browse(&args).await,
+            "related" => self.related(&args).await,
             other => Err(McpError::invalid_params(
                 format!("unknown tool `{other}`"),
                 None,

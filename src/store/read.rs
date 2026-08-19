@@ -510,6 +510,47 @@ impl Store {
         Ok(self.finish(ranked, opts))
     }
 
+    /// "More like this": look up `collection`/`id`'s stored (already unit-normalized) vector and
+    /// search `collections` with it, dropping the source record itself by `(collection, id)`
+    /// identity — never a score test, so a true duplicate (also scoring ~1.0) still comes back.
+    pub fn search_similar(
+        &self,
+        collections: &[&str],
+        collection: &str,
+        id: &str,
+        opts: &SearchOpts,
+    ) -> Result<Vec<Hit>> {
+        let entry = self
+            .collections
+            .get(collection)
+            .and_then(|c| c.docs.get(id))
+            .with_context(|| {
+                format!("{BAD_QUERY}: no record `{id}` in collection `{collection}`")
+            })?;
+        let Some(row) = entry.row else {
+            bail!(
+                "{BAD_QUERY}: record `{collection}/{id}` is text-only and has no vector to search with"
+            );
+        };
+        let query = self.data.row(row).to_vec();
+
+        // Rank one extra slot deep with NO cap or page, so the source is gone before the single
+        // tail runs. Capping first would let the source — always rank 1 — spend its own value's
+        // `limit_per` quota and starve the real neighbour sharing it.
+        let wide = SearchOpts {
+            offset: 0,
+            top_k: depth(opts).saturating_add(1),
+            limit_per: None,
+            ..opts.clone()
+        };
+        let ranked = self.search(collections, &query, &wide)?;
+        let ranked: Vec<Hit> = ranked
+            .into_iter()
+            .filter(|h| !(h.collection == collection && h.id == id))
+            .collect();
+        Ok(self.finish(ranked, opts))
+    }
+
     /// Score an already-gathered, filter-passing scan exactly into ranked [`Hit`]s — the shared
     /// tail of the brute-force path and the ANN exact-prefilter fallback. Splits across workers
     /// once the scan clears the parallel floor, else scores serially, for the same top-k.

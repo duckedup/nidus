@@ -898,6 +898,52 @@ func TestRankingAndAnnotationsAgainstARealServer(t *testing.T) {
 	})
 }
 
+// TestSearchSimilarAgainstARealServer checks "more like this" over a real store: the
+// source record never comes back, its nearest neighbour does, and an empty Scope stays
+// within the source's own collection rather than searching every collection.
+func TestSearchSimilarAgainstARealServer(t *testing.T) {
+	db := startServer(t)
+	ctx := context.Background()
+
+	if err := db.CreateCollection(ctx, "docs"); err != nil {
+		t.Fatalf("CreateCollection failed: %v", err)
+	}
+	if err := db.CreateCollection(ctx, "other"); err != nil {
+		t.Fatalf("CreateCollection failed: %v", err)
+	}
+	_, err := db.Upsert(ctx, "docs", []Record{
+		{ID: "a", Vector: []float32{1, 0, 0}},
+		{ID: "b", Vector: []float32{0.99, 0.14, 0}},
+		{ID: "c", Vector: []float32{-1, 0, 0}},
+	})
+	if err != nil {
+		t.Fatalf("Upsert docs failed: %v", err)
+	}
+	if _, err := db.Upsert(ctx, "other", []Record{{ID: "z", Vector: []float32{1, 0, 0}}}); err != nil {
+		t.Fatalf("Upsert other failed: %v", err)
+	}
+
+	hits, err := db.SearchSimilar(ctx, SimilarRequest{Collection: "docs", ID: "a"})
+	if err != nil {
+		t.Fatalf("SearchSimilar failed: %v", err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("SearchSimilar returned no hits")
+	}
+	if hits[0].Collection != "docs" || hits[0].ID != "b" {
+		t.Errorf("nearest hit = %s/%s, want docs/b ranked first", hits[0].Collection, hits[0].ID)
+	}
+	for _, h := range hits {
+		if h.ID == "a" {
+			t.Fatalf("source record a came back in its own similarity search: %+v", hits)
+		}
+	}
+	// An empty Scope stays within the source's own collection — "other" never appears.
+	if !sameSet(ids(hits), []string{"b", "c"}) {
+		t.Errorf("hits = %v, want b and c only", ids(hits))
+	}
+}
+
 // TestServerErrorsCarryTheirStatus checks the error surface against the real
 // classifier in src/server/mod.rs rather than a canned httptest reply. The status is
 // the part a caller acts on, so it has to be the status the server actually chose.

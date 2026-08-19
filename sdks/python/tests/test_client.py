@@ -171,6 +171,13 @@ ENDPOINTS: list[tuple[str, Callable[[NidusClient], Any], str, str, Any]] = [
     ),
     ("search", lambda db: db.search(query=[1.0, 0.0, 0.0]), "POST", "/search", []),
     (
+        "search_similar",
+        lambda db: db.search_similar(collection="notes", id="a"),
+        "POST",
+        "/search/similar",
+        [],
+    ),
+    (
         "text_search",
         lambda db: db.text_search(field="body", query="fox"),
         "POST",
@@ -342,6 +349,26 @@ def test_search_sends_snake_case_and_decodes_hit_attrs() -> None:
     }
     assert len(hits) == 1
     assert hits[0].id == "a"
+    assert hits[0].attrs == {"lang": "rust"}
+
+
+def test_search_similar_sends_the_source_and_decodes_hit_attrs() -> None:
+    """The source is named by ``collection``/``id``, never by a query vector."""
+    stub = StubTransport(
+        [{"collection": "notes", "id": "b", "score": 0.95, "attrs": {"lang": {"Str": "rust"}}}]
+    )
+    hits = client(stub).search_similar(
+        collection="notes", id="a", top_k=5, filter=f.and_(f.eq("lang", "rust"))
+    )
+    assert stub.last.json == {
+        "collection": "notes",
+        "id": "a",
+        "scope": [],
+        "top_k": 5,
+        "filter": [{"Eq": ["lang", {"Str": "rust"}]}],
+    }
+    assert len(hits) == 1
+    assert hits[0].id == "b"
     assert hits[0].attrs == {"lang": "rust"}
 
 

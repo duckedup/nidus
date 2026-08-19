@@ -28,6 +28,7 @@ import type {
   RememberOptions,
   RememberResult,
   SearchOptions,
+  SimilarSearchOptions,
   Stats,
   TextSearchOptions,
   Value,
@@ -233,6 +234,24 @@ export class NidusClient {
   search(opts: SearchOptions): Promise<Hit[]> {
     return this.searchRequest("/search", {
       query: opts.query,
+      scope: opts.scope ?? [],
+      top_k: opts.topK,
+      offset: opts.offset,
+      min_score: opts.minScore,
+      filter: opts.filter ?? [],
+      exact: opts.exact,
+      include_attributes: opts.includeAttributes,
+      exclude_attributes: opts.excludeAttributes,
+      rank_by: encodeRankBy(opts.rankBy),
+      limit_per: opts.limitPer,
+    });
+  }
+
+  /** Records most like an existing one. The source record itself is never returned. */
+  searchSimilar(opts: SimilarSearchOptions): Promise<Hit[]> {
+    return this.searchRequest("/search/similar", {
+      collection: opts.collection,
+      id: opts.id,
       scope: opts.scope ?? [],
       top_k: opts.topK,
       offset: opts.offset,

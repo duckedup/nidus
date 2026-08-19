@@ -716,6 +716,38 @@ fn batch_search_and_grouped_aggregate_over_real_http() {
     assert!(agg.get("groups").is_none(), "{agg}");
 }
 
+/// `/search/similar` ("more like this") over a real socket: the source record must not
+/// reappear in its own results, and a real neighbour must.
+#[test]
+fn search_similar_over_real_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    let (status, body) = server.post(
+        "/collections/docs/upsert",
+        &json!({"records": [
+            {"id": "src", "vector": [1, 0, 0], "attrs": {}},
+            {"id": "near", "vector": [0.9, 0.1, 0.0], "attrs": {}},
+            {"id": "far", "vector": [0, 1, 0], "attrs": {}}
+        ]}),
+    );
+    assert_eq!(status, 200, "upsert failed: {body}");
+
+    let (status, hits) = server.post(
+        "/search/similar",
+        &json!({"collection": "docs", "id": "src", "top_k": 10}),
+    );
+    assert_eq!(status, 200, "{hits}");
+    let ids: Vec<&str> = hits
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["id"].as_str().unwrap())
+        .collect();
+    assert!(!ids.contains(&"src"), "source must not self-match: {ids:?}");
+    assert_eq!(hits[0]["id"], "near", "{hits}");
+}
+
 /// The six admin routes with no test at any level in CI: collection meta (get/put), the
 /// records dump, delete by ids and by filter, flush, compact, and dropping a collection.
 /// Wired in-process is not the same as reachable through the built router over a socket.

@@ -723,6 +723,47 @@ enum Command {
         #[arg(long = "limit-per-max", requires = "limit_per")]
         limit_per_max: Option<usize>,
     },
+    /// "More like this": nearest-neighbour search using the vector already stored at
+    /// COLLECTION/ID, excluding that source record from the results.
+    Similar {
+        #[command(flatten)]
+        store: StoreArgs,
+        collection: String,
+        id: String,
+        /// Collections to search; repeatable, empty defaults to the source collection.
+        #[arg(long = "scope")]
+        scope: Vec<String>,
+        #[arg(long, short = 'k', default_value_t = 10)]
+        top_k: usize,
+        /// Skip this many top-ranked hits before returning (pagination).
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Drop hits scoring below this cosine similarity.
+        #[arg(long)]
+        min_score: Option<f32>,
+        /// AND-filter as JSON. Leaves: Eq, Ne, Glob, IGlob, In, NotIn, Lt, Le, Gt, Ge, Contains, NotContains, ContainsAny. Groups: All, Any, Not.
+        /// E.g. '[{"Ge":["ts",{"Int":1700000000}]},{"Ne":["status",{"Str":"archived"}]}]'.
+        #[arg(long = "where")]
+        filter: Option<String>,
+        /// Force the exact scan, bypassing any ANN index and the quantized first pass.
+        #[arg(long)]
+        exact: bool,
+        /// Return only this attr (repeatable). Mutually exclusive with --exclude-attr.
+        #[arg(long = "include-attr")]
+        include_attributes: Vec<String>,
+        /// Return every attr but this one (repeatable). Mutually exclusive with --include-attr.
+        #[arg(long = "exclude-attr")]
+        exclude_attributes: Vec<String>,
+        /// Ranking expression as JSON, e.g. '{"Decay":{"field":"ts","origin":1700000000000,"scale":604800000,"lambda":0.2}}'.
+        #[arg(long = "rank-by")]
+        rank_by: Option<String>,
+        /// Cap hits per distinct value of this attribute (needs --limit-per-max).
+        #[arg(long = "limit-per", requires = "limit_per_max")]
+        limit_per: Option<String>,
+        /// Maximum hits kept per distinct --limit-per value.
+        #[arg(long = "limit-per-max", requires = "limit_per")]
+        limit_per_max: Option<usize>,
+    },
     /// Count records matching a filter, and sum numeric attributes, without listing them.
     Aggregate {
         #[command(flatten)]
@@ -1109,6 +1150,51 @@ pub fn run(cli: Cli) -> Result<()> {
             } else {
                 db.search(Scope::Collections(&refs), &query, &opts)?
             };
+            let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
+            print_json(&out)
+        }
+        Command::Similar {
+            store,
+            collection,
+            id,
+            scope,
+            top_k,
+            offset,
+            min_score,
+            filter,
+            exact,
+            include_attributes,
+            exclude_attributes,
+            rank_by,
+            limit_per,
+            limit_per_max,
+        } => {
+            let db = open(&store, false)?;
+            let filter = match filter {
+                Some(s) => serde_json::from_str(&s)?,
+                None => Filter::default(),
+            };
+            let opts = SearchOpts {
+                top_k,
+                offset,
+                min_score,
+                filter,
+                exact,
+                projection: projection(include_attributes, exclude_attributes)?,
+                rank_by: rank_by.map(|s| serde_json::from_str(&s)).transpose()?,
+                // clap's `requires` pairing means either both flags are present or neither is.
+                limit_per: limit_per
+                    .zip(limit_per_max)
+                    .map(|(f, m)| LimitPer::new(f, m)),
+                ..Default::default()
+            };
+            // Empty --scope defaults to the source collection, not every collection.
+            let refs: Vec<&str> = if scope.is_empty() {
+                vec![collection.as_str()]
+            } else {
+                scope.iter().map(String::as_str).collect()
+            };
+            let hits = db.search_similar(Scope::Collections(&refs), &collection, &id, &opts)?;
             let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
             print_json(&out)
         }
@@ -2017,6 +2103,42 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn similar_parses_repeatable_scope() {
+        let cli = Cli::try_parse_from([
+            "nidus", "similar", "--dir", "/tmp/s", "coll", "a", "--scope", "docs", "--scope",
+            "notes", "-k", "5",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Similar {
+                collection,
+                id,
+                scope,
+                top_k,
+                ..
+            } => {
+                assert_eq!(collection, "coll");
+                assert_eq!(id, "a");
+                assert_eq!(scope, vec!["docs", "notes"]);
+                assert_eq!(top_k, 5);
+            }
+            _ => panic!("expected Similar"),
+        }
+    }
+
+    /// Omitting `--scope` yields an empty vec; the dispatch arm is what defaults it to
+    /// the source collection, not clap.
+    #[test]
+    fn similar_defaults_scope_to_empty() {
+        let cli =
+            Cli::try_parse_from(["nidus", "similar", "--dir", "/tmp/s", "coll", "a"]).unwrap();
+        match cli.command {
+            Command::Similar { scope, .. } => assert!(scope.is_empty()),
+            _ => panic!("expected Similar"),
+        }
     }
 
     /// A `--field-spec` tunes ONE field, starting from the invocation-wide flags and
