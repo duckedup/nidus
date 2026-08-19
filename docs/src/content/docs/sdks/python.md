@@ -272,6 +272,11 @@ db.remember("notes", "b", long_article, mode="summarize")
 
 # Embed the query text and search, best first
 hits = db.recall("notes", "quick fox", top_k=5, min_score=0.2, filter=[f.eq("tag", "x")])
+
+# Rerank the retrieved window at a hosted cross-encoder before trimming to top_k
+# (needs a server started with --rerank-provider); "query" defaults to this call's
+# own query text here, and is required only on search()'s raw-vector query.
+reranked = db.recall("notes", "quick fox", top_k=5, rerank={"overscan": 8})
 ```
 
 `remember` returns a `RememberResult` (`id`, `upserted`, `deduped`): `id` is the record
@@ -279,6 +284,11 @@ that actually changed, which is not always the one passed in, and `upserted` is 
 row count from the underlying write. See
 [Parity across the surfaces](/guides/remember-and-recall/#parity-across-the-surfaces)
 for how these semantics line up with the other SDKs and the MCP surface.
+
+`search`, `text_search`, and `hybrid_search` take the same `rerank` argument as
+`recall` above; see the [reranking guide](/guides/reranking/) for the full
+mechanism, including why `rerank["query"]` is required on `search` (a raw-vector
+query has no text of its own) and not elsewhere.
 
 Against a server started **without** an embedder both raise `NidusError` with status
 `400`, and the message names `--embed-provider`; `mode="summarize"` without a summarizer

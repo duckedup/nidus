@@ -51,6 +51,7 @@ from .types import (
     Record,
     RecordInput,
     RememberResult,
+    Rerank,
     Stats,
 )
 from .values import AttrInput
@@ -207,6 +208,7 @@ class AsyncNidusClient:
         exclude_attributes: Optional[Sequence[str]] = None,
         rank_by: Optional[RankBy] = None,
         limit_per: Optional[LimitPer] = None,
+        rerank: Optional[Rerank] = None,
     ) -> Hits:
         """Vector (cosine) nearest-neighbour search. An empty ``scope`` searches everything.
 
@@ -214,6 +216,11 @@ class AsyncNidusClient:
         the server refuses ``offset + top_k`` above 10000. ``exact=True`` forces the exact
         scan past any index; the projection arguments are mutually exclusive. ``rank_by``
         and ``limit_per`` are as in :meth:`nidus.client.NidusClient.search`.
+
+        ``rerank`` re-scores the top ``(offset + top_k) * overscan`` candidates through a
+        cross-encoder provider and re-sorts to ``top_k`` (needs ``--rerank-provider``).
+        ``query`` is **required** in ``rerank`` here — a raw-vector search carries no text
+        of its own to score against.
         """
         return await self._search(
             _wire.SEARCH,
@@ -229,6 +236,7 @@ class AsyncNidusClient:
                 exclude_attributes=exclude_attributes,
                 rank_by=rank_by,
                 limit_per=limit_per,
+                rerank=rerank,
             ),
         )
 
@@ -290,12 +298,14 @@ class AsyncNidusClient:
         exclude_attributes: Optional[Sequence[str]] = None,
         rank_by: Optional[RankBy] = None,
         limit_per: Optional[LimitPer] = None,
+        rerank: Optional[Rerank] = None,
     ) -> Hits:
         """BM25 full-text search, paginated by ``offset``.
 
         One field (``field`` + ``query``) or several (``clauses`` + ``combine``), never
         both; ``explain``/``highlight`` fill ``hit.annotations``. Same rules as
-        :meth:`nidus.client.NidusClient.text_search`.
+        :meth:`nidus.client.NidusClient.text_search`, including ``rerank``, whose
+        ``query`` defaults to this call's own ``query`` when omitted.
         """
         return await self._search(
             _wire.TEXT_SEARCH,
@@ -315,6 +325,7 @@ class AsyncNidusClient:
                 exclude_attributes=exclude_attributes,
                 rank_by=rank_by,
                 limit_per=limit_per,
+                rerank=rerank,
             ),
         )
 
@@ -336,12 +347,13 @@ class AsyncNidusClient:
         highlight: Optional[Union[bool, HighlightOpts]] = None,
         vector_weight: Optional[float] = None,
         text_weight: Optional[float] = None,
+        rerank: Optional[Rerank] = None,
     ) -> Hits:
         """Hybrid search: fuse a vector query and a BM25 text query via RRF.
 
         ``offset`` pages the *fused* ranking, never a leg — a leg's rank is an input to
-        the fused score. The text leg, the weights, and ``explain`` behave exactly as in
-        :meth:`nidus.client.NidusClient.hybrid_search`.
+        the fused score. The text leg, the weights, ``explain``, and ``rerank`` behave
+        exactly as in :meth:`nidus.client.NidusClient.hybrid_search`.
         """
         return await self._search(
             _wire.HYBRID_SEARCH,
@@ -361,6 +373,7 @@ class AsyncNidusClient:
                 highlight=highlight,
                 vector_weight=vector_weight,
                 text_weight=text_weight,
+                rerank=rerank,
             ),
         )
 
@@ -479,11 +492,17 @@ class AsyncNidusClient:
         top_k: Optional[int] = None,
         min_score: Optional[float] = None,
         filter: Optional[Filter] = None,  # noqa: A002
+        rerank: Optional[Rerank] = None,
     ) -> Hits:
-        """Embed ``query`` and vector-search ``collection``, best first."""
+        """Embed ``query`` and vector-search ``collection``, best first.
+
+        ``rerank`` behaves exactly as in :meth:`nidus.client.NidusClient.recall`.
+        """
         return await self._search(
             _wire.recall_path(collection),
-            _wire.recall_body(query, top_k=top_k, min_score=min_score, filter=filter),
+            _wire.recall_body(
+                query, top_k=top_k, min_score=min_score, filter=filter, rerank=rerank
+            ),
         )
 
     # ── Maintenance ──────────────────────────────────────────────────────────────────

@@ -731,6 +731,81 @@ func TestZeroValuedRequestFieldsAreOmitted(t *testing.T) {
 	}
 }
 
+// TestRerankMarshalsToTheFrozenWireShape pins the rerank object's JSON on all four
+// ranked endpoints (Search, TextSearch, HybridSearch, Recall) to the shape the server
+// contract freezes: a sibling of top_k, never a wrapper. Overscan is asserted at both
+// a real value and zero, since zero is exactly the case a plain int could not express.
+func TestRerankMarshalsToTheFrozenWireShape(t *testing.T) {
+	full := &Rerank{Query: "q", TextField: "nidus.text", Overscan: iptr(4), Model: "rerank-2.5"}
+	wantFull := `"rerank":{"query":"q","text_field":"nidus.text","overscan":4,"model":"rerank-2.5"}`
+
+	cases := []struct {
+		name string
+		want string
+		call func(context.Context, *Client) error
+	}{
+		{
+			"Search", `{"query":[1,0,0],` + wantFull + `}`,
+			func(ctx context.Context, c *Client) error {
+				_, err := c.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}, Rerank: full})
+				return err
+			},
+		},
+		{
+			"TextSearch", `{"field":"body","query":"fox",` + wantFull + `}`,
+			func(ctx context.Context, c *Client) error {
+				_, err := c.TextSearch(ctx, TextSearchRequest{Field: "body", Query: "fox", Rerank: full})
+				return err
+			},
+		},
+		{
+			"HybridSearch", `{"vector":[1,0,0],"field":"body","text":"fox",` + wantFull + `}`,
+			func(ctx context.Context, c *Client) error {
+				_, err := c.HybridSearch(ctx, HybridSearchRequest{
+					Vector: []float32{1, 0, 0}, Field: "body", Text: "fox", Rerank: full,
+				})
+				return err
+			},
+		},
+		{
+			"Recall", `{"query":"some text",` + wantFull + `}`,
+			func(ctx context.Context, c *Client) error {
+				_, err := c.Recall(ctx, "docs", "some text", RecallOptions{Rerank: full})
+				return err
+			},
+		},
+		{
+			"Search with nil Rerank omits the key", `{"query":[1,0,0]}`,
+			func(ctx context.Context, c *Client) error {
+				_, err := c.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}})
+				return err
+			},
+		},
+		{
+			"Recall with Overscan zero sends it, not omits it",
+			`{"query":"some text","rerank":{"overscan":0}}`,
+			func(ctx context.Context, c *Client) error {
+				_, err := c.Recall(ctx, "docs", "some text", RecallOptions{
+					Rerank: &Rerank{Overscan: iptr(0)},
+				})
+				return err
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &capture{reply: `[]`}
+			db := serve(t, fake)
+			if err := tc.call(context.Background(), db); err != nil {
+				t.Fatalf("call failed: %v", err)
+			}
+			if body := fake.sentBody(t); body != tc.want {
+				t.Errorf("body = %s, want %s", body, tc.want)
+			}
+		})
+	}
+}
+
 // TestMinScoreNilIsOmittedAndZeroIsSent — the case a plain float32 could not express.
 // nil means "no floor"; &0.0 means "a floor of exactly zero", which for cosine drops
 // everything orthogonal or worse and is a real thing to ask for.

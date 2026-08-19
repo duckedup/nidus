@@ -337,6 +337,21 @@ class LimitPer(TypedDict):
     max: int
 
 
+class Rerank(TypedDict, total=False):
+    """Re-score the over-fetched candidates through a cross-encoder provider.
+
+    ``query`` is required on :meth:`~nidus.NidusClient.search` (a raw-vector query carries
+    no text of its own) and optional on the text-bearing calls, where it defaults to that
+    call's own query text. All four keys are optional here; the server fills the rest.
+    ``overscan`` defaults to 4 and may not exceed 64.
+    """
+
+    query: str
+    text_field: str
+    overscan: int
+    model: str
+
+
 class _OrderByRequired(TypedDict):
     """The one key every ``order_by`` must carry (split out so ``descending`` can default)."""
 

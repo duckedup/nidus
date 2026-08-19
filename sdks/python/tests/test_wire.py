@@ -41,6 +41,7 @@ from decimal import Decimal
 import pytest
 
 from nidus import NidusError, RememberResult, _wire, f, rank, v
+from nidus.types import Rerank
 
 # A `/stats` payload for a store doing exact brute-force search: `ann` is null.
 EXACT_STATS = {
@@ -372,6 +373,39 @@ def test_a_limit_per_must_name_both_keys_and_no_others() -> None:
         _wire.search_body([1.0], limit_per="path")  # type: ignore[arg-type]
 
 
+def test_rerank_is_omitted_unless_asked_for_on_every_search_route() -> None:
+    """``rerank`` is additive on all four ranked bodies, unset by default."""
+    assert "rerank" not in _wire.search_body([1.0])
+    assert "rerank" not in _wire.text_search_body("body", "fox")
+    assert "rerank" not in _wire.hybrid_search_body([1.0], "body", "fox")
+    assert "rerank" not in _wire.recall_body("q")
+
+
+def test_rerank_reaches_the_wire_with_every_knob() -> None:
+    knobs: Rerank = {
+        "query": "q",
+        "text_field": "nidus.text",
+        "overscan": 4,
+        "model": "rerank-2.5",
+    }
+    assert _wire.search_body([1.0], rerank=knobs)["rerank"] == dict(knobs)
+    assert _wire.text_search_body("body", "fox", rerank=knobs)["rerank"] == dict(knobs)
+    assert _wire.hybrid_search_body([1.0], "body", "fox", rerank=knobs)["rerank"] == dict(knobs)
+    assert _wire.recall_body("q", rerank=knobs)["rerank"] == dict(knobs)
+
+
+def test_rerank_overscan_zero_survives_rather_than_being_stripped() -> None:
+    """``overscan`` is checked by key presence, not truthiness — ``0`` is a real value."""
+    assert _wire.search_body([1.0], rerank={"overscan": 0})["rerank"] == {"overscan": 0}
+
+
+def test_rerank_every_key_is_optional_and_an_unknown_one_is_refused() -> None:
+    assert _wire.search_body([1.0], rerank={})["rerank"] == {}
+    assert _wire.search_body([1.0], rerank={"query": "q"})["rerank"] == {"query": "q"}
+    with pytest.raises(TypeError, match="unknown key"):
+        _wire.search_body([1.0], rerank={"modle": "x"})  # type: ignore[typeddict-unknown-key]
+
+
 def test_text_search_body_takes_several_clauses_with_a_combine_rule() -> None:
     """The multi-field spelling: one text per field, folded by ``combine``."""
     assert _wire.text_search_body(
@@ -604,6 +638,9 @@ def test_recall_body() -> None:
         "top_k": 5,
         "min_score": 0.2,
         "filter": [{"Eq": ["tag", {"Str": "x"}]}],
+    }
+    assert _wire.recall_body("q", rerank={"model": "rerank-2.5"})["rerank"] == {
+        "model": "rerank-2.5"
     }
 
 

@@ -72,6 +72,7 @@ from .types import (
     Record,
     RecordInput,
     RememberResult,
+    Rerank,
     Stats,
 )
 from .values import AttrInput, Value, decode_attrs, decode_value, encode_attrs
@@ -292,6 +293,7 @@ def search_body(
     exclude_attributes: Optional[Sequence[str]] = None,
     rank_by: Optional[RankBy] = None,
     limit_per: Optional[LimitPer] = None,
+    rerank: Optional[Rerank] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /search`` (vector nearest-neighbour).
 
@@ -313,6 +315,7 @@ def search_body(
             **_projection(include_attributes, exclude_attributes),
             "rank_by": rank_by,
             "limit_per": _limit_per(limit_per),
+            "rerank": _rerank(rerank),
         }
     )
 
@@ -371,6 +374,7 @@ def text_search_body(
     exclude_attributes: Optional[Sequence[str]] = None,
     rank_by: Optional[RankBy] = None,
     limit_per: Optional[LimitPer] = None,
+    rerank: Optional[Rerank] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /text-search`` (BM25). ``min_score`` here is a raw BM25 floor.
 
@@ -392,6 +396,7 @@ def text_search_body(
             **_projection(include_attributes, exclude_attributes),
             "rank_by": rank_by,
             "limit_per": _limit_per(limit_per),
+            "rerank": _rerank(rerank),
         }
     )
 
@@ -412,6 +417,7 @@ def hybrid_search_body(
     highlight: Optional[Union[bool, HighlightOpts]] = None,
     vector_weight: Optional[float] = None,
     text_weight: Optional[float] = None,
+    rerank: Optional[Rerank] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /hybrid-search`` (vector + BM25 fused via RRF).
 
@@ -435,6 +441,7 @@ def hybrid_search_body(
             "highlight": _highlight(highlight),
             "vector_weight": vector_weight,
             "text_weight": text_weight,
+            "rerank": _rerank(rerank),
         }
     )
 
@@ -539,6 +546,7 @@ def recall_body(
     top_k: Optional[int] = None,
     min_score: Optional[float] = None,
     filter: Optional[Filter] = None,  # noqa: A002
+    rerank: Optional[Rerank] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /collections/{name}/recall`` (query text in, hits out)."""
     return prune(
@@ -547,6 +555,7 @@ def recall_body(
             "top_k": top_k,
             "min_score": min_score,
             "filter": list(filter) if filter is not None else [],
+            "rerank": _rerank(rerank),
         }
     )
 
@@ -937,6 +946,13 @@ def _limit_per(limit_per: Optional[LimitPer]) -> Optional[dict[str, Any]]:
 
 def _order_by(order_by: Optional[OrderBy]) -> Optional[dict[str, Any]]:
     return None if order_by is None else _spec(order_by, "order_by", ("field",), ("descending",))
+
+
+def _rerank(rerank: Optional[Rerank]) -> Optional[dict[str, Any]]:
+    """``rerank=`` as it goes on the wire. Every key is optional, so ``{}`` is valid."""
+    if rerank is None:
+        return None
+    return _spec(rerank, "rerank", (), ("query", "text_field", "overscan", "model"))
 
 
 def _spec(

@@ -295,6 +295,15 @@ hits, err := db.Recall(ctx, "notes", "quick fox", nidus.RecallOptions{
     MinScore: &floor,
     Filter:   nidus.And(nidus.Eq("tag", "x")),
 })
+
+// Rerank the retrieved window at a hosted cross-encoder before trimming to TopK
+// (needs a server started with --rerank-provider). Overscan is a pointer for the
+// same omit-vs-zero reason as MinScore above.
+overscan := 8
+reranked, err := db.Recall(ctx, "notes", "quick fox", nidus.RecallOptions{
+    TopK:   5,
+    Rerank: &nidus.Rerank{Overscan: &overscan},
+})
 ```
 
 `Remember` returns a `RememberResult` (`ID`, `Upserted`, `Deduped`): `ID` is the record
@@ -302,6 +311,11 @@ that actually changed, which is not always the one passed in, and `Upserted` is 
 count from the underlying write. See
 [Parity across the surfaces](/guides/remember-and-recall/#parity-across-the-surfaces)
 for how these semantics line up with the other SDKs and the MCP surface.
+
+`Search`, `TextSearch`, and `HybridSearch` requests take the same `Rerank` field as
+`RecallOptions` above; see the [reranking guide](/guides/reranking/). `Rerank.Query`
+is required on `Search` (a raw-vector query has no text of its own) and optional
+everywhere else, where it defaults to that call's own query text.
 
 Two different failures are worth telling apart when these do not work. A **`404` with no
 message** means the server binary was built without the `memory` feature, so `/remember`

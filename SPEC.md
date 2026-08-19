@@ -1238,6 +1238,30 @@ build until a real need exists.
   RAM path — exact, filter-respecting, ANN/quant-compatible. (Compaction of a mapped store
   materializes the live set in RAM like any compaction, so it is bounded by RAM even when the
   store is not.)
+- **Reranker provider stage (nidus-4ss).** `src/rerank/` opts a caller into
+  retrieve-then-rerank: a hosted cross-encoder (Voyage `rerank-2.5`, Cohere
+  `rerank-v3.5`, Jina `jina-reranker-v2-base-multilingual`) scores `(query,
+  candidate_text)` pairs over an over-fetched window and replaces the metric
+  score with the provider's. This is a **transport-and-query-time** concern, not
+  a storage one: `Nidus`/`Store` stay sync and never learn `RerankOpts` exists —
+  `src/rerank/apply.rs` runs the plain sync search first, then awaits the
+  provider, mirroring `src/memory.rs`'s `recall_with` (embed, then a plain `db`
+  call, never the reverse). It exposes that as two halves, `plan_*` then
+  `finish`, so a lock-holding caller (the HTTP handlers, the MCP tools) fetches
+  inside `run_read` and lets the guard drop before the `.await`: a guard held
+  across it makes the handler future non-`Send`, which axum and rmcp reject.
+  The all-in-one `*_reranked` wrappers are for a caller that owns the store
+  outright, which today is the CLI. The candidate window is `(offset + top_k) *
+  overscan` deep with `offset` zeroed, `stage::DEFAULT_OVERSCAN` (4) unless the
+  caller overrides it; a candidate whose text attr is absent passes through
+  unranked (keeps its metric score, sorts below every reranked hit) rather than
+  erroring. `min_score` applies to the pre-rerank metric score only, since a
+  cross-encoder score is not on the same scale as cosine/BM25. **This is not**
+  the quantized f32 second pass (`search_reranked` the metric, above) or
+  `AnnConfig::overscan`/`Quantization::rescore` — three different mechanisms
+  that happen to share a shape, kept apart by the `rerank_provider_*` metric
+  prefix. No on-disk format change; feature-gated (`rerank`,
+  `rerank-<provider>`, `rerank-all`, folded into `serve`).
 
 ### Still deferred (designed-for, not built)
 
@@ -1268,8 +1292,10 @@ were evaluated against turbopuffer's surface and answered separately:
   this; the branch is closed.
 - **Multi-vector late interaction (ColBERT-style) — deferred as a rerank-only feature.**
   The useful form scores a candidate set produced by ordinary dense retrieval, so it
-  belongs on the rerank seam, not in the segment format. It needs no format change if
-  scoped that way, and it should not be built until a caller wants it.
+  belongs on the reranker provider stage (`src/rerank/`, §9 "Shipped", nidus-4ss), not in
+  the segment format. It needs no format change if scoped that way (a `Reranker` adapter
+  scoring candidates locally rather than over HTTP), and it should not be built until a
+  caller wants it.
 - **Sparse vectors (`SparseKNN`) — deferred, and deliberately not built now.** The byte
   format could carry them additively, but the surrounding cost is out of proportion to
   demand: a breaking `Record` change, a second `Op` append, a working-set key bump that
@@ -1388,9 +1414,12 @@ src/
 ├── embed/        Embedder trait + per-provider adapters: mod.rs, voyage.rs, openai.rs,
 │                 openai_compat.rs, ollama.rs, cohere.rs, gemini.rs, mistral.rs, jina.rs
 ├── summarize/    Summarizer trait + adapters: mod.rs, anthropic.rs, openai.rs, prompts.rs
+├── rerank/       opt-in retrieve-then-rerank over a hosted cross-encoder (§9, nidus-4ss):
+│                 stage.rs (pure ranking logic, ungated, Miri-covered), apply.rs (the async
+│                 orchestrator), voyage.rs, cohere.rs, jina.rs
 ├── memory.rs     Memory (remember/recall over a Nidus + an embedder); reserved
 │                 nidus.* attr vocabulary, recency stamps, the TTL read guard (§9)
-├── providers.rs  provider capability registry (Embed/Summarize)
+├── providers.rs  provider capability registry (Embed/Summarize/Rerank)
 ├── http.rs       shared HTTP retry infrastructure for the ingest adapters
 
 # ── `cli` feature only (the `nidus` binary, --features cli) ──

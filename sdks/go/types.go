@@ -300,7 +300,28 @@ type SearchRequest struct {
 	Exact    bool      `json:"exact,omitempty"`
 	RankBy   *RankBy   `json:"rank_by,omitempty"`
 	LimitPer *LimitPer `json:"limit_per,omitempty"`
+	Rerank   *Rerank   `json:"rerank,omitempty"`
 	Projection
+}
+
+// A Rerank asks the server to rerank the candidate window with a hosted cross-encoder
+// before returning it: it ranks (Offset+TopK)*Overscan deep, scores each candidate's text
+// against Query, and returns the top TopK of that. Needs a server started with
+// --rerank-provider; without one the request is a 400.
+//
+// Overscan is a pointer for the omit-vs-zero reason at the top of this file: 0 is
+// meaningful (no over-fetch), so a plain int could not distinguish it from "use the
+// server default".
+type Rerank struct {
+	// Query is the text scored against each candidate. Required on Search, which has no
+	// query text of its own; elsewhere the endpoint's own query text is used.
+	Query string `json:"query,omitempty"`
+	// TextField is the attr carrying the candidate text. Empty takes nidus.text.
+	TextField string `json:"text_field,omitempty"`
+	// Overscan defaults to 4 server-side and may not exceed 64; past that the request is a 400.
+	Overscan *int `json:"overscan,omitempty"`
+	// Model overrides the server's configured rerank model for this request only.
+	Model string `json:"model,omitempty"`
 }
 
 // A Projection selects which attrs the returned hits carry. Leave both nil for every attr
@@ -424,6 +445,7 @@ type TextSearchRequest struct {
 	Highlight *HighlightOpts `json:"highlight,omitempty"`
 	RankBy    *RankBy        `json:"rank_by,omitempty"`
 	LimitPer  *LimitPer      `json:"limit_per,omitempty"`
+	Rerank    *Rerank        `json:"rerank,omitempty"`
 	Projection
 }
 
@@ -457,6 +479,7 @@ type HybridSearchRequest struct {
 	Highlight    *HighlightOpts `json:"highlight,omitempty"`
 	VectorWeight *float32       `json:"vector_weight,omitempty"`
 	TextWeight   *float32       `json:"text_weight,omitempty"`
+	Rerank       *Rerank        `json:"rerank,omitempty"`
 }
 
 // A ListRequest is a metadata-only query: no vector, paginated, filter-driven.
@@ -598,6 +621,7 @@ type RecallOptions struct {
 	TopK     int
 	MinScore *float32 // a cosine-similarity floor; hits below it are dropped
 	Filter   Filter
+	Rerank   *Rerank
 }
 
 type recallWire struct {
@@ -605,8 +629,11 @@ type recallWire struct {
 	TopK     int      `json:"top_k,omitempty"`
 	MinScore *float32 `json:"min_score,omitempty"`
 	Filter   Filter   `json:"filter,omitempty"`
+	Rerank   *Rerank  `json:"rerank,omitempty"`
 }
 
 func (o RecallOptions) wire(query string) recallWire {
-	return recallWire{Query: query, TopK: o.TopK, MinScore: o.MinScore, Filter: o.Filter}
+	return recallWire{
+		Query: query, TopK: o.TopK, MinScore: o.MinScore, Filter: o.Filter, Rerank: o.Rerank,
+	}
 }

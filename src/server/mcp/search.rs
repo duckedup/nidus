@@ -14,6 +14,8 @@ use crate::meta::now_ms;
 use crate::{Filter, HybridOpts, SearchOpts};
 
 use super::NidusMcp;
+#[cfg(feature = "rerank")]
+use super::args::optional_rerank;
 use super::args::{api_error, optional_f32, optional_top_k, required_str, tool};
 use super::{HitDto, hits_content};
 
@@ -140,6 +142,37 @@ pub(super) fn filter_schema() -> JsonValue {
     })
 }
 
+/// The `rerank` request option shared by `recall`, `text_search`, and `hybrid_search`. No
+/// `query` property: each tool's own query/text argument stands in for it, so a model
+/// cannot send two contradictory ones.
+#[cfg(feature = "rerank")]
+fn rerank_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "description": "Rerank the results with a cross-encoder before returning them. Much more accurate than the default similarity ranking on the same corpus, at the cost of one extra API call. Use it when precision matters more than latency.",
+        "properties": {
+            "text_field": { "type": "string", "description": "Attr holding the text to score. Defaults to nidus.text, which is what remember writes." },
+            "overscan":   { "type": "integer", "minimum": 1, "maximum": 64, "description": "How many times deeper than top_k to search before reranking. Defaults to 4. Higher finds more but costs more." },
+            "model":      { "type": "string", "description": "Override the server's configured rerank model." }
+        },
+        "additionalProperties": false
+    })
+}
+
+/// Splice [`rerank_schema`] into a tool's `properties`. Feature-gated at the function level
+/// (not just the property) so `--features mcp` alone advertises no such argument at all,
+/// mirroring `RerankDto`'s absence from the wire DTOs in that build.
+#[cfg(feature = "rerank")]
+fn with_rerank(mut schema: JsonValue) -> JsonValue {
+    schema["properties"]["rerank"] = rerank_schema();
+    schema
+}
+
+#[cfg(not(feature = "rerank"))]
+fn with_rerank(schema: JsonValue) -> JsonValue {
+    schema
+}
+
 /// Parse the optional `filter` argument. A present-but-malformed filter is a caller fault
 /// (`invalid_params`), matching every other argument error in this module.
 pub(super) fn parse_filter(args: &Map<String, JsonValue>) -> Result<Option<Filter>, McpError> {
@@ -168,7 +201,7 @@ pub(super) fn tools() -> Vec<Tool> {
              relevance scores. The query is embedded server-side — pass a natural-language \
              question, not vectors. This is semantic search: it finds entries that mean the \
              same thing as the query even when they share no words with it.",
-            json!({
+            with_rerank(json!({
                 "$defs": filter_defs(),
                 "type": "object",
                 "properties": {
@@ -193,14 +226,14 @@ pub(super) fn tools() -> Vec<Tool> {
                 },
                 "required": ["collection", "query"],
                 "additionalProperties": false
-            }),
+            })),
         ),
         tool(
             "text_search",
             "Search memory by keyword (BM25 full-text), not by meaning. Use this when the \
              exact wording matters — an error string, an identifier, a proper noun — and \
              `recall` when the meaning matters. Requires a full-text schema on the field.",
-            json!({
+            with_rerank(json!({
                 "$defs": filter_defs(),
                 "type": "object",
                 "properties": {
@@ -225,14 +258,14 @@ pub(super) fn tools() -> Vec<Tool> {
                 },
                 "required": ["collection", "field", "query"],
                 "additionalProperties": false
-            }),
+            })),
         ),
         tool(
             "hybrid_search",
             "Search memory by meaning and keyword at once, fusing both rankings. Use this \
              when a query has both a semantic intent and a term that must appear — \
              \"the retry bug in the upsert path\". The text is embedded server-side.",
-            json!({
+            with_rerank(json!({
                 "$defs": filter_defs(),
                 "type": "object",
                 "properties": {
@@ -257,7 +290,7 @@ pub(super) fn tools() -> Vec<Tool> {
                 },
                 "required": ["collection", "field", "query"],
                 "additionalProperties": false
-            }),
+            })),
         ),
     ]
 }
@@ -301,6 +334,49 @@ pub(super) fn related_tool() -> Tool {
     )
 }
 
+#[cfg(all(test, feature = "rerank"))]
+mod rerank_schema_tests {
+    use super::*;
+
+    /// All three tools list `rerank` (so `additionalProperties: false` honours rather than
+    /// drops it), and no property of it has an array shape — the MCP text-native invariant.
+    #[test]
+    fn rerank_arg_is_listed_and_carries_no_vector_shaped_property() {
+        for t in tools() {
+            let rerank = t
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.get("rerank"))
+                .unwrap_or_else(|| panic!("tool `{}` must list `rerank`", t.name));
+            let props = rerank
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .expect("rerank schema carries its own properties");
+            assert!(
+                !props.contains_key("query"),
+                "tool `{}`'s rerank arg must not carry its own query",
+                t.name
+            );
+            for (name, prop) in props {
+                assert_ne!(
+                    prop.get("type").and_then(|v| v.as_str()),
+                    Some("array"),
+                    "tool `{}`'s rerank.{name} must not be array-shaped (no vectors over MCP)",
+                    t.name
+                );
+            }
+        }
+    }
+}
+
+/// Route a plain `anyhow::Result` failure through [`crate::server::ApiError`]'s
+/// message-based client/server-fault split, so the rerank branches report faults exactly
+/// like the plain path does via [`api_error`].
+#[cfg(feature = "rerank")]
+fn anyhow_error(e: anyhow::Error) -> McpError {
+    api_error(crate::server::ApiError::from(e))
+}
+
 impl NidusMcp {
     pub(super) async fn recall(
         &self,
@@ -312,6 +388,8 @@ impl NidusMcp {
         let top_k = optional_top_k(args)?;
         let min_score = optional_f32(args, "min_score")?;
         let filter = parse_filter(args)?;
+        #[cfg(feature = "rerank")]
+        let rerank = optional_rerank(args)?;
 
         let vector = embedder
             .embed_query(&query)
@@ -324,6 +402,29 @@ impl NidusMcp {
             filter: with_ttl_guard(filter),
             ..Default::default()
         };
+
+        // Fetch the deep window through `run_read` so its lock guard drops, then call the
+        // provider: a guard held across the `.await` makes `call_tool`'s future non-`Send`.
+        #[cfg(feature = "rerank")]
+        if let Some(mut rr) = rerank {
+            let reranker = self.reranker()?;
+            if rr.query.is_none() {
+                rr.query = Some(query.clone());
+            }
+            let (deep, plan) =
+                crate::rerank::apply::plan_search(&opts, &rr).map_err(anyhow_error)?;
+            let hits = crate::server::run_read(self.state.clone(), move |db| {
+                crate::memory::guard_recall_identity(db, embedder.as_ref(), &collection)?;
+                db.search(collection.as_str(), &vector, &deep)
+            })
+            .await
+            .map_err(api_error)?;
+            let hits = crate::rerank::apply::finish(hits, reranker.as_ref(), &plan)
+                .await
+                .map_err(anyhow_error)?;
+            return Ok(hits_content(hits.into_iter().map(HitDto::from).collect()));
+        }
+
         let hits = crate::server::run_read(self.state.clone(), move |db| {
             // Recalling with a different embedder than wrote the collection returns
             // nonsense, so the same guard the HTTP route uses refuses it.
@@ -345,14 +446,34 @@ impl NidusMcp {
         let query = required_str(args, "query")?;
         let top_k = optional_top_k(args)?;
         let filter = parse_filter(args)?;
+        #[cfg(feature = "rerank")]
+        let rerank = optional_rerank(args)?;
+
+        let opts = SearchOpts {
+            top_k,
+            filter: with_ttl_guard(filter),
+            ..Default::default()
+        };
+        let q = crate::FtsQuery::new(field, query);
+
+        // `rr.query` defaults to `q`'s own clause text inside `text_search_reranked`, so
+        // there is nothing to fill in here — unlike `recall`'s raw-vector path.
+        #[cfg(feature = "rerank")]
+        if let Some(rr) = rerank {
+            let reranker = self.reranker()?;
+            let (deep, plan) = crate::rerank::apply::plan_text_search(&q, &opts, &rr);
+            let hits = crate::server::run_read(self.state.clone(), move |db| {
+                db.text_search(crate::Scope::Collections(&[collection.as_str()]), &q, &deep)
+            })
+            .await
+            .map_err(api_error)?;
+            let hits = crate::rerank::apply::finish(hits, reranker.as_ref(), &plan)
+                .await
+                .map_err(anyhow_error)?;
+            return Ok(hits_content(hits.into_iter().map(HitDto::from).collect()));
+        }
 
         let hits = crate::server::run_read(self.state.clone(), move |db| {
-            let opts = SearchOpts {
-                top_k,
-                filter: with_ttl_guard(filter),
-                ..Default::default()
-            };
-            let q = crate::FtsQuery::new(field, query);
             db.text_search(crate::Scope::Collections(&[collection.as_str()]), &q, &opts)
         })
         .await
@@ -371,6 +492,8 @@ impl NidusMcp {
         let query = required_str(args, "query")?;
         let top_k = optional_top_k(args)?;
         let filter = parse_filter(args)?;
+        #[cfg(feature = "rerank")]
+        let rerank = optional_rerank(args)?;
 
         // The one divergence from `POST /hybrid-search`, which takes a caller-supplied
         // `vector`: embedding the query text gives the same fusion from an argument a model
@@ -380,15 +503,38 @@ impl NidusMcp {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        // `rrf_k`/`candidates` stay default: fusion knobs mean nothing to a model, so
+        // exposing them adds ways to get worse results and none to get better ones.
+        let opts = HybridOpts {
+            top_k,
+            filter: with_ttl_guard(filter),
+            ..Default::default()
+        };
+        let q = crate::FtsQuery::new(field, query);
+
+        // `rr.query` defaults to `q`'s own clause text inside `hybrid_search_reranked`,
+        // which is `query` again here, so there is nothing to fill in.
+        #[cfg(feature = "rerank")]
+        if let Some(rr) = rerank {
+            let reranker = self.reranker()?;
+            let (deep, plan) = crate::rerank::apply::plan_hybrid_search(&q, &opts, &rr);
+            let hits = crate::server::run_read(self.state.clone(), move |db| {
+                db.hybrid_search(
+                    crate::Scope::Collections(&[collection.as_str()]),
+                    &vector,
+                    &q,
+                    &deep,
+                )
+            })
+            .await
+            .map_err(api_error)?;
+            let hits = crate::rerank::apply::finish(hits, reranker.as_ref(), &plan)
+                .await
+                .map_err(anyhow_error)?;
+            return Ok(hits_content(hits.into_iter().map(HitDto::from).collect()));
+        }
+
         let hits = crate::server::run_read(self.state.clone(), move |db| {
-            // `rrf_k`/`candidates` stay default: fusion knobs mean nothing to a model, so
-            // exposing them adds ways to get worse results and none to get better ones.
-            let opts = HybridOpts {
-                top_k,
-                filter: with_ttl_guard(filter),
-                ..Default::default()
-            };
-            let q = crate::FtsQuery::new(field, query);
             db.hybrid_search(
                 crate::Scope::Collections(&[collection.as_str()]),
                 &vector,

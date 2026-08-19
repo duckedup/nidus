@@ -27,6 +27,7 @@ import type {
   RecordInput,
   RememberOptions,
   RememberResult,
+  RerankOptions,
   SearchOptions,
   SimilarSearchOptions,
   Stats,
@@ -244,6 +245,7 @@ export class NidusClient {
       exclude_attributes: opts.excludeAttributes,
       rank_by: encodeRankBy(opts.rankBy),
       limit_per: opts.limitPer,
+      rerank: encodeRerank(opts.rerank),
     });
   }
 
@@ -285,6 +287,7 @@ export class NidusClient {
       exclude_attributes: opts.excludeAttributes,
       rank_by: encodeRankBy(opts.rankBy),
       limit_per: opts.limitPer,
+      rerank: encodeRerank(opts.rerank),
     });
   }
 
@@ -308,6 +311,7 @@ export class NidusClient {
       highlight: encodeHighlight(opts.highlight),
       vector_weight: opts.vectorWeight,
       text_weight: opts.textWeight,
+      rerank: encodeRerank(opts.rerank),
     });
   }
 
@@ -456,6 +460,7 @@ export class NidusClient {
       top_k: opts.topK,
       min_score: opts.minScore,
       filter: opts.filter ?? [],
+      rerank: encodeRerank(opts.rerank),
     });
   }
 
@@ -604,6 +609,17 @@ function encodeHighlight(h: boolean | HighlightOptions | undefined): unknown {
   return prune({
     max_fragments: h.maxFragments,
     fragment_chars: h.fragmentChars,
+  });
+}
+
+/** Encode `rerank` to snake_case, keeping `overscan: 0` (a falsy value, not an unset one). */
+function encodeRerank(rerank: RerankOptions | undefined): unknown {
+  if (!rerank) return undefined;
+  return prune({
+    query: rerank.query,
+    text_field: rerank.textField,
+    overscan: rerank.overscan,
+    model: rerank.model,
   });
 }
 

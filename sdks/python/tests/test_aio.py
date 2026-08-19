@@ -34,6 +34,7 @@ from nidus import (  # noqa: E402 - must follow the importorskip guard
     v,
 )
 from nidus.aio import AsyncNidusClient  # noqa: E402 - same
+from nidus.types import Rerank  # noqa: E402 - same
 
 STATS_PAYLOAD = {
     "dimension": 3,
@@ -384,6 +385,30 @@ async def test_the_multi_clause_and_ranking_knobs_reach_the_same_wire() -> None:
             await db.hybrid_search(
                 vector=[1.0], field="body", clauses=[{"field": "t", "query": "x"}]
             )
+
+
+async def test_rerank_reaches_the_wire_on_all_four_ranked_calls_awaited() -> None:
+    """The awaited path sends ``rerank`` on all four methods, same as the sync client."""
+    mock = MockServer([])
+    knob: Rerank = {"query": "q", "overscan": 4, "model": "rerank-2.5"}
+    async with client(mock) as db:
+        await db.search(query=[1.0], rerank=knob)
+        assert mock.json["rerank"] == knob
+        await db.text_search(field="body", query="fox", rerank=knob)
+        assert mock.json["rerank"] == knob
+        await db.hybrid_search(vector=[1.0], field="body", text="fox", rerank=knob)
+        assert mock.json["rerank"] == knob
+        await db.recall("notes", "hello", rerank=knob)
+        assert mock.json["rerank"] == knob
+
+
+async def test_rerank_none_omits_the_key_and_zero_overscan_survives_awaited() -> None:
+    mock = MockServer([])
+    async with client(mock) as db:
+        await db.search(query=[1.0])
+        assert "rerank" not in mock.json
+        await db.search(query=[1.0], rerank={"overscan": 0})
+        assert mock.json["rerank"] == {"overscan": 0}
 
 
 async def test_aggregate_and_annotations_decode_on_the_async_path_too() -> None:

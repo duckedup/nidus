@@ -97,6 +97,15 @@ pub struct Metrics {
     pub search_vectors_scanned: Counter,
     /// Candidates reranked in f32 by the quantized path's second pass.
     pub search_reranked: Counter,
+
+    // ── Hosted reranker provider stage — `search_reranked` above is the quantized f32
+    // second pass, a different mechanism wearing the same word (nidus-4ss) ───────────
+    /// Round trips made to a rerank provider (one per chunk, not per query).
+    pub rerank_provider_calls: Counter,
+    /// Candidates actually sent to a rerank provider (had usable text).
+    pub rerank_provider_candidates: Counter,
+    /// Candidates that skipped the provider because they had no text attr.
+    pub rerank_provider_passthrough: Counter,
 }
 
 impl Metrics {
@@ -119,6 +128,9 @@ impl Metrics {
             search_exact: Counter::new(),
             search_vectors_scanned: Counter::new(),
             search_reranked: Counter::new(),
+            rerank_provider_calls: Counter::new(),
+            rerank_provider_candidates: Counter::new(),
+            rerank_provider_passthrough: Counter::new(),
         }
     }
 
@@ -142,6 +154,9 @@ impl Metrics {
             search_exact,
             search_vectors_scanned,
             search_reranked,
+            rerank_provider_calls,
+            rerank_provider_candidates,
+            rerank_provider_passthrough,
         } = self;
         vec![
             (
@@ -228,6 +243,21 @@ impl Metrics {
                 "nidus_search_reranked_total",
                 "Candidates reranked in f32 by the quantized second pass",
                 search_reranked.get(),
+            ),
+            (
+                "nidus_rerank_provider_calls_total",
+                "Round trips made to a hosted rerank provider",
+                rerank_provider_calls.get(),
+            ),
+            (
+                "nidus_rerank_provider_candidates_total",
+                "Candidates sent to a hosted rerank provider",
+                rerank_provider_candidates.get(),
+            ),
+            (
+                "nidus_rerank_provider_passthrough_total",
+                "Candidates that skipped the rerank provider for lacking text",
+                rerank_provider_passthrough.get(),
             ),
         ]
     }

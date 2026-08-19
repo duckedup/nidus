@@ -37,7 +37,7 @@ pub const META_UPDATED_AT: &str = "nidus.updated_at";
 
 /// Default `top_k` used by [`recall`](Memory::recall) when [`RecallOpts::top_k`]
 /// is left at its `0` default.
-const DEFAULT_TOP_K: usize = 10;
+pub(crate) const DEFAULT_TOP_K: usize = 10;
 
 /// How [`Memory::remember`] prepares the text it stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

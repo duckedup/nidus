@@ -313,6 +313,8 @@ src/
 ├── embed/        # embedding providers: voyage, openai, ollama, cohere, gemini, mistral,
 │                 #   jina, openai_compat
 ├── summarize/    # single-shot text summarization (anthropic, openai)
+├── rerank/       # opt-in retrieve-then-rerank: a hosted cross-encoder scores (query, text)
+│                 #   pairs — stage.rs (pure, ungated), apply.rs, voyage/cohere/jina
 ├── memory.rs     # the text-native memory API the MCP surface is built on
 ├── providers.rs  # provider capability registry
 ├── http.rs       # shared HTTP retry infrastructure for the reqwest-based adapters

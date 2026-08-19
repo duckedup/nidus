@@ -34,6 +34,7 @@ from typing import Any, Callable, NamedTuple
 import pytest
 
 from nidus import ClusterStatus, NidusClient, NidusError, Readiness, RememberResult, f, rank, v
+from nidus.types import Rerank
 
 # Canned response payloads, one per shape the client has to decode. Kept beside the
 # endpoint table below so a row and its response read together.
@@ -412,6 +413,30 @@ def test_the_ranking_knobs_reach_the_wire() -> None:
     db.hybrid_search(vector=[1.0], field="body", text="fox", vector_weight=2.0, text_weight=0.5)
     assert stub.last.json["vector_weight"] == 2.0
     assert stub.last.json["text_weight"] == 0.5
+
+
+def test_rerank_reaches_the_wire_on_all_four_ranked_calls() -> None:
+    """``rerank`` is a sibling of ``top_k`` on every method that can carry it."""
+    stub = StubTransport([])
+    db = client(stub)
+    knob: Rerank = {"query": "q", "overscan": 4, "model": "rerank-2.5"}
+    db.search(query=[1.0], rerank=knob)
+    assert stub.last.json["rerank"] == knob
+    db.text_search(field="body", query="fox", rerank=knob)
+    assert stub.last.json["rerank"] == knob
+    db.hybrid_search(vector=[1.0], field="body", text="fox", rerank=knob)
+    assert stub.last.json["rerank"] == knob
+    db.recall("notes", "hello", rerank=knob)
+    assert stub.last.json["rerank"] == knob
+
+
+def test_rerank_none_omits_the_key_and_zero_overscan_survives() -> None:
+    stub = StubTransport([])
+    db = client(stub)
+    db.search(query=[1.0])
+    assert "rerank" not in stub.last.json
+    db.search(query=[1.0], rerank={"overscan": 0})
+    assert stub.last.json["rerank"] == {"overscan": 0}
 
 
 def test_a_search_refuses_a_query_it_cannot_spell_unambiguously() -> None:

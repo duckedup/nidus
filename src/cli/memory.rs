@@ -11,6 +11,9 @@ use crate::embed::{AnyEmbedder, Embedder, embedder_identity};
 use crate::server::dto::HitDto;
 use crate::{Filter, Memory, Nidus, RecallOpts, RememberMode, Value};
 
+#[cfg(feature = "rerank")]
+use super::RerankArgs;
+
 /// A stable id for a memory whose caller supplied none, mirroring the MCP surface's
 /// derivation so the same text lands on the same id from either entry point.
 /// `DefaultHasher` is fixed-key, so the id survives restarts.
@@ -133,6 +136,7 @@ pub(super) fn remember(
 }
 
 /// `nidus recall`: embed `query` and print the ranked hits, in the shape `search` prints.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn recall(
     store: StoreArgs,
     ingest: IngestArgs,
@@ -141,6 +145,7 @@ pub(super) fn recall(
     top_k: usize,
     min_score: Option<f32>,
     filter: Option<String>,
+    #[cfg(feature = "rerank")] rerank: RerankArgs,
 ) -> Result<()> {
     let filter: Option<Filter> = match filter {
         Some(s) => Some(
@@ -155,8 +160,24 @@ pub(super) fn recall(
         let embedder = require_embedder(&ingest).await?;
         // Read-only: a recall must run alongside a `nidus serve` holding the writer lock.
         let db = open_with(store, &embedder, false)?;
-        let memory = Memory::new(db, embedder);
 
+        #[cfg(feature = "rerank")]
+        if let Some(r) = rerank.build_reranker()? {
+            return recall_reranked(
+                &db,
+                &embedder,
+                &r,
+                &collection,
+                &query,
+                top_k,
+                min_score,
+                filter,
+                &rerank,
+            )
+            .await;
+        }
+
+        let memory = Memory::new(db, embedder);
         let opts = RecallOpts {
             top_k,
             min_score: min_score.unwrap_or(0.0),
@@ -166,6 +187,52 @@ pub(super) fn recall(
         let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
         super::print_json(&out)
     })
+}
+
+/// The reranked path for `nidus recall` (nidus-4ss): [`Memory::recall`] has no reranker
+/// hook, so this replicates its embed-then-search shape directly over
+/// [`crate::rerank::apply::search_reranked`] instead of touching `src/memory.rs`.
+#[cfg(feature = "rerank")]
+#[allow(clippy::too_many_arguments)]
+async fn recall_reranked(
+    db: &Nidus,
+    embedder: &AnyEmbedder,
+    reranker: &crate::rerank::AnyReranker,
+    collection: &str,
+    query: &str,
+    top_k: usize,
+    min_score: Option<f32>,
+    filter: Option<Filter>,
+    rerank: &RerankArgs,
+) -> Result<()> {
+    crate::memory::guard_recall_identity(db, embedder, collection)?;
+    let vector = embedder
+        .embed_query(query)
+        .await
+        .with_context(|| format!("embedding recall query for '{collection}'"))?;
+    let mut filter = filter.unwrap_or_default();
+    filter
+        .0
+        .push(crate::memory::not_expired_predicate(crate::meta::now_ms()));
+    let min_score = min_score.unwrap_or(0.0);
+    let opts = crate::SearchOpts {
+        // Same `0 means default` substitution `RecallOpts` makes, so `--top-k 0` does not
+        // mean one thing with `--rerank-provider` and another without it.
+        top_k: if top_k == 0 {
+            crate::memory::DEFAULT_TOP_K
+        } else {
+            top_k
+        },
+        filter,
+        min_score: (min_score > 0.0).then_some(min_score),
+        ..Default::default()
+    };
+    let rr_opts = rerank.opts(Some(query.to_string()));
+    let hits =
+        crate::rerank::apply::search_reranked(db, reranker, collection, &vector, &opts, &rr_opts)
+            .await?;
+    let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
+    super::print_json(&out)
 }
 
 /// Guard against the two ids drifting apart: a memory written over MCP and the same text

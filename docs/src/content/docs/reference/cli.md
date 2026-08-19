@@ -19,18 +19,19 @@ binary was built:
 
 | Install | Command | Surface |
 | --- | --- | --- |
-| `cargo binstall nidus` (prebuilt), or the install script | n/a | Everything below: all 23 subcommands, every `--embed-*`/`--summarize-*` flag, `mcp`, `remember`, `recall` |
-| `cargo install nidus --features cli` | build from source | No `mcp`, `remember`, or `recall` subcommand, and `serve` has **no** `--embed-*`/`--summarize-*` flags |
+| `cargo binstall nidus` (prebuilt), or the install script | n/a | Everything below: all 23 subcommands, every `--embed-*`/`--summarize-*`/`--rerank-*` flag, `mcp`, `remember`, `recall` |
+| `cargo install nidus --features cli` | build from source | No `mcp`, `remember`, or `recall` subcommand, and `serve` has **no** `--embed-*`/`--summarize-*`/`--rerank-*` flags |
 
 The prebuilt binaries (`cargo binstall`, the install script, and the release
 tarballs) are all built with `--features serve`, which is the umbrella feature
-`cli + memory + embed-all + summarize-all + mcp`. A plain `--features cli`
+`cli + memory + embed-all + summarize-all + rerank-all + mcp`. A plain `--features cli`
 source build gets the store-operation subcommands and `serve` for the raw vector
 routes, but none of the AI-ingest layer: `mcp`, `remember`, and `recall` do not
-exist as subcommands at all, and `serve`'s embedder/summarizer flags are absent
-rather than merely inert. A reference that listed them anyway would be wrong for
-that install, so every flag below tagged **memory** or **mcp** is only present
-when the binary was built with that feature (`serve` pulls in both).
+exist as subcommands at all, and `serve`'s embedder/summarizer/reranker flags are
+absent rather than merely inert. A reference that listed them anyway would be
+wrong for that install, so every flag below tagged **memory**, **mcp**, or
+**rerank** is only present when the binary was built with that feature (`serve`
+pulls in all three).
 
 See [Install](/guides/cli-and-server/#install) for the two paths, and
 [Remember & recall](/guides/remember-and-recall/#turn-it-on) for the Cargo
@@ -116,10 +117,33 @@ See [Remember & recall](/guides/remember-and-recall/) for the provider table and
 parity between the CLI, HTTP, and MCP surfaces at
 [Parity across the surfaces](/guides/remember-and-recall/#parity-across-the-surfaces).
 
+## Rerank flags (`rerank` feature)
+
+`serve`, `mcp`, `search`, `text-search`, `hybrid-search`, and `recall` additionally
+take this set, present only when the binary was built with the `rerank` feature
+(part of the `serve` umbrella). With no `--rerank-provider`, nothing reranks and
+every search runs exactly as before.
+
+| Flag | Env | Description |
+| --- | --- | --- |
+| `--rerank-provider <NAME>` | `NIDUS_RERANK_PROVIDER` | Rerank provider: `voyage`, `cohere`, or `jina`. Omit to leave reranking off. |
+| `--rerank-model <MODEL>` | `NIDUS_RERANK_MODEL` | Rerank model. Defaults to the provider's default. |
+| `--rerank-api-key <KEY>` | `NIDUS_RERANK_API_KEY` | API key for the rerank provider. |
+| `--rerank-base-url <URL>` | `NIDUS_RERANK_BASE_URL` | Base-URL override (self-hosted gateways, or a mock in tests). |
+| `--rerank-overscan <N>` | `NIDUS_RERANK_OVERSCAN` | How many times deeper than `--top-k` to rank before reranking. This is the reranker's own window, distinct from `--ann-overscan` (the ANN candidate fan-out) and `--rescore` (the quantized second pass). Defaults to `4`, maximum `64`. |
+| `--rerank-text-field <ATTR>` | `NIDUS_RERANK_TEXT_FIELD` | Attr holding the candidate text. Defaults to `nidus.text`. |
+
+`search` additionally takes `--rerank-query <TEXT>` (no env var): the text scored
+against each candidate, **required** alongside `--rerank-provider` there since a
+raw-vector query is a JSON array of floats, not text. `text-search`,
+`hybrid-search`, and `recall` have no such flag: they already take a query/text
+argument of their own, and that is what the reranker scores against when it is
+on. See the [reranking guide](/guides/reranking/).
+
 ## Subcommands
 
-Flags already listed above (store flags, ingest flags) are not repeated per
-subcommand; only what that subcommand adds is shown.
+Flags already listed above (store flags, ingest flags, rerank flags) are not
+repeated per subcommand; only what that subcommand adds is shown.
 
 ### `serve`
 
@@ -137,6 +161,7 @@ Run the HTTP server. Usage: `nidus serve [OPTIONS] --dir <DIR>`.
 | `--refresh-interval <SECONDS>` | `NIDUS_REFRESH_INTERVAL` | Refresh this instance on a timer instead of leaving it to the caller. |
 | `--require-remote` | `NIDUS_REQUIRE_REMOTE` | Refuse to start unless `--persistence` and `--memory` are both shared, non-local backends. |
 | `--embed-*`/`--summarize-*` | see above | Present only under the `memory` feature; see [Ingest flags](#ingest-flags-memory-feature). |
+| `--rerank-*` | see above | Present only under the `rerank` feature; see [Rerank flags](#rerank-flags-rerank-feature). |
 
 The full operator-facing environment table, authentication model, and request
 lifecycle live on the [HTTP server](/guides/http-server/) page; this page only lists
@@ -145,8 +170,9 @@ the flags.
 ### `mcp` (`mcp` feature)
 
 Speak MCP over stdio, for `claude mcp add nidus -- nidus mcp --dir ~/.nidus`. Usage:
-`nidus mcp [OPTIONS] --dir <DIR>`. Takes the [store flags](#store-flags) and, under
-the `memory` feature, the [ingest flags](#ingest-flags-memory-feature). No flags of
+`nidus mcp [OPTIONS] --dir <DIR>`. Takes the [store flags](#store-flags), under
+the `memory` feature the [ingest flags](#ingest-flags-memory-feature), and under
+the `rerank` feature the [rerank flags](#rerank-flags-rerank-feature). No flags of
 its own. See [MCP](/guides/mcp/).
 
 ### `collections`
@@ -207,6 +233,10 @@ The source record is always excluded from its own results, by id rather than by
 score, so a genuine duplicate of the source still comes back. `COLLECTION`/`ID`
 naming no record, or a record with no stored vector (a text-only entry), is an error
 naming the reason, not an empty result.
+
+Under the `rerank` feature, also takes the [rerank flags](#rerank-flags-rerank-feature)
+plus `--rerank-query <TEXT>`, required alongside `--rerank-provider` here since a raw
+vector has no text of its own.
 
 ### `aggregate`
 
@@ -269,6 +299,10 @@ Full-text (BM25) search of fields declared via `set-fts-schema`. Usage:
 | `--min-score <SCORE>` | none | Drop hits scoring below this raw BM25 score. |
 | `--where <FILTER>` | none | AND-filter as JSON (same form as `search --where`). |
 
+Under the `rerank` feature, also takes the [rerank flags](#rerank-flags-rerank-feature);
+the reranker (when on) scores against this command's own `QUERY` argument, with no
+extra flag needed.
+
 ### `hybrid-search`
 
 Fuse a vector query and a BM25 text query with Reciprocal Rank Fusion. Usage:
@@ -287,6 +321,10 @@ flags as `text-search` above, plus:
 | `--candidates <N>` | none | Candidates pulled per leg before fusing (default `100`). |
 | `--vector-weight <N>` | none | Weight on the vector leg's fused contribution (default `1`). |
 | `--text-weight <N>` | none | Weight on the BM25 leg's fused contribution (default `1`). |
+
+Under the `rerank` feature, also takes the [rerank flags](#rerank-flags-rerank-feature);
+the reranker (when on) scores against this command's own `TEXT` leg, with no extra
+flag needed.
 
 ### `get`
 
@@ -405,6 +443,10 @@ the [ingest flags](#ingest-flags-memory-feature), plus:
 | `-k, --top-k <N>` | none | Hits to return (default `10`). |
 | `--min-score <SCORE>` | none | Drop hits scoring below this cosine similarity. |
 | `--where <FILTER>` | none | AND-filter as JSON (same form as `search --where`). |
+
+Under the `rerank` feature, also takes the [rerank flags](#rerank-flags-rerank-feature);
+the reranker (when on) scores against this command's own `QUERY` argument, with no
+extra flag needed.
 
 `remember`/`recall` are the CLI door onto the same memory layer HTTP's
 `/remember`/`/recall` and MCP's tools use; see

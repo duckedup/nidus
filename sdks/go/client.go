@@ -407,6 +407,10 @@ func (c *Client) SetFilterIndexFields(ctx context.Context, name string, fields [
 // take the server's default rather than asking for zero results; see the note in
 // types.go on the omit-vs-zero trap. Offset skips that many top-ranked hits, so
 // successive pages tile the ranking; Offset+TopK may not exceed 10000.
+//
+// req.Rerank asks the server to rescore the candidate window with a hosted
+// cross-encoder before returning it; Rerank.Query is required here since a vector
+// query carries no text of its own. Needs a server started with --rerank-provider.
 func (c *Client) Search(ctx context.Context, req SearchRequest) ([]Hit, error) {
 	return c.hits(ctx, "/search", req)
 }
@@ -414,6 +418,10 @@ func (c *Client) Search(ctx context.Context, req SearchRequest) ([]Hit, error) {
 // TextSearch runs a BM25 full-text query over one field declared with
 // [Client.SetFtsSchema]. Scores are raw BM25, not cosine: unbounded above and not
 // comparable between queries.
+//
+// req.Rerank asks the server to rescore the candidate window with a hosted
+// cross-encoder before returning it; Rerank.Query defaults to this request's own
+// query text when left empty. Needs a server started with --rerank-provider.
 func (c *Client) TextSearch(ctx context.Context, req TextSearchRequest) ([]Hit, error) {
 	return c.hits(ctx, "/text-search", req)
 }
@@ -422,6 +430,10 @@ func (c *Client) TextSearch(ctx context.Context, req TextSearchRequest) ([]Hit, 
 // fusion, so a document that ranks well on either leg surfaces. The returned score is
 // the fused RRF score — a rank-derived number, not a similarity, and not comparable
 // with a [Client.Search] score.
+//
+// req.Rerank asks the server to rescore the candidate window with a hosted
+// cross-encoder before returning it; Rerank.Query defaults to this request's own text
+// leg when left empty. Needs a server started with --rerank-provider.
 func (c *Client) HybridSearch(ctx context.Context, req HybridSearchRequest) ([]Hit, error) {
 	return c.hits(ctx, "/hybrid-search", req)
 }
@@ -518,6 +530,10 @@ func (c *Client) Remember(
 // A collection written with one embedding model and recalled against a server
 // configured with another is refused (409) rather than silently answered with
 // meaningless scores.
+//
+// opts.Rerank asks the server to rescore the candidate window with a hosted
+// cross-encoder before returning it; Rerank.Query defaults to this call's own query
+// text when left empty. Needs a server started with --rerank-provider.
 func (c *Client) Recall(
 	ctx context.Context, collection, query string, opts RecallOptions,
 ) ([]Hit, error) {

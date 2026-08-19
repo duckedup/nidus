@@ -118,6 +118,13 @@ JSON array of metadata predicates, AND-combined, with `Any`/`Not` for OR and
 negation. It narrows a search to the records that match before scoring, the
 same filters `forget` and `browse` use to scope which records they touch.
 
+Under the `rerank` feature, the same three tools also take an optional `rerank`
+argument (`text_field`, `overscan` up to 64, `model`), which reranks the retrieved window
+at a hosted cross-encoder before returning it. It carries no `query` property of
+its own; each tool's own query text stands in for it. A server started with no
+`--rerank-provider` answers a call carrying `rerank` with an error naming the
+flag. See the [reranking guide](/guides/reranking/).
+
 ### No setup step
 
 `remember` provisions what it needs on first write: it creates the collection if

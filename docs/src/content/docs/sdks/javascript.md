@@ -187,6 +187,19 @@ const hits = await db.recall("notes", "quick fox", {
 });
 ```
 
+`recall`, `search`, `textSearch`, and `hybridSearch` all take an optional
+`rerank`, which [reranks](/guides/reranking/) the retrieved window at a hosted
+cross-encoder before trimming to `topK`. It needs a server started with
+`--rerank-provider`; `query` is required on `search` only (a raw-vector query has
+no text of its own) and elsewhere defaults to that call's own query text.
+
+```ts
+const reranked = await db.recall("notes", "quick fox", {
+  topK: 5,
+  rerank: { overscan: 8 }, // 4x by default; how deep to rank before reranking
+});
+```
+
 Against a server started **without** an embedder both throw `NidusError` with status
 `400`, and the message names `--embed-provider`; `mode: "summarize"` without a
 summarizer configured is likewise a `400`. The client only ever sends text; the
@@ -269,6 +282,7 @@ const hits = await db.search({
     },
   },
   limitPer: { field: "sourceFile", max: 2 }, // at most 2 hits per sourceFile
+  // rerank: { query: "…", overscan: 8 }, // query is required here: a vector has no text
 });
 
 // list() sorts by an attribute instead of storage order

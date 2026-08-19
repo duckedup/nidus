@@ -228,6 +228,19 @@ case is an error instead: recall against an unpinned collection fails, and `reme
 that already holds rows fails rather than claiming those vectors as nidus's own. See
 [remember and recall](/guides/remember-and-recall/#dimension-and-embedder-identity-pinning).
 
+## Reranking is not a `Config` field
+
+`Config` pins what a store *is*: dimension, distance metric, on-disk layout. A
+[reranker](/guides/reranking/) is a stateless, per-process, per-request concern
+layered above an already-open store, so it has no field here. It is configured
+at serve time with `--rerank-provider` and its matching `NIDUS_RERANK_*`
+environment variables (see the [CLI reference](/reference/cli/#rerank-flags-rerank-feature)),
+and gated behind its own Cargo features: `rerank` (the shared plumbing), one
+`rerank-<provider>` feature per hosted cross-encoder (`rerank-voyage`,
+`rerank-cohere`, `rerank-jina`), and `rerank-all` for every provider at once. The
+`serve` feature umbrella folds in `rerank-all`, exactly as it does for
+`embed-all`/`summarize-all`.
+
 ## `Fsync`
 
 ```rust

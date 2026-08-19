@@ -396,6 +396,44 @@ describe("NidusClient request shaping", () => {
     });
   });
 
+  it("omits rerank unless asked, and maps it to snake_case on every ranked endpoint", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    // Unset: the un-reranked body carries no `rerank` key at all.
+    await db.search({ query: [1, 0, 0] });
+    expect(calls[0]!.json).toEqual({ query: [1, 0, 0], scope: [], filter: [] });
+
+    await db.search({
+      query: [1, 0, 0],
+      rerank: { query: "quick fox", textField: "nidus.text", overscan: 4, model: "rerank-2.5" },
+    });
+    expect(calls[1]!.json).toMatchObject({
+      rerank: {
+        query: "quick fox",
+        text_field: "nidus.text",
+        overscan: 4,
+        model: "rerank-2.5",
+      },
+    });
+
+    // overscan: 0 is falsy but set — it must survive, not be dropped as unset.
+    await db.search({ query: [1, 0, 0], rerank: { query: "fox", overscan: 0 } });
+    expect(calls[2]!.json).toMatchObject({ rerank: { query: "fox", overscan: 0 } });
+
+    await db.textSearch({ field: "body", query: "fox", rerank: { textField: "body" } });
+    expect(calls[3]!.json).toMatchObject({ rerank: { text_field: "body" } });
+    await db.hybridSearch({
+      vector: [1, 0, 0],
+      field: "body",
+      text: "fox",
+      rerank: { overscan: 8 },
+    });
+    expect(calls[4]!.json).toMatchObject({ rerank: { overscan: 8 } });
+    await db.recall("notes", "fox", { rerank: { model: "rerank-2.5" } });
+    expect(calls[5]!.json).toMatchObject({ rerank: { model: "rerank-2.5" } });
+  });
+
   it("keeps the single-field text query spelling and adds the clause list", async () => {
     const { fn, calls } = mockFetch([]);
     const db = new NidusClient({ baseUrl: "http://x", fetch: fn });

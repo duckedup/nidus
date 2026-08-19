@@ -21,13 +21,19 @@ use crate::{
 
 // AI-ingest (memory) wiring for `serve`: only under the `memory` feature (pulled
 // by the `serve` umbrella). A plain `cli` build has no `--embed-provider` flags.
-#[cfg(feature = "memory")]
+#[cfg(any(feature = "memory", feature = "rerank"))]
 use std::sync::Arc;
 
 #[cfg(feature = "memory")]
 use crate::embed::{AnyEmbedder, EmbedConfig, EmbedProvider, Embedder};
 #[cfg(all(feature = "memory", feature = "summarize"))]
 use crate::summarize::{AnySummarizer, SummarizeConfig, SummarizeProvider};
+// Cross-encoder rerank wiring (nidus-4ss): a separate base from `memory`/`embed` — BM25 +
+// rerank with no embedder is a valid lean build.
+#[cfg(feature = "rerank")]
+use crate::rerank::{
+    AnyReranker, RerankConfig, RerankProvider, apply as rerank_apply, stage::RerankOpts,
+};
 
 mod backup;
 #[cfg(feature = "memory")]
@@ -538,6 +544,89 @@ impl IngestArgs {
     }
 }
 
+/// Cross-encoder rerank flags. With no --rerank-provider nothing reranks and every search
+/// behaves exactly as before.
+#[cfg(feature = "rerank")]
+#[derive(Args, Debug, Default)]
+struct RerankArgs {
+    /// Rerank provider: voyage, cohere, or jina. Omit to leave reranking off.
+    #[arg(long, env = "NIDUS_RERANK_PROVIDER")]
+    rerank_provider: Option<String>,
+    /// Rerank model. Defaults to the provider's default when omitted.
+    #[arg(long, env = "NIDUS_RERANK_MODEL")]
+    rerank_model: Option<String>,
+    #[arg(long, env = "NIDUS_RERANK_API_KEY")]
+    rerank_api_key: Option<String>,
+    /// Base-URL override for the rerank provider (self-hosted gateways, and what the e2e
+    /// suite points at a local mock).
+    #[arg(long, env = "NIDUS_RERANK_BASE_URL")]
+    rerank_base_url: Option<String>,
+    /// How many times deeper than --top-k to rank before reranking. This is the RERANKER's
+    /// window, not --ann-overscan (the ANN candidate fan-out) and not --rescore (the
+    /// quantized first pass's f32 second pass). Defaults to 4.
+    #[arg(
+        long,
+        env = "NIDUS_RERANK_OVERSCAN",
+        value_parser = clap::value_parser!(u64).range(1..=crate::MAX_OVERSCAN as u64),
+    )]
+    rerank_overscan: Option<u64>,
+    /// Attr holding the text to score. Defaults to nidus.text.
+    #[arg(long, env = "NIDUS_RERANK_TEXT_FIELD")]
+    rerank_text_field: Option<String>,
+}
+
+#[cfg(feature = "rerank")]
+impl RerankArgs {
+    /// Build the reranker from `--rerank-provider …`, or `None` when the flag was omitted
+    /// (the caller then searches exactly as before). Sync — unlike `IngestArgs::build_embedder`,
+    /// no adapter probes anything with a live call during construction.
+    pub(super) fn build_reranker(&self) -> Result<Option<AnyReranker>> {
+        let Some(name) = self.rerank_provider.as_deref() else {
+            return Ok(None);
+        };
+        let provider = RerankProvider::from_name(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown rerank provider '{name}'"))?;
+        // An empty model lets `AnyReranker::build` fill the provider default.
+        let mut config = RerankConfig::new(self.rerank_model.clone().unwrap_or_default());
+        if let Some(k) = &self.rerank_api_key {
+            config = config.api_key(k);
+        }
+        if let Some(u) = &self.rerank_base_url {
+            config = config.base_url(u);
+        }
+        let reranker = AnyReranker::build(provider, config)
+            .map_err(|e| anyhow::anyhow!("building reranker '{name}': {e}"))?;
+        Ok(Some(reranker))
+    }
+
+    /// This request's `RerankOpts`. `query` overrides the surface's own query text; only
+    /// `search` (a raw-vector query) needs to pass one.
+    fn opts(&self, query: Option<String>) -> RerankOpts {
+        RerankOpts {
+            text_field: self.rerank_text_field.clone(),
+            overscan: self
+                .rerank_overscan
+                .map(|n| n as usize)
+                .unwrap_or(crate::rerank::stage::DEFAULT_OVERSCAN),
+            model: None,
+            query,
+        }
+    }
+}
+
+/// `search` takes a raw vector, which has no text of its own: reranking it without
+/// `--rerank-query` is refused up front, rather than left to fail deep in the async
+/// orchestrator (`apply::search_reranked`'s own `rr.query` check).
+#[cfg(feature = "rerank")]
+fn check_rerank_query(has_reranker: bool, has_query: bool) -> Result<()> {
+    if has_reranker && !has_query {
+        bail!(
+            "--rerank-provider requires --rerank-query on `search`: a raw-vector query has no text of its own"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum DistanceArg {
     Cosine,
@@ -723,6 +812,11 @@ enum Command {
         #[cfg(feature = "memory")]
         #[command(flatten)]
         ingest: IngestArgs,
+        /// Cross-encoder rerank flags backing the `rerank` field on `/search`,
+        /// `/text-search`, `/hybrid-search` and `/collections/{name}/recall`.
+        #[cfg(feature = "rerank")]
+        #[command(flatten)]
+        rerank: RerankArgs,
     },
     /// Speak MCP over stdio, for `claude mcp add nidus -- nidus mcp --dir ~/.nidus`.
     #[cfg(feature = "mcp")]
@@ -732,6 +826,9 @@ enum Command {
         #[cfg(feature = "memory")]
         #[command(flatten)]
         ingest: IngestArgs,
+        #[cfg(feature = "rerank")]
+        #[command(flatten)]
+        rerank: RerankArgs,
     },
     /// List collections.
     Collections {
@@ -798,6 +895,14 @@ enum Command {
         /// Maximum hits kept per distinct --limit-per value.
         #[arg(long = "limit-per-max", requires = "limit_per")]
         limit_per_max: Option<usize>,
+        #[cfg(feature = "rerank")]
+        #[command(flatten)]
+        rerank: RerankArgs,
+        /// The text to score against each candidate when reranking. Required alongside
+        /// --rerank-provider: a raw-vector query has no text of its own.
+        #[cfg(feature = "rerank")]
+        #[arg(long)]
+        rerank_query: Option<String>,
     },
     /// "More like this": nearest-neighbour search using the vector already stored at
     /// COLLECTION/ID, excluding that source record from the results.
@@ -936,6 +1041,9 @@ enum Command {
         /// AND-filter as JSON (same form as `search --where`).
         #[arg(long = "where")]
         filter: Option<String>,
+        #[cfg(feature = "rerank")]
+        #[command(flatten)]
+        rerank: RerankArgs,
     },
     /// Hybrid search: fuse a vector query and a BM25 text query with RRF.
     HybridSearch {
@@ -973,6 +1081,9 @@ enum Command {
         /// Weight on the BM25 leg's fused contribution.
         #[arg(long, default_value_t = 1.0)]
         text_weight: f32,
+        #[cfg(feature = "rerank")]
+        #[command(flatten)]
+        rerank: RerankArgs,
     },
     /// Print every record in a collection (JSON).
     Get {
@@ -1116,6 +1227,9 @@ enum Command {
         /// AND-filter as JSON (same form as `search --where`).
         #[arg(long = "where")]
         filter: Option<String>,
+        #[cfg(feature = "rerank")]
+        #[command(flatten)]
+        rerank: RerankArgs,
     },
 }
 
@@ -1135,6 +1249,8 @@ pub fn run(cli: Cli) -> Result<()> {
             require_remote,
             #[cfg(feature = "memory")]
             ingest,
+            #[cfg(feature = "rerank")]
+            rerank,
         } => serve(
             ServeArgs {
                 addr,
@@ -1150,16 +1266,22 @@ pub fn run(cli: Cli) -> Result<()> {
             store,
             #[cfg(feature = "memory")]
             ingest,
+            #[cfg(feature = "rerank")]
+            rerank,
         ),
         #[cfg(feature = "mcp")]
         Command::Mcp {
             store,
             #[cfg(feature = "memory")]
             ingest,
+            #[cfg(feature = "rerank")]
+            rerank,
         } => mcp(
             store,
             #[cfg(feature = "memory")]
             ingest,
+            #[cfg(feature = "rerank")]
+            rerank,
         ),
         Command::Collections { store } => {
             let db = open(&store, false)?;
@@ -1199,6 +1321,10 @@ pub fn run(cli: Cli) -> Result<()> {
             rank_by,
             limit_per,
             limit_per_max,
+            #[cfg(feature = "rerank")]
+            rerank,
+            #[cfg(feature = "rerank")]
+            rerank_query,
         } => {
             let db = open(&store, false)?;
             let query: Vec<f32> = serde_json::from_str(&read_input(query_file.as_ref())?)?;
@@ -1221,11 +1347,33 @@ pub fn run(cli: Cli) -> Result<()> {
                 ..Default::default()
             };
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
-            let hits = if refs.is_empty() {
-                db.search(Scope::All, &query, &opts)?
-            } else {
-                db.search(Scope::Collections(&refs), &query, &opts)?
+            let plain = || {
+                if refs.is_empty() {
+                    db.search(Scope::All, &query, &opts)
+                } else {
+                    db.search(Scope::Collections(&refs), &query, &opts)
+                }
             };
+            #[cfg(feature = "rerank")]
+            let reranker = rerank.build_reranker()?;
+            #[cfg(feature = "rerank")]
+            check_rerank_query(reranker.is_some(), rerank_query.is_some())?;
+            #[cfg(feature = "rerank")]
+            let hits = if let Some(r) = &reranker {
+                let scope = if refs.is_empty() {
+                    Scope::All
+                } else {
+                    Scope::Collections(&refs)
+                };
+                let rr_opts = rerank.opts(rerank_query.clone());
+                tokio::runtime::Runtime::new()?.block_on(rerank_apply::search_reranked(
+                    &db, r, scope, &query, &opts, &rr_opts,
+                ))?
+            } else {
+                plain()?
+            };
+            #[cfg(not(feature = "rerank"))]
+            let hits = plain()?;
             let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
             print_json(&out)
         }
@@ -1393,6 +1541,8 @@ pub fn run(cli: Cli) -> Result<()> {
             offset,
             min_score,
             filter,
+            #[cfg(feature = "rerank")]
+            rerank,
         } => {
             let q = text.query(field, query)?;
             let db = open(&store, false)?;
@@ -1409,11 +1559,31 @@ pub fn run(cli: Cli) -> Result<()> {
                 ..Default::default()
             };
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
-            let hits = if refs.is_empty() {
-                db.text_search(Scope::All, &q, &opts)?
-            } else {
-                db.text_search(Scope::Collections(&refs), &q, &opts)?
+            let plain = || {
+                if refs.is_empty() {
+                    db.text_search(Scope::All, &q, &opts)
+                } else {
+                    db.text_search(Scope::Collections(&refs), &q, &opts)
+                }
             };
+            #[cfg(feature = "rerank")]
+            let reranker = rerank.build_reranker()?;
+            #[cfg(feature = "rerank")]
+            let hits = if let Some(r) = &reranker {
+                let scope = if refs.is_empty() {
+                    Scope::All
+                } else {
+                    Scope::Collections(&refs)
+                };
+                let rr_opts = rerank.opts(None);
+                tokio::runtime::Runtime::new()?.block_on(rerank_apply::text_search_reranked(
+                    &db, r, scope, &q, &opts, &rr_opts,
+                ))?
+            } else {
+                plain()?
+            };
+            #[cfg(not(feature = "rerank"))]
+            let hits = plain()?;
             let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
             print_json(&out)
         }
@@ -1431,6 +1601,8 @@ pub fn run(cli: Cli) -> Result<()> {
             candidates,
             vector_weight,
             text_weight,
+            #[cfg(feature = "rerank")]
+            rerank,
         } => {
             let q = query.query(field, text)?;
             let db = open(&store, false)?;
@@ -1450,11 +1622,31 @@ pub fn run(cli: Cli) -> Result<()> {
                 text_weight,
             };
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
-            let hits = if refs.is_empty() {
-                db.hybrid_search(Scope::All, &vector, &q, &opts)?
-            } else {
-                db.hybrid_search(Scope::Collections(&refs), &vector, &q, &opts)?
+            let plain = || {
+                if refs.is_empty() {
+                    db.hybrid_search(Scope::All, &vector, &q, &opts)
+                } else {
+                    db.hybrid_search(Scope::Collections(&refs), &vector, &q, &opts)
+                }
             };
+            #[cfg(feature = "rerank")]
+            let reranker = rerank.build_reranker()?;
+            #[cfg(feature = "rerank")]
+            let hits = if let Some(r) = &reranker {
+                let scope = if refs.is_empty() {
+                    Scope::All
+                } else {
+                    Scope::Collections(&refs)
+                };
+                let rr_opts = rerank.opts(None);
+                tokio::runtime::Runtime::new()?.block_on(rerank_apply::hybrid_search_reranked(
+                    &db, r, scope, &vector, &q, &opts, &rr_opts,
+                ))?
+            } else {
+                plain()?
+            };
+            #[cfg(not(feature = "rerank"))]
+            let hits = plain()?;
             let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
             print_json(&out)
         }
@@ -1583,7 +1775,19 @@ pub fn run(cli: Cli) -> Result<()> {
             top_k,
             min_score,
             filter,
-        } => memory::recall(store, ingest, collection, query, top_k, min_score, filter),
+            #[cfg(feature = "rerank")]
+            rerank,
+        } => memory::recall(
+            store,
+            ingest,
+            collection,
+            query,
+            top_k,
+            min_score,
+            filter,
+            #[cfg(feature = "rerank")]
+            rerank,
+        ),
     }
 }
 
@@ -1683,6 +1887,7 @@ fn serve(
     args: ServeArgs,
     mut store: StoreArgs,
     #[cfg(feature = "memory")] ingest: IngestArgs,
+    #[cfg(feature = "rerank")] rerank: RerankArgs,
 ) -> Result<()> {
     let ServeArgs {
         addr,
@@ -1729,6 +1934,9 @@ fn serve(
     let embedder = rt.block_on(ingest.embedder())?;
     #[cfg(all(feature = "memory", feature = "summarize"))]
     let summarizer = rt.block_on(ingest.summarizer())?;
+    // Sync — unlike the embedder/summarizer above, no adapter probes anything on construction.
+    #[cfg(feature = "rerank")]
+    let reranker = rerank.build_reranker()?.map(Arc::new);
 
     #[cfg(feature = "memory")]
     store.apply_embedder_dim(embedder.as_deref())?;
@@ -1754,6 +1962,8 @@ fn serve(
         embedder,
         #[cfg(all(feature = "memory", feature = "summarize"))]
         summarizer,
+        #[cfg(feature = "rerank")]
+        reranker,
     };
     rt.block_on(crate::server::serve(move || Nidus::open(open_config), cfg))
 }
@@ -1761,7 +1971,11 @@ fn serve(
 /// `nidus mcp`: speak MCP over stdio. Always opens read-write — there is exactly one
 /// client and no reason to run a memory server it cannot write to.
 #[cfg(feature = "mcp")]
-fn mcp(mut store: StoreArgs, #[cfg(feature = "memory")] ingest: IngestArgs) -> Result<()> {
+fn mcp(
+    mut store: StoreArgs,
+    #[cfg(feature = "memory")] ingest: IngestArgs,
+    #[cfg(feature = "rerank")] rerank: RerankArgs,
+) -> Result<()> {
     // Honour `--read-only` as `serve` does: a reader that never takes the writer lock is a
     // legitimate way to run this alongside a writer. `remember`/`forget` then fail honestly.
     let mode = if store.read_only {
@@ -1777,6 +1991,8 @@ fn mcp(mut store: StoreArgs, #[cfg(feature = "memory")] ingest: IngestArgs) -> R
     let embedder = rt.block_on(ingest.embedder())?;
     #[cfg(all(feature = "memory", feature = "summarize"))]
     let summarizer = rt.block_on(ingest.summarizer())?;
+    #[cfg(feature = "rerank")]
+    let reranker = rerank.build_reranker()?.map(Arc::new);
 
     #[cfg(feature = "memory")]
     store.apply_embedder_dim(embedder.as_deref())?;
@@ -1787,6 +2003,8 @@ fn mcp(mut store: StoreArgs, #[cfg(feature = "memory")] ingest: IngestArgs) -> R
         embedder,
         #[cfg(all(feature = "memory", feature = "summarize"))]
         summarizer,
+        #[cfg(feature = "rerank")]
+        reranker,
         // A third of the lease TTL, as in `serve`.
         lease_renew_interval: open_config.lock_ttl / 3,
     };
@@ -2943,6 +3161,8 @@ mod tests {
             store_args(None, Some("redis://c")),
             #[cfg(feature = "memory")]
             IngestArgs::default(),
+            #[cfg(feature = "rerank")]
+            RerankArgs::default(),
         )
         .unwrap_err()
         .to_string();
@@ -2957,6 +3177,8 @@ mod tests {
             store_args(Some("s3://b/s"), None),
             #[cfg(feature = "memory")]
             IngestArgs::default(),
+            #[cfg(feature = "rerank")]
+            RerankArgs::default(),
         )
         .unwrap_err()
         .to_string();
@@ -3081,5 +3303,193 @@ mod tests {
         };
         args.apply_embedder_dim(Some(&embedder)).unwrap();
         assert_eq!(args.dim, Some(7));
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn no_rerank_provider_builds_no_reranker() {
+        assert!(RerankArgs::default().build_reranker().unwrap().is_none());
+    }
+
+    /// `search` reranks a raw vector query, which has no text of its own — the mirror-image
+    /// check `apply::search_reranked` makes deep in the async orchestrator, surfaced early.
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn rerank_provider_without_query_is_refused_on_search() {
+        assert!(check_rerank_query(true, false).is_err());
+        assert!(check_rerank_query(true, true).is_ok());
+        assert!(check_rerank_query(false, false).is_ok());
+        assert!(check_rerank_query(false, true).is_ok());
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn search_parses_rerank_flags() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "search",
+            "--dir",
+            "/tmp/s",
+            "docs",
+            "--rerank-provider",
+            "voyage",
+            "--rerank-model",
+            "rerank-2.5",
+            "--rerank-api-key",
+            "k",
+            "--rerank-base-url",
+            "http://mock",
+            "--rerank-overscan",
+            "8",
+            "--rerank-text-field",
+            "body",
+            "--rerank-query",
+            "cats",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Search {
+                rerank,
+                rerank_query,
+                ..
+            } => {
+                assert_eq!(rerank.rerank_provider.as_deref(), Some("voyage"));
+                assert_eq!(rerank.rerank_model.as_deref(), Some("rerank-2.5"));
+                assert_eq!(rerank.rerank_api_key.as_deref(), Some("k"));
+                assert_eq!(rerank.rerank_base_url.as_deref(), Some("http://mock"));
+                assert_eq!(rerank.rerank_overscan, Some(8));
+                assert_eq!(rerank.rerank_text_field.as_deref(), Some("body"));
+                assert_eq!(rerank_query.as_deref(), Some("cats"));
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    /// `search` parses with no `--rerank-*` flags at all: `RerankArgs` is all-`None`, so
+    /// `build_reranker` is `None` and the search runs exactly as before.
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn search_without_rerank_flags_builds_no_reranker() {
+        let cli = Cli::try_parse_from(["nidus", "search", "--dir", "/tmp/s", "docs"]).unwrap();
+        match cli.command {
+            Command::Search { rerank, .. } => {
+                assert!(rerank.build_reranker().unwrap().is_none());
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn text_search_and_hybrid_search_parse_rerank_flags() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "text-search",
+            "--dir",
+            "/tmp/s",
+            "body",
+            "cats",
+            "--rerank-provider",
+            "cohere",
+            "--rerank-api-key",
+            "k",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::TextSearch { rerank, .. } => {
+                assert_eq!(rerank.rerank_provider.as_deref(), Some("cohere"));
+            }
+            _ => panic!("expected TextSearch"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "hybrid-search",
+            "--dir",
+            "/tmp/s",
+            "body",
+            "quantum",
+            "--rerank-provider",
+            "jina",
+            "--rerank-api-key",
+            "k",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::HybridSearch { rerank, .. } => {
+                assert_eq!(rerank.rerank_provider.as_deref(), Some("jina"));
+            }
+            _ => panic!("expected HybridSearch"),
+        }
+    }
+
+    #[cfg(all(feature = "rerank", feature = "memory"))]
+    #[test]
+    fn recall_parses_rerank_flags() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "recall",
+            "--dir",
+            "/tmp/s",
+            "--embed-provider",
+            "ollama",
+            "notes",
+            "when do deploys run",
+            "--rerank-provider",
+            "voyage",
+            "--rerank-api-key",
+            "k",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Recall { rerank, .. } => {
+                assert_eq!(rerank.rerank_provider.as_deref(), Some("voyage"));
+            }
+            _ => panic!("expected Recall"),
+        }
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn serve_parses_rerank_flags() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "serve",
+            "--dir",
+            "/tmp/s",
+            "--dim",
+            "3",
+            "--rerank-provider",
+            "voyage",
+            "--rerank-api-key",
+            "k",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Serve { rerank, .. } => {
+                assert_eq!(rerank.rerank_provider.as_deref(), Some("voyage"));
+            }
+            _ => panic!("expected Serve"),
+        }
+    }
+
+    #[cfg(all(feature = "rerank", feature = "mcp"))]
+    #[test]
+    fn mcp_parses_rerank_flags() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "mcp",
+            "--dir",
+            "/tmp/s",
+            "--rerank-provider",
+            "jina",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Mcp { rerank, .. } => {
+                assert_eq!(rerank.rerank_provider.as_deref(), Some("jina"));
+            }
+            _ => panic!("expected Mcp"),
+        }
     }
 }

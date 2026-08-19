@@ -298,6 +298,23 @@ export interface AnnotationOptions {
   highlight?: boolean | HighlightOptions;
 }
 
+/**
+ * Rerank the candidate window with a hosted cross-encoder before returning it. The server
+ * ranks `(offset + topK) * overscan` deep, scores each candidate's text against `query`,
+ * and returns the top `topK` of that. Requires a server started with `--rerank-provider`;
+ * without one the request is a 400.
+ */
+export interface RerankOptions {
+  /** Text scored against each candidate. Required on {@link NidusClient.search}. */
+  query?: string;
+  /** Attr carrying the candidate text. Defaults to `nidus.text`. */
+  textField?: string;
+  /** Candidate over-fetch multiple. Defaults to 4, maximum 64; past that the server 400s. */
+  overscan?: number;
+  /** Per-request model override. */
+  model?: string;
+}
+
 /** Options for {@link NidusClient.search}. An empty/omitted `scope` searches every collection. */
 export interface SearchOptions extends ProjectionOptions, RankingOptions {
   query: number[];
@@ -312,6 +329,8 @@ export interface SearchOptions extends ProjectionOptions, RankingOptions {
    * quantized first pass. The index stays in place for every other query.
    */
   exact?: boolean;
+  /** Rerank the candidate window with a hosted cross-encoder. `query` is required here. */
+  rerank?: RerankOptions;
 }
 
 /**
@@ -360,6 +379,8 @@ export interface TextSearchBase
   /** A raw BM25 score floor (not cosine). */
   minScore?: number;
   filter?: Filter;
+  /** Rerank the candidate window with a hosted cross-encoder. */
+  rerank?: RerankOptions;
 }
 
 /** Options for {@link NidusClient.textSearch} (BM25). */
@@ -427,6 +448,8 @@ export interface HybridSearchBase extends AnnotationOptions {
   vectorWeight?: number;
   /** Weight on the BM25 leg's RRF contribution (default `1`). */
   textWeight?: number;
+  /** Rerank the candidate window with a hosted cross-encoder. */
+  rerank?: RerankOptions;
 }
 
 /** Options for {@link NidusClient.hybridSearch} (vector + BM25 fused via RRF). */
@@ -540,4 +563,6 @@ export interface RecallOptions {
   /** Cosine-similarity floor; hits below it are dropped. */
   minScore?: number;
   filter?: Filter;
+  /** Rerank the candidate window with a hosted cross-encoder. */
+  rerank?: RerankOptions;
 }

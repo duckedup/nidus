@@ -91,6 +91,18 @@ impl NidusMcp {
             )
         })
     }
+
+    /// The configured reranker, or an `internal_error` — mirrors [`Self::embedder`] exactly.
+    #[cfg(feature = "rerank")]
+    fn reranker(&self) -> Result<Arc<crate::rerank::AnyReranker>, McpError> {
+        self.state.reranker.clone().ok_or_else(|| {
+            McpError::internal_error(
+                "this nidus server was started without a reranker, so it cannot rerank \
+                 results; restart it with --rerank-provider … to enable the rerank argument",
+                None,
+            )
+        })
+    }
 }
 
 /// The tool list. Order must stay stable — reordering invalidates every client's cached
@@ -251,5 +263,19 @@ impl ServerHandler for NidusMcp {
         }?;
         // Always `Complete`, for the same reason `call_tool` is.
         Ok(GetPromptResponse::Complete(result))
+    }
+}
+
+#[cfg(all(test, feature = "rerank"))]
+mod tests {
+    use super::*;
+
+    /// A server started without `--rerank-provider` must fail loud and name the flag, not
+    /// read as a correctable argument mistake — mirrors `embedder()`'s missing-case test.
+    #[test]
+    fn reranker_missing_names_the_flag() {
+        let mcp = NidusMcp::new(crate::server::test_state(None));
+        let err = mcp.reranker().unwrap_err();
+        assert!(err.message.contains("--rerank-provider"));
     }
 }

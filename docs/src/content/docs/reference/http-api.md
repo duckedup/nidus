@@ -380,6 +380,7 @@ curl -s localhost:7700/search \
 | `exclude_attributes` | all attrs | return every attr but these |
 | `rank_by` | none | a [ranking expression](/guides/search/#ranking-by-recency) over the metric |
 | `limit_per` | none | cap hits per distinct value of an attribute |
+| `rerank` | none | [rerank](#reranking) the over-fetched window at a hosted cross-encoder; `rerank.query` is required here |
 
 Returns hits ordered by `(score desc, collection, id)`; the tie-break is a guarantee,
 which is what makes paging coherent:
@@ -517,6 +518,7 @@ curl -s localhost:7700/text-search \
 | `combine` | `"Sum"` | `"Sum"` adds every matched clause's score; `"Max"` takes the strongest |
 | `explain` | `false` | report each matched clause's own BM25 score |
 | `highlight` | absent | `{}` for defaults, or `{"max_fragments": 2, "fragment_chars": 120}` |
+| `rerank` | none | [rerank](#reranking) the over-fetched window; `rerank.query` defaults to this request's own query text |
 
 `field`+`query` and `clauses` are **mutually exclusive**, and an empty `clauses` list is a
 `400`: an empty result set would otherwise read as "no matches" rather than "no query".
@@ -526,7 +528,8 @@ curl -s localhost:7700/text-search \
 Fuse a vector query and a BM25 text query with Reciprocal Rank Fusion. Takes `vector`
 plus the text leg (`field` + `text`, or the same `clauses` + `combine` as `/text-search`),
 plus `top_k`, `offset` (which pages the **fused** ranking, never a leg),
-`filter`, `rrf_k` (default 60), `candidates` (default 100), and `explain`/`highlight`.
+`filter`, `rrf_k` (default 60), `candidates` (default 100), `explain`/`highlight`, and
+an optional [`rerank`](#reranking) (its `query` defaults to this request's own text leg).
 There is no `min_score` (a fused RRF score has no absolute scale).
 Returns the same hit shape as `/search`.
 
@@ -573,6 +576,33 @@ key is **absent** otherwise: an unannotated response is byte-for-byte what it al
 as the document spells it: a query for `run` marks `running`. Highlighting reads the
 stored text, so it still works on a field `include_attributes`/`exclude_attributes`
 dropped from the payload: that pairing (drop the long body, keep the snippet) is the point.
+
+### Reranking
+
+`/search`, `/text-search`, `/hybrid-search`, and `/collections/{name}/recall` all
+accept an optional `rerank` object: rank `(offset + top_k) * overscan` deep by the
+plain metric, score each candidate's text against `query` at a hosted cross-encoder,
+then trim to `top_k` by the provider's score. See the
+[reranking guide](/guides/reranking/) for the full mechanism, including why this
+`overscan` is unrelated to the ANN `overscan` and the quantization `rescore`.
+
+| `rerank` field | Default | Meaning |
+| --- | --- | --- |
+| `query` | endpoint's own query text | Text scored against each candidate. **Required** on `/search`: a raw-vector query has no text of its own. |
+| `text_field` | `nidus.text` | Attr holding each candidate's text. A candidate missing it is returned unranked, sorted below every reranked hit. |
+| `overscan` | `4` | How many times deeper than `top_k` to rank before reranking. Maximum 64, and the resulting depth is capped at the same 10000 a plain query is. Past 64 the request is a `400` rather than a silent clamp. |
+| `model` | – | Override the rerank model for this request only. Omit to use the server's configured model (`--rerank-model`). |
+
+```bash
+curl -s localhost:7700/collections/docs/recall \
+  -H 'content-type: application/json' \
+  -d '{"query": "how do I rotate the signing key", "top_k": 5, "rerank": {"overscan": 8}}'
+```
+
+A `rerank` field against a server started with no `--rerank-provider` is a `400`
+naming the flag, not a silent no-op. `min_score` (where the endpoint has one) is
+compared against the plain metric score while building the deep window, before the
+rerank runs, since a cross-encoder score is on a different scale.
 
 ### `POST /list`
 
@@ -802,6 +832,7 @@ curl -s localhost:7700/collections/notes/recall \
 | `top_k` | `10` | maximum hits to return |
 | `min_score` | none | drop hits scoring below this cosine similarity |
 | `filter` | none | AND of predicates applied before scoring |
+| `rerank` | none | [rerank](#reranking) the over-fetched window; `rerank.query` defaults to this request's own recall query |
 
 Returns the same `HitDto` shape as `/search`: an array of `{collection, id, score, attrs}`.
 

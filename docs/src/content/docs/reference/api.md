@@ -748,6 +748,75 @@ Attr and collection-meta keys `remember`/`recall` stamp and read. All gated on
 | `META_SOURCE` | `nidus.source` | `summarize` feature. **Legacy and read-only**: no longer stamped by any surface. `META_TEXT` carries the raw source text now; this is kept only so records written before nidus-133 remain readable |
 | `META_EXPIRES_AT` | `nidus.expires_at` | ungated. `Value::DateTime` after which an entry is expired; absent means it never expires. Consulted by `Nidus::sweep_expired` |
 
+## `Reranker`, `AnyReranker`, `RerankConfig`, `RerankProvider` & `RerankOpts`
+
+A hosted cross-encoder that re-scores a retrieved candidate window before it is
+trimmed to `top_k`; see the [reranking guide](/guides/reranking/). `RerankOpts` and
+its defaults (`DEFAULT_OVERSCAN`, `DEFAULT_TEXT_FIELD`) are ungated pure logic,
+re-exported at the crate root even without the `rerank` feature; everything else
+here needs it.
+
+```rust
+pub trait Reranker: Send + Sync {
+    async fn rerank(&self, query: &str, docs: &[&str]) -> Result<Vec<f32>, RerankError>;
+    fn provider_name(&self) -> &str;
+    fn model_name(&self) -> &str;
+    fn max_documents(&self) -> usize; // adapters chunk internally past this
+}
+
+pub enum AnyReranker { /* one variant per compiled-in provider */ }
+
+impl AnyReranker {
+    pub fn build(provider: RerankProvider, config: RerankConfig) -> Result<Self, RerankError>;
+}
+
+pub enum RerankProvider { Voyage, Cohere, Jina }
+
+pub struct RerankConfig {
+    pub model: String,               // empty = the provider's own default
+    pub api_key: String,
+    pub base_url: Option<String>,    // override the provider's default endpoint
+    pub extra_headers: Vec<(String, String)>,
+}
+
+pub struct RerankOpts {
+    pub text_field: Option<String>,  // None = DEFAULT_TEXT_FIELD ("nidus.text")
+    pub overscan: usize,             // DEFAULT_OVERSCAN (4); 0 and 1 both mean "no over-fetch"
+    pub model: Option<String>,       // per-request model override; None uses the reranker's own
+    pub query: Option<String>,       // required for search(); elsewhere the caller's own query
+}
+```
+
+| Provider | Feature | `RerankProvider` | Default model |
+|---|---|---|---|
+| Voyage | `rerank-voyage` | `RerankProvider::Voyage` | `rerank-2.5` |
+| Cohere | `rerank-cohere` | `RerankProvider::Cohere` | `rerank-v3.5` |
+| Jina | `rerank-jina` | `RerankProvider::Jina` | `jina-reranker-v2-base-multilingual` |
+
+Unlike `AnyEmbedder::build`, `AnyReranker::build` is **sync**: no adapter probes
+anything with a live call while constructing. `rerank` pulls in every provider
+adapter's shared wire plumbing; `rerank-voyage`/`rerank-cohere`/`rerank-jina` add
+one adapter each, and `rerank-all` pulls in all three. `serve` folds in `rerank-all`.
+
+`RerankOpts` is deliberately **not** a field on `SearchOpts`/`HybridOpts`: `Nidus`
+is synchronous and a provider call is not, so there is no honest way for `search`
+itself to consume it. Instead `nidus::rerank::apply` holds the async orchestrator
+every surface (HTTP, CLI, MCP) calls, over the plain sync store:
+
+```rust
+pub async fn search_reranked(db: &Nidus, r: &AnyReranker, scope: impl Into<Scope<'_>>, vector: &[f32], opts: &SearchOpts, rr: &RerankOpts) -> Result<Vec<Hit>>;
+pub async fn text_search_reranked(db: &Nidus, r: &AnyReranker, scope: impl Into<Scope<'_>>, query: &FtsQuery, opts: &SearchOpts, rr: &RerankOpts) -> Result<Vec<Hit>>;
+pub async fn hybrid_search_reranked(db: &Nidus, r: &AnyReranker, scope: impl Into<Scope<'_>>, vector: &[f32], text: &FtsQuery, opts: &HybridOpts, rr: &RerankOpts) -> Result<Vec<Hit>>;
+```
+
+Each ranks `(offset + top_k) * overscan` deep (offset zeroed for the deep fetch),
+force-includes `rr.text_field` in the candidate projection so a caller's own
+[projection](#projection) cannot starve the rerank of text, sends every candidate
+that has usable text to the provider (chunked to `max_documents`), replaces its
+score, re-sorts, re-trims the projection back to what the caller asked for, and
+finally applies the original `offset`/`top_k`. A candidate missing the text field
+is returned unranked, sorted below every reranked hit.
+
 ## `Persistence`, `Appender`, `BackendLock` & `MemoryTier`
 
 The pluggable storage and shared-memory-tier seam (SPEC §13): implement one of these

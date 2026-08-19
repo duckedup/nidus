@@ -63,11 +63,11 @@ pub mod server;
 // ── AI ingest layer (epic nidus-54l) — all behind off-by-default features ────
 // The async edge: text-native `remember`/`recall` on top of the sync store
 // core, which depends on NONE of this. See Cargo.toml `[features]`.
-#[cfg(any(feature = "embed", feature = "summarize"))]
+#[cfg(any(feature = "embed", feature = "summarize", feature = "rerank"))]
 mod http;
-// Provider capability registry (Embed | Summarize): the single source of truth
-// the embed/summarize factories consult before dispatching.
-#[cfg(any(feature = "embed", feature = "summarize"))]
+// Provider capability registry (Embed | Summarize | Rerank): the single source of truth
+// the embed/summarize/rerank factories consult before dispatching.
+#[cfg(any(feature = "embed", feature = "summarize", feature = "rerank"))]
 pub mod providers;
 // Embedding abstraction + provider adapters + runtime `AnyEmbedder` selection.
 #[cfg(feature = "embed")]
@@ -75,6 +75,10 @@ pub mod embed;
 // Single-shot summarization abstraction + provider adapters.
 #[cfg(feature = "summarize")]
 pub mod summarize;
+// Retrieve-then-rerank over a hosted cross-encoder (nidus-4ss). Declared ungated because
+// `rerank::stage` is pure ranking logic that must run under Miri; the provider adapters and
+// the async orchestrator inside it are `rerank`-gated.
+pub mod rerank;
 // Text-native memory API: `remember(text)` / `recall(query_text)`. Gated on the
 // `memory` feature (= `embed`) so building a bare provider (e.g. `embed-voyage`)
 // does not require this module to exist.
@@ -108,6 +112,13 @@ pub use model::{
     Value,
 };
 pub use profile::OpenProfile;
+pub use rerank::stage::{
+    DEFAULT_OVERSCAN, DEFAULT_TEXT_FIELD, MAX_OVERSCAN, MAX_RERANK_DEPTH, RerankOpts,
+};
+#[cfg(feature = "rerank")]
+pub use rerank::{
+    AnyReranker, RerankConfig, RerankError, RerankProvider, Reranker, reranker_identity,
+};
 pub use store::Readiness;
 pub use store::SegmentReport;
 

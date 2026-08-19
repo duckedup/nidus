@@ -45,6 +45,50 @@ pub(super) fn default_top_k() -> usize {
 /// the bounded top-k kernel would otherwise be handed a `k` it must defend against itself.
 pub(super) const MAX_TOP_K: usize = 10_000;
 
+/// Per-request rerank knobs. No `api_key` and no `base_url`: the reranker is configured at
+/// serve time, so a request can pick a model but never a destination or a credential.
+#[cfg(feature = "rerank")]
+#[derive(Debug, Deserialize)]
+pub struct RerankDto {
+    /// Text scored against each candidate. REQUIRED on `/search` (a raw-vector query has no
+    /// text of its own); elsewhere it defaults to that endpoint's own query text.
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub text_field: Option<String>,
+    #[serde(default)]
+    pub overscan: Option<usize>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// Resolves `overscan: None` to the crate default, and refuses one past `MAX_OVERSCAN`
+/// rather than clamping: the window decides how many candidates reach a paid provider, so
+/// its size stays caller-visible.
+#[cfg(feature = "rerank")]
+impl TryFrom<RerankDto> for crate::rerank::stage::RerankOpts {
+    type Error = anyhow::Error;
+
+    fn try_from(dto: RerankDto) -> Result<Self, Self::Error> {
+        use crate::rerank::stage::{DEFAULT_OVERSCAN, MAX_OVERSCAN};
+        let overscan = dto.overscan.unwrap_or(DEFAULT_OVERSCAN);
+        if overscan > MAX_OVERSCAN {
+            anyhow::bail!("rerank.overscan {overscan} exceeds the maximum of {MAX_OVERSCAN}");
+        }
+        Ok(crate::rerank::stage::RerankOpts {
+            text_field: dto.text_field,
+            overscan,
+            model: dto.model,
+            query: dto.query,
+        })
+    }
+}
+
+/// The rerank over-fetch ceiling must not exceed the depth a plain query is capped at, or a
+/// `rerank` request would be a way around [`MAX_TOP_K`].
+#[cfg(feature = "rerank")]
+const _: () = assert!(crate::rerank::stage::MAX_RERANK_DEPTH <= MAX_TOP_K);
+
 /// Body of `POST /search`. An empty `scope` searches every collection; `offset` skips
 /// that many top-ranked hits, for pagination.
 #[derive(Debug, Deserialize)]
@@ -73,6 +117,11 @@ pub struct SearchRequest {
     /// Cap hits per distinct value of an attribute: `{"field": "path", "max": 2}`.
     #[serde(default)]
     pub limit_per: Option<LimitPer>,
+    /// Rerank the over-fetched window at a hosted cross-encoder before trimming to `top_k`.
+    /// `query` is required here: a raw-vector query has no text of its own.
+    #[cfg(feature = "rerank")]
+    #[serde(default)]
+    pub rerank: Option<RerankDto>,
 }
 
 /// Body of `POST /search/similar`: "more like this" over the vector already stored at
@@ -220,6 +269,11 @@ pub struct TextSearchRequest {
     pub rank_by: Option<RankBy>,
     #[serde(default)]
     pub limit_per: Option<LimitPer>,
+    /// Rerank the over-fetched window at a hosted cross-encoder before trimming to `top_k`.
+    /// `query` defaults to this request's own query text when left unset.
+    #[cfg(feature = "rerank")]
+    #[serde(default)]
+    pub rerank: Option<RerankDto>,
 }
 
 /// Body of `POST /hybrid-search`: fuse a vector query and a BM25 text query (RRF). The text
@@ -259,6 +313,11 @@ pub struct HybridSearchRequest {
     /// Weight on the BM25 leg's RRF contribution.
     #[serde(default = "default_weight")]
     pub text_weight: f32,
+    /// Rerank the over-fetched window at a hosted cross-encoder before trimming to `top_k`.
+    /// `query` defaults to this request's own query text when left unset.
+    #[cfg(feature = "rerank")]
+    #[serde(default)]
+    pub rerank: Option<RerankDto>,
 }
 
 fn default_weight() -> f32 {
@@ -505,6 +564,11 @@ pub struct RecallRequest {
     pub min_score: Option<f32>,
     #[serde(default)]
     pub filter: Filter,
+    /// Rerank the over-fetched window at a hosted cross-encoder before trimming to `top_k`.
+    /// `query` defaults to this request's own recall query when left unset.
+    #[cfg(feature = "rerank")]
+    #[serde(default)]
+    pub rerank: Option<RerankDto>,
 }
 
 /// Serializable mirror of [`crate::Hit`] (which carries no serde derive).
@@ -881,6 +945,21 @@ mod tests {
         let req: ListRequest =
             serde_json::from_value(json!({"order_by": {"field": "ts"}})).unwrap();
         assert_eq!(req.order_by, Some(crate::OrderBy::asc("ts")));
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn rerank_wire_spelling_is_stable() {
+        let req: SearchRequest = serde_json::from_value(json!({
+            "query": [1.0], "rerank": {"text_field": "body", "overscan": 8}
+        }))
+        .unwrap();
+        let rr = req.rerank.expect("rerank present");
+        assert_eq!(rr.text_field.as_deref(), Some("body"));
+        assert_eq!(rr.overscan, Some(8));
+
+        let req: SearchRequest = serde_json::from_value(json!({"query": [1.0]})).unwrap();
+        assert!(req.rerank.is_none());
     }
 
     #[test]

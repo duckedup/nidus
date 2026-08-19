@@ -41,6 +41,12 @@ use crate::summarize::{AnySummarizer, SummarizeOpts, Summarizer};
 #[cfg(feature = "memory")]
 use dto::{RecallRequest, RememberRequest};
 
+// ── Rerank imports: only under the `rerank` feature (pulled by the `serve` umbrella). ──
+#[cfg(feature = "rerank")]
+use crate::rerank::{AnyReranker, apply, stage::RerankOpts};
+#[cfg(feature = "rerank")]
+use dto::RerankDto;
+
 /// How `nidus serve` is configured beyond the store itself.
 pub struct ServeConfig {
     /// Bind address.
@@ -86,6 +92,11 @@ pub struct ServeConfig {
     /// `None`, a summarize request answers `400`.
     #[cfg(all(feature = "memory", feature = "summarize"))]
     pub summarizer: Option<Arc<AnySummarizer>>,
+    /// Reranker backing the `rerank` field on `/search`, `/text-search`, `/hybrid-search`
+    /// and `/collections/{name}/recall`. A request carrying `rerank` against a server
+    /// started without `--rerank-provider` gets a `400`.
+    #[cfg(feature = "rerank")]
+    pub reranker: Option<Arc<AnyReranker>>,
 }
 
 /// How `nidus mcp` (the stdio transport) is configured beyond the store itself. No
@@ -100,6 +111,9 @@ pub struct StdioConfig {
     /// Optional summarizer enabling `summarize: true` on `remember`.
     #[cfg(all(feature = "memory", feature = "summarize"))]
     pub summarizer: Option<Arc<AnySummarizer>>,
+    /// Reranker backing the rerank args on the text-native tools, as in [`ServeConfig`].
+    #[cfg(feature = "rerank")]
+    pub reranker: Option<Arc<AnyReranker>>,
     /// How often to renew the cluster writer lease, as in [`ServeConfig`]. An interactive
     /// session idles far longer than `lock_ttl` between writes, so without this a peer
     /// reclaims the lease and the next write finds itself fenced.
@@ -137,6 +151,9 @@ struct AppState {
     /// Shared summarizer for `mode: "summarize"`; `None` disables it (→ `400`).
     #[cfg(all(feature = "memory", feature = "summarize"))]
     summarizer: Option<Arc<AnySummarizer>>,
+    /// Shared reranker for the `rerank` request field; `None` disables it (→ `400`).
+    #[cfg(feature = "rerank")]
+    reranker: Option<Arc<AnyReranker>>,
 }
 
 /// Bind the address, open the store, and serve until a shutdown signal (Ctrl-C /
@@ -164,6 +181,8 @@ where
         embedder: cfg.embedder,
         #[cfg(all(feature = "memory", feature = "summarize"))]
         summarizer: cfg.summarizer,
+        #[cfg(feature = "rerank")]
+        reranker: cfg.reranker,
     };
     let renew_every = cfg.lease_renew_interval;
     let app = router(state.clone(), cfg.max_body_bytes);
@@ -320,6 +339,8 @@ where
         embedder: cfg.embedder,
         #[cfg(all(feature = "memory", feature = "summarize"))]
         summarizer: cfg.summarizer,
+        #[cfg(feature = "rerank")]
+        reranker: cfg.reranker,
     };
     spawn_lease_renewal(slot.clone(), cfg.lease_renew_interval);
 
@@ -769,11 +790,48 @@ async fn search(
     State(st): State<AppState>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<Vec<HitDto>>, ApiError> {
+    #[cfg(feature = "rerank")]
+    let (req, rerank) = {
+        let mut req = req;
+        let rerank = req.rerank.take();
+        (req, rerank)
+    };
     let (scope, query, opts) = plan_search(req)?;
+    #[cfg(feature = "rerank")]
+    if let Some(rr) = rerank {
+        return search_with_rerank(st, scope, query, opts, rr).await;
+    }
     let hits = run_read(st, move |db| {
         scoped(&scope, |s| db.search(s, &query, &opts))
     })
     .await?;
+    Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+}
+
+/// The `/search` rerank path: `rerank.query` is required (a raw-vector query has no text of
+/// its own), so its absence is a `400` rather than a silent skip. The deep fetch goes through
+/// `run_read` so its guard drops before the provider `.await`, which must stay `Send`.
+#[cfg(feature = "rerank")]
+async fn search_with_rerank(
+    st: AppState,
+    scope: Vec<String>,
+    query: Vec<f32>,
+    opts: SearchOpts,
+    rr: RerankDto,
+) -> Result<Json<Vec<HitDto>>, ApiError> {
+    let reranker = st.reranker.clone().ok_or_else(missing_reranker_error)?;
+    if rr.query.is_none() {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "rerank.query is required for /search: a raw-vector query has no text of its own"
+        )));
+    }
+    let rr_opts: RerankOpts = rr.try_into().map_err(ApiError::bad_request)?;
+    let (deep, plan) = apply::plan_search(&opts, &rr_opts)?;
+    let hits = run_read(st, move |db| {
+        scoped(&scope, |s| db.search(s, &query, &deep))
+    })
+    .await?;
+    let hits = apply::finish(hits, reranker.as_ref(), &plan).await?;
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
 }
 
@@ -1038,29 +1096,57 @@ async fn text_search(
         exclude_attributes,
         rank_by,
         limit_per,
+        #[cfg(feature = "rerank")]
+        rerank,
     } = req;
     let clauses = check_clauses(field, query, clauses)?;
     let projection = check_projection(include_attributes, exclude_attributes)?;
+    let opts = SearchOpts {
+        top_k,
+        offset,
+        min_score,
+        filter,
+        explain,
+        projection,
+        rank_by,
+        limit_per,
+        ..Default::default()
+    };
+    let q = FtsQuery {
+        clauses,
+        combine,
+        highlight,
+    };
+    #[cfg(feature = "rerank")]
+    if let Some(rr) = rerank {
+        return text_search_with_rerank(st, scope, q, opts, rr).await;
+    }
     let hits = run_read(st, move |db| {
-        let opts = SearchOpts {
-            top_k,
-            offset,
-            min_score,
-            filter,
-            explain,
-            projection,
-            rank_by,
-            limit_per,
-            ..Default::default()
-        };
-        let q = FtsQuery {
-            clauses,
-            combine,
-            highlight,
-        };
         scoped(&scope, |s| db.text_search(s, &q, &opts))
     })
     .await?;
+    Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+}
+
+/// The `/text-search` rerank path: `rerank.query` defaults to the query's own clause text
+/// (resolved in [`apply::plan_text_search`]), so unlike `/search` there is nothing to
+/// validate here.
+#[cfg(feature = "rerank")]
+async fn text_search_with_rerank(
+    st: AppState,
+    scope: Vec<String>,
+    q: FtsQuery,
+    opts: SearchOpts,
+    rr: RerankDto,
+) -> Result<Json<Vec<HitDto>>, ApiError> {
+    let reranker = st.reranker.clone().ok_or_else(missing_reranker_error)?;
+    let rr_opts: RerankOpts = rr.try_into().map_err(ApiError::bad_request)?;
+    let (deep, plan) = apply::plan_text_search(&q, &opts, &rr_opts);
+    let hits = run_read(st, move |db| {
+        scoped(&scope, |s| db.text_search(s, &q, &deep))
+    })
+    .await?;
+    let hits = apply::finish(hits, reranker.as_ref(), &plan).await?;
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
 }
 
@@ -1085,27 +1171,55 @@ async fn hybrid_search(
         highlight,
         vector_weight,
         text_weight,
+        #[cfg(feature = "rerank")]
+        rerank,
     } = req;
     let clauses = check_clauses(field, text, clauses)?;
+    let opts = HybridOpts {
+        top_k,
+        offset,
+        filter,
+        rrf_k,
+        candidates,
+        explain,
+        vector_weight,
+        text_weight,
+    };
+    let q = FtsQuery {
+        clauses,
+        combine,
+        highlight,
+    };
+    #[cfg(feature = "rerank")]
+    if let Some(rr) = rerank {
+        return hybrid_search_with_rerank(st, scope, vector, q, opts, rr).await;
+    }
     let hits = run_read(st, move |db| {
-        let opts = HybridOpts {
-            top_k,
-            offset,
-            filter,
-            rrf_k,
-            candidates,
-            explain,
-            vector_weight,
-            text_weight,
-        };
-        let q = FtsQuery {
-            clauses,
-            combine,
-            highlight,
-        };
         scoped(&scope, |s| db.hybrid_search(s, &vector, &q, &opts))
     })
     .await?;
+    Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+}
+
+/// The `/hybrid-search` rerank path: mirrors `text_search_with_rerank` — `rerank.query`
+/// defaults inside [`apply::hybrid_search_reranked`], so there is nothing to validate here.
+#[cfg(feature = "rerank")]
+async fn hybrid_search_with_rerank(
+    st: AppState,
+    scope: Vec<String>,
+    vector: Vec<f32>,
+    q: FtsQuery,
+    opts: HybridOpts,
+    rr: RerankDto,
+) -> Result<Json<Vec<HitDto>>, ApiError> {
+    let reranker = st.reranker.clone().ok_or_else(missing_reranker_error)?;
+    let rr_opts: RerankOpts = rr.try_into().map_err(ApiError::bad_request)?;
+    let (deep, plan) = apply::plan_hybrid_search(&q, &opts, &rr_opts);
+    let hits = run_read(st, move |db| {
+        scoped(&scope, |s| db.hybrid_search(s, &vector, &q, &deep))
+    })
+    .await?;
+    let hits = apply::finish(hits, reranker.as_ref(), &plan).await?;
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
 }
 
@@ -1245,6 +1359,8 @@ async fn recall(
         top_k,
         min_score,
         filter,
+        #[cfg(feature = "rerank")]
+        rerank,
     } = req;
 
     // Embed the query off-lock (network IO), then search under the read lock.
@@ -1264,6 +1380,26 @@ async fn recall(
         filter,
         ..Default::default()
     };
+
+    // Same lock-across-await tradeoff as `search_with_rerank`: the identity guard and the
+    // deep search both need `db`, and the provider call must come after both.
+    #[cfg(feature = "rerank")]
+    if let Some(rr) = rerank {
+        let reranker = st.reranker.clone().ok_or_else(missing_reranker_error)?;
+        let mut rr_opts: RerankOpts = rr.try_into().map_err(ApiError::bad_request)?;
+        if rr_opts.query.is_none() {
+            rr_opts.query = Some(query.clone());
+        }
+        let (deep, plan) = apply::plan_search(&opts, &rr_opts)?;
+        let hits = run_read(st, move |db| {
+            crate::memory::guard_recall_identity(db, embedder.as_ref(), &name)?;
+            db.search(name.as_str(), &vector, &deep)
+        })
+        .await?;
+        let hits = apply::finish(hits, reranker.as_ref(), &plan).await?;
+        return Ok(Json(hits.into_iter().map(HitDto::from).collect()));
+    }
+
     let hits = run_read(st, move |db| {
         crate::memory::guard_recall_identity(db, embedder.as_ref(), &name)?;
         db.search(name.as_str(), &vector, &opts)
@@ -1278,6 +1414,15 @@ async fn recall(
 fn missing_embedder_error() -> ApiError {
     ApiError::bad_request(anyhow::anyhow!(
         "nidus serve was started without an embedder; pass --embed-provider … to enable /remember and /recall"
+    ))
+}
+
+/// The `400` returned when a request carries `rerank` but no reranker was configured at
+/// serve time.
+#[cfg(feature = "rerank")]
+fn missing_reranker_error() -> ApiError {
+    ApiError::bad_request(anyhow::anyhow!(
+        "this server was started without a reranker; pass --rerank-provider … to use `rerank`"
     ))
 }
 
@@ -1482,6 +1627,8 @@ fn test_state(db: Option<Nidus>) -> AppState {
         embedder: None,
         #[cfg(all(feature = "memory", feature = "summarize"))]
         summarizer: None,
+        #[cfg(feature = "rerank")]
+        reranker: None,
     }
 }
 
@@ -3711,5 +3858,256 @@ mod memory_tests {
         assert_eq!(q.query, "find me");
         assert_eq!(q.top_k, 10);
         assert!(q.min_score.is_none());
+    }
+}
+
+// ── Rerank-route tests (the `rerank` feature) ────────────────────────────────
+// Drive `/search` offline against an in-process TCP mock standing in for a Voyage-shaped
+// rerank API — no provider network. Every CI lane enabling `rerank` also enables `rerank-all`.
+#[cfg(all(test, feature = "rerank-voyage"))]
+mod rerank_tests {
+    use super::*;
+    use crate::rerank::testutil::mock_once;
+    use crate::rerank::{RerankConfig, RerankProvider};
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::ServiceExt; // for `oneshot`
+
+    const DIM: usize = 2;
+
+    /// A mock rerank response that inverts the plain-cosine order: candidate 0 ("a") scores
+    /// low, candidate 1 ("b") scores high.
+    const INVERTING_RESPONSE: &str =
+        r#"{"data":[{"index":0,"relevance_score":0.1},{"index":1,"relevance_score":0.9}]}"#;
+
+    /// A router whose `rerank` field is backed by the offline mock at `base_url`.
+    fn router_with_reranker(base_url: &str) -> Router {
+        let reranker = AnyReranker::build(
+            RerankProvider::Voyage,
+            RerankConfig::new("mock-rerank")
+                .api_key("k")
+                .base_url(base_url),
+        )
+        .expect("build mock reranker");
+        let db = Nidus::open_in_memory(DIM).unwrap();
+        let state = AppState {
+            reranker: Some(Arc::new(reranker)),
+            ..test_state(Some(db))
+        };
+        router(state, 16 * 1024 * 1024)
+    }
+
+    /// A router with NO reranker configured — `rerank` must answer `400`.
+    fn router_without_reranker() -> Router {
+        let state = test_state(Some(Nidus::open_in_memory(DIM).unwrap()));
+        router(state, 16 * 1024 * 1024)
+    }
+
+    async fn json_body(resp: Response) -> JsonValue {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn post(path: &str, body: JsonValue) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn ids_of(resp: Response) -> Vec<String> {
+        json_body(resp)
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Seed two records whose plain-cosine order against `[1.0, 0.0]` is known: "a" matches
+    /// exactly (score 1.0), "b" partially (score 0.6). `text` controls whether each carries
+    /// the `nidus.text` attr the reranker reads candidates from.
+    async fn seed(app: &Router, text: bool) {
+        app.clone()
+            .oneshot(post("/collections/docs", json!({})))
+            .await
+            .unwrap();
+        let attrs = |t: &str| {
+            if text {
+                json!({"nidus.text": {"Str": t}})
+            } else {
+                json!({})
+            }
+        };
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "a", "vector": [1.0, 0.0], "attrs": attrs("alpha")},
+                    {"id": "b", "vector": [0.6, 0.8], "attrs": attrs("beta")}
+                ]}),
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// The ordering flips: plain cosine ranks "a" first, the mock reranker ranks "b" first,
+    /// and the response reflects the reranked order, not the metric one. Fails if the rerank
+    /// stage is removed (the response would stay `[a, b]`).
+    #[tokio::test]
+    async fn rerank_flips_the_plain_cosine_order() {
+        let mock = mock_once(200, INVERTING_RESPONSE);
+        let app = router_with_reranker(&mock.base_url);
+        seed(&app, true).await;
+
+        let plain = app
+            .clone()
+            .oneshot(post("/search", json!({"query": [1.0, 0.0], "top_k": 2})))
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_of(plain).await,
+            vec!["a", "b"],
+            "plain cosine: a, then b"
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/search",
+                json!({"query": [1.0, 0.0], "top_k": 2, "rerank": {"query": "q"}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            ids_of(resp).await,
+            vec!["b", "a"],
+            "the reranker inverts the order"
+        );
+    }
+
+    /// `overscan` past the ceiling is a `400`, not a clamp: the window size decides how many
+    /// candidates reach a paid provider, and it must not become a way around `MAX_TOP_K`.
+    #[tokio::test]
+    async fn an_overscan_past_the_ceiling_is_400() {
+        let mock = mock_once(200, INVERTING_RESPONSE);
+        let app = router_with_reranker(&mock.base_url);
+        seed(&app, true).await;
+
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/search",
+                json!({"query": [1.0, 0.0], "top_k": 2,
+                       "rerank": {"query": "q", "overscan": crate::MAX_OVERSCAN + 1}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let msg = json_body(resp).await["error"].as_str().unwrap().to_string();
+        assert!(msg.contains("overscan"), "should name the knob: {msg}");
+    }
+
+    /// The over-fetch cannot outrun the depth a plain query is capped at, whatever `overscan`
+    /// and `top_k` multiply out to.
+    #[test]
+    fn the_overscan_window_never_exceeds_the_plain_query_ceiling() {
+        use crate::rerank::stage::depth;
+        assert_eq!(
+            depth(0, dto::MAX_TOP_K, crate::MAX_OVERSCAN),
+            dto::MAX_TOP_K
+        );
+        assert_eq!(depth(usize::MAX, usize::MAX, usize::MAX), dto::MAX_TOP_K);
+        assert_eq!(depth(0, 10, 4), 40);
+    }
+
+    /// A `rerank` field against a server started with no reranker is refused, not silently
+    /// answered with the un-reranked order.
+    #[tokio::test]
+    async fn rerank_without_a_configured_reranker_is_400() {
+        let app = router_without_reranker();
+        seed(&app, true).await;
+
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/search",
+                json!({"query": [1.0, 0.0], "top_k": 2, "rerank": {"query": "q"}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let msg = json_body(resp).await["error"].as_str().unwrap().to_string();
+        assert!(
+            msg.contains("reranker"),
+            "should name the missing reranker: {msg}"
+        );
+    }
+
+    /// No candidate carries `nidus.text`, so the response is byte-identical to the
+    /// un-reranked order even though a `rerank` field was sent — the mock's inverted scores
+    /// would show up in the order if the empty-candidates guard did not short-circuit.
+    #[tokio::test]
+    async fn rerank_passes_through_candidates_with_no_text() {
+        let mock = mock_once(200, INVERTING_RESPONSE);
+        let app = router_with_reranker(&mock.base_url);
+        seed(&app, false).await;
+
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/search",
+                json!({"query": [1.0, 0.0], "top_k": 2, "rerank": {"query": "q"}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            ids_of(resp).await,
+            vec!["a", "b"],
+            "no text anywhere: order is unchanged"
+        );
+    }
+
+    /// A projection excluding `nidus.text` must still reach the reranker (force-included over
+    /// the fetch) and still flip the order, yet must not leak the field back into the
+    /// response. Catches the force-include/re-trim logic being wrong in either direction.
+    #[tokio::test]
+    async fn rerank_widens_the_projection_then_retrims_it() {
+        let mock = mock_once(200, INVERTING_RESPONSE);
+        let app = router_with_reranker(&mock.base_url);
+        seed(&app, true).await;
+
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/search",
+                json!({
+                    "query": [1.0, 0.0], "top_k": 2,
+                    "include_attributes": [],
+                    "rerank": {"query": "q"}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        let hits = body.as_array().unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            vec!["b", "a"],
+            "the order still flips despite the narrow projection"
+        );
+        for h in hits {
+            assert!(
+                h["attrs"].as_object().unwrap().is_empty(),
+                "the forced-in text field must be trimmed back out: {h}"
+            );
+        }
     }
 }

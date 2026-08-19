@@ -12,6 +12,10 @@ mod mcp;
 #[cfg(feature = "mcp")]
 mod memory_http;
 mod profile;
+#[cfg(all(feature = "cli", feature = "rerank-voyage", feature = "embed-ollama"))]
+mod rerank;
+#[cfg(all(feature = "cli", feature = "rerank-voyage", feature = "embed-ollama"))]
+mod rerank_mock;
 mod scale;
 #[cfg(all(feature = "mcp", feature = "embed-ollama"))]
 mod serve_dim;
