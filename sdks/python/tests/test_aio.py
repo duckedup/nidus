@@ -380,6 +380,11 @@ async def test_the_multi_clause_and_ranking_knobs_reach_the_same_wire() -> None:
         assert mock.json["limit_per"] == {"field": "path", "max": 2}
         await db.list(order_by={"field": "ts"})
         assert mock.json["order_by"] == {"field": "ts"}
+        # The async client owns its own signatures, so `diversity` has to be plumbed here too.
+        await db.search(query=[1.0], diversity=0.0)
+        assert mock.json["diversity"] == 0.0
+        await db.recall("notes", "why", diversity=0.4)
+        assert mock.json["diversity"] == 0.4
         with pytest.raises(ValueError, match="mutually exclusive"):
             await db.hybrid_search(
                 vector=[1.0], field="body", clauses=[{"field": "t", "query": "x"}]

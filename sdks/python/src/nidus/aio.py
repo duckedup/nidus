@@ -208,6 +208,7 @@ class AsyncNidusClient:
         exclude_attributes: Optional[Sequence[str]] = None,
         rank_by: Optional[RankBy] = None,
         limit_per: Optional[LimitPer] = None,
+        diversity: Optional[float] = None,
         rerank: Optional[RerankOpts] = None,
     ) -> Hits:
         """Vector (cosine) nearest-neighbour search. An empty ``scope`` searches everything.
@@ -231,6 +232,7 @@ class AsyncNidusClient:
                 exclude_attributes=exclude_attributes,
                 rank_by=rank_by,
                 limit_per=limit_per,
+                diversity=diversity,
                 rerank=rerank,
             ),
         )
@@ -250,6 +252,7 @@ class AsyncNidusClient:
         exclude_attributes: Optional[Sequence[str]] = None,
         rank_by: Optional[RankBy] = None,
         limit_per: Optional[LimitPer] = None,
+        diversity: Optional[float] = None,
     ) -> Hits:
         """Records most like the one already stored at ``collection``/``id``.
 
@@ -272,6 +275,7 @@ class AsyncNidusClient:
                 exclude_attributes=exclude_attributes,
                 rank_by=rank_by,
                 limit_per=limit_per,
+                diversity=diversity,
             ),
         )
 
@@ -293,6 +297,7 @@ class AsyncNidusClient:
         exclude_attributes: Optional[Sequence[str]] = None,
         rank_by: Optional[RankBy] = None,
         limit_per: Optional[LimitPer] = None,
+        diversity: Optional[float] = None,
         rerank: Optional[RerankOpts] = None,
     ) -> Hits:
         """BM25 full-text search, paginated by ``offset``.
@@ -319,6 +324,7 @@ class AsyncNidusClient:
                 exclude_attributes=exclude_attributes,
                 rank_by=rank_by,
                 limit_per=limit_per,
+                diversity=diversity,
                 rerank=rerank,
             ),
         )
@@ -486,6 +492,7 @@ class AsyncNidusClient:
         top_k: Optional[int] = None,
         min_score: Optional[float] = None,
         filter: Optional[Filter] = None,  # noqa: A002
+        diversity: Optional[float] = None,
         rerank: Optional[RerankOpts] = None,
     ) -> Hits:
         """Embed ``query`` and vector-search ``collection``, best first.
@@ -495,7 +502,12 @@ class AsyncNidusClient:
         return await self._search(
             _wire.recall_path(collection),
             _wire.recall_body(
-                query, top_k=top_k, min_score=min_score, filter=filter, rerank=rerank
+                query,
+                top_k=top_k,
+                min_score=min_score,
+                filter=filter,
+                diversity=diversity,
+                rerank=rerank,
             ),
         )
 

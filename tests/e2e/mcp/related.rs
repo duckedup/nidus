@@ -145,3 +145,89 @@ fn an_expired_source_is_refused_rather_than_used_as_a_query() {
         "the error should name why: {message}"
     );
 }
+
+/// `diversity` must reach the MCP tool surface and change what an agent gets back, not
+/// merely be accepted. Seeded here because `related` needs no embedder: `dup` is identical
+/// to `src`, `near` almost so, and `far` is the outlier MMR has to promote.
+#[test]
+fn diversity_spreads_the_related_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    let (status, body) = server.post(
+        "/collections/sim/upsert",
+        &json!({"records": [
+            {"id": "src", "vector": [1, 0, 0], "attrs": {}},
+            {"id": "dup", "vector": [1, 0.01, 0], "attrs": {}},
+            {"id": "near", "vector": [1, 0.02, 0], "attrs": {}},
+            {"id": "far", "vector": [0.6, 0.8, 0], "attrs": {}}
+        ]}),
+    );
+    assert_eq!(status, 200, "seed upsert failed: {body}");
+
+    let ids = |args: serde_json::Value| -> String {
+        let (status, body) = call_related(&server, args);
+        assert_eq!(status, 200, "{body}");
+        super::text(&super::result(&body))
+    };
+    let plain = ids(json!({"collection": "sim", "id": "src", "top_k": 2}));
+    assert!(
+        !plain.contains("\"far\""),
+        "the outlier should be crowded out: {plain}"
+    );
+
+    let spread = ids(json!({"collection": "sim", "id": "src", "top_k": 2, "diversity": 0.3}));
+    assert!(
+        spread.contains("\"far\""),
+        "diversity should surface the outlier: {spread}"
+    );
+}
+
+/// The tool schemas must advertise `diversity` wherever the handler honours it, and the
+/// text-native rule still holds: no tool may take a raw vector.
+#[test]
+fn diversity_is_advertised_on_the_tools_that_honour_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    let (status, body) = super::mcp(
+        &server,
+        "tools/list",
+        None,
+        &super::rpc(1, "tools/list", json!({})),
+    );
+    assert_eq!(status, 200, "tools/list failed: {body}");
+
+    let listed = super::result(&body);
+    let tools = listed["tools"].as_array().expect("tools array");
+    for want in ["recall", "text_search", "related"] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == want)
+            .unwrap_or_else(|| panic!("no `{want}` tool"));
+        let props = &tool["inputSchema"]["properties"];
+        assert!(
+            props["diversity"].is_object(),
+            "`{want}` should advertise diversity: {props}"
+        );
+        assert!(
+            props["diversity"]["description"].is_string(),
+            "`{want}`'s diversity needs a hand-written description: {props}"
+        );
+    }
+    // hybrid_search fuses two legs through `HybridOpts`, which carries no diversity, so
+    // advertising one there would promise a knob the handler cannot honour.
+    let hybrid = tools
+        .iter()
+        .find(|t| t["name"] == "hybrid_search")
+        .expect("no `hybrid_search` tool");
+    assert!(
+        hybrid["inputSchema"]["properties"]["diversity"].is_null(),
+        "hybrid_search must not advertise diversity: {hybrid}"
+    );
+    for tool in tools {
+        assert!(
+            tool["inputSchema"]["properties"]["vector"].is_null(),
+            "no tool may take a raw vector: {}",
+            tool["name"]
+        );
+    }
+}

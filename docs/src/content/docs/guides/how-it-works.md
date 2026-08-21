@@ -119,7 +119,9 @@ Steps 3–5 are where the opt-in ranking knobs sit: a
 [`rank_by`](/guides/search/#ranking-by-recency) recency penalty is subtracted from each
 base score before the heap sees it, and
 [`limit_per`](/guides/search/#capping-hits-per-attribute-value) caps hits per attribute
-value as the page is cut. Both are off by default, and an untouched query returns exactly
+value as the page is cut, with
+[`diversity`](/guides/search/#spreading-near-duplicates-apart) reordering the survivors in
+vector space between the two. All are off by default, and an untouched query returns exactly
 what it always did.
 
 Scoping the whole store in one call is sound because **every collection shares

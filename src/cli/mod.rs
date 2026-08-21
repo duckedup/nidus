@@ -958,6 +958,9 @@ enum Command {
         /// Maximum hits kept per distinct --limit-per value.
         #[arg(long = "limit-per-max", requires = "limit_per")]
         limit_per_max: Option<usize>,
+        /// MMR lambda spreading hits in vector space: 1.0 pure relevance, 0.0 pure spread.
+        #[arg(long = "diversity")]
+        diversity: Option<f32>,
         #[cfg(feature = "rerank")]
         #[command(flatten)]
         rerank: RerankArgs,
@@ -1002,6 +1005,9 @@ enum Command {
         /// Maximum hits kept per distinct --limit-per value.
         #[arg(long = "limit-per-max", requires = "limit_per")]
         limit_per_max: Option<usize>,
+        /// MMR lambda spreading hits in vector space: 1.0 pure relevance, 0.0 pure spread.
+        #[arg(long = "diversity")]
+        diversity: Option<f32>,
     },
     /// Count records matching a filter, and sum numeric attributes, without listing them.
     Aggregate {
@@ -1099,6 +1105,9 @@ enum Command {
         /// AND-filter as JSON (same form as `search --where`).
         #[arg(long = "where")]
         filter: Option<String>,
+        /// MMR lambda spreading hits in vector space: 1.0 pure relevance, 0.0 pure spread.
+        #[arg(long = "diversity")]
+        diversity: Option<f32>,
         #[cfg(feature = "rerank")]
         #[command(flatten)]
         rerank: RerankArgs,
@@ -1319,6 +1328,9 @@ enum Command {
         /// AND-filter as JSON (same form as `search --where`).
         #[arg(long = "where")]
         filter: Option<String>,
+        /// MMR lambda spreading hits in vector space: 1.0 pure relevance, 0.0 pure spread.
+        #[arg(long = "diversity")]
+        diversity: Option<f32>,
         // `ingest` already carries the `--rerank-provider` flags (via `IngestArgs`), so
         // this flattens only the per-query knobs — not another `RerankArgs`, which would
         // redefine `--rerank-provider` a second time on the same command.
@@ -1408,6 +1420,7 @@ pub fn run(cli: Cli) -> Result<()> {
             rank_by,
             limit_per,
             limit_per_max,
+            diversity,
             #[cfg(feature = "rerank")]
             rerank,
         } => {
@@ -1432,6 +1445,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 limit_per: limit_per
                     .zip(limit_per_max)
                     .map(|(f, m)| LimitPer::new(f, m)),
+                diversity,
                 #[cfg(feature = "rerank")]
                 rerank: resolved.as_ref().map(|(_, o, _)| o.clone()),
                 ..Default::default()
@@ -1477,6 +1491,7 @@ pub fn run(cli: Cli) -> Result<()> {
             rank_by,
             limit_per,
             limit_per_max,
+            diversity,
         } => {
             let db = open(&store, false)?;
             let filter = match filter {
@@ -1495,6 +1510,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 limit_per: limit_per
                     .zip(limit_per_max)
                     .map(|(f, m)| LimitPer::new(f, m)),
+                diversity,
                 ..Default::default()
             };
             // Empty --scope defaults to the source collection, not every collection.
@@ -1626,6 +1642,7 @@ pub fn run(cli: Cli) -> Result<()> {
             offset,
             min_score,
             filter,
+            diversity,
             #[cfg(feature = "rerank")]
             rerank,
         } => {
@@ -1647,6 +1664,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 min_score,
                 filter,
                 explain: text.explain,
+                diversity,
                 #[cfg(feature = "rerank")]
                 rerank: resolved.as_ref().map(|(_, o, _)| o.clone()),
                 ..Default::default()
@@ -1894,31 +1912,29 @@ pub fn run(cli: Cli) -> Result<()> {
             top_k,
             min_score,
             filter,
+            diversity,
             #[cfg(feature = "rerank")]
             rerank,
         } => {
+            let args = memory::RecallArgs {
+                collection,
+                query,
+                top_k,
+                min_score,
+                filter,
+                diversity,
+            };
             // `recall`'s own query text is always its rerank default (mirrors `/recall`).
             #[cfg(feature = "rerank")]
-            if let Some((rerank_opts, rerank_query)) = rerank.resolve(Some(query.as_str()))? {
+            if let Some((rerank_opts, rerank_query)) = rerank.resolve(Some(args.query.as_str()))? {
                 let reranker = ingest.build_reranker()?.ok_or_else(|| {
                     anyhow::anyhow!(
                         "--rerank needs --rerank-provider (voyage or cohere), or NIDUS_RERANK_PROVIDER"
                     )
                 })?;
-                return recall_reranked(
-                    store,
-                    ingest,
-                    collection,
-                    query,
-                    top_k,
-                    min_score,
-                    filter,
-                    reranker,
-                    rerank_opts,
-                    rerank_query,
-                );
+                return recall_reranked(store, ingest, args, reranker, rerank_opts, rerank_query);
             }
-            memory::recall(store, ingest, collection, query, top_k, min_score, filter)
+            memory::recall(store, ingest, args)
         }
     }
 }
@@ -1927,19 +1943,22 @@ pub fn run(cli: Cli) -> Result<()> {
 /// TTL-filter steps `memory::recall` takes, but through `rerank::search_reranked` — which
 /// `Memory::recall` has no knob for — over its own current-thread runtime.
 #[cfg(all(feature = "memory", feature = "rerank"))]
-#[allow(clippy::too_many_arguments)]
 fn recall_reranked(
     mut store: StoreArgs,
     ingest: IngestArgs,
-    collection: String,
-    query: String,
-    top_k: usize,
-    min_score: Option<f32>,
-    filter: Option<String>,
+    args: memory::RecallArgs,
     reranker: AnyReranker,
     rerank_opts: RerankOpts,
     rerank_query: String,
 ) -> Result<()> {
+    let memory::RecallArgs {
+        collection,
+        query,
+        top_k,
+        min_score,
+        filter,
+        diversity,
+    } = args;
     let mut filter: Filter = match filter {
         Some(s) => serde_json::from_str(&s)
             .with_context(|| format!("--where must be a JSON filter, got {s}"))?,
@@ -1977,6 +1996,7 @@ fn recall_reranked(
             },
             min_score: min_score.filter(|s| *s > 0.0),
             filter,
+            diversity,
             rerank: Some(rerank_opts),
             ..Default::default()
         };
@@ -2537,6 +2557,47 @@ mod tests {
         }
     }
 
+    /// `--diversity` reaches every query subcommand that shapes a ranking through
+    /// `Store::finish`, and is absent unless asked for.
+    #[test]
+    fn diversity_flag_parses_on_every_query_subcommand() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
+        match parse(&["nidus", "search", "--dir", "/tmp/s", "--diversity", "0.3"]) {
+            Command::Search { diversity, .. } => assert_eq!(diversity, Some(0.3)),
+            _ => panic!("expected Search"),
+        }
+        match parse(&["nidus", "search", "--dir", "/tmp/s"]) {
+            Command::Search { diversity, .. } => assert_eq!(diversity, None),
+            _ => panic!("expected Search"),
+        }
+        match parse(&[
+            "nidus",
+            "similar",
+            "--dir",
+            "/tmp/s",
+            "--diversity",
+            "0.0",
+            "docs",
+            "d1",
+        ]) {
+            Command::Similar { diversity, .. } => assert_eq!(diversity, Some(0.0)),
+            _ => panic!("expected Similar"),
+        }
+        match parse(&[
+            "nidus",
+            "text-search",
+            "--dir",
+            "/tmp/s",
+            "--diversity",
+            "1.0",
+            "body",
+            "alpha",
+        ]) {
+            Command::TextSearch { diversity, .. } => assert_eq!(diversity, Some(1.0)),
+            _ => panic!("expected TextSearch"),
+        }
+    }
+
     /// `recall` mirrors `search`'s query knobs (`-k`, `--min-score`, `--where`).
     #[cfg(feature = "memory")]
     #[test]
@@ -2554,6 +2615,8 @@ mod tests {
             "0.4",
             "--where",
             r#"[{"Eq":["tag",{"Str":"ops"}]}]"#,
+            "--diversity",
+            "0.25",
             "notes",
             "when do deploys run",
         ])
@@ -2565,8 +2628,10 @@ mod tests {
                 top_k,
                 min_score,
                 filter,
+                diversity,
                 ..
             } => {
+                assert_eq!(diversity, Some(0.25));
                 assert_eq!(collection, "notes");
                 assert_eq!(query, "when do deploys run");
                 assert_eq!(top_k, 3);

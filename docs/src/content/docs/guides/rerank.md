@@ -67,9 +67,10 @@ this is the deliberate, documented alternative to failing the whole query over o
 A rerank score **replaces** `Hit::score`, and it is on the provider's own scale, not
 cosine. `min_score` and `rank_by` are cosine-scale (or BM25-scale for a text leg) and are
 evaluated **before** reranking, inside the ordinary sync search; nothing about them changes
-after that. `limit_per`, on the other hand, is **re-applied after** reranking: the store
-caps the over-fetched window as usual, but the cap has to run again on the reranked order
-or a diversity guarantee you asked for would be silently undone by the reordering. Ties
+after that. `limit_per` and `diversity`, on the other hand, are **re-applied after**
+reranking: the store shapes the over-fetched window as usual, but both have to run again on
+the reranked order or a diversity guarantee you asked for would be silently undone by the
+reordering. `diversity` therefore spreads the reranked relevance, not the metric's. Ties
 still break on `(collection, id)`, exactly as everywhere else in nidus.
 
 ## How it composes

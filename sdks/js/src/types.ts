@@ -268,6 +268,12 @@ export interface OrderBy {
 export interface RankingOptions {
   rankBy?: RankBy;
   limitPer?: LimitPer;
+  /**
+   * Maximal Marginal Relevance lambda, spreading results apart in vector space so
+   * near-duplicates stop filling a page. `1` is pure relevance, `0` pure variety.
+   * Omitted leaves the ranking exactly as it is.
+   */
+  diversity?: number;
 }
 
 /** How several {@link TextClause}s fold into one text score. */
@@ -566,6 +572,11 @@ export interface RecallOptions {
   /** Cosine-similarity floor; hits below it are dropped. */
   minScore?: number;
   filter?: Filter;
+  /**
+   * Maximal Marginal Relevance lambda, so one verbose document's near-identical chunks
+   * stop filling the recalled window. `1` is pure relevance, `0` pure variety.
+   */
+  diversity?: number;
   /** See {@link RerankOptions}. Defaults `query` to the request's own text. */
   rerank?: RerankOptions;
 }

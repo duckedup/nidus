@@ -171,7 +171,7 @@ messages on the branch (`git log --format=%B main..HEAD`), and the issue id in t
 name. Confirm each with `bd show <id>` and drop what does not resolve; a guessed ticket is
 worse than none, since `scope` would then review against the wrong requirements.
 
-1. **Deterministic first.** `nidus-check laws --pr <n>` (or `--base main`, or bare). These are
+1. **Deterministic first.** `nidus-check laws --pr <n>` (or `--base origin/main`, or bare). These are
    already true — they need no verification and no agent.
 2. **Eligibility** (PR targets only): skip closed, draft, or bot PRs, and say so rather than
    reviewing them anyway.

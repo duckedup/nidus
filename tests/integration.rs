@@ -838,3 +838,59 @@ fn sweep_expired_no_op_when_nothing_expired() {
     assert_eq!(before.dead_rows, after.dead_rows);
     assert_eq!(before.doc_count, after.doc_count);
 }
+
+/// MMR diversity through the public API on a file-backed store reopened between writing and
+/// querying, so it works against vectors read back off disk rather than a fresh in-RAM
+/// matrix (nidus-tx2).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn diversity_survives_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut db = Nidus::open_dir(dir.path(), 3).unwrap();
+        db.upsert(
+            "c",
+            &[
+                Record::new("dup0", vec![1.0, 0.02, 0.0], BTreeMap::new()),
+                Record::new("dup1", vec![1.0, 0.03, 0.0], BTreeMap::new()),
+                Record::new("dup2", vec![1.0, 0.04, 0.0], BTreeMap::new()),
+                Record::new("novel", vec![0.6, 0.8, 0.0], BTreeMap::new()),
+            ],
+        )
+        .unwrap();
+        db.flush().unwrap();
+    }
+
+    let db = Nidus::open_dir(dir.path(), 3).unwrap();
+    let ids = |diversity: Option<f32>| -> Vec<String> {
+        db.search(
+            "c",
+            &[1.0, 0.0, 0.0],
+            &SearchOpts {
+                top_k: 2,
+                diversity,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect()
+    };
+    assert_eq!(ids(None), ["dup0", "dup1"]);
+    assert_eq!(ids(Some(0.3)), ["dup0", "novel"]);
+
+    // An out-of-range lambda is refused rather than clamped.
+    assert!(
+        db.search(
+            "c",
+            &[1.0, 0.0, 0.0],
+            &SearchOpts {
+                top_k: 2,
+                diversity: Some(-0.5),
+                ..Default::default()
+            },
+        )
+        .is_err()
+    );
+}

@@ -23,6 +23,7 @@ use crate::model::{AnnConfig, ClusterStatus, Distance, Op, Role};
 use crate::profile::OpenProfile;
 
 pub(crate) mod aggregate;
+mod diversity;
 mod memtier;
 mod quant;
 mod rank;

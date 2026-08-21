@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use anyhow::{Context, Result, bail};
 
 use super::aggregate::LIMIT_PER_OVERFETCH;
+use super::diversity::MMR_OVERFETCH;
 use super::rank;
 use super::scoring::{PARALLEL_SCAN_WORK_FLOOR, parallel_topk, score_chunk};
 use super::{ScanOrder, Store, oom};
@@ -19,13 +20,21 @@ use crate::model::{
 use crate::search::{TopK, dot, euclidean_neg_sq, normalize};
 
 /// How deep a search path must rank: one page (`offset + top_k`), multiplied by the over-fetch
-/// factor when a per-value cap is going to thin the ranking (nidus-m50.6).
+/// factor when a per-value cap will thin the ranking (nidus-m50.6) or MMR will reorder it
+/// (nidus-tx2). The **larger** factor wins, since one deep ranking serves both.
 pub(super) fn depth(opts: &SearchOpts) -> usize {
     let page = opts.offset.saturating_add(opts.top_k);
-    match opts.limit_per {
-        None => page,
-        Some(_) => page.saturating_mul(LIMIT_PER_OVERFETCH),
-    }
+    let cap = if opts.limit_per.is_some() {
+        LIMIT_PER_OVERFETCH
+    } else {
+        1
+    };
+    let spread = if opts.diversity.is_some() {
+        MMR_OVERFETCH
+    } else {
+        1
+    };
+    page.saturating_mul(cap.max(spread))
 }
 
 /// The options a search *path* runs with: rank [`depth`] deep, then let the caller's single
@@ -47,6 +56,7 @@ pub(crate) const BAD_QUERY: &str = "invalid query option";
 pub(super) fn check_query_opts(opts: &SearchOpts) -> Result<()> {
     rank::validate(opts.rank_by.as_ref())
         .and_then(|()| super::aggregate::validate(opts.limit_per.as_ref()))
+        .and_then(|()| super::diversity::validate(opts.diversity))
         .context(BAD_QUERY)
 }
 
@@ -74,15 +84,19 @@ pub(super) fn paginate<T>(mut ranked: Vec<T>, offset: usize) -> Vec<T> {
 }
 
 impl Store {
-    /// The ONE tail every ranked surface funnels through: thin the over-fetched ranking by the
-    /// per-value cap, cut the page, hold `top_k`. Capping must precede pagination — capping a
-    /// page would move the boundary rather than diversify what crosses it.
+    /// The ONE tail every ranked surface funnels through: cap by value, spread by MMR, cut the
+    /// page, hold `top_k`. Both precede pagination (reshaping a page moves the boundary, not
+    /// what crosses it), and the cap precedes MMR so a hard constraint outranks an objective.
     pub(crate) fn finish(&self, ranked: Vec<Hit>, opts: &SearchOpts) -> Vec<Hit> {
         let capped = match &opts.limit_per {
             Some(cap) => self.cap_per_value(ranked, cap),
             None => ranked,
         };
-        let mut hits = paginate(capped, opts.offset);
+        let spread = match opts.diversity {
+            Some(lambda) => self.diversify(capped, lambda),
+            None => capped,
+        };
+        let mut hits = paginate(spread, opts.offset);
         hits.truncate(opts.top_k);
         hits
     }
@@ -553,6 +567,7 @@ impl Store {
             offset: 0,
             top_k: depth(opts).saturating_add(1),
             limit_per: None,
+            diversity: None,
             ..opts.clone()
         };
         let ranked = self.search(collections, &query, &wide)?;

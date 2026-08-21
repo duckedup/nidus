@@ -1247,3 +1247,252 @@ fn text_search_rerank_without_a_provider_fails() {
     );
     assert!(err.contains("--rerank-provider"), "{err}");
 }
+
+/// A crowded corpus: three near-copies of the query direction plus one outlier that scores
+/// lower. Written through the real binary's stdin, the shape `--diversity` has to reshape.
+fn crowded_seed() -> String {
+    json!([
+        {"id": "dup0", "vector": [1, 0.02, 0], "attrs": {}},
+        {"id": "dup1", "vector": [1, 0.03, 0], "attrs": {}},
+        {"id": "dup2", "vector": [1, 0.04, 0], "attrs": {}},
+        {"id": "novel", "vector": [0.6, 0.8, 0], "attrs": {}}
+    ])
+    .to_string()
+}
+
+/// `--diversity` must change which ids come back, not merely be accepted. A flag that
+/// parses and does nothing passes any test that only checks the command succeeded.
+#[test]
+fn cli_diversity_changes_the_returned_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(&["upsert", "--dir", dir, "docs"], &crowded_seed());
+
+    let ids = |args: &[&str]| -> Vec<String> {
+        ok(args, "[1, 0, 0]")
+            .as_array()
+            .expect("search prints an array")
+            .iter()
+            .map(|h| h["id"].as_str().expect("id").to_string())
+            .collect()
+    };
+    assert_eq!(
+        ids(&["search", "--dir", dir, "-k", "2", "docs"]),
+        ["dup0", "dup1"]
+    );
+    assert_eq!(
+        ids(&[
+            "search",
+            "--dir",
+            dir,
+            "-k",
+            "2",
+            "--diversity",
+            "0.3",
+            "docs"
+        ]),
+        ["dup0", "novel"],
+        "--diversity did not reshape the page"
+    );
+
+    // Out of range is a caller error, refused rather than clamped.
+    let err = fails(
+        &[
+            "search",
+            "--dir",
+            dir,
+            "-k",
+            "2",
+            "--diversity",
+            "2.0",
+            "docs",
+        ],
+        "[1, 0, 0]",
+    );
+    assert!(err.contains("diversity"), "{err}");
+}
+
+/// `--diversity` on `similar`, through the binary. The source is excluded, so the crowding
+/// this has to break up is among the remaining near-copies.
+#[test]
+fn cli_diversity_reshapes_a_similar_search() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(&["upsert", "--dir", dir, "docs"], &crowded_seed());
+
+    let ids = |args: &[&str]| -> Vec<String> {
+        ok(args, "")
+            .as_array()
+            .expect("similar prints an array")
+            .iter()
+            .map(|h| h["id"].as_str().expect("id").to_string())
+            .collect()
+    };
+    assert_eq!(
+        ids(&["similar", "--dir", dir, "-k", "2", "docs", "dup0"]),
+        ["dup1", "dup2"]
+    );
+    assert_eq!(
+        ids(&[
+            "similar",
+            "--dir",
+            dir,
+            "-k",
+            "2",
+            "--diversity",
+            "0.3",
+            "docs",
+            "dup0",
+        ]),
+        ["dup1", "novel"],
+        "--diversity did not reshape the similar page"
+    );
+}
+
+/// `--diversity` on `text-search`, through the binary. The ranking is BM25 here, not cosine,
+/// but redundancy is still measured in vector space, which is the whole point of the knob.
+#[test]
+fn cli_diversity_reshapes_a_text_search() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(
+        &["set-fts-schema", "--dir", dir, "docs", "--field", "body"],
+        "",
+    );
+    // `t0`/`t1` share a vector, so they are redundant with each other; `t2` is orthogonal and
+    // ranks last on BM25 alone (one term in the longest body).
+    let seed = json!([
+        {"id": "t0", "vector": [1, 0, 0], "attrs": {"body": {"Str": "alpha alpha alpha"}}},
+        {"id": "t1", "vector": [1, 0, 0], "attrs": {"body": {"Str": "alpha alpha"}}},
+        {"id": "t2", "vector": [0, 1, 0], "attrs": {"body": {"Str": "alpha beta gamma"}}}
+    ])
+    .to_string();
+    ok(&["upsert", "--dir", dir, "docs"], &seed);
+
+    let ids = |args: &[&str]| -> Vec<String> {
+        ok(args, "")
+            .as_array()
+            .expect("text-search prints an array")
+            .iter()
+            .map(|h| h["id"].as_str().expect("id").to_string())
+            .collect()
+    };
+    assert_eq!(
+        ids(&[
+            "text-search",
+            "--dir",
+            dir,
+            "--in",
+            "docs",
+            "-k",
+            "2",
+            "body",
+            "alpha",
+        ]),
+        ["t0", "t1"]
+    );
+    assert_eq!(
+        ids(&[
+            "text-search",
+            "--dir",
+            dir,
+            "--in",
+            "docs",
+            "-k",
+            "2",
+            "--diversity",
+            "0.3",
+            "body",
+            "alpha",
+        ]),
+        ["t0", "t2"],
+        "--diversity did not reshape the text-search page"
+    );
+}
+
+/// `recall --diversity` through the binary. `remember` pins the collection and provisions the
+/// store at the embedder's dimension; the crowded corpus is then written as raw vectors built
+/// in the query's own embedding space, so which hits are redundant is computed, not guessed.
+#[cfg(all(feature = "mcp", feature = "embed-ollama"))]
+#[test]
+fn cli_diversity_reshapes_a_recall() {
+    use crate::mcp::support::{DIM, mock_embedder_per_text, vector_for};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+    let url = mock_embedder_per_text(DIM);
+    let e = embed_args(&url);
+    let (p, b) = (e[0].as_str(), e[1].as_str());
+    let (u, v) = (e[2].as_str(), e[3].as_str());
+
+    // `remember` provisions the collection at the embedder's dimension and pins its identity,
+    // so the raw-vector upsert below lands in a store `recall` will accept.
+    let seeded = ok(&["remember", "--dir", dir, p, b, u, v, "notes", "seed"], "");
+    // Remove it by its derived id, not a glob: `delete` takes literal ids, so a pattern would
+    // silently delete nothing and leave the seed competing in the ranking below.
+    let seeded_id = seeded["id"].as_str().expect("a derived id").to_string();
+    let removed = ok(&["delete", "--dir", dir, "notes", &seeded_id], "");
+    // Two assertions on purpose: the count catches a delete that matched nothing at the line
+    // it happened, and the emptiness check catches the state rather than the operation.
+    assert_eq!(removed["deleted"], 1, "{removed}");
+    assert!(
+        ids(&ok(&["list", "--dir", dir, "notes"], "")).is_empty(),
+        "the seed must be gone before the corpus is written"
+    );
+
+    let dir_vec = unit_vec(vector_for("query", DIM));
+    let side = orthogonal_unit_vec(&dir_vec);
+    let mix =
+        |a: f32, c: f32| -> Vec<f32> { (0..DIM).map(|i| a * dir_vec[i] + c * side[i]).collect() };
+    let seed = json!([
+        {"id": "dup0", "vector": mix(1.0, 0.0), "attrs": {"nidus.text": {"Str": "alpha"}}},
+        {"id": "dup1", "vector": mix(0.9999, 0.0141), "attrs": {"nidus.text": {"Str": "alpha again"}}},
+        {"id": "novel", "vector": mix(0.6, 0.8), "attrs": {"nidus.text": {"Str": "different"}}}
+    ])
+    .to_string();
+    ok(&["upsert", "--dir", dir, "notes"], &seed);
+
+    let recalled = |extra: &[&str]| -> Vec<String> {
+        let mut args = vec!["recall", "--dir", dir, p, b, u, v, "-k", "2"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["notes", "query"]);
+        ids(&ok(&args, ""))
+    };
+    assert_eq!(recalled(&[]), ["dup0", "dup1"]);
+    assert_eq!(
+        recalled(&["--diversity", "0.3"]),
+        ["dup0", "novel"],
+        "--diversity did not reshape the recall window"
+    );
+    // `RecallOpts` uses zero as its "unset" sentinel for `top_k`/`min_score`; a real zero
+    // lambda must not be swallowed by that convention.
+    assert_eq!(recalled(&["--diversity", "0"]), ["dup0", "novel"]);
+}
+
+/// `v` scaled to unit length; a zero vector is returned unchanged, as the store does.
+#[cfg(all(feature = "mcp", feature = "embed-ollama"))]
+fn unit_vec(mut v: Vec<f32>) -> Vec<f32> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+    v
+}
+
+/// A unit vector orthogonal to `u`, for building a corpus at a known cosine.
+#[cfg(all(feature = "mcp", feature = "embed-ollama"))]
+fn orthogonal_unit_vec(u: &[f32]) -> Vec<f32> {
+    let pick = if u[0].abs() < 0.9 { 0 } else { 1 };
+    let mut e = vec![0.0f32; u.len()];
+    e[pick] = 1.0;
+    let dot: f32 = u.iter().zip(&e).map(|(a, b)| a * b).sum();
+    for (i, x) in e.iter_mut().enumerate() {
+        *x -= dot * u[i];
+    }
+    unit_vec(e)
+}

@@ -394,6 +394,22 @@ def test_a_multi_clause_text_search_reaches_the_wire_with_its_combine_rule() -> 
     }
 
 
+def test_diversity_reaches_the_wire_on_every_search_route() -> None:
+    """The kwarg has to be plumbed on all four routes, and ``0.0`` must survive the prune."""
+    stub = StubTransport([])
+    db = client(stub)
+    db.search(query=[1.0])
+    assert "diversity" not in stub.last.json
+    db.search(query=[1.0], diversity=0.0)
+    assert stub.last.json["diversity"] == 0.0
+    db.search_similar(collection="docs", id="d1", diversity=0.3)
+    assert stub.last.json["diversity"] == 0.3
+    db.text_search(field="body", query="fox", diversity=0.5)
+    assert stub.last.json["diversity"] == 0.5
+    db.recall("notes", "why", diversity=1.0)
+    assert stub.last.json["diversity"] == 1.0
+
+
 def test_the_ranking_knobs_reach_the_wire() -> None:
     """``rank_by``/``limit_per``/``order_by``/the hybrid weights, in the server's spelling."""
     stub = StubTransport([])

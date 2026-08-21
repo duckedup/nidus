@@ -362,6 +362,19 @@ def test_ranking_knobs_are_omitted_unless_asked_for() -> None:
     ] == {"field": "path", "max": 1}
 
 
+def test_diversity_is_omitted_unless_asked_for_and_keeps_zero() -> None:
+    """Absent, not null: an unset lambda leaves the request bytes unchanged. ``0.0`` is a
+    meaningful lambda (pure variety), so ``prune`` must not drop it as falsy."""
+    assert "diversity" not in _wire.search_body([1.0], top_k=5)
+    assert "diversity" not in _wire.similar_body("docs", "d1")
+    assert "diversity" not in _wire.text_search_body("body", "fox")
+    assert "diversity" not in _wire.recall_body("why")
+    assert _wire.search_body([1.0], diversity=0.0)["diversity"] == 0.0
+    assert _wire.similar_body("docs", "d1", diversity=0.3)["diversity"] == 0.3
+    assert _wire.text_search_body("body", "fox", diversity=0.5)["diversity"] == 0.5
+    assert _wire.recall_body("why", diversity=1.0)["diversity"] == 1.0
+
+
 def test_a_limit_per_must_name_both_keys_and_no_others() -> None:
     """A missing ``max`` is a 400; a misspelled key would be *ignored* by serde instead."""
     with pytest.raises(TypeError, match="missing required key"):

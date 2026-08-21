@@ -689,6 +689,10 @@ pub struct SearchOpts {
     pub rank_by: Option<RankBy>,
     /// Cap the hits carrying any one value of an attribute. `None` (the default) is uncapped.
     pub limit_per: Option<LimitPer>,
+    /// Maximal Marginal Relevance lambda: `1.0` is pure relevance, `0.0` pure spread, and
+    /// `None` (the default) skips the pass entirely. Reorders a bounded head window
+    /// (`store::diversity::MAX_DIVERSITY_WINDOW`) so near-duplicates stop crowding a page.
+    pub diversity: Option<f32>,
     /// Rerank the candidate window with a hosted cross-encoder (`crate::rerank`, feature-gated).
     /// `None` (the default) leaves the metric ranking untouched.
     pub rerank: Option<RerankOpts>,

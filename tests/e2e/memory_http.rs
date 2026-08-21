@@ -8,7 +8,7 @@
 use serde_json::{Value, json};
 
 use crate::harness::RunningServer;
-use crate::mcp::support::{DIM, per_text_embedder_server};
+use crate::mcp::support::{DIM, per_text_embedder_server, vector_for};
 
 /// `POST /collections/notes/remember`, asserting success and returning the response.
 fn remember(server: &RunningServer, args: Value) -> Value {
@@ -200,4 +200,74 @@ fn recall_hides_expired_entries_but_raw_list_still_sees_them() {
         listed.contains(&"gone") && listed.contains(&"kept"),
         "raw list is unguarded by design and sees both: {listed:?}"
     );
+}
+
+/// Recall is the surface where near-duplicate crowding hurts most, so `diversity` has to
+/// reach it through the real binary and not just the library. The corpus is built in the
+/// query's own embedding space, so which hits are redundant is not a guess.
+#[test]
+fn recall_diversity_spreads_a_crowded_window_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = per_text_embedder_server(dir.path(), DIM);
+    assert_eq!(server.post("/collections/notes", &json!({})).0, 200);
+
+    // The mock embeds by hashing the text, so the query's direction is computable in-test.
+    let u = unit(vector_for("query", DIM));
+    let w = orthogonal_unit(&u);
+    let mix = |a: f32, b: f32| -> Vec<f32> { (0..DIM).map(|i| a * u[i] + b * w[i]).collect() };
+    let rec = |id: &str, v: Vec<f32>, text: &str| json!({"id": id, "vector": v, "attrs": {"nidus.text": {"Str": text}}});
+    let (status, body) = server.post(
+        "/collections/notes/upsert",
+        &json!({"records": [
+            rec("dup0", mix(1.0, 0.0), "alpha"),
+            rec("dup1", mix(0.9999, 0.0141), "alpha again"),
+            rec("novel", mix(0.6, 0.8), "something else")
+        ]}),
+    );
+    assert_eq!(status, 200, "upsert failed: {body}");
+
+    let recalled = |diversity: Option<f32>| -> Vec<String> {
+        let mut req = json!({"query": "query", "top_k": 2});
+        if let Some(d) = diversity {
+            req["diversity"] = json!(d);
+        }
+        let (status, body) = server.post("/collections/notes/recall", &req);
+        assert_eq!(status, 200, "recall failed: {body}");
+        body.as_array()
+            .expect("recall returns an array")
+            .iter()
+            .map(|h| h["id"].as_str().expect("id").to_string())
+            .collect()
+    };
+    assert_eq!(recalled(None), ["dup0", "dup1"]);
+    assert_eq!(
+        recalled(Some(0.3)),
+        ["dup0", "novel"],
+        "diversity changed nothing"
+    );
+    // `0.0` is a real lambda, not "unset" — the trap `RecallOpts`' zero sentinel sets.
+    assert_eq!(recalled(Some(0.0)), ["dup0", "novel"]);
+}
+
+/// `v` scaled to unit length. A zero vector is returned unchanged, as the store does.
+fn unit(mut v: Vec<f32>) -> Vec<f32> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+    v
+}
+
+/// A unit vector orthogonal to `u`, for building a corpus at a known cosine.
+fn orthogonal_unit(u: &[f32]) -> Vec<f32> {
+    let pick = if u[0].abs() < 0.9 { 0 } else { 1 };
+    let mut e = vec![0.0f32; u.len()];
+    e[pick] = 1.0;
+    let dot: f32 = u.iter().zip(&e).map(|(a, b)| a * b).sum();
+    for (i, x) in e.iter_mut().enumerate() {
+        *x -= dot * u[i];
+    }
+    unit(e)
 }

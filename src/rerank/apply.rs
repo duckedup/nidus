@@ -320,6 +320,33 @@ mod tests {
         );
     }
 
+    /// Diversity is deferred past the cross-encoder and re-applied in the same tail, so MMR
+    /// spreads the *reranked* relevance rather than the metric's, and runs exactly once.
+    #[tokio::test]
+    async fn search_reranked_reapplies_diversity_over_the_reranked_scores() {
+        let db = store();
+        let reranked = SearchOpts {
+            top_k: 4,
+            rerank: Some(RerankOpts::default()),
+            ..Default::default()
+        };
+        let out = search_reranked(&db, &LenReranker, "docs", &[1.0, 0.0], "q", &reranked)
+            .await
+            .unwrap();
+        assert_eq!(ids(&out), vec!["d", "c", "b", "a"], "rerank order");
+
+        // Pure spread over that same list: after `d` the least-redundant candidate is `a`,
+        // which is last by both the metric and the reranker.
+        let spread = SearchOpts {
+            diversity: Some(0.0),
+            ..reranked
+        };
+        let out = search_reranked(&db, &LenReranker, "docs", &[1.0, 0.0], "q", &spread)
+            .await
+            .unwrap();
+        assert_eq!(ids(&out), vec!["d", "a", "c", "b"]);
+    }
+
     /// A hit with no text attr is passed through unranked, after the reranked hits, keeping
     /// its metric score (decision 1).
     #[tokio::test]

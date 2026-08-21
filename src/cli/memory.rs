@@ -132,16 +132,27 @@ pub(super) fn remember(
     })
 }
 
+/// The query knobs of `nidus recall`, bundled so the entry point stays under clippy's
+/// argument bound.
+pub(super) struct RecallArgs {
+    pub collection: String,
+    pub query: String,
+    pub top_k: usize,
+    pub min_score: Option<f32>,
+    pub filter: Option<String>,
+    pub diversity: Option<f32>,
+}
+
 /// `nidus recall`: embed `query` and print the ranked hits, in the shape `search` prints.
-pub(super) fn recall(
-    store: StoreArgs,
-    ingest: IngestArgs,
-    collection: String,
-    query: String,
-    top_k: usize,
-    min_score: Option<f32>,
-    filter: Option<String>,
-) -> Result<()> {
+pub(super) fn recall(store: StoreArgs, ingest: IngestArgs, args: RecallArgs) -> Result<()> {
+    let RecallArgs {
+        collection,
+        query,
+        top_k,
+        min_score,
+        filter,
+        diversity,
+    } = args;
     let filter: Option<Filter> = match filter {
         Some(s) => Some(
             serde_json::from_str(&s)
@@ -161,6 +172,7 @@ pub(super) fn recall(
             top_k,
             min_score: min_score.unwrap_or(0.0),
             filter,
+            diversity,
         };
         let hits = memory.recall(&collection, &query, &opts).await?;
         let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();

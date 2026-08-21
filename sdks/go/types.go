@@ -291,16 +291,20 @@ type OrderBy struct {
 // see [Projection]. RankBy and LimitPer reshape the ranking after scoring; see [Decay]
 // and [LimitPer].
 type SearchRequest struct {
-	Query    []float32      `json:"query"`
-	Scope    []string       `json:"scope,omitempty"`
-	TopK     int            `json:"top_k,omitempty"`     // 0 takes the server's default
-	Offset   int            `json:"offset,omitempty"`    // skip this many top-ranked hits
-	MinScore *float32       `json:"min_score,omitempty"` // nil is "no floor"; &0 is a floor of zero
-	Filter   Filter         `json:"filter,omitempty"`
-	Exact    bool           `json:"exact,omitempty"`
-	RankBy   *RankBy        `json:"rank_by,omitempty"`
-	LimitPer *LimitPer      `json:"limit_per,omitempty"`
-	Rerank   *RerankOptions `json:"rerank,omitempty"`
+	Query    []float32 `json:"query"`
+	Scope    []string  `json:"scope,omitempty"`
+	TopK     int       `json:"top_k,omitempty"`     // 0 takes the server's default
+	Offset   int       `json:"offset,omitempty"`    // skip this many top-ranked hits
+	MinScore *float32  `json:"min_score,omitempty"` // nil is "no floor"; &0 is a floor of zero
+	Filter   Filter    `json:"filter,omitempty"`
+	Exact    bool      `json:"exact,omitempty"`
+	RankBy   *RankBy   `json:"rank_by,omitempty"`
+	LimitPer *LimitPer `json:"limit_per,omitempty"`
+	// Diversity is a Maximal Marginal Relevance lambda, spreading hits apart in vector
+	// space so near-duplicates stop filling a page: 1 is pure relevance, 0 pure variety.
+	// A pointer because &0 is a meaningful lambda that omitempty would drop.
+	Diversity *float32       `json:"diversity,omitempty"`
+	Rerank    *RerankOptions `json:"rerank,omitempty"`
 	Projection
 }
 
@@ -335,6 +339,10 @@ type SimilarRequest struct {
 	Exact      bool      `json:"exact,omitempty"`
 	RankBy     *RankBy   `json:"rank_by,omitempty"`
 	LimitPer   *LimitPer `json:"limit_per,omitempty"`
+	// Diversity is a Maximal Marginal Relevance lambda, spreading hits apart in vector
+	// space so near-duplicates stop filling a page: 1 is pure relevance, 0 pure variety.
+	// A pointer because &0 is a meaningful lambda that omitempty would drop.
+	Diversity *float32 `json:"diversity,omitempty"`
 	Projection
 }
 
@@ -443,6 +451,10 @@ type TextSearchRequest struct {
 	Highlight *HighlightOpts `json:"highlight,omitempty"`
 	RankBy    *RankBy        `json:"rank_by,omitempty"`
 	LimitPer  *LimitPer      `json:"limit_per,omitempty"`
+	// Diversity is a Maximal Marginal Relevance lambda, spreading hits apart in vector
+	// space so near-duplicates stop filling a page: 1 is pure relevance, 0 pure variety.
+	// A pointer because &0 is a meaningful lambda that omitempty would drop.
+	Diversity *float32       `json:"diversity,omitempty"`
 	Rerank    *RerankOptions `json:"rerank,omitempty"`
 	Projection
 }
@@ -619,19 +631,28 @@ type RecallOptions struct {
 	TopK     int
 	MinScore *float32 // a cosine-similarity floor; hits below it are dropped
 	Filter   Filter
-	Rerank   *RerankOptions
+	// Diversity spreads the recalled window apart in vector space (MMR lambda), so one
+	// verbose document's near-identical chunks stop filling it. &0 is meaningful.
+	Diversity *float32
+	Rerank    *RerankOptions
 }
 
 type recallWire struct {
-	Query    string         `json:"query"`
-	TopK     int            `json:"top_k,omitempty"`
-	MinScore *float32       `json:"min_score,omitempty"`
-	Filter   Filter         `json:"filter,omitempty"`
-	Rerank   *RerankOptions `json:"rerank,omitempty"`
+	Query     string         `json:"query"`
+	TopK      int            `json:"top_k,omitempty"`
+	MinScore  *float32       `json:"min_score,omitempty"`
+	Filter    Filter         `json:"filter,omitempty"`
+	Diversity *float32       `json:"diversity,omitempty"`
+	Rerank    *RerankOptions `json:"rerank,omitempty"`
 }
 
 func (o RecallOptions) wire(query string) recallWire {
 	return recallWire{
-		Query: query, TopK: o.TopK, MinScore: o.MinScore, Filter: o.Filter, Rerank: o.Rerank,
+		Query:     query,
+		TopK:      o.TopK,
+		MinScore:  o.MinScore,
+		Filter:    o.Filter,
+		Diversity: o.Diversity,
+		Rerank:    o.Rerank,
 	}
 }

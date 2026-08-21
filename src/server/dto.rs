@@ -73,6 +73,9 @@ pub struct SearchRequest {
     /// Cap hits per distinct value of an attribute: `{"field": "path", "max": 2}`.
     #[serde(default)]
     pub limit_per: Option<LimitPer>,
+    /// MMR lambda spreading the page in vector space: `1.0` pure relevance, `0.0` pure spread.
+    #[serde(default)]
+    pub diversity: Option<f32>,
     /// Opt into the cross-encoder rerank stage. `None` (the default, and the only shape an
     /// old client ever sends) leaves the metric ranking untouched.
     #[cfg(feature = "rerank")]
@@ -122,6 +125,9 @@ pub struct SimilarRequest {
     pub rank_by: Option<RankBy>,
     #[serde(default)]
     pub limit_per: Option<LimitPer>,
+    /// MMR lambda spreading the page in vector space: `1.0` pure relevance, `0.0` pure spread.
+    #[serde(default)]
+    pub diversity: Option<f32>,
 }
 
 /// Most queries one batch may carry. Matches turbopuffer's documented cap; the point is that
@@ -239,6 +245,9 @@ pub struct TextSearchRequest {
     pub rank_by: Option<RankBy>,
     #[serde(default)]
     pub limit_per: Option<LimitPer>,
+    /// MMR lambda spreading the page in vector space: `1.0` pure relevance, `0.0` pure spread.
+    #[serde(default)]
+    pub diversity: Option<f32>,
     /// Opt into the cross-encoder rerank stage. An omitted or empty `rerank.query` falls
     /// back to the single-field `query` above; the `clauses` spelling has no single text,
     /// so it must name `rerank.query` itself.
@@ -534,6 +543,10 @@ pub struct RecallRequest {
     pub min_score: Option<f32>,
     #[serde(default)]
     pub filter: Filter,
+    /// MMR lambda spreading the recalled window in vector space, so one verbose document's
+    /// near-identical chunks stop filling it.
+    #[serde(default)]
+    pub diversity: Option<f32>,
     /// Opt into the cross-encoder rerank stage. An omitted or empty `rerank.query` falls
     /// back to `query` above, so `{"rerank": {}}` is a valid minimal form here.
     #[cfg(feature = "rerank")]
@@ -897,6 +910,24 @@ mod tests {
         let req: HybridSearchRequest =
             serde_json::from_value(json!({"vector": [1.0], "field": "b", "text": "x"})).unwrap();
         assert_eq!((req.vector_weight, req.text_weight), (1.0, 1.0));
+    }
+
+    #[test]
+    fn diversity_is_absent_by_default_and_snake_case_on_the_wire() {
+        let req: SearchRequest = serde_json::from_value(json!({"query": [1.0]})).unwrap();
+        assert!(req.diversity.is_none());
+        let req: SearchRequest =
+            serde_json::from_value(json!({"query": [1.0], "diversity": 0.0})).unwrap();
+        // `0.0` is a meaningful lambda (pure spread), not an absent one.
+        assert_eq!(req.diversity, Some(0.0));
+        let req: TextSearchRequest =
+            serde_json::from_value(json!({"field": "body", "query": "x", "diversity": 0.5}))
+                .unwrap();
+        assert_eq!(req.diversity, Some(0.5));
+        let req: SimilarRequest =
+            serde_json::from_value(json!({"collection": "c", "id": "i", "diversity": 1.0}))
+                .unwrap();
+        assert_eq!(req.diversity, Some(1.0));
     }
 
     #[test]

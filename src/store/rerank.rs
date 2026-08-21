@@ -21,9 +21,9 @@ pub(crate) fn rerank_depth(opts: &SearchOpts) -> usize {
     depth(opts).saturating_mul(overscan)
 }
 
-/// The pre-rerank fetch's opts: [`rerank_depth`] deep, unpaginated, `limit_per` deferred, and
-/// the text attr force-included — `hits_from_topk` projects before a `Hit` exists, so
-/// inheriting a projection that drops it would silently skip the rerank (nidus-d6z).
+/// The pre-rerank fetch's opts: [`rerank_depth`] deep, unpaginated, `limit_per`/`diversity`
+/// deferred to the single tail, and the text attr force-included — `hits_from_topk` projects
+/// before a `Hit` exists, so dropping it would silently skip the rerank (nidus-d6z).
 pub(crate) fn widened_opts(opts: &SearchOpts) -> (SearchOpts, bool) {
     let text_attr = opts
         .rerank
@@ -40,6 +40,8 @@ pub(crate) fn widened_opts(opts: &SearchOpts) -> (SearchOpts, bool) {
         top_k: rerank_depth(opts),
         offset: 0,
         limit_per: None,
+        // Deferred, not dropped: MMR here would thin the window before the cross-encoder saw it.
+        diversity: None,
         projection,
         ..opts.clone()
     };
@@ -180,6 +182,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(rerank_depth(&opts), 10);
+    }
+
+    #[test]
+    fn widened_opts_defers_diversity_to_the_single_tail() {
+        let opts = SearchOpts {
+            top_k: 5,
+            diversity: Some(0.3),
+            rerank: Some(crate::model::RerankOpts::default()),
+            ..Default::default()
+        };
+        let (widened, _) = widened_opts(&opts);
+        // MMR here would thin the window before the cross-encoder ever scored it.
+        assert_eq!(widened.diversity, None);
+        // And the window is still widened by diversity's own over-fetch.
+        assert_eq!(widened.top_k, rerank_depth(&opts));
+        assert!(widened.top_k > 5 * 10, "{}", widened.top_k);
     }
 
     #[test]

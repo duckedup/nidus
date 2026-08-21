@@ -245,6 +245,7 @@ export class NidusClient {
       exclude_attributes: opts.excludeAttributes,
       rank_by: encodeRankBy(opts.rankBy),
       limit_per: opts.limitPer,
+      diversity: opts.diversity,
       rerank: encodeRerank(opts.rerank),
     });
   }
@@ -264,6 +265,7 @@ export class NidusClient {
       exclude_attributes: opts.excludeAttributes,
       rank_by: encodeRankBy(opts.rankBy),
       limit_per: opts.limitPer,
+      diversity: opts.diversity,
     });
   }
 
@@ -287,6 +289,7 @@ export class NidusClient {
       exclude_attributes: opts.excludeAttributes,
       rank_by: encodeRankBy(opts.rankBy),
       limit_per: opts.limitPer,
+      diversity: opts.diversity,
       rerank: encodeRerank(opts.rerank),
     });
   }
@@ -383,6 +386,7 @@ export class NidusClient {
         exclude_attributes: q.excludeAttributes,
         rank_by: encodeRankBy(q.rankBy),
         limit_per: q.limitPer,
+        diversity: q.diversity,
       })),
       fuse: opts.fuse
         ? prune({
@@ -460,6 +464,7 @@ export class NidusClient {
       top_k: opts.topK,
       min_score: opts.minScore,
       filter: opts.filter ?? [],
+      diversity: opts.diversity,
       rerank: encodeRerank(opts.rerank),
     });
   }

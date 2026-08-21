@@ -871,6 +871,7 @@ fn plan_search(req: SearchRequest) -> Result<SearchPlan, ApiError> {
         explain: false,
         rank_by: req.rank_by,
         limit_per: req.limit_per,
+        diversity: req.diversity,
         rerank,
     };
     #[cfg(feature = "rerank")]
@@ -902,6 +903,7 @@ async fn search_similar(
         explain: false,
         rank_by: req.rank_by,
         limit_per: req.limit_per,
+        diversity: req.diversity,
         // No rerank here: a cross-encoder scores (query text, candidate) pairs, and
         // more-like-this starts from a stored vector with no query text to score against.
         rerank: None,
@@ -1136,6 +1138,7 @@ async fn text_search(
         exclude_attributes,
         rank_by,
         limit_per,
+        diversity,
         #[cfg(feature = "rerank")]
         rerank,
     } = req;
@@ -1160,6 +1163,7 @@ async fn text_search(
         projection,
         rank_by,
         limit_per,
+        diversity,
         rerank,
         ..Default::default()
     };
@@ -1445,6 +1449,7 @@ async fn recall(
         top_k,
         min_score,
         filter,
+        diversity,
         #[cfg(feature = "rerank")]
         rerank,
     } = req;
@@ -1473,6 +1478,7 @@ async fn recall(
         top_k,
         min_score,
         filter,
+        diversity,
         rerank: rerank_opts,
         ..Default::default()
     };
@@ -2580,6 +2586,60 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let hits = json_body(resp).await;
         assert_eq!(hits.as_array().unwrap().len(), 1, "both share one file");
+    }
+
+    /// A crowded corpus over the wire: three near-copies plus one outlier. Without the knob
+    /// the page is two copies; with it the outlier takes slot 2.
+    async fn crowded_router() -> Router {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "dup0", "vector": [1, 0.02, 0], "attrs": {"file": {"Str": "a.rs"}}},
+                    {"id": "dup1", "vector": [1, 0.03, 0], "attrs": {"file": {"Str": "a.rs"}}},
+                    {"id": "dup2", "vector": [1, 0.04, 0], "attrs": {"file": {"Str": "a.rs"}}},
+                    {"id": "novel", "vector": [0.6, 0.8, 0], "attrs": {"file": {"Str": "b.rs"}}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        app
+    }
+
+    #[tokio::test]
+    async fn diversity_changes_the_page_over_http() {
+        let app = crowded_router().await;
+        let ids = |diversity: Option<f32>| {
+            let app = app.clone();
+            async move {
+                let mut body = json!({"query": [1, 0, 0], "top_k": 2});
+                if let Some(d) = diversity {
+                    body["diversity"] = json!(d);
+                }
+                let resp = app.oneshot(post("/search", body)).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let hits = json_body(resp).await;
+                hits.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|h| h["id"].as_str().unwrap().to_string())
+                    .collect::<Vec<String>>()
+            }
+        };
+        assert_eq!(ids(None).await, ["dup0", "dup1"]);
+        assert_eq!(ids(Some(0.3)).await, ["dup0", "novel"]);
+    }
+
+    /// A lambda outside `[0, 1]` is a caller fault, so it must be a 400 rather than a 500.
+    #[tokio::test]
+    async fn a_malformed_diversity_is_a_bad_request() {
+        let app = crowded_router().await;
+        for bad in [-0.1, 1.5] {
+            let body = json!({"query": [1, 0, 0], "diversity": bad});
+            let resp = app.clone().oneshot(post("/search", body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ pub(crate) const DIM: usize = 3;
 
 /// The per-text hash `src/memory.rs`'s inline `FakeEmbedder` uses: byte contributions spread
 /// across buckets, `+0.1` so an all-zero vector (unnormalizable by the store) never occurs.
-pub(super) fn vector_for(text: &str, dim: usize) -> Vec<f32> {
+pub(crate) fn vector_for(text: &str, dim: usize) -> Vec<f32> {
     let mut v = vec![0.1f32; dim];
     for (i, b) in text.bytes().enumerate() {
         v[i % dim] += (b as f32) + 1.0;
