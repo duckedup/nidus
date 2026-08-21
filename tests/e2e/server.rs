@@ -1065,3 +1065,42 @@ fn filter_index_declared_over_http_survives_a_restart() {
     assert_eq!(hits.as_array().map(Vec::len), Some(1));
     assert_eq!(hits[0]["id"], "a");
 }
+
+/// `diversity` over a real socket: the knob has to survive JSON round-tripping and reshape
+/// the page, and a lambda outside `[0, 1]` has to be a 400 rather than a 500.
+#[test]
+fn diversity_reshapes_a_page_over_real_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    let (status, body) = server.post(
+        "/collections/docs/upsert",
+        &json!({"records": [
+            {"id": "dup0", "vector": [1, 0.02, 0], "attrs": {}},
+            {"id": "dup1", "vector": [1, 0.03, 0], "attrs": {}},
+            {"id": "dup2", "vector": [1, 0.04, 0], "attrs": {}},
+            {"id": "novel", "vector": [0.6, 0.8, 0], "attrs": {}}
+        ]}),
+    );
+    assert_eq!(status, 200, "upsert failed: {body}");
+
+    let ids = |body: &Value| -> Vec<String> {
+        body.as_array()
+            .expect("hits array")
+            .iter()
+            .map(|h| h["id"].as_str().expect("id").to_string())
+            .collect()
+    };
+    let (status, plain) = server.post("/search", &json!({"query": [1, 0, 0], "top_k": 2}));
+    assert_eq!(status, 200);
+    assert_eq!(ids(&plain), ["dup0", "dup1"]);
+
+    let (status, spread) = server.post(
+        "/search",
+        &json!({"query": [1, 0, 0], "top_k": 2, "diversity": 0.3}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(ids(&spread), ["dup0", "novel"], "diversity changed nothing");
+
+    let (status, _) = server.post("/search", &json!({"query": [1, 0, 0], "diversity": 2.0}));
+    assert_eq!(status, 400, "an out-of-range lambda is a caller fault");
+}

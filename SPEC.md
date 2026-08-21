@@ -230,8 +230,9 @@ pub enum Scope<'a> {
 
 // `offset` skips that many top-ranked hits (§7 pagination); 0 is the whole first page.
 // `exact` forces the brute-force scan for one query; `projection` picks the attrs (§7).
-// `rank_by`/`limit_per` are the opt-in ranking expression and per-value hit cap (§7.6, §7.7).
-pub struct SearchOpts { pub top_k: usize, pub offset: usize, pub filter: Filter, pub min_score: Option<f32>, pub exact: bool, pub projection: Projection, pub rank_by: Option<RankBy>, pub limit_per: Option<LimitPer> }
+// `rank_by`/`limit_per`/`diversity`: the ranking expression, the per-value hit cap, and the
+// MMR spread — all opt-in (§7.6, §7.7).
+pub struct SearchOpts { pub top_k: usize, pub offset: usize, pub filter: Filter, pub min_score: Option<f32>, pub exact: bool, pub projection: Projection, pub rank_by: Option<RankBy>, pub limit_per: Option<LimitPer>, pub diversity: Option<f32> }
 
 // Which attrs a Hit carries. An enum, so "include and exclude at once" cannot be built.
 pub enum Projection { All, Include(Vec<String>), Exclude(Vec<String>) }
@@ -667,7 +668,8 @@ reliable guard there is to refuse work *before* allocating:
   it, on the reranking provider's own scale, over the candidate window `rank_by` and
   `min_score` already ran on. **Result diversity** is
   `SearchOpts::limit_per` — a cap on hits per attribute value, exact only within an over-fetch
-  window (§7.7). Aggregation (`count`/`sum`) is answered without materializing a record.
+  window — and `SearchOpts::diversity`, MMR spread in vector space over a bounded window
+  (§7.7). Aggregation (`count`/`sum`) is answered without materializing a record.
 - **`search_similar` is "more like this" by record id** (nidus-9gs): it looks up
   `collection`/`id`'s stored vector — already unit-scaled, so no re-normalization and no
   caller round-trip — and searches `scope` with it exactly as `search` would. The source
@@ -975,6 +977,32 @@ Making it exact would mean ranking the entire match set for every capped query �
 scan to satisfy a diversity knob. The cap that *is* guaranteed is the upper bound: no
 returned page ever carries more than `max` hits for one value.
 
+**`diversity`** (`SearchOpts::diversity`, nidus-tx2) diversifies by **vector space** rather
+than by attribute value, which is the case `limit_per` structurally cannot reach: five
+near-identical passages carrying the same attributes, or five chunks of one parent document.
+It is a Maximal Marginal Relevance lambda in `[0.0, 1.0]` — `1.0` pure relevance, `0.0` pure
+spread, `None` (the default) skipping the pass — and over an over-fetched window it greedily
+selects the candidate maximising `lambda × score − (1 − lambda) × max_sim_to_selected`.
+
+Four properties are load-bearing. Redundancy is **cosine** similarity computed from the
+stored vectors' own norms, not a bare dot product: vectors are unit-normalized on insert only
+for `Cosine`, so a `DotProduct`/`Euclidean` store would otherwise measure magnitude as
+similarity. Candidates are walked in ranked order and replace the incumbent only on a
+**strictly greater** MMR score, so a tie resolves the way the ranking already did and §7's
+total order (and pagination with it) still holds. The reordered window is **bounded at 512
+candidates**, documented rather than discovered, because pairwise similarity is O(W² · dim);
+a deeper page keeps its score order past that point. And a record with **no vector** (a
+text-only doc reachable through `text_search`) has nothing measurable to be redundant with,
+so it carries no penalty rather than being dropped or arbitrarily punished.
+
+**Order of operations, in the one tail every ranked surface funnels through
+(`Store::finish`): cap → MMR → page cut.** `limit_per` is a hard constraint and so runs
+first, leaving MMR to reorder only legal survivors; both must precede pagination, since
+reshaping a page would move the boundary rather than what crosses it. The rerank stage defers
+both to that same tail, so MMR spreads the *reranked* relevance and never thins the window
+before the cross-encoder has seen it. A diversified search over-fetches `(offset + top_k) × 4`
+deep; where a cap is also asked for, the larger factor wins rather than the two multiplying.
+
 ### 7.8 Result annotations — why a hit matched
 
 A `Hit` carries one score and an attrs map, which does not answer "which clause fired, and
@@ -1256,8 +1284,9 @@ build until a real need exists.
   selection over an over-fetched window (`overscan`, default 10), so it composes with ANN,
   quantization, and hybrid RRF without any of them changing. A candidate missing its text
   attr (default `nidus.text`) is passed through unranked rather than failing the query,
-  appended after the reranked hits in original metric order. `limit_per` is re-applied
-  post-rerank so a diversity cap survives the reordering; `min_score`/`rank_by` are
+  appended after the reranked hits in original metric order. `limit_per` **and
+  `diversity`** are re-applied post-rerank so a diversity guarantee survives the reordering
+  (MMR therefore spreads the reranked relevance, not the metric's); `min_score`/`rank_by` are
   cosine-scale and run pre-rerank. Wired into HTTP (`rerank` on `/search`,
   `/text-search`, `/hybrid-search`, `/collections/{name}/recall`, additive over the
   wire), MCP (a `rerank` boolean plus `rerank_overscan` on
@@ -1423,7 +1452,8 @@ src/
                   (accessors, exact + ANN search incl. the exact-prefilter fallback),
                   text.rs (multi-clause BM25, hybrid fusion, annotations, §7.8),
                   rank.rs (recency decay + ORDER BY, §7.6), aggregate.rs (count/sum +
-                  group_by + limit_per, §7.7), write.rs (upsert/delete/flush/compact),
+                  group_by + limit_per, §7.7), diversity.rs (MMR spread, §7.7),
+                  write.rs (upsert/delete/flush/compact),
                   memtier.rs (working-set publish/adopt), rerank.rs (pure over-fetch/
                   passthrough/re-sort tail, unconditional, §9), tests.rs
 

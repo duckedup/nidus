@@ -1878,6 +1878,66 @@ func TestConcurrentUseIsSafe(t *testing.T) {
 	}
 }
 
+// TestDiversityIsAdditiveAndKeepsZero — an unset diversity must leave the key out of the
+// body entirely (not null), and &0 is a meaningful lambda that omitempty would drop if the
+// field were a bare float32. RecallOptions is checked too: its wire form is hand-copied,
+// so a new field there can silently never reach the server.
+func TestDiversityIsAdditiveAndKeepsZero(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.Search(ctx, SearchRequest{Query: []float32{1}}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"query":[1]}` {
+		t.Errorf("body = %s, want no diversity key at all", body)
+	}
+
+	if _, err := db.Search(ctx, SearchRequest{Query: []float32{1}, Diversity: f32(0)}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"query":[1],"diversity":0}` {
+		t.Errorf("body = %s, want a zero lambda on the wire", body)
+	}
+
+	_, err := db.SearchSimilar(ctx, SimilarRequest{
+		Collection: "docs", ID: "d1", Diversity: f32(0.3),
+	})
+	if err != nil {
+		t.Fatalf("SearchSimilar failed: %v", err)
+	}
+	want := `{"collection":"docs","id":"d1","diversity":0.3}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+
+	_, err = db.TextSearch(ctx, TextSearchRequest{
+		Field: "body", Query: "alpha", Diversity: f32(0.5),
+	})
+	if err != nil {
+		t.Fatalf("TextSearch failed: %v", err)
+	}
+	want = `{"field":"body","query":"alpha","diversity":0.5}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+
+	if _, err := db.Recall(ctx, "notes", "why", RecallOptions{}); err != nil {
+		t.Fatalf("Recall failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"query":"why"}` {
+		t.Errorf("body = %s, want no diversity key at all", body)
+	}
+	_, err = db.Recall(ctx, "notes", "why", RecallOptions{Diversity: f32(1)})
+	if err != nil {
+		t.Fatalf("Recall failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"query":"why","diversity":1}` {
+		t.Errorf("body = %s, want the diversity to reach recallWire", body)
+	}
+}
+
 // TestRankingKnobsAreAdditive — rank_by, limit_per and order_by must be absent from a
 // request that does not use them, so today's bodies stay byte-identical, and must
 // carry only the sub-knobs the caller actually named when they are used.

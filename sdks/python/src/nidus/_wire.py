@@ -293,6 +293,7 @@ def search_body(
     exclude_attributes: Optional[Sequence[str]] = None,
     rank_by: Optional[RankBy] = None,
     limit_per: Optional[LimitPer] = None,
+    diversity: Optional[float] = None,
     rerank: Optional[RerankOpts] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /search`` (vector nearest-neighbour).
@@ -315,6 +316,7 @@ def search_body(
             **_projection(include_attributes, exclude_attributes),
             "rank_by": rank_by,
             "limit_per": _limit_per(limit_per),
+            "diversity": diversity,
             "rerank": _rerank(rerank),
         }
     )
@@ -333,6 +335,7 @@ def similar_body(
     exclude_attributes: Optional[Sequence[str]] = None,
     rank_by: Optional[RankBy] = None,
     limit_per: Optional[LimitPer] = None,
+    diversity: Optional[float] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /search/similar`` ("more like this" over an existing record).
 
@@ -354,6 +357,7 @@ def similar_body(
             **_projection(include_attributes, exclude_attributes),
             "rank_by": rank_by,
             "limit_per": _limit_per(limit_per),
+            "diversity": diversity,
         }
     )
 
@@ -374,6 +378,7 @@ def text_search_body(
     exclude_attributes: Optional[Sequence[str]] = None,
     rank_by: Optional[RankBy] = None,
     limit_per: Optional[LimitPer] = None,
+    diversity: Optional[float] = None,
     rerank: Optional[RerankOpts] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /text-search`` (BM25). ``min_score`` here is a raw BM25 floor.
@@ -396,6 +401,7 @@ def text_search_body(
             **_projection(include_attributes, exclude_attributes),
             "rank_by": rank_by,
             "limit_per": _limit_per(limit_per),
+            "diversity": diversity,
             "rerank": _rerank(rerank),
         }
     )
@@ -547,6 +553,7 @@ def recall_body(
     top_k: Optional[int] = None,
     min_score: Optional[float] = None,
     filter: Optional[Filter] = None,  # noqa: A002
+    diversity: Optional[float] = None,
     rerank: Optional[RerankOpts] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /collections/{name}/recall`` (query text in, hits out).
@@ -559,6 +566,7 @@ def recall_body(
             "top_k": top_k,
             "min_score": min_score,
             "filter": list(filter) if filter is not None else [],
+            "diversity": diversity,
             "rerank": _rerank(rerank),
         }
     )

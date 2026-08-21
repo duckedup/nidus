@@ -338,6 +338,37 @@ describe("NidusClient request shaping", () => {
     expect(calls[0]!.json).toEqual({ fields: [] });
   });
 
+  it("sends diversity only when set, and keeps a zero lambda", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    // Absent, not null: an unset knob must leave the request bytes unchanged.
+    await db.search({ query: [1, 0, 0] });
+    expect("diversity" in (calls[0]!.json as object)).toBe(false);
+
+    // Zero is a meaningful lambda (pure variety), so it must survive pruning.
+    await db.search({ query: [1, 0, 0], diversity: 0 });
+    expect(calls[1]!.json).toMatchObject({ diversity: 0 });
+
+    await db.searchSimilar({ collection: "docs", id: "d1", diversity: 0.3 });
+    expect(calls[2]!.json).toMatchObject({ diversity: 0.3 });
+    await db.textSearch({ field: "body", query: "alpha", diversity: 0.5 });
+    expect(calls[3]!.json).toMatchObject({ diversity: 0.5 });
+    await db.recall("notes", "why", { diversity: 1 });
+    expect(calls[4]!.json).toMatchObject({ diversity: 1 });
+    await db.recall("notes", "why");
+    expect("diversity" in (calls[5]!.json as object)).toBe(false);
+
+    // The batch route builds its per-query objects inline rather than through `prune`, so
+    // absence there depends on JSON.stringify dropping `undefined`, not on the pruner.
+    await db.batchSearch({ queries: [{ query: [1, 0, 0] }, { query: [0, 1, 0], diversity: 0 }] });
+    const sent = JSON.parse(JSON.stringify(calls[6]!.json)) as {
+      queries: Record<string, unknown>[];
+    };
+    expect("diversity" in sent.queries[0]!).toBe(false);
+    expect(sent.queries[1]!.diversity).toBe(0);
+  });
+
   it("omits the ranking knobs unless asked, and maps them to snake_case", async () => {
     const { fn, calls } = mockFetch([]);
     const db = new NidusClient({ baseUrl: "http://x", fetch: fn });

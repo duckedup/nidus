@@ -228,6 +228,16 @@ pub(super) fn with_ttl_guard(filter: Option<Filter>) -> Filter {
     filter
 }
 
+/// `diversity`: the MMR knob, shared by every tool whose ranking `Store::finish` shapes.
+fn diversity_schema() -> JsonValue {
+    json!({
+        "type": "number",
+        "description": "Spread near-duplicate results apart. 1.0 is pure relevance (the default behaviour when omitted), 0.5 balances, 0.0 maximises variety. Use it when several results say the same thing.",
+        "minimum": 0.0,
+        "maximum": 1.0
+    })
+}
+
 /// `rerank`: opt into the cross-encoder post-ranking stage, shared by `recall`,
 /// `text_search`, and `hybrid_search`. A plain boolean, not an object: the query text is
 /// already a required argument on every one of these tools.
@@ -278,6 +288,7 @@ pub(super) fn tools() -> Vec<Tool> {
                         "description": "Drop results scoring below this. Scores are cosine similarity in [-1, 1]; around 0.7 is a reasonable floor for \"actually relevant\"."
                     },
                     "filter": filter_schema(),
+                    "diversity": diversity_schema(),
                     "rerank": rerank_bool_schema(),
                     "rerank_overscan": rerank_overscan_schema()
                 },
@@ -312,6 +323,7 @@ pub(super) fn tools() -> Vec<Tool> {
                         "minimum": 1
                     },
                     "filter": filter_schema(),
+                    "diversity": diversity_schema(),
                     "rerank": rerank_bool_schema(),
                     "rerank_overscan": rerank_overscan_schema()
                 },
@@ -387,7 +399,8 @@ pub(super) fn related_tool() -> Tool {
                     "type": "number",
                     "description": "Drop results scoring below this. Scores are cosine similarity in [-1, 1]; around 0.7 is a reasonable floor for \"actually relevant\"."
                 },
-                "filter": filter_schema()
+                "filter": filter_schema(),
+                "diversity": diversity_schema()
             },
             "required": ["collection", "id"],
             "additionalProperties": false
@@ -406,6 +419,7 @@ impl NidusMcp {
         let top_k = optional_top_k(args)?;
         let min_score = optional_f32(args, "min_score")?;
         let filter = parse_filter(args)?;
+        let diversity = optional_f32(args, "diversity")?;
         let rerank = parse_rerank(args)?;
 
         let vector = embedder
@@ -417,6 +431,7 @@ impl NidusMcp {
             top_k,
             min_score,
             filter: with_ttl_guard(filter),
+            diversity,
             rerank,
             ..Default::default()
         };
@@ -460,11 +475,13 @@ impl NidusMcp {
         let query = required_str(args, "query")?;
         let top_k = optional_top_k(args)?;
         let filter = parse_filter(args)?;
+        let diversity = optional_f32(args, "diversity")?;
         let rerank = parse_rerank(args)?;
 
         let opts = SearchOpts {
             top_k,
             filter: with_ttl_guard(filter),
+            diversity,
             rerank,
             ..Default::default()
         };
@@ -571,6 +588,7 @@ impl NidusMcp {
         let top_k = optional_top_k(args)?;
         let min_score = optional_f32(args, "min_score")?;
         let filter = parse_filter(args)?;
+        let diversity = optional_f32(args, "diversity")?;
 
         let hits = crate::server::run_read(self.state.clone(), move |db| {
             if let Some(source) = db.get(&collection, &id) {
@@ -586,6 +604,7 @@ impl NidusMcp {
                 top_k,
                 min_score,
                 filter: with_ttl_guard(filter),
+                diversity,
                 ..Default::default()
             };
             db.search_similar(collection.as_str(), collection.as_str(), id.as_str(), &opts)

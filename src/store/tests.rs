@@ -8150,3 +8150,441 @@ fn segment_report_field_shape() {
         SegmentIntegrity::NoChecksum { rows_total: 0 }
     ));
 }
+
+// ── Result diversity: MMR in vector space (nidus-tx2) ─────────────────────
+
+/// Three near-duplicates crowding the query plus one genuinely different doc that scores
+/// lower. Without MMR the duplicates own every page; with it the outlier surfaces.
+fn crowded_store() -> Store {
+    let mut store = Store::in_memory(3).unwrap();
+    let recs = vec![
+        rec_with(
+            "dup0",
+            vec![1.0, 0.02, 0.0],
+            BTreeMap::from([("file".to_string(), Value::Str("a.rs".into()))]),
+        ),
+        rec_with(
+            "dup1",
+            vec![1.0, 0.03, 0.0],
+            BTreeMap::from([("file".to_string(), Value::Str("a.rs".into()))]),
+        ),
+        rec_with(
+            "dup2",
+            vec![1.0, 0.04, 0.0],
+            BTreeMap::from([("file".to_string(), Value::Str("a.rs".into()))]),
+        ),
+        rec_with(
+            "novel",
+            vec![0.6, 0.8, 0.0],
+            BTreeMap::from([("file".to_string(), Value::Str("b.rs".into()))]),
+        ),
+    ];
+    store.upsert("docs", &recs).unwrap();
+    store
+}
+
+fn spread(store: &Store, lambda: Option<f32>, top_k: usize) -> Vec<String> {
+    store
+        .search(
+            &["docs"],
+            &[1.0, 0.0, 0.0],
+            &SearchOpts {
+                top_k,
+                diversity: lambda,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect()
+}
+
+#[test]
+fn diversity_changes_the_returned_set_on_a_near_duplicate_corpus() {
+    let store = crowded_store();
+    // The plain ranking is three interchangeable duplicates; the different doc never shows.
+    assert_eq!(spread(&store, None, 2), ["dup0", "dup1"]);
+    // MMR keeps rank 1 and spends slot 2 on the outlier instead of a second near-copy.
+    // A duplicate scoring 0.9996 against 0.9998 only loses to spread once lambda tips past
+    // relevance, which is MMR working, not a threshold to tune away.
+    assert_eq!(spread(&store, Some(0.3), 2), ["dup0", "novel"]);
+}
+
+#[test]
+fn diversity_unset_is_a_no_op() {
+    let store = crowded_store();
+    let plain = store
+        .search(&["docs"], &[1.0, 0.0, 0.0], &default_opts(4))
+        .unwrap();
+    let explicit = store
+        .search(
+            &["docs"],
+            &[1.0, 0.0, 0.0],
+            &SearchOpts {
+                top_k: 4,
+                diversity: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let ids: Vec<&str> = plain.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, ["dup0", "dup1", "dup2", "novel"]);
+    assert_eq!(plain, explicit);
+}
+
+/// An unset knob must not deepen the scan either, or "no-op" would still cost a wider ranking.
+#[test]
+fn diversity_only_over_fetches_when_it_is_set() {
+    let plain = SearchOpts {
+        top_k: 10,
+        ..Default::default()
+    };
+    assert_eq!(read::depth(&plain), 10);
+    let spread = SearchOpts {
+        diversity: Some(0.5),
+        ..plain.clone()
+    };
+    assert_eq!(read::depth(&spread), 10 * super::diversity::MMR_OVERFETCH);
+    // The larger factor wins rather than the two multiplying into an unbounded scan.
+    let both = SearchOpts {
+        limit_per: Some(LimitPer::new("file", 1)),
+        ..spread
+    };
+    assert_eq!(
+        read::depth(&both),
+        10 * super::aggregate::LIMIT_PER_OVERFETCH
+    );
+}
+
+#[test]
+fn lambda_one_leaves_the_metric_ranking_alone() {
+    let store = crowded_store();
+    assert_eq!(spread(&store, Some(1.0), 4), spread(&store, None, 4));
+}
+
+#[test]
+fn diversity_never_displaces_the_top_hit() {
+    let store = crowded_store();
+    for lambda in [0.0, 0.25, 0.5, 0.75, 1.0] {
+        assert_eq!(
+            spread(&store, Some(lambda), 4)[0],
+            "dup0",
+            "lambda {lambda}"
+        );
+    }
+}
+
+/// Greedy selection is order-dependent, so identical candidates must resolve the way the
+/// ranking already did — else SPEC §7's total order (and pagination with it) stops holding.
+#[test]
+fn identical_vectors_keep_the_deterministic_total_order() {
+    let mut store = Store::in_memory(2).unwrap();
+    let recs: Vec<Record> = ["c", "a", "b", "d"]
+        .iter()
+        .map(|id| rec(id, vec![1.0, 0.0]))
+        .collect();
+    store.upsert("docs", &recs).unwrap();
+    let ids = spread_q(&store, &[1.0, 0.0], Some(0.3), 4);
+    assert_eq!(ids, ["a", "b", "c", "d"], "{ids:?}");
+    // And stable across repeated calls, not merely sorted once.
+    assert_eq!(spread_q(&store, &[1.0, 0.0], Some(0.3), 4), ids);
+}
+
+#[test]
+fn diversity_composes_with_pagination() {
+    let store = crowded_store();
+    let page0 = store
+        .search(
+            &["docs"],
+            &[1.0, 0.0, 0.0],
+            &SearchOpts {
+                top_k: 1,
+                diversity: Some(0.3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let page1 = store
+        .search(
+            &["docs"],
+            &[1.0, 0.0, 0.0],
+            &SearchOpts {
+                top_k: 1,
+                offset: 1,
+                diversity: Some(0.3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Diversify then paginate: page 2 is the second MMR pick, not the second raw score.
+    assert_eq!(page0[0].id, "dup0");
+    assert_eq!(page1[0].id, "novel");
+}
+
+/// The cap is a hard constraint and runs first, so MMR only ever reorders legal survivors.
+#[test]
+fn diversity_composes_with_limit_per() {
+    let store = crowded_store();
+    let ids: Vec<String> = store
+        .search(
+            &["docs"],
+            &[1.0, 0.0, 0.0],
+            &SearchOpts {
+                top_k: 4,
+                limit_per: Some(LimitPer::new("file", 2)),
+                diversity: Some(0.3),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    // The cap keeps two of `a.rs` and MMR then spends slot 2 on the other file, so both
+    // mechanisms are visibly in force: uncapped this would be dup0/dup1/dup2.
+    assert_eq!(ids, ["dup0", "novel", "dup1"], "{ids:?}");
+}
+
+/// Both knobs must be in force at once: `rank_by` reshapes the scores MMR then spreads, so
+/// a diversified ranking still reflects the decay penalty rather than the raw metric.
+#[test]
+fn diversity_composes_with_rank_by() {
+    const DAY: i64 = 86_400_000;
+    let origin = 2_000 * DAY;
+    let mut store = crowded_store();
+    // Only `dup1` carries a timestamp, so `missing(0.0)` penalizes every other doc and `dup1`
+    // takes rank 1 away from `dup0`.
+    store
+        .upsert(
+            "docs",
+            &[rec_with(
+                "dup1",
+                vec![1.0, 0.03, 0.0],
+                BTreeMap::from([
+                    ("file".to_string(), Value::Str("a.rs".into())),
+                    ("ts".to_string(), Value::Int(origin)),
+                ]),
+            )],
+        )
+        .unwrap();
+    let opts = SearchOpts {
+        top_k: 2,
+        rank_by: Some(RankBy::Decay(
+            Decay::new("ts", origin, 7 * DAY).lambda(0.5).missing(0.0),
+        )),
+        diversity: Some(0.1),
+        ..Default::default()
+    };
+    let ids: Vec<String> = store
+        .search(&["docs"], &[1.0, 0.0, 0.0], &opts)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(ids, ["dup1", "novel"], "{ids:?}");
+    // Without the decay the same diversity lambda keeps `dup0` at rank 1, so neither knob is
+    // quietly overriding the other.
+    assert_eq!(spread(&store, Some(0.1), 2), ["dup0", "novel"]);
+}
+
+/// Vectors are normalized on insert only for `Cosine`, so MMR must divide by real norms
+/// rather than assume the dot product already is a cosine.
+#[test]
+fn diversity_measures_cosine_on_an_unnormalized_store() {
+    let mut store = Store::in_memory_with(2, Distance::DotProduct).unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                rec("big", vec![9.0, 0.0]),
+                rec("small", vec![1.0, 0.0]),
+                rec("side", vec![0.0, 2.0]),
+            ],
+        )
+        .unwrap();
+    let ids = spread_q(&store, &[1.0, 0.0], Some(0.0), 2);
+    // `big` and `small` are collinear (cosine 1.0) despite very different dot products, so
+    // pure-diversity selection must pick the orthogonal doc second.
+    assert_eq!(ids, ["big", "side"], "{ids:?}");
+}
+
+fn spread_q(store: &Store, q: &[f32], lambda: Option<f32>, top_k: usize) -> Vec<String> {
+    store
+        .search(
+            &["docs"],
+            q,
+            &SearchOpts {
+                top_k,
+                diversity: lambda,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect()
+}
+
+#[test]
+fn a_bad_lambda_is_a_caller_fault() {
+    let store = crowded_store();
+    for bad in [f32::NAN, -0.1, 1.1, f32::INFINITY] {
+        let err = store
+            .search(
+                &["docs"],
+                &[1.0, 0.0, 0.0],
+                &SearchOpts {
+                    top_k: 2,
+                    diversity: Some(bad),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(read::BAD_QUERY), "{bad}: {msg}");
+        assert!(msg.contains("diversity"), "{bad}: {msg}");
+    }
+}
+
+/// The window is bounded on purpose (MMR is O(W² · dim)). Past it the ranking keeps its
+/// score order rather than the cost growing with whatever depth was over-fetched.
+#[test]
+#[cfg_attr(miri, ignore)] // runtime cost: a 512-wide MMR window is 512² pairs under the interpreter
+fn beyond_the_window_bound_the_tail_keeps_score_order() {
+    let n = super::diversity::MAX_DIVERSITY_WINDOW + 8;
+    let mut store = Store::in_memory(2).unwrap();
+    let recs: Vec<Record> = (0..n)
+        .map(|i| {
+            let angle = i as f32 * 1e-4;
+            rec(&format!("d{i:05}"), vec![1.0, angle])
+        })
+        .collect();
+    store.upsert("docs", &recs).unwrap();
+    let hits = store
+        .search(
+            &["docs"],
+            &[1.0, 0.0],
+            &SearchOpts {
+                top_k: n,
+                diversity: Some(0.5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(hits.len(), n);
+    let tail: Vec<&str> = hits[super::diversity::MAX_DIVERSITY_WINDOW..]
+        .iter()
+        .map(|h| h.id.as_str())
+        .collect();
+    let mut sorted = tail.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        tail, sorted,
+        "the tail past the window must stay score-ordered"
+    );
+}
+
+/// The approximate paths hand `finish` the same `Vec<Hit>` the exact one does, so MMR must
+/// spread an ANN or quantized ranking too rather than silently only working on brute force.
+#[test]
+fn diversity_spreads_the_ann_and_quantized_rankings() {
+    let crowd = [
+        vec![1.0, 0.02, 0.0],
+        vec![1.0, 0.03, 0.0],
+        vec![1.0, 0.04, 0.0],
+        vec![0.6, 0.8, 0.0],
+    ];
+    let configs: Vec<(&str, Store)> = vec![
+        ("hnsw", ann_store(3, AnnConfig::hnsw(), &crowd)),
+        ("ivf", ann_store(3, AnnConfig::ivf(), &crowd)),
+        ("int8", crowded_quant_store(Quantization::default())),
+        ("binary", crowded_quant_store(Quantization::binary())),
+    ];
+    for (name, store) in configs {
+        let plain = spread_col(&store, None, 2);
+        let mmr = spread_col(&store, Some(0.3), 2);
+        assert_eq!(plain[0], mmr[0], "{name}: rank 1 must survive");
+        assert_ne!(plain, mmr, "{name}: MMR changed nothing");
+        assert!(
+            mmr[1].contains('3'),
+            "{name}: expected the outlier, got {mmr:?}"
+        );
+    }
+}
+
+/// `crowded_store`'s corpus in collection `col`, under a quantization kind.
+fn crowded_quant_store(q: Quantization) -> Store {
+    let mut store = Store::in_memory_cfg(
+        Config::new("/dev/null/in-memory", 3)
+            .open_mode(OpenMode::ReadWrite)
+            .auto_compact(None)
+            .quantization(Some(q)),
+    )
+    .unwrap();
+    let recs: Vec<Record> = [
+        vec![1.0, 0.02, 0.0],
+        vec![1.0, 0.03, 0.0],
+        vec![1.0, 0.04, 0.0],
+        vec![0.6, 0.8, 0.0],
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, v)| rec(&format!("d{i}"), v.clone()))
+    .collect();
+    store.upsert("col", &recs).unwrap();
+    store
+}
+
+fn spread_col(store: &Store, lambda: Option<f32>, top_k: usize) -> Vec<String> {
+    store
+        .search(
+            &["col"],
+            &[1.0, 0.0, 0.0],
+            &SearchOpts {
+                top_k,
+                diversity: lambda,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect()
+}
+
+/// A text-only record has no vector, so it cannot be measurably redundant with anything —
+/// MMR must carry it on its BM25 score instead of dropping or mis-penalizing it.
+#[test]
+fn diversity_handles_a_text_only_hit() {
+    let mut store = Store::in_memory(2).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    let body = |t: &str| BTreeMap::from([("body".to_string(), Value::Str(t.to_string()))]);
+    store
+        .upsert(
+            "docs",
+            &[
+                rec_with("vec0", vec![1.0, 0.0], body("alpha alpha alpha")),
+                rec_with("vec1", vec![1.0, 0.0], body("alpha alpha")),
+                Record::text_only("textual", body("alpha beta gamma delta")),
+            ],
+        )
+        .unwrap();
+    let opts = SearchOpts {
+        top_k: 3,
+        diversity: Some(0.3),
+        ..Default::default()
+    };
+    let ids: Vec<String> = store
+        .text_search(&["docs"], &FtsQuery::new("body", "alpha"), &opts)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    // BM25 alone ranks the vectorless doc last (one term, longest body). The two identical
+    // vectors penalize each other and it carries no penalty, so MMR promotes it past the
+    // second copy rather than burying or dropping it.
+    assert_eq!(ids, ["vec0", "textual", "vec1"], "{ids:?}");
+}

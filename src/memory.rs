@@ -104,6 +104,9 @@ pub struct RecallOpts {
     pub min_score: f32,
     /// Optional pre-scoring metadata filter.
     pub filter: Option<Filter>,
+    /// MMR lambda spreading the recalled window in vector space, so one verbose document's
+    /// near-identical chunks stop filling it. `None` (the default) skips the pass.
+    pub diversity: Option<f32>,
 }
 
 /// A text-native memory handle over a [`Nidus`] store and an embedder.
@@ -693,6 +696,7 @@ async fn recall_with<E: Embedder>(
         },
         filter,
         min_score: (opts.min_score > 0.0).then_some(opts.min_score),
+        diversity: opts.diversity,
         // No `offset` on `RecallOpts` by design (nidus-m50.15): the memory API stays lean.
         ..Default::default()
     };
@@ -1030,6 +1034,81 @@ mod tests {
             msg.contains('4') && msg.contains('8'),
             "message names both dims: {msg}"
         );
+    }
+
+    /// Recall is the surface where near-duplicate crowding hurts most (SPEC §7.7), so the
+    /// knob has to reach it — and reach it as MMR, not as a threaded-through no-op.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // file-backed via open_tmp; also `memory` is off in the Miri lane.
+    async fn recall_diversity_spreads_a_crowded_window() {
+        let (_dir, mut db) = open_tmp(3);
+        let emb = FakeEmbedder::new(3, "fake", "v1");
+        ensure_collection_and_pin(&mut db, &emb, "notes").unwrap();
+
+        // Build the corpus in the query's own space: two near-copies of the query direction
+        // and one at cosine 0.6, so the ranking is unambiguous and the crowding is real.
+        let mut u = emb.vector_for("query");
+        crate::search::normalize(&mut u);
+        let w = orthogonal_to(&u);
+        let mix = |a: f32, b: f32| -> Vec<f32> { (0..3).map(|i| a * u[i] + b * w[i]).collect() };
+        let text = |t: &str| BTreeMap::from([(META_TEXT.to_string(), Value::Str(t.into()))]);
+        db.upsert(
+            "notes",
+            &[
+                Record::new("dup0", mix(1.0, 0.0), text("alpha")),
+                Record::new("dup1", mix(0.9999, 0.0141), text("alpha again")),
+                Record::new("novel", mix(0.6, 0.8), text("something else")),
+            ],
+        )
+        .unwrap();
+
+        let ids = |hits: Vec<Hit>| -> Vec<String> { hits.into_iter().map(|h| h.id).collect() };
+        let plain = RecallOpts {
+            top_k: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            ids(recall_with(&db, &emb, "notes", "query", &plain)
+                .await
+                .unwrap()),
+            ["dup0", "dup1"]
+        );
+        let spread = RecallOpts {
+            diversity: Some(0.3),
+            ..plain.clone()
+        };
+        assert_eq!(
+            ids(recall_with(&db, &emb, "notes", "query", &spread)
+                .await
+                .unwrap()),
+            ["dup0", "novel"]
+        );
+
+        // `RecallOpts` uses zero as the "unset" sentinel for `top_k` and `min_score`, so a
+        // bare `f32` here would turn "pure spread" into "no spread"; `Option` keeps them apart.
+        let pure = RecallOpts {
+            diversity: Some(0.0),
+            ..plain
+        };
+        assert_eq!(
+            ids(recall_with(&db, &emb, "notes", "query", &pure)
+                .await
+                .unwrap()),
+            ["dup0", "novel"]
+        );
+    }
+
+    /// Any unit vector orthogonal to `u` (dim 3), for building a corpus at a known cosine.
+    fn orthogonal_to(u: &[f32]) -> Vec<f32> {
+        let e = if u[0].abs() < 0.9 {
+            [1.0, 0.0, 0.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        let dot: f32 = u.iter().zip(e).map(|(a, b)| a * b).sum();
+        let mut w: Vec<f32> = (0..3).map(|i| e[i] - dot * u[i]).collect();
+        crate::search::normalize(&mut w);
+        w
     }
 
     #[tokio::test]

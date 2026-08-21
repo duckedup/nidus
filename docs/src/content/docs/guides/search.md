@@ -86,7 +86,7 @@ surprised by otherwise:
   matters, exactly like any other search.
 
 Every other `SearchOpts` field (`filter`, `min_score`, `exact`, projections,
-`rank_by`, `limit_per`) works the same as it does for `search`.
+`rank_by`, `limit_per`, `diversity`) works the same as it does for `search`.
 
 ## Scoring
 
@@ -291,6 +291,53 @@ It is a deliberately **approximate** cap. A capped search ranks eight pages deep
 cap in rank order, then cuts the page, so a page can come back shorter than `top_k` even
 though more uncapped matches exist further down. What is guaranteed is the upper bound: a
 returned page never carries more than `max` hits for one value.
+
+## Spreading near-duplicates apart
+
+`limit_per` diversifies by attribute value. It cannot help when five near-identical passages
+carry the same attributes, or when they are five chunks of one document. `diversity` handles
+that case, in vector space: it is a Maximal Marginal Relevance lambda, and over an
+over-fetched candidate window it greedily picks the hit maximising
+
+```text
+lambda * score - (1 - lambda) * max_cosine_similarity_to_what_is_already_picked
+```
+
+```rust
+use nidus::SearchOpts;
+
+let query = vec![0.1_f32; 384];
+let hits = db.search(
+    "code",
+    &query,
+    &SearchOpts {
+        top_k: 10,
+        diversity: Some(0.5), // 1.0 is pure relevance, 0.0 pure variety
+        ..Default::default()
+    },
+)?;
+# anyhow::Ok(())
+```
+
+Things worth knowing:
+
+- **Rank 1 never moves.** With nothing selected yet there is no redundancy to penalise, so
+  the best hit is always the best hit. Only what follows it is reshaped.
+- **Similarity is cosine**, computed from the stored vectors' real norms, so it means the
+  same thing on a dot-product or Euclidean store where vectors are not normalized.
+- **Lambda is relative, not a threshold.** A duplicate scoring 0.9996 against 0.9998 is
+  barely less relevant, so it only loses its slot once lambda tips away from relevance.
+  Around 0.5 balances; lower favours variety.
+- **The window is bounded** (512 candidates). MMR needs pairwise similarity, which is
+  quadratic, so a deeper page keeps its score order past that point rather than paying
+  an unbounded cost.
+- **Order of operations.** `limit_per` runs first (a hard cap), then `diversity` reorders
+  the survivors, then the page is cut. So both compose, and `offset` still tiles one
+  ranking.
+- **A text-only record** has no vector and so can never be measurably redundant; it is
+  carried on its score alone.
+- **Unset is unset.** `None` skips the pass and does not deepen the scan, so an existing
+  query is unchanged to the byte.
 
 ## Typed metadata
 
@@ -904,8 +951,8 @@ field name still means "all defaults":
   `Language` enum is the seam for further languages.
 - **What gets indexed.** `Str` attrs are indexed directly; `List` attrs are indexed
   per element. A document only lives in a field's index while it has text there.
-- **`SearchOpts`.** `top_k`, `offset`, `filter`, `projection`, `rank_by`, and `limit_per`
-  all work exactly as for vector search; only `min_score` differs, being a **raw BM25**
+- **`SearchOpts`.** `top_k`, `offset`, `filter`, `projection`, `rank_by`, `limit_per`, and
+  `diversity` all work exactly as for vector search; only `min_score` differs, being a **raw BM25**
   floor rather than a cosine one. Results are tie-broken by `(collection, id)` for
   determinism, the same total order [pagination](#paginating-a-search) relies on.
 - **Text-only documents.** A `Record` may carry no vector (`Record::text_only`), a

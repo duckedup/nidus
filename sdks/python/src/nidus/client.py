@@ -230,6 +230,7 @@ class NidusClient:
         exclude_attributes: Optional[Sequence[str]] = None,
         rank_by: Optional[RankBy] = None,
         limit_per: Optional[LimitPer] = None,
+        diversity: Optional[float] = None,
         rerank: Optional[RerankOpts] = None,
     ) -> Hits:
         """Vector (cosine) nearest-neighbour search. An empty ``scope`` searches everything.
@@ -241,7 +242,10 @@ class NidusClient:
         ``rank_by`` layers a ranking expression over the metric (``rank.decay(...)``), and
         ``limit_per={"field": "path", "max": 2}`` caps how many hits share one attribute
         value — the cap is applied to the ranking, so it thins results rather than deepening
-        the search. ``rerank`` is documented on :class:`~nidus.RerankOpts`.
+        the search. ``diversity`` is a Maximal Marginal Relevance lambda spreading hits apart
+        in vector space so near-duplicates stop filling a page: ``1.0`` is pure relevance,
+        ``0.0`` pure variety, and omitting it leaves the ranking untouched. ``rerank`` is
+        documented on :class:`~nidus.RerankOpts`.
         """
         return self._search(
             _wire.SEARCH,
@@ -257,6 +261,7 @@ class NidusClient:
                 exclude_attributes=exclude_attributes,
                 rank_by=rank_by,
                 limit_per=limit_per,
+                diversity=diversity,
                 rerank=rerank,
             ),
         )
@@ -276,6 +281,7 @@ class NidusClient:
         exclude_attributes: Optional[Sequence[str]] = None,
         rank_by: Optional[RankBy] = None,
         limit_per: Optional[LimitPer] = None,
+        diversity: Optional[float] = None,
     ) -> Hits:
         """Records most like the one already stored at ``collection``/``id``.
 
@@ -299,6 +305,7 @@ class NidusClient:
                 exclude_attributes=exclude_attributes,
                 rank_by=rank_by,
                 limit_per=limit_per,
+                diversity=diversity,
             ),
         )
 
@@ -320,6 +327,7 @@ class NidusClient:
         exclude_attributes: Optional[Sequence[str]] = None,
         rank_by: Optional[RankBy] = None,
         limit_per: Optional[LimitPer] = None,
+        diversity: Optional[float] = None,
         rerank: Optional[RerankOpts] = None,
     ) -> Hits:
         """BM25 full-text search, paginated by ``offset``.
@@ -355,6 +363,7 @@ class NidusClient:
                 exclude_attributes=exclude_attributes,
                 rank_by=rank_by,
                 limit_per=limit_per,
+                diversity=diversity,
                 rerank=rerank,
             ),
         )
@@ -552,6 +561,7 @@ class NidusClient:
         top_k: Optional[int] = None,
         min_score: Optional[float] = None,
         filter: Optional[Filter] = None,  # noqa: A002
+        diversity: Optional[float] = None,
         rerank: Optional[RerankOpts] = None,
     ) -> Hits:
         """Embed ``query`` and vector-search ``collection``, best first.
@@ -562,7 +572,12 @@ class NidusClient:
         return self._search(
             _wire.recall_path(collection),
             _wire.recall_body(
-                query, top_k=top_k, min_score=min_score, filter=filter, rerank=rerank
+                query,
+                top_k=top_k,
+                min_score=min_score,
+                filter=filter,
+                diversity=diversity,
+                rerank=rerank,
             ),
         )
 

@@ -380,6 +380,7 @@ curl -s localhost:7700/search \
 | `exclude_attributes` | all attrs | return every attr but these |
 | `rank_by` | none | a [ranking expression](/guides/search/#ranking-by-recency) over the metric |
 | `limit_per` | none | cap hits per distinct value of an attribute |
+| `diversity` | none | MMR lambda spreading hits apart in vector space (`1.0` relevance, `0.0` variety) |
 | `rerank` | none | re-score the candidate window with a hosted cross-encoder; see below |
 
 Omitting `rerank` leaves the response byte-identical to a nidus without the feature.
@@ -497,6 +498,7 @@ curl -s localhost:7700/search/similar \
 | `exclude_attributes` | all attrs | return every attr but these |
 | `rank_by` | none | a [ranking expression](/guides/search/#ranking-by-recency) over the metric |
 | `limit_per` | none | cap hits per distinct value of an attribute |
+| `diversity` | none | MMR lambda spreading hits apart in vector space (`1.0` relevance, `0.0` variety) |
 
 The one difference from `/search`: an omitted or empty `scope` searches only the source's
 own collection, not every collection in the store.
@@ -509,7 +511,7 @@ with (a text-only entry), is a `400` naming the id and the reason, not an empty 
 ### `POST /text-search`
 
 BM25 full-text search of declared fields. Returns the same hit shape as `/search`.
-Takes `scope`, `top_k`, `offset`, `filter`, `rank_by`, `limit_per`, `min_score` (here a
+Takes `scope`, `top_k`, `offset`, `filter`, `rank_by`, `limit_per`, `diversity`, `min_score` (here a
 **raw BM25** floor, not cosine), the `include_attributes`/`exclude_attributes` projection,
 `rerank`, and the query itself in one of two spellings.
 
@@ -840,6 +842,7 @@ curl -s localhost:7700/collections/notes/recall \
 | `top_k` | `10` | maximum hits to return |
 | `min_score` | none | drop hits scoring below this cosine similarity |
 | `filter` | none | AND of predicates applied before scoring |
+| `diversity` | none | MMR lambda spreading hits apart in vector space (`1.0` relevance, `0.0` variety) |
 | `rerank` | none | re-score the candidate window with a hosted cross-encoder; see below |
 
 Returns the same `HitDto` shape as `/search`: an array of `{collection, id, score, attrs}`.

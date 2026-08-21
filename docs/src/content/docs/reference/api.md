@@ -291,11 +291,12 @@ pub struct SearchOpts {
     pub explain: bool,           // annotate each hit with its per-clause BM25 scores
     pub rank_by: Option<RankBy>, // a ranking expression over the metric
     pub limit_per: Option<LimitPer>, // cap hits per attribute value
+    pub diversity: Option<f32>,  // MMR lambda spreading hits apart in vector space
 }
 ```
 
 Implements `Default` (`offset: 0`, `exact: false`, `explain: false`,
-`projection: Projection::All`, `rank_by: None`, `limit_per: None`);
+`projection: Projection::All`, `rank_by: None`, `limit_per: None`, `diversity: None`);
 `SearchOpts { top_k: 5, ..Default::default() }` is the idiomatic call. Reused by
 `text_search`, where `min_score` is a raw BM25 floor.
 
@@ -354,6 +355,20 @@ Build with `LimitPer::new(field, max)`. Records **missing** the attribute form o
 group, and the value is read from the stored record, so a `Projection` cannot lift the cap.
 Deliberately approximate: exact only within the over-fetch window, so a capped page may come
 back shorter than `top_k`.
+
+## `SearchOpts::diversity`
+
+A Maximal Marginal Relevance lambda in `[0.0, 1.0]`, spreading hits apart in vector space so
+near-duplicates stop filling a page; see
+[spreading near-duplicates apart](/guides/search/#spreading-near-duplicates-apart). `1.0` is
+pure relevance, `0.0` pure variety, and `None` (the default) skips the pass entirely.
+
+Redundancy is **cosine** similarity computed from the stored vectors' own norms, so it means
+the same thing on a dot-product or Euclidean store. Rank 1 never moves, ties resolve on
+`(collection, id)` like every other ranking, and the reordered window is bounded at 512
+candidates because pairwise similarity is quadratic. A record with no vector carries no
+redundancy penalty. Applied after `limit_per` and before the page cut, so both compose.
+Anything outside `[0.0, 1.0]`, or not finite, is a `400`.
 
 ## `OrderBy`
 

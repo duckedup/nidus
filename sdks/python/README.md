@@ -315,8 +315,9 @@ built, no vector is read), and its sums keep the server's type: a run of `Int`s 
 
 ### Ranking
 
-`search` and `text_search` take two more knobs. `rank_by` layers a ranking expression over
-the metric, and `limit_per` caps how many hits may share one attribute value:
+`search` and `text_search` take three more knobs. `rank_by` layers a ranking expression over
+the metric, `limit_per` caps how many hits may share one attribute value, and `diversity`
+spreads the page apart in vector space so near-duplicates stop filling it:
 
 ```python
 from datetime import datetime, timedelta, timezone
@@ -327,8 +328,13 @@ hits = db.search(
     query=[0.1, 0.2, 0.3],
     rank_by=rank.decay("updated_at", datetime.now(timezone.utc), scale=timedelta(days=7)),
     limit_per={"field": "path", "max": 2},   # at most 2 hits per file
+    diversity=0.5,                           # balance relevance against variety
 )
 ```
+
+`diversity` is a Maximal Marginal Relevance lambda: `1.0` is pure relevance (the ranking you
+get without it), `0.0` is pure variety, and values between trade one against the other. It
+reorders a bounded window of candidates, so it never deepens the scan without limit.
 
 Decay **subtracts** `lambda_ * (1 - factor)` from the base score rather than multiplying
 it, so it stays meaningful where scores are negative or unbounded (Euclidean, dot product,

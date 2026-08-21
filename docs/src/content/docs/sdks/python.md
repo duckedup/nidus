@@ -146,7 +146,7 @@ hits = db.search_similar("docs", "a", top_k=5)
 ```
 
 Takes the same keyword options as `search` (`top_k`, `offset`, `min_score`, `filter`,
-`exact`, `rank_by`, `limit_per`), plus `scope`: which collections to search, defaulting
+`exact`, `rank_by`, `limit_per`, `diversity`), plus `scope`: which collections to search, defaulting
 to the source record's own collection rather than every collection in the store the
 way a plain `search`'s omitted scope does.
 
