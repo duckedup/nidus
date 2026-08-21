@@ -386,6 +386,21 @@ async def test_the_multi_clause_and_ranking_knobs_reach_the_same_wire() -> None:
             )
 
 
+async def test_rerank_reaches_the_wire_on_every_rerankable_method() -> None:
+    """``rerank`` on ``search``/``text_search``/``hybrid_search``/``recall``, async client."""
+    mock = MockServer([])
+    opts = {"query": "sign in", "overscan": 4, "text_attr": "body"}
+    async with client(mock) as db:
+        await db.search(query=[1.0], rerank=opts)
+        assert mock.json["rerank"] == opts
+        await db.text_search(field="body", query="fox", rerank=opts)
+        assert mock.json["rerank"] == opts
+        await db.hybrid_search(vector=[1.0], field="body", text="fox", rerank=opts)
+        assert mock.json["rerank"] == opts
+        await db.recall("docs", "fox", rerank=opts)
+        assert mock.json["rerank"] == opts
+
+
 async def test_aggregate_and_annotations_decode_on_the_async_path_too() -> None:
     """The two new response shapes, reached through the awaited client."""
     mock = MockServer({"count": 2, "sums": {"bytes": {"Int": 40}, "cost": {"Float": 1.5}}})

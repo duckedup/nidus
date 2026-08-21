@@ -110,16 +110,16 @@ let hits = search_reranked(
 # }
 ```
 
-`hybrid_reranked` is the same shape over `HybridOpts`. `Nidus` itself gains no async
-method: the sync search runs first, and only the resulting candidate texts cross the
-network.
+`hybrid_reranked` is the same shape over `HybridOpts`, and `text_search_reranked` is the
+same shape over an `FtsQuery`. `Nidus` itself gains no async method: the sync search runs
+first, and only the resulting candidate texts cross the network.
 
 ### HTTP
 
-`rerank` is an additive field on `POST /search`, `POST /hybrid-search`, and
-`POST /collections/{name}/recall`; omitting it leaves the response byte-identical to
-before. See the [HTTP API reference](/reference/http-api/) for the exact request shape on
-each route.
+`rerank` is an additive field on `POST /search`, `POST /text-search`,
+`POST /hybrid-search`, and `POST /collections/{name}/recall`; omitting it leaves the
+response byte-identical to before. See the [HTTP API reference](/reference/http-api/) for
+the exact request shape on each route.
 
 ### MCP
 
@@ -127,6 +127,21 @@ The `recall`, `text_search`, and `hybrid_search` tools each take a plain `rerank
 and an optional `rerank_overscan` integer. Every one of these tools already carries the
 query as text, so there is nothing extra to plumb: set `rerank: true` and the server reads
 the query it already has.
+
+### Client SDKs
+
+Each of the three client SDKs exposes the same option under its own naming convention:
+`rerank` in JS, `RerankOptions` in Go, and `RerankOpts` in Python. It is available on the
+`search`, `textSearch`, `hybridSearch`, and `recall` methods in all three, mirroring the
+HTTP routes above.
+
+```javascript
+const hits = await client.search({
+  query: [1, 0, 0],
+  topK: 5,
+  rerank: { query: "how do users sign in" },
+});
+```
 
 ## Where to next
 

@@ -2121,6 +2121,84 @@ func TestTextSearchProjectionAndRanking(t *testing.T) {
 	}
 }
 
+// TestRerankIsSentOnEverySearchRoute — all four rerankable requests carry Rerank and send
+// the frozen wire shape. Recall is the leg recallWire can silently drop a new field on, so
+// it must be in this table rather than covered separately.
+func TestRerankIsSentOnEverySearchRoute(t *testing.T) {
+	rerank := &RerankOptions{Query: "fox", Overscan: iptr(4), TextAttr: "body"}
+	want := `"rerank":{"query":"fox","overscan":4,"text_attr":"body"}`
+
+	cases := []struct {
+		name string
+		run  func(db *Client, ctx context.Context) error
+	}{
+		{"Search", func(db *Client, ctx context.Context) error {
+			_, err := db.Search(ctx, SearchRequest{Query: []float32{1}, Rerank: rerank})
+			return err
+		}},
+		{"TextSearch", func(db *Client, ctx context.Context) error {
+			_, err := db.TextSearch(ctx, TextSearchRequest{Field: "body", Query: "fox", Rerank: rerank})
+			return err
+		}},
+		{"HybridSearch", func(db *Client, ctx context.Context) error {
+			_, err := db.HybridSearch(ctx, HybridSearchRequest{
+				Vector: []float32{1}, Field: "body", Text: "fox", Rerank: rerank,
+			})
+			return err
+		}},
+		{"Recall", func(db *Client, ctx context.Context) error {
+			_, err := db.Recall(ctx, "docs", "q", RecallOptions{Rerank: rerank})
+			return err
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &capture{reply: `[]`}
+			db := serve(t, fake)
+			if err := tc.run(db, context.Background()); err != nil {
+				t.Fatalf("%s failed: %v", tc.name, err)
+			}
+			if body := fake.sentBody(t); !strings.Contains(body, want) {
+				t.Errorf("body = %s, want it to contain %s", body, want)
+			}
+		})
+	}
+}
+
+// TestRerankOmittedIsAbsentFromTheBody — the additive-wire guarantee: not setting Rerank
+// leaves the request byte-identical to a client that predates this field.
+func TestRerankOmittedIsAbsentFromTheBody(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+
+	if _, err := db.Search(context.Background(), SearchRequest{Query: []float32{1}}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); strings.Contains(body, "rerank") {
+		t.Errorf("body = %s, must omit rerank when it is nil", body)
+	}
+}
+
+// TestRerankEmptyStructIsSentAsEmptyObject — &RerankOptions{} is the valid minimal form
+// (query defaults to the request's own text server-side), pinned so a later omitempty
+// change on a sub-field cannot silently drop it.
+func TestRerankEmptyStructIsSentAsEmptyObject(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+
+	_, err := db.TextSearch(context.Background(), TextSearchRequest{
+		Field: "body", Query: "fox", Rerank: &RerankOptions{},
+	})
+	if err != nil {
+		t.Fatalf("TextSearch failed: %v", err)
+	}
+	want := `{"field":"body","query":"fox","rerank":{}}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+}
+
 // TestHitAnnotationsDecode — a hit carrying annotations, and one that does not. The
 // second case is the common one and the one that must not regress: the server omits
 // the key entirely, and the decoded Hit has to be indistinguishable from today's.

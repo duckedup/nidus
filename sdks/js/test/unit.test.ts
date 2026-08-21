@@ -845,6 +845,43 @@ describe("memory (remember/recall)", () => {
   });
 });
 
+describe("rerank", () => {
+  it("rerank is sent on all four search methods, renaming textAttr to text_attr", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const rerank = { query: "how do users sign in", overscan: 4, textAttr: "body" };
+    const wire = { query: "how do users sign in", overscan: 4, text_attr: "body" };
+
+    await db.search({ query: [1, 0, 0], rerank });
+    expect(calls[0]!.json).toMatchObject({ rerank: wire });
+
+    await db.textSearch({ field: "body", query: "fox", rerank });
+    expect(calls[1]!.json).toMatchObject({ rerank: wire });
+
+    await db.hybridSearch({ vector: [1, 0, 0], field: "body", text: "fox", rerank });
+    expect(calls[2]!.json).toMatchObject({ rerank: wire });
+
+    await db.recall("notes", "hello", { rerank });
+    expect(calls[3]!.json).toMatchObject({ rerank: wire });
+  });
+
+  it("rerank is absent from the body when not asked for", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.textSearch({ field: "body", query: "fox" });
+    expect("rerank" in (calls[0]!.json as object)).toBe(false);
+  });
+
+  it("an empty rerank object is sent as an empty object", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.recall("notes", "hello", { rerank: {} });
+    expect((calls[0]!.json as { rerank: unknown }).rerank).toEqual({});
+    await db.textSearch({ field: "body", query: "fox", rerank: {} });
+    expect((calls[1]!.json as { rerank: unknown }).rerank).toEqual({});
+  });
+});
+
 describe("error handling", () => {
   it("throws NidusError carrying the server status and message", async () => {
     const { fn } = mockFetch({ error: "store is locked: /tmp/s/lock" }, 409);

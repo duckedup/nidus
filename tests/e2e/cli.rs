@@ -971,3 +971,279 @@ fn compact_expired_reclaims_only_past_entries() {
     let stats = ok(&["stats", "--dir", dir], "");
     assert_eq!(stats["footprint"]["dead_rows"], 0, "swept: {stats}");
 }
+
+// ── `nidus text-search --rerank` (nidus-d42) ────────────────────────────────
+
+/// `--rerank` reorders `text-search`'s BM25 ranking through the real `--rerank-provider`
+/// wiring (the same mock `tests/e2e/rerank.rs` uses): identical bodies tie the baseline,
+/// so the inverting mock's reversal cannot coincide with it by chance.
+#[cfg(all(feature = "mcp", feature = "embed-ollama", feature = "rerank-cohere"))]
+#[test]
+fn text_search_rerank_reorders_against_the_baseline() {
+    use crate::mcp::support::mock_reranker_inverting;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    let records = json!([
+        {"id": "a", "vector": [1, 0, 0], "attrs": {"body": {"Str": "cat"}}},
+        {"id": "b", "vector": [0, 1, 0], "attrs": {"body": {"Str": "cat"}}},
+        {"id": "c", "vector": [0, 0, 1], "attrs": {"body": {"Str": "cat"}}}
+    ])
+    .to_string();
+    assert_eq!(
+        ok(&["upsert", "--dir", dir, "docs"], &records)["upserted"],
+        3
+    );
+    ok(
+        &["set-fts-schema", "--dir", dir, "--field", "body", "docs"],
+        "",
+    );
+
+    let baseline = ids(&ok(
+        &["text-search", "--dir", dir, "-k", "5", "body", "cat"],
+        "",
+    ));
+    assert_eq!(baseline.len(), 3, "{baseline:?}");
+
+    let rerank_url = mock_reranker_inverting();
+    let reranked = ids(&ok(
+        &[
+            "text-search",
+            "--dir",
+            dir,
+            "-k",
+            "5",
+            "body",
+            "cat",
+            "--rerank",
+            "--rerank-provider",
+            "cohere",
+            "--rerank-api-key",
+            "mock-key",
+            "--rerank-base-url",
+            &rerank_url,
+            "--rerank-text-attr",
+            "body",
+        ],
+        "",
+    ));
+    assert_eq!(reranked.len(), 3, "{reranked:?}");
+    assert_ne!(
+        reranked, baseline,
+        "--rerank must reorder against the no-rerank baseline"
+    );
+}
+
+/// `recall --rerank` is a wholly separate ~95-line path (embed, cross-model identity guard,
+/// TTL filter, rerank), so it needs its own proof: it must reorder AND still hide an expired
+/// memory, which is the guard most easily lost when a path is re-implemented.
+#[cfg(all(feature = "mcp", feature = "embed-ollama", feature = "rerank-cohere"))]
+#[test]
+fn recall_rerank_reorders_and_still_hides_expired_memories() {
+    use crate::mcp::support::{DIM, mock_embedder_per_text, mock_reranker_inverting};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+    let url = mock_embedder_per_text(DIM);
+    let e = embed_args(&url);
+    let (p, b) = (e[0].as_str(), e[1].as_str());
+    let (u, v) = (e[2].as_str(), e[3].as_str());
+
+    for text in [
+        "the ranking bug is in the upsert path",
+        "ranking is documented in the guide",
+        "ranking performance over a large corpus",
+    ] {
+        ok(&["remember", "--dir", dir, p, b, u, v, "notes", text], "");
+    }
+    // Already expired: a negative TTL puts the deadline in the past.
+    let expired = ok(
+        &[
+            "remember",
+            "--dir",
+            dir,
+            p,
+            b,
+            u,
+            v,
+            "--ttl-seconds=-3600",
+            "notes",
+            "ranking secret that must never surface",
+        ],
+        "",
+    );
+    let expired_id = expired["id"].as_str().expect("an id").to_string();
+
+    let baseline = ids(&ok(
+        &[
+            "recall", "--dir", dir, p, b, u, v, "-k", "5", "notes", "ranking",
+        ],
+        "",
+    ));
+    assert_eq!(
+        baseline.len(),
+        3,
+        "the expired memory must be hidden: {baseline:?}"
+    );
+
+    let rerank_url = mock_reranker_inverting();
+    let reranked = ids(&ok(
+        &[
+            "recall",
+            "--dir",
+            dir,
+            p,
+            b,
+            u,
+            v,
+            "-k",
+            "5",
+            "--rerank",
+            "--rerank-provider",
+            "cohere",
+            "--rerank-api-key",
+            "mock-key",
+            "--rerank-base-url",
+            &rerank_url,
+            "notes",
+            "ranking",
+        ],
+        "",
+    ));
+    assert_ne!(
+        reranked, baseline,
+        "recall --rerank must reorder against its baseline"
+    );
+    assert!(
+        !reranked.contains(&expired_id),
+        "the TTL guard must survive the reranked path: {reranked:?}"
+    );
+}
+
+/// The vector-query legs of the same wiring. `search` and `hybrid-search` carry no text of
+/// their own, so both require an explicit `--rerank-query`; each must reorder its own
+/// baseline through the real flags, which no other test covers.
+#[cfg(all(feature = "mcp", feature = "embed-ollama", feature = "rerank-cohere"))]
+#[test]
+fn search_and_hybrid_search_rerank_reorder_against_their_baselines() {
+    use crate::mcp::support::mock_reranker_inverting;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    let records = json!([
+        {"id": "a", "vector": [1, 0, 0], "attrs": {"body": {"Str": "cat"}}},
+        {"id": "b", "vector": [0, 1, 0], "attrs": {"body": {"Str": "cat"}}},
+        {"id": "c", "vector": [0, 0, 1], "attrs": {"body": {"Str": "cat"}}}
+    ])
+    .to_string();
+    assert_eq!(
+        ok(&["upsert", "--dir", dir, "docs"], &records)["upserted"],
+        3
+    );
+    ok(
+        &["set-fts-schema", "--dir", dir, "--field", "body", "docs"],
+        "",
+    );
+    let rerank_url = mock_reranker_inverting();
+    let vector = "[1, 1, 1]";
+
+    let baseline = ids(&ok(&["search", "--dir", dir, "-k", "5"], vector));
+    assert_eq!(baseline.len(), 3, "{baseline:?}");
+    let reranked = ids(&ok(
+        &[
+            "search",
+            "--dir",
+            dir,
+            "-k",
+            "5",
+            "--rerank",
+            "--rerank-query",
+            "cat",
+            "--rerank-provider",
+            "cohere",
+            "--rerank-api-key",
+            "mock-key",
+            "--rerank-base-url",
+            &rerank_url,
+            "--rerank-text-attr",
+            "body",
+        ],
+        vector,
+    ));
+    assert_ne!(
+        reranked, baseline,
+        "search --rerank must reorder against its baseline"
+    );
+
+    let hybrid_baseline = ids(&ok(
+        &["hybrid-search", "--dir", dir, "-k", "5", "body", "cat"],
+        vector,
+    ));
+    assert_eq!(hybrid_baseline.len(), 3, "{hybrid_baseline:?}");
+    let hybrid_reranked = ids(&ok(
+        &[
+            "hybrid-search",
+            "--dir",
+            dir,
+            "-k",
+            "5",
+            "body",
+            "cat",
+            "--rerank",
+            "--rerank-query",
+            "cat",
+            "--rerank-provider",
+            "cohere",
+            "--rerank-api-key",
+            "mock-key",
+            "--rerank-base-url",
+            &rerank_url,
+            "--rerank-text-attr",
+            "body",
+        ],
+        vector,
+    ));
+    assert_ne!(
+        hybrid_reranked, hybrid_baseline,
+        "hybrid-search --rerank must reorder against its baseline"
+    );
+}
+
+/// A raw vector query has no text to fall back on, so `--rerank` without `--rerank-query`
+/// must refuse rather than rerank against an empty string.
+#[cfg(feature = "rerank")]
+#[test]
+fn search_rerank_without_a_query_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    let err = fails(&["search", "--dir", dir, "--rerank"], "[1, 0, 0]");
+    assert!(err.contains("--rerank-query"), "{err}");
+}
+
+/// `--rerank` with no `--rerank-provider` is a clear, nonzero-exit error naming the flag —
+/// never a silent, un-reranked success.
+#[cfg(feature = "rerank")]
+#[test]
+fn text_search_rerank_without_a_provider_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(
+        &["upsert", "--dir", dir, "docs"],
+        &json!([{"id": "a", "vector": [1, 0, 0], "attrs": {"body": {"Str": "cat"}}}]).to_string(),
+    );
+    ok(
+        &["set-fts-schema", "--dir", dir, "--field", "body", "docs"],
+        "",
+    );
+
+    let err = fails(
+        &["text-search", "--dir", dir, "body", "cat", "--rerank"],
+        "",
+    );
+    assert!(err.contains("--rerank-provider"), "{err}");
+}

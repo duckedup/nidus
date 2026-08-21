@@ -291,15 +291,16 @@ type OrderBy struct {
 // see [Projection]. RankBy and LimitPer reshape the ranking after scoring; see [Decay]
 // and [LimitPer].
 type SearchRequest struct {
-	Query    []float32 `json:"query"`
-	Scope    []string  `json:"scope,omitempty"`
-	TopK     int       `json:"top_k,omitempty"`     // 0 takes the server's default
-	Offset   int       `json:"offset,omitempty"`    // skip this many top-ranked hits
-	MinScore *float32  `json:"min_score,omitempty"` // nil is "no floor"; &0 is a floor of zero
-	Filter   Filter    `json:"filter,omitempty"`
-	Exact    bool      `json:"exact,omitempty"`
-	RankBy   *RankBy   `json:"rank_by,omitempty"`
-	LimitPer *LimitPer `json:"limit_per,omitempty"`
+	Query    []float32      `json:"query"`
+	Scope    []string       `json:"scope,omitempty"`
+	TopK     int            `json:"top_k,omitempty"`     // 0 takes the server's default
+	Offset   int            `json:"offset,omitempty"`    // skip this many top-ranked hits
+	MinScore *float32       `json:"min_score,omitempty"` // nil is "no floor"; &0 is a floor of zero
+	Filter   Filter         `json:"filter,omitempty"`
+	Exact    bool           `json:"exact,omitempty"`
+	RankBy   *RankBy        `json:"rank_by,omitempty"`
+	LimitPer *LimitPer      `json:"limit_per,omitempty"`
+	Rerank   *RerankOptions `json:"rerank,omitempty"`
 	Projection
 }
 
@@ -399,6 +400,24 @@ type HighlightOpts struct {
 	FragmentChars int `json:"fragment_chars,omitempty"`
 }
 
+// RerankOptions opts into the hosted cross-encoder stage. The server ranks
+// (Offset+TopK)*Overscan deep, scores each candidate's text against Query, and returns the
+// caller's page of that. It needs a server started with --rerank-provider; without one the
+// request is a 400 rather than a silent pass-through of the un-reranked order.
+//
+// Query is required on [SearchRequest] and [HybridSearchRequest], which carry no text of
+// their own. It defaults to the request's own text on [Client.Recall] and on the
+// Field+Query spelling of [TextSearchRequest]; the Clauses spelling has no single text, so
+// it must name Query here.
+//
+// Overscan is a pointer because &0 is a distinguishable (and rejected) request, so nil is
+// how you ask for the server's default of 10.
+type RerankOptions struct {
+	Query    string `json:"query,omitempty"`
+	Overscan *int   `json:"overscan,omitempty"`
+	TextAttr string `json:"text_attr,omitempty"`
+}
+
 // A TextSearchRequest is a BM25 full-text query. MinScore is a raw BM25 floor, not a
 // cosine one — BM25 scores are unbounded above and not comparable across queries, so a
 // floor that works for one query may drop everything for another.
@@ -424,6 +443,7 @@ type TextSearchRequest struct {
 	Highlight *HighlightOpts `json:"highlight,omitempty"`
 	RankBy    *RankBy        `json:"rank_by,omitempty"`
 	LimitPer  *LimitPer      `json:"limit_per,omitempty"`
+	Rerank    *RerankOptions `json:"rerank,omitempty"`
 	Projection
 }
 
@@ -457,6 +477,7 @@ type HybridSearchRequest struct {
 	Highlight    *HighlightOpts `json:"highlight,omitempty"`
 	VectorWeight *float32       `json:"vector_weight,omitempty"`
 	TextWeight   *float32       `json:"text_weight,omitempty"`
+	Rerank       *RerankOptions `json:"rerank,omitempty"`
 }
 
 // A ListRequest is a metadata-only query: no vector, paginated, filter-driven.
@@ -598,15 +619,19 @@ type RecallOptions struct {
 	TopK     int
 	MinScore *float32 // a cosine-similarity floor; hits below it are dropped
 	Filter   Filter
+	Rerank   *RerankOptions
 }
 
 type recallWire struct {
-	Query    string   `json:"query"`
-	TopK     int      `json:"top_k,omitempty"`
-	MinScore *float32 `json:"min_score,omitempty"`
-	Filter   Filter   `json:"filter,omitempty"`
+	Query    string         `json:"query"`
+	TopK     int            `json:"top_k,omitempty"`
+	MinScore *float32       `json:"min_score,omitempty"`
+	Filter   Filter         `json:"filter,omitempty"`
+	Rerank   *RerankOptions `json:"rerank,omitempty"`
 }
 
 func (o RecallOptions) wire(query string) recallWire {
-	return recallWire{Query: query, TopK: o.TopK, MinScore: o.MinScore, Filter: o.Filter}
+	return recallWire{
+		Query: query, TopK: o.TopK, MinScore: o.MinScore, Filter: o.Filter, Rerank: o.Rerank,
+	}
 }

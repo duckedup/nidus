@@ -1256,9 +1256,14 @@ build until a real need exists.
   appended after the reranked hits in original metric order. `limit_per` is re-applied
   post-rerank so a diversity cap survives the reordering; `min_score`/`rank_by` are
   cosine-scale and run pre-rerank. Wired into HTTP (`rerank` on `/search`,
-  `/hybrid-search`, `/collections/{name}/recall`, additive over the wire) and MCP (a
-  `rerank` boolean plus `rerank_overscan` on `recall`/`text_search`/`hybrid_search`, since
-  those tools already carry the query as text). No on-disk format change.
+  `/text-search`, `/hybrid-search`, `/collections/{name}/recall`, additive over the
+  wire), MCP (a `rerank` boolean plus `rerank_overscan` on
+  `recall`/`text_search`/`hybrid_search`, since those tools already carry the query as
+  text), the three client SDKs (`rerank` on their search, text-search, hybrid-search and
+  recall methods), and the CLI's `search`, `text-search`, `hybrid-search` and `recall`
+  subcommands via `--rerank` (nidus-d42). `similar` and `/search/batch` remain excluded:
+  the former has no query text, the latter is out of scope for v1. No on-disk format
+  change.
 
 ### Still deferred (designed-for, not built)
 

@@ -62,6 +62,27 @@ pub async fn search_reranked<'a, R: Reranker>(
     Ok(db.store().finish(reranked, opts))
 }
 
+/// BM25 search widened to [`rerank_depth`], reranked, then tailed with the caller's real
+/// `opts` exactly as [`search_reranked`] does. A pass-through to `db.text_search` when
+/// `opts.rerank` is `None` — safe to call unconditionally.
+pub async fn text_search_reranked<'a, R: Reranker>(
+    db: &Nidus,
+    reranker: &R,
+    scope: impl Into<Scope<'a>>,
+    text: &FtsQuery,
+    query_text: &str,
+    opts: &SearchOpts,
+) -> Result<Vec<Hit>> {
+    let Some(rerank_opts) = opts.rerank.clone() else {
+        return db.text_search(scope, text, opts);
+    };
+    let (widened, kept) = widened_opts(opts);
+    let hits = db.text_search(scope, text, &widened)?;
+    let mut reranked = rerank_hits(reranker, query_text, hits, &rerank_opts).await?;
+    retrim(&mut reranked, opts, kept);
+    Ok(db.store().finish(reranked, opts))
+}
+
 /// Hybrid (vector + BM25) search, reranked the same way as [`search_reranked`]. `HybridOpts`
 /// has no `limit_per`, so the tail is just the page cut (`Store::finish_hybrid`).
 pub async fn hybrid_reranked<'a, R: Reranker>(
@@ -341,6 +362,89 @@ mod tests {
         assert_eq!(
             ids(&out),
             ids(&db.search("docs", &[1.0, 0.0], &opts).unwrap())
+        );
+    }
+
+    /// Decoupled from [`attrs`]: `meta_text` (what `LenReranker` scores) is independent of
+    /// `body` (what BM25 matches), so a fixture can tie BM25 while varying rerank length.
+    fn text_attrs(meta_text: &str, body: &str) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            (META_TEXT.to_string(), Value::Str(meta_text.to_string())),
+            ("body".to_string(), Value::Str(body.to_string())),
+        ])
+    }
+
+    /// Three docs tied on BM25 relevance (identical `body`, so identical term frequency and
+    /// length norm) but with `META_TEXT` lengths 1/2/3 — `LenReranker` must break the tie
+    /// its own way, which cannot equal the (necessarily untied-by-length) baseline.
+    fn text_store() -> Nidus {
+        let mut db = Nidus::open_in_memory(2).unwrap();
+        db.set_fts_schema("docs", &[FtsField::new("body")]).unwrap();
+        let recs = vec![
+            Record::new("a", vec![1.0, 0.0], text_attrs("x", "cat")),
+            Record::new("b", vec![1.0, 0.0], text_attrs("xx", "cat")),
+            Record::new("c", vec![1.0, 0.0], text_attrs("xxx", "cat")),
+        ];
+        db.upsert("docs", &recs).unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn text_search_reranked_reorders_by_the_rerank_score() {
+        let db = text_store();
+        let query = crate::FtsQuery::new("body", "cat");
+        let plain = SearchOpts {
+            top_k: 3,
+            ..Default::default()
+        };
+        let baseline_hits = db.text_search("docs", &query, &plain).unwrap();
+        let baseline = ids(&baseline_hits);
+
+        let opts = SearchOpts {
+            top_k: 3,
+            rerank: Some(RerankOpts::default()),
+            ..Default::default()
+        };
+        let out = text_search_reranked(&db, &LenReranker, "docs", &query, "q", &opts)
+            .await
+            .unwrap();
+        assert_eq!(ids(&out), vec!["c", "b", "a"], "longest META_TEXT wins");
+        assert_ne!(ids(&out), baseline, "rerank must change the BM25 order");
+    }
+
+    /// `opts.rerank == None` must be a pass-through with zero reranker calls, not merely an
+    /// `Ok` return, or a discarded network call would pass unnoticed.
+    #[tokio::test]
+    async fn text_search_reranked_without_opts_is_a_passthrough() {
+        let db = store();
+        let query = crate::FtsQuery::new("body", "w");
+        let opts = SearchOpts {
+            top_k: 4,
+            ..Default::default()
+        };
+
+        struct PanicReranker;
+        impl Reranker for PanicReranker {
+            async fn rerank(&self, _: &str, _: &[&str]) -> Result<Vec<f32>, RerankError> {
+                panic!("must not be called when opts.rerank is None");
+            }
+            fn provider_name(&self) -> &str {
+                "panic"
+            }
+            fn model_name(&self) -> &str {
+                "panic"
+            }
+            fn max_documents(&self) -> usize {
+                1000
+            }
+        }
+
+        let out = text_search_reranked(&db, &PanicReranker, "docs", &query, "q", &opts)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&out),
+            ids(&db.text_search("docs", &query, &opts).unwrap())
         );
     }
 

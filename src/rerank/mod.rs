@@ -11,7 +11,7 @@ pub mod cohere;
 pub mod voyage;
 
 mod apply;
-pub use apply::{hybrid_reranked, rerank_hits, search_reranked};
+pub use apply::{hybrid_reranked, rerank_hits, search_reranked, text_search_reranked};
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 
