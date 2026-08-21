@@ -30,7 +30,7 @@ export function nextFreeVersion(mainVersion, claimed = [], released = new Set())
 // un-fetched base invalidates every judgement below it, including the ticket's own state.
 export function preflight(facts = {}) {
   const {
-    fetched, branch, onMain, dirty, behind = 0,
+    fetched, branch, onMain, dirty, behind = 0, mainAhead = 0,
     issue, issueBranches = [], me = [],
   } = facts
   const findings = []
@@ -47,6 +47,13 @@ export function preflight(facts = {}) {
     findings.push(err('preflight-stale-base', here,
       `${behind} commit(s) behind origin/main`,
       `Whatever landed in those ${behind} commits is invisible from this tree, so a dependency can read as unmerged and a conflict cannot be seen. Rebase onto origin/main before evaluating.`))
+  }
+  // Not an error: unpushed commits do not invalidate this branch's diff the way a stale
+  // base does. They do mean this machine's main disagrees with everyone else's.
+  if (mainAhead > 0) {
+    findings.push(warn('preflight-unpushed-main', 'main',
+      `local main is ${mainAhead} commit(s) ahead of origin/main`,
+      'Work committed to main on this machine and nowhere else, so it exists in one copy and is invisible to every other clone. Find out what it is before building on this tree; a `--base main` range is also wider than you meant.'))
   }
   if (dirty) {
     findings.push(warn('preflight-dirty', here, 'uncommitted changes present',
@@ -105,7 +112,9 @@ function ticketFindings(issue, issueBranches, me, branch) {
 export function formatPreflight(findings, info = {}) {
   const lines = []
   const { branch, behind, mainVersion, nextVersion, fetched } = info
-  lines.push(`Branch ${branch || '(detached)'} — ${fetched ? 'origin fetched' : 'origin NOT fetched'}, ${behind || 0} commit(s) behind origin/main.`)
+  const { mainAhead } = info
+  const unpushed = mainAhead ? `, local main ${mainAhead} commit(s) AHEAD (unpushed)` : ''
+  lines.push(`Branch ${branch || '(detached)'} — ${fetched ? 'origin fetched' : 'origin NOT fetched'}, ${behind || 0} commit(s) behind origin/main${unpushed}.`)
   if (mainVersion) lines.push(`origin/main is ${mainVersion}; next free version to claim: ${nextVersion || '(none found)'}.`)
   if (!findings.length) {
     lines.push('Clear to evaluate. Fresh base, ticket unclaimed and unshipped.')
@@ -121,5 +130,5 @@ export const PREFLIGHT_IDS = [
   'preflight-no-fetch', 'preflight-on-main', 'preflight-stale-base', 'preflight-dirty',
   'preflight-ticket-unknown', 'preflight-ticket-closed', 'preflight-ticket-deferred',
   'preflight-ticket-shipped', 'preflight-ticket-in-pr', 'preflight-ticket-taken',
-  'preflight-branch-exists',
+  'preflight-branch-exists', 'preflight-unpushed-main',
 ]

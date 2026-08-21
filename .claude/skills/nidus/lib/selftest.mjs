@@ -842,6 +842,28 @@ test('preflight: next free version skips main, in-flight branches and released t
   eq(pre.nextFreeVersion('0.9.0', [{ ref: 'origin/a', version: '0.10.0' }], new Set()), '0.11.0', 'numeric, not lexical')
 })
 
+test('preflight: unpushed commits on local main warn, naming the count', () => {
+  const found = pre.preflight({ ...clean, mainAhead: 2 })
+  eq(ids(found), ['preflight-unpushed-main'], 'findings')
+  eq(found[0].severity, 'warn', 'severity — it does not invalidate this branch\'s diff')
+  eq(found[0].summary.includes('2'), true, 'the count is in the summary')
+})
+
+test('preflight: a main that is up to date says nothing about being ahead', () => {
+  eq(ids(pre.preflight({ ...clean, mainAhead: 0 })), [], 'zero')
+  eq(ids(pre.preflight(clean)), [], 'absent')
+})
+
+test('preflight: a diverged main reports both directions', () => {
+  const found = pre.preflight({ ...clean, behind: 3, mainAhead: 2 })
+  eq(ids(found), ['preflight-stale-base', 'preflight-unpushed-main'], 'both, not one')
+})
+
+test('preflight: on main, unpushed commits are still reported alongside', () => {
+  const found = pre.preflight({ ...clean, onMain: true, branch: 'main', mainAhead: 2 })
+  eq(ids(found), ['preflight-on-main', 'preflight-unpushed-main'], 'findings')
+})
+
 // ── stale base (nidus-qko) ─────────────────────────────────────────────────
 
 test('stale base: a local ref behind its remote is flagged, with both counts', () => {

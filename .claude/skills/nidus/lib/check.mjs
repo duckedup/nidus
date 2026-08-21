@@ -153,6 +153,7 @@ function runPreflight() {
   const fetched = noFetch ? false : git.fetchOrigin()
   const self = git.treeFacts(process.cwd())
   const behind = git.behindMain()
+  const mainAhead = git.refDrift('main').ahead
   const raw = flag('issue')
   const id = typeof raw === 'string' ? raw.replace(new RegExp(`^(?:#|${git.BEAD_PREFIX}-)`), '') : null
 
@@ -171,10 +172,10 @@ function runPreflight() {
 
   const findings = pre.preflight({
     fetched, branch: self.branch, onMain: self.branch === 'main',
-    dirty: self.dirty, behind, issue, issueBranches,
+    dirty: self.dirty, behind, mainAhead, issue, issueBranches,
     me: git.identities(),
   })
-  const info = { branch: self.branch, behind, mainVersion, nextVersion, fetched }
+  const info = { branch: self.branch, behind, mainAhead, mainVersion, nextVersion, fetched }
 
   if (asJson) console.log(JSON.stringify({ info, claimed, issue, issueBranches, findings }, null, 2))
   else console.log(pre.formatPreflight(findings, info))
