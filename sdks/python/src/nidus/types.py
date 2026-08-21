@@ -326,6 +326,25 @@ class HighlightOpts(TypedDict, total=False):
     fragment_chars: int
 
 
+class RerankOpts(TypedDict, total=False):
+    """Opt into the hosted cross-encoder stage.
+
+    The server ranks ``(offset + top_k) * overscan`` deep, scores each candidate's text
+    against ``query``, and returns the caller's page of that. Needs a server started with
+    ``--rerank-provider``; without one the request is a 400, never a silent pass-through.
+
+    ``query`` is required on :meth:`~nidus.NidusClient.search` and
+    :meth:`~nidus.NidusClient.hybrid_search`, and defaults to the request's own text on
+    :meth:`~nidus.NidusClient.recall` and on the single-field spelling of
+    :meth:`~nidus.NidusClient.text_search`. ``overscan`` defaults to 10, ``text_attr`` to
+    ``"nidus.text"``.
+    """
+
+    query: str
+    overscan: int
+    text_attr: str
+
+
 class LimitPer(TypedDict):
     """Cap how many hits may carry any one value of an attribute — "2 hits per file".
 

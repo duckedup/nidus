@@ -116,6 +116,24 @@ See [Remember & recall](/guides/remember-and-recall/) for the provider table and
 parity between the CLI, HTTP, and MCP surfaces at
 [Parity across the surfaces](/guides/remember-and-recall/#parity-across-the-surfaces).
 
+## Rerank flags (`rerank` feature)
+
+`search`, `text-search`, `hybrid-search`, and `recall` additionally take these flags,
+present only when the binary was built with the `rerank` feature. They configure the
+opt-in **cross-encoder** re-scoring stage; this is unrelated to `--ann-overscan`'s
+ANN candidate over-fetch and to `--quantization`'s quantized-then-f32 rescore above,
+which use the word "rerank" for something else entirely.
+
+| Flag | Env | Description |
+| --- | --- | --- |
+| `--rerank-provider <NAME>` | `NIDUS_RERANK_PROVIDER` | Cross-encoder reranking provider: `voyage` or `cohere`. |
+| `--rerank-model <MODEL>` | `NIDUS_RERANK_MODEL` | Reranking model. Defaults to the provider's default. |
+| `--rerank-api-key <KEY>` | `NIDUS_RERANK_API_KEY` | API key for the reranking provider. |
+| `--rerank-base-url <URL>` | `NIDUS_RERANK_BASE_URL` | Base-URL override for the reranking provider. |
+
+`--rerank` (below, per subcommand) with no `--rerank-provider` configured is an error
+naming the flag, never a silent un-reranked result.
+
 ## Subcommands
 
 Flags already listed above (store flags, ingest flags) are not repeated per
@@ -191,6 +209,10 @@ Nearest-neighbour search; the query vector is a JSON array of floats. Usage:
 | `--rank-by <EXPR>` | none | Ranking expression as JSON, e.g. a recency-decay expression. |
 | `--limit-per <ATTR>` | none | Cap hits per distinct value of this attribute; needs `--limit-per-max`. |
 | `--limit-per-max <N>` | none | Maximum hits kept per distinct `--limit-per` value. |
+| `--rerank` (`rerank` feature) | none | Re-score the candidate window with the configured cross-encoder. Requires `--rerank-query`, since a vector query carries no text of its own. |
+| `--rerank-query <TEXT>` (`rerank` feature) | none | Text scored against each candidate by the cross-encoder. |
+| `--rerank-overscan <N>` (`rerank` feature) | none | Candidates retrieved per `top_k` before the cross-encoder rerank (default `10`). |
+| `--rerank-text-attr <ATTR>` (`rerank` feature) | none | Attr holding each candidate's text for the cross-encoder rerank (default `nidus.text`). |
 
 ### `similar`
 
@@ -207,6 +229,9 @@ The source record is always excluded from its own results, by id rather than by
 score, so a genuine duplicate of the source still comes back. `COLLECTION`/`ID`
 naming no record, or a record with no stored vector (a text-only entry), is an error
 naming the reason, not an empty result.
+
+`similar` takes no `--rerank`: "more like this" starts from a stored vector with no
+query text, the same reason `/search/similar` excludes it over HTTP.
 
 ### `aggregate`
 
@@ -268,6 +293,10 @@ Full-text (BM25) search of fields declared via `set-fts-schema`. Usage:
 | `--offset <N>` | none | Skip this many top-ranked hits before returning (default `0`). |
 | `--min-score <SCORE>` | none | Drop hits scoring below this raw BM25 score. |
 | `--where <FILTER>` | none | AND-filter as JSON (same form as `search --where`). |
+| `--rerank` (`rerank` feature) | none | Re-score the candidate window with the configured cross-encoder. |
+| `--rerank-query <TEXT>` (`rerank` feature) | none | Text scored against each candidate by the cross-encoder. Defaults to the positional `QUERY` when the `--clause` spelling is not used; with `--clause`, omitting it is an error. |
+| `--rerank-overscan <N>` (`rerank` feature) | none | Candidates retrieved per `top_k` before the cross-encoder rerank (default `10`). |
+| `--rerank-text-attr <ATTR>` (`rerank` feature) | none | Attr holding each candidate's text for the cross-encoder rerank (default `nidus.text`). |
 
 ### `hybrid-search`
 
@@ -287,6 +316,10 @@ flags as `text-search` above, plus:
 | `--candidates <N>` | none | Candidates pulled per leg before fusing (default `100`). |
 | `--vector-weight <N>` | none | Weight on the vector leg's fused contribution (default `1`). |
 | `--text-weight <N>` | none | Weight on the BM25 leg's fused contribution (default `1`). |
+| `--rerank` (`rerank` feature) | none | Re-score the fused candidate window with the configured cross-encoder. Requires `--rerank-query`, since the fused ranking has no single natural query text. |
+| `--rerank-query <TEXT>` (`rerank` feature) | none | Text scored against each candidate by the cross-encoder. |
+| `--rerank-overscan <N>` (`rerank` feature) | none | Candidates retrieved per `top_k` before the cross-encoder rerank (default `10`). |
+| `--rerank-text-attr <ATTR>` (`rerank` feature) | none | Attr holding each candidate's text for the cross-encoder rerank (default `nidus.text`). |
 
 ### `get`
 
@@ -431,6 +464,10 @@ the [ingest flags](#ingest-flags-memory-feature), plus:
 | `-k, --top-k <N>` | none | Hits to return (default `10`). |
 | `--min-score <SCORE>` | none | Drop hits scoring below this cosine similarity. |
 | `--where <FILTER>` | none | AND-filter as JSON (same form as `search --where`). |
+| `--rerank` (`rerank` feature) | none | Re-score the candidate window with the configured cross-encoder. |
+| `--rerank-query <TEXT>` (`rerank` feature) | none | Text scored against each candidate by the cross-encoder. Defaults to `QUERY` above. |
+| `--rerank-overscan <N>` (`rerank` feature) | none | Candidates retrieved per `top_k` before the cross-encoder rerank (default `10`). |
+| `--rerank-text-attr <ATTR>` (`rerank` feature) | none | Attr holding each candidate's text for the cross-encoder rerank (default `nidus.text`). |
 
 `remember`/`recall` are the CLI door onto the same memory layer HTTP's
 `/remember`/`/recall` and MCP's tools use; see

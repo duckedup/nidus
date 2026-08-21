@@ -1136,26 +1136,52 @@ async fn text_search(
         exclude_attributes,
         rank_by,
         limit_per,
+        #[cfg(feature = "rerank")]
+        rerank,
     } = req;
+    #[cfg(feature = "rerank")]
+    let default_rerank_query = query.clone();
     let clauses = check_clauses(field, query, clauses)?;
     let projection = check_projection(include_attributes, exclude_attributes)?;
+    #[cfg(feature = "rerank")]
+    let (rerank, rerank_query) = match check_rerank(rerank, default_rerank_query.as_deref())? {
+        Some((ro, q)) => (Some(ro), Some(q)),
+        None => (None, None),
+    };
+    #[cfg(not(feature = "rerank"))]
+    let (rerank, rerank_query): (Option<RerankOpts>, Option<String>) = (None, None);
+
+    let opts = SearchOpts {
+        top_k,
+        offset,
+        min_score,
+        filter,
+        explain,
+        projection,
+        rank_by,
+        limit_per,
+        rerank,
+        ..Default::default()
+    };
+    #[cfg(feature = "rerank")]
+    check_rerank_depth(&opts)?;
+    let q = FtsQuery {
+        clauses,
+        combine,
+        highlight,
+    };
+
+    #[cfg(feature = "rerank")]
+    if let Some(rerank_query) = rerank_query {
+        let reranker = st.reranker.clone().ok_or_else(missing_reranker_error)?;
+        let hits =
+            rerank_text_search_and_finish(st, reranker, scope, q, rerank_query, opts).await?;
+        return Ok(Json(hits.into_iter().map(HitDto::from).collect()));
+    }
+    #[cfg(not(feature = "rerank"))]
+    let _ = rerank_query;
+
     let hits = run_read(st, move |db| {
-        let opts = SearchOpts {
-            top_k,
-            offset,
-            min_score,
-            filter,
-            explain,
-            projection,
-            rank_by,
-            limit_per,
-            ..Default::default()
-        };
-        let q = FtsQuery {
-            clauses,
-            combine,
-            highlight,
-        };
         scoped(&scope, |s| db.text_search(s, &q, &opts))
     })
     .await?;
@@ -1259,6 +1285,28 @@ async fn rerank_hybrid_and_finish(
     .await?;
     let reranked = rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts).await?;
     run_read(st, move |db| Ok(db.store().finish_hybrid(reranked, &opts))).await
+}
+
+/// Text analogue of [`rerank_search_and_finish`]: widen inside `run_read`, rerank outside
+/// it, then cut the page via the promoted `Store::finish`.
+#[cfg(feature = "rerank")]
+async fn rerank_text_search_and_finish(
+    st: AppState,
+    reranker: Arc<AnyReranker>,
+    scope: Vec<String>,
+    q: FtsQuery,
+    rerank_query: String,
+    opts: SearchOpts,
+) -> Result<Vec<Hit>, ApiError> {
+    let rerank_opts = opts.rerank.clone().unwrap_or_default();
+    let (widened, kept) = crate::store::rerank::widened_opts(&opts);
+    let hits = run_read(st.clone(), move |db| {
+        scoped(&scope, |s| db.text_search(s, &q, &widened))
+    })
+    .await?;
+    let mut reranked = rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts).await?;
+    crate::store::rerank::retrim(&mut reranked, &opts, kept);
+    run_read(st, move |db| Ok(db.store().finish(reranked, &opts))).await
 }
 
 async fn flush(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
@@ -4325,5 +4373,139 @@ mod rerank_tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(ids(&json_body(resp).await), vec!["c", "b", "a"]);
+    }
+
+    fn text_search_body(query: JsonValue, rerank: Option<JsonValue>) -> JsonValue {
+        let mut body = query;
+        body["top_k"] = json!(3);
+        if let Some(r) = rerank {
+            body["rerank"] = r;
+        }
+        body
+    }
+
+    /// The same order-flip as `/search`, over `/text-search`'s BM25 ranking. The mock always
+    /// scores candidate position 0 lowest and position 2 highest, so the reranked order must
+    /// be the exact reverse of the baseline BM25 order.
+    #[tokio::test]
+    async fn rerank_changes_the_returned_order_over_text_search() {
+        let baseline_app = router_without_reranker();
+        setup_hybrid_docs(&baseline_app).await;
+        let resp = baseline_app
+            .oneshot(post(
+                "/text-search",
+                text_search_body(json!({"field": "nidus.text", "query": "doc"}), None),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut baseline = ids(&json_body(resp).await);
+        assert_eq!(baseline.len(), 3);
+
+        let app = router_with_mock_reranker(INVERTING_SCORES);
+        setup_hybrid_docs(&app).await;
+        let resp = app
+            .oneshot(post(
+                "/text-search",
+                text_search_body(
+                    json!({"field": "nidus.text", "query": "doc"}),
+                    Some(json!({"query": "best doc"})),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let reranked = ids(&json_body(resp).await);
+        baseline.reverse();
+        assert_eq!(
+            reranked, baseline,
+            "rerank must reverse the baseline BM25 order"
+        );
+    }
+
+    /// `{"rerank": {}}` on the single-field spelling back-fills `rerank.query` from the
+    /// text `query` — asserted both by the order flip and by the mock actually receiving it.
+    #[tokio::test]
+    async fn text_search_rerank_query_defaults_to_the_text_query() {
+        let server = mock_once(200, INVERTING_SCORES);
+        let reranker = AnyReranker::build(
+            RerankProvider::Voyage,
+            RerankConfig::new("mock-rerank")
+                .api_key("k")
+                .base_url(&server.base_url),
+        )
+        .unwrap();
+        let db = Nidus::open_in_memory(DIM).unwrap();
+        let state = AppState {
+            reranker: Some(Arc::new(reranker)),
+            ..test_state(Some(db))
+        };
+        let app = router(state, 16 * 1024 * 1024);
+        setup_hybrid_docs(&app).await;
+
+        let resp = app
+            .oneshot(post(
+                "/text-search",
+                text_search_body(
+                    json!({"field": "nidus.text", "query": "doc"}),
+                    Some(json!({})),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(ids(&json_body(resp).await), vec!["c", "b", "a"]);
+        let captured = server.captured();
+        assert!(
+            captured.body.contains("doc"),
+            "the defaulted rerank query must be the text query, not empty: {}",
+            captured.body
+        );
+    }
+
+    /// The `clauses` spelling has no single natural text, so `{"rerank": {}}` there must
+    /// `400` rather than silently return an un-reranked `200` (decision 1).
+    #[tokio::test]
+    async fn text_search_rerank_without_query_on_clauses_is_400() {
+        let app = router_without_reranker();
+        setup_hybrid_docs(&app).await;
+        let resp = app
+            .oneshot(post(
+                "/text-search",
+                text_search_body(
+                    json!({"clauses": [{"field": "nidus.text", "query": "doc"}]}),
+                    Some(json!({})),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A `/text-search` rerank request with no reranker configured is a `400` naming the
+    /// flag, mirroring the other three rerankable routes.
+    #[tokio::test]
+    async fn text_search_rerank_without_a_configured_reranker_is_400() {
+        let app = router_without_reranker();
+        setup_hybrid_docs(&app).await;
+        let resp = app
+            .oneshot(post(
+                "/text-search",
+                text_search_body(
+                    json!({"field": "nidus.text", "query": "doc"}),
+                    Some(json!({"query": "q"})),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(resp).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("--rerank-provider"),
+            "message names the flag: {body}"
+        );
     }
 }

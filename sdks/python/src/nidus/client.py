@@ -54,6 +54,7 @@ from .types import (
     Record,
     RecordInput,
     RememberResult,
+    RerankOpts,
     Stats,
 )
 from .values import AttrInput
@@ -229,6 +230,7 @@ class NidusClient:
         exclude_attributes: Optional[Sequence[str]] = None,
         rank_by: Optional[RankBy] = None,
         limit_per: Optional[LimitPer] = None,
+        rerank: Optional[RerankOpts] = None,
     ) -> Hits:
         """Vector (cosine) nearest-neighbour search. An empty ``scope`` searches everything.
 
@@ -239,7 +241,7 @@ class NidusClient:
         ``rank_by`` layers a ranking expression over the metric (``rank.decay(...)``), and
         ``limit_per={"field": "path", "max": 2}`` caps how many hits share one attribute
         value — the cap is applied to the ranking, so it thins results rather than deepening
-        the search.
+        the search. ``rerank`` is documented on :class:`~nidus.RerankOpts`.
         """
         return self._search(
             _wire.SEARCH,
@@ -255,6 +257,7 @@ class NidusClient:
                 exclude_attributes=exclude_attributes,
                 rank_by=rank_by,
                 limit_per=limit_per,
+                rerank=rerank,
             ),
         )
 
@@ -317,6 +320,7 @@ class NidusClient:
         exclude_attributes: Optional[Sequence[str]] = None,
         rank_by: Optional[RankBy] = None,
         limit_per: Optional[LimitPer] = None,
+        rerank: Optional[RerankOpts] = None,
     ) -> Hits:
         """BM25 full-text search, paginated by ``offset``.
 
@@ -329,7 +333,9 @@ class NidusClient:
         ``explain=True`` reports each matched clause's own score, and ``highlight=True``
         (or a ``{"max_fragments": …, "fragment_chars": …}`` mapping) returns fragments of
         the stored text; both land on ``hit.annotations``. Highlighting reads the stored
-        text, so it still works on a field the projection dropped.
+        text, so it still works on a field the projection dropped. ``rerank`` is documented
+        on :class:`~nidus.RerankOpts`; on the single-field spelling its ``query`` defaults
+        to this method's own ``query``.
         """
         return self._search(
             _wire.TEXT_SEARCH,
@@ -349,6 +355,7 @@ class NidusClient:
                 exclude_attributes=exclude_attributes,
                 rank_by=rank_by,
                 limit_per=limit_per,
+                rerank=rerank,
             ),
         )
 
@@ -370,6 +377,7 @@ class NidusClient:
         highlight: Optional[Union[bool, HighlightOpts]] = None,
         vector_weight: Optional[float] = None,
         text_weight: Optional[float] = None,
+        rerank: Optional[RerankOpts] = None,
     ) -> Hits:
         """Hybrid search: fuse a vector query and a BM25 text query via RRF.
 
@@ -381,7 +389,8 @@ class NidusClient:
         ``vector_weight``/``text_weight`` scale each leg's contribution to the fused score
         (both default to 1.0, which is the unweighted fusion exactly). With ``explain=True``
         each hit reports both legs' own rank and score in ``hit.annotations``, which is the
-        only way to see a leg's rank — the returned score is the fused one.
+        only way to see a leg's rank — the returned score is the fused one. ``rerank`` is
+        documented on :class:`~nidus.RerankOpts`; its ``query`` is required here.
         """
         return self._search(
             _wire.HYBRID_SEARCH,
@@ -401,6 +410,7 @@ class NidusClient:
                 highlight=highlight,
                 vector_weight=vector_weight,
                 text_weight=text_weight,
+                rerank=rerank,
             ),
         )
 
@@ -542,11 +552,18 @@ class NidusClient:
         top_k: Optional[int] = None,
         min_score: Optional[float] = None,
         filter: Optional[Filter] = None,  # noqa: A002
+        rerank: Optional[RerankOpts] = None,
     ) -> Hits:
-        """Embed ``query`` and vector-search ``collection``, best first."""
+        """Embed ``query`` and vector-search ``collection``, best first.
+
+        ``rerank`` is documented on :class:`~nidus.RerankOpts`; its ``query`` defaults to
+        this method's own ``query`` when omitted.
+        """
         return self._search(
             _wire.recall_path(collection),
-            _wire.recall_body(query, top_k=top_k, min_score=min_score, filter=filter),
+            _wire.recall_body(
+                query, top_k=top_k, min_score=min_score, filter=filter, rerank=rerank
+            ),
         )
 
     # ── Maintenance ──────────────────────────────────────────────────────────────────

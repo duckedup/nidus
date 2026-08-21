@@ -239,6 +239,12 @@ pub struct TextSearchRequest {
     pub rank_by: Option<RankBy>,
     #[serde(default)]
     pub limit_per: Option<LimitPer>,
+    /// Opt into the cross-encoder rerank stage. An omitted or empty `rerank.query` falls
+    /// back to the single-field `query` above; the `clauses` spelling has no single text,
+    /// so it must name `rerank.query` itself.
+    #[cfg(feature = "rerank")]
+    #[serde(default)]
+    pub rerank: Option<RerankRequest>,
 }
 
 /// Body of `POST /hybrid-search`: fuse a vector query and a BM25 text query (RRF). The text

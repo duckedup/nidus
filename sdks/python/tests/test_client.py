@@ -414,6 +414,21 @@ def test_the_ranking_knobs_reach_the_wire() -> None:
     assert stub.last.json["text_weight"] == 0.5
 
 
+def test_rerank_reaches_the_wire_on_every_rerankable_method() -> None:
+    """``rerank`` on ``search``/``text_search``/``hybrid_search``/``recall``, sync client."""
+    stub = StubTransport([])
+    db = client(stub)
+    opts = {"query": "sign in", "overscan": 4, "text_attr": "body"}
+    db.search(query=[1.0], rerank=opts)
+    assert stub.last.json["rerank"] == opts
+    db.text_search(field="body", query="fox", rerank=opts)
+    assert stub.last.json["rerank"] == opts
+    db.hybrid_search(vector=[1.0], field="body", text="fox", rerank=opts)
+    assert stub.last.json["rerank"] == opts
+    db.recall("docs", "fox", rerank=opts)
+    assert stub.last.json["rerank"] == opts
+
+
 def test_a_search_refuses_a_query_it_cannot_spell_unambiguously() -> None:
     """Both text spellings at once, or an empty clause list, never reach the server."""
     stub = StubTransport([])

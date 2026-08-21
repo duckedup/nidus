@@ -298,6 +298,26 @@ export interface AnnotationOptions {
   highlight?: boolean | HighlightOptions;
 }
 
+/**
+ * Rerank the candidate window with a hosted cross-encoder before returning it. The server
+ * ranks `(offset + topK) * overscan` deep, scores each candidate's text against `query`,
+ * and returns the caller's page of that. Requires a server started with
+ * `--rerank-provider`; without one the request is a 400.
+ */
+export interface RerankOptions {
+  /**
+   * Text scored against each candidate. Required on {@link NidusClient.search} and
+   * {@link NidusClient.hybridSearch}; defaults to the request's own text on
+   * {@link NidusClient.recall} and on the single-field spelling of
+   * {@link NidusClient.textSearch}.
+   */
+  query?: string;
+  /** Candidate over-fetch multiple (default `10`). Higher finds more, costs more. */
+  overscan?: number;
+  /** Attr holding each candidate's text (default `"nidus.text"`). */
+  textAttr?: string;
+}
+
 /** Options for {@link NidusClient.search}. An empty/omitted `scope` searches every collection. */
 export interface SearchOptions extends ProjectionOptions, RankingOptions {
   query: number[];
@@ -312,6 +332,8 @@ export interface SearchOptions extends ProjectionOptions, RankingOptions {
    * quantized first pass. The index stays in place for every other query.
    */
   exact?: boolean;
+  /** See {@link RerankOptions}. `query` is required here. */
+  rerank?: RerankOptions;
 }
 
 /**
@@ -360,6 +382,8 @@ export interface TextSearchBase
   /** A raw BM25 score floor (not cosine). */
   minScore?: number;
   filter?: Filter;
+  /** See {@link RerankOptions}. Backfills `query` from the single-field spelling. */
+  rerank?: RerankOptions;
 }
 
 /** Options for {@link NidusClient.textSearch} (BM25). */
@@ -427,6 +451,8 @@ export interface HybridSearchBase extends AnnotationOptions {
   vectorWeight?: number;
   /** Weight on the BM25 leg's RRF contribution (default `1`). */
   textWeight?: number;
+  /** See {@link RerankOptions}. `query` is required here. */
+  rerank?: RerankOptions;
 }
 
 /** Options for {@link NidusClient.hybridSearch} (vector + BM25 fused via RRF). */
@@ -540,4 +566,6 @@ export interface RecallOptions {
   /** Cosine-similarity floor; hits below it are dropped. */
   minScore?: number;
   filter?: Filter;
+  /** See {@link RerankOptions}. Defaults `query` to the request's own text. */
+  rerank?: RerankOptions;
 }

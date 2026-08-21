@@ -511,7 +511,7 @@ with (a text-only entry), is a `400` naming the id and the reason, not an empty 
 BM25 full-text search of declared fields. Returns the same hit shape as `/search`.
 Takes `scope`, `top_k`, `offset`, `filter`, `rank_by`, `limit_per`, `min_score` (here a
 **raw BM25** floor, not cosine), the `include_attributes`/`exclude_attributes` projection,
-and the query itself in one of two spellings.
+`rerank`, and the query itself in one of two spellings.
 
 ```bash
 curl -s localhost:7700/text-search \
@@ -544,6 +544,14 @@ curl -s localhost:7700/text-search \
 
 `field`+`query` and `clauses` are **mutually exclusive**, and an empty `clauses` list is a
 `400`: an empty result set would otherwise read as "no matches" rather than "no query".
+
+`/text-search` also takes the same `rerank` field as `/search` (`overscan` default `10`,
+`text_attr` default `"nidus.text"`). `query` is optional when the query is named as one
+`field` plus its `query`: an omitted or empty `rerank.query` falls back to that text, so
+`{"rerank": {}}` is a valid minimal form. The `clauses` spelling has no single text to
+fall back to, so a rerank there must name `rerank.query` itself; omitting it is a `400`.
+See [the `/search` entry above](#post-search) and the [reranking guide](/guides/rerank/)
+for the field shape and the passthrough/score-scale rules, which apply here unchanged.
 
 ### `POST /hybrid-search`
 

@@ -46,6 +46,7 @@ export type {
   RecordInput,
   RememberOptions,
   RememberResult,
+  RerankOptions,
   SearchOptions,
   SimilarSearchOptions,
   Stats,

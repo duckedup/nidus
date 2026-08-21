@@ -72,6 +72,7 @@ from .types import (
     Record,
     RecordInput,
     RememberResult,
+    RerankOpts,
     Stats,
 )
 from .values import AttrInput, Value, decode_attrs, decode_value, encode_attrs
@@ -292,6 +293,7 @@ def search_body(
     exclude_attributes: Optional[Sequence[str]] = None,
     rank_by: Optional[RankBy] = None,
     limit_per: Optional[LimitPer] = None,
+    rerank: Optional[RerankOpts] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /search`` (vector nearest-neighbour).
 
@@ -299,7 +301,7 @@ def search_body(
     "every collection" and an empty filter means "match everything", so the empty array is
     the real value, not a missing one. Every other knob is pruned when unset, so an omitted
     ``offset`` (or projection, or ranking expression) is byte-identical to the request
-    before it existed.
+    before it existed. ``rerank`` is documented on :class:`~nidus.types.RerankOpts`.
     """
     return prune(
         {
@@ -313,6 +315,7 @@ def search_body(
             **_projection(include_attributes, exclude_attributes),
             "rank_by": rank_by,
             "limit_per": _limit_per(limit_per),
+            "rerank": _rerank(rerank),
         }
     )
 
@@ -371,12 +374,13 @@ def text_search_body(
     exclude_attributes: Optional[Sequence[str]] = None,
     rank_by: Optional[RankBy] = None,
     limit_per: Optional[LimitPer] = None,
+    rerank: Optional[RerankOpts] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /text-search`` (BM25). ``min_score`` here is a raw BM25 floor.
 
     The query is named either as ``field`` + ``query`` or as a ``clauses`` list, never both
     — see :func:`_fts_query`. A single-field call is sent in exactly the spelling it always
-    was.
+    was. ``rerank`` is documented on :class:`~nidus.types.RerankOpts`.
     """
     return prune(
         {
@@ -392,6 +396,7 @@ def text_search_body(
             **_projection(include_attributes, exclude_attributes),
             "rank_by": rank_by,
             "limit_per": _limit_per(limit_per),
+            "rerank": _rerank(rerank),
         }
     )
 
@@ -412,13 +417,15 @@ def hybrid_search_body(
     highlight: Optional[Union[bool, HighlightOpts]] = None,
     vector_weight: Optional[float] = None,
     text_weight: Optional[float] = None,
+    rerank: Optional[RerankOpts] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /hybrid-search`` (vector + BM25 fused via RRF).
 
     Note there is no ``min_score``: the score is a fused RRF rank, not a similarity, so
     the server offers no floor for it. ``offset`` pages the *fused* ranking. The text leg
     takes the same two spellings as ``/text-search``, except that its single-field text is
-    called ``text``; a clause's is ``query`` on both routes.
+    called ``text``; a clause's is ``query`` on both routes. ``rerank`` is documented on
+    :class:`~nidus.types.RerankOpts`.
     """
     return prune(
         {
@@ -435,6 +442,7 @@ def hybrid_search_body(
             "highlight": _highlight(highlight),
             "vector_weight": vector_weight,
             "text_weight": text_weight,
+            "rerank": _rerank(rerank),
         }
     )
 
@@ -539,14 +547,19 @@ def recall_body(
     top_k: Optional[int] = None,
     min_score: Optional[float] = None,
     filter: Optional[Filter] = None,  # noqa: A002
+    rerank: Optional[RerankOpts] = None,
 ) -> dict[str, Any]:
-    """Body for ``POST /collections/{name}/recall`` (query text in, hits out)."""
+    """Body for ``POST /collections/{name}/recall`` (query text in, hits out).
+
+    ``rerank`` is documented on :class:`~nidus.types.RerankOpts`.
+    """
     return prune(
         {
             "query": query,
             "top_k": top_k,
             "min_score": min_score,
             "filter": list(filter) if filter is not None else [],
+            "rerank": _rerank(rerank),
         }
     )
 
@@ -933,6 +946,12 @@ def _highlight(highlight: Optional[Union[bool, HighlightOpts]]) -> Optional[dict
 
 def _limit_per(limit_per: Optional[LimitPer]) -> Optional[dict[str, Any]]:
     return None if limit_per is None else _spec(limit_per, "limit_per", ("field", "max"))
+
+
+def _rerank(rerank: Optional[RerankOpts]) -> Optional[dict[str, Any]]:
+    if rerank is None:
+        return None
+    return _spec(rerank, "rerank", (), ("query", "overscan", "text_attr"))
 
 
 def _order_by(order_by: Optional[OrderBy]) -> Optional[dict[str, Any]]:

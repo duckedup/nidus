@@ -372,6 +372,37 @@ def test_a_limit_per_must_name_both_keys_and_no_others() -> None:
         _wire.search_body([1.0], limit_per="path")  # type: ignore[arg-type]
 
 
+def test_rerank_is_sent_on_every_search_body() -> None:
+    """The four rerankable builders all carry the same option shape under ``rerank``."""
+    opts = {"query": "how do users sign in", "overscan": 4, "text_attr": "body"}
+    assert _wire.search_body([1.0], rerank=opts)["rerank"] == opts
+    assert _wire.text_search_body("body", "fox", rerank=opts)["rerank"] == opts
+    assert _wire.hybrid_search_body([1.0], "body", "fox", rerank=opts)["rerank"] == opts
+    assert _wire.recall_body("q", rerank=opts)["rerank"] == opts
+
+
+def test_rerank_omitted_leaves_no_key() -> None:
+    """Unset ``rerank`` is pruned, so an old server sees a byte-identical body."""
+    assert "rerank" not in _wire.search_body([1.0])
+    assert "rerank" not in _wire.text_search_body("body", "fox")
+    assert "rerank" not in _wire.hybrid_search_body([1.0], "body", "fox")
+    assert "rerank" not in _wire.recall_body("q")
+
+
+def test_empty_rerank_is_sent_as_an_empty_dict() -> None:
+    """``rerank={}`` is the valid minimal form; if ``prune`` collapsed it, this would fail."""
+    assert _wire.search_body([1.0], rerank={})["rerank"] == {}
+    assert _wire.text_search_body("body", "fox", rerank={})["rerank"] == {}
+    assert _wire.hybrid_search_body([1.0], "body", "fox", rerank={})["rerank"] == {}
+    assert _wire.recall_body("q", rerank={})["rerank"] == {}
+
+
+def test_rerank_rejects_an_unknown_key() -> None:
+    """The stale ``text_field`` spelling from the earlier blueprint draft must not pass."""
+    with pytest.raises(TypeError, match="unknown key"):
+        _wire.search_body([1.0], rerank={"text_field": "body"})  # type: ignore[typeddict-unknown-key]
+
+
 def test_text_search_body_takes_several_clauses_with_a_combine_rule() -> None:
     """The multi-field spelling: one text per field, folded by ``combine``."""
     assert _wire.text_search_body(

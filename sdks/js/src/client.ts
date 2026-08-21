@@ -27,6 +27,7 @@ import type {
   RecordInput,
   RememberOptions,
   RememberResult,
+  RerankOptions,
   SearchOptions,
   SimilarSearchOptions,
   Stats,
@@ -244,6 +245,7 @@ export class NidusClient {
       exclude_attributes: opts.excludeAttributes,
       rank_by: encodeRankBy(opts.rankBy),
       limit_per: opts.limitPer,
+      rerank: encodeRerank(opts.rerank),
     });
   }
 
@@ -285,6 +287,7 @@ export class NidusClient {
       exclude_attributes: opts.excludeAttributes,
       rank_by: encodeRankBy(opts.rankBy),
       limit_per: opts.limitPer,
+      rerank: encodeRerank(opts.rerank),
     });
   }
 
@@ -308,6 +311,7 @@ export class NidusClient {
       highlight: encodeHighlight(opts.highlight),
       vector_weight: opts.vectorWeight,
       text_weight: opts.textWeight,
+      rerank: encodeRerank(opts.rerank),
     });
   }
 
@@ -456,6 +460,7 @@ export class NidusClient {
       top_k: opts.topK,
       min_score: opts.minScore,
       filter: opts.filter ?? [],
+      rerank: encodeRerank(opts.rerank),
     });
   }
 
@@ -605,6 +610,12 @@ function encodeHighlight(h: boolean | HighlightOptions | undefined): unknown {
     max_fragments: h.maxFragments,
     fragment_chars: h.fragmentChars,
   });
+}
+
+/** Encode `rerank`. Undefined sub-fields drop out at `JSON.stringify`, not here. */
+function encodeRerank(r: RerankOptions | undefined): unknown {
+  if (r === undefined) return undefined;
+  return { query: r.query, overscan: r.overscan, text_attr: r.textAttr };
 }
 
 /** Path-segment encode a collection name (allows slashes/spaces in names). */

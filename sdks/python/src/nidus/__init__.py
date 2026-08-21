@@ -59,6 +59,7 @@ from .types import (
     Record,
     RecordInput,
     RememberResult,
+    RerankOpts,
     Stats,
 )
 from .values import (
@@ -116,6 +117,7 @@ __all__ = [
     "Record",
     "RecordInput",
     "RememberResult",
+    "RerankOpts",
     "Stats",
     "Transport",
     "Value",
