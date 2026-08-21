@@ -398,7 +398,7 @@ async fn embed_and_commit<E: Embedder>(
 /// The seam [`Memory::remember_chunked`] delegates to, and the unit tests drive directly
 /// with a fake embedder (`Memory` cannot be poured into, same as [`embed_and_commit`]).
 /// See [`Memory::remember_chunked`] for the write-then-prune contract.
-async fn remember_chunked_with<E: Embedder>(
+pub(crate) async fn remember_chunked_with<E: Embedder>(
     db: &mut Nidus,
     embedder: &E,
     collection: &str,

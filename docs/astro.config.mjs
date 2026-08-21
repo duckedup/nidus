@@ -72,6 +72,7 @@ export default defineConfig({
             { label: "Search & filters", link: "/guides/search/" },
             { label: "Reranking", link: "/guides/rerank/" },
             { label: "Remember & recall", link: "/guides/remember-and-recall/" },
+            { label: "Ingest a directory", link: "/guides/ingest/" },
             { label: "MCP (agent memory)", link: "/guides/mcp/" },
             { label: "Automatic memory", link: "/guides/automatic-memory/" },
             { label: "Embedding in a host app", link: "/guides/integrating/" },

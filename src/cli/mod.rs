@@ -40,6 +40,8 @@ use crate::summarize::{AnySummarizer, SummarizeConfig, SummarizeProvider};
 
 mod backup;
 #[cfg(feature = "memory")]
+mod ingest;
+#[cfg(feature = "memory")]
 mod memory;
 mod tune;
 
@@ -698,6 +700,25 @@ impl RerankArgs {
     }
 }
 
+#[cfg(feature = "memory")]
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum ChunkStrategyArg {
+    Recursive,
+    Markdown,
+    Sentence,
+}
+
+#[cfg(feature = "memory")]
+impl From<ChunkStrategyArg> for crate::chunk::ChunkStrategy {
+    fn from(s: ChunkStrategyArg) -> Self {
+        match s {
+            ChunkStrategyArg::Recursive => crate::chunk::ChunkStrategy::Recursive,
+            ChunkStrategyArg::Markdown => crate::chunk::ChunkStrategy::Markdown,
+            ChunkStrategyArg::Sentence => crate::chunk::ChunkStrategy::Sentence,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum DistanceArg {
     Cosine,
@@ -1278,6 +1299,47 @@ enum Command {
         /// SplitMix64 seed for the deterministic query sample.
         #[arg(long)]
         seed: Option<u64>,
+    },
+    /// Walk a directory, chunk each file, embed the chunks and upsert them. Idempotent:
+    /// a re-run over an unchanged tree makes no embedding calls and no writes.
+    #[cfg(feature = "memory")]
+    Ingest {
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(flatten)]
+        ingest: IngestArgs,
+        /// Directory to walk. Dot-entries and symlinks are skipped.
+        path: PathBuf,
+        /// Collection to ingest into.
+        #[arg(long)]
+        collection: String,
+        /// GLOB over each path relative to PATH. `*` crosses `/`, so `*.md` is already
+        /// recursive; a leading `**/` is optional, so `**/*.md` matches root files too.
+        #[arg(long, default_value = "*")]
+        glob: String,
+        /// How to split each file.
+        #[arg(long, value_enum, default_value_t = ChunkStrategyArg::Recursive)]
+        strategy: ChunkStrategyArg,
+        /// Chunk budget in characters (not tokens).
+        #[arg(long, default_value_t = 1000)]
+        max_chars: usize,
+        /// Characters of backward overlap per chunk. Must be below --max-chars.
+        #[arg(long, default_value_t = 100)]
+        overlap_chars: usize,
+        /// Delete previously-ingested records whose source file is gone. Opt-in, because
+        /// pointing ingest at a partial tree must not empty the collection.
+        #[arg(long)]
+        prune: bool,
+        /// Report what would happen without embedding or writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the content-hash embedding cache. The file-level skip still applies, so an
+        /// unchanged file still costs nothing.
+        #[arg(long)]
+        no_cache: bool,
+        /// Cached vectors to keep before evicting the oldest.
+        #[arg(long, default_value_t = crate::embed::cache::DEFAULT_MAX_ENTRIES)]
+        cache_max_entries: usize,
     },
     /// Remember a fact: embed `text` (optionally summarizing first) and store it.
     /// Needs an embedder — the same `--embed-*` flags (and `NIDUS_EMBED_*` envs) `serve` takes.
@@ -1878,6 +1940,35 @@ pub fn run(cli: Cli) -> Result<()> {
             sweep_quantization,
             target_recall,
             seed,
+        ),
+        #[cfg(feature = "memory")]
+        #[cfg(feature = "memory")]
+        Command::Ingest {
+            store,
+            ingest,
+            path,
+            collection,
+            glob,
+            strategy,
+            max_chars,
+            overlap_chars,
+            prune,
+            dry_run,
+            no_cache,
+            cache_max_entries,
+        } => ingest::run(
+            store,
+            ingest,
+            path,
+            collection,
+            glob,
+            strategy,
+            max_chars,
+            overlap_chars,
+            prune,
+            dry_run,
+            no_cache,
+            cache_max_entries,
         ),
         #[cfg(feature = "memory")]
         Command::Remember {
