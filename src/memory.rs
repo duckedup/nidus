@@ -7,7 +7,10 @@ use anyhow::{Context, bail};
 use crate::diag::diag;
 use crate::embed::{AnyEmbedder, Embedder, embedder_identity};
 use crate::meta::now_ms;
-use crate::{Filter, FtsField, Hit, META_EXPIRES_AT, Nidus, Predicate, Record, SearchOpts, Value};
+use crate::{
+    Filter, FtsField, Hit, META_CHUNK_INDEX, META_EXPIRES_AT, META_PARENT_ID, Nidus, Predicate,
+    Record, SearchOpts, Value,
+};
 
 #[cfg(feature = "summarize")]
 use crate::summarize::{AnySummarizer, SummarizeOpts, Summarizer};
@@ -78,6 +81,17 @@ pub struct Remembered {
     pub deduped: bool,
     /// How many records the upsert touched.
     pub upserted: usize,
+}
+
+/// What a [`Memory::remember_chunked`] write actually did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkedRemembered {
+    /// The `parent_id` the caller passed in.
+    pub parent_id: String,
+    /// One entry per emitted chunk, in index order.
+    pub chunks: Vec<Remembered>,
+    /// Stale tail records (from a longer prior chunking of the same `parent_id`) removed.
+    pub pruned: usize,
 }
 
 /// Options for [`Memory::recall`], mapped onto the store's [`SearchOpts`].
@@ -173,6 +187,29 @@ impl Memory {
         .await
     }
 
+    /// Chunk `text`, embed in one batch, upsert each as `"{parent_id}#{index}"`, then delete
+    /// any survivor with that `parent_id` and index `>= n`. Empty text writes and prunes
+    /// nothing, so an accidental empty read cannot wipe the document.
+    pub async fn remember_chunked(
+        &mut self,
+        collection: &str,
+        parent_id: &str,
+        text: &str,
+        chunk_opts: &crate::chunk::ChunkOpts,
+        opts: RememberOpts,
+    ) -> anyhow::Result<ChunkedRemembered> {
+        remember_chunked_with(
+            &mut self.db,
+            &self.embedder,
+            collection,
+            parent_id,
+            text,
+            chunk_opts,
+            opts,
+        )
+        .await
+    }
+
     /// Recall the nearest remembered records to `query_text` from `collection`.
     pub async fn recall(
         &self,
@@ -213,6 +250,15 @@ pub(crate) fn default_fts_fields() -> Vec<FtsField> {
 /// set an expiry that never went through `ttl_seconds`.
 pub(crate) fn strip_reserved_recency(attrs: &mut BTreeMap<String, Value>) {
     for key in [META_CREATED_AT, META_UPDATED_AT, META_EXPIRES_AT] {
+        attrs.remove(key);
+    }
+}
+
+/// Drop caller-supplied chunk provenance. Accepting these would let any write forge a
+/// `parent_id`/`chunk_index`, and `remember_chunked`'s stale-tail prune matches on exactly
+/// that pair, so a forged row is deletable by an unrelated document's re-ingest.
+pub(crate) fn strip_reserved_chunk(attrs: &mut BTreeMap<String, Value>) {
+    for key in [META_PARENT_ID, META_CHUNK_INDEX] {
         attrs.remove(key);
     }
 }
@@ -346,6 +392,108 @@ async fn embed_and_commit<E: Embedder>(
     commit_remember(db, embedder, collection, write, vector)
 }
 
+/// The seam [`Memory::remember_chunked`] delegates to, and the unit tests drive directly
+/// with a fake embedder (`Memory` cannot be poured into, same as [`embed_and_commit`]).
+/// See [`Memory::remember_chunked`] for the write-then-prune contract.
+async fn remember_chunked_with<E: Embedder>(
+    db: &mut Nidus,
+    embedder: &E,
+    collection: &str,
+    parent_id: &str,
+    text: &str,
+    chunk_opts: &crate::chunk::ChunkOpts,
+    opts: RememberOpts,
+) -> anyhow::Result<ChunkedRemembered> {
+    let RememberOpts {
+        mode,
+        attrs,
+        ttl_seconds,
+        dedupe_threshold,
+    } = opts;
+    // Silently honouring only `Raw` would embed a summarize-mode caller's raw chunks and
+    // stamp no summary, reporting success for a write they did not ask for.
+    match mode {
+        RememberMode::Raw => {}
+        #[cfg(feature = "summarize")]
+        RememberMode::Summarize => bail!(
+            "remember_chunked: RememberMode::Summarize is incompatible with chunking. \
+             Summarize the document first and chunk the summary, or chunk with \
+             RememberMode::Raw"
+        ),
+    }
+    if dedupe_threshold.is_some() {
+        bail!(
+            "remember_chunked: dedupe_threshold is incompatible with chunking, since a dedup \
+             match could redirect one document's chunk onto another document's, breaking the \
+             parent_id/chunk_index invariant rollups group on"
+        );
+    }
+
+    let chunks = crate::chunk::chunk_text(text, chunk_opts)?;
+    if chunks.is_empty() {
+        return Ok(ChunkedRemembered {
+            parent_id: parent_id.to_string(),
+            chunks: Vec::new(),
+            pruned: 0,
+        });
+    }
+
+    let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+    let vectors = embedder.embed_batch(&texts).await.with_context(|| {
+        format!(
+            "embedding {} chunks for '{collection}/{parent_id}'",
+            texts.len()
+        )
+    })?;
+
+    let n = chunks.len();
+    // `zip` would silently drop the tail while `n` still gates the prune below, writing
+    // fewer chunks than the prune assumes survive.
+    if vectors.len() != n {
+        bail!(
+            "remember_chunked: embedder returned {} vectors for {n} chunks of \
+             '{collection}/{parent_id}'",
+            vectors.len()
+        );
+    }
+    let mut remembered = Vec::with_capacity(n);
+    for (chunk, vector) in chunks.into_iter().zip(vectors) {
+        let index = chunk.index;
+        let write = RememberWrite {
+            id: format!("{parent_id}#{index}"),
+            text: chunk.text,
+            attrs: attrs.clone(),
+            ttl_seconds,
+            dedupe_threshold: None,
+        };
+        remembered.push(commit_remember_chunk(
+            db,
+            embedder,
+            collection,
+            write,
+            vector,
+            (parent_id, index as i64),
+        )?);
+    }
+
+    let pruned = db.delete_where(
+        collection,
+        &Filter(vec![Predicate::All(vec![
+            Predicate::Eq(
+                META_PARENT_ID.to_string(),
+                Value::Str(parent_id.to_string()),
+            ),
+            Predicate::Ge(META_CHUNK_INDEX.to_string(), Value::Int(n as i64)),
+        ])]),
+    )?;
+
+    Ok(ChunkedRemembered {
+        parent_id: parent_id.to_string(),
+        chunks: remembered,
+        pruned,
+    })
+}
+
 /// The store half of a `remember`, shared by the Rust, HTTP, and MCP surfaces so the
 /// stamping, dedup, and recency rules cannot drift between them.
 ///
@@ -360,6 +508,30 @@ pub(crate) fn commit_remember<E: Embedder>(
     write: RememberWrite,
     vector: Vec<f32>,
 ) -> anyhow::Result<Remembered> {
+    commit_remember_inner(db, embedder, collection, write, vector, None)
+}
+
+/// [`commit_remember`] for one chunk of a chunked document: same stamping, plus the
+/// `(parent_id, chunk_index)` provenance, stamped here so it cannot be forged by a caller.
+pub(crate) fn commit_remember_chunk<E: Embedder>(
+    db: &mut Nidus,
+    embedder: &E,
+    collection: &str,
+    write: RememberWrite,
+    vector: Vec<f32>,
+    chunk: (&str, i64),
+) -> anyhow::Result<Remembered> {
+    commit_remember_inner(db, embedder, collection, write, vector, Some(chunk))
+}
+
+fn commit_remember_inner<E: Embedder>(
+    db: &mut Nidus,
+    embedder: &E,
+    collection: &str,
+    write: RememberWrite,
+    vector: Vec<f32>,
+    chunk: Option<(&str, i64)>,
+) -> anyhow::Result<Remembered> {
     let RememberWrite {
         id,
         text,
@@ -372,6 +544,14 @@ pub(crate) fn commit_remember<E: Embedder>(
     // Stamped from here, never accepted from a caller — and before the dedup merge below,
     // so this write's text wins over the matched entry's.
     strip_reserved_recency(&mut attrs);
+    strip_reserved_chunk(&mut attrs);
+    if let Some((parent_id, index)) = chunk {
+        attrs.insert(
+            META_PARENT_ID.to_string(),
+            Value::Str(parent_id.to_string()),
+        );
+        attrs.insert(META_CHUNK_INDEX.to_string(), Value::Int(index));
+    }
     attrs.insert(META_TEXT.to_string(), Value::Str(text));
 
     let mut target_id = id;
@@ -1324,5 +1504,359 @@ mod tests {
             db.get("notes", "original").unwrap().attrs[META_CREATED_AT],
             created
         );
+    }
+
+    /// 10-char chunks, no overlap, so a run of identical filler chars splits by hard char
+    /// count and the chunk count is exactly predictable (`ceil(len / 10)`).
+    fn small_chunk_opts() -> crate::chunk::ChunkOpts {
+        crate::chunk::ChunkOpts {
+            strategy: crate::chunk::ChunkStrategy::Recursive,
+            max_chars: 10,
+            overlap_chars: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn remember_chunked_rejects_dedupe_threshold() {
+        let mut db = Nidus::open_in_memory(8).unwrap();
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+
+        let err = remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-1",
+            "some text to chunk",
+            &small_chunk_opts(),
+            RememberOpts {
+                dedupe_threshold: Some(0.9),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("dedup"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn remember_chunked_empty_text_writes_nothing() {
+        let mut db = Nidus::open_in_memory(8).unwrap();
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+
+        let result = remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-1",
+            "   \n\t  ",
+            &small_chunk_opts(),
+            RememberOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.chunks.is_empty());
+        assert_eq!(result.pruned, 0);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn remember_chunked_stamps_parent_and_index_on_every_chunk() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+
+        let result = remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-1",
+            &"a".repeat(95),
+            &small_chunk_opts(),
+            RememberOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.chunks.len(), 10);
+        assert_eq!(result.pruned, 0);
+        for (i, remembered) in result.chunks.iter().enumerate() {
+            assert_eq!(remembered.id, format!("doc-1#{i}"));
+            let record = db.get("docs", &remembered.id).unwrap();
+            assert_eq!(
+                record.attrs[META_PARENT_ID],
+                Value::Str("doc-1".to_string())
+            );
+            assert_eq!(record.attrs[META_CHUNK_INDEX], Value::Int(i as i64));
+            assert!(record.attrs.contains_key(META_TEXT));
+            assert!(record.attrs.contains_key(META_CREATED_AT));
+            assert!(record.attrs.contains_key(META_UPDATED_AT));
+        }
+    }
+
+    /// The whole point of upsert-then-prune: re-chunking a shortened document must not
+    /// leave the longer version's tail behind.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn remember_chunked_prunes_stale_tail_on_reingest() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        let opts = small_chunk_opts();
+
+        let first = remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-1",
+            &"a".repeat(95),
+            &opts,
+            RememberOpts::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.chunks.len(), 10);
+
+        let second = remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-1",
+            &"a".repeat(25),
+            &opts,
+            RememberOpts::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.chunks.len(), 3);
+        assert_eq!(second.pruned, 7);
+
+        let ids: Vec<String> = db
+            .get_all("docs")
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
+        assert_eq!(ids.len(), 3, "the stale indices 3..9 must be gone: {ids:?}");
+        for i in 0..3 {
+            assert!(ids.contains(&format!("doc-1#{i}")));
+        }
+        for i in 3..10 {
+            assert!(!ids.contains(&format!("doc-1#{i}")));
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn remember_chunked_reingesting_identical_text_is_idempotent() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        let opts = small_chunk_opts();
+        let text = "a".repeat(25);
+
+        let first = remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-1",
+            &text,
+            &opts,
+            RememberOpts::default(),
+        )
+        .await
+        .unwrap();
+        let created: Vec<Value> = first
+            .chunks
+            .iter()
+            .map(|r| db.get("docs", &r.id).unwrap().attrs[META_CREATED_AT].clone())
+            .collect();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-1",
+            &text,
+            &opts,
+            RememberOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(second.pruned, 0);
+        let first_ids: Vec<&str> = first.chunks.iter().map(|r| r.id.as_str()).collect();
+        let second_ids: Vec<&str> = second.chunks.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(first_ids, second_ids);
+
+        for (i, remembered) in second.chunks.iter().enumerate() {
+            let record = db.get("docs", &remembered.id).unwrap();
+            assert_eq!(record.attrs[META_CREATED_AT], created[i]);
+            assert_ne!(record.attrs[META_UPDATED_AT], created[i]);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn a_forged_parent_id_is_stripped_and_survives_an_unrelated_prune() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+
+        // A plain remember forging another document's chunk provenance.
+        let mut attrs = BTreeMap::new();
+        attrs.insert(META_PARENT_ID.to_string(), Value::Str("doc-1".to_string()));
+        attrs.insert(META_CHUNK_INDEX.to_string(), Value::Int(999));
+        embed_and_commit(
+            &mut db,
+            &emb,
+            "docs",
+            "victim text",
+            RememberWrite {
+                id: "victim".to_string(),
+                text: "victim text".to_string(),
+                attrs,
+                ttl_seconds: None,
+                dedupe_threshold: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let victim = db.get("docs", "victim").unwrap();
+        assert!(
+            !victim.attrs.contains_key(META_PARENT_ID),
+            "caller-supplied parent_id must be stripped: {:?}",
+            victim.attrs
+        );
+        assert!(!victim.attrs.contains_key(META_CHUNK_INDEX));
+
+        // doc-1's own re-ingest prunes chunk_index >= n for parent doc-1. The forged row
+        // must not be caught by it.
+        remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-1",
+            &"a".repeat(20),
+            &small_chunk_opts(),
+            RememberOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.get("docs", "victim").is_some(),
+            "an unrelated record was deleted by doc-1's prune"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn remember_chunked_rejects_a_short_embed_batch() {
+        struct ShortEmbedder(FakeEmbedder);
+        impl Embedder for ShortEmbedder {
+            fn embed(
+                &self,
+                text: &str,
+            ) -> impl Future<Output = Result<Vec<f32>, EmbedError>> + Send {
+                self.0.embed(text)
+            }
+            fn embed_batch(
+                &self,
+                texts: &[&str],
+            ) -> impl Future<Output = Result<Vec<Vec<f32>>, EmbedError>> + Send {
+                // One vector short: the tail would be silently dropped by `zip`.
+                let mut vs: Vec<Vec<f32>> = texts.iter().map(|t| self.0.vector_for(t)).collect();
+                vs.pop();
+                async move { Ok(vs) }
+            }
+            fn dimension(&self) -> usize {
+                self.0.dimension()
+            }
+            fn provider_name(&self) -> &str {
+                self.0.provider_name()
+            }
+            fn model_name(&self) -> &str {
+                self.0.model_name()
+            }
+            fn max_input_tokens(&self) -> usize {
+                self.0.max_input_tokens()
+            }
+        }
+
+        let (_dir, mut db) = open_tmp(8);
+        let emb = ShortEmbedder(FakeEmbedder::new(8, "fake", "v1"));
+        let err = remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-1",
+            &"a".repeat(95),
+            &small_chunk_opts(),
+            RememberOpts::default(),
+        )
+        .await
+        .expect_err("a short embed_batch must be an error, not a silent truncation");
+        let msg = err.to_string();
+        assert!(msg.contains("vectors"), "unhelpful message: {msg}");
+        assert!(
+            db.get_all("docs").is_empty(),
+            "nothing should have been written"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn remember_chunked_does_not_prune_a_different_parent() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        let opts = small_chunk_opts();
+
+        remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-a",
+            &"a".repeat(95),
+            &opts,
+            RememberOpts::default(),
+        )
+        .await
+        .unwrap();
+        remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-b",
+            &"b".repeat(25),
+            &opts,
+            RememberOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        let second = remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-b",
+            &"b".repeat(15),
+            &opts,
+            RememberOpts::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.pruned, 1);
+
+        let ids: Vec<String> = db
+            .get_all("docs")
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
+        assert_eq!(
+            ids.len(),
+            12,
+            "doc-a's 10 chunks must survive doc-b's prune: {ids:?}"
+        );
+        for i in 0..10 {
+            assert!(ids.contains(&format!("doc-a#{i}")));
+        }
     }
 }

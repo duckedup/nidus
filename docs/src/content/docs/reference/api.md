@@ -694,6 +694,7 @@ impl Memory {
     #[cfg(feature = "summarize")]
     pub fn with_summarizer(mut self, summarizer: AnySummarizer) -> Self;
     pub async fn remember(&mut self, collection: &str, id: &str, text: &str, opts: RememberOpts) -> Result<Remembered>;
+    pub async fn remember_chunked(&mut self, collection: &str, parent_id: &str, text: &str, chunk_opts: &ChunkOpts, opts: RememberOpts) -> Result<ChunkedRemembered>;
     pub async fn recall(&self, collection: &str, query_text: &str, opts: &RecallOpts) -> Result<Vec<Hit>>;
     pub fn db(&self) -> &Nidus;       // the raw Vec<f32> API escape hatch
     pub fn db_mut(&mut self) -> &mut Nidus;
@@ -719,6 +720,12 @@ pub struct Remembered {
     pub upserted: usize,  // rows the upsert touched
 }
 
+pub struct ChunkedRemembered {
+    pub parent_id: String,
+    pub chunks: Vec<Remembered>, // one per emitted chunk, in index order
+    pub pruned: usize,           // stale tail records removed by re-chunking a shortened document
+}
+
 pub struct RecallOpts {
     pub top_k: usize,           // 0 means "use the default" (10)
     pub min_score: f32,         // drop hits scoring below this cosine similarity; 0.0 applies no floor
@@ -730,6 +737,29 @@ pub struct RecallOpts {
 `RememberOpts { ttl_seconds: Some(3600), ..Default::default() }` is the idiomatic call.
 `RememberMode::Raw` embeds and stores the text as given; `Summarize` needs a summarizer
 attached via `with_summarizer` and additionally requires the `summarize` feature.
+
+`remember_chunked` splits `text` with [`chunk_text`](#chunk-chunkstrategy-chunkopts-chunk--chunk_text)
+under `chunk_opts`, embeds every chunk in one batched call, and writes one record per
+chunk with a deterministic `{parent_id}#{index}` id, each stamped with
+`nidus.parent_id`/`nidus.chunk_index` (see the table below). Two behaviours worth
+knowing before they surprise a caller in production: re-chunking a document that has
+shrunk since its last write prunes the stale tail, so if a parent previously produced
+10 chunks and now produces 3, records 3 through 9 are deleted and `pruned` reports how
+many; and `RememberOpts::dedupe_threshold` together with chunking is a hard error, not
+a silently ignored option, because deduping a chunk onto some unrelated document's
+chunk would break the `parent_id`/`chunk_index` grouping that later processing relies
+on. `RememberOpts::mode` is likewise rejected rather than ignored: summarizing is a
+whole-document operation, so summarize first and chunk the summary.
+
+Empty or whitespace-only `text` is the one case that writes nothing **and** prunes
+nothing. That asymmetry is deliberate: an accidental empty read (a failed file load, a
+truncated fetch) would otherwise delete every chunk of the document it was meant to
+update. To remove a document, call `delete_where` on its `nidus.parent_id` rather than
+remembering it as empty.
+
+`nidus.parent_id` and `nidus.chunk_index` are stamped by the store and stripped from
+caller-supplied attrs on every write path, so a caller cannot forge chunk provenance and
+have an unrelated document's re-ingest delete the row.
 
 ### Memory metadata keys
 
@@ -747,6 +777,68 @@ Attr and collection-meta keys `remember`/`recall` stamp and read. All gated on
 | `META_SUMMARY` | `nidus.summary` | `summarize` feature. The generated summary text when `RememberMode::Summarize` is used, i.e. what was actually embedded |
 | `META_SOURCE` | `nidus.source` | `summarize` feature. **Legacy and read-only**: no longer stamped by any surface. `META_TEXT` carries the raw source text now; this is kept only so records written before nidus-133 remain readable |
 | `META_EXPIRES_AT` | `nidus.expires_at` | ungated. `Value::DateTime` after which an entry is expired; absent means it never expires. Consulted by `Nidus::sweep_expired` |
+| `META_PARENT_ID` | `nidus.parent_id` | ungated. `Value::Str`: the id of the document a chunk was split from. Stamped by `remember_chunked` on every chunk record |
+| `META_CHUNK_INDEX` | `nidus.chunk_index` | ungated. `Value::Int`: the chunk's 0-based position within its parent document. Stamped by `remember_chunked`; lets a stale tail be deleted with a `Ge` filter |
+
+## `chunk`: `ChunkStrategy`, `ChunkOpts`, `Chunk` & `chunk_text`
+
+Splits text into overlapping spans before embedding, so a document longer than a
+paragraph does not get averaged into one vector that loses what a caller will later
+search for. Ungated: no dependency, no store, no IO. Pure text in, spans out.
+
+```rust
+pub enum ChunkStrategy {
+    Recursive,  // splits on a separator ladder: "\n\n", "\n", ". ", " ", then a hard char cut
+    Markdown,   // splits at headings, never inside a fenced code block
+    Sentence,   // splits at sentence boundaries ('.', '!', '?' followed by whitespace or EOF)
+}
+// Default is Recursive.
+
+pub struct ChunkOpts {
+    pub strategy: ChunkStrategy,
+    pub max_chars: usize,     // default 1000
+    pub overlap_chars: usize, // default 100
+}
+
+pub struct Chunk {
+    pub text: String,
+    pub index: usize,      // 0-based, dense, in source order
+    pub char_start: usize, // a CHAR offset into the source, not a byte offset
+}
+
+pub fn chunk_text(text: &str, opts: &ChunkOpts) -> anyhow::Result<Vec<Chunk>>;
+```
+
+```rust
+use nidus::chunk::{chunk_text, ChunkOpts, ChunkStrategy};
+
+let opts = ChunkOpts { strategy: ChunkStrategy::Markdown, max_chars: 500, overlap_chars: 50 };
+let chunks = chunk_text(&document_text, &opts)?;
+for c in &chunks {
+    println!("chunk {} at char {}: {} bytes", c.index, c.char_start, c.text.len());
+}
+```
+
+Every chunk is an exact slice of the source text: nothing is rewritten, only trimmed by
+moving `char_start` or shortening the span. Overlap works forward from that guarantee,
+so `char_start` of chunk N+1 sits `overlap_chars` behind the end of chunk N.
+
+Honest limits, in the order a reader tends to hit them:
+- sizes are measured in **characters**, not tokens and not bytes. nidus does not
+  tokenize for a model it does not own; a provider's own max-input limit is a
+  separate concern (batch size, not document size) that stays the embedder's job.
+- `char_start` is a **char** offset. Do not index the original `&str` by byte using
+  it directly; collect to `Vec<char>` first, or use `str::chars().skip(...)`.
+- `char` boundaries are not grapheme boundaries, so a ZWJ emoji sequence or a
+  combining accent can split across chunks.
+- `Markdown` never splits inside a fenced code block (``` or ~~~), even if a line
+  inside it looks like a heading.
+- `Sentence` boundaries are naive: there is no abbreviation dictionary, so "Dr." or
+  "e.g." ends a sentence just like a real one does.
+
+`max_chars == 0` and `overlap_chars >= max_chars` are both rejected with `Err`, since
+an overlap at or above the budget makes no forward progress. Empty or all-whitespace
+input returns `Ok(vec![])`, never a single empty chunk.
 
 ## `Persistence`, `Appender`, `BackendLock` & `MemoryTier`
 

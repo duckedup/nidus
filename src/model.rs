@@ -590,6 +590,12 @@ impl LimitPer {
 /// re-exports this constant so its public path is unchanged.
 pub const META_TEXT: &str = "nidus.text";
 
+/// Attr keys stamped by `src/chunk`. Live here (not `memory.rs`) so the ungated `chunk`
+/// module and the `store/` rollup reach them without `memory`/`embed`. `chunk_index` is
+/// `Value::Int` (so `Predicate::Ge` can address it); `parent_id` is `Value::Str`.
+pub const META_PARENT_ID: &str = "nidus.parent_id";
+pub const META_CHUNK_INDEX: &str = "nidus.chunk_index";
+
 /// Default overscan (see [`RerankOpts::overscan`]): a `top_k=10` query reranks 100 candidates.
 pub const DEFAULT_RERANK_OVERSCAN: usize = 10;
 

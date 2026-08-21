@@ -26,6 +26,9 @@ pub mod backend;
 // Cooperative cancellation for long scans: a request deadline frees the client, only the
 // scan loop can free the CPU.
 mod cancel;
+// Pure text -> ordered spans chunking for the memory layer (nidus-lvo.1). Ungated: it
+// must run under `just miri` and ship to every `cargo add nidus`, not just `memory`.
+pub mod chunk;
 mod config;
 mod data;
 // Levelled, logfmt diagnostics (`NIDUS_LOG`). Internal: what an embedding application
@@ -90,8 +93,8 @@ pub mod rerank;
 mod memory;
 #[cfg(feature = "memory")]
 pub use memory::{
-    META_CREATED_AT, META_DIM, META_EMBEDDER, META_TEXT, META_UPDATED_AT, Memory, RecallOpts,
-    RememberMode, RememberOpts, Remembered,
+    ChunkedRemembered, META_CREATED_AT, META_DIM, META_EMBEDDER, META_TEXT, META_UPDATED_AT,
+    Memory, RecallOpts, RememberMode, RememberOpts, Remembered,
 };
 // The summarize-mode attr keys are only defined when summaries can be produced.
 #[cfg(all(feature = "memory", feature = "summarize"))]
@@ -112,8 +115,8 @@ pub use meta::META_EXPIRES_AT;
 pub use model::{
     AggregateOpts, Aggregation, AnnConfig, AnnKind, ClusterStatus, DEFAULT_RERANK_OVERSCAN, Decay,
     Distance, Filter, Footprint, FtsClause, FtsCombine, FtsQuery, Group, Hit, HybridOpts, LimitPer,
-    ListOpts, OrderBy, Predicate, Projection, QuantKind, Quantization, RankBy, Record, RerankOpts,
-    Role, SearchOpts, Value,
+    ListOpts, META_CHUNK_INDEX, META_PARENT_ID, OrderBy, Predicate, Projection, QuantKind,
+    Quantization, RankBy, Record, RerankOpts, Role, SearchOpts, Value,
 };
 pub use profile::OpenProfile;
 pub use store::Readiness;
