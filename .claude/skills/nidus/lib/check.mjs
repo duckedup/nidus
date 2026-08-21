@@ -4,6 +4,7 @@
 import { lanes, formatLanes } from './lanes.mjs'
 import * as laws from './laws.mjs'
 import * as fleet from './fleet.mjs'
+import * as pre from './preflight.mjs'
 import * as git from './git.mjs'
 import { selftest } from './selftest.mjs'
 import { readFileSync, existsSync } from 'node:fs'
@@ -39,9 +40,16 @@ const RS = f => f.endsWith('.rs')
 function runLaws() {
   const t = target()
   const changed = git.changedFiles(t)
+  // nidus-qko: a --base over a stale local ref examines a range nobody meant and reports
+  // it as thoroughness. The two file counts are the tell, so compute both.
+  const drift = t.kind === 'range' ? git.refDrift(flag('base') === true ? null : flag('base') || 'main') : { behind: 0 }
+  const driftFindings = drift.behind > 0
+    ? laws.staleBase({ ...drift, examined: changed.length, examinedFresh: git.changedFiles(git.resolveTarget({ base: `origin/${drift.ref}`, head: flag('head') === true ? null : flag('head') })).length })
+    : []
   const added = git.addedFiles(t)
   const addedLines = git.addedLineMap(t)
   const findings = []
+  findings.push(...driftFindings)
   findings.push(...laws.emptyScope(changed, t.kind))
 
   for (const f of changed.filter(RS)) {
@@ -92,7 +100,8 @@ function runLaws() {
   } else {
     // Printed unconditionally: when this was tied to the no-findings branch, any finding
     // hid what had been examined, so a run over nothing read exactly like a clean one.
-    console.log(`Examined ${changed.length} changed file(s) (${t.kind}).`)
+    const stale = driftFindings.length ? ` — WARNING: base ${drift.ref} is ${drift.behind} commit(s) behind origin/${drift.ref}` : ''
+    console.log(`Examined ${changed.length} changed file(s) (${t.kind})${stale}.`)
     if (!findings.length) console.log('No law violations.')
     for (const f of findings) {
       console.log(`${f.severity === 'error' ? '✗' : '!'} [${f.id}] ${f.file}:${f.line} — ${f.summary}\n    ${f.detail}`)
@@ -106,7 +115,7 @@ function runLaws() {
 // than in a context that cannot clear itself.
 const PLAN = '.claude/fleet-plan.json'
 
-const mainVersion = () => (git.sh('git show origin/main:Cargo.toml', { allowFail: true }).match(/^version\s*=\s*"([^"]+)"/m) || [])[1] || null
+const mainVersion_ = () => (git.sh('git show origin/main:Cargo.toml', { allowFail: true }).match(/^version\s*=\s*"([^"]+)"/m) || [])[1] || null
 
 function runFleet() {
   const explicit = flag('plan')
@@ -128,13 +137,47 @@ function runFleet() {
     ...fleet.issueFindings(peers, issues, { login: self.login }),
     ...fleet.overlapFindings(peers),
     ...fleet.orphanFindings(trees, peers, self),
-    ...fleet.versionFindings(git.inflightVersions(), mainVersion(), git.releasedTags(), git.openPrRefs(), laws.BEHAVIOURAL),
+    ...fleet.versionFindings(git.inflightVersions(), mainVersion_(), git.releasedTags(), git.openPrRefs(), laws.BEHAVIOURAL),
   ]
   const state = fleet.rehydrate(peers, issues, trees, git.inflightVersions().map(b => b.ref))
 
   if (asJson) console.log(JSON.stringify({ plan: planPath, self, peers, issues, state, findings }, null, 2))
   else if (argv.includes('--status')) console.log(fleet.formatRehydrate(state))
   else console.log(`${fleet.formatRehydrate(state)}\n\n${fleet.formatFleet(findings)}`)
+  return findings.some(f => f.severity === 'error') || (argv.includes('--strict') && findings.length) ? 1 : 0
+}
+
+
+function runPreflight() {
+  const noFetch = argv.includes('--no-fetch')
+  const fetched = noFetch ? false : git.fetchOrigin()
+  const self = git.treeFacts(process.cwd())
+  const behind = git.behindMain()
+  const raw = flag('issue')
+  const id = typeof raw === 'string' ? raw.replace(new RegExp(`^(?:#|${git.BEAD_PREFIX}-)`), '') : null
+
+  let issue = null
+  let issueBranches = []
+  if (id) {
+    const facts = git.issueFacts([id])
+    issue = facts[String(id)] || { number: id, unknown: true }
+    issueBranches = git.branchesForIssue(id)
+  }
+
+  const mainVersion = mainVersion_()
+  const claimed = git.inflightVersions()
+  const released = git.releasedTags()
+  const nextVersion = pre.nextFreeVersion(mainVersion, claimed, released)
+
+  const findings = pre.preflight({
+    fetched, branch: self.branch, onMain: self.branch === 'main',
+    dirty: self.dirty, behind, issue, issueBranches,
+    me: git.identities(),
+  })
+  const info = { branch: self.branch, behind, mainVersion, nextVersion, fetched }
+
+  if (asJson) console.log(JSON.stringify({ info, claimed, issue, issueBranches, findings }, null, 2))
+  else console.log(pre.formatPreflight(findings, info))
   return findings.some(f => f.severity === 'error') || (argv.includes('--strict') && findings.length) ? 1 : 0
 }
 
@@ -159,6 +202,15 @@ const USAGE = `nidus-check — deterministic checks for this repo's laws and ver
       run. --status prints just that derived state. The plan is
       {"peers":[{"name":…,"dir":…,"self":true?,"queue":[…],"surface":{"<n>":["path"]}}]}.
 
+  nidus-check preflight [--issue <id>] [--no-fetch] [--json] [--strict]
+      Run this FIRST, before evaluating anything. Fetches origin, then reports
+      whether this tree is fit to reason from: behind origin/main, on main,
+      dirty, and — with --issue — whether the ticket is already closed, already
+      carried by a merged or open PR, assigned to someone else, or already has a
+      remote branch. Also prints the next free Cargo.toml version. Errors block:
+      a stale base makes every judgement below it, the ticket's state included,
+      a statement about a main that has since moved.
+
   nidus-check selftest
       Run the fixture suite for the detectors.
 
@@ -169,6 +221,7 @@ const exit = (() => {
     case 'lanes': return runLanes()
     case 'laws': return runLaws()
     case 'fleet': return runFleet()
+    case 'preflight': return runPreflight()
     case 'selftest': return selftest({ json: asJson })
     default: console.log(USAGE); return cmd ? 1 : 0
   }
