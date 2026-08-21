@@ -311,12 +311,23 @@ export function behindMain(dir = process.cwd()) {
 // Is `ref` a local branch behind its own remote counterpart? The nidus-qko case: a
 // `--base main` over a stale local main examines a range nobody meant.
 export function refDrift(ref, dir = process.cwd()) {
-  if (!ref || /^origin\//.test(ref)) return { ref, hasRemote: false, behind: 0 }
+  if (!ref || /^origin\//.test(ref)) return { ref, hasRemote: false, behind: 0, ahead: 0 }
   const short = ref.replace(/^refs\/heads\//, '')
   const hasRemote = inDir(dir, `rev-parse --verify --quiet origin/${short}`) !== ''
-  if (!hasRemote) return { ref: short, hasRemote: false, behind: 0 }
-  const n = inDir(dir, `rev-list --count ${short}..origin/${short}`)
-  return { ref: short, hasRemote: true, behind: /^\d+$/.test(n) ? Number(n) : 0 }
+  if (!hasRemote) return { ref: short, hasRemote: false, behind: 0, ahead: 0 }
+  const count = spec => {
+    const n = inDir(dir, `rev-list --count ${spec}`)
+    return /^\d+$/.test(n) ? Number(n) : 0
+  }
+  // Ahead matters as much as behind (nidus-1jb): unpushed commits on a shared branch are
+  // work stranded on one machine, and they widen a `--base <ref>` range nobody meant.
+  const local = inDir(dir, `rev-parse --verify --quiet ${short}`) !== ''
+  return {
+    ref: short,
+    hasRemote: true,
+    behind: count(`${short}..origin/${short}`),
+    ahead: local ? count(`origin/${short}..${short}`) : 0,
+  }
 }
 
 // Remote branches whose name carries this issue's number, so a ticket someone else
