@@ -97,6 +97,19 @@ export function versionBump(baseCargo, headCargo, changed) {
 // A run that examined nothing must not read as a pass. Reported as a finding rather than
 // a console line so it survives --json and cannot be hidden by another finding — the
 // exact asymmetry that let a vacuous run mask a real comment-cap error (#173).
+// `nidus-check laws --base <local ref>` over a ref behind its remote counterpart examines
+// a range nobody meant, and reports it as thoroughness rather than as the wrong range
+// (nidus-qko). The two file counts are the tell that distinguishes the two.
+export function staleBase({ ref, hasRemote, behind = 0, examined = null, examinedFresh = null } = {}) {
+  if (!ref || !hasRemote || behind <= 0) return []
+  const counts = examined !== null && examinedFresh !== null && examined !== examinedFresh
+    ? ` This run examined ${examined} file(s); against origin/${ref} it is ${examinedFresh}.`
+    : ''
+  return [finding('stale-base', 'warn', ref, 1,
+    `local ${ref} is ${behind} commit(s) behind origin/${ref}, so this range is not the one you meant`,
+    `A green result over the wrong range says nothing about your work.${counts} Re-run with --base origin/${ref}.`)]
+}
+
 export function emptyScope(changed, kind = 'range') {
   if ((changed || []).length) return []
   return [finding('empty-scope', 'warn', 'scope', 1,
@@ -311,6 +324,7 @@ export function unclosedTickets(mentioned = new Set(), closing = new Set(), titl
 }
 
 export const LAW_IDS = [
+  'stale-base',
   'comment-cap', 'unsafe-code', 'unsafe-attr', 'version-bump', 'docs-version-sync',
   'bot-stamped', 'forbidden-dep', 'new-dep', 'test-placement', 'miri-ignore',
   'feature-gating', 'mod-gating', 'stale-ticket',

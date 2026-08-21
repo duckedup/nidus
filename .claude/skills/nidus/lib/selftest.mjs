@@ -3,6 +3,7 @@
 
 import * as laws from './laws.mjs'
 import * as fleet from './fleet.mjs'
+import * as pre from './preflight.mjs'
 import { lanes, formatLanes } from './lanes.mjs'
 
 const cases = []
@@ -773,6 +774,95 @@ test('fleet: version compare is numeric, not lexical', () => {
   eq(ids(fleet.versionFindings([{ ref: 'origin/a', version: '0.10.0' }], '0.9.0', new Set())), [], '0.10 > 0.9 and alone')
   const two = [{ ref: 'origin/a', version: '0.10.0' }, { ref: 'origin/b', version: '0.9.1' }]
   eq(ids(fleet.versionFindings(two, '0.9.0', new Set())), [], 'both ahead, both distinct')
+})
+
+// ── preflight (nidus-3xx) ──────────────────────────────────────────────────
+
+const clean = { fetched: true, branch: 'austin/x', onMain: false, dirty: false, behind: 0 }
+
+test('preflight: a fresh branch off a fetched main is clear', () => {
+  eq(ids(pre.preflight(clean)), [], 'findings')
+})
+
+test('preflight: --no-fetch is itself the finding', () => {
+  eq(ids(pre.preflight({ ...clean, fetched: false })), ['preflight-no-fetch'], 'findings')
+})
+
+test('preflight: behind origin/main blocks, and names the count', () => {
+  const found = pre.preflight({ ...clean, behind: 12 })
+  eq(ids(found), ['preflight-stale-base'], 'findings')
+  eq(found[0].summary.includes('12'), true, 'the count is in the summary')
+})
+
+test('preflight: on main reports that instead of staleness', () => {
+  eq(ids(pre.preflight({ ...clean, onMain: true, branch: 'main', behind: 3 })), ['preflight-on-main'], 'one finding, not two')
+})
+
+test('preflight: a dirty tree warns but does not block', () => {
+  const found = pre.preflight({ ...clean, dirty: true })
+  eq(found.map(f => f.severity), ['warn'], 'severity')
+})
+
+test('preflight: no --issue means no ticket findings at all', () => {
+  eq(ids(pre.preflight({ ...clean, issue: null })), [], 'findings')
+})
+
+test('preflight: a closed ticket shipped by a merged PR blocks on both counts', () => {
+  const issue = { number: 'lvo.1', state: 'CLOSED', assignees: [], linkedPrs: [{ number: 218, state: 'MERGED' }] }
+  eq(ids(pre.preflight({ ...clean, issue })), ['preflight-ticket-closed', 'preflight-ticket-shipped'], 'findings')
+})
+
+test('preflight: an open PR on the ticket blocks a second branch', () => {
+  const issue = { number: 'tx2', state: 'OPEN', assignees: [], linkedPrs: [{ number: 219, state: 'OPEN' }] }
+  const found = pre.preflight({ ...clean, issue })
+  eq(ids(found), ['preflight-ticket-in-pr'], 'findings')
+  eq(found[0].summary.includes('#219'), true, 'the PR number is in the summary')
+})
+
+test('preflight: assigned to me is not taken; assigned to someone else is', () => {
+  const mine = { number: '7', state: 'OPEN', assignees: ['Austin Riendeau'], linkedPrs: [] }
+  eq(ids(pre.preflight({ ...clean, issue: mine, me: ['ariendeau', 'Austin Riendeau'] })), [], 'mine')
+  eq(ids(pre.preflight({ ...clean, issue: mine, me: ['someone-else'] })), ['preflight-ticket-taken'], 'theirs')
+})
+
+test('preflight: a ticket bd cannot resolve warns rather than being invented', () => {
+  eq(ids(pre.preflight({ ...clean, issue: { number: 'zzz', unknown: true } })), ['preflight-ticket-unknown'], 'findings')
+})
+
+test('preflight: an existing remote branch for the ticket is not this branch', () => {
+  const issue = { number: '7', state: 'OPEN', assignees: [], linkedPrs: [] }
+  eq(ids(pre.preflight({ ...clean, issue, issueBranches: ['origin/austin/x'] })), [], 'our own branch')
+  eq(ids(pre.preflight({ ...clean, issue, issueBranches: ['origin/someone/7-thing'] })), ['preflight-branch-exists'], 'a foreign one')
+})
+
+test('preflight: next free version skips main, in-flight branches and released tags', () => {
+  const claimed = [{ ref: 'origin/a', version: '0.73.0' }]
+  eq(pre.nextFreeVersion('0.72.0', claimed, new Set(['v0.72.0'])), '0.74.0', 'past the in-flight claim')
+  eq(pre.nextFreeVersion('0.72.0', [], new Set(['v0.72.0', 'v0.73.0'])), '0.74.0', 'past a released tag with no branch')
+  eq(pre.nextFreeVersion('0.9.0', [{ ref: 'origin/a', version: '0.10.0' }], new Set()), '0.11.0', 'numeric, not lexical')
+})
+
+// ── stale base (nidus-qko) ─────────────────────────────────────────────────
+
+test('stale base: a local ref behind its remote is flagged, with both counts', () => {
+  const found = laws.staleBase({ ref: 'main', hasRemote: true, behind: 12, examined: 89, examinedFresh: 10 })
+  eq(ids(found), ['stale-base'], 'findings')
+  eq(found[0].severity, 'warn', 'severity')
+  eq(found[0].detail.includes('89') && found[0].detail.includes('10'), true, 'both counts named')
+})
+
+test('stale base: an up-to-date ref is silent', () => {
+  eq(ids(laws.staleBase({ ref: 'main', hasRemote: true, behind: 0, examined: 10, examinedFresh: 10 })), [], 'findings')
+})
+
+test('stale base: a ref with no remote counterpart is silent', () => {
+  eq(ids(laws.staleBase({ ref: 'local-only', hasRemote: false, behind: 0 })), [], 'findings')
+})
+
+test('stale base: equal counts do not claim a difference that is not there', () => {
+  const found = laws.staleBase({ ref: 'main', hasRemote: true, behind: 2, examined: 10, examinedFresh: 10 })
+  eq(ids(found), ['stale-base'], 'still flagged — the range is still wrong')
+  eq(found[0].detail.includes('examined 10 file(s)'), false, 'no fabricated count comparison')
 })
 
 export function selftest({ json = false } = {}) {

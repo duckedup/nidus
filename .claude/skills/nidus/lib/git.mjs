@@ -212,6 +212,15 @@ export function selfFacts() {
   }
 }
 
+// Every name that means "me". beads records a display name and GitHub a login, so a
+// single identity would report a ticket assigned to its own holder as taken.
+export function identities() {
+  const gh = JSON.parse(sh('gh api user --jq "{login:.login}"', { allowFail: true }) || '{}').login || null
+  const name = sh('git config user.name', { allowFail: true }).trim() || null
+  const email = sh('git config user.email', { allowFail: true }).trim() || null
+  return [gh, name, email].filter(Boolean)
+}
+
 // Issues live in beads; PRs still live on GitHub. `bd show --json` returns an array.
 const bead = n => {
   try {
@@ -236,7 +245,7 @@ export function issueFacts(numbers) {
     if (!j) continue
     const re = new RegExp(`\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+(?:#${n}|${BEAD_PREFIX}-${n})\\b`, 'i')
     out[String(n)] = {
-      number: Number(n),
+      number: /^\d+$/.test(String(n)) ? Number(n) : String(n),
       state: beadState(j.status),
       status: j.status,
       assignees: j.assignee ? [j.assignee] : [],
@@ -279,4 +288,41 @@ export function releasedTags(dir = process.cwd()) {
 export function openPrRefs() {
   const raw = sh('gh pr list --state open --limit 200 --json headRefName', { allowFail: true })
   try { return new Set(JSON.parse(raw || '[]').map(p => p.headRefName)) } catch { return new Set() }
+}
+
+// ── preflight IO ───────────────────────────────────────────────────────────
+
+// The whole point of preflight: judge against origin as it is now, not as this clone
+// last saw it. Returns false when the fetch failed, so the caller can say so.
+export function fetchOrigin(dir = process.cwd()) {
+  try {
+    sh(`git -C ${JSON.stringify(dir)} fetch --quiet --prune origin`)
+    return true
+  } catch { return false }
+}
+
+// How many commits origin/main has that HEAD does not. Non-zero means work landed that
+// this tree cannot see, so a dependency here can read as unmerged when it has shipped.
+export function behindMain(dir = process.cwd()) {
+  const n = inDir(dir, 'rev-list --count HEAD..origin/main')
+  return /^\d+$/.test(n) ? Number(n) : 0
+}
+
+// Is `ref` a local branch behind its own remote counterpart? The nidus-qko case: a
+// `--base main` over a stale local main examines a range nobody meant.
+export function refDrift(ref, dir = process.cwd()) {
+  if (!ref || /^origin\//.test(ref)) return { ref, hasRemote: false, behind: 0 }
+  const short = ref.replace(/^refs\/heads\//, '')
+  const hasRemote = inDir(dir, `rev-parse --verify --quiet origin/${short}`) !== ''
+  if (!hasRemote) return { ref: short, hasRemote: false, behind: 0 }
+  const n = inDir(dir, `rev-list --count ${short}..origin/${short}`)
+  return { ref: short, hasRemote: true, behind: /^\d+$/.test(n) ? Number(n) : 0 }
+}
+
+// Remote branches whose name carries this issue's number, so a ticket someone else
+// already started does not get picked up twice.
+export function branchesForIssue(number, dir = process.cwd()) {
+  const refs = inDir(dir, "for-each-ref --format='%(refname:short)' refs/remotes/origin").split('\n').filter(Boolean)
+  const re = new RegExp(`(^|[^0-9a-z])${String(number).replace(/\./g, '\\.')}([^0-9a-z]|$)`, 'i')
+  return refs.filter(r => !/\/(HEAD|main)$/.test(r) && re.test(r.replace(/^origin\//, '')))
 }
