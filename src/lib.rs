@@ -176,6 +176,13 @@ impl Nidus {
         })
     }
 
+    /// The object backend, for a sidecar this store does not itself own (the embedding
+    /// cache, nidus-lvo.3). `None` in memory, where there is nothing to persist to.
+    #[cfg(all(feature = "cli", feature = "memory"))]
+    pub(crate) fn persistence(&self) -> Option<std::sync::Arc<dyn backend::Persistence>> {
+        self.store.persistence()
+    }
+
     /// The pinned embedding dimension.
     pub fn dimension(&self) -> usize {
         self.store.dimension()

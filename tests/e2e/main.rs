@@ -7,6 +7,8 @@ mod harness;
 mod cluster;
 mod env_flags;
 mod hardening;
+#[cfg(feature = "embed-ollama")]
+mod ingest;
 #[cfg(feature = "mcp")]
 mod mcp;
 #[cfg(feature = "mcp")]

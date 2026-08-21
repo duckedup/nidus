@@ -23,7 +23,7 @@ fn content_id(text: &str) -> String {
 
 /// A current-thread runtime: these subcommands make one or two HTTP calls and exit, so
 /// they have nothing to gain from `serve`'s multi-threaded pool.
-fn runtime() -> Result<tokio::runtime::Runtime> {
+pub(super) fn runtime() -> Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -32,7 +32,7 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 
 /// Build the embedder these subcommands cannot run without, failing with the flag to
 /// reach for when none was configured.
-async fn require_embedder(ingest: &IngestArgs) -> Result<AnyEmbedder> {
+pub(super) async fn require_embedder(ingest: &IngestArgs) -> Result<AnyEmbedder> {
     ingest.build_embedder().await?.context(
         "no embedder configured: pass --embed-provider (voyage, openai, ollama, cohere, \
          gemini, mistral, jina, openai-compat), or set NIDUS_EMBED_PROVIDER",
@@ -42,7 +42,11 @@ async fn require_embedder(ingest: &IngestArgs) -> Result<AnyEmbedder> {
 /// Open the store for a memory subcommand, defaulting the dimension to the embedder's own
 /// so a first `remember` into a fresh directory needs no `--dim`. An explicit `--dim` still
 /// wins, and either way a store whose header disagrees is refused on open.
-fn open_with(mut store: StoreArgs, embedder: &AnyEmbedder, mutating: bool) -> Result<Nidus> {
+pub(super) fn open_with(
+    mut store: StoreArgs,
+    embedder: &AnyEmbedder,
+    mutating: bool,
+) -> Result<Nidus> {
     if store.dim.is_none() {
         store.dim = Some(embedder.dimension());
     }

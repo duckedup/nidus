@@ -1308,6 +1308,28 @@ build until a real need exists.
   default build like `src/glob/`. A provider's own max-input limit is a separate
   axis (batch size, not document size) and stays the embedder's concern.
 
+- **Directory ingestion (`nidus ingest`, nidus-lvo.2) over a content-hash embedding
+  cache (`src/embed/cache.rs`, nidus-lvo.3).** One command from a tree of files to a
+  searchable corpus: walk, chunk, embed, upsert. Idempotent by construction, via two
+  independent mechanisms that cover different cases. A **per-file digest**
+  (`nidus.source_hash`, over the text *plus* the chunk options, embedder identity and
+  dimension) skips an unchanged file whole, which is the only thing that delivers "zero
+  writes" on a re-run; changing `--max-chars` or the model correctly re-ingests rather
+  than leaving vectors from two regimes side by side. A **chunk-level vector cache** then
+  makes a file that did change cost only its changed chunks. The digest is **not** sufficient
+  alone: it lives on chunk 0, which `remember_chunked` writes *first*, so a write torn partway
+  (nidus-lvo.5) would read as complete forever. Records therefore also carry
+  `nidus.source_chunks` and the skip requires the last chunk to exist — sound because chunks
+  are written in index order, and one extra point lookup. Two more decisions worth keeping
+  settled: the cache is a **sidecar object** over the existing `src/index_cache.rs`
+  framing, not a reserved collection, because a collection is visible to whole-store scans
+  and `Scope::All` and cached vectors must never appear in a caller's results; and
+  `--prune` is **opt-in** and touches only records carrying `nidus.source_hash`, because
+  pointing `ingest` at a partial tree must not empty the collection and a hand-written
+  `remember` in the same collection is not ingest's to delete. CLI-only by nature (a
+  server cannot walk the caller's disk), so there is no HTTP, MCP or SDK leg. No on-disk
+  format change: the cache is a derived, rebuildable object.
+
 ### Still deferred (designed-for, not built)
 
 - **Pluggable storage & memory backends.** Generalize the §5 local directory along two

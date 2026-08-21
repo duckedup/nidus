@@ -2,6 +2,10 @@
 
 use std::fmt;
 
+// Content-hash embedding cache (nidus-lvo.3). Provider-independent, so it sits outside the
+// per-provider gating below and ships with the `embed` base feature.
+pub mod cache;
+
 // ── Provider adapter modules (one per `embed-<name>` feature) ────────────────
 // Public so the concrete types can appear in the public `AnyEmbedder` variants
 // without tripping the private-interface lint.
@@ -225,6 +229,41 @@ pub trait Embedder: Send + Sync {
     fn max_input_tokens(&self) -> usize;
     fn provider_name(&self) -> &str;
     fn model_name(&self) -> &str;
+}
+
+/// So a decorator ([`cache::CachedEmbedder`]) can wrap a borrowed embedder without taking
+/// ownership of one the caller still needs.
+impl<E: Embedder + ?Sized> Embedder for &E {
+    fn embed(
+        &self,
+        text: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<f32>, EmbedError>> + Send {
+        (**self).embed(text)
+    }
+    fn embed_batch(
+        &self,
+        texts: &[&str],
+    ) -> impl std::future::Future<Output = Result<Vec<Vec<f32>>, EmbedError>> + Send {
+        (**self).embed_batch(texts)
+    }
+    fn embed_query(
+        &self,
+        text: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<f32>, EmbedError>> + Send {
+        (**self).embed_query(text)
+    }
+    fn dimension(&self) -> usize {
+        (**self).dimension()
+    }
+    fn max_input_tokens(&self) -> usize {
+        (**self).max_input_tokens()
+    }
+    fn provider_name(&self) -> &str {
+        (**self).provider_name()
+    }
+    fn model_name(&self) -> &str {
+        (**self).model_name()
+    }
 }
 
 /// `"provider/model"` — a stable identity string for an embedder (used to tag

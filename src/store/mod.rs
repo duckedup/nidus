@@ -1055,6 +1055,13 @@ impl Store {
         Ok(())
     }
 
+    /// The store's object backend, for a sidecar the store itself does not own (the
+    /// embedding cache, nidus-lvo.3). `None` in memory, where there is nothing to persist to.
+    #[cfg(all(feature = "cli", feature = "memory"))]
+    pub(crate) fn persistence(&self) -> Option<Arc<dyn Persistence>> {
+        self.persistence.clone()
+    }
+
     /// Retune `ef_search`/`n_probe`/`overscan` in place. Never rebuilds: these are query-time-only
     /// tunables excluded from the persisted-cache validity key (`ann/persist.rs`), so the built
     /// structure stays exactly as it was.

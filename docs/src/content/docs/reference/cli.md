@@ -438,6 +438,29 @@ approximate results before scoring, and the output says so in words rather than
 reporting a flattered number. The result is print-only: it names `nidus configure`
 as the way to persist the recommendation, but never writes to the store itself.
 
+### `ingest` (`memory` feature)
+
+Walk a directory, chunk each file, embed the chunks and upsert them. Idempotent: a
+re-run over an unchanged tree makes no embedding calls and no writes. Usage:
+`nidus ingest [OPTIONS] --collection <NAME> --dir <DIR> <PATH>`. Takes the store flags
+and the [ingest flags](#ingest-flags-memory-feature) (it needs an embedder), plus:
+
+| Flag | Env | Description |
+| --- | --- | --- |
+| `--collection <NAME>` | none | Collection to ingest into. Required. |
+| `--glob <GLOB>` | none | GLOB over each path relative to `PATH` (default `*`). `*` crosses `/`, so `*.md` is already recursive; a leading `**/` is optional. |
+| `--strategy <S>` | none | `recursive` (default), `markdown`, or `sentence`. |
+| `--max-chars <N>` | none | Chunk budget in characters, not tokens (default `1000`). |
+| `--overlap-chars <N>` | none | Characters of backward overlap per chunk (default `100`). Must be below `--max-chars`. |
+| `--prune` | none | Delete previously-ingested records whose source file is gone. Opt-in, because pointing `ingest` at a partial tree must not empty the collection. Only removes records this command wrote. |
+| `--dry-run` | none | Report what would happen without embedding or writing anything. |
+| `--no-cache` | none | Skip the content-hash embedding cache. The per-file skip still applies. |
+| `--cache-max-entries <N>` | none | Cached vectors to keep before evicting the oldest (default `50000`). |
+
+Dot-entries, symlinks, and files that are not valid UTF-8 are skipped; the last of
+these is counted as `skipped_non_utf8` rather than failing the run. See
+[Ingest a directory](/guides/ingest/) for the full behaviour.
+
 ### `remember` (`memory` feature)
 
 Embed `text` (optionally summarizing first) and store it. Usage:
