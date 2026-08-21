@@ -126,3 +126,25 @@ fn ingest_lane_enables_the_async_edge() {
         "ingest lane must enable at least one async-edge base feature"
     );
 }
+
+/// `src/chunk` is deliberately ungated (no Cargo feature), so it must compile and split
+/// text with zero features enabled. A `#[cfg(feature = "…")]` added above `pub mod chunk`
+/// would fail this test to compile on the pure lane, catching the regression this guards.
+#[test]
+fn chunker_ships_in_default_build() {
+    let opts = nidus::chunk::ChunkOpts {
+        max_chars: 20,
+        overlap_chars: 0,
+        ..Default::default()
+    };
+    let chunks = nidus::chunk::chunk_text(
+        "This text is comfortably longer than twenty characters and must split.",
+        &opts,
+    )
+    .unwrap();
+    assert!(
+        chunks.len() > 1,
+        "expected more than one chunk from text longer than max_chars"
+    );
+    assert_eq!(chunks[0].index, 0);
+}

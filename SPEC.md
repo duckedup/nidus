@@ -1125,7 +1125,10 @@ build until a real need exists.
   reserved attr vocabulary, and optionally suppresses near-duplicates. The reserved
   keys are `nidus.text` (the raw text, always stamped, and what the default schema
   indexes), `nidus.created_at` / `nidus.updated_at` / `nidus.expires_at` (all
-  `Value::DateTime`, UTC epoch ms). `nidus.source` predates `nidus.text`, carried
+  `Value::DateTime`, UTC epoch ms), and `nidus.parent_id` (`Value::Str`) /
+  `nidus.chunk_index` (`Value::Int`), stamped by `remember_chunked` to record which
+  document a chunk came from and its 0-based position within it. `nidus.source`
+  predates `nidus.text`, carried
   exactly the same value, and is retained read-only so records written before this
   change still resolve — nothing stamps it now. Because `upsert` replaces a doc's
   attrs wholesale, both preserving `created_at` and merging a dedupe match's
@@ -1264,6 +1267,17 @@ build until a real need exists.
   subcommands via `--rerank` (nidus-d42). `similar` and `/search/batch` remain excluded:
   the former has no query text, the latter is out of scope for v1. No on-disk format
   change.
+- **Chunking (`src/chunk`, nidus-lvo.1).** Pure text-in/spans-out splitting
+  (`Recursive`/`Markdown`/`Sentence` strategies) that `Memory::remember_chunked`
+  builds on, so a document too long to embed as one vector without averaging away
+  what a caller will later search for is instead split into overlapping spans, each
+  its own record carrying `nidus.parent_id`/`nidus.chunk_index`. Two decisions worth
+  keeping settled: sizes are measured in **characters, not tokens**, because nidus
+  does not tokenize for a model it does not own, and a character budget with a
+  built-in safety margin is honest about that; and the module is **ungated** (no
+  `Cargo.toml` dependency added), unlike `embed`/`rerank`, so it ships in the
+  default build like `src/glob/`. A provider's own max-input limit is a separate
+  axis (batch size, not document size) and stays the embedder's concern.
 
 ### Still deferred (designed-for, not built)
 
@@ -1496,6 +1510,11 @@ A typical semantic-index document maps cleanly, e.g.:
 | language / mime / labels | `Str` / `List` or absent |
 | content hash (change detection) | `Str` or absent |
 | optional edges/relations | `List` (present) · `Null` (computed-empty) · absent (un-indexed) |
+
+`attrs["kind"]` above is an application-level convention the caller chooses for its own
+document taxonomy; it is not the same thing as the `nidus.*`-namespaced reserved keys
+(§9's agent-memory write path, including `nidus.parent_id`/`nidus.chunk_index`), which
+nidus itself stamps and reads.
 
 The application's notion of a namespace → a nidus collection; any per-namespace
 bookkeeping (a sync high-water mark, the embedding model id) → the collection's
