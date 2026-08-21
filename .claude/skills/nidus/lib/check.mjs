@@ -69,7 +69,7 @@ function runLaws() {
     // Against where origin/main is NOW, not the merge base — the backwards case is
     // invisible from inside the branch, which is why no existing law catches it.
     const originCargo = git.readAtRef('origin/main', 'Cargo.toml')
-    if (originCargo) findings.push(...laws.versionBackwards(headCargo, originCargo, changed))
+    if (originCargo) findings.push(...laws.versionBackwards(baseCargo, headCargo, originCargo, changed))
     findings.push(...laws.docsVersionSync(baseCargo, headCargo, {
       'README.md': git.readAt(t, 'README.md'),
       'docs/src/content/docs/getting-started.md': git.readAt(t, 'docs/src/content/docs/getting-started.md'),

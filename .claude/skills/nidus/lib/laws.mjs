@@ -115,17 +115,20 @@ const cmpVersion = (a, b) => {
 }
 
 // versionBump and docsVersionSync both compare merge-base to head, so neither can see a
-// branch landing *behind* a version already on origin/main — the second merge silently
-// releases nothing. Only a branch that edits Cargo.toml can do this: leave it alone and
-// the merge keeps main's value.
-export function versionBackwards(headCargo, originCargo, changed) {
+// branch claiming a version origin/main already has or has passed — the second merge
+// silently releases nothing. Gate on the version having *changed*, not on Cargo.toml
+// being touched, so a dependency-only edit at the same version stays clean.
+export function versionBackwards(baseCargo, headCargo, originCargo, changed) {
   if (!(changed || []).includes('Cargo.toml')) return []
+  const base = versionOf(baseCargo)
   const head = versionOf(headCargo)
   const origin = versionOf(originCargo)
-  if (!head || !origin || cmpVersion(head, origin) >= 0) return []
+  if (!head || !origin || base === head) return []
+  if (cmpVersion(head, origin) > 0) return []
+  const how = cmpVersion(head, origin) === 0 ? `is already origin/main's` : `is behind origin/main's`
   return [finding('version-backwards', 'error', 'Cargo.toml', 1,
-    `version ${head} is behind origin/main's ${origin}`,
-    'Merging this would move the crate version backwards, and release.yml only tags a version it has not seen — so it would ship nothing, silently. Rebase and pick a version above origin/main.')]
+    `version ${head} ${how} ${origin}`,
+    'release.yml only tags a version it has not seen, so merging this ships NOTHING, silently. Pick a version strictly above origin/main.')]
 }
 
 const SNIPPET_FILES = ['README.md', 'docs/src/content/docs/getting-started.md']
