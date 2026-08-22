@@ -7,8 +7,10 @@
 
 use serde_json::{Value, json};
 
-use crate::harness::RunningServer;
-use crate::mcp::support::{DIM, mock_embedder_per_text, per_text_embedder_server, vector_for};
+use crate::harness::{RunningServer, Server};
+use crate::mcp::support::{
+    DIM, mock_embedder_per_text, mock_embedder_slow_for, per_text_embedder_server, vector_for,
+};
 
 /// `POST /collections/notes/remember`, asserting success and returning the response.
 fn remember(server: &RunningServer, args: Value) -> Value {
@@ -574,6 +576,50 @@ fn recall_diversity_spreads_a_crowded_window_over_http() {
     );
     // `0.0` is a real lambda, not "unset" — the trap `RecallOpts`' zero sentinel sets.
     assert_eq!(recalled(Some(0.0)), ["dup0", "novel"]);
+}
+
+/// A `reinforce` recall queues through the write committer, so the real binary must judge it on
+/// `--write-timeout` (nidus-a34). The embed is what is made slow, since it runs inside the
+/// deadline; the two recalls differ **only** in the flag, so this is about classification.
+#[test]
+fn a_reinforced_recall_is_judged_on_the_write_deadline_over_http() {
+    const SLOW: &str = "SLOWQUERY";
+    let dir = tempfile::tempdir().unwrap();
+    let embed_url = mock_embedder_slow_for(DIM, SLOW, std::time::Duration::from_secs(3));
+    // 3s against a 1s read deadline and a 60s write one: 3x over the bound it must breach,
+    // 20x under the one it must not, so neither arm is a timing race on a shared runner.
+    let server = Server::new(dir.path(), DIM)
+        .args([
+            "--embed-provider",
+            "ollama",
+            "--embed-base-url",
+            &embed_url,
+            "--read-timeout",
+            "1",
+            "--write-timeout",
+            "60",
+        ])
+        .start();
+
+    remember(&server, json!({"id": "alpha", "text": "the first note"}));
+
+    let (status, body) = server.post(
+        "/collections/notes/recall",
+        &json!({"query": SLOW, "top_k": 10}),
+    );
+    assert_eq!(status, 504, "a plain recall is a read: {body}");
+    assert_eq!(body["retryable"], false, "{body}");
+
+    let hits = recall_with(
+        &server,
+        json!({"query": SLOW, "top_k": 10, "reinforce": true}),
+    );
+    assert_eq!(ids(&hits), ["alpha"], "the reinforced recall answered");
+    assert_eq!(
+        access_count(&listed_attrs(&server, "alpha")),
+        Some(1),
+        "and its stamp landed, so it really did take the write path"
+    );
 }
 
 /// `v` scaled to unit length. A zero vector is returned unchanged, as the store does.

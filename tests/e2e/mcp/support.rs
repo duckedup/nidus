@@ -115,6 +115,35 @@ pub(crate) fn mock_embedder_per_text(dim: usize) -> String {
     format!("http://{addr}")
 }
 
+/// A per-text mock that sleeps `delay` before answering, but **only** for a text containing
+/// `marker` — so a test can make one request outlive a deadline while its setup stays fast.
+/// One thread per connection, so a slow answer never delays a later request.
+pub(crate) fn mock_embedder_slow_for(
+    dim: usize,
+    marker: &str,
+    delay: std::time::Duration,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock embedder");
+    let addr = listener.local_addr().expect("mock embedder addr");
+    let marker = marker.to_string();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let marker = marker.clone();
+            std::thread::spawn(move || {
+                let body = read_request_body(&mut stream);
+                let text = requested_text(&body);
+                if text.contains(&marker) {
+                    std::thread::sleep(delay);
+                }
+                let vector: Vec<f64> = vector_for(&text, dim).into_iter().map(f64::from).collect();
+                let response = json!({ "embeddings": [vector] }).to_string();
+                write_json_response(stream, &response);
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
 /// A server with a [`mock_embedder_fixed`]-backed embedder, over a fresh store directory.
 pub(super) fn fixed_embedder_server(
     dir: &std::path::Path,

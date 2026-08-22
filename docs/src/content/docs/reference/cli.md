@@ -151,8 +151,8 @@ Run the HTTP server. Usage: `nidus serve [OPTIONS] --dir <DIR>`.
 | `--token <TOKEN>` | `NIDUS_TOKEN` | Require `Authorization: Bearer <token>` on every request except `/health`. |
 | `--max-body-bytes <N>` | `NIDUS_MAX_BODY_BYTES` | Maximum request body size in bytes (default 256 MiB). |
 | `--max-concurrent-requests <N>` | `NIDUS_MAX_CONCURRENT_REQUESTS` | Cap on store-touching requests in flight (default `0` = auto: 8x CPU cores, floored at 64). |
-| `--read-timeout <SECONDS>` | `NIDUS_READ_TIMEOUT` | Deadline for a read request (default `30`; `0` disables). |
-| `--write-timeout <SECONDS>` | `NIDUS_WRITE_TIMEOUT` | Deadline for a mutating request (default `600`; `0` disables). |
+| `--read-timeout <SECONDS>` | `NIDUS_READ_TIMEOUT` | Deadline for a read request, a plain recall included (default `30`; `0` disables). |
+| `--write-timeout <SECONDS>` | `NIDUS_WRITE_TIMEOUT` | Deadline for a mutating request, a `reinforce` recall included (default `600`; `0` disables). |
 | `--body-idle-timeout <SECONDS>` | `NIDUS_BODY_IDLE_TIMEOUT` | Abandon a stalled request body (default `15`; `0` disables). |
 | `--refresh-interval <SECONDS>` | `NIDUS_REFRESH_INTERVAL` | Refresh this instance on a timer instead of leaving it to the caller. |
 | `--require-remote` | `NIDUS_REQUIRE_REMOTE` | Refuse to start unless `--persistence` and `--memory` are both shared, non-local backends. |

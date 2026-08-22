@@ -912,8 +912,9 @@ each gaining a `context` string when the query asked to `expand` or `rollup`.
 Setting `reinforce` makes this call a **write**: it queues behind the server's other
 writes to take the writer lock before stamping. On a server started with `--read-only`
 the request is refused, like any other write, rather than answered as though the stamp
-happened. Omit `reinforce` and the recall is a plain read that a read-only server serves
-normally.
+happened. It is also judged on `--write-timeout` rather than `--read-timeout`, since it
+waits in the same queue every other write does. Omit `reinforce` and the recall is a plain
+read that a read-only server serves normally, under the read deadline.
 
 `rerank` takes the same `overscan`/`text_attr` fields as [`/search`](#post-search), but
 `query` is optional here: an omitted or empty `rerank.query` falls back to the request's
