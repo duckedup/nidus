@@ -1399,6 +1399,70 @@ fn at_version_after_compaction_names_oldest_readable() {
     );
 }
 
+// ── `nidus search --rerank --plan` (nidus-cvz) ──────────────────────────────
+
+/// `--plan` and `--rerank` together must still report a plan. The rerank branch returns
+/// early, so it originally dropped `--plan` on the floor: no error, no plan, just the bare
+/// array. HTTP reports one for a reranked query, and the surfaces must not disagree.
+#[cfg(all(feature = "mcp", feature = "embed-ollama", feature = "rerank-cohere"))]
+#[test]
+fn search_reports_a_plan_even_when_reranking() {
+    use crate::mcp::support::mock_reranker_inverting;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    let records = json!([
+        {"id": "a", "vector": [1, 0, 0], "attrs": {"body": {"Str": "cat"}}},
+        {"id": "b", "vector": [0, 1, 0], "attrs": {"body": {"Str": "cat"}}}
+    ])
+    .to_string();
+    assert_eq!(
+        ok(&["upsert", "--dir", dir, "docs"], &records)["upserted"],
+        2
+    );
+
+    let rerank_url = mock_reranker_inverting();
+    let out = ok(
+        &[
+            "search",
+            "--dir",
+            dir,
+            "-k",
+            "5",
+            "docs",
+            "--plan",
+            "--rerank",
+            "--rerank-query",
+            "cat",
+            "--rerank-provider",
+            "cohere",
+            "--rerank-api-key",
+            "mock-key",
+            "--rerank-base-url",
+            &rerank_url,
+            "--rerank-text-attr",
+            "body",
+        ],
+        "[1, 0, 0]",
+    );
+
+    // The envelope, not the bare array: `hits` alongside a plan naming the path it took.
+    assert!(
+        out["hits"].is_array(),
+        "want a {{hits, plan}} envelope: {out}"
+    );
+    assert!(
+        out["plan"]["path"].as_str().is_some_and(|p| !p.is_empty()),
+        "reranked search dropped its plan: {out}"
+    );
+    assert!(
+        out["plan"]["timings"]["total_us"].is_number(),
+        "plan carries no timings: {out}"
+    );
+}
+
 // ── `nidus text-search --rerank` (nidus-d42) ────────────────────────────────
 
 /// `--rerank` reorders `text-search`'s BM25 ranking through the real `--rerank-provider`

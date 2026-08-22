@@ -62,6 +62,27 @@ pub async fn search_reranked<'a, R: Reranker>(
     Ok(db.store().finish(reranked, opts))
 }
 
+/// [`search_reranked`] that also reports the plan. The plan describes the **widened**
+/// search the rerank ran over, not the caller's final page, which is the same thing the
+/// HTTP rerank path reports (nidus-cvz).
+pub async fn search_reranked_with_plan<'a, R: Reranker>(
+    db: &Nidus,
+    reranker: &R,
+    scope: impl Into<Scope<'a>>,
+    query_vector: &[f32],
+    query_text: &str,
+    opts: &SearchOpts,
+) -> Result<(Vec<Hit>, crate::QueryPlan)> {
+    let Some(rerank_opts) = opts.rerank.clone() else {
+        return db.search_with_plan(scope, query_vector, opts);
+    };
+    let (widened, kept) = widened_opts(opts);
+    let (hits, plan) = db.search_with_plan(scope, query_vector, &widened)?;
+    let mut reranked = rerank_hits(reranker, query_text, hits, &rerank_opts).await?;
+    retrim(&mut reranked, opts, kept);
+    Ok((db.store().finish(reranked, opts), plan))
+}
+
 /// BM25 search widened to [`rerank_depth`], reranked, then tailed with the caller's real
 /// `opts` exactly as [`search_reranked`] does. A pass-through to `db.text_search` when
 /// `opts.rerank` is `None` — safe to call unconditionally.
@@ -110,6 +131,35 @@ pub async fn hybrid_reranked<'a, R: Reranker>(
     let hits = db.hybrid_search(scope, vector, text, &widened)?;
     let reranked = rerank_hits(reranker, query_text, hits, &rerank_opts).await?;
     Ok(db.store().finish_hybrid(reranked, opts))
+}
+
+/// [`hybrid_reranked`] that also reports the plan, on the same widened-search terms as
+/// [`search_reranked_with_plan`].
+pub async fn hybrid_reranked_with_plan<'a, R: Reranker>(
+    db: &Nidus,
+    reranker: &R,
+    scope: impl Into<Scope<'a>>,
+    vector: &[f32],
+    text: &FtsQuery,
+    query_text: &str,
+    opts: &HybridOpts,
+) -> Result<(Vec<Hit>, crate::QueryPlan)> {
+    let Some(rerank_opts) = opts.rerank.clone() else {
+        return db.hybrid_search_with_plan(scope, vector, text, opts);
+    };
+    let overscan = rerank_opts.overscan.max(1);
+    let widened = HybridOpts {
+        top_k: opts
+            .offset
+            .saturating_add(opts.top_k)
+            .saturating_mul(overscan),
+        offset: 0,
+        candidates: opts.candidates.saturating_mul(overscan),
+        ..opts.clone()
+    };
+    let (hits, plan) = db.hybrid_search_with_plan(scope, vector, text, &widened)?;
+    let reranked = rerank_hits(reranker, query_text, hits, &rerank_opts).await?;
+    Ok((db.store().finish_hybrid(reranked, opts), plan))
 }
 
 #[cfg(test)]

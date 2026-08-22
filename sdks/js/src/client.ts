@@ -698,6 +698,8 @@ interface RawQueryPlan {
     gather_us?: number;
     walk_us?: number;
     resolve_us?: number;
+    first_pass_us?: number;
+    rescore_us?: number;
     score_us?: number;
     total_us: number;
   };
@@ -721,6 +723,8 @@ function decodeQueryPlan(p: RawQueryPlan): QueryPlan {
     ...(t.gather_us !== undefined ? { gatherUs: t.gather_us } : {}),
     ...(t.walk_us !== undefined ? { walkUs: t.walk_us } : {}),
     ...(t.resolve_us !== undefined ? { resolveUs: t.resolve_us } : {}),
+    ...(t.first_pass_us !== undefined ? { firstPassUs: t.first_pass_us } : {}),
+    ...(t.rescore_us !== undefined ? { rescoreUs: t.rescore_us } : {}),
     ...(t.score_us !== undefined ? { scoreUs: t.score_us } : {}),
     totalUs: t.total_us,
   };

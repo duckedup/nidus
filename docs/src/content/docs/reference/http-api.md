@@ -832,6 +832,10 @@ curl -s localhost:7700/search/batch \
 A `weights` list of the wrong length is a `400` rather than a zero-filled short list, which
 would silently re-weight the wrong query.
 
+`plan` is not supported here and is a `400`, the same as `rerank`. A batch answers many
+queries into one response that has nowhere to carry a per-query plan, so accepting the
+field would mean dropping it in silence. Ask for the plan on a single-query `/search`.
+
 ### `POST /aggregate`
 
 Count the filter-matching records and total numeric attributes, without materializing any

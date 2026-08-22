@@ -721,6 +721,34 @@ func TestPlanAbsentFieldsDecodeToNilNotZero(t *testing.T) {
 	}
 }
 
+// TestQuantizedPlanTimingsAreDecoded pins the two phases the quantized two-pass path is
+// the only one to report. They were missing from PlanTimings at first, and encoding/json
+// drops unknown keys silently, so the gap was invisible: the plan decoded fine and simply
+// had no first-pass or rescore timing in it (nidus-cvz).
+func TestQuantizedPlanTimingsAreDecoded(t *testing.T) {
+	fake := &capture{reply: `{
+		"hits": [],
+		"plan": {
+			"path": "quantized",
+			"rows_scanned": 1000,
+			"narrowing": {"state": "inactive"},
+			"timings": {"first_pass_us": 120, "rescore_us": 340, "total_us": 610}
+		}
+	}`}
+	db := serve(t, fake)
+
+	_, plan, err := db.SearchWithPlan(context.Background(), SearchRequest{Query: []float32{1, 0, 0}})
+	if err != nil {
+		t.Fatalf("SearchWithPlan failed: %v", err)
+	}
+	if plan.Timings.FirstPassUs == nil || *plan.Timings.FirstPassUs != 120 {
+		t.Errorf("plan.Timings.FirstPassUs = %v, want 120", plan.Timings.FirstPassUs)
+	}
+	if plan.Timings.RescoreUs == nil || *plan.Timings.RescoreUs != 340 {
+		t.Errorf("plan.Timings.RescoreUs = %v, want 340", plan.Timings.RescoreUs)
+	}
+}
+
 // TestSearchSimilarAndHybridSearchWithPlanHitTheRightRouteAndSetPlan checks the other
 // two *WithPlan methods hit the same route as their plain sibling and set plan:true.
 func TestSearchSimilarAndHybridSearchWithPlanHitTheRightRouteAndSetPlan(t *testing.T) {

@@ -850,6 +850,28 @@ describe("*WithPlan search methods", () => {
     expect(plan.narrowing).toEqual({ state: "inactive" });
     expect(plan.timings).toEqual({ totalUs: 5 });
   });
+
+  // The quantized two-pass path is the only one reporting these two phases, and they were
+  // missing from PlanTimings at first. The decoder copies field by field, so an omitted key
+  // is dropped in silence: the plan still decoded, just without its most expensive phases.
+  it("decodes the quantized path's first-pass and rescore timings", async () => {
+    const { fn } = mockFetch({
+      hits: [],
+      plan: {
+        path: "quantized",
+        rows_scanned: 1000,
+        narrowing: { state: "inactive" },
+        timings: { first_pass_us: 120, rescore_us: 340, total_us: 610 },
+      },
+    });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const { plan } = await db.searchWithPlan({ query: [1, 0, 0] });
+    expect(plan.timings).toEqual({
+      firstPassUs: 120,
+      rescoreUs: 340,
+      totalUs: 610,
+    });
+  });
 });
 
 describe("hit annotations", () => {

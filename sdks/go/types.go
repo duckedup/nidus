@@ -437,12 +437,14 @@ type PlanNarrowing struct {
 // PlanTimings breaks the query down by phase, all in microseconds. Every field is
 // optional except Total, since not every path runs every phase.
 type PlanTimings struct {
-	NarrowUs  *uint64 `json:"narrow_us,omitempty"`
-	GatherUs  *uint64 `json:"gather_us,omitempty"`
-	WalkUs    *uint64 `json:"walk_us,omitempty"`
-	ResolveUs *uint64 `json:"resolve_us,omitempty"`
-	ScoreUs   *uint64 `json:"score_us,omitempty"`
-	TotalUs   uint64  `json:"total_us"`
+	NarrowUs    *uint64 `json:"narrow_us,omitempty"`
+	GatherUs    *uint64 `json:"gather_us,omitempty"`
+	WalkUs      *uint64 `json:"walk_us,omitempty"`
+	ResolveUs   *uint64 `json:"resolve_us,omitempty"`
+	FirstPassUs *uint64 `json:"first_pass_us,omitempty"`
+	RescoreUs   *uint64 `json:"rescore_us,omitempty"`
+	ScoreUs     *uint64 `json:"score_us,omitempty"`
+	TotalUs     uint64  `json:"total_us"`
 }
 
 // An FtsField is one entry of a [Client.SetFtsFields] schema: the attribute to

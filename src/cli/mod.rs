@@ -32,8 +32,8 @@ use crate::embed::{AnyEmbedder, EmbedConfig, EmbedProvider, Embedder};
 use crate::RerankOpts;
 #[cfg(feature = "rerank")]
 use crate::rerank::{
-    AnyReranker, RerankConfig, RerankProvider, hybrid_reranked, search_reranked,
-    text_search_reranked,
+    AnyReranker, RerankConfig, RerankProvider, hybrid_reranked, hybrid_reranked_with_plan,
+    search_reranked, search_reranked_with_plan, text_search_reranked,
 };
 #[cfg(all(feature = "memory", feature = "summarize"))]
 use crate::summarize::{AnySummarizer, SummarizeConfig, SummarizeProvider};
@@ -1646,6 +1646,17 @@ pub fn run(cli: Cli) -> Result<()> {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
+                if plan {
+                    let (hits, p) = rt.block_on(search_reranked_with_plan(
+                        &db,
+                        &reranker,
+                        scope,
+                        &query,
+                        &query_text,
+                        &opts,
+                    ))?;
+                    return print_json(&SearchResponse::new(hits, Some(p)));
+                }
                 let hits = rt.block_on(search_reranked(
                     &db,
                     &reranker,
@@ -1967,6 +1978,18 @@ pub fn run(cli: Cli) -> Result<()> {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
+                if plan {
+                    let (hits, p) = rt.block_on(hybrid_reranked_with_plan(
+                        &db,
+                        &reranker,
+                        scope,
+                        &vector,
+                        &q,
+                        &query_text,
+                        &opts,
+                    ))?;
+                    return print_json(&SearchResponse::new(hits, Some(p)));
+                }
                 let hits = rt.block_on(hybrid_reranked(
                     &db,
                     &reranker,

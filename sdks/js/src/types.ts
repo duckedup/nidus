@@ -173,6 +173,8 @@ export interface PlanTimings {
   gatherUs?: number;
   walkUs?: number;
   resolveUs?: number;
+  firstPassUs?: number;
+  rescoreUs?: number;
   scoreUs?: number;
   totalUs: number;
 }

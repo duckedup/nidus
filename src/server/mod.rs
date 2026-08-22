@@ -993,6 +993,13 @@ async fn search_batch(
             "rerank is not supported on /search/batch queries"
         )));
     }
+    // Same rule for `plan`: `BatchSearchResponse` has nowhere to carry one, so accepting the
+    // field and dropping it would let a caller believe they asked for a plan and got none.
+    if queries.iter().any(|q| q.plan) {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "plan is not supported on /search/batch queries"
+        )));
+    }
     let plans = queries
         .into_iter()
         .map(plan_search)
@@ -2915,6 +2922,9 @@ mod tests {
             json!({"queries": [one.clone()], "fuse": {"top_k": MAX_TOP_K + 1}}),
             // A per-query page cap still applies inside a batch.
             json!({"queries": [{"query": [1, 0, 0], "top_k": MAX_TOP_K + 1}]}),
+            // `plan` has nowhere to go in a BatchSearchResponse, so it is refused rather
+            // than silently dropped (nidus-cvz).
+            json!({"queries": [{"query": [1, 0, 0], "top_k": 1, "plan": true}]}),
         ];
         for body in cases {
             let resp = app
