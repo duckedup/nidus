@@ -45,6 +45,9 @@ mod ingest;
 mod memory;
 mod tune;
 
+#[cfg(test)]
+mod docs_coverage;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "nidus",
