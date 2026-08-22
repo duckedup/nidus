@@ -51,7 +51,7 @@ const RESEARCH_SCHEMA = {
 const PARTITION_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['summary', 'groups', 'ordering', 'open_questions'],
+  required: ['summary', 'groups', 'ordering', 'scope_questions', 'open_questions'],
   properties: {
     summary: { type: 'string' },
     groups: {
@@ -72,7 +72,37 @@ const PARTITION_SCHEMA = {
       },
     },
     ordering: { type: 'array', items: { type: 'string' }, description: 'Why the groups are ordered that way' },
-    open_questions: { type: 'array', items: { type: 'string' } },
+    scope_questions: {
+      type: 'array',
+      description: 'Forks that change WHICH files exist, so they must be settled before any blueprint is written',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['question', 'forks', 'options'],
+        properties: {
+          question: { type: 'string', description: 'Asked of the developer, answerable without reading the code' },
+          forks: { type: 'string', description: 'What changes in the unit list and file list depending on the answer' },
+          options: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['label', 'implication'],
+              properties: {
+                label: { type: 'string', description: 'Four words or fewer' },
+                implication: { type: 'string', description: 'What this answer adds to or drops from the change' },
+              },
+            },
+          },
+          recommendation: { type: 'string', description: 'Which option this partition would pick, and one line of why' },
+        },
+      },
+    },
+    open_questions: {
+      type: 'array',
+      description: 'Small reversible details that belong in a blueprint, NOT questions for the developer',
+      items: { type: 'string' },
+    },
   },
 }
 
@@ -149,7 +179,18 @@ parallel without touching each other's files. Rules:
 - Each unit's \`verify\` is the exact just recipes that cover it. Remember \`just ci\` does NOT
   compile src/cli, src/server or src/bin — those need \`just ci-cli\`; the MCP surface needs
   \`--features mcp\`; codec and kernel changes need \`just miri\`.
-- Flag anything that must stay in ONE unit because splitting it would break the build.`,
+- Flag anything that must stay in ONE unit because splitting it would break the build.
+
+Then split what you do not know into two piles, because they are consumed differently.
+\`scope_questions\` are forks the developer must settle BEFORE any blueprint is written: each one
+changes which units exist or which files they touch, and answering it wrong is expensive to walk
+back. Which surfaces are in scope (core / HTTP / CLI / MCP / the three SDKs / docs), whether an
+on-disk or wire format changes, whether an existing default moves, whether this supersedes or
+sits beside something that already ships. Ask only what the ticket and the research do not
+already answer, phrase each so it can be answered without reading the code, and give concrete
+options with their consequences. If the ask is genuinely unambiguous, return an empty array
+rather than inventing a question. Everything else — a name, a constant, an ordering that is
+cheap to revise — is an \`open_question\`, and goes in a blueprint rather than to the developer.`,
   { label: 'partition', phase: 'Partition', schema: PARTITION_SCHEMA },
 )
 
