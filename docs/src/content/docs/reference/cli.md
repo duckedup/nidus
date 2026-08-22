@@ -7,10 +7,10 @@ Every flag the `nidus` binary accepts, generated from `nidus --help` and each su
 own `--help`. For a guided tour with worked examples, see the [command-line
 guide](/guides/cli-and-server/); this page is the exhaustive reference.
 
-The binary has **25 subcommands**: `serve`, `mcp`, `collections`, `create`, `drop`,
+The binary has **27 subcommands**: `serve`, `mcp`, `collections`, `create`, `drop`,
 `upsert`, `search`, `similar`, `aggregate`, `list`, `set-fts-schema`, `text-search`,
-`hybrid-search`, `get`, `delete`, `compact`, `configure`, `backup`, `restore`,
-`verify`, `check`, `stats`, `tune`, `remember`, `recall`.
+`hybrid-search`, `get`, `delete`, `compact`, `versions`, `configure`, `backup`,
+`restore`, `verify`, `check`, `stats`, `tune`, `ingest`, `remember`, `recall`.
 
 ## Feature gating
 
@@ -19,8 +19,8 @@ binary was built:
 
 | Install | Command | Surface |
 | --- | --- | --- |
-| `cargo binstall nidus` (prebuilt), or the install script | n/a | Everything below: all 25 subcommands, every `--embed-*`/`--summarize-*` flag, `mcp`, `remember`, `recall` |
-| `cargo install nidus --features cli` | build from source | No `mcp`, `remember`, or `recall` subcommand, and `serve` has **no** `--embed-*`/`--summarize-*` flags |
+| `cargo binstall nidus` (prebuilt), or the install script | n/a | Everything below: all 27 subcommands, every `--embed-*`/`--summarize-*` flag, `mcp`, `ingest`, `remember`, `recall` |
+| `cargo install nidus --features cli` | build from source | No `mcp`, `ingest`, `remember`, or `recall` subcommand, and `serve` has **no** `--embed-*`/`--summarize-*` flags |
 
 The prebuilt binaries (`cargo binstall`, the install script, and the release
 tarballs) are all built with `--features serve`, which is the umbrella feature
@@ -306,7 +306,10 @@ Full-text (BM25) search of fields declared via `set-fts-schema`. Usage:
 | `--limit-per <ATTR>` | none | Cap hits per distinct value of this attribute; needs `--limit-per-max`. |
 | `--limit-per-max <N>` | none | Maximum hits kept per distinct `--limit-per` value. |
 | `--diversity <LAMBDA>` | none | MMR lambda spreading hits in vector space: `1.0` pure relevance, `0.0` pure spread. |
-| `--expand-radius <N>` | none | Widen each hit with this many neighbouring chunks of its own document, either side. The three `--expand-*-field` flags from [`search`](#search) apply here too. |
+| `--expand-radius <N>` | none | Widen each hit with this many neighbouring chunks of its own document, either side. Adds a `context` field; changes nothing about the ranking. |
+| `--expand-parent-field <ATTR>` | none | Attr grouping a document's chunks (default `nidus.parent_id`); needs `--expand-radius`. |
+| `--expand-index-field <ATTR>` | none | Attr ordering the chunks within a document (default `nidus.chunk_index`); needs `--expand-radius`. |
+| `--expand-text-field <ATTR>` | none | Attr holding each chunk's text (default `nidus.text`); needs `--expand-radius`. |
 | `--rerank` (`rerank` feature) | none | Re-score the candidate window with the configured cross-encoder. |
 | `--rerank-query <TEXT>` (`rerank` feature) | none | Text scored against each candidate by the cross-encoder. Defaults to the positional `QUERY` when the `--clause` spelling is not used; with `--clause`, omitting it is an error. |
 | `--rerank-overscan <N>` (`rerank` feature) | none | Candidates retrieved per `top_k` before the cross-encoder rerank (default `10`). |
@@ -330,6 +333,10 @@ flags as `text-search` above, plus:
 | `--candidates <N>` | none | Candidates pulled per leg before fusing (default `100`). |
 | `--vector-weight <N>` | none | Weight on the vector leg's fused contribution (default `1`). |
 | `--text-weight <N>` | none | Weight on the BM25 leg's fused contribution (default `1`). |
+| `--expand-radius <N>` | none | Widen each fused hit with this many neighbouring chunks of its own document, either side. Adds a `context` field; changes nothing about the ranking. |
+| `--expand-parent-field <ATTR>` | none | Attr grouping a document's chunks (default `nidus.parent_id`); needs `--expand-radius`. |
+| `--expand-index-field <ATTR>` | none | Attr ordering the chunks within a document (default `nidus.chunk_index`); needs `--expand-radius`. |
+| `--expand-text-field <ATTR>` | none | Attr holding each chunk's text (default `nidus.text`); needs `--expand-radius`. |
 | `--rerank` (`rerank` feature) | none | Re-score the fused candidate window with the configured cross-encoder. Requires `--rerank-query`, since the fused ranking has no single natural query text. |
 | `--rerank-query <TEXT>` (`rerank` feature) | none | Text scored against each candidate by the cross-encoder. |
 | `--rerank-overscan <N>` (`rerank` feature) | none | Candidates retrieved per `top_k` before the cross-encoder rerank (default `10`). |
