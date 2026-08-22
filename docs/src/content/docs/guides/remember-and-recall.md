@@ -252,12 +252,13 @@ TTL stays permanent no matter how often it is reinforced.
 Both attrs are stamped only by a reinforced recall, and stripped from any `attrs` a
 caller supplies to `remember`, the same as `nidus.created_at`/`nidus.updated_at`.
 
-A reinforced recall is a **write**: it takes the writer lock to apply the stamp. On a
-store opened `OpenMode::ReadOnly`, `Memory::recall` skips the stamp with a warning
-rather than failing the call, since an optional bookkeeping write must not sink an
-otherwise good recall. The HTTP, MCP, and CLI surfaces share that same behavior against
-a read-only store; what differs for the CLI is reaching a writable handle at all, since
-`nidus recall --reinforce` opens the store read-write and that open is refused outright
+A reinforced recall is a **write**: it takes the writer lock to apply the stamp. What a
+read-only store does about that depends on who asked. In process, `Memory::recall` skips
+the stamp with a warning rather than failing the call, since a library caller may not own
+the open mode and optional bookkeeping must not sink an otherwise good recall. The HTTP
+and MCP surfaces instead refuse the request: it named `reinforce`, so reporting success
+without stamping would be indistinguishable from having stamped. On the CLI,
+`nidus recall --reinforce` opens the store read-write, and that open is refused outright
 if a live `nidus serve` already holds the writer lock (a plain `nidus recall`, with no
 `--reinforce`, is unaffected).
 

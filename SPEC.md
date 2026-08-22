@@ -1257,9 +1257,13 @@ build until a real need exists.
   (nidus-gk6).** `RecallOpts::reinforce` defaults `false`, so an untouched recall
   stays a pure read; setting it stamps `nidus.access_count`/`nidus.last_accessed`
   on every returned entry as one durable write. That write takes the writer lease
-  like any other mutation, so a `ReadOnly` opener **skips** the stamp — with a
-  `diag!` warning, never an error — rather than failing an otherwise good recall
-  over optional bookkeeping. `RecallOpts::extend_ttl_seconds` only ever moves an
+  like any other mutation, so `Nidus::reinforce` refuses outright on a `ReadOnly`
+  opener. Who sees that refusal splits deliberately: the in-process
+  `Memory::recall` **skips** the stamp with a `diag!` warning, because a library
+  caller may not own `open_mode` and optional bookkeeping must not lose it an
+  otherwise good recall; the HTTP, MCP and CLI surfaces **propagate** it, because a
+  request that named `reinforce` did choose, and answering it as though the stamp
+  happened would be indistinguishable from success. `RecallOpts::extend_ttl_seconds` only ever moves an
   **existing** `nidus.expires_at` forward to `max(current, now + extend)`; it never
   creates one, since giving a never-expiring memory a TTL because it happened to be
   recalled would be a silent, one-way change to its lifetime. The counters are as
