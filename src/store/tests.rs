@@ -6721,6 +6721,62 @@ fn highlighting_reads_the_stored_text_even_when_projection_drops_the_field() {
     assert!(!hits[0].annotations.as_ref().unwrap().highlights.is_empty());
 }
 
+/// nidus-lvo.4's projection/highlighting criterion, both at once: a text search over a
+/// chunked corpus that projects the body away must still highlight the match AND still widen
+/// the hit, since both read the stored record rather than the payload.
+#[test]
+fn expansion_and_highlighting_coexist_over_a_projected_away_body() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body").b(0.0)])
+        .unwrap();
+    let chunk = |i: i64, start: i64, body: &str| {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("body".to_string(), Value::Str(body.to_string()));
+        attrs.insert(
+            crate::model::META_TEXT.to_string(),
+            Value::Str(body.to_string()),
+        );
+        attrs.insert(
+            crate::model::META_PARENT_ID.to_string(),
+            Value::Str("doc".to_string()),
+        );
+        attrs.insert(crate::model::META_CHUNK_INDEX.to_string(), Value::Int(i));
+        attrs.insert(crate::model::META_CHAR_START.to_string(), Value::Int(start));
+        Record::text_only(format!("doc#{i}"), attrs)
+    };
+    store
+        .upsert(
+            "docs",
+            &[
+                chunk(0, 0, "the engineers were"),
+                chunk(1, 4, "engineers were running late"),
+            ],
+        )
+        .unwrap();
+
+    let q = FtsQuery::new("body", "run").highlight(HighlightOpts::default());
+    let opts = SearchOpts {
+        top_k: 10,
+        projection: Projection::exclude(["body", crate::model::META_TEXT]),
+        expand: Some(crate::Expand::new(1)),
+        ..Default::default()
+    };
+    let hits = store.text_search(&["docs"], &q, &opts).unwrap();
+    let hit = hits.iter().find(|h| h.id == "doc#1").expect("chunk 1 hit");
+    assert!(!hit.attrs.contains_key("body"), "body was projected away");
+    let hl = &hit.annotations.as_ref().unwrap().highlights;
+    assert!(
+        hl[0].fragments[0].text.contains("running"),
+        "the fragment still comes from the stored text"
+    );
+    assert_eq!(
+        hit.context.as_deref(),
+        Some("the engineers were running late"),
+        "and the window is still stitched from the stored chunks"
+    );
+}
+
 #[test]
 fn highlighting_covers_every_matched_clause_and_survives_fusion() {
     let mut store = Store::in_memory(3).unwrap();

@@ -315,9 +315,10 @@ built, no vector is read), and its sums keep the server's type: a run of `Int`s 
 
 ### Ranking
 
-`search` and `text_search` take three more knobs. `rank_by` layers a ranking expression over
-the metric, `limit_per` caps how many hits may share one attribute value, and `diversity`
-spreads the page apart in vector space so near-duplicates stop filling it:
+`search` and `text_search` take four more knobs. `rank_by` layers a ranking expression over
+the metric, `limit_per` caps how many hits may share one attribute value, `diversity`
+spreads the page apart in vector space so near-duplicates stop filling it, and `expand`
+widens each hit with the neighbouring chunks of its own document:
 
 ```python
 from datetime import datetime, timedelta, timezone
@@ -330,6 +331,17 @@ hits = db.search(
     limit_per={"field": "path", "max": 2},   # at most 2 hits per file
     diversity=0.5,                           # balance relevance against variety
 )
+
+# Read a chunked corpus as documents: the best chunk per file, widened with its
+# neighbours into `hit.context`. Payload only, so the ranking is unchanged.
+passages = db.search(
+    query=[0.1, 0.2, 0.3],
+    limit_per={"field": "nidus.parent_id", "max": 1},
+    expand={"radius": 1},
+)
+
+# On recall the same pair has one text-native spelling.
+hits = db.recall("docs", "how does the writer lock work", rollup={"neighbours": 1})
 ```
 
 `diversity` is a Maximal Marginal Relevance lambda: `1.0` is pure relevance (the ranking you

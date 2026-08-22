@@ -40,6 +40,7 @@ from .types import (
     Aggregation,
     Batch,
     ClusterStatus,
+    Expand,
     FilterIndexField,
     FtsClause,
     FtsField,
@@ -52,6 +53,7 @@ from .types import (
     RecordInput,
     RememberResult,
     RerankOpts,
+    Rollup,
     Stats,
 )
 from .values import AttrInput
@@ -209,6 +211,7 @@ class AsyncNidusClient:
         rank_by: Optional[RankBy] = None,
         limit_per: Optional[LimitPer] = None,
         diversity: Optional[float] = None,
+        expand: Optional[Expand] = None,
         rerank: Optional[RerankOpts] = None,
     ) -> Hits:
         """Vector (cosine) nearest-neighbour search. An empty ``scope`` searches everything.
@@ -233,6 +236,7 @@ class AsyncNidusClient:
                 rank_by=rank_by,
                 limit_per=limit_per,
                 diversity=diversity,
+                expand=expand,
                 rerank=rerank,
             ),
         )
@@ -253,6 +257,7 @@ class AsyncNidusClient:
         rank_by: Optional[RankBy] = None,
         limit_per: Optional[LimitPer] = None,
         diversity: Optional[float] = None,
+        expand: Optional[Expand] = None,
     ) -> Hits:
         """Records most like the one already stored at ``collection``/``id``.
 
@@ -276,6 +281,7 @@ class AsyncNidusClient:
                 rank_by=rank_by,
                 limit_per=limit_per,
                 diversity=diversity,
+                expand=expand,
             ),
         )
 
@@ -298,6 +304,7 @@ class AsyncNidusClient:
         rank_by: Optional[RankBy] = None,
         limit_per: Optional[LimitPer] = None,
         diversity: Optional[float] = None,
+        expand: Optional[Expand] = None,
         rerank: Optional[RerankOpts] = None,
     ) -> Hits:
         """BM25 full-text search, paginated by ``offset``.
@@ -325,6 +332,7 @@ class AsyncNidusClient:
                 rank_by=rank_by,
                 limit_per=limit_per,
                 diversity=diversity,
+                expand=expand,
                 rerank=rerank,
             ),
         )
@@ -347,6 +355,7 @@ class AsyncNidusClient:
         highlight: Optional[Union[bool, HighlightOpts]] = None,
         vector_weight: Optional[float] = None,
         text_weight: Optional[float] = None,
+        expand: Optional[Expand] = None,
         rerank: Optional[RerankOpts] = None,
     ) -> Hits:
         """Hybrid search: fuse a vector query and a BM25 text query via RRF.
@@ -373,6 +382,7 @@ class AsyncNidusClient:
                 highlight=highlight,
                 vector_weight=vector_weight,
                 text_weight=text_weight,
+                expand=expand,
                 rerank=rerank,
             ),
         )
@@ -493,6 +503,7 @@ class AsyncNidusClient:
         min_score: Optional[float] = None,
         filter: Optional[Filter] = None,  # noqa: A002
         diversity: Optional[float] = None,
+        rollup: Optional[Rollup] = None,
         rerank: Optional[RerankOpts] = None,
     ) -> Hits:
         """Embed ``query`` and vector-search ``collection``, best first.
@@ -507,6 +518,7 @@ class AsyncNidusClient:
                 min_score=min_score,
                 filter=filter,
                 diversity=diversity,
+                rollup=rollup,
                 rerank=rerank,
             ),
         )

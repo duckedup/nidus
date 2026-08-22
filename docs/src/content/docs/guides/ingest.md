@@ -175,6 +175,41 @@ The summary is JSON, so a CI job can assert on it:
 | `would_ingest` | Under `--dry-run`, files that would be ingested. |
 | `cache` | `hits`, `misses` and `evicted` from the embedding cache. |
 
+## Reading a chunked corpus back
+
+Chunks are how the corpus is stored, not how you want to read it. A plain recall
+over a chunked collection returns chunk hits: several fragments of the same
+document competing for the page, each a sentence or two out of context.
+
+`--rollup` collapses that. It keeps the best-matching chunk per document, and
+`--neighbours` widens each survivor with the chunks around it:
+
+```bash
+nidus recall docs "how does the writer lock work" \
+  --dir ./store --rollup 1 --neighbours 1
+```
+
+Each hit gains a `context` field: the winning chunk plus its neighbours, stitched
+back into the passage they came from. The overlap two adjacent chunks share is
+dropped rather than repeated, so `context` is the source once.
+
+Nothing else about the result changes. `context` is extra payload, so the ids,
+the scores and the order are exactly what the same query returns without it, and
+a hit that is not part of a chunked document simply has no `context`.
+
+Over HTTP the same knob is `rollup` on the recall body, and the `recall` MCP tool
+takes it too:
+
+```bash
+curl -s localhost:8080/collections/docs/recall \
+  -d '{"query": "how does the writer lock work", "rollup": {"neighbours": 1}}'
+```
+
+Corpora ingested before 0.75.0 have no stored chunk offsets, so their windows are
+joined with a blank line and keep whatever overlap the chunker left. The per-file
+digest covers the chunk options, so changing any of them re-ingests the tree and
+picks the offsets up.
+
 ## Scope
 
 `ingest` reads your local filesystem, so it is a command-line feature and has no

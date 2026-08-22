@@ -269,6 +269,19 @@ hits, err := db.Search(ctx, nidus.SearchRequest{
     LimitPer: &nidus.LimitPer{Field: "path", Max: 2}, // at most 2 hits per file
 })
 
+// Read a chunked corpus as documents: the best chunk per file, widened with its
+// neighbours into Hit.Context. Payload only, so the ranking is unchanged.
+passages, err := db.Search(ctx, nidus.SearchRequest{
+    Query:    []float32{0.1, 0.2, 0.3},
+    LimitPer: &nidus.LimitPer{Field: "nidus.parent_id", Max: 1},
+    Expand:   &nidus.Expand{Radius: 1},
+})
+
+// On recall the same pair has one text-native spelling.
+hits, err = db.Recall(ctx, "docs", "how does the writer lock work", nidus.RecallOptions{
+    Rollup: &nidus.Rollup{Neighbours: 1},
+})
+
 // Sort a metadata query by an attribute instead of storage order.
 rows, err := db.List(ctx, nidus.ListRequest{
     OrderBy: &nidus.OrderBy{Field: "updated_at", Descending: true},
@@ -280,8 +293,8 @@ base score, never multiplied, so it stays meaningful where scores are negative o
 unbounded (Euclidean, DotProduct, BM25). Ages are measured from `Origin` rather than the
 wall clock, so the same query against an unchanged store ranks the same way twice. A
 record whose timestamp is missing or unusable is *not* penalized by default; set
-`Missing: &zero` to bury it instead. `RankBy` and `LimitPer` ride on `/search` and
-`/text-search`; `OrderBy` on `/list`.
+`Missing: &zero` to bury it instead. `RankBy`, `LimitPer` and `Expand` ride on `/search`
+and `/text-search`; `OrderBy` on `/list`; `Rollup` on `/recall`.
 
 ## Remembering and recalling (text-native)
 

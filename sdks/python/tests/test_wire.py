@@ -375,6 +375,55 @@ def test_diversity_is_omitted_unless_asked_for_and_keeps_zero() -> None:
     assert _wire.recall_body("why", diversity=1.0)["diversity"] == 1.0
 
 
+def test_expand_is_omitted_unless_asked_for_and_defaults_its_field_names() -> None:
+    """A bare ``radius`` sends only a radius; the server fills the reserved chunk attrs."""
+    assert "expand" not in _wire.search_body([1.0], top_k=5)
+    assert "expand" not in _wire.similar_body("docs", "d1")
+    assert "expand" not in _wire.text_search_body("body", "fox")
+    assert "expand" not in _wire.hybrid_search_body([1.0], "body", "fox")
+    assert _wire.search_body([1.0], expand={"radius": 2})["expand"] == {"radius": 2}
+    # ``0`` is a meaningful radius (the hit's own text as context), so prune must keep it.
+    assert _wire.search_body([1.0], expand={"radius": 0})["expand"] == {"radius": 0}
+    assert _wire.hybrid_search_body([1.0], "body", "fox", expand={"radius": 1})["expand"] == {
+        "radius": 1
+    }
+    assert _wire.text_search_body(
+        "body", "fox", expand={"radius": 1, "parent_field": "doc", "text_field": "body"}
+    )["expand"] == {"radius": 1, "parent_field": "doc", "text_field": "body"}
+
+
+def test_rollup_is_the_recall_spelling_and_is_omitted_unless_asked_for() -> None:
+    """``recall`` takes the text-native ``rollup``, never the raw attr-name ``expand``."""
+    assert "rollup" not in _wire.recall_body("why")
+    assert _wire.recall_body("why", rollup={"neighbours": 1})["rollup"] == {"neighbours": 1}
+    assert _wire.recall_body("why", rollup={"per_parent": 2, "neighbours": 0})["rollup"] == {
+        "per_parent": 2,
+        "neighbours": 0,
+    }
+
+
+def test_an_expand_must_name_a_radius_and_no_unknown_fields() -> None:
+    """A misspelled field name would be *ignored* by serde and stitch the wrong window."""
+    with pytest.raises(TypeError, match="missing required key"):
+        _wire.search_body([1.0], expand={"parent_field": "doc"})  # type: ignore[typeddict-item]
+    with pytest.raises(TypeError, match="unknown key"):
+        _wire.search_body([1.0], expand={"radius": 1, "parent": "doc"})  # type: ignore[typeddict-unknown-key]
+    with pytest.raises(TypeError, match="unknown key"):
+        _wire.recall_body("q", rollup={"per_parents": 1})  # type: ignore[typeddict-unknown-key]
+
+
+def test_a_hit_carries_its_context_only_when_the_server_sends_one() -> None:
+    """Absent means ``None``, so an unexpanded hit is the object it always was."""
+    hits = _wire.decode_hits(
+        [
+            {"collection": "c", "id": "d#1", "score": 0.9, "attrs": {}, "context": "widened"},
+            {"collection": "c", "id": "d#2", "score": 0.8, "attrs": {}},
+        ]
+    )
+    assert hits[0].context == "widened"
+    assert hits[1].context is None
+
+
 def test_a_limit_per_must_name_both_keys_and_no_others() -> None:
     """A missing ``max`` is a 400; a misspelled key would be *ignored* by serde instead."""
     with pytest.raises(TypeError, match="missing required key"):

@@ -145,6 +145,7 @@ pub(super) struct RecallArgs {
     pub min_score: Option<f32>,
     pub filter: Option<String>,
     pub diversity: Option<f32>,
+    pub rollup: Option<crate::memory::Rollup>,
 }
 
 /// `nidus recall`: embed `query` and print the ranked hits, in the shape `search` prints.
@@ -156,6 +157,7 @@ pub(super) fn recall(store: StoreArgs, ingest: IngestArgs, args: RecallArgs) -> 
         min_score,
         filter,
         diversity,
+        rollup,
     } = args;
     let filter: Option<Filter> = match filter {
         Some(s) => Some(
@@ -177,6 +179,7 @@ pub(super) fn recall(store: StoreArgs, ingest: IngestArgs, args: RecallArgs) -> 
             min_score: min_score.unwrap_or(0.0),
             filter,
             diversity,
+            rollup,
         };
         let hits = memory.recall(&collection, &query, &opts).await?;
         let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();

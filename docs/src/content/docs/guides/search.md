@@ -339,6 +339,55 @@ Things worth knowing:
 - **Unset is unset.** `None` skips the pass and does not deepen the scan, so an existing
   query is unchanged to the byte.
 
+## Widening a chunked hit with its neighbours
+
+A chunked corpus stores fragments, but a fragment is rarely what you want to read. `expand`
+widens each hit with the chunks around it, keyed on the chunk attrs that
+[`nidus ingest`](/guides/ingest/) stamps:
+
+```rust
+use nidus::{Expand, LimitPer, SearchOpts};
+
+let query = vec![0.1_f32; 384];
+let hits = db.search(
+    "docs",
+    &query,
+    &SearchOpts {
+        top_k: 10,
+        // The best chunk per document, widened by one chunk either side.
+        limit_per: Some(LimitPer::new("nidus.parent_id", 1)),
+        expand: Some(Expand::new(1)),
+        ..Default::default()
+    },
+)?;
+for hit in &hits {
+    println!("{}", hit.context.as_deref().unwrap_or_default());
+}
+# anyhow::Ok(())
+```
+
+`Expand::new(radius)` uses the reserved attrs (`nidus.parent_id`, `nidus.chunk_index`,
+`nidus.text`). Set the three fields yourself for a corpus you chunked with your own attrs.
+
+Things worth knowing:
+
+- **It is payload only.** The window lands in `Hit::context` and nowhere else, so the ids,
+  the scores and the order are identical to the same query with `expand` unset.
+- **It runs last**, after reranking, `diversity`, `limit_per`, `min_score` and pagination,
+  which is what makes the point above true rather than merely intended.
+- **A projected-away body still expands.** Coordinates and text are read from the stored
+  record, the same rule [highlighting](#full-text-search-bm25) follows.
+- **A record without chunk attrs is left alone**, with no `context`, so a collection holding
+  both chunked documents and plain memories still answers.
+- **The overlap is dropped, not repeated.** Chunks written by nidus carry their source
+  offset, so the window is the source once. A corpus upserted raw (or chunked before 0.75.0)
+  has no offsets, and its window is joined with a blank line instead.
+- **`radius: 0` is legal** and reports the hit's own text, so code that asks for a context
+  field always gets one.
+
+On the memory API the same pair has one text-native spelling, `rollup`, described in the
+[ingest guide](/guides/ingest/#reading-a-chunked-corpus-back).
+
 ## Typed metadata
 
 Each record carries an open map of typed [`Value`](/reference/api/#value)s:

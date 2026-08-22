@@ -14,9 +14,9 @@ use serde::Serialize;
 
 use crate::server::dto::{AnnDto, FootprintDto, HitDto};
 use crate::{
-    AggregateOpts, AnnConfig, Config, Distance, Filter, Fsync, FtsClause, FtsCombine, FtsField,
-    FtsQuery, HighlightOpts, HybridOpts, LeaseWait, LimitPer, ListOpts, Nidus, OpenMode, OrderBy,
-    Projection, Quantization, Record, Scope, SearchOpts,
+    AggregateOpts, AnnConfig, Config, Distance, Expand, Filter, Fsync, FtsClause, FtsCombine,
+    FtsField, FtsQuery, HighlightOpts, HybridOpts, LeaseWait, LimitPer, ListOpts, Nidus, OpenMode,
+    OrderBy, Projection, Quantization, Record, Scope, SearchOpts,
 };
 
 // AI-ingest (memory) wiring for `serve`: only under the `memory` feature (pulled
@@ -614,6 +614,42 @@ impl RerankProviderArgs {
     }
 }
 
+/// The `--expand-*` knobs, flattened onto every ranked query command so the four flags are
+/// declared once. `--expand-radius` is the trigger; a field name without it is a clap error
+/// rather than a silent no-op.
+#[derive(Args, Debug, Default)]
+struct ExpandArgs {
+    /// Widen each hit with this many neighbouring chunks of its own document, either side.
+    #[arg(long = "expand-radius")]
+    expand_radius: Option<usize>,
+    /// Attr grouping a document's chunks (default `nidus.parent_id`).
+    #[arg(long = "expand-parent-field", requires = "expand_radius")]
+    expand_parent_field: Option<String>,
+    /// Attr ordering the chunks within a document (default `nidus.chunk_index`).
+    #[arg(long = "expand-index-field", requires = "expand_radius")]
+    expand_index_field: Option<String>,
+    /// Attr holding each chunk's text (default `nidus.text`).
+    #[arg(long = "expand-text-field", requires = "expand_radius")]
+    expand_text_field: Option<String>,
+}
+
+impl ExpandArgs {
+    /// The built [`Expand`], or `None` when `--expand-radius` was not passed.
+    fn resolve(self) -> Option<Expand> {
+        let mut e = Expand::new(self.expand_radius?);
+        if let Some(f) = self.expand_parent_field {
+            e.parent_field = f;
+        }
+        if let Some(f) = self.expand_index_field {
+            e.index_field = f;
+        }
+        if let Some(f) = self.expand_text_field {
+            e.text_field = f;
+        }
+        Some(e)
+    }
+}
+
 /// Per-query rerank knobs (nidus-d42). `--rerank` opts in; the rest are ignored without
 /// it, exactly as `rerank_overscan` alone is ignored over MCP. `recall` flattens this
 /// alone (its provider flags come from `IngestArgs`); the others pair it via [`RerankArgs`].
@@ -982,6 +1018,8 @@ enum Command {
         /// MMR lambda spreading hits in vector space: 1.0 pure relevance, 0.0 pure spread.
         #[arg(long = "diversity")]
         diversity: Option<f32>,
+        #[command(flatten)]
+        expand: ExpandArgs,
         #[cfg(feature = "rerank")]
         #[command(flatten)]
         rerank: RerankArgs,
@@ -1029,6 +1067,8 @@ enum Command {
         /// MMR lambda spreading hits in vector space: 1.0 pure relevance, 0.0 pure spread.
         #[arg(long = "diversity")]
         diversity: Option<f32>,
+        #[command(flatten)]
+        expand: ExpandArgs,
     },
     /// Count records matching a filter, and sum numeric attributes, without listing them.
     Aggregate {
@@ -1144,6 +1184,8 @@ enum Command {
         /// MMR lambda spreading hits in vector space: 1.0 pure relevance, 0.0 pure spread.
         #[arg(long = "diversity")]
         diversity: Option<f32>,
+        #[command(flatten)]
+        expand: ExpandArgs,
         #[cfg(feature = "rerank")]
         #[command(flatten)]
         rerank: RerankArgs,
@@ -1184,6 +1226,8 @@ enum Command {
         /// Weight on the BM25 leg's fused contribution.
         #[arg(long, default_value_t = 1.0)]
         text_weight: f32,
+        #[command(flatten)]
+        expand: ExpandArgs,
         #[cfg(feature = "rerank")]
         #[command(flatten)]
         rerank: RerankArgs,
@@ -1408,6 +1452,12 @@ enum Command {
         /// MMR lambda spreading hits in vector space: 1.0 pure relevance, 0.0 pure spread.
         #[arg(long = "diversity")]
         diversity: Option<f32>,
+        /// Read a chunked corpus as documents: keep this many chunks per document.
+        #[arg(long = "rollup")]
+        rollup: Option<usize>,
+        /// Chunks stitched either side of each survivor, into the hit's `context`.
+        #[arg(long = "neighbours", requires = "rollup")]
+        neighbours: Option<usize>,
         // `ingest` already carries the `--rerank-provider` flags (via `IngestArgs`), so
         // this flattens only the per-query knobs — not another `RerankArgs`, which would
         // redefine `--rerank-provider` a second time on the same command.
@@ -1500,6 +1550,7 @@ pub fn run(cli: Cli) -> Result<()> {
             diversity,
             #[cfg(feature = "rerank")]
             rerank,
+            expand,
         } => {
             let db = open(&store, false)?;
             let query: Vec<f32> = serde_json::from_str(&read_input(query_file.as_ref())?)?;
@@ -1523,6 +1574,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     .zip(limit_per_max)
                     .map(|(f, m)| LimitPer::new(f, m)),
                 diversity,
+                expand: expand.resolve(),
                 #[cfg(feature = "rerank")]
                 rerank: resolved.as_ref().map(|(_, o, _)| o.clone()),
                 ..Default::default()
@@ -1569,6 +1621,7 @@ pub fn run(cli: Cli) -> Result<()> {
             limit_per,
             limit_per_max,
             diversity,
+            expand,
         } => {
             let db = open(&store, false)?;
             let filter = match filter {
@@ -1588,6 +1641,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     .zip(limit_per_max)
                     .map(|(f, m)| LimitPer::new(f, m)),
                 diversity,
+                expand: expand.resolve(),
                 ..Default::default()
             };
             // Empty --scope defaults to the source collection, not every collection.
@@ -1727,6 +1781,7 @@ pub fn run(cli: Cli) -> Result<()> {
             diversity,
             #[cfg(feature = "rerank")]
             rerank,
+            expand,
         } => {
             // The single-field spelling's own text is the rerank default; `--clause` has
             // none (decision 1), so `query.clone()` must run before `text.query` moves it.
@@ -1753,6 +1808,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     .zip(limit_per_max)
                     .map(|(f, m)| LimitPer::new(f, m)),
                 diversity,
+                expand: expand.resolve(),
                 #[cfg(feature = "rerank")]
                 rerank: resolved.as_ref().map(|(_, o, _)| o.clone()),
                 ..Default::default()
@@ -1799,6 +1855,7 @@ pub fn run(cli: Cli) -> Result<()> {
             text_weight,
             #[cfg(feature = "rerank")]
             rerank,
+            expand,
         } => {
             let q = query.query(field, text)?;
             let db = open(&store, false)?;
@@ -1820,6 +1877,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 explain: query.explain,
                 vector_weight,
                 text_weight,
+                expand: expand.resolve(),
                 #[cfg(feature = "rerank")]
                 rerank: resolved.as_ref().map(|(_, o, _)| o.clone()),
                 #[cfg(not(feature = "rerank"))]
@@ -2030,6 +2088,8 @@ pub fn run(cli: Cli) -> Result<()> {
             min_score,
             filter,
             diversity,
+            rollup,
+            neighbours,
             #[cfg(feature = "rerank")]
             rerank,
         } => {
@@ -2040,6 +2100,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 min_score,
                 filter,
                 diversity,
+                rollup: rollup.map(|per_parent| crate::memory::Rollup {
+                    per_parent,
+                    neighbours: neighbours.unwrap_or(0),
+                }),
             };
             // `recall`'s own query text is always its rerank default (mirrors `/recall`).
             #[cfg(feature = "rerank")]
@@ -2075,6 +2139,7 @@ fn recall_reranked(
         min_score,
         filter,
         diversity,
+        rollup,
     } = args;
     let mut filter: Filter = match filter {
         Some(s) => serde_json::from_str(&s)
@@ -2114,6 +2179,8 @@ fn recall_reranked(
             min_score: min_score.filter(|s| *s > 0.0),
             filter,
             diversity,
+            limit_per: rollup.as_ref().map(|r| r.as_opts().0),
+            expand: rollup.map(|r| r.as_opts().1),
             rerank: Some(rerank_opts),
             ..Default::default()
         };

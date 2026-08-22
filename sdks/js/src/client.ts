@@ -13,6 +13,7 @@ import type {
   BatchSearchOptions,
   ClusterStatus,
   DecodedRecord,
+  Expand,
   Filter,
   FilterIndexField,
   FtsField,
@@ -28,6 +29,7 @@ import type {
   RememberOptions,
   RememberResult,
   RerankOptions,
+  Rollup,
   SearchOptions,
   SimilarSearchOptions,
   Stats,
@@ -246,6 +248,7 @@ export class NidusClient {
       rank_by: encodeRankBy(opts.rankBy),
       limit_per: opts.limitPer,
       diversity: opts.diversity,
+      expand: encodeExpand(opts.expand),
       rerank: encodeRerank(opts.rerank),
     });
   }
@@ -266,6 +269,7 @@ export class NidusClient {
       rank_by: encodeRankBy(opts.rankBy),
       limit_per: opts.limitPer,
       diversity: opts.diversity,
+      expand: encodeExpand(opts.expand),
     });
   }
 
@@ -290,6 +294,7 @@ export class NidusClient {
       rank_by: encodeRankBy(opts.rankBy),
       limit_per: opts.limitPer,
       diversity: opts.diversity,
+      expand: encodeExpand(opts.expand),
       rerank: encodeRerank(opts.rerank),
     });
   }
@@ -314,6 +319,7 @@ export class NidusClient {
       highlight: encodeHighlight(opts.highlight),
       vector_weight: opts.vectorWeight,
       text_weight: opts.textWeight,
+      expand: encodeExpand(opts.expand),
       rerank: encodeRerank(opts.rerank),
     });
   }
@@ -387,6 +393,7 @@ export class NidusClient {
         rank_by: encodeRankBy(q.rankBy),
         limit_per: q.limitPer,
         diversity: q.diversity,
+        expand: encodeExpand(q.expand),
       })),
       fuse: opts.fuse
         ? prune({
@@ -465,6 +472,7 @@ export class NidusClient {
       min_score: opts.minScore,
       filter: opts.filter ?? [],
       diversity: opts.diversity,
+      rollup: encodeRollup(opts.rollup),
       rerank: encodeRerank(opts.rerank),
     });
   }
@@ -509,6 +517,7 @@ export class NidusClient {
       ...(h.annotations
         ? { annotations: decodeAnnotations(h.annotations) }
         : {}),
+      ...(h.context !== undefined ? { context: h.context } : {}),
     };
   }
 
@@ -571,6 +580,7 @@ interface RawHit {
   score: number;
   attrs: Record<string, Value>;
   annotations?: WireAnnotations;
+  context?: string;
 }
 
 /** An `/aggregate` response, whose sums arrive as tagged {@link Value}s. */
@@ -592,6 +602,22 @@ interface RawBatchSearch {
 }
 
 /** Encode `rankBy` to its externally-tagged wire form, dropping the knobs left unset. */
+/** camelCase → the wire's snake_case, omitting the object entirely when unset. */
+function encodeExpand(e: Expand | undefined): unknown {
+  if (!e) return undefined;
+  return prune({
+    radius: e.radius,
+    parent_field: e.parentField,
+    index_field: e.indexField,
+    text_field: e.textField,
+  });
+}
+
+function encodeRollup(r: Rollup | undefined): unknown {
+  if (!r) return undefined;
+  return prune({ per_parent: r.perParent, neighbours: r.neighbours });
+}
+
 function encodeRankBy(rank: RankBy | undefined): unknown {
   if (!rank) return undefined;
   const d = rank.decay;

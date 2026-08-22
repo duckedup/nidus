@@ -42,6 +42,7 @@ from .types import (
     Batch,
     ClauseScore,
     ClusterStatus,
+    Expand,
     FilterIndexField,
     Footprint,
     Fragment,
@@ -60,6 +61,7 @@ from .types import (
     RecordInput,
     RememberResult,
     RerankOpts,
+    Rollup,
     Stats,
 )
 from .values import (
@@ -95,6 +97,7 @@ __all__ = [
     "ClauseScore",
     "ClusterStatus",
     "DecodedValue",
+    "Expand",
     "Filter",
     "FilterIndexField",
     "Footprint",
@@ -118,6 +121,7 @@ __all__ = [
     "RecordInput",
     "RememberResult",
     "RerankOpts",
+    "Rollup",
     "Stats",
     "Transport",
     "Value",

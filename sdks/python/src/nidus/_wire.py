@@ -56,6 +56,7 @@ from .types import (
     Batch,
     ClauseScore,
     ClusterStatus,
+    Expand,
     FilterIndexField,
     Footprint,
     Fragment,
@@ -73,6 +74,7 @@ from .types import (
     RecordInput,
     RememberResult,
     RerankOpts,
+    Rollup,
     Stats,
 )
 from .values import AttrInput, Value, decode_attrs, decode_value, encode_attrs
@@ -294,6 +296,7 @@ def search_body(
     rank_by: Optional[RankBy] = None,
     limit_per: Optional[LimitPer] = None,
     diversity: Optional[float] = None,
+    expand: Optional[Expand] = None,
     rerank: Optional[RerankOpts] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /search`` (vector nearest-neighbour).
@@ -317,6 +320,7 @@ def search_body(
             "rank_by": rank_by,
             "limit_per": _limit_per(limit_per),
             "diversity": diversity,
+            "expand": _expand(expand),
             "rerank": _rerank(rerank),
         }
     )
@@ -336,6 +340,7 @@ def similar_body(
     rank_by: Optional[RankBy] = None,
     limit_per: Optional[LimitPer] = None,
     diversity: Optional[float] = None,
+    expand: Optional[Expand] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /search/similar`` ("more like this" over an existing record).
 
@@ -358,6 +363,7 @@ def similar_body(
             "rank_by": rank_by,
             "limit_per": _limit_per(limit_per),
             "diversity": diversity,
+            "expand": _expand(expand),
         }
     )
 
@@ -379,6 +385,7 @@ def text_search_body(
     rank_by: Optional[RankBy] = None,
     limit_per: Optional[LimitPer] = None,
     diversity: Optional[float] = None,
+    expand: Optional[Expand] = None,
     rerank: Optional[RerankOpts] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /text-search`` (BM25). ``min_score`` here is a raw BM25 floor.
@@ -402,6 +409,7 @@ def text_search_body(
             "rank_by": rank_by,
             "limit_per": _limit_per(limit_per),
             "diversity": diversity,
+            "expand": _expand(expand),
             "rerank": _rerank(rerank),
         }
     )
@@ -423,6 +431,7 @@ def hybrid_search_body(
     highlight: Optional[Union[bool, HighlightOpts]] = None,
     vector_weight: Optional[float] = None,
     text_weight: Optional[float] = None,
+    expand: Optional[Expand] = None,
     rerank: Optional[RerankOpts] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /hybrid-search`` (vector + BM25 fused via RRF).
@@ -448,6 +457,7 @@ def hybrid_search_body(
             "highlight": _highlight(highlight),
             "vector_weight": vector_weight,
             "text_weight": text_weight,
+            "expand": _expand(expand),
             "rerank": _rerank(rerank),
         }
     )
@@ -554,6 +564,7 @@ def recall_body(
     min_score: Optional[float] = None,
     filter: Optional[Filter] = None,  # noqa: A002
     diversity: Optional[float] = None,
+    rollup: Optional[Rollup] = None,
     rerank: Optional[RerankOpts] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /collections/{name}/recall`` (query text in, hits out).
@@ -567,6 +578,7 @@ def recall_body(
             "min_score": min_score,
             "filter": list(filter) if filter is not None else [],
             "diversity": diversity,
+            "rollup": _rollup(rollup),
             "rerank": _rerank(rerank),
         }
     )
@@ -619,6 +631,7 @@ def decode_hits(payload: Any) -> list[Hit]:
             score=float(h["score"]),
             attrs=decode_attrs(_attrs_of(h)),
             annotations=decode_annotations(h.get("annotations")),
+            context=h.get("context"),
         )
         for h in payload or ()
     ]
@@ -954,6 +967,18 @@ def _highlight(highlight: Optional[Union[bool, HighlightOpts]]) -> Optional[dict
 
 def _limit_per(limit_per: Optional[LimitPer]) -> Optional[dict[str, Any]]:
     return None if limit_per is None else _spec(limit_per, "limit_per", ("field", "max"))
+
+
+def _expand(expand: Optional[Expand]) -> Optional[dict[str, Any]]:
+    return (
+        None
+        if expand is None
+        else _spec(expand, "expand", ("radius",), ("parent_field", "index_field", "text_field"))
+    )
+
+
+def _rollup(rollup: Optional[Rollup]) -> Optional[dict[str, Any]]:
+    return None if rollup is None else _spec(rollup, "rollup", (), ("per_parent", "neighbours"))
 
 
 def _rerank(rerank: Optional[RerankOpts]) -> Optional[dict[str, Any]]:

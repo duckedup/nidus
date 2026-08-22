@@ -329,6 +329,7 @@ src/
 │   ├── rank.rs   #   ranking expressions: recency decay, leg weights, ORDER BY (§7.6)
 │   ├── aggregate.rs # count/sum from the in-RAM index + result diversity via limit_per (§7.7)
 │   ├── diversity.rs #   vector-space result diversity: MMR over a bounded window (§7.7)
+│   ├── expand.rs #   parent rollup + neighbour expansion for chunked corpora (§7.10)
 │   ├── write.rs  #   upsert/delete/flush/compact + collection lifecycle
 │   ├── memtier.rs#   publish/adopt the in-RAM working set against the memory tier (§13.3)
 │   └── tests.rs  #   store tests (pure-logic + file-backed + quant/ANN)

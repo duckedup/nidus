@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Aggregation, AnnConfig, AnnKind, Annotations, Filter, FilterIndexField, Footprint, FtsClause,
-    FtsCombine, FtsField, HighlightOpts, Hit, Language, LimitPer, ListOpts, OrderBy, Projection,
-    RankBy, Record, Value,
+    Aggregation, AnnConfig, AnnKind, Annotations, Expand, Filter, FilterIndexField, Footprint,
+    FtsClause, FtsCombine, FtsField, HighlightOpts, Hit, Language, LimitPer, ListOpts, OrderBy,
+    Projection, RankBy, Record, Value,
 };
 
 /// Body of `POST /collections/{name}/upsert`.
@@ -45,6 +45,44 @@ pub(super) fn default_top_k() -> usize {
 /// the bounded top-k kernel would otherwise be handed a `k` it must defend against itself.
 pub(super) const MAX_TOP_K: usize = 10_000;
 
+/// Wire form of [`crate::Expand`]: widen each hit with its document's neighbouring chunks.
+/// Every field but `radius` defaults to the reserved chunk attrs, so `{"radius": 1}` is the
+/// whole body a chunked corpus needs.
+#[derive(Debug, Deserialize)]
+pub struct ExpandRequest {
+    #[serde(default = "default_parent_field")]
+    pub parent_field: String,
+    #[serde(default = "default_index_field")]
+    pub index_field: String,
+    #[serde(default = "default_text_field")]
+    pub text_field: String,
+    #[serde(default)]
+    pub radius: usize,
+}
+
+impl From<ExpandRequest> for Expand {
+    fn from(r: ExpandRequest) -> Self {
+        Self {
+            parent_field: r.parent_field,
+            index_field: r.index_field,
+            text_field: r.text_field,
+            radius: r.radius,
+        }
+    }
+}
+
+fn default_parent_field() -> String {
+    crate::META_PARENT_ID.to_string()
+}
+
+fn default_index_field() -> String {
+    crate::META_CHUNK_INDEX.to_string()
+}
+
+fn default_text_field() -> String {
+    crate::model::META_TEXT.to_string()
+}
+
 /// Body of `POST /search`. An empty `scope` searches every collection; `offset` skips
 /// that many top-ranked hits, for pagination.
 #[derive(Debug, Deserialize)]
@@ -73,6 +111,9 @@ pub struct SearchRequest {
     /// Cap hits per distinct value of an attribute: `{"field": "path", "max": 2}`.
     #[serde(default)]
     pub limit_per: Option<LimitPer>,
+    /// Widen each hit with its document's neighbouring chunks: `{"radius": 1}`.
+    #[serde(default)]
+    pub expand: Option<ExpandRequest>,
     /// MMR lambda spreading the page in vector space: `1.0` pure relevance, `0.0` pure spread.
     #[serde(default)]
     pub diversity: Option<f32>,
@@ -125,6 +166,9 @@ pub struct SimilarRequest {
     pub rank_by: Option<RankBy>,
     #[serde(default)]
     pub limit_per: Option<LimitPer>,
+    /// Widen each hit with its document's neighbouring chunks: `{"radius": 1}`.
+    #[serde(default)]
+    pub expand: Option<ExpandRequest>,
     /// MMR lambda spreading the page in vector space: `1.0` pure relevance, `0.0` pure spread.
     #[serde(default)]
     pub diversity: Option<f32>,
@@ -245,6 +289,9 @@ pub struct TextSearchRequest {
     pub rank_by: Option<RankBy>,
     #[serde(default)]
     pub limit_per: Option<LimitPer>,
+    /// Widen each hit with its document's neighbouring chunks: `{"radius": 1}`.
+    #[serde(default)]
+    pub expand: Option<ExpandRequest>,
     /// MMR lambda spreading the page in vector space: `1.0` pure relevance, `0.0` pure spread.
     #[serde(default)]
     pub diversity: Option<f32>,
@@ -293,6 +340,9 @@ pub struct HybridSearchRequest {
     /// Weight on the BM25 leg's RRF contribution.
     #[serde(default = "default_weight")]
     pub text_weight: f32,
+    /// Widen each fused hit with its document's neighbouring chunks: `{"radius": 1}`.
+    #[serde(default)]
+    pub expand: Option<ExpandRequest>,
     /// Opt into the cross-encoder rerank stage over the fused ranking.
     #[cfg(feature = "rerank")]
     #[serde(default)]
@@ -532,6 +582,32 @@ pub struct RememberRequest {
     pub dedupe_threshold: Option<f32>,
 }
 
+/// Wire form of [`crate::memory::Rollup`]: read a chunked corpus as documents rather than
+/// fragments. `{"neighbours": 1}` keeps the best chunk per document and widens it.
+#[cfg(feature = "memory")]
+#[derive(Debug, Deserialize)]
+pub struct RollupRequest {
+    #[serde(default = "default_per_parent")]
+    pub per_parent: usize,
+    #[serde(default)]
+    pub neighbours: usize,
+}
+
+#[cfg(feature = "memory")]
+impl From<RollupRequest> for crate::memory::Rollup {
+    fn from(r: RollupRequest) -> Self {
+        Self {
+            per_parent: r.per_parent,
+            neighbours: r.neighbours,
+        }
+    }
+}
+
+#[cfg(feature = "memory")]
+fn default_per_parent() -> usize {
+    1
+}
+
 /// Body of `POST /collections/{name}/recall` (the `memory` feature).
 #[cfg(feature = "memory")]
 #[derive(Debug, Deserialize)]
@@ -547,6 +623,9 @@ pub struct RecallRequest {
     /// near-identical chunks stop filling it.
     #[serde(default)]
     pub diversity: Option<f32>,
+    /// Read the collection as a chunked corpus: `{"neighbours": 1}`.
+    #[serde(default)]
+    pub rollup: Option<RollupRequest>,
     /// Opt into the cross-encoder rerank stage. An omitted or empty `rerank.query` falls
     /// back to `query` above, so `{"rerank": {}}` is a valid minimal form here.
     #[cfg(feature = "rerank")]
@@ -565,6 +644,10 @@ pub struct HitDto {
     /// response is byte-identical to a nidus without annotations.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<Annotations>,
+    /// The hit's chunk widened with its neighbours. Present only when the query asked to
+    /// `expand`/`rollup`, so an unexpanded response is byte-identical to a nidus without it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 impl From<Hit> for HitDto {
@@ -575,6 +658,7 @@ impl From<Hit> for HitDto {
             score: h.score,
             attrs: h.attrs,
             annotations: h.annotations,
+            context: h.context,
         }
     }
 }
@@ -928,6 +1012,48 @@ mod tests {
             serde_json::from_value(json!({"collection": "c", "id": "i", "diversity": 1.0}))
                 .unwrap();
         assert_eq!(req.diversity, Some(1.0));
+    }
+
+    #[test]
+    fn expand_fills_the_reserved_chunk_attrs_from_a_bare_radius() {
+        let req: SearchRequest =
+            serde_json::from_value(json!({"query": [1.0], "expand": {"radius": 2}})).unwrap();
+        let e: Expand = req.expand.unwrap().into();
+        assert_eq!(e, Expand::new(2));
+
+        // A caller with its own chunk attrs overrides field by field.
+        let req: SearchRequest = serde_json::from_value(json!({
+            "query": [1.0],
+            "expand": {"radius": 1, "parent_field": "doc", "text_field": "body"}
+        }))
+        .unwrap();
+        let e: Expand = req.expand.unwrap().into();
+        assert_eq!(e.parent_field, "doc");
+        assert_eq!(e.text_field, "body");
+        assert_eq!(e.index_field, crate::META_CHUNK_INDEX);
+    }
+
+    #[cfg(feature = "memory")]
+    #[test]
+    fn rollup_defaults_to_the_best_chunk_per_document() {
+        let req: RecallRequest =
+            serde_json::from_value(json!({"query": "hi", "rollup": {"neighbours": 1}})).unwrap();
+        let r: crate::Rollup = req.rollup.unwrap().into();
+        assert_eq!(r, crate::Rollup::new(1));
+    }
+
+    /// An unexpanded hit must serialize byte-identically to a nidus without expansion, so an
+    /// old client never sees a key it does not know.
+    #[test]
+    fn context_is_absent_unless_the_query_expanded() {
+        let plain = HitDto::from(Hit::new("c", "a", 1.0, BTreeMap::new()));
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("context").is_none(), "{json}");
+
+        let mut hit = Hit::new("c", "a", 1.0, BTreeMap::new());
+        hit.context = Some("widened".to_string());
+        let json = serde_json::to_value(HitDto::from(hit)).unwrap();
+        assert_eq!(json["context"], json!("widened"));
     }
 
     #[test]

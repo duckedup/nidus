@@ -95,6 +95,9 @@ export interface Hit {
   attrs: Record<string, DecodedValue>;
   /** Why this hit matched — present only when the query asked to `explain` or highlight. */
   annotations?: Annotations;
+  /** The hit's chunk widened with its neighbours. Present only when the query asked to
+   * `expand` (or, on recall, to `rollup`). */
+  context?: string;
 }
 
 /** One fusion leg's own view of a hit: its rank in that leg (0-based) and that leg's score. */
@@ -255,6 +258,27 @@ export interface LimitPer {
 }
 
 /**
+ * Widen each hit with the neighbouring chunks of its own document, returned as
+ * {@link Hit.context}. Payload only: the ranking is exactly what it was without it.
+ * Every field but `radius` defaults to the reserved attrs `nidus ingest` stamps.
+ */
+export interface Expand {
+  radius: number;
+  parentField?: string;
+  indexField?: string;
+  textField?: string;
+}
+
+/**
+ * Read a chunked corpus as documents rather than fragments: keep each document's best
+ * `perParent` chunks, then widen each with `neighbours` chunks either side.
+ */
+export interface Rollup {
+  perParent?: number;
+  neighbours?: number;
+}
+
+/**
  * Sort a {@link NidusClient.list} by an attribute instead of storage order. Values of
  * another type, unorderable ones (`null`/lists/`NaN`), and records missing the attribute
  * sort into one trailing bucket, which stays trailing in both directions.
@@ -274,6 +298,8 @@ export interface RankingOptions {
    * Omitted leaves the ranking exactly as it is.
    */
   diversity?: number;
+  /** See {@link Expand}. Adds `context` to each hit and changes nothing else. */
+  expand?: Expand;
 }
 
 /** How several {@link TextClause}s fold into one text score. */
@@ -457,6 +483,8 @@ export interface HybridSearchBase extends AnnotationOptions {
   vectorWeight?: number;
   /** Weight on the BM25 leg's RRF contribution (default `1`). */
   textWeight?: number;
+  /** See {@link Expand}. Applied after fusion, so the RRF order is untouched. */
+  expand?: Expand;
   /** See {@link RerankOptions}. `query` is required here. */
   rerank?: RerankOptions;
 }
@@ -577,6 +605,8 @@ export interface RecallOptions {
    * stop filling the recalled window. `1` is pure relevance, `0` pure variety.
    */
   diversity?: number;
+  /** See {@link Rollup}. The text-native spelling of `limitPer` plus `expand`. */
+  rollup?: Rollup;
   /** See {@link RerankOptions}. Defaults `query` to the request's own text. */
   rerank?: RerankOptions;
 }

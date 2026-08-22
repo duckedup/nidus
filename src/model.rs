@@ -585,6 +585,35 @@ impl LimitPer {
     }
 }
 
+/// Widen each hit with the neighbouring chunks of its own document — payload only, written
+/// to [`Hit::context`] and never to `attrs`, so the total order of SPEC §7 and the caller's
+/// projection both survive it. See `SPEC.md` §7.9.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Expand {
+    /// Attr grouping the chunks of one document (`Value::Str`).
+    pub parent_field: String,
+    /// Attr ordering the chunks within a parent (`Value::Int`).
+    pub index_field: String,
+    /// Attr holding each chunk's text.
+    pub text_field: String,
+    /// Neighbours stitched either side. `0` stitches nothing and still reports the hit's
+    /// own text, so a caller that asked for context always gets the field.
+    pub radius: usize,
+}
+
+impl Expand {
+    /// `radius` neighbours either side, over the reserved chunk attrs `remember_chunked`
+    /// stamps ([`META_PARENT_ID`], [`META_CHUNK_INDEX`], [`META_TEXT`]).
+    pub fn new(radius: usize) -> Self {
+        Self {
+            parent_field: META_PARENT_ID.to_string(),
+            index_field: META_CHUNK_INDEX.to_string(),
+            text_field: META_TEXT.to_string(),
+            radius,
+        }
+    }
+}
+
 /// Attr key holding the raw remembered text. Canonical home is here (unconditional) so
 /// [`RerankOpts::default`] can reference it without the `memory` feature; `memory::META_TEXT`
 /// re-exports this constant so its public path is unchanged.
@@ -595,6 +624,10 @@ pub const META_TEXT: &str = "nidus.text";
 /// `Value::Int` (so `Predicate::Ge` can address it); `parent_id` is `Value::Str`.
 pub const META_PARENT_ID: &str = "nidus.parent_id";
 pub const META_CHUNK_INDEX: &str = "nidus.chunk_index";
+
+/// Char offset of the chunk into its source document (`Value::Int`), stamped so
+/// [`Expand`] can drop the overlap two adjacent chunks share instead of repeating it.
+pub const META_CHAR_START: &str = "nidus.char_start";
 
 /// Default overscan (see [`RerankOpts::overscan`]): a `top_k=10` query reranks 100 candidates.
 pub const DEFAULT_RERANK_OVERSCAN: usize = 10;
@@ -696,6 +729,9 @@ pub struct SearchOpts {
     /// Rerank the candidate window with a hosted cross-encoder (`crate::rerank`, feature-gated).
     /// `None` (the default) leaves the metric ranking untouched.
     pub rerank: Option<RerankOpts>,
+    /// Widen each hit with its document's neighbouring chunks. Runs last, after every pass
+    /// that can reorder, and writes only [`Hit::context`]. `None` (the default) skips it.
+    pub expand: Option<Expand>,
 }
 
 /// Query parameters for a metadata-only listing (no vector scoring).
@@ -749,6 +785,9 @@ pub struct HybridOpts {
     pub vector_weight: f32,
     /// Weight on the BM25 leg's RRF contribution. Default `1.0`.
     pub text_weight: f32,
+    /// Widen each fused hit with its document's neighbouring chunks — payload only, applied
+    /// after fusion so the RRF order is untouched. `None` (the default) skips it.
+    pub expand: Option<Expand>,
     /// Rerank the fused candidate window with a hosted cross-encoder (`crate::rerank`,
     /// feature-gated). `None` (the default) leaves the RRF ranking untouched.
     pub rerank: Option<RerankOpts>,
@@ -766,6 +805,7 @@ impl Default for HybridOpts {
             rerank: None,
             vector_weight: 1.0,
             text_weight: 1.0,
+            expand: None,
         }
     }
 }
@@ -783,6 +823,9 @@ pub struct Hit {
     /// Why this hit matched — per-leg sub-scores and highlighted fragments. `None` unless
     /// the query opted in (`explain` / `FtsQuery::highlight`), so the default is unchanged.
     pub annotations: Option<Annotations>,
+    /// The hit's own chunk text widened with its neighbours. `None` unless the query set
+    /// [`SearchOpts::expand`]; never mirrored into `attrs`, so projection is unaffected.
+    pub context: Option<String>,
 }
 
 impl Hit {
@@ -800,6 +843,7 @@ impl Hit {
             score,
             attrs,
             annotations: None,
+            context: None,
         }
     }
 }

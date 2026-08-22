@@ -1,6 +1,6 @@
 ---
 title: API reference
-description: The full nidus public surface (Nidus, Config, OpenProfile, Record, Value, Filter, Predicate, Scope, SearchOpts, Projection, RankBy, Decay, LimitPer, OrderBy, AggregateOpts, FtsQuery, HybridOpts, ListOpts, Hit, Annotations, Footprint).
+description: The full nidus public surface (Nidus, Config, OpenProfile, Record, Value, Filter, Predicate, Scope, SearchOpts, Projection, RankBy, Decay, LimitPer, Expand, Rollup, OrderBy, AggregateOpts, FtsQuery, HybridOpts, ListOpts, Hit, Annotations, Footprint).
 ---
 
 The complete public API. All fallible methods return `anyhow::Result`. For the
@@ -292,11 +292,13 @@ pub struct SearchOpts {
     pub rank_by: Option<RankBy>, // a ranking expression over the metric
     pub limit_per: Option<LimitPer>, // cap hits per attribute value
     pub diversity: Option<f32>,  // MMR lambda spreading hits apart in vector space
+    pub expand: Option<Expand>,  // widen each hit with its neighbouring chunks
 }
 ```
 
 Implements `Default` (`offset: 0`, `exact: false`, `explain: false`,
-`projection: Projection::All`, `rank_by: None`, `limit_per: None`, `diversity: None`);
+`projection: Projection::All`, `rank_by: None`, `limit_per: None`, `diversity: None`,
+`expand: None`);
 `SearchOpts { top_k: 5, ..Default::default() }` is the idiomatic call. Reused by
 `text_search`, where `min_score` is a raw BM25 floor.
 
@@ -369,6 +371,46 @@ the same thing on a dot-product or Euclidean store. Rank 1 never moves, ties res
 candidates because pairwise similarity is quadratic. A record with no vector carries no
 redundancy penalty. Applied after `limit_per` and before the page cut, so both compose.
 Anything outside `[0.0, 1.0]`, or not finite, is a `400`.
+
+## `Expand`
+
+Widen each hit with the neighbouring chunks of its own document, written to `Hit::context`;
+see [widening a chunked hit](/guides/search/#widening-a-chunked-hit-with-its-neighbours).
+
+```rust
+pub struct Expand {
+    pub parent_field: String,  // default "nidus.parent_id"
+    pub index_field: String,   // default "nidus.chunk_index"
+    pub text_field: String,    // default "nidus.text"
+    pub radius: usize,         // neighbours stitched either side
+}
+```
+
+`Expand::new(radius)` fills the three reserved attrs `remember_chunked` stamps. Payload only:
+it runs after every pass that can reorder or thin a ranking, writes `Hit::context` and never
+`attrs`, and never adds or drops a hit, so a query's `(id, score)` sequence is identical with
+it set and unset. Coordinates and text come from the stored record, so a `Projection` that
+drops the body does not stop it expanding. `radius: 0` reports the hit's own text. An empty
+field name is a `400`.
+
+Chunks written by nidus carry `nidus.char_start`, so the window is the source once rather
+than once per overlapping seam; a corpus without those offsets is joined with a blank line.
+
+## `Rollup`
+
+The text-native spelling of `LimitPer` plus `Expand`, on `RecallOpts::rollup` (the `memory`
+feature).
+
+```rust
+pub struct Rollup {
+    pub per_parent: usize,  // chunks kept per document; 0 reads as 1
+    pub neighbours: usize,  // chunks stitched either side of each survivor
+}
+```
+
+`Rollup::new(neighbours)` keeps the best chunk per document. `Rollup::as_opts()` returns the
+`(LimitPer, Expand)` pair, and every recall surface (in-process, HTTP, MCP) maps through it,
+so what "read this as a chunked corpus" means cannot drift between them.
 
 ## `OrderBy`
 
@@ -589,6 +631,7 @@ pub struct Hit {
     pub score: f32,   // meaning depends on the store's Distance metric
     pub attrs: BTreeMap<String, Value>,
     pub annotations: Option<Annotations>,  // why it matched; None unless asked
+    pub context: Option<String>,  // the chunk widened with its neighbours; None unless asked
 }
 
 impl Hit {

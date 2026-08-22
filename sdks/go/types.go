@@ -77,6 +77,9 @@ type Hit struct {
 	Score       float32      `json:"score"`
 	Attrs       Attrs        `json:"attrs"`
 	Annotations *Annotations `json:"annotations,omitempty"`
+	// Context is the hit's chunk widened with its neighbours. nil unless the query asked
+	// to Expand (or, on recall, to Rollup); the server omits the key entirely.
+	Context *string `json:"context,omitempty"`
 }
 
 // Annotations is why a hit matched: each fusion leg's own view of it, each BM25
@@ -274,6 +277,25 @@ type LimitPer struct {
 	Max   int    `json:"max"`
 }
 
+// An Expand widens each hit with the neighbouring chunks of its own document, returned in
+// [Hit.Context]. Payload only: the ranking is exactly what it was without it. Every field
+// but Radius defaults to the reserved attrs nidus ingest stamps, so &Expand{Radius: 1} is
+// the whole option a chunked corpus needs.
+type Expand struct {
+	Radius      int    `json:"radius"`
+	ParentField string `json:"parent_field,omitempty"`
+	IndexField  string `json:"index_field,omitempty"`
+	TextField   string `json:"text_field,omitempty"`
+}
+
+// A Rollup reads a chunked corpus as documents rather than fragments: PerParent chunks are
+// kept per document (1 when zero, the best-matching chunk), each widened with Neighbours
+// chunks either side. The text-native spelling of LimitPer plus [Expand].
+type Rollup struct {
+	PerParent  int `json:"per_parent,omitempty"`
+	Neighbours int `json:"neighbours,omitempty"`
+}
+
 // An OrderBy sorts a [Client.List] by an attribute instead of storage order. Values of a
 // different type than the first orderable one, unorderable values (Null, List, NaN), and
 // records missing the attribute sort into one trailing bucket, either direction.
@@ -304,6 +326,7 @@ type SearchRequest struct {
 	// space so near-duplicates stop filling a page: 1 is pure relevance, 0 pure variety.
 	// A pointer because &0 is a meaningful lambda that omitempty would drop.
 	Diversity *float32       `json:"diversity,omitempty"`
+	Expand    *Expand        `json:"expand,omitempty"`
 	Rerank    *RerankOptions `json:"rerank,omitempty"`
 	Projection
 }
@@ -343,6 +366,7 @@ type SimilarRequest struct {
 	// space so near-duplicates stop filling a page: 1 is pure relevance, 0 pure variety.
 	// A pointer because &0 is a meaningful lambda that omitempty would drop.
 	Diversity *float32 `json:"diversity,omitempty"`
+	Expand    *Expand  `json:"expand,omitempty"`
 	Projection
 }
 
@@ -455,6 +479,7 @@ type TextSearchRequest struct {
 	// space so near-duplicates stop filling a page: 1 is pure relevance, 0 pure variety.
 	// A pointer because &0 is a meaningful lambda that omitempty would drop.
 	Diversity *float32       `json:"diversity,omitempty"`
+	Expand    *Expand        `json:"expand,omitempty"`
 	Rerank    *RerankOptions `json:"rerank,omitempty"`
 	Projection
 }
@@ -489,6 +514,7 @@ type HybridSearchRequest struct {
 	Highlight    *HighlightOpts `json:"highlight,omitempty"`
 	VectorWeight *float32       `json:"vector_weight,omitempty"`
 	TextWeight   *float32       `json:"text_weight,omitempty"`
+	Expand       *Expand        `json:"expand,omitempty"`
 	Rerank       *RerankOptions `json:"rerank,omitempty"`
 }
 
@@ -634,7 +660,9 @@ type RecallOptions struct {
 	// Diversity spreads the recalled window apart in vector space (MMR lambda), so one
 	// verbose document's near-identical chunks stop filling it. &0 is meaningful.
 	Diversity *float32
-	Rerank    *RerankOptions
+	// Rollup reads the collection as a chunked corpus: one hit per document, widened.
+	Rollup *Rollup
+	Rerank *RerankOptions
 }
 
 type recallWire struct {
@@ -643,6 +671,7 @@ type recallWire struct {
 	MinScore  *float32       `json:"min_score,omitempty"`
 	Filter    Filter         `json:"filter,omitempty"`
 	Diversity *float32       `json:"diversity,omitempty"`
+	Rollup    *Rollup        `json:"rollup,omitempty"`
 	Rerank    *RerankOptions `json:"rerank,omitempty"`
 }
 
@@ -653,6 +682,7 @@ func (o RecallOptions) wire(query string) recallWire {
 		MinScore:  o.MinScore,
 		Filter:    o.Filter,
 		Diversity: o.Diversity,
+		Rollup:    o.Rollup,
 		Rerank:    o.Rerank,
 	}
 }

@@ -381,6 +381,7 @@ curl -s localhost:7700/search \
 | `rank_by` | none | a [ranking expression](/guides/search/#ranking-by-recency) over the metric |
 | `limit_per` | none | cap hits per distinct value of an attribute |
 | `diversity` | none | MMR lambda spreading hits apart in vector space (`1.0` relevance, `0.0` variety) |
+| `expand` | none | widen each hit with its document's neighbouring chunks; see [`expand`](#expand-widen-a-hit-with-its-neighbouring-chunks) |
 | `rerank` | none | re-score the candidate window with a hosted cross-encoder; see below |
 
 Omitting `rerank` leaves the response byte-identical to a nidus without the feature.
@@ -499,6 +500,7 @@ curl -s localhost:7700/search/similar \
 | `rank_by` | none | a [ranking expression](/guides/search/#ranking-by-recency) over the metric |
 | `limit_per` | none | cap hits per distinct value of an attribute |
 | `diversity` | none | MMR lambda spreading hits apart in vector space (`1.0` relevance, `0.0` variety) |
+| `expand` | none | widen each hit with its document's neighbouring chunks; see [`expand`](#expand-widen-a-hit-with-its-neighbouring-chunks) |
 
 The one difference from `/search`: an omitted or empty `scope` searches only the source's
 own collection, not every collection in the store.
@@ -511,7 +513,8 @@ with (a text-only entry), is a `400` naming the id and the reason, not an empty 
 ### `POST /text-search`
 
 BM25 full-text search of declared fields. Returns the same hit shape as `/search`.
-Takes `scope`, `top_k`, `offset`, `filter`, `rank_by`, `limit_per`, `diversity`, `min_score` (here a
+Takes `scope`, `top_k`, `offset`, `filter`, `rank_by`, `limit_per`, `diversity`, `expand`,
+`min_score` (here a
 **raw BM25** floor, not cosine), the `include_attributes`/`exclude_attributes` projection,
 `rerank`, and the query itself in one of two spellings.
 
@@ -561,8 +564,8 @@ Fuse a vector query and a BM25 text query with Reciprocal Rank Fusion. Takes `ve
 plus the text leg (`field` + `text`, or the same `clauses` + `combine` as `/text-search`),
 plus `top_k`, `offset` (which pages the **fused** ranking, never a leg),
 `filter`, `rrf_k` (default 60), `candidates` (default 100), and `explain`/`highlight`.
-There is no `min_score` (a fused RRF score has no absolute scale).
-Returns the same hit shape as `/search`.
+There is no `min_score` (a fused RRF score has no absolute scale). It also takes `expand`,
+applied after fusion so the RRF order is untouched. Returns the same hit shape as `/search`.
 
 ```bash
 curl -s localhost:7700/hybrid-search \
@@ -585,6 +588,49 @@ curl -s localhost:7700/hybrid-search \
   -H 'content-type: application/json' \
   -d '{"vector": [1,0,0], "field": "body", "text": "CVE-2026-1234", "text_weight": 3.0}'
 ```
+
+### `expand`: widen a hit with its neighbouring chunks
+
+`/search`, `/search/similar`, `/text-search` and `/hybrid-search` all take `expand`, which
+adds a `context` string to each hit: the hit's own chunk plus `radius` chunks either side of
+it, stitched back into the passage they came from.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `radius` | `0` | chunks stitched either side. `0` reports the hit's own text |
+| `parent_field` | `nidus.parent_id` | attr grouping a document's chunks |
+| `index_field` | `nidus.chunk_index` | attr ordering the chunks within a document |
+| `text_field` | `nidus.text` | attr holding each chunk's text |
+
+Those defaults are exactly what [`nidus ingest`](/guides/ingest/) stamps, so `{"radius": 1}`
+is the whole object a chunked corpus needs.
+
+```bash
+curl -s localhost:7700/search   -H 'content-type: application/json'   -d '{"query": [1,0,0], "top_k": 5,
+       "limit_per": {"field": "nidus.parent_id", "max": 1},
+       "expand": {"radius": 1}}'
+```
+
+`expand` is payload only. It runs after every pass that can reorder or thin a ranking, so
+the ids, the scores and the order are identical to the same query without it, and `context`
+is the one key that differs. A hit whose record carries no chunk attrs has no `context`
+rather than failing the query. Omitting `expand` leaves the response byte-identical to a
+nidus without the feature.
+
+On `/collections/{name}/recall` the same capability is spelled `rollup`, which pairs it with
+the per-document cap in one object:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `per_parent` | `1` | chunks kept per document |
+| `neighbours` | `0` | chunks stitched either side of each survivor |
+
+```bash
+curl -s localhost:7700/collections/docs/recall   -H 'content-type: application/json'   -d '{"query": "how does the writer lock work", "rollup": {"neighbours": 1}}'
+```
+
+This is the only spelling the [`/mcp`](#mcp) `recall` tool offers: a model means "one result
+per document, widened", not a set of attr names.
 
 ### Annotations: why a hit matched
 
@@ -843,9 +889,11 @@ curl -s localhost:7700/collections/notes/recall \
 | `min_score` | none | drop hits scoring below this cosine similarity |
 | `filter` | none | AND of predicates applied before scoring |
 | `diversity` | none | MMR lambda spreading hits apart in vector space (`1.0` relevance, `0.0` variety) |
+| `rollup` | none | read the collection as a chunked corpus; see [`expand`](#expand-widen-a-hit-with-its-neighbouring-chunks) |
 | `rerank` | none | re-score the candidate window with a hosted cross-encoder; see below |
 
-Returns the same `HitDto` shape as `/search`: an array of `{collection, id, score, attrs}`.
+Returns the same `HitDto` shape as `/search`: an array of `{collection, id, score, attrs}`,
+each gaining a `context` string when the query asked to `expand` or `rollup`.
 
 `rerank` takes the same `overscan`/`text_attr` fields as [`/search`](#post-search), but
 `query` is optional here: an omitted or empty `rerank.query` falls back to the request's

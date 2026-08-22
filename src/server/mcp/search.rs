@@ -238,6 +238,47 @@ fn diversity_schema() -> JsonValue {
     })
 }
 
+/// Parse the `rollup` object into the `limit_per`/`expand` pair, through
+/// [`Rollup::as_opts`] — the same mapping the HTTP and in-process recalls use.
+pub(super) fn parse_rollup(
+    args: &Map<String, JsonValue>,
+) -> Result<Option<(crate::LimitPer, crate::Expand)>, McpError> {
+    let Some(value) = args.get("rollup").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let obj = value
+        .as_object()
+        .ok_or_else(|| McpError::invalid_params("`rollup` must be an object".to_string(), None))?;
+    let rollup = crate::Rollup {
+        per_parent: optional_usize(obj, "per_parent")?.unwrap_or(1),
+        neighbours: optional_usize(obj, "neighbours")?.unwrap_or(0),
+    };
+    Ok(Some(rollup.as_opts()))
+}
+
+/// `rollup`: read a chunked corpus as documents. The text-native form of `Expand` — a model
+/// means "one result per document, widened", never a set of attr names, so the four-field
+/// wire form stays on the HTTP/CLI/SDK surfaces.
+fn rollup_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "description": "Read a chunked corpus as documents rather than fragments: collapse each document's chunks to its best match, then widen that match with the chunks around it so you read a passage instead of a sentence fragment. Use it on any collection written by `nidus ingest` or `remember_chunked`.",
+        "properties": {
+            "per_parent": {
+                "type": "integer",
+                "description": "Chunks kept per document. Defaults to 1, the best-matching chunk.",
+                "minimum": 1
+            },
+            "neighbours": {
+                "type": "integer",
+                "description": "Chunks stitched either side of each kept chunk, returned as the result's `context`. 1 or 2 is usually enough.",
+                "minimum": 0
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
 /// `rerank`: opt into the cross-encoder post-ranking stage, shared by `recall`,
 /// `text_search`, and `hybrid_search`. A plain boolean, not an object: the query text is
 /// already a required argument on every one of these tools.
@@ -289,6 +330,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     },
                     "filter": filter_schema(),
                     "diversity": diversity_schema(),
+                    "rollup": rollup_schema(),
                     "rerank": rerank_bool_schema(),
                     "rerank_overscan": rerank_overscan_schema()
                 },
@@ -324,6 +366,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     },
                     "filter": filter_schema(),
                     "diversity": diversity_schema(),
+                    "rollup": rollup_schema(),
                     "rerank": rerank_bool_schema(),
                     "rerank_overscan": rerank_overscan_schema()
                 },
@@ -400,7 +443,8 @@ pub(super) fn related_tool() -> Tool {
                     "description": "Drop results scoring below this. Scores are cosine similarity in [-1, 1]; around 0.7 is a reasonable floor for \"actually relevant\"."
                 },
                 "filter": filter_schema(),
-                "diversity": diversity_schema()
+                "diversity": diversity_schema(),
+                "rollup": rollup_schema()
             },
             "required": ["collection", "id"],
             "additionalProperties": false
@@ -420,6 +464,7 @@ impl NidusMcp {
         let min_score = optional_f32(args, "min_score")?;
         let filter = parse_filter(args)?;
         let diversity = optional_f32(args, "diversity")?;
+        let rollup = parse_rollup(args)?;
         let rerank = parse_rerank(args)?;
 
         let vector = embedder
@@ -432,6 +477,8 @@ impl NidusMcp {
             min_score,
             filter: with_ttl_guard(filter),
             diversity,
+            limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
+            expand: rollup.map(|(_, e)| e),
             rerank,
             ..Default::default()
         };
@@ -476,12 +523,15 @@ impl NidusMcp {
         let top_k = optional_top_k(args)?;
         let filter = parse_filter(args)?;
         let diversity = optional_f32(args, "diversity")?;
+        let rollup = parse_rollup(args)?;
         let rerank = parse_rerank(args)?;
 
         let opts = SearchOpts {
             top_k,
             filter: with_ttl_guard(filter),
             diversity,
+            limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
+            expand: rollup.map(|(_, e)| e),
             rerank,
             ..Default::default()
         };
@@ -589,6 +639,7 @@ impl NidusMcp {
         let min_score = optional_f32(args, "min_score")?;
         let filter = parse_filter(args)?;
         let diversity = optional_f32(args, "diversity")?;
+        let rollup = parse_rollup(args)?;
 
         let hits = crate::server::run_read(self.state.clone(), move |db| {
             if let Some(source) = db.get(&collection, &id) {
@@ -605,6 +656,8 @@ impl NidusMcp {
                 min_score,
                 filter: with_ttl_guard(filter),
                 diversity,
+                limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
+                expand: rollup.map(|(_, e)| e),
                 ..Default::default()
             };
             db.search_similar(collection.as_str(), collection.as_str(), id.as_str(), &opts)

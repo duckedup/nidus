@@ -600,3 +600,200 @@ fn changing_the_chunk_options_re_ingests() {
         "and the chunking actually differs: {wider}"
     );
 }
+
+/// One `nidus recall` over the real binary, with whatever read flags the test needs.
+fn recall(store: &Path, url: &str, query: &str, extra: &[&str]) -> Value {
+    let store = store.to_string_lossy();
+    let mut args: Vec<&str> = vec![
+        "recall",
+        "docs",
+        query,
+        "--dir",
+        &store,
+        "--dim",
+        "8",
+        "--embed-provider",
+        "ollama",
+        "--embed-base-url",
+        url,
+    ];
+    args.extend_from_slice(extra);
+    ok_json(&args)
+}
+
+/// The epic's own arc, over the real binary: `ingest` a tree, then read it back as
+/// documents. Without `--rollup` the corpus answers in chunks, which is the shape every RAG
+/// application then has to collapse by hand.
+#[test]
+fn ingest_then_recall_with_rollup_returns_one_hit_per_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let (corpus, store) = (dir.path().join("corpus"), dir.path().join("store"));
+    let mock = Recorder::start();
+    for doc in ["a", "b"] {
+        write(&corpus.join(format!("{doc}.md")), &paragraphs(4, "tail"));
+    }
+    ingest(&store, &corpus, &mock.url, &[]);
+
+    let raw = recall(&store, &mock.url, "paragraph 1", &["-k", "20"]);
+    let hits = raw.as_array().expect("recall returns an array");
+    assert!(hits.len() > 2, "chunk hits, not document hits: {raw}");
+
+    let rolled = recall(
+        &store,
+        &mock.url,
+        "paragraph 1",
+        &["-k", "20", "--rollup", "1"],
+    );
+    let rolled = rolled.as_array().expect("recall returns an array");
+    let mut parents: Vec<&str> = rolled
+        .iter()
+        .map(|h| {
+            h["attrs"]["nidus.parent_id"]["Str"]
+                .as_str()
+                .expect("parent")
+        })
+        .collect();
+    parents.sort();
+    parents.dedup();
+    assert_eq!(
+        rolled.len(),
+        parents.len(),
+        "one hit per document: {rolled:?}"
+    );
+    assert_eq!(parents.len(), 2, "both documents present: {parents:?}");
+}
+
+/// The ticket's provable-ordering criterion at the real wire: expansion changes the payload
+/// and nothing else. Compares the `(id, score)` sequence, not just the count.
+#[test]
+fn neighbour_expansion_widens_a_hit_without_reordering_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (corpus, store) = (dir.path().join("corpus"), dir.path().join("store"));
+    let mock = Recorder::start();
+    write(&corpus.join("a.md"), &paragraphs(5, "tail"));
+    ingest(&store, &corpus, &mock.url, &[]);
+
+    let ranking = |v: &Value| -> Vec<(String, f64)> {
+        v.as_array()
+            .expect("array")
+            .iter()
+            .map(|h| {
+                (
+                    h["id"].as_str().expect("id").to_string(),
+                    h["score"].as_f64().expect("score"),
+                )
+            })
+            .collect()
+    };
+    let plain = recall(&store, &mock.url, "paragraph 2", &["-k", "10"]);
+    let widened = recall(
+        &store,
+        &mock.url,
+        "paragraph 2",
+        &["-k", "10", "--rollup", "10", "--neighbours", "1"],
+    );
+
+    assert_eq!(ranking(&plain), ranking(&widened), "payload only");
+    for hit in plain.as_array().expect("array") {
+        assert!(hit.get("context").is_none(), "no context asked for: {hit}");
+    }
+    for hit in widened.as_array().expect("array") {
+        let own = hit["attrs"]["nidus.text"]["Str"].as_str().expect("text");
+        let context = hit["context"].as_str().expect("context");
+        assert!(context.contains(own), "the winning chunk is in its window");
+    }
+    // The middle chunk's window reaches its neighbours, which its own text does not.
+    let widened = widened.as_array().expect("array");
+    let middle = widened
+        .iter()
+        .find(|h| h["id"] == json!("a.md#2"))
+        .expect("chunk 2 ranked");
+    let context = middle["context"].as_str().expect("context");
+    assert!(context.contains("paragraph 1"), "{context}");
+    assert!(context.contains("paragraph 3"), "{context}");
+}
+
+/// Expansion is keyed on `(parent_id, chunk_index)`, so two documents whose indices overlap
+/// must not bleed into each other — a bug a single-document corpus cannot see.
+#[test]
+fn expansion_does_not_cross_a_document_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let (corpus, store) = (dir.path().join("corpus"), dir.path().join("store"));
+    let mock = Recorder::start();
+    write(&corpus.join("a.md"), &paragraphs(4, "alpha tail marker"));
+    write(
+        &corpus.join("b.md"),
+        &paragraphs(4, "bravo tail CONTAMINANT"),
+    );
+    ingest(&store, &corpus, &mock.url, &[]);
+
+    let hits = recall(
+        &store,
+        &mock.url,
+        "alpha tail marker",
+        &["-k", "20", "--rollup", "10", "--neighbours", "5"],
+    );
+    for hit in hits.as_array().expect("array") {
+        let id = hit["id"].as_str().expect("id");
+        let context = hit["context"].as_str().expect("context");
+        if id.starts_with("a.md#") {
+            assert!(
+                !context.contains("CONTAMINANT"),
+                "a.md#'s window pulled b.md's text: {context}"
+            );
+        }
+    }
+}
+
+/// The de-overlap: with `--overlap-chars` set, a stitched window must be the source once,
+/// not the source with every seam repeated. A length check would not catch a wrong trim.
+#[test]
+fn an_expanded_window_does_not_repeat_the_chunk_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (corpus, store) = (dir.path().join("corpus"), dir.path().join("store"));
+    let mock = Recorder::start();
+    let body = paragraphs(4, "tail");
+    write(&corpus.join("a.md"), &body);
+    // Overlapping chunks: the naive concatenation would repeat 20 chars at each seam. Spelled
+    // out rather than via `ingest`, whose baked-in `--overlap-chars 0` cannot be overridden.
+    let (store_s, corpus_s) = (store.to_string_lossy(), corpus.to_string_lossy());
+    ok_json(&[
+        "ingest",
+        &corpus_s,
+        "--collection",
+        "docs",
+        "--glob",
+        "**/*.md",
+        "--dir",
+        &store_s,
+        "--dim",
+        "8",
+        "--embed-provider",
+        "ollama",
+        "--embed-base-url",
+        &mock.url,
+        "--max-chars",
+        "60",
+        "--overlap-chars",
+        "20",
+    ]);
+
+    let hits = recall(
+        &store,
+        &mock.url,
+        "paragraph 1",
+        &["-k", "20", "--rollup", "10", "--neighbours", "10"],
+    );
+    let hits = hits.as_array().expect("array");
+    let widest = hits
+        .iter()
+        .map(|h| h["context"].as_str().expect("context"))
+        .max_by_key(|c| c.len())
+        .expect("at least one hit");
+    // The whole document is one contiguous slice of the source, seams and all.
+    assert_eq!(
+        widest,
+        body.as_str(),
+        "the window must be the source once, not once per seam"
+    );
+}

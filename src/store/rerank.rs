@@ -42,6 +42,8 @@ pub(crate) fn widened_opts(opts: &SearchOpts) -> (SearchOpts, bool) {
         limit_per: None,
         // Deferred, not dropped: MMR here would thin the window before the cross-encoder saw it.
         diversity: None,
+        // Likewise deferred to the tail: stitching a window the rerank then discards is waste.
+        expand: None,
         projection,
         ..opts.clone()
     };

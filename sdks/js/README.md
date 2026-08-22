@@ -214,6 +214,19 @@ const recent = await db.search({
   limitPer: { field: "path", max: 2 },
 });
 
+// Read a chunked corpus as documents: the best chunk per file, widened with its
+// neighbours into `hit.context`. Payload only, so the ranking is unchanged.
+const passages = await db.search({
+  query: [0.1, 0.2, 0.3],
+  limitPer: { field: "nidus.parent_id", max: 1 },
+  expand: { radius: 1 },
+});
+
+// On recall the same pair has one text-native spelling.
+await db.recall("docs", "how does the writer lock work", {
+  rollup: { neighbours: 1 },
+});
+
 // Sort a listing by an attribute instead of storage order
 await db.list({ orderBy: { field: "updated_at", descending: true } });
 

@@ -8,8 +8,8 @@ use crate::diag::diag;
 use crate::embed::{AnyEmbedder, Embedder, embedder_identity};
 use crate::meta::now_ms;
 use crate::{
-    Filter, FtsField, Hit, META_CHUNK_INDEX, META_EXPIRES_AT, META_PARENT_ID, Nidus, Predicate,
-    Record, SearchOpts, Value,
+    Expand, Filter, FtsField, Hit, LimitPer, META_CHAR_START, META_CHUNK_INDEX, META_EXPIRES_AT,
+    META_PARENT_ID, Nidus, Predicate, Record, SearchOpts, Value,
 };
 
 #[cfg(feature = "summarize")]
@@ -83,7 +83,9 @@ pub struct Remembered {
     pub upserted: usize,
 }
 
-/// What a [`Memory::remember_chunked`] write actually did.
+/// What a [`Memory::remember_chunked`] write actually did. The chunks land as one batch, so
+/// each entry's `upserted` reports that batch's total, not its own row — use `chunks.len()`
+/// for the chunk count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkedRemembered {
     /// The `parent_id` the caller passed in.
@@ -107,6 +109,38 @@ pub struct RecallOpts {
     /// MMR lambda spreading the recalled window in vector space, so one verbose document's
     /// near-identical chunks stop filling it. `None` (the default) skips the pass.
     pub diversity: Option<f32>,
+    /// Read a chunked corpus as documents: best chunk per parent, widened with its
+    /// neighbours. `None` (the default) returns raw chunk hits.
+    pub rollup: Option<Rollup>,
+}
+
+/// Read a chunked corpus as documents rather than fragments: keep a document's best
+/// `per_parent` chunks, then widen each with `neighbours` chunks either side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rollup {
+    /// Chunks kept per document. `0` is read as `1` — the best chunk alone.
+    pub per_parent: usize,
+    /// Neighbours stitched either side of each survivor, into [`Hit::context`].
+    pub neighbours: usize,
+}
+
+impl Rollup {
+    /// The best chunk per document, widened by `neighbours` either side.
+    pub fn new(neighbours: usize) -> Self {
+        Self {
+            per_parent: 1,
+            neighbours,
+        }
+    }
+
+    /// The [`SearchOpts`] knobs this maps onto, shared by every recall surface so the
+    /// in-process, HTTP and MCP reads cannot drift.
+    pub fn as_opts(&self) -> (LimitPer, Expand) {
+        (
+            LimitPer::new(META_PARENT_ID, self.per_parent.max(1)),
+            Expand::new(self.neighbours),
+        )
+    }
 }
 
 /// A text-native memory handle over a [`Nidus`] store and an embedder.
@@ -261,7 +295,7 @@ pub(crate) fn strip_reserved_recency(attrs: &mut BTreeMap<String, Value>) {
 /// `parent_id`/`chunk_index`, and `remember_chunked`'s stale-tail prune matches on exactly
 /// that pair, so a forged row is deletable by an unrelated document's re-ingest.
 pub(crate) fn strip_reserved_chunk(attrs: &mut BTreeMap<String, Value>) {
-    for key in [META_PARENT_ID, META_CHUNK_INDEX] {
+    for key in [META_PARENT_ID, META_CHUNK_INDEX, META_CHAR_START] {
         attrs.remove(key);
     }
 }
@@ -459,36 +493,40 @@ pub(crate) async fn remember_chunked_with<E: Embedder>(
             vectors.len()
         );
     }
-    let mut remembered = Vec::with_capacity(n);
-    for (chunk, vector) in chunks.into_iter().zip(vectors) {
-        let index = chunk.index;
-        let write = RememberWrite {
-            id: format!("{parent_id}#{index}"),
-            text: chunk.text,
-            attrs: attrs.clone(),
-            ttl_seconds,
-            dedupe_threshold: None,
-        };
-        remembered.push(commit_remember_chunk(
-            db,
-            embedder,
-            collection,
-            write,
-            vector,
-            (parent_id, index as i64),
-        )?);
-    }
+    let writes: Vec<(RememberWrite, Vec<f32>, i64, i64)> = chunks
+        .into_iter()
+        .zip(vectors)
+        .map(|(chunk, vector)| {
+            let index = chunk.index;
+            let write = RememberWrite {
+                id: format!("{parent_id}#{index}"),
+                text: chunk.text,
+                attrs: attrs.clone(),
+                ttl_seconds,
+                dedupe_threshold: None,
+            };
+            (write, vector, index as i64, chunk.char_start as i64)
+        })
+        .collect();
 
-    let pruned = db.delete_where(
-        collection,
-        &Filter(vec![Predicate::All(vec![
-            Predicate::Eq(
-                META_PARENT_ID.to_string(),
-                Value::Str(parent_id.to_string()),
-            ),
-            Predicate::Ge(META_CHUNK_INDEX.to_string(), Value::Int(n as i64)),
-        ])]),
-    )?;
+    // Group-commit the whole document: the new chunks and the stale-tail prune take ONE
+    // durability barrier between them, so the two generations are never both committed —
+    // a per-chunk loop committed each independently and tore on any crash (nidus-lvo.5).
+    let (remembered, pruned) = db.deferred(|db| {
+        let remembered = commit_remember_chunks(db, embedder, collection, parent_id, writes)?;
+        let pruned = db.delete_where(
+            collection,
+            &Filter(vec![Predicate::All(vec![
+                Predicate::Eq(
+                    META_PARENT_ID.to_string(),
+                    Value::Str(parent_id.to_string()),
+                ),
+                Predicate::Ge(META_CHUNK_INDEX.to_string(), Value::Int(n as i64)),
+            ])]),
+        )?;
+        db.commit()?;
+        Ok((remembered, pruned))
+    })?;
 
     Ok(ChunkedRemembered {
         parent_id: parent_id.to_string(),
@@ -514,17 +552,44 @@ pub(crate) fn commit_remember<E: Embedder>(
     commit_remember_inner(db, embedder, collection, write, vector, None)
 }
 
-/// [`commit_remember`] for one chunk of a chunked document: same stamping, plus the
-/// `(parent_id, chunk_index)` provenance, stamped here so it cannot be forged by a caller.
-pub(crate) fn commit_remember_chunk<E: Embedder>(
+/// [`commit_remember`] for **every** chunk of one document, as a single `upsert`, plus the
+/// `(parent_id, chunk_index, char_start)` provenance stamped here so a caller cannot forge it.
+/// One batch, because a per-chunk loop left two generations mixed on a crash (nidus-lvo.5).
+pub(crate) fn commit_remember_chunks<E: Embedder>(
     db: &mut Nidus,
     embedder: &E,
     collection: &str,
-    write: RememberWrite,
-    vector: Vec<f32>,
-    chunk: (&str, i64),
-) -> anyhow::Result<Remembered> {
-    commit_remember_inner(db, embedder, collection, write, vector, Some(chunk))
+    parent_id: &str,
+    chunks: Vec<(RememberWrite, Vec<f32>, i64, i64)>,
+) -> anyhow::Result<Vec<Remembered>> {
+    ensure_collection_and_pin(db, embedder, collection)?;
+    let mut records = Vec::with_capacity(chunks.len());
+    let mut out = Vec::with_capacity(chunks.len());
+    for (write, vector, index, char_start) in chunks {
+        // Chunked writes refuse `dedupe_threshold` upstream, so no chunk can be redirected
+        // onto another document's id and the batch's ids stay `{parent_id}#{index}`.
+        debug_assert!(write.dedupe_threshold.is_none());
+        let p = prepare_remember(
+            db,
+            collection,
+            write,
+            vector,
+            Some((parent_id, index, char_start)),
+        )?;
+        records.push(Record::new(p.id.clone(), p.vector, p.attrs));
+        out.push((p.id, p.deduped));
+    }
+    // One all-or-nothing batch (SPEC §6.1): every fallible step rolls `data` and `log` back
+    // to the marks taken at entry, so a failure leaves no chunk of this generation behind.
+    let upserted = db.upsert(collection, &records)?;
+    Ok(out
+        .into_iter()
+        .map(|(id, deduped)| Remembered {
+            id,
+            deduped,
+            upserted,
+        })
+        .collect())
 }
 
 fn commit_remember_inner<E: Embedder>(
@@ -533,8 +598,43 @@ fn commit_remember_inner<E: Embedder>(
     collection: &str,
     write: RememberWrite,
     vector: Vec<f32>,
-    chunk: Option<(&str, i64)>,
+    chunk: Option<(&str, i64, i64)>,
 ) -> anyhow::Result<Remembered> {
+    ensure_collection_and_pin(db, embedder, collection)?;
+    let prepared = prepare_remember(db, collection, write, vector, chunk)?;
+    let Prepared {
+        id,
+        attrs,
+        vector,
+        deduped,
+    } = prepared;
+    let upserted = db.upsert(collection, &[Record::new(id.clone(), vector, attrs)])?;
+    Ok(Remembered {
+        id,
+        deduped,
+        upserted,
+    })
+}
+
+/// One remember write, stamped and dedup-resolved but not yet stored — so the single
+/// [`prepare_remember`] chokepoint serves both the one-record and the whole-document write.
+struct Prepared {
+    id: String,
+    attrs: BTreeMap<String, Value>,
+    vector: Vec<f32>,
+    deduped: bool,
+}
+
+/// The single chokepoint for reserved-attr stamping and dedup resolution. Reads the store
+/// (dedup search, `created_at` recovery) but mutates nothing, so a caller may prepare a whole
+/// document and then write it as one batch.
+fn prepare_remember(
+    db: &Nidus,
+    collection: &str,
+    write: RememberWrite,
+    vector: Vec<f32>,
+    chunk: Option<(&str, i64, i64)>,
+) -> anyhow::Result<Prepared> {
     let RememberWrite {
         id,
         text,
@@ -542,18 +642,18 @@ fn commit_remember_inner<E: Embedder>(
         ttl_seconds,
         dedupe_threshold,
     } = write;
-    ensure_collection_and_pin(db, embedder, collection)?;
 
     // Stamped from here, never accepted from a caller — and before the dedup merge below,
     // so this write's text wins over the matched entry's.
     strip_reserved_recency(&mut attrs);
     strip_reserved_chunk(&mut attrs);
-    if let Some((parent_id, index)) = chunk {
+    if let Some((parent_id, index, char_start)) = chunk {
         attrs.insert(
             META_PARENT_ID.to_string(),
             Value::Str(parent_id.to_string()),
         );
         attrs.insert(META_CHUNK_INDEX.to_string(), Value::Int(index));
+        attrs.insert(META_CHAR_START.to_string(), Value::Int(char_start));
     }
     attrs.insert(META_TEXT.to_string(), Value::Str(text));
 
@@ -593,11 +693,11 @@ fn commit_remember_inner<E: Embedder>(
     }
     stamp_recency(&mut attrs, now_ms(), prior_created, ttl_seconds);
 
-    let upserted = db.upsert(collection, &[Record::new(target_id.clone(), vector, attrs)])?;
-    Ok(Remembered {
+    Ok(Prepared {
         id: target_id,
+        attrs,
+        vector,
         deduped,
-        upserted,
     })
 }
 
@@ -688,6 +788,7 @@ async fn recall_with<E: Embedder>(
     // caller's own predicates, so an expired entry cannot leak back into recall.
     let mut filter = opts.filter.clone().unwrap_or_default();
     filter.0.push(not_expired_predicate(now_ms()));
+    let rollup = opts.rollup.as_ref().map(Rollup::as_opts);
     let search_opts = SearchOpts {
         top_k: if opts.top_k == 0 {
             DEFAULT_TOP_K
@@ -697,6 +798,8 @@ async fn recall_with<E: Embedder>(
         filter,
         min_score: (opts.min_score > 0.0).then_some(opts.min_score),
         diversity: opts.diversity,
+        limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
+        expand: rollup.map(|(_, e)| e),
         // No `offset` on `RecallOpts` by design (nidus-m50.15): the memory API stays lean.
         ..Default::default()
     };
@@ -1669,6 +1772,184 @@ mod tests {
             assert!(record.attrs.contains_key(META_TEXT));
             assert!(record.attrs.contains_key(META_CREATED_AT));
             assert!(record.attrs.contains_key(META_UPDATED_AT));
+        }
+    }
+
+    /// nidus-lvo.5: one document is ONE all-or-nothing batch, so a failure part-way through
+    /// leaves the whole OLD generation, never new chunks 0..k beside old ones >k. A
+    /// `max_vector_bytes` refusal stands in for the crash — a per-chunk loop crosses it late.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn a_failed_chunked_write_leaves_the_whole_old_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        // Five rows of headroom at dim 8 (32 bytes a row): enough for the 3-chunk first
+        // generation, not for the 6-chunk second one — but enough for its first two chunks.
+        let cfg = crate::Config::new(dir.path(), 8).max_vector_bytes(Some(5 * 8 * 4));
+        let mut db = Nidus::open(cfg).unwrap();
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        let opts = small_chunk_opts();
+
+        let first = remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-1",
+            &"a".repeat(25),
+            &opts,
+            RememberOpts::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.chunks.len(), 3);
+
+        let err = remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-1",
+            &"b".repeat(55),
+            &opts,
+            RememberOpts::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("max_vector_bytes"), "{err:#}");
+
+        // Nothing of the new generation survived, and nothing of the old one is missing.
+        for i in 0..3 {
+            let record = db.get("docs", &format!("doc-1#{i}")).unwrap();
+            let Value::Str(text) = &record.attrs[META_TEXT] else {
+                panic!("chunk {i} lost its text")
+            };
+            assert!(
+                text.starts_with('a'),
+                "chunk {i} is from the half-written generation: {text}"
+            );
+        }
+        assert!(db.get("docs", "doc-1#3").is_none(), "no new chunk landed");
+    }
+
+    /// Every chunk carries its source offset, which is what lets `Expand` drop the overlap
+    /// two adjacent chunks share rather than repeating it.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn every_chunk_stamps_its_source_offset() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        let text = "a".repeat(55);
+        let result = remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-1",
+            &text,
+            &small_chunk_opts(),
+            RememberOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        let expected = crate::chunk::chunk_text(&text, &small_chunk_opts()).unwrap();
+        assert_eq!(expected.len(), result.chunks.len());
+        for (chunk, remembered) in expected.iter().zip(&result.chunks) {
+            let record = db.get("docs", &remembered.id).unwrap();
+            assert_eq!(
+                record.attrs[META_CHAR_START],
+                Value::Int(chunk.char_start as i64),
+                "chunk {} must carry its own offset",
+                chunk.index
+            );
+        }
+    }
+
+    /// A caller-supplied offset is stripped like the rest of the chunk provenance: a forged
+    /// one would make `Expand` stitch the wrong window.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn a_forged_char_start_is_stripped() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        let mut attrs = BTreeMap::new();
+        attrs.insert(META_CHAR_START.to_string(), Value::Int(9999));
+        let result = remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-1",
+            &"a".repeat(25),
+            &small_chunk_opts(),
+            RememberOpts {
+                attrs,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let record = db.get("docs", &result.chunks[0].id).unwrap();
+        assert_eq!(record.attrs[META_CHAR_START], Value::Int(0));
+    }
+
+    /// A `Rollup` is the text-native spelling of `limit_per` + `expand`, and every recall
+    /// surface maps it through this one method rather than restating it.
+    #[test]
+    fn rollup_maps_onto_the_store_knobs() {
+        let (cap, expand) = Rollup::new(2).as_opts();
+        assert_eq!(cap, crate::LimitPer::new(META_PARENT_ID, 1));
+        assert_eq!(expand, crate::Expand::new(2));
+
+        // `per_parent: 0` would cap every document at zero hits; read it as one.
+        let (cap, _) = Rollup {
+            per_parent: 0,
+            neighbours: 0,
+        }
+        .as_opts();
+        assert_eq!(cap.max, 1);
+    }
+
+    /// The read side end to end: a chunked corpus recalls one hit per document, each widened
+    /// past its own chunk.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // file-backed via open_tmp
+    async fn recall_with_rollup_returns_one_widened_hit_per_document() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        for doc in ["doc-1", "doc-2"] {
+            remember_chunked_with(
+                &mut db,
+                &emb,
+                "docs",
+                doc,
+                &format!("{doc} ").repeat(20),
+                &small_chunk_opts(),
+                RememberOpts::default(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let opts = RecallOpts {
+            top_k: 10,
+            rollup: Some(Rollup::new(1)),
+            ..Default::default()
+        };
+        let hits = recall_with(&db, &emb, "docs", "doc-1", &opts)
+            .await
+            .unwrap();
+        let mut parents: Vec<String> = hits
+            .iter()
+            .map(|h| format!("{:?}", h.attrs[META_PARENT_ID]))
+            .collect();
+        parents.sort();
+        parents.dedup();
+        assert_eq!(hits.len(), parents.len(), "one hit per document");
+        for h in &hits {
+            let own = match &h.attrs[META_TEXT] {
+                Value::Str(s) => s.clone(),
+                other => panic!("{other:?}"),
+            };
+            let context = h.context.as_deref().expect("rollup asked for context");
+            assert!(context.len() > own.len(), "widened past its own chunk");
         }
     }
 

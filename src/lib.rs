@@ -94,7 +94,7 @@ mod memory;
 #[cfg(feature = "memory")]
 pub use memory::{
     ChunkedRemembered, META_CREATED_AT, META_DIM, META_EMBEDDER, META_TEXT, META_UPDATED_AT,
-    Memory, RecallOpts, RememberMode, RememberOpts, Remembered,
+    Memory, RecallOpts, RememberMode, RememberOpts, Remembered, Rollup,
 };
 // The summarize-mode attr keys are only defined when summaries can be produced.
 #[cfg(all(feature = "memory", feature = "summarize"))]
@@ -114,9 +114,9 @@ pub use fts::{Analyzer, FtsField, Language};
 pub use meta::META_EXPIRES_AT;
 pub use model::{
     AggregateOpts, Aggregation, AnnConfig, AnnKind, ClusterStatus, DEFAULT_RERANK_OVERSCAN, Decay,
-    Distance, Filter, Footprint, FtsClause, FtsCombine, FtsQuery, Group, Hit, HybridOpts, LimitPer,
-    ListOpts, META_CHUNK_INDEX, META_PARENT_ID, OrderBy, Predicate, Projection, QuantKind,
-    Quantization, RankBy, Record, RerankOpts, Role, SearchOpts, Value,
+    Distance, Expand, Filter, Footprint, FtsClause, FtsCombine, FtsQuery, Group, Hit, HybridOpts,
+    LimitPer, ListOpts, META_CHAR_START, META_CHUNK_INDEX, META_PARENT_ID, OrderBy, Predicate,
+    Projection, QuantKind, Quantization, RankBy, Record, RerankOpts, Role, SearchOpts, Value,
 };
 pub use profile::OpenProfile;
 pub use store::Readiness;
