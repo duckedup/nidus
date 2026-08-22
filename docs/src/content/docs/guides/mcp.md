@@ -164,11 +164,25 @@ recency-decay ranking), so they are worth knowing by name:
 | `nidus.created_at` | When the entry was first written, as a `DateTime` (UTC epoch ms). Preserved when you re-remember the same id. |
 | `nidus.updated_at` | When the entry was last written. |
 | `nidus.expires_at` | Set only when you pass `ttl_seconds`; after this instant the entry stops surfacing. |
+| `nidus.access_count` | How many `recall` calls with `reinforce` set have returned this entry. Absent means never reinforced. |
+| `nidus.last_accessed` | When the entry was last returned by a reinforced `recall`, as a `DateTime` (UTC epoch ms). |
 
 Reserved keys win a collision, so an attr you pass under one of these names is
 overwritten rather than silently changing what the store relies on. In summarize
 mode `nidus.summary` holds the generated summary (the text that was actually
 embedded) while `nidus.text` still holds your original.
+
+### Reinforcement
+
+`recall` takes two optional arguments that let a model mark which entries were
+actually useful: **`reinforce`** stamps `nidus.access_count` and
+`nidus.last_accessed` on every entry the call returns, and **`extend_ttl_seconds`**
+additionally pushes an existing `nidus.expires_at` forward by that many seconds
+(only with `reinforce` set, and only on entries that already expire). Rank on
+`nidus.access_count` with the [count-decay knobs](/guides/search/#ranking-by-reinforcement)
+so memories that keep getting recalled float up and memories nothing ever recalls
+sink. Setting `reinforce` makes the call a write, so against a store opened read-only
+the tool call is refused rather than answered as though the stamp happened.
 
 ### Expiry and duplicates
 

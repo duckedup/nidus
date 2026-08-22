@@ -264,6 +264,40 @@ curl -sS http://127.0.0.1:7700/text-search \
   -d '{"scope":["memories"],"field":"nidus.text","query":"appVersion","top_k":5}'
 ```
 
+## Memories earning their place
+
+A hook like the one above never stops writing, and nothing here ever deletes on its
+own: left alone, the collection grows forever and a stale note about a decision that
+later got reversed ranks exactly as well as one from this morning. Pass `"reinforce":
+true` in the session-start recall so a memory that actually got surfaced and used
+records that fact:
+
+```bash
+curl -sS http://127.0.0.1:7700/collections/memories/recall \
+  -H 'content-type: application/json' \
+  -d '{"query": "how does the release workflow version things",
+       "top_k": 3, "reinforce": true}'
+```
+
+Every hit gets `nidus.access_count` bumped and `nidus.last_accessed` set to now. Then
+rank on that count so memories that keep proving useful outrank ones nothing has
+touched since they were written:
+
+```json
+{"query": "...", "rank_by": {"Decay": {
+  "field": "nidus.updated_at", "origin": 1770000000000, "scale": 604800000,
+  "count_field": "nidus.access_count"
+}}}
+```
+
+A hit with no `nidus.access_count` at all pays the full count penalty, which is the
+whole point: a memory nothing has ever recalled sinks, without you having to decide
+when to delete it. `reinforce` makes the recall a write, so it queues behind the
+server's other writes; a plain recall with no `reinforce` stays exactly as before.
+See [reinforcement](/guides/remember-and-recall/#reinforcement) for the full
+contract, and [ranking by reinforcement](/guides/search/#ranking-by-reinforcement)
+for the `Decay` fields above.
+
 ## Two limits worth knowing
 
 **A TTL hides an entry; it does not reclaim the row.** Expiry is evaluated at read

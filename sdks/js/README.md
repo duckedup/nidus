@@ -283,6 +283,12 @@ Both throw a `NidusError` with status `400` if the server has no embedder config
 likewise a `400`. Dedupe needs that same embedder — it is a vector search under the
 hood.
 
+Pass `reinforce: true` to have a `recall` stamp `nidus.access_count` and
+`nidus.last_accessed` on the hits it returns, and `extendTtlSeconds` to push an
+existing `nidus.expires_at` out that many seconds (it never gives an expiry to an
+entry that had none). Reinforcing makes the call a write, so it takes the server's
+writer lock and is refused on a read-only server.
+
 ## Everything else
 
 ```ts

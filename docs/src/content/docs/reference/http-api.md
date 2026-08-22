@@ -455,12 +455,22 @@ curl -s localhost:7700/search \
 | `decay` | `0.5` | the factor at one `scale` of age (`0.5` makes `scale` a half-life) |
 | `lambda` | `1.0` | score a fully-decayed hit gives up |
 | `missing` | `1.0` | factor for a record with no usable timestamp (**no penalty**) |
+| `count_field` | none | integer attr adding a second, subtracted [reinforcement term](/guides/search/#ranking-by-reinforcement); `field` may be empty when only this term is wanted |
+| `count_scale` | `10.0` | saturation constant `k` in `n / (n + k)`; must be positive when `count_field` is set |
+| `count_lambda` | `1.0` | penalty an entirely un-reinforced record pays |
 
 The score is `base − lambda × (1 − decay^(age / scale))`. `missing` defaults to `1.0`, so
 enabling decay never buries records written before the field existed. `rank_by` does not
 force an exact scan; over an ANN or quantized result set it reorders within an approximate
 candidate set. A malformed expression (a non-positive `scale`, a `decay` outside `(0, 1)`, a
 negative `lambda`) is a `400`.
+
+`count_field` defaults to unset, so an existing `rank_by` with no count fields ranks exactly
+as it always has. Set it to read an integer count attribute, typically
+`nidus.access_count` from a [reinforced recall](/guides/remember-and-recall/#reinforcement), and subtract
+`count_lambda * (1 - n / (n + count_scale))` from the score: a high count pays a small
+penalty, and a record with no count at all pays the full `count_lambda`, so memories nothing
+ever recalls sink.
 
 #### Capping hits per attribute value
 
@@ -892,9 +902,18 @@ curl -s localhost:7700/collections/notes/recall \
 | `diversity` | none | MMR lambda spreading hits apart in vector space (`1.0` relevance, `0.0` variety) |
 | `rollup` | none | read the collection as a chunked corpus; see [`expand`](#expand-widen-a-hit-with-its-neighbouring-chunks) |
 | `rerank` | none | re-score the candidate window with a hosted cross-encoder; see below |
+| `reinforce` | `false` | stamp `nidus.access_count` / `nidus.last_accessed` on every returned entry; see [reinforcement](/guides/remember-and-recall/#reinforcement) |
+| `extend_ttl_seconds` | none | with `reinforce`, push an existing `nidus.expires_at` forward to now plus this many seconds; never creates an expiry on an entry that had none |
+| `rank_by` | none | ranking expression over the metric, the same shape `/search` takes, so a recall can rank on `nidus.access_count` / `nidus.last_accessed` |
 
 Returns the same `HitDto` shape as `/search`: an array of `{collection, id, score, attrs}`,
 each gaining a `context` string when the query asked to `expand` or `rollup`.
+
+Setting `reinforce` makes this call a **write**: it queues behind the server's other
+writes to take the writer lock before stamping. On a server started with `--read-only`
+the request is refused, like any other write, rather than answered as though the stamp
+happened. Omit `reinforce` and the recall is a plain read that a read-only server serves
+normally.
 
 `rerank` takes the same `overscan`/`text_attr` fields as [`/search`](#post-search), but
 `query` is optional here: an omitted or empty `rerank.query` falls back to the request's

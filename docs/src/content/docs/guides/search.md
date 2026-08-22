@@ -261,6 +261,50 @@ Two behaviours worth knowing:
 
 `min_score` is compared against the final, decayed score on every path.
 
+### Ranking by reinforcement
+
+`Decay` also takes a `count_field`, so a hit that has been [reinforced](/guides/remember-and-recall/#reinforcement)
+pays a smaller penalty than one nothing ever recalls:
+
+```rust
+use nidus::{Decay, RankBy, SearchOpts};
+
+let query = vec![0.1_f32; 384];
+let now = 1_770_000_000_000_i64;
+let week = 7 * 24 * 60 * 60 * 1000;
+
+let hits = db.search(
+    "notes",
+    &query,
+    &SearchOpts {
+        top_k: 10,
+        rank_by: Some(RankBy::Decay(
+            Decay::new("updated_at", now, week)
+                .count_field("nidus.access_count")
+                .count_scale(10.0)
+                .count_lambda(1.0),
+        )),
+        ..Default::default()
+    },
+)?;
+# anyhow::Ok(())
+```
+
+The count term is a second, independent penalty, computed and subtracted alongside the
+recency one:
+
+```text
+count_factor = n / (n + count_scale)          // n read from `count_field`; 0 if absent
+score        = base − lambda × (1 − factor) − count_lambda × (1 − count_factor)
+```
+
+`count_scale` (default `10.0`) is the count at which the term is half spent; `count_lambda`
+(default `1.0`) is the penalty an entirely un-reinforced record pays. That last part is the
+point, not a bug: a record with a high count pays almost nothing, and a record with no
+count at all pays the full `count_lambda`, so memories nothing ever recalls sink over time.
+`count_field` defaults to `None`, so a `Decay` that never sets it ranks exactly as it did
+before this existed. `field` may be left empty when only the count term is wanted.
+
 ## Capping hits per attribute value
 
 One verbose document can fill an entire recall window. `limit_per` caps how many hits may

@@ -1488,6 +1488,18 @@ enum Command {
         /// Chunks stitched either side of each survivor, into the hit's `context`.
         #[arg(long = "neighbours", requires = "rollup")]
         neighbours: Option<usize>,
+        /// Ranking expression as JSON (same form as `search --rank-by`), e.g. a reinforcement
+        /// term over `nidus.access_count`.
+        #[arg(long = "rank-by")]
+        rank_by: Option<String>,
+        /// Stamp `nidus.access_count` / `nidus.last_accessed` on every returned hit.
+        /// Takes the writer lock, so it cannot run while `nidus serve` holds it.
+        #[arg(long)]
+        reinforce: bool,
+        /// With `--reinforce`, push an existing `nidus.expires_at` forward by this many
+        /// seconds. Never creates an expiry on an entry that had none.
+        #[arg(long)]
+        extend_ttl_seconds: Option<i64>,
         // `ingest` already carries the `--rerank-provider` flags (via `IngestArgs`), so
         // this flattens only the per-query knobs — not another `RerankArgs`, which would
         // redefine `--rerank-provider` a second time on the same command.
@@ -2126,6 +2138,9 @@ pub fn run(cli: Cli) -> Result<()> {
             diversity,
             rollup,
             neighbours,
+            rank_by,
+            reinforce,
+            extend_ttl_seconds,
             #[cfg(feature = "rerank")]
             rerank,
         } => {
@@ -2140,6 +2155,9 @@ pub fn run(cli: Cli) -> Result<()> {
                     per_parent,
                     neighbours: neighbours.unwrap_or(0),
                 }),
+                rank_by,
+                reinforce,
+                extend_ttl_seconds,
             };
             // `recall`'s own query text is always its rerank default (mirrors `/recall`).
             #[cfg(feature = "rerank")]
@@ -2176,11 +2194,21 @@ fn recall_reranked(
         filter,
         diversity,
         rollup,
+        rank_by,
+        reinforce,
+        extend_ttl_seconds,
     } = args;
     let mut filter: Filter = match filter {
         Some(s) => serde_json::from_str(&s)
             .with_context(|| format!("--where must be a JSON filter, got {s}"))?,
         None => Filter::default(),
+    };
+    let rank_by = match rank_by {
+        Some(s) => Some(
+            serde_json::from_str(&s)
+                .with_context(|| format!("--rank-by must be a JSON ranking expression, got {s}"))?,
+        ),
+        None => None,
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2193,7 +2221,9 @@ fn recall_reranked(
         if store.dim.is_none() {
             store.dim = Some(embedder.dimension());
         }
-        let db = open(&store, false)?;
+        // Same `reinforce` → writer-lock rule as the un-reranked path: `--reinforce`
+        // opens ReadWrite, or the stamp below would have nothing to write to.
+        let mut db = open(&store, reinforce)?;
         crate::memory::guard_recall_identity(&db, &embedder, &collection)?;
         let vector = embedder
             .embed_query(&query)
@@ -2217,6 +2247,7 @@ fn recall_reranked(
             diversity,
             limit_per: rollup.as_ref().map(|r| r.as_opts().0),
             expand: rollup.map(|r| r.as_opts().1),
+            rank_by,
             rerank: Some(rerank_opts),
             ..Default::default()
         };
@@ -2229,6 +2260,10 @@ fn recall_reranked(
             &opts,
         )
         .await?;
+        if reinforce {
+            crate::memory::reinforce_hits(&mut db, &collection, &hits, extend_ttl_seconds)?;
+            db.flush()?;
+        }
         let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
         print_json(&out)
     })
@@ -2948,6 +2983,61 @@ mod tests {
                 assert_eq!(top_k, 10);
                 assert_eq!(min_score, None);
                 assert_eq!(filter, None);
+            }
+            _ => panic!("expected Recall"),
+        }
+    }
+
+    /// `--reinforce` and `--extend-ttl-seconds` parse; both default off, matching the
+    /// unreinforced, non-mutating recall this unit must not change.
+    #[cfg(feature = "memory")]
+    #[test]
+    fn recall_parses_reinforce_flags() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "recall",
+            "--dir",
+            "/tmp/s",
+            "--embed-provider",
+            "ollama",
+            "--reinforce",
+            "--extend-ttl-seconds",
+            "3600",
+            "notes",
+            "q",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Recall {
+                reinforce,
+                extend_ttl_seconds,
+                ..
+            } => {
+                assert!(reinforce);
+                assert_eq!(extend_ttl_seconds, Some(3600));
+            }
+            _ => panic!("expected Recall"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "recall",
+            "--dir",
+            "/tmp/s",
+            "--embed-provider",
+            "ollama",
+            "notes",
+            "q",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Recall {
+                reinforce,
+                extend_ttl_seconds,
+                ..
+            } => {
+                assert!(!reinforce);
+                assert_eq!(extend_ttl_seconds, None);
             }
             _ => panic!("expected Recall"),
         }

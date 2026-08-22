@@ -670,6 +670,39 @@ def test_recall_defaults_to_an_empty_filter_and_omitted_bounds() -> None:
     assert stub.last.json == {"query": "hello", "filter": []}
 
 
+def test_recall_sends_reinforce_and_extend_ttl_seconds() -> None:
+    stub = StubTransport([])
+    client(stub).recall("notes", "hello", reinforce=True, extend_ttl_seconds=3600)
+    assert stub.last.json == {
+        "query": "hello",
+        "filter": [],
+        "reinforce": True,
+        "extend_ttl_seconds": 3600,
+    }
+
+
+def test_recall_omits_reinforce_when_false() -> None:
+    stub = StubTransport([])
+    client(stub).recall("notes", "hello", reinforce=False)
+    assert stub.last.json == {"query": "hello", "filter": []}
+
+
+def test_recall_sends_rank_by_and_omits_it_when_unset() -> None:
+    stub = StubTransport([])
+    client(stub).recall(
+        "notes",
+        "hello",
+        rank_by=rank.decay(field="", origin=0, count_field="nidus.access_count"),
+    )
+    assert stub.last.json == {
+        "query": "hello",
+        "filter": [],
+        "rank_by": {"Decay": {"field": "", "origin": 0, "count_field": "nidus.access_count"}},
+    }
+    client(stub).recall("notes", "hello")
+    assert "rank_by" not in stub.last.json
+
+
 # ── Responses ────────────────────────────────────────────────────────────────────────
 
 

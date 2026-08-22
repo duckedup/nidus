@@ -9,7 +9,8 @@ where the factor falls from 1 to ``decay`` as a record ages ``scale`` past ``ori
 subtracts rather than multiplies so it stays meaningful where scores are negative or
 unbounded (Euclidean, dot product, BM25), and ages are measured back from ``origin``
 rather than from the wall clock, so the same query against an unchanged store ranks the
-same way twice.
+same way twice. The optional count term is subtracted the same way, so a record recalled
+often pays a smaller penalty rather than earning an added bonus.
 """
 
 from __future__ import annotations
@@ -37,6 +38,9 @@ class rank:  # noqa: N801 - a lowercase namespace, matching `f` and `v`
         decay: Optional[float] = None,
         lambda_: Optional[float] = None,
         missing: Optional[float] = None,
+        count_field: Optional[str] = None,
+        count_scale: Optional[float] = None,
+        count_lambda: Optional[float] = None,
     ) -> RankBy:
         """Penalize a hit by the age of its ``field`` timestamp, measured back from ``origin``.
 
@@ -49,6 +53,10 @@ class rank:  # noqa: N801 - a lowercase namespace, matching `f` and `v`
         1.0 (the score a fully-decayed hit gives up), and ``missing`` 1.0 — a record whose
         timestamp is absent or unusable is **not** penalized. ``lambda_`` carries the
         underscore because ``lambda`` is a reserved word; it travels as ``lambda``.
+
+        ``count_field``, ``count_scale`` (default 10) and ``count_lambda`` (default 1)
+        add a second, independent penalty term keyed off a recall count: the term applies
+        only when ``count_field`` is set, and a higher count means a smaller penalty.
         """
         body = {
             "field": field,
@@ -57,6 +65,9 @@ class rank:  # noqa: N801 - a lowercase namespace, matching `f` and `v`
             "decay": decay,
             "lambda": lambda_,
             "missing": missing,
+            "count_field": count_field,
+            "count_scale": count_scale,
+            "count_lambda": count_lambda,
         }
         return {"Decay": {k: val for k, val in body.items() if val is not None}}
 

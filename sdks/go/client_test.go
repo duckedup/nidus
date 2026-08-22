@@ -2567,3 +2567,121 @@ func TestSetFilterIndexFieldsOmitsUnsetKnobs(t *testing.T) {
 		t.Errorf("body = %s, want an empty field list", body)
 	}
 }
+
+// TestRecallOmitsReinforceWhenUnset — the compatibility promise: a recall that does not
+// ask to reinforce must send no reinforce/extend_ttl_seconds keys at all, so a server
+// predating them sees exactly the body it always has.
+func TestRecallOmitsReinforceWhenUnset(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+
+	if _, err := db.Recall(context.Background(), "notes", "why", RecallOptions{}); err != nil {
+		t.Fatalf("Recall failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"query":"why"}` {
+		t.Errorf("body = %s, want no reinforce keys at all", body)
+	}
+}
+
+// TestRecallSendsReinforceAndExtendTTL asserts the exact body once both knobs are set.
+func TestRecallSendsReinforceAndExtendTTL(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+
+	_, err := db.Recall(context.Background(), "notes", "why", RecallOptions{
+		Reinforce: true, ExtendTTLSeconds: i64(3600),
+	})
+	if err != nil {
+		t.Fatalf("Recall failed: %v", err)
+	}
+	want := `{"query":"why","reinforce":true,"extend_ttl_seconds":3600}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+}
+
+// TestDecayCountKnobsMarshal asserts the reinforcement sub-knobs travel under Decay
+// when the caller sets them.
+func TestDecayCountKnobsMarshal(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+
+	_, err := db.Search(context.Background(), SearchRequest{
+		Query: []float32{1},
+		RankBy: DecayRank(Decay{
+			Field: "ts", Origin: 1700000000000,
+			CountField: "nidus.access_count", CountScale: 20, CountLambda: f32(0.5),
+		}),
+	})
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	want := `{"query":[1],"rank_by":{"Decay":{"field":"ts","origin":1700000000000,` +
+		`"count_field":"nidus.access_count","count_scale":20,"count_lambda":0.5}}}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+}
+
+// TestDecayWithoutCountKnobsIsUnchanged is the assertion that makes generalising Decay
+// instead of adding a variant safe: no count_* key travels unless CountField is set.
+func TestDecayWithoutCountKnobsIsUnchanged(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+
+	_, err := db.Search(context.Background(), SearchRequest{
+		Query:  []float32{1},
+		RankBy: DecayRank(Decay{Field: "ts", Origin: 1700000000000}),
+	})
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	want := `{"query":[1],"rank_by":{"Decay":{"field":"ts","origin":1700000000000}}}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want no count_* keys", body)
+	}
+}
+
+// A RankBy on a recall must reach the wire as the same tagged union /search takes, and must
+// be absent when unset: a recall that names no ranking expression is the plain metric.
+func TestRecallRankByMarshalsAndIsOmittedWhenUnset(t *testing.T) {
+	withRankBy := RecallOptions{
+		RankBy: DecayRank(Decay{CountField: "nidus.access_count", CountLambda: f32(10)}),
+	}.wire("hello")
+	b, err := json.Marshal(withRankBy)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	rb, ok := got["rank_by"].(map[string]any)
+	if !ok {
+		t.Fatalf("rank_by missing or not an object: %s", b)
+	}
+	d, ok := rb["Decay"].(map[string]any)
+	if !ok {
+		t.Fatalf("rank_by is not the Decay variant: %s", b)
+	}
+	if d["count_field"] != "nidus.access_count" {
+		t.Errorf("count_field = %v, want nidus.access_count", d["count_field"])
+	}
+
+	// A zero must reach the wire, not be swallowed as "unset": it disables the term.
+	zero, err := json.Marshal(DecayRank(Decay{CountField: "n", CountLambda: f32(0)}))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.Contains(zero, []byte(`"count_lambda":0`)) {
+		t.Errorf("an explicit CountLambda of 0 must be sent: %s", zero)
+	}
+
+	plain, err := json.Marshal(RecallOptions{}.wire("hello"))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(plain, []byte("rank_by")) {
+		t.Errorf("a recall naming no ranking expression must omit rank_by: %s", plain)
+	}
+}

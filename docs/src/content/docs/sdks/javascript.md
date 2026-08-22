@@ -185,7 +185,23 @@ const hits = await db.recall("notes", "quick fox", {
   minScore: 0.2,
   filter: f.and(f.eq("tag", "x")),
 });
+
+// Reinforce: stamp nidus.access_count / nidus.last_accessed on every hit
+// returned, and push an existing expiry forward. Off by default, so a plain
+// recall stays a pure read.
+const reinforced = await db.recall("notes", "quick fox", {
+  topK: 5,
+  reinforce: true,
+  extendTtlSeconds: 86400,
+});
 ```
+
+Setting `reinforce` makes the call a write: it takes the server's writer lock to apply
+the stamp, and against a server started `--read-only` the stamp is skipped with a
+warning rather than failing the recall. `extendTtlSeconds` only applies with
+`reinforce` set, and only pushes an **existing** `nidus.expires_at` forward; it never
+gives an expiry to an entry that had none. See
+[reinforcement](/guides/remember-and-recall/#reinforcement).
 
 Against a server started **without** an embedder both throw `NidusError` with status
 `400`, and the message names `--embed-provider`; `mode: "summarize"` without a

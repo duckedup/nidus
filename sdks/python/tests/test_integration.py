@@ -25,9 +25,12 @@ Two implementation notes worth stating, since both are the second thing you woul
 
 from __future__ import annotations
 
+import http.server
+import json
 import os
 import re
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -134,6 +137,143 @@ def _transcript(log: Path) -> str:
         return log.read_text(errors="replace")
     except OSError:  # pragma: no cover - the file exists unless the temp dir vanished
         return "<no server output>"
+
+
+# ── A local mock embedder, for the one test that needs `remember`/`recall` to really embed ──
+
+_EMBED_DIM = 3
+
+
+def _vector_for(text: str, dim: int) -> list[float]:
+    """A deterministic per-text vector, ported from the Rust e2e harness's own mock
+    (`tests/e2e/mcp/support.rs::vector_for`) so the two suites agree on what a "real"
+    embedder would return for the same input."""
+    vector = [0.1] * dim
+    for i, byte in enumerate(text.encode("utf-8")):
+        vector[i % dim] += byte + 1.0
+    return vector
+
+
+class _EmbedHandler(http.server.BaseHTTPRequestHandler):
+    """Answers Ollama's ``POST /api/embed`` (``{"model", "input"}`` in) with the
+    deterministic vector for ``input``, standing in for ``--embed-provider ollama``."""
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        vector = _vector_for(str(body.get("input", "")), _EMBED_DIM)
+        payload = json.dumps({"embeddings": [vector]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, log_format: str, *args: object) -> None:
+        pass  # keep the mock's own request log out of the server's transcript
+
+
+class _MockEmbedServer:
+    """A background HTTP server standing in for a real embedding provider."""
+
+    def __init__(self) -> None:
+        self._httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _EmbedHandler)
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+
+    @property
+    def base_url(self) -> str:
+        host, port = self._httpd.server_address
+        return f"http://{host}:{port}"
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def shutdown(self) -> None:
+        self._httpd.shutdown()
+        self._thread.join(timeout=5)
+        self._httpd.server_close()
+
+
+def _await_base_url_or_skip(child: subprocess.Popen[bytes], log: Path) -> str:
+    """Like ``_await_base_url``, except a binary that exits before printing an address
+    skips the test rather than failing it: ``just build-cli`` (what CI's ``$NIDUS_BIN``
+    is) carries neither the ``memory`` nor the ``embed-ollama`` feature this fixture
+    needs, so ``--embed-provider``/``--embed-base-url`` are unrecognized flags there —
+    an environment gap, not an SDK bug.
+    """
+    deadline = time.monotonic() + STARTUP_TIMEOUT
+    while time.monotonic() < deadline:
+        found = re.search(r"http://\d+\.\d+\.\d+\.\d+:\d+", _transcript(log))
+        if found:
+            return found.group(0)
+        if child.poll() is not None:
+            pytest.skip(
+                f"nidus exited ({child.returncode}) before serving, probably missing the "
+                f"memory/embed-ollama feature\n{_transcript(log)}"
+            )
+        time.sleep(0.05)
+    pytest.skip(f"nidus serve printed no address within {STARTUP_TIMEOUT}s\n{_transcript(log)}")
+
+
+@pytest.fixture()
+def server_with_embedder(tmp_path: Path) -> Iterator[str]:
+    """Like ``server``, but wired to a local mock embedding provider so ``remember`` and
+    ``recall`` (the ``memory``-gated routes) have something to embed against.
+    """
+    mock = _MockEmbedServer()
+    mock.start()
+    try:
+        log = tmp_path / "server.log"
+        store = tmp_path / "store"
+        with log.open("wb") as sink:
+            child = subprocess.Popen(
+                [
+                    str(BINARY),
+                    "serve",
+                    "--dir",
+                    str(store),
+                    "--dim",
+                    str(_EMBED_DIM),
+                    "--addr",
+                    "127.0.0.1:0",
+                    "--embed-provider",
+                    "ollama",
+                    "--embed-base-url",
+                    mock.base_url,
+                ],
+                stdout=sink,
+                stderr=sink,
+            )
+        try:
+            base_url = _await_base_url_or_skip(child, log)
+            deadline = time.monotonic() + STARTUP_TIMEOUT
+            while not _ready(base_url):
+                if time.monotonic() > deadline:
+                    pytest.fail(f"nidus serve never became ready\n{_transcript(log)}")
+                time.sleep(0.05)
+            yield base_url
+        finally:
+            child.terminate()
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:  # pragma: no cover - only if shutdown hangs
+                child.kill()
+                child.wait()
+    finally:
+        mock.shutdown()
+
+
+def test_recall_with_reinforce_stamps_the_access_count(server_with_embedder: str) -> None:
+    """``reinforce=True`` on ``recall`` is a write, mirroring the Rust e2e assertion for the
+    same route (``tests/e2e/memory_http.rs``): the entry it returns gets its
+    ``nidus.access_count`` bumped, read back through :meth:`~nidus.NidusClient.records`.
+    """
+    with NidusClient(server_with_embedder, timeout=10.0) as db:
+        db.remember("notes", "a", "a durable memory")
+        db.recall("notes", "a durable memory", reinforce=True)
+        records = db.records("notes")
+    assert len(records) == 1
+    assert records[0].attrs["nidus.access_count"] == 1
 
 
 def test_full_lifecycle(server: str) -> None:

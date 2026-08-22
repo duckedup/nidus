@@ -8,7 +8,7 @@
 use serde_json::{Value, json};
 
 use crate::harness::RunningServer;
-use crate::mcp::support::{DIM, per_text_embedder_server, vector_for};
+use crate::mcp::support::{DIM, mock_embedder_per_text, per_text_embedder_server, vector_for};
 
 /// `POST /collections/notes/remember`, asserting success and returning the response.
 fn remember(server: &RunningServer, args: Value) -> Value {
@@ -27,6 +27,15 @@ fn recall(server: &RunningServer, query: &str) -> Vec<Value> {
     body.as_array().expect("recall returns an array").clone()
 }
 
+/// `POST /collections/notes/recall` with a full request body — for cases needing fields
+/// beyond `query`/`top_k` (`reinforce`, `extend_ttl_seconds`, a stamping filter, …), so
+/// `recall` above stays untouched for the cases that don't.
+fn recall_with(server: &RunningServer, body: Value) -> Vec<Value> {
+    let (status, body) = server.post("/collections/notes/recall", &body);
+    assert_eq!(status, 200, "recall failed: {body}");
+    body.as_array().expect("recall returns an array").clone()
+}
+
 fn ids(hits: &[Value]) -> Vec<&str> {
     hits.iter().map(|h| h["id"].as_str().unwrap()).collect()
 }
@@ -36,6 +45,36 @@ fn stamp(hit: &Value, key: &str) -> i64 {
     hit["attrs"][key]["DateTime"]
         .as_i64()
         .unwrap_or_else(|| panic!("{key} missing or not DateTime: {hit}"))
+}
+
+/// The raw attrs of one entry, read back through `/list` (unguarded by the recall-time
+/// TTL filter, and the only route that shows a reinforcement stamp regardless of ranking).
+fn listed_attrs(server: &RunningServer, id: &str) -> Value {
+    let (status, listed) = server.post("/list", &json!({"limit": 1000}));
+    assert_eq!(status, 200, "list failed: {listed}");
+    listed
+        .as_array()
+        .expect("list returns an array")
+        .iter()
+        .find(|h| h["id"] == id)
+        .unwrap_or_else(|| panic!("id '{id}' not found in list: {listed}"))["attrs"]
+        .clone()
+}
+
+/// `nidus.access_count`, as a plain `i64`, or `None` when the key is absent.
+fn access_count(attrs: &Value) -> Option<i64> {
+    attrs.get("nidus.access_count").map(|v| {
+        v["Int"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("access_count not an Int: {v}"))
+    })
+}
+
+fn epoch_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_millis() as i64
 }
 
 /// remember → recall round-trips with zero setup: the collection and its FTS schema
@@ -199,6 +238,294 @@ fn recall_hides_expired_entries_but_raw_list_still_sees_them() {
     assert!(
         listed.contains(&"gone") && listed.contains(&"kept"),
         "raw list is unguarded by design and sees both: {listed:?}"
+    );
+}
+
+/// A plain recall (`reinforce` omitted) must stay a pure read: asserting "recall returned
+/// hits" would pass whether or not reinforcement exists at all, so this checks the raw attrs.
+#[test]
+fn a_default_recall_stamps_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = per_text_embedder_server(dir.path(), DIM);
+    remember(&server, json!({"id": "note", "text": "a plain memory"}));
+
+    let hits = recall(&server, "a plain memory");
+    assert!(ids(&hits).contains(&"note"), "{hits:?}");
+
+    let attrs = listed_attrs(&server, "note");
+    assert!(
+        access_count(&attrs).is_none(),
+        "a default recall must not stamp: {attrs}"
+    );
+}
+
+/// `"reinforce": true` stamps the returned entry, and a second reinforced recall increments
+/// it rather than resetting it — proving the counter, not just its presence.
+#[test]
+fn a_reinforced_recall_stamps_the_returned_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = per_text_embedder_server(dir.path(), DIM);
+    remember(&server, json!({"id": "note", "text": "a durable memory"}));
+
+    let before = epoch_ms_now();
+    let hits = recall_with(
+        &server,
+        json!({"query": "a durable memory", "top_k": 10, "reinforce": true}),
+    );
+    assert!(ids(&hits).contains(&"note"), "{hits:?}");
+
+    let attrs = listed_attrs(&server, "note");
+    assert_eq!(access_count(&attrs), Some(1), "{attrs}");
+    let last_accessed = attrs["nidus.last_accessed"]["DateTime"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("last_accessed missing or not DateTime: {attrs}"));
+    assert!(
+        last_accessed >= before,
+        "last_accessed must be a plausible epoch ms: {attrs}"
+    );
+
+    recall_with(
+        &server,
+        json!({"query": "a durable memory", "top_k": 10, "reinforce": true}),
+    );
+    let attrs = listed_attrs(&server, "note");
+    assert_eq!(
+        access_count(&attrs),
+        Some(2),
+        "the second recall must increment: {attrs}"
+    );
+}
+
+/// A reinforced recall stamps only the entries it actually returned — a `top_k` of 1 must
+/// leave the entry that lost the ranking untouched.
+#[test]
+fn a_reinforced_recall_does_not_stamp_an_entry_it_did_not_return() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = per_text_embedder_server(dir.path(), DIM);
+    remember(
+        &server,
+        json!({"id": "winner", "text": "the target memory text"}),
+    );
+    remember(
+        &server,
+        json!({"id": "loser", "text": "a totally unrelated memory"}),
+    );
+
+    let hits = recall_with(
+        &server,
+        json!({"query": "the target memory text", "top_k": 1, "reinforce": true}),
+    );
+    assert_eq!(ids(&hits), ["winner"], "{hits:?}");
+
+    assert_eq!(access_count(&listed_attrs(&server, "winner")), Some(1));
+    assert_eq!(access_count(&listed_attrs(&server, "loser")), None);
+}
+
+/// `extend_ttl_seconds` moves an existing expiry forward and never fabricates one on an
+/// entry that had none — the same semantics `crate::memory::reinforce_hits` documents,
+/// pinned here through the actual HTTP surface.
+#[test]
+fn extend_ttl_seconds_moves_an_existing_expiry_and_creates_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = per_text_embedder_server(dir.path(), DIM);
+    remember(
+        &server,
+        json!({"id": "mortal", "text": "a memory with a ttl", "ttl_seconds": 60}),
+    );
+    remember(
+        &server,
+        json!({"id": "eternal", "text": "a memory with no ttl"}),
+    );
+
+    let original_expiry = listed_attrs(&server, "mortal")["nidus.expires_at"]["DateTime"]
+        .as_i64()
+        .expect("mortal must start with an expiry");
+
+    recall_with(
+        &server,
+        json!({
+            "query": "a memory",
+            "top_k": 10,
+            "reinforce": true,
+            "extend_ttl_seconds": 3600,
+        }),
+    );
+
+    let mortal_attrs = listed_attrs(&server, "mortal");
+    let new_expiry = mortal_attrs["nidus.expires_at"]["DateTime"]
+        .as_i64()
+        .expect("mortal must still have an expiry");
+    assert!(new_expiry > original_expiry, "{mortal_attrs}");
+
+    let eternal_attrs = listed_attrs(&server, "eternal");
+    assert!(
+        eternal_attrs.get("nidus.expires_at").is_none(),
+        "extend_ttl_seconds must not create an expiry: {eternal_attrs}"
+    );
+}
+
+/// The durable half of the point: the stamp is a real log append, not an in-RAM tweak, so
+/// it must survive the process that wrote it going away.
+#[test]
+fn a_reinforced_recall_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = per_text_embedder_server(dir.path(), DIM);
+    remember(&server, json!({"id": "note", "text": "a durable memory"}));
+    recall_with(
+        &server,
+        json!({"query": "a durable memory", "top_k": 10, "reinforce": true}),
+    );
+    assert_eq!(access_count(&listed_attrs(&server, "note")), Some(1));
+
+    assert!(server.shutdown(), "clean shutdown should exit successfully");
+
+    let restarted = per_text_embedder_server(dir.path(), DIM);
+    let attrs = listed_attrs(&restarted, "note");
+    assert_eq!(
+        access_count(&attrs),
+        Some(1),
+        "the reinforcement stamp must survive a restart: {attrs}"
+    );
+}
+
+/// A caller that asked for the write over the wire is refused on a `--read-only` server, not
+/// answered as though the stamp happened. The in-process `Memory::recall` degrades instead: a
+/// library caller may not own `open_mode`, where a request naming `reinforce` does.
+#[test]
+fn a_reinforced_recall_on_a_read_only_server_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = per_text_embedder_server(dir.path(), DIM);
+        remember(&server, json!({"id": "note", "text": "a durable memory"}));
+        assert!(server.shutdown(), "clean shutdown should exit successfully");
+    }
+
+    let embed_url = mock_embedder_per_text(DIM);
+    let server = crate::harness::Server::new(dir.path(), DIM)
+        .args([
+            "--embed-provider",
+            "ollama",
+            "--embed-base-url",
+            &embed_url,
+            "--read-only",
+        ])
+        .start();
+
+    let (status, body) = server.post(
+        "/collections/notes/recall",
+        &json!({"query": "a durable memory", "top_k": 10, "reinforce": true}),
+    );
+    assert_ne!(
+        status, 200,
+        "a reinforced recall must not report success: {body}"
+    );
+    assert!(
+        body.to_string().contains("read-only"),
+        "the refusal must name the cause: {body}"
+    );
+    assert_eq!(
+        access_count(&listed_attrs(&server, "note")),
+        None,
+        "and nothing may have been written"
+    );
+
+    // The same server still answers an ordinary recall: only the write was refused.
+    let hits = recall_with(&server, json!({"query": "a durable memory", "top_k": 10}));
+    assert!(ids(&hits).contains(&"note"), "{hits:?}");
+}
+
+/// The criterion that matters end to end: a reinforced entry's durable count must be able to
+/// flip a ranking. Reinforced via `/recall` isolated by `filter`, then ranked through both
+/// `/search` (exact vectors, so the cosine gap to overturn is known) and `/recall`.
+#[test]
+fn a_reinforced_recall_ranks_by_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = per_text_embedder_server(dir.path(), DIM);
+    assert_eq!(server.post("/collections/notes", &json!({})).0, 200);
+
+    // hot at 0 degrees, cold at 10 degrees, the tie query at 6 degrees: cold's raw cosine
+    // edges out hot's by ~0.003, small enough for the count term (~0.33 at count 5) to
+    // overturn once hot alone is reinforced.
+    let angle =
+        |deg: f32| -> Vec<f32> { vec![deg.to_radians().cos(), deg.to_radians().sin(), 0.0] };
+    let hot = angle(0.0);
+    let cold = angle(10.0);
+    let tie = angle(6.0);
+    let rec =
+        |id: &str, v: Vec<f32>| json!({"id": id, "vector": v, "attrs": {"which": {"Str": id}}});
+    let (status, body) = server.post(
+        "/collections/notes/upsert",
+        &json!({"records": [rec("hot", hot), rec("cold", cold)]}),
+    );
+    assert_eq!(status, 200, "upsert failed: {body}");
+
+    for _ in 0..5 {
+        recall_with(
+            &server,
+            json!({
+                "query": "anything",
+                "top_k": 10,
+                "reinforce": true,
+                "filter": [{"Eq": ["which", {"Str": "hot"}]}],
+            }),
+        );
+    }
+    assert_eq!(access_count(&listed_attrs(&server, "hot")), Some(5));
+    assert_eq!(access_count(&listed_attrs(&server, "cold")), None);
+
+    let ranked = |rank_by: Option<Value>| -> Vec<String> {
+        let mut req = json!({"query": tie.clone(), "top_k": 2, "scope": ["notes"]});
+        if let Some(rb) = rank_by {
+            req["rank_by"] = rb;
+        }
+        let (status, body) = server.post("/search", &req);
+        assert_eq!(status, 200, "search failed: {body}");
+        body.as_array()
+            .expect("search returns an array")
+            .iter()
+            .map(|h| h["id"].as_str().expect("id").to_string())
+            .collect()
+    };
+    assert_eq!(
+        ranked(None),
+        vec!["cold".to_string(), "hot".to_string()],
+        "cold's raw cosine must edge out hot's before any count term applies"
+    );
+    assert_eq!(
+        ranked(Some(json!({"Decay": {
+            "field": "", "origin": 0, "count_field": "nidus.access_count"
+        }}))),
+        vec!["hot".to_string(), "cold".to_string()],
+        "the reinforced entry must out-rank the fresher-scoring one once counted"
+    );
+
+    // `count_lambda` of 10 dwarfs any cosine gap (which cannot exceed 2), so "hot" must lead;
+    // pointed at a key nothing carries, every hit pays the same penalty and the order falls
+    // back to the plain one. The pair proves the term is read, not merely accepted.
+    let recalled = |rank_by: Option<Value>| -> Vec<String> {
+        let mut req = json!({"query": "anything", "top_k": 2});
+        if let Some(rb) = rank_by {
+            req["rank_by"] = rb;
+        }
+        ids(&recall_with(&server, req))
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    };
+    let term = |field: &str| {
+        json!({"Decay": {
+            "field": "", "origin": 0, "count_field": field, "count_lambda": 10.0
+        }})
+    };
+    assert_eq!(
+        recalled(Some(term("nidus.access_count")))[0],
+        "hot",
+        "a count term on /recall must promote the reinforced entry"
+    );
+    assert_eq!(
+        recalled(Some(term("nidus.no_such_key"))),
+        recalled(None),
+        "a count term nothing carries must leave the plain recall order alone"
     );
 }
 

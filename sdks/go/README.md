@@ -326,6 +326,15 @@ hits, err := db.Recall(ctx, "notes", "quick fox", nidus.RecallOptions{
     MinScore: &floor,
     Filter:   nidus.And(nidus.Eq("tag", "x")),
 })
+
+// Reinforce records that these hits proved useful: the server stamps
+// nidus.access_count and nidus.last_accessed, and pushes any existing
+// nidus.expires_at out by ExtendTTLSeconds. This makes the recall a write,
+// so it takes the writer lock and is refused on a read-only server.
+extend := int64(3600)
+hits, err = db.Recall(ctx, "notes", "quick fox", nidus.RecallOptions{
+    Reinforce: true, ExtendTTLSeconds: &extend,
+})
 ```
 
 Both knobs are pointers because zero means something in each: a `TTLSeconds` of `0`

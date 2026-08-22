@@ -1466,6 +1466,9 @@ async fn recall(
         rollup,
         #[cfg(feature = "rerank")]
         rerank,
+        reinforce,
+        extend_ttl_seconds,
+        rank_by,
     } = req;
     // The rerank query defaults to the recall query itself (decision: `rerank: {}` is a
     // valid minimal form here, unlike `/search`, which has no text of its own to fall back to).
@@ -1498,6 +1501,7 @@ async fn recall(
         diversity,
         limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
         expand: rollup.map(|(_, e)| e),
+        rank_by,
         rerank: rerank_opts,
         ..Default::default()
     };
@@ -1507,24 +1511,44 @@ async fn recall(
     #[cfg(feature = "rerank")]
     if let Some(rerank_query) = rerank_query {
         let reranker = st.reranker.clone().ok_or_else(missing_reranker_error)?;
-        let hits =
-            rerank_recall_and_finish(st, reranker, name, embedder, vector, rerank_query, opts)
-                .await?;
+        let reinforce_arg = reinforce.then_some(extend_ttl_seconds);
+        let hits = rerank_recall_and_finish(
+            st,
+            reranker,
+            name,
+            embedder,
+            vector,
+            (rerank_query, reinforce_arg),
+            opts,
+        )
+        .await?;
         return Ok(Json(hits.into_iter().map(HitDto::from).collect()));
     }
     #[cfg(not(feature = "rerank"))]
     let _ = rerank_query;
 
-    let hits = run_read(st, move |db| {
-        crate::memory::guard_recall_identity(db, embedder.as_ref(), &name)?;
-        db.search(name.as_str(), &vector, &opts)
-    })
-    .await?;
+    // Fork on `reinforce`: off, this is byte-identical to before (a plain `run_read`);
+    // on, the search and the stamp share one `run_write` closure so the stamp is atomic
+    // against every other queued write (mirrors `remember`'s read-modify-write, 1421-1424).
+    let hits = if reinforce {
+        run_write(st, move |db| {
+            crate::memory::guard_recall_identity(db, embedder.as_ref(), &name)?;
+            crate::memory::commit_recall(db, &name, &vector, &opts, extend_ttl_seconds)
+        })
+        .await?
+    } else {
+        run_read(st, move |db| {
+            crate::memory::guard_recall_identity(db, embedder.as_ref(), &name)?;
+            db.search(name.as_str(), &vector, &opts)
+        })
+        .await?
+    };
     Ok(Json(hits.into_iter().map(HitDto::from).collect()))
 }
 
 /// Recall analogue of [`rerank_search_and_finish`]: the identity guard runs inside both
-/// `run_read`s (widen and tail), same as the unreranked path above.
+/// `run_read`s. `reinforce` is `Some(extend_ttl_seconds)` to stamp the **finished** page
+/// under `run_write` — never the overscanned candidate set.
 #[cfg(all(feature = "memory", feature = "rerank"))]
 async fn rerank_recall_and_finish(
     st: AppState,
@@ -1532,9 +1556,10 @@ async fn rerank_recall_and_finish(
     name: String,
     embedder: Arc<AnyEmbedder>,
     vector: Vec<f32>,
-    rerank_query: String,
+    query_and_reinforce: (String, Option<Option<i64>>),
     opts: SearchOpts,
 ) -> Result<Vec<Hit>, ApiError> {
+    let (rerank_query, reinforce) = query_and_reinforce;
     let rerank_opts = opts.rerank.clone().unwrap_or_default();
     let (widened, kept) = crate::store::rerank::widened_opts(&opts);
     let name_for_widen = name.clone();
@@ -1545,7 +1570,17 @@ async fn rerank_recall_and_finish(
     .await?;
     let mut reranked = rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts).await?;
     crate::store::rerank::retrim(&mut reranked, &opts, kept);
-    run_read(st, move |db| Ok(db.store().finish(reranked, &opts))).await
+    match reinforce {
+        None => run_read(st, move |db| Ok(db.store().finish(reranked, &opts))).await,
+        Some(extend_ttl_seconds) => {
+            run_write(st, move |db| {
+                let finished = db.store().finish(reranked, &opts);
+                crate::memory::reinforce_hits(db, &name, &finished, extend_ttl_seconds)?;
+                Ok(finished)
+            })
+            .await
+        }
+    }
 }
 
 /// The `400` returned when a memory route is hit but no embedder was configured

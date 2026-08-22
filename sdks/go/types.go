@@ -277,6 +277,16 @@ type Decay struct {
 	Lambda *float32 `json:"lambda,omitempty"`
 	// The factor for a record whose Field is missing or not a timestamp.
 	Missing *float32 `json:"missing,omitempty"`
+	// The attribute counting reinforcement (nidus.access_count is the usual one). The
+	// count term only applies when this is set.
+	CountField string `json:"count_field,omitempty"`
+	// The count at which the penalty reduction reaches CountLambda. The server rejects
+	// a zero, so 0 safely means "take the default" (10).
+	CountScale float32 `json:"count_scale,omitempty"`
+	// The penalty an entirely un-reinforced hit pays. A pointer for the same reason Lambda
+	// is: the server accepts a zero (no count penalty at all), so a plain value could not
+	// tell "disable the term" from "take the default".
+	CountLambda *float32 `json:"count_lambda,omitempty"`
 }
 
 // A LimitPer caps how many hits may carry any one value of an attribute — "at most two
@@ -673,26 +683,42 @@ type RecallOptions struct {
 	// Rollup reads the collection as a chunked corpus: one hit per document, widened.
 	Rollup *Rollup
 	Rerank *RerankOptions
+	// Reinforce records that these entries proved useful, stamping nidus.access_count and
+	// nidus.last_accessed. It makes the recall a write: it takes the server's writer lock
+	// and is refused on a read-only server.
+	Reinforce bool
+	// ExtendTTLSeconds pushes an existing nidus.expires_at out to this many seconds from
+	// now. Only applies with Reinforce, and never gives an expiry to an entry without one.
+	ExtendTTLSeconds *int64
+	// RankBy layers a ranking expression over cosine: decay over nidus.last_accessed, a
+	// reinforcement term over nidus.access_count, or both. Build it with [DecayRank].
+	RankBy *RankBy
 }
 
 type recallWire struct {
-	Query     string         `json:"query"`
-	TopK      int            `json:"top_k,omitempty"`
-	MinScore  *float32       `json:"min_score,omitempty"`
-	Filter    Filter         `json:"filter,omitempty"`
-	Diversity *float32       `json:"diversity,omitempty"`
-	Rollup    *Rollup        `json:"rollup,omitempty"`
-	Rerank    *RerankOptions `json:"rerank,omitempty"`
+	Query            string         `json:"query"`
+	TopK             int            `json:"top_k,omitempty"`
+	MinScore         *float32       `json:"min_score,omitempty"`
+	Filter           Filter         `json:"filter,omitempty"`
+	Diversity        *float32       `json:"diversity,omitempty"`
+	Rollup           *Rollup        `json:"rollup,omitempty"`
+	Rerank           *RerankOptions `json:"rerank,omitempty"`
+	Reinforce        bool           `json:"reinforce,omitempty"`
+	ExtendTTLSeconds *int64         `json:"extend_ttl_seconds,omitempty"`
+	RankBy           *RankBy        `json:"rank_by,omitempty"`
 }
 
 func (o RecallOptions) wire(query string) recallWire {
 	return recallWire{
-		Query:     query,
-		TopK:      o.TopK,
-		MinScore:  o.MinScore,
-		Filter:    o.Filter,
-		Diversity: o.Diversity,
-		Rollup:    o.Rollup,
-		Rerank:    o.Rerank,
+		Query:            query,
+		TopK:             o.TopK,
+		MinScore:         o.MinScore,
+		Filter:           o.Filter,
+		Diversity:        o.Diversity,
+		Rollup:           o.Rollup,
+		Rerank:           o.Rerank,
+		Reinforce:        o.Reinforce,
+		ExtendTTLSeconds: o.ExtendTTLSeconds,
+		RankBy:           o.RankBy,
 	}
 }

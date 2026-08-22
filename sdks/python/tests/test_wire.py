@@ -700,6 +700,16 @@ def test_recall_body() -> None:
     }
 
 
+def test_recall_body_omits_reinforce_when_false() -> None:
+    """The compatibility promise: an unset (or explicitly ``False``) ``reinforce`` must
+    leave the key absent, not send ``False`` — a byte-identical body for an old server."""
+    assert "reinforce" not in _wire.recall_body("why")
+    assert "reinforce" not in _wire.recall_body("why", reinforce=False)
+    assert "extend_ttl_seconds" not in _wire.recall_body("why")
+    assert _wire.recall_body("why", reinforce=True)["reinforce"] is True
+    assert _wire.recall_body("why", extend_ttl_seconds=3600)["extend_ttl_seconds"] == 3600
+
+
 def test_fts_schema_body() -> None:
     assert _wire.fts_schema_body(["body", "title"]) == {"fields": ["body", "title"]}
 

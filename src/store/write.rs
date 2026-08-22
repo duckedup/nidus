@@ -32,6 +32,15 @@ pub struct SegmentReport {
     pub integrity: SegmentIntegrity,
 }
 
+/// The attrs a reinforcement stamp can write — `expires_at` included, since
+/// `extend_ttl_seconds` moves it. A schema over anything else is untouched by a stamp, so
+/// the doc needs no reindex.
+fn is_reinforced_attr(field: &str) -> bool {
+    field == crate::meta::META_ACCESS_COUNT
+        || field == crate::meta::META_LAST_ACCESSED
+        || field == crate::meta::META_EXPIRES_AT
+}
+
 impl Store {
     /// Reject mutations in ReadOnly mode and, in cluster mode, renew/fence the writer lease
     /// before any durable write (SPEC §14.6 phase 5). Every mutating op calls this first, so it is
@@ -801,6 +810,145 @@ impl Store {
             }
         }
 
+        Ok(count)
+    }
+
+    /// Stamp reinforcement counters on `ids` in `collection`, leaving every other attr and
+    /// the doc's row untouched. Absent ids are skipped, not an error: a concurrent delete
+    /// between the search and the stamp is ordinary. Returns how many docs were stamped.
+    pub fn reinforce(
+        &mut self,
+        collection: &str,
+        ids: &[&str],
+        now_ms: i64,
+        extend_ttl_seconds: Option<i64>,
+    ) -> Result<usize> {
+        self.check_writable()?;
+
+        let Some(col) = self.collections.get(collection) else {
+            return Ok(0);
+        };
+
+        // Resolve ids against the live doc set and compute the new counters up front —
+        // pure, so an all-absent batch touches nothing.
+        let mut stamps: Vec<(String, i64, Option<i64>)> = Vec::new();
+        for &id in ids {
+            let Some(entry) = col.docs.get(id) else {
+                continue;
+            };
+            // Saturating: a raw `upsert` can put any `Int` here (the raw store API is
+            // unguarded by design), and a plain add would panic in debug and wrap in release.
+            let access_count = match entry.attrs.get(crate::meta::META_ACCESS_COUNT) {
+                Some(Value::Int(n)) => n.saturating_add(1),
+                _ => 1,
+            };
+            // Only ever moves an *existing* expiry forward; never creates one on an
+            // entry that had none (a never-expiring memory must not turn mortal).
+            // Saturating for the same reason `stamp_recency` is: wire-supplied seconds.
+            let expires_at = extend_ttl_seconds.and_then(|secs| {
+                match entry.attrs.get(crate::meta::META_EXPIRES_AT) {
+                    Some(Value::DateTime(cur)) => {
+                        Some((*cur).max(now_ms.saturating_add(secs.saturating_mul(1000))))
+                    }
+                    _ => None,
+                }
+            });
+            stamps.push((id.to_string(), access_count, expires_at));
+        }
+        if stamps.is_empty() {
+            return Ok(0);
+        }
+
+        // No vector is appended by this op; `data_mark` is passed through `rollback`
+        // unchanged, so only `log` actually unwinds on a failure.
+        let data_mark = self.data.row_count();
+        let log_mark = self.log.offset()?;
+
+        for (id, access_count, expires_at) in &stamps {
+            let op = Op::Reinforce {
+                collection: collection.to_string(),
+                id: id.clone(),
+                access_count: *access_count,
+                last_accessed: now_ms,
+                expires_at: *expires_at,
+            };
+            if let Err(e) = self.log.append(&op) {
+                self.rollback(data_mark, log_mark)?;
+                return Err(e);
+            }
+        }
+
+        // Barrier: log only. No row was created or referenced, so the §6.2 write order
+        // is untouched and there is nothing for a `data` fsync to protect here. That is why
+        // this cannot call `maybe_sync`, so the two counters it owns are taken by hand.
+        crate::metrics::metrics().write_batches.inc();
+        let barrier_now = self.barrier_now();
+        if barrier_now {
+            if let Err(e) = self.log.sync() {
+                self.rollback(data_mark, log_mark)?;
+                return Err(e);
+            }
+            crate::metrics::metrics().durability_barriers.inc();
+        } else {
+            self.pending_barrier = true;
+        }
+
+        // Reindex ONLY where this collection indexes a reinforcement attr: `FieldIndex::index`
+        // tombstones and re-appends, so reindexing every recall would leak a dead posting set
+        // per stamp on a read path.
+        let fts_on = self.fts.is_active()
+            && self
+                .fts
+                .schema_for(collection)
+                .is_some_and(|d| d.iter().any(|f| is_reinforced_attr(&f.field)));
+        let findex_on = self.findex.is_active()
+            && self
+                .findex
+                .schema_for(collection)
+                .is_some_and(|d| d.iter().any(|f| is_reinforced_attr(&f.field)));
+        // Infallible from here: the log is durable (or the barrier is owed). Does NOT touch
+        // `dead_rows`/`extend_quant`/`extend_ann`/`invalidate_scan_order` — no row changed and
+        // no doc joined or left the live set.
+        let col = self.collections.get_mut(collection).unwrap();
+        let mut count = 0usize;
+        for (id, access_count, expires_at) in stamps {
+            let Some(entry) = col.docs.get_mut(&id) else {
+                continue;
+            };
+            entry.attrs.insert(
+                crate::meta::META_ACCESS_COUNT.to_string(),
+                Value::Int(access_count),
+            );
+            entry.attrs.insert(
+                crate::meta::META_LAST_ACCESSED.to_string(),
+                Value::DateTime(now_ms),
+            );
+            if let Some(exp) = expires_at {
+                entry.attrs.insert(
+                    crate::meta::META_EXPIRES_AT.to_string(),
+                    Value::DateTime(exp),
+                );
+            }
+            if fts_on {
+                self.fts.index_doc(collection, &id, &entry.attrs);
+            }
+            if findex_on {
+                self.findex.index_doc(collection, &id, &entry.attrs);
+            }
+            count += 1;
+        }
+        if fts_on {
+            self.fts_dirty = true;
+        }
+        if findex_on {
+            self.findex_dirty = true;
+        }
+
+        // #229 widened this from the cluster counter to the addressable commit point a pinned
+        // read can target, so a stamp needs it for the same reason every other write does.
+        if barrier_now {
+            self.note_commit_point()?;
+        }
         Ok(count)
     }
 

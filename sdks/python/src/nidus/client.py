@@ -579,11 +579,17 @@ class NidusClient:
         diversity: Optional[float] = None,
         rollup: Optional[Rollup] = None,
         rerank: Optional[RerankOpts] = None,
+        reinforce: bool = False,
+        extend_ttl_seconds: Optional[int] = None,
+        rank_by: Optional[RankBy] = None,
     ) -> Hits:
         """Embed ``query`` and vector-search ``collection``, best first.
 
         ``rerank`` is documented on :class:`~nidus.RerankOpts`; its ``query`` defaults to
-        this method's own ``query`` when omitted.
+        this method's own ``query`` when omitted. ``reinforce=True`` bumps each returned
+        hit's recall count (a write, refused against a read-only server) and
+        ``extend_ttl_seconds`` moves an existing expiry forward by that many seconds;
+        both are omitted from the request, and so left at the server's defaults, unless set.
         """
         return self._search(
             _wire.recall_path(collection),
@@ -595,6 +601,9 @@ class NidusClient:
                 diversity=diversity,
                 rollup=rollup,
                 rerank=rerank,
+                reinforce=reinforce,
+                extend_ttl_seconds=extend_ttl_seconds,
+                rank_by=rank_by,
             ),
         )
 

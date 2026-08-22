@@ -1157,6 +1157,19 @@ func TestMemoryRoutesWithoutAnEmbedder(t *testing.T) {
 	} else if nerr.Status != 404 && nerr.Status != 400 {
 		t.Errorf("Recall status = %d (%s), want 404 or 400", nerr.Status, nerr.Message)
 	}
+
+	// The reinforcement knobs must reach the wire and fail the same visible way, not as
+	// a client-side encode error. This `cli`-feature binary never has an embedder, so
+	// the access_count assertion itself lives in tests/e2e/memory_http.rs instead.
+	if _, err := db.Recall(ctx, "notes", "quick fox", RecallOptions{
+		Reinforce: true, ExtendTTLSeconds: i64(3600),
+	}); err == nil {
+		t.Error("reinforced Recall succeeded on a server with no embedder")
+	} else if !errors.As(err, &nerr) {
+		t.Errorf("reinforced Recall error is %T, want *nidus.Error", err)
+	} else if nerr.Status != 404 && nerr.Status != 400 {
+		t.Errorf("reinforced Recall status = %d (%s), want 404 or 400", nerr.Status, nerr.Message)
+	}
 }
 
 // TestBearerTokenIsEnforced starts a token-protected server, since auth is a layer

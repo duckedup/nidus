@@ -234,6 +234,64 @@ in the past is invisible to it (and to the server's memory reads), while the raw
 `search`/`list` store API still returns it. Only the HTTP and MCP write paths set
 that attr today; see the parity note below.
 
+### Reinforcement
+
+`RecallOpts::reinforce` marks the entries a call actually returned as useful, so a
+memory that keeps coming back can outrank one nothing has touched in months.
+Setting it stamps two reserved attrs on every returned entry:
+
+- **`nidus.access_count`**: an integer, how many reinforced recalls have returned
+  this entry so far. Absent means never reinforced.
+- **`nidus.last_accessed`**: a `DateTime` (UTC epoch ms), the last reinforced recall.
+
+`RecallOpts::extend_ttl_seconds` goes with it: when `reinforce` is set, it pushes an
+*existing* `nidus.expires_at` forward to now plus that many seconds. It never gives
+an expiry to an entry that had none, and never moves one backwards, so a note with no
+TTL stays permanent no matter how often it is reinforced.
+
+Both attrs are stamped only by a reinforced recall, and stripped from any `attrs` a
+caller supplies to `remember`, the same as `nidus.created_at`/`nidus.updated_at`.
+
+A reinforced recall is a **write**: it takes the writer lock to apply the stamp. What a
+read-only store does about that depends on who asked. In process, `Memory::recall` skips
+the stamp with a warning rather than failing the call, since a library caller may not own
+the open mode and optional bookkeeping must not sink an otherwise good recall. The HTTP
+and MCP surfaces instead refuse the request: it named `reinforce`, so reporting success
+without stamping would be indistinguishable from having stamped. On the CLI,
+`nidus recall --reinforce` opens the store read-write, and that open is refused outright
+if a live `nidus serve` already holds the writer lock (a plain `nidus recall`, with no
+`--reinforce`, is unaffected).
+
+Reinforcement pairs with [`Decay::count_field`](/guides/search/#ranking-by-reinforcement)
+to rank on `nidus.access_count` directly:
+
+```rust
+use nidus::{Decay, RankBy, RecallOpts, SearchOpts};
+
+# async fn run(mut memory: nidus::Memory) -> anyhow::Result<()> {
+let now = 1_770_000_000_000_i64;
+let week = 7 * 24 * 60 * 60 * 1000;
+
+// Recall, and record that these hits were useful.
+let hits = memory.recall("notes", "how do users sign in?", &RecallOpts {
+    top_k: 3,
+    reinforce: true,
+    ..Default::default()
+}).await?;
+
+// Later: rank by recency, with reinforced entries paying a smaller penalty.
+let query = vec![0.1_f32; memory.db().dimension()];
+let _ranked = memory.db().search("notes", &query, &SearchOpts {
+    rank_by: Some(RankBy::Decay(
+        Decay::new("updated_at", now, week).count_field("nidus.access_count"),
+    )),
+    ..Default::default()
+})?;
+# let _ = hits;
+# anyhow::Ok(())
+# }
+```
+
 :::note
 The in-process `Memory::remember` is leaner than the server's write path: it does
 not take `ttl_seconds`/`dedupe_threshold` options and it does not stamp the

@@ -469,6 +469,12 @@ place by `Nidus::refresh()` (§14.6 phase 4), which re-applies this same rule at
 manifest version without reopening — the basis for a search-only process tracking a store
 another process is writing.
 
+A **reinforced** recall (nidus-gk6) is the one exception to "search is a read": stamping
+`nidus.access_count`/`nidus.last_accessed` is a durable write, so it takes the writer lease
+like any other mutation and is refused on a `ReadOnly` opener. The lock-free reader rule
+above is otherwise untouched — `Op::Reinforce` references no row, so there is nothing for
+the `row ≥ S/dim` rule to ignore.
+
 ### 6.3 Writer/writer exclusion — best-effort, pure std
 Two concurrent writers would corrupt the append stream. A writer acquires
 `<dir>/lock` via `OpenOptions::new().write(true).create_new(true)` (atomic O_EXCL
@@ -509,6 +515,10 @@ then does each request get its `200`. There is no timed window — a lone write 
 of one and pays exactly what it always did — so the uncontended path is untouched while the
 contended one stops paying N barriers for N writes. `nidus_write_groups_total` /
 `nidus_write_group_members_total` report the resulting coalescing factor.
+
+A reinforced recall's stamp (nidus-gk6, §7.6/§9) follows this same barrier policy, but
+appends only to `log`: no vector is written, so there is no `data` append and nothing for
+a `data` fsync to protect.
 
 Leadership is a `bool` under the queue's mutex rather than a dedicated commit thread: less
 machinery for the same behaviour, with no lifecycle to own and no thread idling in a
@@ -909,6 +919,28 @@ Three defaults matter:
   silently buries every document written before the field existed. Callers who want the
   opposite set `missing: 0.0` explicitly.
 
+**Reinforcement** (nidus-gk6, `Decay::count_field`) widens the same expression rather than
+adding a new one: a second, independent subtractive term over a count attribute (typically
+`nidus.access_count`), so a memory nothing ever recalls sinks against one that keeps getting
+matched. `count_field` is `None` by default, so a `Decay` that never sets it ranks exactly
+as it did before this term existed — the same additive-default promise `count`/`decay`
+share. The factor is
+
+```
+count_factor = n / (n + count_scale)                 # n = attrs[count_field], missing ⇒ 0
+score        = score − count_lambda × (1 − count_factor)
+```
+
+`count_scale` is the saturation constant `k`: at `n == count_scale` the term is half spent,
+and it climbs asymptotically toward "no penalty" rather than ever reaching it, so one very
+hot record cannot make every other record's penalty vanish. Exactly like the recency
+half, this term **subtracts** — the same metric-agnostic reasoning applies unchanged — and
+a missing or non-integer count reads as `n = 0`, the maximal penalty, by design: an entry
+that has never been reinforced should rank behind one that has. `field` (the recency
+attribute) may be **empty** when `count_field` is set: a count-only ranking expression is a
+real use case, and `validate` only requires `field` when there is no count term to rank on
+instead.
+
 `rank_by` **does not force the exact path.** `SearchOpts::exact` is the explicit opt-in for
 that, and conflating the two would mean enabling decay silently disabled the index. The
 expression is applied where each candidate's final score is decided, which every path
@@ -1192,14 +1224,15 @@ build until a real need exists.
   reserved attr vocabulary, and optionally suppresses near-duplicates. The reserved
   keys are `nidus.text` (the raw text, always stamped, and what the default schema
   indexes), `nidus.created_at` / `nidus.updated_at` / `nidus.expires_at` (all
-  `Value::DateTime`, UTC epoch ms), and `nidus.parent_id` (`Value::Str`) /
-  `nidus.chunk_index` (`Value::Int`) / `nidus.char_start` (`Value::Int`), stamped by
-  `remember_chunked` to record which document a chunk came from, its 0-based position
-  within it, and its char offset into the source (which is what lets §7.10 stitch a
-  window without repeating the overlap). `nidus.source`
-  predates `nidus.text`, carried
-  exactly the same value, and is retained read-only so records written before this
-  change still resolve — nothing stamps it now. Because `upsert` replaces a doc's
+  `Value::DateTime`, UTC epoch ms), `nidus.access_count` (`Value::Int`) /
+  `nidus.last_accessed` (`Value::DateTime`, nidus-gk6, below), and `nidus.parent_id`
+  (`Value::Str`) / `nidus.chunk_index` (`Value::Int`) / `nidus.char_start`
+  (`Value::Int`), stamped by `remember_chunked` to record which document a chunk came
+  from, its 0-based position within it, and its char offset into the source (which is
+  what lets §7.10 stitch a window without repeating the overlap). `nidus.source`
+  predates `nidus.text`, carried exactly the same value, and is retained read-only so
+  records written before this change still resolve — nothing stamps it now.
+  Because `upsert` replaces a doc's
   attrs wholesale, both preserving `created_at` and merging a dedupe match's
   untouched attrs require an explicit read-before-write, done inside the same
   `run_write` closure so it is atomic against every other queued write.
@@ -1219,6 +1252,23 @@ build until a real need exists.
   Physical reclaim stays a separate, caller-triggered concern reached through
   `delete_where` + `compact` (§8); it is deliberately not new logic inside
   `compact`'s per-doc re-emission loop.
+
+  **Reinforcement is opt-in per recall, and that is not one option of two either
+  (nidus-gk6).** `RecallOpts::reinforce` defaults `false`, so an untouched recall
+  stays a pure read; setting it stamps `nidus.access_count`/`nidus.last_accessed`
+  on every returned entry as one durable write. That write takes the writer lease
+  like any other mutation, so `Nidus::reinforce` refuses outright on a `ReadOnly`
+  opener. Who sees that refusal splits deliberately: the in-process
+  `Memory::recall` **skips** the stamp with a `diag!` warning, because a library
+  caller may not own `open_mode` and optional bookkeeping must not lose it an
+  otherwise good recall; the HTTP, MCP and CLI surfaces **propagate** it, because a
+  request that named `reinforce` did choose, and answering it as though the stamp
+  happened would be indistinguishable from success. `RecallOpts::extend_ttl_seconds` only ever moves an
+  **existing** `nidus.expires_at` forward to `max(current, now + extend)`; it never
+  creates one, since giving a never-expiring memory a TTL because it happened to be
+  recalled would be a silent, one-way change to its lifetime. The counters are as
+  durable as any other committed write: per-batch fsync under the store's normal
+  barrier policy, so a crash loses at most the in-flight stamp, never more.
 - **ANN index (HNSW/IVF).** `Config::ann` opts a store into an in-RAM approximate
   index over the same `data` rows; `search` walks it instead of scanning. Two
   algorithms, selected by `AnnKind`: **HNSW** (`AnnConfig::hnsw`, the default — a

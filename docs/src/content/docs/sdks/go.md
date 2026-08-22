@@ -295,6 +295,16 @@ hits, err := db.Recall(ctx, "notes", "quick fox", nidus.RecallOptions{
     MinScore: &floor,
     Filter:   nidus.And(nidus.Eq("tag", "x")),
 })
+
+// Reinforce: stamp nidus.access_count / nidus.last_accessed on every hit
+// returned, and push an existing expiry forward. Off by default, so a plain
+// Recall stays a pure read.
+extend := int64(86400)
+reinforced, err := db.Recall(ctx, "notes", "quick fox", nidus.RecallOptions{
+    TopK:             5,
+    Reinforce:        true,
+    ExtendTTLSeconds: &extend,
+})
 ```
 
 `Remember` returns a `RememberResult` (`ID`, `Upserted`, `Deduped`): `ID` is the record
@@ -302,6 +312,13 @@ that actually changed, which is not always the one passed in, and `Upserted` is 
 count from the underlying write. See
 [Parity across the surfaces](/guides/remember-and-recall/#parity-across-the-surfaces)
 for how these semantics line up with the other SDKs and the MCP surface.
+
+Setting `Reinforce` makes the call a write: it takes the server's writer lock to apply
+the stamp, and against a server started `--read-only` the stamp is skipped with a
+warning rather than failing the recall. `ExtendTTLSeconds` only applies with
+`Reinforce` set, and only pushes an **existing** `nidus.expires_at` forward; it never
+gives an expiry to an entry that had none. See
+[reinforcement](/guides/remember-and-recall/#reinforcement).
 
 Two different failures are worth telling apart when these do not work. A **`404` with no
 message** means the server binary was built without the `memory` feature, so `/remember`

@@ -468,6 +468,14 @@ fn default_missing() -> f32 {
     1.0
 }
 
+fn default_count_scale() -> f32 {
+    10.0
+}
+
+fn default_count_lambda() -> f32 {
+    1.0
+}
+
 /// Recency decay over a timestamp attribute. The penalty is **subtracted** from the base
 /// score, never multiplied, so it is valid for every [`Distance`] metric and for negative
 /// scores alike (nidus-m50.15 #7). See `SPEC.md` §7.6.
@@ -492,6 +500,19 @@ pub struct Decay {
     /// `1.0` — no penalty. Must be in `[0, 1]`.
     #[serde(default = "default_missing")]
     pub missing: f32,
+    /// Count attribute adding a bounded reinforcement term: a record with a high count
+    /// pays less penalty. `None` (the default) skips the term entirely, so a `Decay`
+    /// without it ranks exactly as it did before nidus-gk6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_field: Option<String>,
+    /// Saturation constant `k` in `n / (n + k)`: the count at which the term is half
+    /// spent. Must be positive when `count_field` is set.
+    #[serde(default = "default_count_scale")]
+    pub count_scale: f32,
+    /// Penalty an entirely un-reinforced record pays. Bounded on purpose: an unbounded
+    /// bonus would let one hot record win every query.
+    #[serde(default = "default_count_lambda")]
+    pub count_lambda: f32,
 }
 
 impl Decay {
@@ -504,6 +525,9 @@ impl Decay {
             decay: default_decay(),
             lambda: default_lambda(),
             missing: default_missing(),
+            count_field: None,
+            count_scale: default_count_scale(),
+            count_lambda: default_count_lambda(),
         }
     }
 
@@ -522,6 +546,24 @@ impl Decay {
     /// Set the factor used when the timestamp attribute is missing or unusable.
     pub fn missing(mut self, missing: f32) -> Self {
         self.missing = missing;
+        self
+    }
+
+    /// Enable the reinforcement term, reading counts from `field`.
+    pub fn count_field(mut self, field: impl Into<String>) -> Self {
+        self.count_field = Some(field.into());
+        self
+    }
+
+    /// Set the saturation constant `k` in `n / (n + k)`.
+    pub fn count_scale(mut self, count_scale: f32) -> Self {
+        self.count_scale = count_scale;
+        self
+    }
+
+    /// Set the penalty an entirely un-reinforced record pays.
+    pub fn count_lambda(mut self, count_lambda: f32) -> Self {
+        self.count_lambda = count_lambda;
         self
     }
 }
@@ -978,6 +1020,18 @@ pub enum Op {
         collection: String,
         fields: Vec<FilterIndexField>,
     },
+    /// Bump an entry's reinforcement counters in place. Carries no `row`; replay leaves
+    /// `DocEntry.row` alone (an attrs-only `UpsertText` would null it and strip the vector).
+    /// Appended last, like `UpsertText`, for the same forward-compatibility reason.
+    Reinforce {
+        collection: String,
+        id: String,
+        access_count: i64,
+        last_accessed: i64,
+        /// New `nidus.expires_at`, when the recall asked to extend a TTL. `None` leaves
+        /// expiry untouched.
+        expires_at: Option<i64>,
+    },
 }
 
 #[cfg(test)]
@@ -988,7 +1042,7 @@ mod tests {
     fn appending_variants_did_not_renumber_the_existing_ones() {
         // bincode tags a variant by its **declaration index**, so inserting one anywhere
         // but the end silently reinterprets every op in every store's existing log.
-        let cases: [(Op, u32); 9] = [
+        let cases: [(Op, u32); 10] = [
             (
                 Op::CreateCollection {
                     collection: "c".into(),
@@ -1052,6 +1106,16 @@ mod tests {
                     fields: vec![FilterIndexField::new("body")],
                 },
                 8,
+            ),
+            (
+                Op::Reinforce {
+                    collection: "c".into(),
+                    id: "i".into(),
+                    access_count: 1,
+                    last_accessed: 0,
+                    expires_at: None,
+                },
+                9,
             ),
         ];
         for (op, want) in cases {

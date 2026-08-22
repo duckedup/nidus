@@ -247,6 +247,15 @@ export interface Decay {
   lambda?: number;
   /** Factor for a record whose `field` is missing or not a timestamp. Defaults to `1` — no penalty. */
   missing?: number;
+  /**
+   * An `Int` attribute counting how often a record was used (e.g. `nidus.access_count`).
+   * The count term applies only when this is set; omit it to decay by recency alone.
+   */
+  countField?: string;
+  /** Count at which the count term reaches its full effect (default `10`). */
+  countScale?: number;
+  /** Weight of the count term, subtracted like the recency penalty (default `1`). */
+  countLambda?: number;
 }
 
 /**
@@ -617,4 +626,20 @@ export interface RecallOptions {
   rollup?: Rollup;
   /** See {@link RerankOptions}. Defaults `query` to the request's own text. */
   rerank?: RerankOptions;
+  /**
+   * Record that these entries proved useful, stamping `nidus.access_count` and
+   * `nidus.last_accessed`. This makes the recall a write: it takes the server's writer
+   * lock and is refused on a read-only server.
+   */
+  reinforce?: boolean;
+  /**
+   * Push an existing `nidus.expires_at` out to this many seconds from now. Only applies
+   * with `reinforce`, and never gives an expiry to an entry that had none.
+   */
+  extendTtlSeconds?: number;
+  /**
+   * Ranking expression layered over cosine: decay over `nidus.last_accessed`, a
+   * reinforcement term over `nidus.access_count`, or both. See {@link Decay}.
+   */
+  rankBy?: RankBy;
 }

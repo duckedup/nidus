@@ -507,8 +507,8 @@ and the [ingest flags](#ingest-flags-memory-feature) (it needs an embedder), plu
 
 ### `recall` (`memory` feature)
 
-Recall the nearest remembered text to `query`. Opens read-only, so it runs alongside
-a `nidus serve` holding the writer lock. Usage:
+Recall the nearest remembered text to `query`. Opens read-only by default, so a plain
+`nidus recall` runs alongside a `nidus serve` holding the writer lock. Usage:
 `nidus recall [OPTIONS] --dir <DIR> <COLLECTION> <QUERY>`. Takes the store flags and
 the [ingest flags](#ingest-flags-memory-feature), plus:
 
@@ -523,6 +523,14 @@ the [ingest flags](#ingest-flags-memory-feature), plus:
 | `--rerank-query <TEXT>` (`rerank` feature) | none | Text scored against each candidate by the cross-encoder. Defaults to `QUERY` above. |
 | `--rerank-overscan <N>` (`rerank` feature) | none | Candidates retrieved per `top_k` before the cross-encoder rerank (default `10`). |
 | `--rerank-text-attr <ATTR>` (`rerank` feature) | none | Attr holding each candidate's text for the cross-encoder rerank (default `nidus.text`). |
+| `--reinforce` | none | Stamp `nidus.access_count` / `nidus.last_accessed` on every returned entry; see [reinforcement](/guides/remember-and-recall/#reinforcement). |
+| `--extend-ttl-seconds <SECS>` | none | With `--reinforce`, push an existing `nidus.expires_at` forward to now plus this many seconds. Never creates an expiry on an entry that had none. |
+| `--rank-by <JSON>` | none | Ranking expression, the same form `search --rank-by` takes, so a recall can rank on the reinforcement counters. |
+
+**`--reinforce` opens the store read-write instead of read-only**, since stamping the
+counters is a write. That means `nidus recall --reinforce` cannot run beside a live
+`nidus serve` holding the writer lock: the open fails outright with a lock error. A
+plain `nidus recall`, with no `--reinforce`, is unaffected and keeps opening read-only.
 
 `remember`/`recall` are the CLI door onto the same memory layer HTTP's
 `/remember`/`/recall` and MCP's tools use; see
