@@ -214,6 +214,10 @@ export function botStamped(changed, diffs) {
 // ── 6. New dependencies vs. the build-and-ship budget ──────────────────────
 
 const FORBIDDEN_DEP = /(libduckdb|duckdb|aws-lc|openssl-sys|vendored-openssl|arrow|datafusion|[-_]sys$)/i
+// `[-_]sys$` catches the name, not the tree, so the pure-Rust exceptions are named
+// here — same reasoning CLAUDE.md gives for `openssl-probe`. Verified for these two:
+// no build.rs, no C/C++ sources, nothing linked (nidus-y67).
+const SYS_NAME_ONLY = /^(js-sys|web-sys)$/
 const DEP_TABLE = /^\[(?:target\.[^\]]+\.)?(dependencies|dev-dependencies|build-dependencies)(?:\.([A-Za-z0-9_-]+))?\]/
 
 // Names from the dependency tables only. Reading the two Cargo.toml versions beats
@@ -241,7 +245,7 @@ export function newDeps(baseCargo, headCargo) {
   const before = depNames(baseCargo)
   const added = [...depNames(headCargo)].filter(n => !before.has(n))
   for (const name of added) {
-    if (FORBIDDEN_DEP.test(name)) {
+    if (FORBIDDEN_DEP.test(name) && !SYS_NAME_ONLY.test(name)) {
       out.push(finding('forbidden-dep', 'error', 'Cargo.toml', 1,
         `new dependency \`${name}\` looks like a bundled-C / heavy tree`,
         'CLAUDE.md forbids bundled C/C++, vendored OpenSSL, aws-lc-sys, and Arrow+DataFusion. This is a design change — raise an issue first.'))

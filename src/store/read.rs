@@ -289,7 +289,7 @@ impl Store {
     /// configured `query_threads` when that is `> 1` *and* the total work
     /// (`scan_len × dimension`) clears [`PARALLEL_SCAN_WORK_FLOOR`], else `1` (serial).
     fn parallel_workers(&self, scan_len: usize) -> usize {
-        let threads = self.config.query_threads.max(1);
+        let threads = self.effective_query_threads().max(1);
         if threads > 1 && scan_len.saturating_mul(self.data.dimension()) >= PARALLEL_SCAN_WORK_FLOOR
         {
             threads

@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 
@@ -83,17 +83,10 @@ fn oom(what: &str, count: usize) -> anyhow::Error {
     anyhow!("out of memory reserving capacity for {count} {what}")
 }
 
-/// Monotonic clock base for the lock-free staleness stamp: `Instant` cannot live in an atomic,
-/// and staleness must read without the store lock. NOT `SystemTime` — the wall clock can jump
-/// backwards, making a reader look *younger* than it is.
-fn mono_base() -> Instant {
-    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    *BASE.get_or_init(Instant::now)
-}
-
-/// Milliseconds on the [`mono_base`] clock — the value stored in a staleness stamp.
+/// Milliseconds on nidus's monotonic clock — the value stored in a staleness stamp. See
+/// [`crate::clock`] for why this is monotonic, not wall-clock, on every platform.
 fn mono_millis() -> u64 {
-    mono_base().elapsed().as_millis() as u64
+    crate::clock::mono_millis()
 }
 
 /// The facts a readiness probe needs, readable with no lock — every field is an atomic or
@@ -142,10 +135,10 @@ fn jitter(span: Duration) -> Duration {
     if span.is_zero() {
         return Duration::ZERO;
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos() as u64);
-    Duration::from_nanos(nanos % (span.as_nanos().max(1) as u64))
+    // Microseconds, not millis: two instances waking in the same millisecond would
+    // otherwise draw the SAME jitter and stay in the lockstep this exists to break.
+    let seed = crate::clock::mono_micros() ^ (crate::clock::now_unix_millis() as u64);
+    Duration::from_nanos(seed % (span.as_nanos().max(1) as u64))
 }
 
 // ── Store ─────────────────────────────────────────────────────────────────────
@@ -1059,6 +1052,20 @@ impl Store {
         }
     }
 
+    /// [`Config::query_threads`] after the wasm clamp: wasm32 has no threads, so every caller
+    /// that might reach a `std::thread::scope` fan-out reads this instead of the raw config
+    /// field, and the `#[cfg]` lives in exactly one place (nidus-y67).
+    fn effective_query_threads(&self) -> usize {
+        #[cfg(target_family = "wasm")]
+        {
+            1
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.config.query_threads
+        }
+    }
+
     /// A `Drop`-free renewal handle for the writer lease, independent of the store lock so a batch
     /// longer than `lock_ttl` cannot let a peer fence a merely-slow writer (nidus-lp4.3). NOT a
     /// lease clone: a cloned owning guard would delete the lease object on drop.
@@ -1085,7 +1092,9 @@ impl Store {
             LeaseWait::Fail => {
                 return claim()?.ok_or_else(|| locked_error(location));
             }
-            LeaseWait::Timeout(limit) => Some(Instant::now() + limit),
+            LeaseWait::Timeout(limit) => {
+                Some(crate::clock::mono_millis().saturating_add(limit.as_millis() as u64))
+            }
             LeaseWait::Forever => None,
         };
 
@@ -1111,7 +1120,7 @@ impl Store {
                 }
             }
             if let Some(deadline) = deadline
-                && Instant::now() >= deadline
+                && crate::clock::mono_millis() >= deadline
             {
                 // Surface the real cause when the wait ended in errors rather than
                 // contention — "store is locked" would be a misleading diagnosis.
@@ -1293,7 +1302,9 @@ impl Store {
             return;
         }
         let live_rows = self.rebuild_row_to_doc();
-        let workers = self.config.query_threads;
+        // Clamped here (not left to `ann.build`): this may dispatch to the HNSW backend, whose
+        // `thread::scope` fan-out (nidus-y67) must never be reached on wasm.
+        let workers = self.effective_query_threads();
         let walk = quant::ann_walk_for(self.quant.as_ref(), &self.data, self.config.distance);
         if let Some(ann) = self.ann.as_mut() {
             ann.build(&walk, &live_rows, workers);
@@ -1510,7 +1521,7 @@ impl Store {
         let cfg = Self::segment_ivf_config();
         let dim = self.data.dimension();
         let distance = self.config.distance;
-        let workers = self.config.query_threads;
+        let workers = self.effective_query_threads();
         // Cloned so the sidecar reads below do not hold a borrow of `self`.
         let persistence = self.persistence.clone();
         let walk = Walk::exact(&self.data, distance);
@@ -1637,7 +1648,7 @@ impl Store {
             );
             let walk = Walk::exact(&self.data, self.config.distance);
             let segment_rows: Vec<u64> = (base..base + rows).collect();
-            ix.build(&walk, &segment_rows, self.config.query_threads);
+            ix.build(&walk, &segment_rows, self.effective_query_threads());
             Some(ix)
         } else {
             None

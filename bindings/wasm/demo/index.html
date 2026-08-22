@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>nidus in the browser</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 640px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+        color: #1a1a1a;
+      }
+      pre {
+        background: #f4f4f4;
+        border-radius: 6px;
+        padding: 1rem;
+        overflow-x: auto;
+        white-space: pre-wrap;
+      }
+      button {
+        font-size: 1rem;
+        padding: 0.5rem 1rem;
+        cursor: pointer;
+      }
+      code {
+        background: #f4f4f4;
+        padding: 0.1rem 0.3rem;
+        border-radius: 3px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>nidus in the browser</h1>
+    <p>
+      Upserts three vectors into an <code>opfs://</code> store from a dedicated worker,
+      searches, then closes and reopens the store handle to show the same ranking comes
+      back out — the data lives in the browser's Origin Private File System, not RAM.
+    </p>
+    <p>
+      Must be served over <code>http://localhost</code> (or any secure context) — OPFS
+      is unavailable on a plain <code>file://</code> page.
+    </p>
+    <button id="run">Run demo</button>
+    <pre id="log">(click "Run demo")</pre>
+    <script type="module">
+      const worker = new Worker("./worker.js", { type: "module" });
+      const pending = new Map();
+      let nextId = 0;
+
+      worker.onmessage = (ev) => {
+        const { id, ok, result, error } = ev.data;
+        const p = pending.get(id);
+        if (!p) return;
+        pending.delete(id);
+        ok ? p.resolve(result) : p.reject(new Error(error));
+      };
+
+      function send(cmd, payload) {
+        const id = nextId++;
+        return new Promise((resolve, reject) => {
+          pending.set(id, { resolve, reject });
+          worker.postMessage({ id, cmd, payload });
+        });
+      }
+
+      const logEl = document.getElementById("log");
+      function line(s) {
+        logEl.textContent += s + "\n";
+      }
+
+      document.getElementById("run").addEventListener("click", async () => {
+        logEl.textContent = "";
+        try {
+          await send("init");
+          line("opened opfs://nidus-demo");
+
+          const docs = [
+            { id: "a", vector: [1, 0, 0], attrs: { title: "alpha" } },
+            { id: "b", vector: [0, 1, 0], attrs: { title: "beta" } },
+            { id: "c", vector: [0, 0, 1], attrs: { title: "gamma" } },
+          ];
+          await send("upsert", { records: docs });
+          line(`upserted ${docs.length} records`);
+
+          const before = await send("search", { query: [1, 0, 0], topK: 3 });
+          const beforeIds = before.map((h) => h.id);
+          line("search before reopen: " + JSON.stringify(beforeIds));
+
+          await send("close");
+          line("closed the store");
+          await send("reopen");
+          line("reopened opfs://nidus-demo");
+
+          const after = await send("search", { query: [1, 0, 0], topK: 3 });
+          const afterIds = after.map((h) => h.id);
+          line("search after reopen:  " + JSON.stringify(afterIds));
+
+          line(
+            JSON.stringify(beforeIds) === JSON.stringify(afterIds)
+              ? "\nPERSISTED: identical ranking before and after the reopen."
+              : "\nMISMATCH: ranking changed after reopen (unexpected).",
+          );
+        } catch (e) {
+          line("ERROR: " + e.message);
+        }
+      });
+    </script>
+  </body>
+</html>

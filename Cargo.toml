@@ -4,12 +4,12 @@
 # exists to avoid (bundled DuckDB C++, LanceDB/Arrow/DataFusion) — is a member built
 # solely on explicit request (`-p nidus-bench`, via `just bench`).
 [workspace]
-members = ["benchmarks"]
+members = ["benchmarks", "bindings/wasm"]
 default-members = ["."]
 
 [package]
 name = "nidus"
-version = "0.82.0"
+version = "0.83.0"
 edition = "2024"
 rust-version = "1.96"
 description = "A small, pure-Rust embeddable vector store: brute-force or ANN cosine search over a single append-only directory, with pluggable persistence (local files, S3, GCS). No SQL, no query engine; builds in seconds."
@@ -21,7 +21,7 @@ categories = ["database-implementations", "data-structures"]
 # `docs/` and `sdks/` are excluded for the same reason — an Astro site and the
 # client SDKs are separately-published artifacts (GitHub Pages, npm, PyPI, the Go
 # module proxy), so shipping their sources to every `cargo add nidus` is pure weight.
-exclude = [".claude/", ".github/", "AGENTS.md", "justfile", "benchmarks/", "charts/", "Dockerfile", ".dockerignore", "docs/", "sdks/"]
+exclude = [".claude/", ".github/", "AGENTS.md", "justfile", "benchmarks/", "bindings/", "charts/", "Dockerfile", ".dockerignore", "docs/", "sdks/"]
 
 [lib]
 name = "nidus"
@@ -150,27 +150,32 @@ regex = "1"
 # both `regex` and `regex-automata` depend on it — so a direct dep adds no build time.
 regex-syntax = "0.8"
 
-# Storage-backend deps (SPEC §13), in the DEFAULT build. The cloud clients are
-# sans-IO (build + sign requests; no transport, no async) — `rusty-s3` (Sigv4 = pure
+# `http` is the request-type crate shared by the (native-only, see below) S3/GCS
+# backend construction AND by `embed`/`server` — it compiles for wasm32, so it stays
+# unconditional here rather than moving to the wasm-excluded table below.
+http = "1"
+
+# Storage-backend deps (SPEC §13), in the DEFAULT (native) build only — see the
+# `cfg(not(target_family = "wasm"))` table below. The cloud clients are sans-IO
+# (build + sign requests; no transport, no async) — `rusty-s3` (Sigv4 = pure
 # RustCrypto HMAC) and `tame-gcs`/`tame-oauth` (GCS + OAuth2 service-account JWT) —
 # executed over `ureq`, a small blocking HTTP client whose default TLS is
 # rustls + `ring` (self-contained via webpki-roots; NOT aws-lc, NOT OpenSSL). `url`
-# and `http` are their request types, surfaced for backend construction.
-rusty-s3 = "0.9"
-tame-gcs = "0.14"
-tame-oauth = "0.10"
-ureq = "3"
-url = "2"
-http = "1"
-
-# The shared MEMORY TIER over Redis (SPEC §13.3), also in the DEFAULT build. One
+# is their request type, surfaced for backend construction.
+#
+# The shared MEMORY TIER over Redis (SPEC §13.3) is native-only for the same reason:
 # `redis-rs` blocking client covers Redis, Valkey, KeyDB, and DragonflyDB — all
 # RESP-protocol-compatible — selected by `redis://`/`rediss://`/`valkey://`/… URL
 # scheme. `default-features = false` keeps it SYNC (no tokio/async pulled). Extras:
 # `tls-rustls` for `rediss://` (reuses the rustls + `ring` already present for ureq —
 # NOT aws-lc, NOT a second TLS stack) and `cluster` for Redis/Valkey Cluster (slot
 # routing + MOVED/ASK), whose only added deps are `crc16` + `rand` — tiny, pure Rust.
-redis = { version = "1", default-features = false, features = ["tls-rustls", "cluster"] }
+#
+# None of `ureq`/`tame-oauth`/`redis` compile for wasm32 (network + threads), so
+# `rusty-s3`/`tame-gcs`/`tame-oauth`/`ureq`/`url`/`redis` move to the wasm-excluded
+# table below (§ "wasm32 target" near the end of this file); `url` moves with them
+# because it is used only by `backend/aws_creds.rs` and `backend/s3.rs`, both gated
+# out for wasm (see `src/backend/mod.rs`).
 
 # Memory-mapped immutable segments (SPEC §9 / §14.6 phase 3), in the DEFAULT build.
 # `memmap2` is the one conscious FFI/`unsafe` opt-in in nidus — a thin, fast-compiling
@@ -239,6 +244,30 @@ rmcp = { version = "=3.1.1", default-features = false, features = [
 # Embeddings/summaries are single-shot request/response, so NO `stream` feature.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
+# Storage-backend + memory-tier deps that do not compile for wasm32 (network + threads):
+# `rusty-s3`/`tame-gcs`/`tame-oauth` (S3/GCS clients) run over `ureq`; `url` is their
+# request type, used only by `backend/aws_creds.rs`/`backend/s3.rs`; `redis` is the
+# Redis-family memory tier. All gated out for wasm in `src/backend/mod.rs`.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+rusty-s3 = "0.9"
+tame-gcs = "0.14"
+tame-oauth = "0.10"
+ureq = "3"
+url = "2"
+redis = { version = "1", default-features = false, features = ["tls-rustls", "cluster"] }
+
+# wasm32 target (browser / edge, nidus-y67). Measured cost: 10s cold, 33 crates,
+# wasm target only — the native dependency graph above is byte-identical, so
+# `build-budget` and `build-thesis` are unaffected.
+[target.'cfg(target_family = "wasm")'.dependencies]
+wasm-bindgen = "0.2"
+# `js-sys` only: the OPFS handle is reached via `Reflect` on an opaque `JsValue`, so no
+# typed `web-sys` binding (and none of its feature list) is needed anywhere.
+js-sys = "0.3"
+
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
 [dev-dependencies]
 tempfile = "3"
 
@@ -256,3 +285,13 @@ pkg-fmt = "zip"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The wasm binding only (nidus-y67). A browser pays for every byte and the binding exposes
+# the whole surface, so nothing is dead-code-eliminated. Size over speed — kept off
+# `[profile.release]` because the native library trades the other way (SPEC §1, Speed).
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true

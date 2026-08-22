@@ -57,7 +57,7 @@ fast dependency.
 
 ```toml
 [dependencies]
-nidus = "0.82"
+nidus = "0.83"
 ```
 
 ```rust
@@ -128,6 +128,10 @@ See [`examples/demo.rs`](examples/demo.rs) for an end-to-end run (`cargo run
 - **Synchronous, runtime-agnostic**: the hot path is CPU-bound, so there's no async
   core to lock you into a runtime. `Arc<RwLock<Nidus>>` gives concurrent searchers +
   one writer; async callers bridge with `spawn_blocking`.
+- **Runs in the browser**: nidus compiles for `wasm32-unknown-unknown`, storing its
+  data in the browser's Origin Private File System (`opfs://`) from a dedicated
+  worker, no server round trip. See the
+  [browser guide](https://nidus.duckedup.org/guides/wasm/).
 
 ## Command line & server
 

@@ -151,3 +151,81 @@ jobs:
         run: |
           ./scripts/e2e-services.sh down
           ./scripts/e2e-services.sh down-cluster
+
+  # nidus-y67: the real behavioural check for the wasm32 target. Both runtime
+  # hazards (the clock read, `thread::scope`) compile cleanly, so `ci.yml`'s
+  # `wasm` job (build + clippy only) has no failing mode for them — this job
+  # actually executes the suites: `just test-wasm` under Node (clock, thread
+  # degradation, ranking), then the `wasm_opfs` target in a real headless
+  # browser, since OPFS does not exist outside one.
+  wasm-e2e:
+    name: wasm-e2e (Node + real headless browser)
+    runs-on: ubuntu-latest
+    # Generous next to toolchain install + browser startup, but bounded so a
+    # hung browser fails the check instead of burning an hour.
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Lane guard — skip the work when no changed path exercises this job
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --quiet --depth=1 origin "$BASE_SHA"
+          files="$(git diff --name-only "$BASE_SHA" HEAD | paste -sd, -)"
+          if [ -n "$files" ] && [ "$(.claude/skills/nidus/bin/nidus-check ci-guard wasm-e2e --paths "$files")" = "skip" ]; then
+            echo "SKIP_LANE=true" >> "$GITHUB_ENV"
+          fi
+
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+
+      # NOT the action's `targets:` input. `rust-toolchain.toml` pins 1.96.0, so every
+      # cargo call resolves there while `targets:` would add wasm32 to `stable` instead,
+      # and the build would fail with "can't find crate for `core`". `rustup target add`
+      # honours the toolchain-file override, so it lands on whatever cargo actually uses.
+      - name: Add the wasm32 target to the pinned toolchain
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Ensure `just` is available
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: command -v just >/dev/null 2>&1 || cargo install just --locked
+
+      # Own cache key, same shape as the other jobs, so it neither evicts nor
+      # is evicted by them.
+      - uses: actions/cache@v5
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-wasm-e2e-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-wasm-e2e-
+
+      # Pins wasm-bindgen-cli to 0.2.122 (must match Cargo.lock's wasm-bindgen)
+      # and locates the ubuntu runner's preinstalled chromedriver; on failure
+      # it names the unusable case rather than hanging (macOS only, not this runner).
+      - name: Bring up the wasm-bindgen runner + browser driver
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: ./scripts/e2e-wasm.sh up
+
+      - name: Node suite (clock, thread degradation, ranking)
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: just test-wasm
+
+      # OPFS only exists in a browser, so this is the only place the handle
+      # pool is actually exercised; a Node-only lane could not prove it.
+      - name: Browser suite (wasm_opfs, real headless browser)
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: ./scripts/e2e-wasm.sh test
+
+      - name: Clean up
+        if: ${{ always() && env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: ./scripts/e2e-wasm.sh down

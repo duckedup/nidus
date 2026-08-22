@@ -1,0 +1,25 @@
+# The JS binding over nidus (nidus-y67, U4): wasm-bindgen exports over `Nidus`. NOT a
+# workspace default-member (root `Cargo.toml`), so `cargo build`/`just test`/`just ci`
+# never touch it. Built by `just build-wasm-binding`.
+[package]
+name = "nidus_wasm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Path dependency on the crate itself, default features only (no `cli`/`embed`/etc — none
+# of those compile for wasm32 anyway). The binding depends on nidus; never the reverse.
+nidus = { path = "../.." }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+# Marshals Rust <-> JsValue through the same serde model the request/response DTOs already
+# use, so a `Record`/`Hit` crosses the boundary without a hand-rolled `JsValue` walk.
+serde-wasm-bindgen = "0.6"
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+

@@ -4,7 +4,6 @@
 //! ground truth, and recommend the cheapest cell that clears a target recall.
 
 use std::collections::HashSet;
-use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
@@ -242,7 +241,7 @@ pub fn tune(config: &Config, opts: &TuneOpts) -> Result<TuneReport> {
                 let mut returned = Vec::with_capacity(sample.len());
                 let mut micros = Vec::with_capacity(sample.len());
                 for s in &sample {
-                    let started = Instant::now();
+                    let started = crate::clock::mono_micros();
                     let hits = nidus.search(
                         refs.as_slice(),
                         &s.vector,
@@ -251,7 +250,7 @@ pub fn tune(config: &Config, opts: &TuneOpts) -> Result<TuneReport> {
                             ..Default::default()
                         },
                     )?;
-                    micros.push(started.elapsed().as_micros() as u64);
+                    micros.push(crate::clock::mono_micros().saturating_sub(started));
                     returned.push(strip_self_hit(hits, &s.collection, &s.id, opts.top_k));
                 }
                 micros.sort_unstable();

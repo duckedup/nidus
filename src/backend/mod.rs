@@ -6,29 +6,47 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 
+// aws_creds/cloud/gcs/redis/s3 pull crates that do not compile for wasm32 (ureq,
+// tame-oauth, redis-rs, and url via aws_creds/s3), so they are gated out there. `object`
+// pulls none of them, so it stays unconditional and OPFS reuses its ObjectAppender.
+#[cfg(not(target_family = "wasm"))]
 mod aws_creds;
+#[cfg(not(target_family = "wasm"))]
 mod cloud;
+#[cfg(not(target_family = "wasm"))]
 mod gcs;
 mod local;
 mod object;
+// Wasm (where it is the browser backend) plus `cfg(test)`, so the pool logic stays
+// host-tested and Miri-clean. Not a native non-test build: the `opfs://` arm below is
+// wasm-only, so nothing could reach it and it would be dead code.
+#[cfg(any(target_family = "wasm", test))]
+mod opfs;
 mod ram;
+#[cfg(not(target_family = "wasm"))]
 mod redis;
+#[cfg(not(target_family = "wasm"))]
 mod s3;
 
 #[cfg(test)]
 mod tests;
 
+#[cfg(not(target_family = "wasm"))]
 pub use gcs::Gcs;
 pub use local::{FileAppender, LocalFs};
 pub use object::ObjectAppender;
 pub(crate) use object::{latch_fenced, locked_error, object_try_lock};
+#[cfg(any(target_family = "wasm", test))]
+pub use opfs::{OpfsFs, SyncHandle, grow_pool, register_pool};
 // Public: a cluster writer's lease handle is part of the API surface, so an async host
 // (`nidus serve`, or an embedding application) can keep the lease warm on a timer while a
 // long write holds the store lock — see `Nidus::lease_handle`.
 pub use object::{ClusterLease, LeaseLost, LeaseRenewer, is_lease_lost};
 pub use ram::LocalRam;
 pub(crate) use ram::MemAppender;
+#[cfg(not(target_family = "wasm"))]
 pub use redis::RedisTier;
+#[cfg(not(target_family = "wasm"))]
 pub use s3::S3;
 
 /// Where the durable bytes live: whole **named byte objects** in two classes —
@@ -229,10 +247,33 @@ pub(crate) fn validate_key(key: &str) -> Result<()> {
 /// Open a **persistence** backend from a URL/location string (SPEC §13.4):
 pub fn open_persistence(location: &str) -> Result<Box<dyn Persistence>> {
     if let Some(rest) = strip_scheme(location, "s3") {
+        #[cfg(not(target_family = "wasm"))]
         return Ok(Box::new(S3::from_url(rest)?));
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = rest;
+            bail!("s3:// persistence backend {location:?} is not available in wasm32 builds");
+        }
     }
     if let Some(rest) = strip_scheme(location, "gs").or_else(|| strip_scheme(location, "gcs")) {
+        #[cfg(not(target_family = "wasm"))]
         return Ok(Box::new(Gcs::from_url(rest)?));
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = rest;
+            bail!(
+                "gs:// / gcs:// persistence backend {location:?} is not available in wasm32 builds"
+            );
+        }
+    }
+    if let Some(rest) = strip_scheme(location, "opfs") {
+        #[cfg(target_family = "wasm")]
+        return opfs::open_registered(rest);
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let _ = rest;
+            bail!("opfs:// persistence backend {location:?} is only available in wasm32 builds");
+        }
     }
     // `file://<path>` or a bare path → local files.
     let path = strip_scheme(location, "file").unwrap_or(location);
@@ -247,7 +288,13 @@ pub fn open_memory_tier(location: &str) -> Result<Box<dyn MemoryTier>> {
     }
     for scheme in REDIS_SCHEMES {
         if strip_scheme(location, scheme).is_some() {
+            #[cfg(not(target_family = "wasm"))]
             return Ok(Box::new(RedisTier::from_url(location)?));
+            #[cfg(target_family = "wasm")]
+            bail!(
+                "redis-family memory tier {location:?} is not available in wasm32 builds \
+                 (the backend is absent, not degraded — this is not a silent local fallback)"
+            );
         }
     }
     bail!(

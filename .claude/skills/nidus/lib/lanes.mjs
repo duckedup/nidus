@@ -143,6 +143,13 @@ export const CI_JOBS = {
   'build-thesis': RUST,
   'sdk-integration': [...RUST, /^sdks\//],
   'e2e': [...RUST.slice(0, -1), /^scripts\/e2e-services\.sh$/, /^\.github\/workflows\/integration\.yml$/],
+  // wasm32 (nidus-y67). `justfile` counts because the recipes ARE the lane, and
+  // `bindings/` because the binding is the only consumer of the browser backend.
+  'wasm': [...RUST, /^justfile$/, /^bindings\//],
+  'wasm-e2e': [
+    ...RUST.slice(0, -1), /^justfile$/, /^bindings\//,
+    /^scripts\/e2e-wasm\.sh$/, /^\.github\/workflows\/integration\.yml$/,
+  ],
 }
 
 // Fail open twice over: an empty file list runs everything (a guard that saw

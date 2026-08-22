@@ -53,6 +53,14 @@ fn in_memory_dimension() {
 }
 
 #[test]
+fn effective_query_threads_matches_config_on_native() {
+    // The wasm branch clamps to 1; it cannot be exercised on this (native) host, so U5's
+    // wasm test suite asserts that half — see BLUEPRINT-nidus-y67.md.
+    let store = Store::in_memory_cfg(Config::new("/dev/null", 3).query_threads(4)).unwrap();
+    assert_eq!(store.effective_query_threads(), 4);
+}
+
+#[test]
 fn create_and_has_collection() {
     let mut store = Store::in_memory(3).unwrap();
     assert!(!store.has_collection("docs"));
