@@ -254,6 +254,15 @@ struct StoreArgs {
     /// where a mismatched embedder returns plausible-looking scores (nidus-8ki).
     #[arg(long, env = "NIDUS_STRICT_EMBEDDER_IDENTITY")]
     strict_embedder_identity: bool,
+    /// Open a read-only snapshot pinned to this past commit version (nidus-bnf) instead of
+    /// the current one. Requires `--history-versions` to have recorded it. Forces the store
+    /// read-only regardless of the subcommand, so a write against a pinned version fails.
+    #[arg(long, env = "NIDUS_AT_VERSION")]
+    at_version: Option<u64>,
+    /// Keep the last N commit points addressable via `--at-version` (default: off, no
+    /// history recorded). The flag is the only way a store starts recording.
+    #[arg(long, env = "NIDUS_HISTORY_VERSIONS")]
+    history_versions: Option<usize>,
 }
 
 impl StoreArgs {
@@ -304,6 +313,12 @@ impl StoreArgs {
                 .iter()
                 .any(|s| m.starts_with(&format!("{s}://")))
         })
+    }
+
+    /// Whether these args force a read-only open. `--at-version` joins `--read-only` here:
+    /// a pinned snapshot is a past state, so nothing may be written through it.
+    fn pins_read_only(&self) -> bool {
+        self.read_only || self.at_version.is_some()
     }
 
     /// Build the open [`Config`] from these args — the single place the store flags
@@ -357,6 +372,14 @@ impl StoreArgs {
         }
         cfg = cfg.lease_wait(self.lease_wait()?);
         cfg = cfg.max_staleness(self.max_staleness.map(std::time::Duration::from_secs));
+        if let Some(n) = self.history_versions {
+            cfg = cfg.history_versions(Some(n));
+        }
+        if let Some(v) = self.at_version {
+            // `pins_read_only` already routes every caller here with ReadOnly; forcing it
+            // again keeps a future caller from opening a pinned store writable.
+            cfg = cfg.at_version(Some(v)).open_mode(OpenMode::ReadOnly);
+        }
         Ok(cfg)
     }
 
@@ -1258,6 +1281,12 @@ enum Command {
         #[arg(long)]
         expired: bool,
     },
+    /// Report the commit-version landscape recorded for this store (nidus-bnf):
+    /// the current version, the oldest still-readable one, and any `--at-version` pin.
+    Versions {
+        #[command(flatten)]
+        store: StoreArgs,
+    },
     /// Record ann/quantization/query-threads/mmap flags as this store's open-time
     /// defaults (nidus-141), so later opens need not repeat them. An explicit flag on a
     /// later command still wins over the recorded default for that knob.
@@ -1944,9 +1973,15 @@ pub fn run(cli: Cli) -> Result<()> {
                 print_json(&serde_json::json!({ "ok": true }))
             }
         }
+        Command::Versions { store } => {
+            let db = open(&store, false)?;
+            print_json(&db.versions()?)
+        }
         Command::Configure { store, clear } => {
-            if store.read_only {
-                bail!("--read-only was set, but configure mutates the store");
+            if store.pins_read_only() {
+                bail!(
+                    "the store was opened read-only (--read-only/--at-version), but configure mutates it"
+                );
             }
             let cfg = store.config(OpenMode::ReadWrite)?;
             let mut db = Nidus::open(cfg.clone())?;
@@ -2261,8 +2296,10 @@ fn first_duplicate(decl: &[FtsField]) -> Option<&str> {
 /// Open the store. `mutating` commands take the writer lock; read commands open
 /// read-only so they never contend with a running `nidus serve` writer.
 fn open(store: &StoreArgs, mutating: bool) -> Result<Nidus> {
-    if mutating && store.read_only {
-        bail!("--read-only was set, but this command mutates the store");
+    if mutating && store.pins_read_only() {
+        bail!(
+            "the store was opened read-only (--read-only/--at-version), but this command mutates it"
+        );
     }
     let mode = if mutating {
         OpenMode::ReadWrite
@@ -2323,7 +2360,7 @@ fn serve(
             );
         }
     }
-    let mode = if store.read_only {
+    let mode = if store.pins_read_only() {
         OpenMode::ReadOnly
     } else {
         OpenMode::ReadWrite
@@ -2384,7 +2421,7 @@ fn serve(
 fn mcp(mut store: StoreArgs, #[cfg(feature = "memory")] ingest: IngestArgs) -> Result<()> {
     // Honour `--read-only` as `serve` does: a reader that never takes the writer lock is a
     // legitimate way to run this alongside a writer. `remember`/`forget` then fail honestly.
-    let mode = if store.read_only {
+    let mode = if store.pins_read_only() {
         OpenMode::ReadOnly
     } else {
         OpenMode::ReadWrite

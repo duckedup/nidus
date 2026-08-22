@@ -113,6 +113,14 @@ pub struct Config {
     /// (`nidus.embedder`) rather than warning about it — the un-pinned collection an
     /// external writer leaves behind cannot be checked for embedder agreement (nidus-8ki).
     pub strict_embedder_identity: bool,
+    /// Open a point-in-time snapshot at this commit version instead of the current one
+    /// (nidus-bnf); requires [`history_versions`](Self::history_versions) to have recorded
+    /// it and [`OpenMode::ReadOnly`]. `None` (the default) opens current, as always.
+    pub at_version: Option<u64>,
+    /// Keep the last N commit points addressable by [`at_version`](Self::at_version);
+    /// `None` (the default) records no history. Enabling it makes every durable batch a
+    /// commit point — seals alone are far too rare to pin to — so the write path pays for it.
+    pub history_versions: Option<usize>,
     /// Which of the profile-eligible knobs were set explicitly via a builder call, so
     /// [`Config::apply_profile`] knows an explicit setter must beat a recorded default.
     explicit: ExplicitFlags,
@@ -153,6 +161,8 @@ impl Config {
             memory: String::new(),
             cluster: false,
             strict_embedder_identity: false,
+            at_version: None,
+            history_versions: None,
             explicit: ExplicitFlags::default(),
         }
     }
@@ -282,6 +292,20 @@ impl Config {
         self
     }
 
+    /// Pin the open to a past commit version (`None` = current). See
+    /// [`at_version`](Self::at_version); requires [`OpenMode::ReadOnly`].
+    pub fn at_version(mut self, version: Option<u64>) -> Self {
+        self.at_version = version;
+        self
+    }
+
+    /// Record the last N commit points as addressable history (`None` disables). See
+    /// [`history_versions`](Self::history_versions).
+    pub fn history_versions(mut self, n: Option<usize>) -> Self {
+        self.history_versions = n;
+        self
+    }
+
     /// Resolve recorded [`OpenProfile`] defaults against this config: an explicit builder call
     /// always wins, otherwise a recorded value fills in, otherwise the built-in default (already
     /// in place) stands. Applied per knob independently.
@@ -340,6 +364,15 @@ impl Config {
                  (segment_max_rows + segment_index_min_rows): once a segment is IVF-indexed, \
                  search fans out per-segment and never uses the quantized matrix, so \
                  quantization would cost memory and CPU with no effect — enable one or the other"
+            );
+        }
+        if self.at_version.is_some() && self.open_mode == OpenMode::ReadWrite {
+            bail!("a pinned read (at_version) is read-only: open with OpenMode::ReadOnly");
+        }
+        if self.history_versions == Some(0) {
+            bail!(
+                "Config::history_versions(Some(0)) has no spelling distinct from disabled — \
+                 use None to turn history off"
             );
         }
         // Also enforced when the quantized matrix is built, but a recorded profile resolves at
@@ -472,6 +505,24 @@ mod tests {
             .to_string();
         assert!(err.contains("quantization"), "{err}");
         assert!(err.contains("per-segment indexing"), "{err}");
+    }
+
+    #[test]
+    fn at_version_requires_read_only() {
+        let bad = Config::new("/tmp/s", 8).at_version(Some(3));
+        assert!(bad.validate().is_err());
+        let ok = Config::new("/tmp/s", 8)
+            .at_version(Some(3))
+            .open_mode(OpenMode::ReadOnly);
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn history_versions_zero_is_rejected() {
+        let bad = Config::new("/tmp/s", 8).history_versions(Some(0));
+        assert!(bad.validate().is_err());
+        let ok = Config::new("/tmp/s", 8).history_versions(Some(2));
+        assert!(ok.validate().is_ok());
     }
 
     #[test]

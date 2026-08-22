@@ -207,6 +207,14 @@ export interface ClusterStatus {
   max_staleness_secs: number | null;
 }
 
+/** The readable commit points and this instance's pin (SPEC §14.2). */
+export interface StoreVersions {
+  commit_version: number;
+  oldest_readable: number | null;
+  pinned: number | null;
+  readable: number[];
+}
+
 /**
  * Which attrs the returned hits carry. Omit both for every attr (the default).
  * Sending both is a `400` — the server refuses rather than picking one.

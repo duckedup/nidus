@@ -18,8 +18,8 @@ use crate::data::Segments;
 use crate::findex::Findex;
 use crate::fts::{Fts, FtsField};
 use crate::log::OpLog;
-use crate::manifest::{MANIFEST_KEY, Manifest};
-use crate::model::{AnnConfig, ClusterStatus, Distance, Op, Role};
+use crate::manifest::{MANIFEST_KEY, Manifest, history};
+use crate::model::{AnnConfig, ClusterStatus, Distance, Op, Role, StoreVersions};
 use crate::profile::OpenProfile;
 
 pub(crate) mod aggregate;
@@ -247,6 +247,13 @@ pub struct Store {
     /// commit-counter bump in cluster mode). Set by any mutation that did not sync itself and
     /// cleared by the covering barrier, which is what lets `commit` no-op when nothing is owed.
     pending_barrier: bool,
+    /// The commit version this handle is pinned to (nidus-bnf, `Config::at_version`); `None`
+    /// for the ordinary current-version open. `refresh()` refuses to cross a pin.
+    pinned: Option<u64>,
+    /// The highest history version already pruned (nidus-bnf), initialised at open from the
+    /// on-disk floor. Advanced unconditionally as write.rs prunes, so a failing delete can
+    /// never freeze it.
+    pruned_through: u64,
 }
 
 impl Store {
@@ -337,12 +344,25 @@ impl Store {
             (None, None)
         };
 
-        // 4. Read the manifest naming the live segments (SPEC §14.2). Absent → a fresh store or
-        //    a legacy `data`+`log` one; both synthesize a single-segment manifest over the base
-        //    `data` object, persisted below (ReadWrite only).
-        let on_disk = Manifest::load(persistence.as_ref())?;
-        let manifest = match &on_disk {
-            Some(m) => {
+        // 4. Read the manifest naming the live segments (SPEC §14.2), or resolve a pinned
+        //    historical commit point instead (nidus-bnf, `Config::at_version`). Absent and
+        //    unpinned → a fresh/legacy store, synthesized and persisted below (ReadWrite only).
+        let pinned_entry = match config.at_version {
+            Some(v) => Some(Self::resolve_pinned_entry(
+                persistence.as_ref(),
+                &config,
+                v,
+            )?),
+            None => None,
+        };
+        let on_disk = if pinned_entry.is_some() {
+            None
+        } else {
+            Manifest::load(persistence.as_ref())?
+        };
+        let manifest = match (&pinned_entry, &on_disk) {
+            (Some(entry), _) => entry.manifest(),
+            (None, Some(m)) => {
                 if m.dimension as usize != config.dimension {
                     bail!(
                         "store dimension mismatch: manifest has {}, requested {}",
@@ -359,7 +379,7 @@ impl Store {
                 }
                 m.clone()
             }
-            None => Manifest::fresh(config.dimension, config.distance),
+            (None, None) => Manifest::fresh(config.dimension, config.distance),
         };
 
         // nidus-141: merge the recorded profile now that the manifest is resolved, before
@@ -384,9 +404,25 @@ impl Store {
             cas,
         )?;
 
+        // A pinned snapshot's segments may have grown past its recorded row count (the active
+        // segment kept taking later writes) — fine, §6.2 bounds replay below. Fewer rows than
+        // recorded means the base was rewritten by a compaction: refuse rather than serve it.
+        if let Some(entry) = &pinned_entry
+            && data.row_count() < entry.row_count
+        {
+            bail!(
+                "version {} is no longer readable (its segments were reclaimed by a \
+                 compaction, or it was pruned): the live segment set now holds {} rows, \
+                 fewer than the {} this snapshot expects",
+                entry.version,
+                data.row_count(),
+                entry.row_count
+            );
+        }
+
         // No manifest on disk → write one now, initializing a fresh store and migrating a legacy
-        // one in the same step. ReadOnly never writes; it reads the synthesized manifest in RAM.
-        if on_disk.is_none() && config.open_mode == OpenMode::ReadWrite {
+        // one in the same step. ReadOnly never writes (a pinned open is always ReadOnly too).
+        if on_disk.is_none() && pinned_entry.is_none() && config.open_mode == OpenMode::ReadWrite {
             data.manifest(manifest.profile.clone())
                 .store(persistence.as_ref())?;
         }
@@ -400,24 +436,41 @@ impl Store {
             None
         };
 
-        // 6. Open the op log through the backend's appender (replaying torn tails). The
-        //    decoded `ops` are the fallback source for building the in-RAM index.
-        let log_ap = appender_for(&persistence, "log", cas)?;
-        let (log, ops) = OpLog::open_with(log_ap)?;
-
-        let row_count = data.row_count();
-
-        // 6. Build the in-RAM index. Prefer the shared memory tier's serialized working
-        //    set when it is exactly current (skipping the replay) — SPEC §13.3; otherwise
-        //    replay the log ops, then publish the fresh working set so peers can adopt it.
-        let watermark = log.offset()?;
-        let key = memtier::working_set_key(&config);
-        let adopted = memtier::try_adopt(memory.as_deref(), &key, row_count, watermark)?;
-        let from_tier = adopted.is_some();
-        let (collections, dead_rows, fts, findex) = match adopted {
-            Some(index) => index.into_parts(),
-            None => Self::replay_ops(ops, row_count),
+        // 6. Open the op log through the backend's appender: bounded to the pinned commit's
+        //    exact log length when pinned (§6.2's row bound alone would still replay a later
+        //    `Delete`/`UpsertText`, which carries no row), else replaying torn tails as usual.
+        let (log, ops, row_count, watermark) = if let Some(entry) = &pinned_entry {
+            let log_ap = appender_for(&persistence, "log", false)?;
+            let (log, ops) = OpLog::open_bounded(log_ap, entry.log_offset)?;
+            (log, ops, entry.row_count, entry.log_offset)
+        } else {
+            let log_ap = appender_for(&persistence, "log", cas)?;
+            let (log, ops) = OpLog::open_with(log_ap)?;
+            let row_count = data.row_count();
+            let watermark = log.offset()?;
+            (log, ops, row_count, watermark)
         };
+
+        // Build the in-RAM index. A pinned open never consults the memory tier (keyed on
+        // `(row_count, watermark)`, which could collide with a different segment generation)
+        // nor publishes one; otherwise prefer the tier's exact-current snapshot (§13.3).
+        let (collections, dead_rows, fts, findex, from_tier) = if pinned_entry.is_some() {
+            let (c, d, f, x) = Self::replay_ops(ops, row_count);
+            (c, d, f, x, false)
+        } else {
+            let key = memtier::working_set_key(&config);
+            let adopted = memtier::try_adopt(memory.as_deref(), &key, row_count, watermark)?;
+            let from_tier = adopted.is_some();
+            let (c, d, f, x) = match adopted {
+                Some(index) => index.into_parts(),
+                None => Self::replay_ops(ops, row_count),
+            };
+            (c, d, f, x, from_tier)
+        };
+
+        let pruned_through = history::load_floor(persistence.as_ref())?
+            .map(|f| f.oldest_readable.saturating_sub(1))
+            .unwrap_or(0);
 
         let quant = match config.quantization {
             Some(q) => Some(Quant::empty(q.kind, data.dimension(), config.distance)?),
@@ -426,6 +479,7 @@ impl Store {
         let ann = config
             .ann
             .map(|a| Ann::empty(a, data.dimension(), config.distance));
+        let pinned = config.at_version;
 
         let mut store = Store {
             config,
@@ -457,10 +511,13 @@ impl Store {
             last_verified: Arc::new(std::sync::atomic::AtomicU64::new(mono_millis())),
             defer_barrier: false,
             pending_barrier: false,
+            pinned,
+            pruned_through,
         };
 
         // Whether the in-RAM index now differs from any tier snapshot — true if we built
         // it from the log, or if a compaction below rewrote `data`/`log` (new watermark).
+        // Meaningless for a pinned open, which never touches the tier either way.
         let mut tier_stale = !from_tier;
 
         // 6. Auto-compact if the dead-row ratio exceeds the threshold. Writers only:
@@ -505,12 +562,76 @@ impl Store {
 
         // 11. Warm the shared memory tier: if the index came from the log, or a compaction above
         //     rewrote the store, publish the working set so peers adopt it instead of replaying.
-        //     Best-effort — the tier is a rebuildable cache.
-        if tier_stale {
+        //     Best-effort — the tier is a rebuildable cache. Never for a pinned open (nidus-bnf).
+        if tier_stale && store.pinned.is_none() {
             store.publish_working_set();
         }
 
         Ok(store)
+    }
+
+    /// Resolve a pinned `Config::at_version` against recorded history (nidus-bnf): the
+    /// ceiling, floor, and entry checks before any segment or log object is touched. Never
+    /// falls through to a substitute — a missing/pruned version is a hard, named error.
+    fn resolve_pinned_entry(
+        persistence: &dyn Persistence,
+        config: &Config,
+        version: u64,
+    ) -> Result<history::HistoryEntry> {
+        let current = Manifest::load(persistence)?.map(|m| m.version).unwrap_or(0);
+        if version > current {
+            bail!(
+                "version {version} does not exist yet: the store's current commit version is \
+                 {current}"
+            );
+        }
+        let floor = history::load_floor(persistence)?;
+        let entry = history::load_entry(persistence, version)?;
+        let readable = match (&entry, &floor) {
+            (Some(_), Some(f)) => version >= f.oldest_readable,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        let entry = match entry {
+            Some(e) if readable => e,
+            _ => match floor {
+                Some(f) => bail!(
+                    "version {version} is no longer readable (its segments were reclaimed by \
+                     a compaction, or it was pruned): the oldest readable version is {}, \
+                     current is {current}",
+                    f.oldest_readable
+                ),
+                // No floor and no entry: either nothing was ever recorded, or history is on
+                // and this version simply predates the first entry. Name the oldest that
+                // exists rather than blaming a knob that may well be set.
+                None => match history::list_versions(persistence)?.first().copied() {
+                    Some(oldest) => bail!(
+                        "version {version} is not readable: the oldest recorded version is \
+                         {oldest}, current is {current}"
+                    ),
+                    None => bail!(
+                        "version {version} is not readable: this store records no history \
+                         (Config::history_versions is off); only the current version \
+                         {current} is readable"
+                    ),
+                },
+            },
+        };
+        if entry.dimension as usize != config.dimension {
+            bail!(
+                "store dimension mismatch: manifest has {}, requested {}",
+                entry.dimension,
+                config.dimension
+            );
+        }
+        if entry.distance != config.distance {
+            bail!(
+                "store distance metric mismatch: manifest has {:?}, requested {:?}",
+                entry.distance,
+                config.distance
+            );
+        }
+        Ok(entry)
     }
 
     /// An in-memory store (no files, no lock). For tests.
@@ -567,6 +688,8 @@ impl Store {
             last_verified: Arc::new(std::sync::atomic::AtomicU64::new(mono_millis())),
             defer_barrier: false,
             pending_barrier: false,
+            pinned: None,
+            pruned_through: 0,
             config,
         };
         // Align `seg_indexes` to the (single, empty) segment so a later seal can update it
@@ -576,13 +699,20 @@ impl Store {
     }
 
     /// Adopt a writer's newer committed state into this lock-free reader without a full reopen
-    /// (SPEC §14.6 phase 4). `Ok(false)` when already current or unable to refresh. Atomic against
-    /// compaction: built into locals first, so a failure leaves the prior snapshot intact.
+    /// (SPEC §14.6 phase 4), atomically (a failure leaves the prior snapshot intact). `Ok(false)`
+    /// when current, unable to refresh, or pinned ([`refresh_to`](Self::refresh_to) moves a pin).
     pub fn refresh(&mut self) -> Result<bool> {
         // Only a lock-free ReadOnly reader over a durable backend tracks a separate writer.
         // A writer holds the only mutating handle (the §6.3 lock excludes other writers), so
         // its in-RAM state already is the truth; an in-memory store has no backend at all.
         if self.in_memory || self.config.open_mode != OpenMode::ReadOnly {
+            return Ok(false);
+        }
+        if self.pinned.is_some() {
+            // A pin is deliberately not current, so it can never go stale by not advancing.
+            // Without this the staleness clock never resets and readiness eventually fails.
+            self.last_verified
+                .store(mono_millis(), std::sync::atomic::Ordering::Release);
             return Ok(false);
         }
         let Some(persistence) = self.persistence.clone() else {
@@ -728,6 +858,134 @@ impl Store {
         self.last_verified
             .store(mono_millis(), std::sync::atomic::Ordering::Release);
         Ok(true)
+    }
+
+    /// The commit version this handle is pinned to (`Config::at_version`), if any.
+    pub fn pinned(&self) -> Option<u64> {
+        self.pinned
+    }
+
+    /// Move a `ReadOnly` handle to a specific commit version, historical or current —
+    /// [`refresh`](Self::refresh)'s explicit counterpart, which never crosses a pin. Always
+    /// the full re-open shape; callable on a pinned or an ordinary reader alike.
+    pub fn refresh_to(&mut self, version: u64) -> Result<()> {
+        if self.in_memory || self.config.open_mode != OpenMode::ReadOnly {
+            bail!("refresh_to requires a durable ReadOnly store");
+        }
+        let Some(persistence) = self.persistence.clone() else {
+            bail!("refresh_to requires a durable backend");
+        };
+        let entry = Self::resolve_pinned_entry(persistence.as_ref(), &self.config, version)?;
+        let manifest = entry.manifest();
+
+        let data = Segments::open(
+            persistence.clone(),
+            &manifest,
+            self.config.max_vector_bytes,
+            self.config.mmap,
+            false,
+        )?;
+        if data.row_count() < entry.row_count {
+            bail!(
+                "version {} is no longer readable (its segments were reclaimed by a \
+                 compaction, or it was pruned): the live segment set now holds {} rows, \
+                 fewer than the {} this snapshot expects",
+                entry.version,
+                data.row_count(),
+                entry.row_count
+            );
+        }
+        let (log, ops) =
+            OpLog::open_bounded(appender_for(&persistence, "log", false)?, entry.log_offset)?;
+        let (collections, dead_rows, fts, findex) = Self::replay_ops(ops, entry.row_count);
+
+        // Every fallible load has succeeded — swap the new snapshot in atomically.
+        self.data = data;
+        self.log = log;
+        self.collections = collections;
+        self.dead_rows = dead_rows;
+        self.fts = fts;
+        self.findex = findex;
+        self.loaded_log_offset = entry.log_offset;
+        self.row_to_doc = Vec::new();
+        self.invalidate_scan_order();
+        self.pinned = Some(version);
+
+        // nidus-141: apply the profile *as recorded at that commit*, matching `open_at`.
+        self.open_profile = entry.profile.clone();
+        let mut merged = self.baseline_config.clone();
+        merged.apply_profile(&entry.profile);
+        let requant = if self.config.quantization == merged.quantization {
+            None
+        } else {
+            Some(match merged.quantization {
+                Some(q) => Some(Quant::empty(
+                    q.kind,
+                    self.data.dimension(),
+                    self.config.distance,
+                )?),
+                None => None,
+            })
+        };
+        self.config.query_threads = merged.query_threads;
+        if let Some(q) = requant {
+            self.config.quantization = merged.quantization;
+            self.quant = q;
+        }
+        if self.config.ann != merged.ann {
+            self.config.ann = merged.ann;
+            self.ann = self
+                .config
+                .ann
+                .map(|a| Ann::empty(a, self.data.dimension(), self.config.distance));
+        }
+
+        self.rebuild_quant();
+        self.load_or_build_ann()?;
+        self.build_segment_indexes();
+        self.load_or_build_fts()?;
+        self.load_or_build_findex()?;
+
+        self.last_verified
+            .store(mono_millis(), std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// The commit-version landscape of this store's recorded history (nidus-bnf): the
+    /// current version, the oldest still-readable one, this handle's pin, and every
+    /// recorded version in between. One `list()` call — not for a hot path.
+    pub fn versions(&self) -> Result<StoreVersions> {
+        let pinned = self.pinned;
+        let Some(persistence) = self.persistence.as_deref() else {
+            let commit_version = self.data.version();
+            return Ok(StoreVersions {
+                commit_version,
+                oldest_readable: None,
+                pinned,
+                readable: Vec::new(),
+            });
+        };
+        // The live head, re-read: `self.data.version()` is the *pinned* version on a pinned
+        // handle, which would report the pin twice and hide how far behind it is.
+        let commit_version = match Manifest::load(persistence)? {
+            Some(m) => m.version,
+            None => self.data.version(),
+        };
+        let floor = history::load_floor(persistence)?;
+        let mut readable = history::list_versions(persistence)?;
+        let oldest_readable = match &floor {
+            Some(f) => {
+                readable.retain(|&v| v >= f.oldest_readable);
+                Some(f.oldest_readable)
+            }
+            None => readable.first().copied(),
+        };
+        Ok(StoreVersions {
+            commit_version,
+            oldest_readable,
+            pinned,
+            readable,
+        })
     }
 
     // ── Backend wiring helpers ───────────────────────────────────────────────────

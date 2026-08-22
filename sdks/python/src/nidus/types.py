@@ -235,6 +235,16 @@ class ClusterStatus:
 
 
 @dataclass(frozen=True)
+class StoreVersions:
+    """Readable commit points and this instance's pin, mirroring the ``/versions`` response."""
+
+    commit_version: int
+    oldest_readable: Optional[int]
+    pinned: Optional[int]
+    readable: list[int]
+
+
+@dataclass(frozen=True)
 class RememberResult:
     """What a :meth:`~nidus.NidusClient.remember` actually wrote.
 

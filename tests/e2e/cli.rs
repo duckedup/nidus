@@ -972,6 +972,177 @@ fn compact_expired_reclaims_only_past_entries() {
     assert_eq!(stats["footprint"]["dead_rows"], 0, "swept: {stats}");
 }
 
+// ── `--at-version` / `--history-versions` / `nidus versions` (nidus-bnf) ───
+
+/// `--at-version` serves the older snapshot: it sees what existed at the pinned commit
+/// and nothing committed after, even a since-deleted record that was still live then.
+#[test]
+fn at_version_serves_older_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+
+    ok(
+        &[
+            "create",
+            "--dir",
+            dir,
+            "--dim",
+            "3",
+            "--history-versions",
+            "5",
+            "docs",
+        ],
+        "",
+    );
+    let ab = json!([
+        {"id": "a", "vector": [1, 0, 0], "attrs": {}},
+        {"id": "b", "vector": [0, 1, 0], "attrs": {}}
+    ])
+    .to_string();
+    ok(
+        &["upsert", "--dir", dir, "--history-versions", "5", "docs"],
+        &ab,
+    );
+
+    let v = ok(&["versions", "--dir", dir], "")["commit_version"]
+        .as_u64()
+        .expect("commit_version");
+
+    let c = json!([{"id": "c", "vector": [0, 0, 1], "attrs": {}}]).to_string();
+    ok(
+        &["upsert", "--dir", dir, "--history-versions", "5", "docs"],
+        &c,
+    );
+    ok(&["delete", "--dir", dir, "docs", "a"], "");
+
+    let hits = ok(
+        &[
+            "search",
+            "--dir",
+            dir,
+            "--at-version",
+            &v.to_string(),
+            "docs",
+        ],
+        "[1, 1, 1]",
+    );
+    let mut got = ids(&hits);
+    got.sort_unstable();
+    assert_eq!(got, ["a", "b"], "{hits}");
+}
+
+/// A write subcommand against `--at-version` fails at the mutation itself, naming
+/// read-only — never a silent downgrade to a read.
+#[test]
+fn at_version_on_write_subcommand_fails_read_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    let v = ok(&["versions", "--dir", dir], "")["commit_version"]
+        .as_u64()
+        .expect("commit_version");
+
+    let record = json!([{"id": "a", "vector": [1, 0, 0], "attrs": {}}]).to_string();
+    let err = fails(
+        &[
+            "upsert",
+            "--dir",
+            dir,
+            "--at-version",
+            &v.to_string(),
+            "docs",
+        ],
+        &record,
+    );
+    assert!(
+        err.to_lowercase().contains("read-only"),
+        "expected a read-only message: {err}"
+    );
+}
+
+/// `nidus versions` reports the current commit version, and `null` for `pinned` on an
+/// unpinned handle, and the pin itself once `--at-version` names a recorded one.
+#[test]
+fn versions_reports_commit_version_and_pinned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+
+    ok(
+        &[
+            "create",
+            "--dir",
+            dir,
+            "--dim",
+            "3",
+            "--history-versions",
+            "5",
+            "docs",
+        ],
+        "",
+    );
+    let out = ok(&["versions", "--dir", dir], "");
+    let v = out["commit_version"].as_u64().expect("commit_version");
+    assert!(out["pinned"].is_null(), "{out}");
+
+    let pinned = ok(
+        &["versions", "--dir", dir, "--at-version", &v.to_string()],
+        "",
+    );
+    assert_eq!(pinned["pinned"], v, "{pinned}");
+}
+
+/// Asking for a version whose segments a compaction already reclaimed fails loudly,
+/// naming the oldest version still readable — not just a bare non-zero exit.
+#[test]
+fn at_version_after_compaction_names_oldest_readable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+
+    ok(
+        &[
+            "create",
+            "--dir",
+            dir,
+            "--dim",
+            "3",
+            "--history-versions",
+            "5",
+            "docs",
+        ],
+        "",
+    );
+    let record = json!([{"id": "a", "vector": [1, 0, 0], "attrs": {}}]).to_string();
+    ok(
+        &["upsert", "--dir", dir, "--history-versions", "5", "docs"],
+        &record,
+    );
+    let v = ok(&["versions", "--dir", dir], "")["commit_version"]
+        .as_u64()
+        .expect("commit_version");
+
+    ok(&["compact", "--dir", dir], "");
+    let oldest = ok(&["versions", "--dir", dir], "")["oldest_readable"]
+        .as_u64()
+        .expect("oldest_readable after a compaction that reclaimed history");
+
+    let err = fails(
+        &[
+            "search",
+            "--dir",
+            dir,
+            "--at-version",
+            &v.to_string(),
+            "docs",
+        ],
+        "[1, 0, 0]",
+    );
+    assert!(
+        err.contains(&format!("oldest readable version is {oldest}")),
+        "expected the oldest readable version named: {err}"
+    );
+}
+
 // ── `nidus text-search --rerank` (nidus-d42) ────────────────────────────────
 
 /// `--rerank` reorders `text-search`'s BM25 ranking through the real `--rerank-provider`

@@ -854,6 +854,8 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         manifest_cas: None,
         defer_barrier: false,
         pending_barrier: false,
+        pinned: None,
+        pruned_through: 0,
     };
     store.create_collection("col").unwrap();
     store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
@@ -4922,6 +4924,378 @@ fn refresh_composes_with_a_memory_mapped_reader() {
     for q in random_unit_vectors(15, dim, 13) {
         assert_eq!(ranking(&r, &q, 10), ranking(&fresh, &q, 10), "query {q:?}");
     }
+}
+
+// ── Pinned point-in-time opens (nidus-bnf, SPEC §14.2 history) ──────────────
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn pinned_open_survives_a_later_commit_but_not_its_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let mut w = Store::open(
+        Config::new(&path, 2)
+            .auto_compact(None)
+            .segment_max_rows(Some(2))
+            .history_versions(Some(10)),
+    )
+    .unwrap();
+    w.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+    w.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
+    // Every durable batch is a commit point once history is on, so this is a real pin.
+    let v = w.data.version();
+
+    w.upsert("col", &[rec("c", vec![1.0, 1.0])]).unwrap();
+    w.delete("col", &["a"]).unwrap();
+    w.flush().unwrap();
+
+    let pinned = Store::open(
+        Config::new(&path, 2)
+            .open_mode(OpenMode::ReadOnly)
+            .auto_compact(None)
+            .at_version(Some(v)),
+    )
+    .unwrap();
+    let ids: std::collections::BTreeSet<String> =
+        pinned.get_all("col").into_iter().map(|r| r.id).collect();
+    // A row-count-only bound would still replay the later `Delete`, dropping "a" — the log
+    // offset is what keeps it. A row-count-only bound would also let "c" leak in.
+    assert_eq!(
+        ids,
+        ["a", "b"].into_iter().map(String::from).collect(),
+        "sees a,b as of the pin; not c; still a despite the later delete"
+    );
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn pinned_open_across_a_compaction_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let mut w = Store::open(
+        Config::new(&path, 2)
+            .auto_compact(None)
+            .segment_max_rows(Some(2))
+            .history_versions(Some(10)),
+    )
+    .unwrap();
+    w.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+    w.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
+    w.upsert("col", &[rec("c", vec![1.0, 1.0])]).unwrap();
+    let v = w.data.version();
+
+    w.delete("col", &["a"]).unwrap();
+    w.compact().unwrap();
+
+    let err = Store::open(
+        Config::new(&path, 2)
+            .open_mode(OpenMode::ReadOnly)
+            .auto_compact(None)
+            .at_version(Some(v)),
+    )
+    .map(|_| ())
+    .unwrap_err()
+    .to_string();
+    let oldest = w.versions().unwrap().oldest_readable.unwrap();
+    assert!(err.contains(&v.to_string()), "{err}");
+    assert!(err.contains(&oldest.to_string()), "{err}");
+}
+
+/// The floor is the fence, not the delete. `compact` reclaims stale history entries
+/// best-effort (it swallows delete failures), so a survivor must still be refused — it
+/// describes segments the in-place base rewrite renumbered, and would serve wrong bytes.
+#[cfg_attr(miri, ignore)] // fsyncs: Miri has no sync_all
+#[test]
+fn a_history_entry_that_outlives_a_compaction_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let mut w = Store::open(
+        Config::new(&path, 2)
+            .auto_compact(None)
+            .segment_max_rows(Some(2))
+            .history_versions(Some(10)),
+    )
+    .unwrap();
+    w.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+    w.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
+    let v = w.data.version();
+
+    let p = crate::open_persistence(path.to_str().unwrap()).unwrap();
+    let stale = crate::manifest::history::load_entry(p.as_ref(), v)
+        .unwrap()
+        .expect("the pinned version was recorded");
+
+    w.delete("col", &["a"]).unwrap();
+    w.compact().unwrap();
+    // Put the entry back: exactly the state a failed delete leaves behind.
+    crate::manifest::history::store_entry(p.as_ref(), &stale).unwrap();
+
+    let err = Store::open(
+        Config::new(&path, 2)
+            .open_mode(OpenMode::ReadOnly)
+            .auto_compact(None)
+            .at_version(Some(v)),
+    )
+    .map(|_| ())
+    .unwrap_err()
+    .to_string();
+    let oldest = w.versions().unwrap().oldest_readable.unwrap();
+    assert!(err.contains(&oldest.to_string()), "{err}");
+}
+
+/// A pin held *across* a live writer's compaction. The reader keeps serving the snapshot it
+/// already has (it never re-reads the rewritten base), `refresh` still refuses to move it,
+/// and only a fresh open at that version is refused — the floor cannot un-open a handle.
+#[cfg_attr(miri, ignore)] // fsyncs: Miri has no sync_all
+#[test]
+fn a_pin_held_across_a_compaction_keeps_serving_and_never_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let mut w = Store::open(
+        Config::new(&path, 2)
+            .auto_compact(None)
+            .segment_max_rows(Some(2))
+            .history_versions(Some(10)),
+    )
+    .unwrap();
+    w.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+    w.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
+    let v = w.data.version();
+
+    let mut r = Store::open(
+        Config::new(&path, 2)
+            .open_mode(OpenMode::ReadOnly)
+            .auto_compact(None)
+            .at_version(Some(v)),
+    )
+    .unwrap();
+    let before: std::collections::BTreeSet<String> =
+        r.get_all("col").into_iter().map(|rec| rec.id).collect();
+    assert_eq!(before, ["a", "b"].into_iter().map(String::from).collect());
+
+    w.delete("col", &["a"]).unwrap();
+    w.compact().unwrap();
+
+    assert!(!r.refresh().unwrap(), "refresh must never cross a pin");
+    let after: std::collections::BTreeSet<String> =
+        r.get_all("col").into_iter().map(|rec| rec.id).collect();
+    assert_eq!(after, before, "the held pin still serves its own snapshot");
+
+    // But the version is gone for anyone opening now, and `refresh_to` back to it says so.
+    let err = r.refresh_to(v).map(|_| ()).unwrap_err().to_string();
+    let oldest = w.versions().unwrap().oldest_readable.unwrap();
+    assert!(err.contains(&oldest.to_string()), "{err}");
+    let survived: std::collections::BTreeSet<String> =
+        r.get_all("col").into_iter().map(|rec| rec.id).collect();
+    assert_eq!(
+        survived, before,
+        "a refused refresh_to left the snapshot serving"
+    );
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn refresh_never_crosses_a_pin_but_refresh_to_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let mut w = Store::open(
+        Config::new(&path, 2)
+            .auto_compact(None)
+            .segment_max_rows(Some(2))
+            .history_versions(Some(10)),
+    )
+    .unwrap();
+    w.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+    w.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
+    w.upsert("col", &[rec("c", vec![1.0, 1.0])]).unwrap(); // seals, records v1
+    let v1 = w.data.version();
+
+    let mut r = Store::open(
+        Config::new(&path, 2)
+            .open_mode(OpenMode::ReadOnly)
+            .auto_compact(None)
+            .at_version(Some(v1)),
+    )
+    .unwrap();
+    let before: std::collections::BTreeSet<String> =
+        r.get_all("col").into_iter().map(|rec| rec.id).collect();
+
+    w.upsert("col", &[rec("d", vec![0.0, 0.0])]).unwrap();
+    w.upsert("col", &[rec("e", vec![1.0, 0.0])]).unwrap(); // seals again, records v2
+    w.flush().unwrap();
+    let v2 = w.data.version();
+    assert!(v2 > v1, "the second seal must have advanced the version");
+
+    assert!(!r.refresh().unwrap(), "refresh must never cross a pin");
+    let still_pinned: std::collections::BTreeSet<String> =
+        r.get_all("col").into_iter().map(|rec| rec.id).collect();
+    assert_eq!(
+        still_pinned, before,
+        "refresh left the pinned snapshot alone"
+    );
+
+    // The pin is behind the live head, and `versions()` must say so rather than reporting
+    // the pin twice (`self.data.version()` is the pinned version on a pinned handle).
+    let vs = r.versions().unwrap();
+    assert_eq!(vs.pinned, Some(v1));
+    assert_eq!(
+        vs.commit_version, v2,
+        "commit_version is the live head, not the pin"
+    );
+
+    r.refresh_to(v2).unwrap();
+    assert_eq!(r.pinned(), Some(v2));
+    let moved: std::collections::BTreeSet<String> =
+        r.get_all("col").into_iter().map(|rec| rec.id).collect();
+    assert_ne!(moved, before, "refresh_to actually moved the snapshot");
+
+    let fresh_pin = Store::open(
+        Config::new(&path, 2)
+            .open_mode(OpenMode::ReadOnly)
+            .auto_compact(None)
+            .at_version(Some(v2)),
+    )
+    .unwrap();
+    let expected: std::collections::BTreeSet<String> = fresh_pin
+        .get_all("col")
+        .into_iter()
+        .map(|rec| rec.id)
+        .collect();
+    assert_eq!(moved, expected, "matches a fresh open at the same version");
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn pinned_handle_rejects_every_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let mut w = Store::open(
+        Config::new(&path, 2)
+            .auto_compact(None)
+            .segment_max_rows(Some(2))
+            .history_versions(Some(10)),
+    )
+    .unwrap();
+    w.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+    w.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap();
+    w.upsert("col", &[rec("c", vec![1.0, 1.0])]).unwrap();
+    let v = w.data.version();
+    w.flush().unwrap();
+
+    let mut pinned = Store::open(
+        Config::new(&path, 2)
+            .open_mode(OpenMode::ReadOnly)
+            .auto_compact(None)
+            .at_version(Some(v)),
+    )
+    .unwrap();
+    assert!(pinned.upsert("col", &[rec("z", vec![0.0, 0.0])]).is_err());
+    assert!(pinned.delete("col", &["a"]).is_err());
+    assert!(pinned.compact().is_err());
+    assert!(pinned.flush().is_err());
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn open_at_with_history_off_names_the_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let mut w = Store::open(Config::new(&path, 2).auto_compact(None)).unwrap();
+        w.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+    }
+
+    let err = Store::open(
+        Config::new(&path, 2)
+            .open_mode(OpenMode::ReadOnly)
+            .at_version(Some(1)),
+    )
+    .map(|_| ())
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("no history"), "{err}");
+    assert!(err.contains("history_versions"), "{err}");
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn pruning_moves_the_floor_and_versions_reports_the_survivors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let mut w = Store::open(
+        Config::new(&path, 2)
+            .auto_compact(None)
+            .segment_max_rows(Some(1))
+            .history_versions(Some(2)),
+    )
+    .unwrap();
+    for (i, id) in ["a", "b", "c", "d", "e"].into_iter().enumerate() {
+        w.upsert("col", &[rec(id, vec![i as f32, 0.0])]).unwrap();
+    }
+    w.flush().unwrap();
+
+    let vs = w.versions().unwrap();
+    assert_eq!(vs.commit_version, w.data.version());
+    assert_eq!(vs.pinned, None);
+    let oldest = vs.oldest_readable.expect("some history was recorded");
+    assert!(oldest > 1, "the earliest seals must have been pruned");
+    assert_eq!(
+        vs.readable,
+        (oldest..=vs.commit_version).collect::<Vec<_>>(),
+        "no gaps in the surviving window"
+    );
+
+    let err = Store::open(
+        Config::new(&path, 2)
+            .open_mode(OpenMode::ReadOnly)
+            .at_version(Some(oldest - 1)),
+    )
+    .map(|_| ())
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains(&oldest.to_string()), "{err}");
+}
+
+#[cfg_attr(miri, ignore)]
+#[test]
+fn versions_reports_the_landscape_without_pruning() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let mut w = Store::open(
+        Config::new(&path, 2)
+            .auto_compact(None)
+            .segment_max_rows(Some(1))
+            .history_versions(Some(10)),
+    )
+    .unwrap();
+    w.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
+    w.upsert("col", &[rec("b", vec![0.0, 1.0])]).unwrap(); // seals, records the only entry
+    w.flush().unwrap();
+    let v = w.data.version();
+
+    // Version 1 has no entry: it is the manifest a fresh store opens at, published before
+    // any batch. History begins at the first commit point, which is the first durable batch.
+    let vs = w.versions().unwrap();
+    assert_eq!(vs.commit_version, v);
+    assert_eq!(vs.pinned, None);
+    assert_eq!(vs.oldest_readable, Some(2));
+    assert_eq!(vs.readable, vec![2, 3, 4, v]);
+
+    let pinned = Store::open(
+        Config::new(&path, 2)
+            .open_mode(OpenMode::ReadOnly)
+            .at_version(Some(v)),
+    )
+    .unwrap();
+    assert_eq!(pinned.versions().unwrap().pinned, Some(v));
 }
 
 #[cfg_attr(miri, ignore)]

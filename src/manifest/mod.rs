@@ -7,6 +7,8 @@ use crate::backend::Persistence;
 use crate::model::Distance;
 use crate::profile::OpenProfile;
 
+pub(crate) mod history;
+
 /// The object key the manifest lives under within a store.
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 

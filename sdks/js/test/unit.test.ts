@@ -1043,6 +1043,26 @@ describe("ops surface (ready/cluster/refresh)", () => {
     });
   });
 
+  it("decodes all four versions fields, including the nullable ones", async () => {
+    const { fn, calls } = mockFetch({
+      commit_version: 42,
+      oldest_readable: 40,
+      pinned: null,
+      readable: [40, 41, 42],
+    });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const versions = await db.versions();
+    expect(calls[0]!.url).toBe("http://x/versions");
+    expect(calls[0]!.init.method).toBe("GET");
+    expect(calls[0]!.json).toBeUndefined();
+    expect(versions).toEqual({
+      commit_version: 42,
+      oldest_readable: 40,
+      pinned: null,
+      readable: [40, 41, 42],
+    });
+  });
+
   it("posts to /refresh and returns the adopted boolean", async () => {
     const { fn: fnTrue, calls: callsTrue } = mockFetch({ adopted: true });
     const dbTrue = new NidusClient({ baseUrl: "http://x", fetch: fnTrue });

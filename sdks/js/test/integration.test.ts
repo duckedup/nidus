@@ -100,6 +100,10 @@ describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
     expect(typeof status.staleness_secs).toBe("number");
 
     expect(typeof (await db.refresh())).toBe("boolean");
+
+    const versions = await db.versions();
+    expect(typeof versions.commit_version).toBe("number");
+    expect(versions.pinned).toBeNull();
   });
 
   it("create → upsert → search → stats", async () => {

@@ -13,7 +13,12 @@ use crate::data::SegmentIntegrity;
 use crate::filter;
 use crate::findex::FilterIndexField;
 use crate::fts::FtsField;
-use crate::manifest::{BASE_SEGMENT, MANIFEST_KEY};
+use crate::manifest::history::{self, HistoryEntry, HistoryFloor};
+
+/// History-entry deletes issued per call, both when pruning and when compaction reclaims.
+/// The floor already makes every excluded entry unreachable, so a backlog is cheap to leave.
+const HISTORY_PRUNE_BATCH: usize = 32;
+use crate::manifest::{BASE_SEGMENT, MANIFEST_KEY, Manifest};
 use crate::model::{Distance, Filter, Op, Record, Value};
 use crate::profile::OpenProfile;
 use crate::search::normalize;
@@ -70,11 +75,14 @@ impl Store {
         Ok(())
     }
 
-    /// In cluster mode, advance the manifest version and republish it as the universal commit
-    /// counter (SPEC §14.6 phase 5), so a reader detects the commit with one manifest read. No-op
-    /// outside cluster mode, where refresh uses the live log length instead.
-    fn note_cluster_commit(&mut self) -> Result<()> {
-        if !self.config.cluster {
+    /// Advance the manifest version and republish it, making this batch an addressable commit
+    /// point: the cluster commit counter (SPEC §14.6 phase 5), and — since seals are rare and
+    /// `segment_max_rows` defaults to off — the only thing a pinned read could pin to.
+    fn note_commit_point(&mut self) -> Result<()> {
+        if self.in_memory || self.config.open_mode == OpenMode::ReadOnly {
+            return Ok(());
+        }
+        if !self.config.cluster && self.config.history_versions.is_none() {
             return Ok(());
         }
         self.data.bump_version();
@@ -98,7 +106,7 @@ impl Store {
         self.data.sync()?;
         self.log.sync()?;
         crate::metrics::metrics().durability_barriers.inc();
-        self.note_cluster_commit()
+        self.note_commit_point()
     }
 
     /// Enter a deferred-barrier scope (**group commit**, nidus-xb9.1), returning the previous
@@ -123,7 +131,7 @@ impl Store {
         self.data.sync()?;
         self.log.sync()?;
         crate::metrics::metrics().durability_barriers.inc();
-        self.note_cluster_commit()?;
+        self.note_commit_point()?;
         // Last: a failure above must leave the barrier still owed, so the next `commit` (or
         // `flush`) retries it rather than reporting durability nobody achieved.
         self.pending_barrier = false;
@@ -157,26 +165,108 @@ impl Store {
             return Ok(());
         };
         let manifest = self.data.manifest(self.open_profile.clone());
-        if !self.config.cluster {
-            return manifest.store(p.as_ref());
-        }
-        let bytes = manifest.encode()?;
-        match p.put_cas(MANIFEST_KEY, &bytes, self.manifest_cas.as_deref())? {
-            CasOutcome::Written(new) => {
-                self.manifest_cas = match new {
-                    Some(t) => Some(t),
-                    None => p.get_cas(MANIFEST_KEY)?.and_then(|(_, t)| t),
-                };
-                Ok(())
+        let result = if !self.config.cluster {
+            manifest.store(p.as_ref())
+        } else {
+            let bytes = manifest.encode()?;
+            match p.put_cas(MANIFEST_KEY, &bytes, self.manifest_cas.as_deref())? {
+                CasOutcome::Written(new) => {
+                    self.manifest_cas = match new {
+                        Some(t) => Some(t),
+                        None => p.get_cas(MANIFEST_KEY)?.and_then(|(_, t)| t),
+                    };
+                    Ok(())
+                }
+                CasOutcome::Stale => Err(anyhow!(
+                    "writer lease lost: the manifest was committed by another writer — this \
+                     instance was superseded (its lease was taken over while it stalled mid-batch); \
+                     stop writing and reopen"
+                )),
+                // No CAS on this backend — publish plainly (advisory; the per-batch lease fence
+                // still applies). Keep `manifest_cas` `None` so we stay on this path.
+                CasOutcome::Unsupported => manifest.store(p.as_ref()),
             }
-            CasOutcome::Stale => bail!(
-                "writer lease lost: the manifest was committed by another writer — this \
-                 instance was superseded (its lease was taken over while it stalled mid-batch); \
-                 stop writing and reopen"
-            ),
-            // No CAS on this backend — publish plainly (advisory; the per-batch lease fence
-            // still applies). Keep `manifest_cas` `None` so we stay on this path.
-            CasOutcome::Unsupported => manifest.store(p.as_ref()),
+        };
+        // After the commit point, off the durability path (nidus-bnf): a failure here loses
+        // history, never correctness. Before it would be worse — a CAS-stale writer would
+        // clobber the entry of the peer that actually won this version.
+        if result.is_ok() {
+            self.record_history_entry(&manifest, p.as_ref());
+        }
+        result
+    }
+
+    /// Best-effort: record `manifest`'s commit point as a history entry (nidus-bnf), then
+    /// prune past `Config::history_versions`. No-op when history is off. A failure here
+    /// costs only introspection — the manifest itself is already durable.
+    fn record_history_entry(&mut self, manifest: &Manifest, p: &dyn crate::backend::Persistence) {
+        let Some(n) = self.config.history_versions else {
+            return;
+        };
+        let log_offset = match self.log.offset() {
+            Ok(o) => o,
+            Err(e) => {
+                crate::diag::diag!(
+                    crate::diag::Level::Warn,
+                    "history",
+                    "failed to read log offset while recording history entry",
+                    "err" => format!("{e:#}"),
+                );
+                return;
+            }
+        };
+        let entry = HistoryEntry {
+            format_version: history::HIST_FORMAT_VERSION,
+            version: manifest.version,
+            dimension: manifest.dimension,
+            distance: manifest.distance,
+            segments: manifest.segments.clone(),
+            next_id: manifest.next_id,
+            row_count: self.data.row_count(),
+            log_offset,
+            profile: manifest.profile.clone(),
+            commit_millis: crate::meta::now_ms().max(0) as u64,
+        };
+        if let Err(e) = history::store_entry(p, &entry) {
+            crate::diag::diag!(
+                crate::diag::Level::Warn,
+                "history",
+                "failed to write history entry",
+                "err" => format!("{e:#}"),
+            );
+            return;
+        }
+        self.prune_history(manifest.version, n as u64, p);
+    }
+
+    /// Delete history entries the retention window (`n` versions) has aged past, capped at
+    /// [`HISTORY_PRUNE_BATCH`] keys per call. Advances `pruned_through` unconditionally (nidus-bnf) — a failing delete
+    /// must never freeze the floor, and a leaked object is already unreachable once excluded.
+    fn prune_history(&mut self, version: u64, n: u64, p: &dyn crate::backend::Persistence) {
+        if version <= n {
+            return;
+        }
+        let target = version - n;
+        if target <= self.pruned_through {
+            return;
+        }
+        let start = self.pruned_through + 1;
+        let end = target.min(start + HISTORY_PRUNE_BATCH as u64 - 1);
+        for v in start..=end {
+            let _ = history::delete_entry(p, v);
+            self.pruned_through = v;
+        }
+        let floor = HistoryFloor {
+            format_version: history::HIST_FORMAT_VERSION,
+            oldest_readable: self.pruned_through + 1,
+        };
+        if let Err(e) = history::store_floor(p, &floor) {
+            crate::diag::diag!(
+                crate::diag::Level::Warn,
+                "history",
+                "failed to advance the history floor",
+                "err" => format!("{e:#}"),
+            );
         }
     }
 
@@ -548,7 +638,7 @@ impl Store {
         // Cluster: announce this committed batch via the manifest commit counter so reader
         // instances detect it (this path commits durably itself, bypassing `maybe_sync`).
         if barrier_now {
-            self.note_cluster_commit()?;
+            self.note_commit_point()?;
         }
         Ok(count)
     }
@@ -723,7 +813,7 @@ impl Store {
         // bump was deferred to here (PerBatch already did it in `maybe_sync`). Advance it now the
         // batch is durable so peers see it.
         if self.config.fsync == Fsync::OnFlush || self.pending_barrier {
-            self.note_cluster_commit()?;
+            self.note_commit_point()?;
         }
         self.pending_barrier = false;
         // Seal a large active-segment tail into an immutable segment (SPEC §14.4). No-op
@@ -888,6 +978,32 @@ impl Store {
             }
         }
 
+        // 1c. The compaction fence (nidus-bnf), written *before* the rewrite so a crash
+        // refuses history rather than serving it. Keyed on the store *having* history, not on
+        // this process's flag: `nidus compact` without it must still fence.
+        let new_floor = match self.persistence.clone() {
+            Some(p) if !history::list_versions(p.as_ref())?.is_empty() => Some((
+                p,
+                HistoryFloor {
+                    format_version: history::HIST_FORMAT_VERSION,
+                    oldest_readable: self.data.version() + 1,
+                },
+            )),
+            _ => None,
+        };
+        // Captured before advancing `pruned_through` below, so the best-effort cleanup loop
+        // after the rewrite still knows the true start of the range to delete.
+        let prior_pruned_through = self.pruned_through;
+        if let Some((p, floor)) = &new_floor {
+            history::store_floor(p.as_ref(), floor)?;
+            // Advance the in-memory floor now, before `persist_manifest` runs below — otherwise
+            // its own count-based pruning would see the stale value and could write a *smaller*
+            // floor back, reopening a window onto the segments this rewrite just invalidated.
+            self.pruned_through = self
+                .pruned_through
+                .max(floor.oldest_readable.saturating_sub(1));
+        }
+
         // 2. Rewrite data and log atomically. Compaction collapses every segment into one fresh
         //    base; `rewrite` returns the now-unreferenced names so their objects can be reclaimed,
         //    and the new manifest is the commit point (SPEC §14.2).
@@ -900,6 +1016,16 @@ impl Store {
                 // already invisible (the manifest no longer names it), so a delete failure
                 // must not fail the compaction.
                 let _ = p.delete(name);
+            }
+        }
+        // nidus-bnf: reclaim the history entries the new floor just excluded — best-effort,
+        // since each is already unreachable the instant the floor excludes it.
+        if let Some((p, floor)) = &new_floor {
+            // Capped like `prune_history`: the floor already makes every one of these
+            // unreachable, so a long backlog must not turn one compaction into a million
+            // synchronous backend deletes.
+            for v in (prior_pruned_through + 1..floor.oldest_readable).take(HISTORY_PRUNE_BATCH) {
+                let _ = history::delete_entry(p.as_ref(), v);
             }
         }
 

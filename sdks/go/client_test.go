@@ -247,6 +247,10 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 			_, err := c.Cluster(ctx)
 			return err
 		}},
+		{"Versions", `{"commit_version":1,"oldest_readable":null,"pinned":null,"readable":[1]}`, http.MethodGet, "/versions", func(c *Client) error {
+			_, err := c.Versions(ctx)
+			return err
+		}},
 		{"Stats", `{"dimension":3}`, http.MethodGet, "/stats", func(c *Client) error {
 			_, err := c.Stats(ctx)
 			return err
@@ -1475,6 +1479,25 @@ func TestClusterDecodesAllFields(t *testing.T) {
 	}
 	if *got != *want {
 		t.Errorf("Cluster = %+v, want %+v", *got, *want)
+	}
+}
+
+// TestVersionsDecodesAllFields — OldestReadable and Pinned come back nil when the
+// server sends null, since a fresh, unpinned store has neither.
+func TestVersionsDecodesAllFields(t *testing.T) {
+	fake := &capture{reply: `{"commit_version":3,"oldest_readable":null,"pinned":null,` +
+		`"readable":[1,2,3]}`}
+	db := serve(t, fake)
+
+	got, err := db.Versions(context.Background())
+	if err != nil {
+		t.Fatalf("Versions failed: %v", err)
+	}
+	want := &StoreVersions{
+		CommitVersion: 3, OldestReadable: nil, Pinned: nil, Readable: []uint64{1, 2, 3},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Versions = %+v, want %+v", *got, *want)
 	}
 }
 

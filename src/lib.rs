@@ -116,7 +116,8 @@ pub use model::{
     AggregateOpts, Aggregation, AnnConfig, AnnKind, ClusterStatus, DEFAULT_RERANK_OVERSCAN, Decay,
     Distance, Expand, Filter, Footprint, FtsClause, FtsCombine, FtsQuery, Group, Hit, HybridOpts,
     LimitPer, ListOpts, META_CHAR_START, META_CHUNK_INDEX, META_PARENT_ID, OrderBy, Predicate,
-    Projection, QuantKind, Quantization, RankBy, Record, RerankOpts, Role, SearchOpts, Value,
+    Projection, QuantKind, Quantization, RankBy, Record, RerankOpts, Role, SearchOpts,
+    StoreVersions, Value,
 };
 pub use profile::OpenProfile;
 pub use store::Readiness;
@@ -174,6 +175,17 @@ impl Nidus {
         Ok(Self {
             store: store::Store::in_memory(dimension)?,
         })
+    }
+
+    /// Open a point-in-time snapshot at a past commit `version` (nidus-bnf) instead of the
+    /// current one. Requires `Config::history_versions` to have recorded it; the handle is
+    /// always read-only. See [`Config::at_version`].
+    pub fn open_at(config: Config, version: u64) -> Result<Self> {
+        Self::open(
+            config
+                .at_version(Some(version))
+                .open_mode(OpenMode::ReadOnly),
+        )
     }
 
     /// The object backend, for a sidecar this store does not itself own (the embedding
@@ -506,6 +518,22 @@ impl Nidus {
     /// committed state at a single consistent point, never a torn mix.
     pub fn refresh(&mut self) -> Result<bool> {
         self.store.refresh()
+    }
+
+    /// Move this handle to a specific commit `version`, historical or current (nidus-bnf) —
+    /// the explicit counterpart to [`refresh`](Self::refresh), which never crosses a pin.
+    pub fn refresh_to(&mut self, version: u64) -> Result<()> {
+        self.store.refresh_to(version)
+    }
+
+    /// The commit-version landscape of this store's recorded history — see [`StoreVersions`].
+    pub fn versions(&self) -> Result<StoreVersions> {
+        self.store.versions()
+    }
+
+    /// The commit version this handle is pinned to via [`Config::at_version`], if any.
+    pub fn pinned(&self) -> Option<u64> {
+        self.store.pinned()
     }
 
     /// Write the ANN index ([`Config::ann`]) to its on-disk cache so the next [`open`](Self::open)

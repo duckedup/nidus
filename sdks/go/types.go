@@ -220,6 +220,16 @@ type ClusterStatus struct {
 	MaxStalenessSecs  *uint64 `json:"max_staleness_secs"`
 }
 
+// StoreVersions is the /versions response: the commit-version landscape of a
+// store's recorded history. OldestReadable is nil when no history is recorded at
+// all; Pinned is nil unless this instance is pinned to a version.
+type StoreVersions struct {
+	CommitVersion  uint64   `json:"commit_version"`
+	OldestReadable *uint64  `json:"oldest_readable"`
+	Pinned         *uint64  `json:"pinned"`
+	Readable       []uint64 `json:"readable"`
+}
+
 // A RankBy is a ranking expression layered over the store's distance metric, and a
 // tagged union on the wire with exactly one variant today. Build it with [DecayRank];
 // a RankBy naming no variant is an encode error rather than a 400 from the server.

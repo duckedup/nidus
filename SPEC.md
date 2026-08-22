@@ -1390,6 +1390,15 @@ build until a real need exists.
   small/recent tail; an IVF index covers the cold bulk. **Phases 1–5 (the segment format +
   manifest + WAL→segment sealing, per-segment IVF, per-segment mmap, manifest-versioned reader
   refresh, and cooperating-instances cluster mode) are built — see §14.**
+- **Point-in-time reads at a manifest version (nidus-bnf).** *(built)* Opt-in, bounded
+  history of past commit points (`Config::history_versions`) makes every commit point —
+  every durable batch, once it is on — an addressable snapshot: `Nidus::open_at`/`refresh_to` pin
+  a read-only handle to a past version, bounded by both row count *and* the exact log
+  offset at that commit (a row-count-only bound would still replay a later delete).
+  Compaction is a hard floor — `Segments::rewrite` invalidates every earlier snapshot, so a
+  durable `HistoryFloor` written *before* the rewrite refuses anything below it, never
+  serving stale bytes. New object keys only (`hist-*`); the live `manifest` is unchanged.
+  See §14.2.
 
 #### Exotic vector types — DECIDED, 2026-08 (nidus-m50.14)
 
@@ -1454,6 +1463,16 @@ as int8 never had an f32 to rerank against.
 Revisit when a caller names ingest bandwidth as a real cost (a large backfill over a slow
 or metered link is the plausible one), or when the rerank-accuracy objection is measured
 and turns out not to bite. The decision is "not yet", not "never".
+
+**Manifest history, deferred edges (nidus-bnf):**
+
+- **Timestamp addressing (`--at-time`).** `HistoryEntry.commit_millis` is already
+  recorded and displayed (`Nidus::versions`) but not addressable — only a `version`
+  resolves. Purely additive over the same objects whenever a caller asks for it.
+- **Retaining history across a compaction.** `compact()`'s floor is a hard, deliberate
+  wall: `Segments::rewrite` rewrites the base segment in place, so no knob can keep
+  pre-compaction versions readable without also keeping the pre-compaction bytes
+  (effectively a backup). Not built; a caller who needs deeper history takes one.
 
 ### 9.1 A bundled zero-config local embedder — RESOLVED (not shipping)
 
@@ -1997,6 +2016,57 @@ a bug: the alternative (silently downgrading a v2 manifest's profile away to sta
 v1-readable) would make configuring a store next to a mixed fleet of binary versions look
 like it worked and then silently stop applying.
 
+**Manifest history (nidus-bnf): opt-in point-in-time reads.** The live `manifest` object
+is still overwritten on every publish (format unchanged, still v2) — history lives in
+**new object keys** instead: `hist-{version:020}` (a `HistoryEntry` per commit point:
+the segment set, `next_id`, `row_count`, the *exact log length at that commit*, the
+recorded `OpenProfile`, and a display-only wall-clock stamp) and `hist-floor` (a
+`HistoryFloor{oldest_readable}`, the retention/compaction fence below). Both are CRC32 +
+bincode frames, coded exactly like the manifest itself.
+
+A row-count bound alone is not enough to reconstruct a past snapshot: the §14.6/§6.2
+reader rule bounds replay by row count, but a `Delete`/`UpsertText` carries no row, so a
+snapshot pinned only by row count would still replay a later delete. `HistoryEntry`
+therefore also records the **log byte offset** at that commit, and a pinned open replays
+the log bounded to exactly that offset (`OpLog::open_bounded`) as well as by row count.
+
+History is **opt-in and bounded**: `Config::history_versions: Option<usize>` (default
+`None`) keeps the last N commit points; every `persist_manifest` (a seal, a compaction, a
+cluster commit, a profile change) writes one best-effort entry when set, and prunes
+entries older than the window, best-effort, capped at 32 keys per call.
+
+Enabling it also makes **every durable batch** a commit point (`note_commit_point`, the
+generalised `note_cluster_commit`), because otherwise there is usually nothing to pin to:
+outside cluster mode a manifest is published only on a seal or a compaction, and
+`segment_max_rows` defaults to `None` — never seal — so a default store publishes nothing
+after creation and would record an empty history. That per-batch manifest publish is
+exactly the cost that keeps the knob off by default: a store that never asks for history
+has a byte-for-byte unchanged write path, and one that does pays a small object write per
+batch. Trading Speed silently for a feature most deployments never asked for is the thing
+this shape avoids.
+
+**Compaction is a hard floor, not a knob.** `compact()` calls `Segments::rewrite`, which
+rewrites the base segment **in place** under the same name — so a surviving pre-compaction
+`HistoryEntry` would describe bytes that no longer exist and, worse, might *look* valid
+against the segment names it recorded while actually serving the wrong rows. There is no
+setting that keeps pre-compaction history: `compact()` writes `HistoryFloor{oldest_readable:
+current_version + 1}` **durably, before** the rewrite, so a crash between the two only
+refuses history that was about to go stale — it can never serve it. A version below the
+floor is a hard, explicit error naming the oldest version still readable; a caller who
+needs pre-compaction history takes a backup instead.
+
+Addressable points are exactly the commit points (wherever `persist_manifest` publishes,
+which with history on includes every durable batch), and addressing is **version-only**: a wall-clock `commit_millis` is recorded and displayed but never
+addressable (a `--at-time` lookup is a purely additive follow-up, not built here). A
+pinned handle (`Config::at_version`) is always `OpenMode::ReadOnly`, enforced in
+`Config::validate()`; `Nidus::open_at` sets both. `Store::refresh()` never crosses a pin
+(it returns `Ok(false)` immediately); `Store::refresh_to(version)` is the explicit move,
+usable on a pinned *or* an ordinary reader, always doing the full re-open (never the
+incremental active-segment-only path, since both the segments and the row/log bounds can
+move). `Nidus::versions()` reports the landscape (`StoreVersions`: `commit_version`,
+`oldest_readable`, this handle's `pinned`, and the full `readable` list) with one `list()`
+call, so it stays off `footprint()`'s no-IO path.
+
 Immutability is what unlocks everything else, because each scaling limit of the monolith
 dissolves into a segment operation:
 
@@ -2111,6 +2181,15 @@ single-node payoff before any distribution work:
    seal/compaction), it re-reads **only the active segment** object and reuses every immutable
    segment — avoiding the dominant cost (re-fetching the whole set) on an object store. A
    restructure (seal/compaction changes the list) takes the full re-open.
+
+   `refresh()` never crosses a **pin** (`Config::at_version`, nidus-bnf, §14.2): a pinned
+   reader calling it gets `Ok(false)` immediately, current or not. `refresh_to(version)` is
+   the explicit move — to a historical version, or forward to whatever is current *as a
+   pin on that version* — usable on a pinned or an ordinary reader alike, always via the
+   full re-open shape (never the incremental path, since a pin can move both the segment set
+   and the row/log bounds at once). It never *un*-pins: a handle that should follow the store
+   again is reopened without `at_version`, because a pin is what the caller asked for and
+   silently dropping it is the substitute-serving this feature exists to refuse.
 5. **Cluster mode.** *(built)* Cooperating instances over one **shared** backend, enabled by
    `Config::cluster` (rejected unless persistence is a shared object store **and** a shared
    memory tier is set — local FS / process RAM are single-node). One `ReadWrite` writer holds

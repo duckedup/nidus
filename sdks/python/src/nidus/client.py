@@ -58,6 +58,7 @@ from .types import (
     RerankOpts,
     Rollup,
     Stats,
+    StoreVersions,
 )
 from .values import AttrInput
 
@@ -136,6 +137,10 @@ class NidusClient:
     def cluster(self) -> ClusterStatus:
         """Role, writer-handle state, fencing token, commit counter, staleness."""
         return _wire.decode_cluster(self._request("GET", _wire.CLUSTER))
+
+    def versions(self) -> StoreVersions:
+        """The readable commit points and this instance's pin (SPEC §14.2)."""
+        return _wire.decode_versions(self._request("GET", _wire.VERSIONS))
 
     def stats(self) -> Stats:
         """Store-wide introspection: dimension, distance, ANN config, collections, footprint."""

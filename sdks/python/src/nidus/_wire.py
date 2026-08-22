@@ -76,6 +76,7 @@ from .types import (
     RerankOpts,
     Rollup,
     Stats,
+    StoreVersions,
 )
 from .values import AttrInput, Value, decode_attrs, decode_value, encode_attrs
 
@@ -89,6 +90,7 @@ from .values import AttrInput, Value, decode_attrs, decode_value, encode_attrs
 HEALTH = "/health"
 READY = "/ready"
 CLUSTER = "/cluster"
+VERSIONS = "/versions"
 REFRESH = "/refresh"
 STATS = "/stats"
 COLLECTIONS = "/collections"
@@ -797,6 +799,18 @@ def decode_cluster(payload: Any) -> ClusterStatus:
         commit_version=int(payload["commit_version"]),
         staleness_secs=int(payload["staleness_secs"]),
         max_staleness_secs=_opt_int(payload.get("max_staleness_secs")),
+    )
+
+
+def decode_versions(payload: Any) -> StoreVersions:
+    """Decode ``GET /versions``. ``oldest_readable``/``pinned`` may be ``null``."""
+    if not isinstance(payload, Mapping):
+        raise NidusError(f"/versions returned no JSON object (got {payload!r})", 0)
+    return StoreVersions(
+        commit_version=int(payload["commit_version"]),
+        oldest_readable=_opt_int(payload.get("oldest_readable")),
+        pinned=_opt_int(payload.get("pinned")),
+        readable=[int(v) for v in payload.get("readable") or ()],
     )
 
 

@@ -63,6 +63,7 @@ from .types import (
     RerankOpts,
     Rollup,
     Stats,
+    StoreVersions,
 )
 from .values import (
     AttrInput,
@@ -123,6 +124,7 @@ __all__ = [
     "RerankOpts",
     "Rollup",
     "Stats",
+    "StoreVersions",
     "Transport",
     "Value",
     "__version__",

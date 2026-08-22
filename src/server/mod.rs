@@ -30,7 +30,7 @@ use dto::{
     AggregateRequest, AggregationDto, AnnDto, BatchFuse, BatchSearchRequest, BatchSearchResponse,
     CompactRequest, DeleteRequest, FilterIndexRequest, FootprintDto, FtsSchemaRequest, HitDto,
     HybridSearchRequest, ListRequest, MAX_BATCH_QUERIES, MAX_TOP_K, SearchRequest, SimilarRequest,
-    TextSearchRequest, UpsertRequest,
+    TextSearchRequest, UpsertRequest, VersionsDto,
 };
 
 // ── AI-ingest (memory) imports: only under the `memory` feature (pulled by the
@@ -444,6 +444,7 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/ready", get(ready))
         .route("/metrics", get(metrics::metrics_endpoint))
         .route("/cluster", get(cluster))
+        .route("/versions", get(versions))
         .route("/stats", get(stats))
         .route("/collections", get(list_collections))
         .route(
@@ -673,6 +674,12 @@ async fn cluster(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError
         "staleness_secs": s.staleness_secs,
         "max_staleness_secs": st.max_staleness.map(|d| d.as_secs()),
     })))
+}
+
+/// `GET /versions` — the readable commit points and this instance's pin (SPEC §14.2).
+async fn versions(State(st): State<AppState>) -> Result<Json<VersionsDto>, ApiError> {
+    let v = run_read(st, |db| db.versions()).await?;
+    Ok(Json(VersionsDto::from(v)))
 }
 
 /// Read [`ClusterStatus`] without blocking the async executor.
@@ -3214,6 +3221,19 @@ mod tests {
         assert_eq!(body["fenced"], false);
         assert_eq!(body["lease_owner"], JsonValue::Null);
         assert_eq!(body["staleness_secs"], 0);
+    }
+
+    /// `/versions` on a fresh in-memory store: a live commit, no pin, and the two
+    /// nullable fields present as JSON `null` rather than absent.
+    #[tokio::test]
+    async fn versions_endpoint_reports_commit_and_no_pin() {
+        let resp = test_router(3).oneshot(get("/versions")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert!(body["commit_version"].is_u64());
+        assert!(body["pinned"].is_null());
+        assert!(body["oldest_readable"].is_null());
+        assert!(body["readable"].is_array());
     }
 
     /// A staleness bound only ever fails a *reader*: a writer is the current state by
