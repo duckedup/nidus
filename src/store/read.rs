@@ -57,6 +57,7 @@ pub(super) fn check_query_opts(opts: &SearchOpts) -> Result<()> {
     rank::validate(opts.rank_by.as_ref())
         .and_then(|()| super::aggregate::validate(opts.limit_per.as_ref()))
         .and_then(|()| super::diversity::validate(opts.diversity))
+        .and_then(|()| super::expand::validate(opts.expand.as_ref()))
         .context(BAD_QUERY)
 }
 
@@ -98,6 +99,11 @@ impl Store {
         };
         let mut hits = paginate(spread, opts.offset);
         hits.truncate(opts.top_k);
+        // Last, and after the page is cut: expansion is payload-only, so it must not be able
+        // to influence anything that reorders or thins the ranking.
+        if let Some(e) = &opts.expand {
+            self.expand_hits(&mut hits, e);
+        }
         hits
     }
 
@@ -108,6 +114,9 @@ impl Store {
     pub(crate) fn finish_hybrid(&self, ranked: Vec<Hit>, opts: &HybridOpts) -> Vec<Hit> {
         let mut hits = paginate(ranked, opts.offset);
         hits.truncate(opts.top_k);
+        if let Some(e) = &opts.expand {
+            self.expand_hits(&mut hits, e);
+        }
         hits
     }
 

@@ -369,6 +369,46 @@ describe("NidusClient request shaping", () => {
     expect(sent.queries[1]!.diversity).toBe(0);
   });
 
+  it("maps expand and rollup to snake_case, and omits them unless asked", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    // Unset: byte-identical to a client that predates expansion.
+    await db.search({ query: [1, 0, 0] });
+    expect(calls[0]!.json).toEqual({ query: [1, 0, 0], scope: [], filter: [] });
+
+    // A bare radius sends only a radius; the server fills the reserved attr names.
+    await db.search({ query: [1, 0, 0], expand: { radius: 2 } });
+    expect(calls[1]!.json).toMatchObject({ expand: { radius: 2 } });
+    expect(
+      Object.keys((calls[1]!.json as { expand: object }).expand),
+    ).toEqual(["radius"]);
+
+    await db.search({
+      query: [1, 0, 0],
+      expand: { radius: 1, parentField: "doc", textField: "body" },
+    });
+    expect(calls[2]!.json).toMatchObject({
+      expand: { radius: 1, parent_field: "doc", text_field: "body" },
+    });
+
+    await db.recall("notes", "hi", { rollup: { neighbours: 1 } });
+    expect(calls[3]!.json).toMatchObject({ rollup: { neighbours: 1 } });
+  });
+
+  it("carries a hit's context through when the server sends one", async () => {
+    const { fn, calls } = mockFetch([
+      { collection: "c", id: "d#1", score: 0.9, attrs: {}, context: "widened" },
+      { collection: "c", id: "d#2", score: 0.8, attrs: {} },
+    ]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const hits = await db.search({ query: [1, 0, 0], expand: { radius: 1 } });
+    expect(calls[0]!.json).toMatchObject({ expand: { radius: 1 } });
+    expect(hits[0]!.context).toBe("widened");
+    // Absent stays absent, not `undefined` — the shape an unexpanded hit always had.
+    expect("context" in hits[1]!).toBe(false);
+  });
+
   it("omits the ranking knobs unless asked, and maps them to snake_case", async () => {
     const { fn, calls } = mockFetch([]);
     const db = new NidusClient({ baseUrl: "http://x", fetch: fn });

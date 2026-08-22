@@ -24,6 +24,7 @@ use crate::profile::OpenProfile;
 
 pub(crate) mod aggregate;
 mod diversity;
+mod expand;
 mod memtier;
 mod quant;
 mod rank;

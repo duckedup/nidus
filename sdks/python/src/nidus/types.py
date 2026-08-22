@@ -105,6 +105,9 @@ class Hit:
     attrs: dict[str, DecodedValue] = field(default_factory=dict)
     #: ``None`` unless the query asked to ``explain`` or to highlight; the server omits it.
     annotations: Optional[Annotations] = None
+    #: The hit's chunk widened with its neighbours. ``None`` unless the query asked to
+    #: ``expand`` (or, on recall, to ``rollup``); the server omits the key entirely.
+    context: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -354,6 +357,38 @@ class LimitPer(TypedDict):
 
     field: str
     max: int
+
+
+class _ExpandRequired(TypedDict):
+    """The one key every ``expand`` must carry (split out so the fields can default)."""
+
+    radius: int
+
+
+class Expand(_ExpandRequired, total=False):
+    """Widen each hit with the neighbouring chunks of its own document.
+
+    Payload only: it fills :attr:`~nidus.types.Hit.context` and changes nothing about the
+    ranking. Every key but ``radius`` defaults to the reserved attrs ``nidus ingest`` stamps
+    (``nidus.parent_id``, ``nidus.chunk_index``, ``nidus.text``), so ``{"radius": 1}`` is the
+    whole option a chunked corpus needs.
+    """
+
+    parent_field: str
+    index_field: str
+    text_field: str
+
+
+class Rollup(TypedDict, total=False):
+    """Read a chunked corpus as documents rather than fragments.
+
+    ``per_parent`` chunks are kept per document (default 1, the best-matching chunk), each
+    widened with ``neighbours`` chunks either side. The text-native spelling of
+    ``limit_per`` plus :class:`Expand`.
+    """
+
+    per_parent: int
+    neighbours: int
 
 
 class _OrderByRequired(TypedDict):

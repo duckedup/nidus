@@ -200,6 +200,9 @@ impl Store {
             })
             .collect();
         self.annotate(&mut hits, text, None);
+        if let Some(e) = &opts.expand {
+            self.expand_hits(&mut hits, e);
+        }
         Ok(hits)
     }
 

@@ -872,6 +872,7 @@ fn plan_search(req: SearchRequest) -> Result<SearchPlan, ApiError> {
         rank_by: req.rank_by,
         limit_per: req.limit_per,
         diversity: req.diversity,
+        expand: req.expand.map(Into::into),
         rerank,
     };
     #[cfg(feature = "rerank")]
@@ -904,6 +905,7 @@ async fn search_similar(
         rank_by: req.rank_by,
         limit_per: req.limit_per,
         diversity: req.diversity,
+        expand: req.expand.map(Into::into),
         // No rerank here: a cross-encoder scores (query text, candidate) pairs, and
         // more-like-this starts from a stored vector with no query text to score against.
         rerank: None,
@@ -1139,6 +1141,7 @@ async fn text_search(
         rank_by,
         limit_per,
         diversity,
+        expand,
         #[cfg(feature = "rerank")]
         rerank,
     } = req;
@@ -1164,6 +1167,7 @@ async fn text_search(
         rank_by,
         limit_per,
         diversity,
+        expand: expand.map(Into::into),
         rerank,
         ..Default::default()
     };
@@ -1213,6 +1217,7 @@ async fn hybrid_search(
         highlight,
         vector_weight,
         text_weight,
+        expand,
         #[cfg(feature = "rerank")]
         rerank,
     } = req;
@@ -1233,6 +1238,7 @@ async fn hybrid_search(
         explain,
         vector_weight,
         text_weight,
+        expand: expand.map(Into::into),
         rerank,
     };
     #[cfg(feature = "rerank")]
@@ -1450,6 +1456,7 @@ async fn recall(
         min_score,
         filter,
         diversity,
+        rollup,
         #[cfg(feature = "rerank")]
         rerank,
     } = req;
@@ -1474,11 +1481,16 @@ async fn recall(
     filter
         .0
         .push(crate::memory::not_expired_predicate(crate::meta::now_ms()));
+    // Through `Rollup::as_opts`, the same mapping `Memory::recall` uses — the two surfaces
+    // must not drift on what "read this as a chunked corpus" means.
+    let rollup = rollup.map(crate::memory::Rollup::from).map(|r| r.as_opts());
     let opts = SearchOpts {
         top_k,
         min_score,
         filter,
         diversity,
+        limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
+        expand: rollup.map(|(_, e)| e),
         rerank: rerank_opts,
         ..Default::default()
     };
@@ -1883,6 +1895,66 @@ mod tests {
             .uri(path)
             .body(Body::empty())
             .unwrap()
+    }
+
+    /// `expand` over the wire: the DTO reaches `SearchOpts`, the store stitches the window,
+    /// and `context` reaches the response. The ids and scores are identical with it off, so
+    /// the payload is all it can change.
+    #[tokio::test]
+    async fn expand_widens_a_hit_over_http_without_reordering() {
+        let app = test_router(2);
+        // Three overlapping chunks of "one two three four five six", as `ingest` would write.
+        let chunk = |i: usize, start: usize, text: &str, v: f64| {
+            json!({"id": format!("d#{i}"), "vector": [1.0, v], "attrs": {
+                "nidus.parent_id": {"Str": "d"},
+                "nidus.chunk_index": {"Int": i},
+                "nidus.char_start": {"Int": start},
+                "nidus.text": {"Str": text}
+            }})
+        };
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    chunk(0, 0, "one two three", 0.0),
+                    chunk(1, 8, "three four five", 0.1),
+                    chunk(2, 19, "five six", 0.2)
+                ]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let plain = json_body(
+            app.clone()
+                .oneshot(post("/search", json!({"query": [1, 0.1], "top_k": 3})))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let expanded = json_body(
+            app.clone()
+                .oneshot(post(
+                    "/search",
+                    json!({"query": [1, 0.1], "top_k": 3, "expand": {"radius": 1}}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let ranking = |hits: &JsonValue| -> Vec<JsonValue> {
+            hits.as_array()
+                .unwrap()
+                .iter()
+                .map(|h| json!([h["id"], h["score"]]))
+                .collect()
+        };
+        assert_eq!(ranking(&plain), ranking(&expanded), "payload only");
+        assert!(plain[0].get("context").is_none(), "{}", plain[0]);
+        // The whole document, with neither seam repeating the shared overlap.
+        assert_eq!(expanded[0]["context"], "one two three four five six");
     }
 
     /// A client that never links the library can drive the whole lifecycle over
@@ -3973,6 +4045,58 @@ mod memory_tests {
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap()
+    }
+
+    /// `rollup` over `/recall`: the text-native knob collapses a chunked corpus to one hit
+    /// per document and widens it, through the same `Rollup::as_opts` the library uses.
+    #[tokio::test]
+    async fn recall_with_rollup_collapses_and_widens_over_http() {
+        let app = router_with_mock_embedder().await;
+        // Seeded raw, because chunked writes have no HTTP route: `nidus ingest` and the Rust
+        // `Memory::remember_chunked` are what produce these attrs.
+        let chunk = |doc: &str, i: usize, start: usize, text: &str| {
+            json!({"id": format!("{doc}#{i}"), "vector": vec![0.5f32; DIM], "attrs": {
+                "nidus.parent_id": {"Str": doc},
+                "nidus.chunk_index": {"Int": i},
+                "nidus.char_start": {"Int": start},
+                "nidus.text": {"Str": text}
+            }})
+        };
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/notes/upsert",
+                json!({"records": [
+                    chunk("d1", 0, 0, "alpha beta"),
+                    chunk("d1", 1, 6, "beta gamma"),
+                    chunk("d2", 0, 0, "delta epsilon")
+                ]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let hits = json_body(
+            app.clone()
+                .oneshot(post(
+                    "/collections/notes/recall",
+                    json!({"query": "beta", "top_k": 10, "rollup": {"neighbours": 1}}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let hits = hits.as_array().unwrap();
+        let parents: std::collections::BTreeSet<&str> = hits
+            .iter()
+            .map(|h| h["attrs"]["nidus.parent_id"]["Str"].as_str().unwrap())
+            .collect();
+        assert_eq!(hits.len(), parents.len(), "one hit per document: {hits:?}");
+        let d1 = hits
+            .iter()
+            .find(|h| h["attrs"]["nidus.parent_id"]["Str"] == "d1")
+            .expect("d1 present");
+        assert_eq!(d1["context"], "alpha beta gamma");
     }
 
     /// Remember text (server embeds via the mock), then recall it back.

@@ -118,6 +118,32 @@ JSON array of metadata predicates, AND-combined, with `Any`/`Not` for OR and
 negation. It narrows a search to the records that match before scoring, the
 same filters `forget` and `browse` use to scope which records they touch.
 
+### Reading a chunked corpus
+
+A collection written by [`nidus ingest`](/guides/ingest/) holds chunks, not whole
+documents, so a plain `recall` returns several fragments of the same file competing
+for the window. `recall`, `text_search` and `related` all take an optional `rollup`
+to fix that:
+
+```json
+{"collection": "docs", "query": "how does the writer lock work",
+ "rollup": {"neighbours": 1}}
+```
+
+`per_parent` (default 1) is how many chunks survive per document; `neighbours` is
+how many chunks are stitched either side of each survivor. Each result then carries
+a `context` string: the passage the chunk came from, with the overlap between
+adjacent chunks dropped rather than repeated. Read `context` when it is there and
+`nidus.text` when it is not.
+
+`rollup` only changes the payload. The results, their scores and their order are
+exactly what the same call returns without it.
+
+This is the only spelling MCP offers. The HTTP and CLI surfaces also take a raw
+`expand` naming the chunk attrs directly, which matters for a corpus chunked by
+something other than nidus; a model asking for one result per document does not
+need it.
+
 ### No setup step
 
 `remember` provisions what it needs on first write: it creates the collection if

@@ -16,8 +16,10 @@ remember text, recall the relevant bits. Classically that is a pipeline — chun
 some source content → embed each chunk into a dense vector → store the vectors plus
 metadata → answer "nearest neighbours to this query vector" — and nidus can own the
 whole thing (built-in embedding, optionally summarizing first, with the provider of
-your choice) or just the storage-and-search core if you bring your own vectors. It
-runs fast, in-process, with no hosted service. The source can be anything — code,
+your choice) or just the storage-and-search core if you bring your own vectors. Both ends
+are covered: `nidus ingest` walks a tree into a searchable corpus in one command, and rollup
+plus neighbour expansion (§7.10) hand back passages rather than the chunk fragments a
+chunked store would otherwise return. It runs fast, in-process, with no hosted service. The source can be anything — code,
 documents, issues, wiki pages — nidus does not care; it turns text into vectors,
 stores vectors and metadata, and ranks them.
 
@@ -1053,6 +1055,43 @@ zero-filled shorter list, because the silent version re-weights the wrong leg.
 This is a **transport** concern, not a storage one: there is no library counterpart, since an
 embedding caller already has the loop and the fusion is `rrf_fuse` either way.
 
+### 7.10 Parent rollup and neighbour expansion (chunked corpora)
+
+Once documents are chunked (`nidus ingest`, `Memory::remember_chunked`), a raw chunk hit is the
+wrong answer shape: every RAG application then hand-rolls the same two steps. nidus does both.
+
+**Rollup** is `limit_per` on `nidus.parent_id` — it predates this section, and `max: 1` is
+"the best chunk per document".
+
+**Expansion** (`SearchOpts::expand` / `HybridOpts::expand`, `src/store/expand.rs`) widens each
+surviving hit with the chunks around it. Three invariants make it safe to layer over the total
+order §7 defines:
+
+- **Payload only.** It writes `Hit::context` and nothing else — never `attrs`, so a caller's
+  projection is unaffected, and never `score`.
+- **Last.** It runs after rerank, MMR, `limit_per`, `min_score` and pagination, so nothing that
+  reorders or thins a ranking can see it. A query's `(id, score)` sequence is identical with
+  expansion on and off, and that is asserted rather than asserted-in-prose.
+- **Never adds or drops a hit.** A record without chunk coordinates keeps `context: None`
+  rather than failing the query, so a mixed collection still answers.
+
+Coordinates and text are read from the **stored** record, not from the projected hit, so a
+projected-away body still expands — the same rule highlighting follows (§7.8). Neighbours are
+gathered in one pass over the in-RAM index for every hit's window at once, not one lookup per
+hit.
+
+**De-overlap.** `ChunkOpts::overlap_chars` defaults to 100, so concatenating a window would
+repeat text at every seam. Each chunk therefore carries `nidus.char_start` (a reserved attr,
+stamped like `nidus.parent_id`/`nidus.chunk_index` and never accepted from a caller), and the
+stitcher appends only the part of each neighbour beyond the previous chunk's end — reconstructing
+the source window exactly. A corpus without those offsets (upserted raw, or chunked before
+0.75.0) falls back to a blank-line join.
+
+`RecallOpts::rollup` (`{per_parent, neighbours}`) is the text-native spelling of the pair, and
+the only form the MCP surface offers: a model means "one result per document, widened", never a
+set of attr names. Every recall surface maps it through `Rollup::as_opts`, so the in-process,
+HTTP and MCP reads cannot drift.
+
 ## 8. Compaction
 
 Deletes and overwrites leave dead rows in `data` and superseded records in `log`.
@@ -1154,8 +1193,10 @@ build until a real need exists.
   keys are `nidus.text` (the raw text, always stamped, and what the default schema
   indexes), `nidus.created_at` / `nidus.updated_at` / `nidus.expires_at` (all
   `Value::DateTime`, UTC epoch ms), and `nidus.parent_id` (`Value::Str`) /
-  `nidus.chunk_index` (`Value::Int`), stamped by `remember_chunked` to record which
-  document a chunk came from and its 0-based position within it. `nidus.source`
+  `nidus.chunk_index` (`Value::Int`) / `nidus.char_start` (`Value::Int`), stamped by
+  `remember_chunked` to record which document a chunk came from, its 0-based position
+  within it, and its char offset into the source (which is what lets §7.10 stitch a
+  window without repeating the overlap). `nidus.source`
   predates `nidus.text`, carried
   exactly the same value, and is retained read-only so records written before this
   change still resolve — nothing stamps it now. Because `upsert` replaces a doc's
@@ -1300,7 +1341,10 @@ build until a real need exists.
   (`Recursive`/`Markdown`/`Sentence` strategies) that `Memory::remember_chunked`
   builds on, so a document too long to embed as one vector without averaging away
   what a caller will later search for is instead split into overlapping spans, each
-  its own record carrying `nidus.parent_id`/`nidus.chunk_index`. Two decisions worth
+  its own record carrying `nidus.parent_id`/`nidus.chunk_index`/`nidus.char_start`, and
+  written as **one** all-or-nothing batch under a single durability barrier, so a failure
+  part-way through a document leaves the whole prior generation rather than a mix of two
+  (nidus-lvo.5). Two decisions worth
   keeping settled: sizes are measured in **characters, not tokens**, because nidus
   does not tokenize for a model it does not own, and a character budget with a
   built-in safety margin is honest about that; and the module is **ungated** (no
@@ -1475,6 +1519,7 @@ src/
                   text.rs (multi-clause BM25, hybrid fusion, annotations, §7.8),
                   rank.rs (recency decay + ORDER BY, §7.6), aggregate.rs (count/sum +
                   group_by + limit_per, §7.7), diversity.rs (MMR spread, §7.7),
+                  expand.rs (parent rollup + neighbour expansion, §7.10),
                   write.rs (upsert/delete/flush/compact),
                   memtier.rs (working-set publish/adopt), rerank.rs (pure over-fetch/
                   passthrough/re-sort tail, unconditional, §9), tests.rs

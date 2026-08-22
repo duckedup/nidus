@@ -1938,6 +1938,72 @@ func TestDiversityIsAdditiveAndKeepsZero(t *testing.T) {
 	}
 }
 
+// TestExpandAndRollupAreAdditive — an unexpanded request stays byte-identical to a client
+// that predates expansion, and a set one carries only the fields the caller named. Recall
+// takes the text-native Rollup, never the raw attr-name Expand.
+func TestExpandAndRollupAreAdditive(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.Search(ctx, SearchRequest{Query: []float32{1}}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); strings.Contains(body, "expand") {
+		t.Errorf("body = %s, want no expand key at all", body)
+	}
+
+	// A bare radius sends only a radius; the server fills the reserved chunk attrs.
+	if _, err := db.Search(ctx, SearchRequest{
+		Query: []float32{1}, Expand: &Expand{Radius: 2},
+	}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body, want := fake.sentBody(t), `"expand":{"radius":2}`; !strings.Contains(body, want) {
+		t.Errorf("body = %s, want it to contain %s", body, want)
+	}
+
+	if _, err := db.HybridSearch(ctx, HybridSearchRequest{
+		Vector: []float32{1}, Field: "body", Text: "fox",
+		Expand: &Expand{Radius: 1, ParentField: "doc", TextField: "body"},
+	}); err != nil {
+		t.Fatalf("HybridSearch failed: %v", err)
+	}
+	want := `"expand":{"radius":1,"parent_field":"doc","text_field":"body"}`
+	if body := fake.sentBody(t); !strings.Contains(body, want) {
+		t.Errorf("body = %s, want it to contain %s", body, want)
+	}
+
+	if _, err := db.Recall(ctx, "notes", "why", RecallOptions{
+		Rollup: &Rollup{Neighbours: 1},
+	}); err != nil {
+		t.Fatalf("Recall failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"query":"why","rollup":{"neighbours":1}}` {
+		t.Errorf("body = %s, want the rollup to reach recallWire", body)
+	}
+}
+
+// TestAHitCarriesItsContext — Context is nil unless the server sent one, so an unexpanded
+// hit is the object it always was.
+func TestAHitCarriesItsContext(t *testing.T) {
+	fake := &capture{reply: `[{"collection":"c","id":"d#1","score":0.9,"attrs":{},"context":"widened"},` +
+		`{"collection":"c","id":"d#2","score":0.8,"attrs":{}}]`}
+	db := serve(t, fake)
+	hits, err := db.Search(context.Background(), SearchRequest{
+		Query: []float32{1}, Expand: &Expand{Radius: 1},
+	})
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if hits[0].Context == nil || *hits[0].Context != "widened" {
+		t.Errorf("hits[0].Context = %v, want \"widened\"", hits[0].Context)
+	}
+	if hits[1].Context != nil {
+		t.Errorf("hits[1].Context = %v, want nil", hits[1].Context)
+	}
+}
+
 // TestRankingKnobsAreAdditive — rank_by, limit_per and order_by must be absent from a
 // request that does not use them, so today's bodies stay byte-identical, and must
 // carry only the sub-knobs the caller actually named when they are used.

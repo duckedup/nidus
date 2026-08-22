@@ -320,6 +320,58 @@ mod tests {
         );
     }
 
+    /// Expansion is deferred to the same tail, so a reranked hit is widened but its reranked
+    /// position is not disturbed: the pre-rerank fetch carries `expand: None` on purpose.
+    #[tokio::test]
+    async fn search_reranked_expands_in_the_tail_without_moving_a_hit() {
+        let mut db = store();
+        let chunk = |i: i64, start: i64, text: &str| {
+            let mut a = attrs(text, "g3");
+            a.insert(
+                crate::model::META_PARENT_ID.to_string(),
+                Value::Str("doc".to_string()),
+            );
+            a.insert(crate::model::META_CHUNK_INDEX.to_string(), Value::Int(i));
+            a.insert(crate::model::META_CHAR_START.to_string(), Value::Int(start));
+            Record::new(format!("doc#{i}"), vec![0.8, 0.2], a)
+        };
+        db.upsert(
+            "docs",
+            &[chunk(0, 0, "alpha beta"), chunk(1, 6, "beta gamma")],
+        )
+        .unwrap();
+
+        let base = SearchOpts {
+            top_k: 6,
+            rerank: Some(RerankOpts::default()),
+            ..Default::default()
+        };
+        let plain = search_reranked(&db, &LenReranker, "docs", &[1.0, 0.0], "q", &base)
+            .await
+            .unwrap();
+        let expanded = search_reranked(
+            &db,
+            &LenReranker,
+            "docs",
+            &[1.0, 0.0],
+            "q",
+            &SearchOpts {
+                expand: Some(crate::Expand::new(1)),
+                ..base
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ids(&plain), ids(&expanded), "reranked order is untouched");
+        assert!(plain.iter().all(|h| h.context.is_none()));
+        let widened = expanded
+            .iter()
+            .find(|h| h.id == "doc#0")
+            .expect("chunk 0 ranked");
+        assert_eq!(widened.context.as_deref(), Some("alpha beta gamma"));
+    }
+
     /// Diversity is deferred past the cross-encoder and re-applied in the same tail, so MMR
     /// spreads the *reranked* relevance rather than the metric's, and runs exactly once.
     #[tokio::test]
