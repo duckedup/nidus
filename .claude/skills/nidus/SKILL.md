@@ -36,7 +36,7 @@ Read the first word of `$ARGUMENTS`:
 | `review` | **Review** |
 | `ship` | **Ship** |
 | `fleet` | **Fleet** |
-| anything else | **Full pipeline**: Spec → gate → Implement → Review → offer Ship |
+| anything else | **Full pipeline**: Spec → scope gate → plan gate → Implement → Review → offer Ship |
 
 The rest of `$ARGUMENTS` is the target: an issue number (`#42`), a PR number (review only),
 a path, or a freeform description. With no arguments at all, run **Review** on the working
@@ -119,10 +119,26 @@ sharp paragraphs beat ten pages.
 ## Spec
 
 1. Run the research workflow. It fans out four fixed lenses (modules, tests, laws, prior art)
-   and returns a proposed directory partition:
+   and returns a proposed directory partition plus the scope forks it could not settle:
    `Workflow({ scriptPath: ".claude/skills/nidus/spec.workflow.js", args: { id, ask } })`
-2. **You** write the blueprints from what it returns — do not delegate this. The gate the
-   user approves must be yours.
+   Ask something before you launch it only if the ambiguity would send the *research* somewhere
+   useless — the ticket names no surface at all, or two readings of it share no files.
+   Otherwise research first: a question asked from the code is a better question than the same
+   question asked from the title.
+2. **The scope gate — ask before you write, not after.** `partition.scope_questions` is the
+   seed. Drop any the ticket already answers, add anything the research surfaced that the
+   partition missed, and put what is left in **one** `AskUserQuestion` (four maximum), each
+   with concrete options and what each one adds to or drops from the change. Lead with the 2–3
+   sentence understanding summary, so the answers land against your reading rather than theirs.
+
+   The rule is positional, not advisory: **no `BLUEPRINT-*.md` exists on disk until these are
+   answered.** Once a blueprint is written the question silently changes from "what should this
+   be" to "is this wrong" — a worse question, asked later, against work already done. And a
+   scope assumption is not local: it is baked into every sub-blueprint, so walking one back
+   means rewriting all of them. If `scope_questions` comes back empty and you agree the ask is
+   unambiguous, say so in one line and go to step 3 — an invented question is its own noise.
+3. **You** write the blueprints from the research and the answers — do not delegate this. The
+   gate the user approves must be yours.
    - `BLUEPRINT-<id>.md` in **each directory** that will change.
    - `BLUEPRINT-<id>.md` at the **repo root**: summary, the table of sub-blueprints, complete
      file create/modify/remove list, group ordering and why, and the global verification lanes
@@ -135,11 +151,12 @@ sharp paragraphs beat ten pages.
      patterns to mirror (path + line range + snippet, so the agent never re-explores), the
      test pattern for that area, acceptance criteria, its exact `verify` lanes, and a scope
      boundary naming the files it may NOT touch.
-3. **The gate.** One `AskUserQuestion` carrying a 2–3 sentence understanding summary plus any
-   decision that genuinely forks the implementation and would be expensive to walk back.
-   Options: approve / refine (they edit, then re-ask) / reject (delete the blueprints, stop).
-   Include a decision only if it is real — small reversible details belong in the blueprint's
-   open questions instead.
+4. **The plan gate.** One `AskUserQuestion`: what you are about to build in 2–3 sentences, the
+   unit list, and the file create/modify/remove count. Options: approve / refine (they edit,
+   then re-ask) / reject (delete the blueprints, stop). Scope was settled at step 2 — do not
+   re-ask it here. Carry a decision into this gate only if writing the blueprints surfaced a
+   fork the research did not; small reversible details belong in the blueprint's open
+   questions instead.
 
 **Do not implement anything until the user picks approve.**
 
@@ -408,7 +425,7 @@ branches is the cheapest collision detector you have.
 Demand three reports per ticket: **claimed**, **blocked or colliding**, **PR open with its
 number**. Ask for the file-level surface *before* they go deep, not after.
 
-**A peer's Spec gate goes to the developer directly, not through you.** A peer is a full
+**A peer's Spec gates — scope and plan both — go to the developer directly, not through you.** A peer is a full
 session in the developer's own terminal, so relaying only adds a hop and a chance for you to
 garble it — and your message can never stand in for the gate anyway, which is the one thing a
 peer message explicitly is not. Ask for the verdict afterwards so the plan file stays true.
@@ -461,7 +478,8 @@ back to the user.
 
 - Blueprints are `BLUEPRINT-<id>.md`; they are transient, gitignored, and deleted once
   implemented. `SPEC.md` is the product spec and is never touched by this skill.
-- Never cross a gate the user has not approved, and never commit to `main`.
+- Never cross a gate the user has not approved, and never commit to `main`. Writing a
+  blueprint before the scope gate is crossing one: the file is the plan.
 - Track work in beads (`bd`). No TodoWrite lists, no markdown checklists, no MEMORY.md —
   durable knowledge goes in the issue that owns it, or in `SPEC.md`. Issue state is not in
   the repo: `bd dolt push` publishes it, `bd bootstrap` sets up a fresh clone.
