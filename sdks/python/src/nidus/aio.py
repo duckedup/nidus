@@ -510,10 +510,14 @@ class AsyncNidusClient:
         diversity: Optional[float] = None,
         rollup: Optional[Rollup] = None,
         rerank: Optional[RerankOpts] = None,
+        reinforce: bool = False,
+        extend_ttl_seconds: Optional[int] = None,
+        rank_by: Optional[RankBy] = None,
     ) -> Hits:
         """Embed ``query`` and vector-search ``collection``, best first.
 
-        ``rerank`` is as in :meth:`nidus.client.NidusClient.recall`.
+        ``rerank``, ``reinforce`` and ``extend_ttl_seconds`` are as in
+        :meth:`nidus.client.NidusClient.recall`.
         """
         return await self._search(
             _wire.recall_path(collection),
@@ -525,6 +529,9 @@ class AsyncNidusClient:
                 diversity=diversity,
                 rollup=rollup,
                 rerank=rerank,
+                reinforce=reinforce,
+                extend_ttl_seconds=extend_ttl_seconds,
+                rank_by=rank_by,
             ),
         )
 

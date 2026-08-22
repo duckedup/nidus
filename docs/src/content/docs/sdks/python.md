@@ -272,6 +272,11 @@ db.remember("notes", "b", long_article, mode="summarize")
 
 # Embed the query text and search, best first
 hits = db.recall("notes", "quick fox", top_k=5, min_score=0.2, filter=[f.eq("tag", "x")])
+
+# Reinforce: stamp nidus.access_count / nidus.last_accessed on every hit
+# returned, and push an existing expiry forward. Off by default, so a plain
+# recall stays a pure read.
+reinforced = db.recall("notes", "quick fox", top_k=5, reinforce=True, extend_ttl_seconds=86400)
 ```
 
 `remember` returns a `RememberResult` (`id`, `upserted`, `deduped`): `id` is the record
@@ -279,6 +284,13 @@ that actually changed, which is not always the one passed in, and `upserted` is 
 row count from the underlying write. See
 [Parity across the surfaces](/guides/remember-and-recall/#parity-across-the-surfaces)
 for how these semantics line up with the other SDKs and the MCP surface.
+
+Setting `reinforce` makes the call a write: it takes the server's writer lock to apply
+the stamp, and against a server started `--read-only` the stamp is skipped with a
+warning rather than failing the recall. `extend_ttl_seconds` only applies with
+`reinforce` set, and only pushes an **existing** `nidus.expires_at` forward; it never
+gives an expiry to an entry that had none. See
+[reinforcement](/guides/remember-and-recall/#reinforcement).
 
 Against a server started **without** an embedder both raise `NidusError` with status
 `400`, and the message names `--embed-provider`; `mode="summarize"` without a summarizer

@@ -19,7 +19,8 @@ use crate::findex::Findex;
 use crate::fts::{Fts, FtsField};
 use crate::log::OpLog;
 use crate::manifest::{MANIFEST_KEY, Manifest, history};
-use crate::model::{AnnConfig, ClusterStatus, Distance, Op, Role, StoreVersions};
+use crate::meta::{META_ACCESS_COUNT, META_EXPIRES_AT, META_LAST_ACCESSED};
+use crate::model::{AnnConfig, ClusterStatus, Distance, Op, Role, StoreVersions, Value};
 use crate::profile::OpenProfile;
 
 pub(crate) mod aggregate;
@@ -257,6 +258,13 @@ pub struct Store {
 }
 
 impl Store {
+    /// FTS postings held, live and tombstoned. Test-only observable for a write that must
+    /// not reindex.
+    #[cfg(test)]
+    pub(crate) fn fts_posting_count(&self) -> usize {
+        self.fts.posting_count()
+    }
+
     /// Open per `config`: take the writer lock unless `ReadOnly`, open data + log, replay the
     /// log into the in-RAM index (ignoring `Upsert`s past the data file — the lock-free reader
     /// rule, §6.2), and auto-compact past `config.auto_compact`.
@@ -1219,6 +1227,33 @@ impl Store {
                         .entry(collection.clone())
                         .or_insert_with(Collection::new);
                     findex.set_schema(&collection, &fields);
+                }
+                Op::Reinforce {
+                    collection,
+                    id,
+                    access_count,
+                    last_accessed,
+                    expires_at,
+                } => {
+                    // A stamp for a doc a later `Delete` removed, or one whose `Upsert`
+                    // referenced a row beyond the snapshot, is not an error: `row` is
+                    // never touched here, so no row joins or leaves the live set.
+                    if let Some(col) = collections.get_mut(&collection)
+                        && let Some(entry) = col.docs.get_mut(&id)
+                    {
+                        entry
+                            .attrs
+                            .insert(META_ACCESS_COUNT.to_string(), Value::Int(access_count));
+                        entry.attrs.insert(
+                            META_LAST_ACCESSED.to_string(),
+                            Value::DateTime(last_accessed),
+                        );
+                        if let Some(exp) = expires_at {
+                            entry
+                                .attrs
+                                .insert(META_EXPIRES_AT.to_string(), Value::DateTime(exp));
+                        }
+                    }
                 }
             }
         }

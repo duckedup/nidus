@@ -146,6 +146,9 @@ pub(super) struct RecallArgs {
     pub filter: Option<String>,
     pub diversity: Option<f32>,
     pub rollup: Option<crate::memory::Rollup>,
+    pub rank_by: Option<String>,
+    pub reinforce: bool,
+    pub extend_ttl_seconds: Option<i64>,
 }
 
 /// `nidus recall`: embed `query` and print the ranked hits, in the shape `search` prints.
@@ -158,6 +161,9 @@ pub(super) fn recall(store: StoreArgs, ingest: IngestArgs, args: RecallArgs) -> 
         filter,
         diversity,
         rollup,
+        rank_by,
+        reinforce,
+        extend_ttl_seconds,
     } = args;
     let filter: Option<Filter> = match filter {
         Some(s) => Some(
@@ -166,13 +172,21 @@ pub(super) fn recall(store: StoreArgs, ingest: IngestArgs, args: RecallArgs) -> 
         ),
         None => None,
     };
+    let rank_by = match rank_by {
+        Some(s) => Some(
+            serde_json::from_str(&s)
+                .with_context(|| format!("--rank-by must be a JSON ranking expression, got {s}"))?,
+        ),
+        None => None,
+    };
     let rt = runtime()?;
 
     rt.block_on(async move {
         let embedder = require_embedder(&ingest).await?;
-        // Read-only: a recall must run alongside a `nidus serve` holding the writer lock.
-        let db = open_with(store, &embedder, false)?;
-        let memory = Memory::new(db, embedder);
+        // `--reinforce` takes the writer lock (it stamps access counters durably); a
+        // plain recall stays read-only, so it can run beside a `nidus serve` writer.
+        let db = open_with(store, &embedder, reinforce)?;
+        let mut memory = Memory::new(db, embedder);
 
         let opts = RecallOpts {
             top_k,
@@ -180,8 +194,16 @@ pub(super) fn recall(store: StoreArgs, ingest: IngestArgs, args: RecallArgs) -> 
             filter,
             diversity,
             rollup,
+            rank_by,
+            reinforce,
+            extend_ttl_seconds,
         };
         let hits = memory.recall(&collection, &query, &opts).await?;
+        // Only the reinforced path opened ReadWrite; `flush` on a ReadOnly store errors,
+        // so a plain recall must not call it — that would break the read-only guarantee.
+        if reinforce {
+            memory.db_mut().flush()?;
+        }
         let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
         super::print_json(&out)
     })

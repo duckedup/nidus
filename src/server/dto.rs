@@ -631,6 +631,19 @@ pub struct RecallRequest {
     #[cfg(feature = "rerank")]
     #[serde(default)]
     pub rerank: Option<RerankRequest>,
+    /// Stamp `nidus.access_count` / `nidus.last_accessed` on every returned entry. This
+    /// makes the recall a **write**: it takes the writer lock, and is refused on a
+    /// read-only store rather than answered as though the stamp happened.
+    #[serde(default)]
+    pub reinforce: bool,
+    /// Push an existing `nidus.expires_at` forward to `now + this`. Only honoured with
+    /// `reinforce`; never creates an expiry on an entry that had none.
+    #[serde(default)]
+    pub extend_ttl_seconds: Option<i64>,
+    /// Ranking expression layered over cosine, the same shape `/search` takes: decay over
+    /// `nidus.last_accessed`, a reinforcement term over `nidus.access_count`, or both.
+    #[serde(default)]
+    pub rank_by: Option<RankBy>,
 }
 
 /// Serializable mirror of [`crate::Hit`] (which carries no serde derive).

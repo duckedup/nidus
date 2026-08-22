@@ -568,10 +568,16 @@ def recall_body(
     diversity: Optional[float] = None,
     rollup: Optional[Rollup] = None,
     rerank: Optional[RerankOpts] = None,
+    reinforce: bool = False,
+    extend_ttl_seconds: Optional[int] = None,
+    rank_by: Optional[RankBy] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /collections/{name}/recall`` (query text in, hits out).
 
-    ``rerank`` is documented on :class:`~nidus.types.RerankOpts`.
+    ``rerank`` is documented on :class:`~nidus.types.RerankOpts`. ``reinforce`` and
+    ``extend_ttl_seconds`` are both omitted (server default, unchanged) unless set:
+    ``prune`` only drops ``None``, so a bare ``False`` is turned into ``None`` here to
+    keep it off the wire.
     """
     return prune(
         {
@@ -582,6 +588,9 @@ def recall_body(
             "diversity": diversity,
             "rollup": _rollup(rollup),
             "rerank": _rerank(rerank),
+            "reinforce": reinforce or None,
+            "extend_ttl_seconds": extend_ttl_seconds,
+            "rank_by": rank_by,
         }
     )
 

@@ -1,5 +1,5 @@
-//! The four read-only search tools — `recall`, `text_search`, `hybrid_search`, `related` —
-//! and the metadata `filter` they share (nidus-k28.3).
+//! The four search tools — `recall`, `text_search`, `hybrid_search`, `related` — and the
+//! metadata `filter` they share (nidus-k28.3). `recall`'s `reinforce` flag also writes.
 
 use rmcp::{
     ErrorData as McpError,
@@ -332,7 +332,16 @@ pub(super) fn tools() -> Vec<Tool> {
                     "diversity": diversity_schema(),
                     "rollup": rollup_schema(),
                     "rerank": rerank_bool_schema(),
-                    "rerank_overscan": rerank_overscan_schema()
+                    "rerank_overscan": rerank_overscan_schema(),
+                    "reinforce": {
+                        "type": "boolean",
+                        "description": "Record that these entries were useful. Entries you recall with this set float up in later searches that rank on reinforcement, and entries nothing ever recalls sink. Leave it off for a plain lookup."
+                    },
+                    "extend_ttl_seconds": {
+                        "type": "integer",
+                        "description": "Also push the expiry of every returned entry out to this many seconds from now. Only applies with `reinforce`, and only to entries that already expire.",
+                        "minimum": 1
+                    }
                 },
                 "required": ["collection", "query"],
                 "additionalProperties": false
@@ -466,6 +475,8 @@ impl NidusMcp {
         let diversity = optional_f32(args, "diversity")?;
         let rollup = parse_rollup(args)?;
         let rerank = parse_rerank(args)?;
+        let reinforce = optional_bool(args, "reinforce")?;
+        let extend_ttl_seconds = optional_usize(args, "extend_ttl_seconds")?.map(|s| s as i64);
 
         let vector = embedder
             .embed_query(&query)
@@ -501,14 +512,23 @@ impl NidusMcp {
             ));
         }
 
-        let hits = crate::server::run_read(self.state.clone(), move |db| {
-            // Recalling with a different embedder than wrote the collection returns
-            // nonsense, so the same guard the HTTP route uses refuses it.
-            crate::memory::guard_recall_identity(db, embedder.as_ref(), &collection)?;
-            db.search(collection.as_str(), &vector, &opts)
-        })
-        .await
-        .map_err(api_error)?;
+        let hits = if reinforce {
+            crate::server::run_write(self.state.clone(), move |db| {
+                crate::memory::guard_recall_identity(db, embedder.as_ref(), &collection)?;
+                crate::memory::commit_recall(db, &collection, &vector, &opts, extend_ttl_seconds)
+            })
+            .await
+            .map_err(api_error)?
+        } else {
+            crate::server::run_read(self.state.clone(), move |db| {
+                // Recalling with a different embedder than wrote the collection returns
+                // nonsense, so the same guard the HTTP route uses refuses it.
+                crate::memory::guard_recall_identity(db, embedder.as_ref(), &collection)?;
+                db.search(collection.as_str(), &vector, &opts)
+            })
+            .await
+            .map_err(api_error)?
+        };
 
         Ok(hits_content(hits.into_iter().map(HitDto::from).collect()))
     }

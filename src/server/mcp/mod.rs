@@ -153,7 +153,9 @@ impl ServerHandler for NidusMcp {
         ))
         .with_instructions(
             "nidus is a vector store used here as long-term memory. Use `remember` to \
-                 store text worth keeping and `recall` to find it again by meaning. \
+                 store text worth keeping and `recall` to find it again by meaning. Pass \
+                 `reinforce` to `recall` to record that the entries you got back were \
+                 useful, so memory that earns its place ranks higher over time. \
                  `text_search` matches exact wording instead, and `hybrid_search` does both \
                  at once. Call `list_collections` if you do not know which collection to \
                  use, or `browse` to see what a collection already holds before adding to \

@@ -111,7 +111,7 @@ pub use config::{Config, Fsync, LeaseWait, OpenMode};
 pub use data::SegmentIntegrity;
 pub use findex::FilterIndexField;
 pub use fts::{Analyzer, FtsField, Language};
-pub use meta::META_EXPIRES_AT;
+pub use meta::{META_ACCESS_COUNT, META_EXPIRES_AT, META_LAST_ACCESSED};
 pub use model::{
     AggregateOpts, Aggregation, AnnConfig, AnnKind, ClusterStatus, DEFAULT_RERANK_OVERSCAN, Decay,
     Distance, Expand, Filter, Footprint, FtsClause, FtsCombine, FtsQuery, Group, Hit, HybridOpts,
@@ -511,6 +511,19 @@ impl Nidus {
             self.compact()?;
         }
         Ok(swept)
+    }
+
+    /// Stamp `nidus.access_count` / `nidus.last_accessed` on the given entries, optionally
+    /// pushing an existing `nidus.expires_at` forward. Refused on a ReadOnly store, which is
+    /// why `Memory::recall` checks the mode before calling it.
+    pub fn reinforce(
+        &mut self,
+        collection: &str,
+        ids: &[&str],
+        extend_ttl_seconds: Option<i64>,
+    ) -> Result<usize> {
+        self.store
+            .reinforce(collection, ids, meta::now_ms(), extend_ttl_seconds)
     }
 
     /// Adopt a separate writer's newer committed state into a lock-free `ReadOnly` handle without

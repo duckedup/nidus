@@ -68,6 +68,7 @@ searchers plus one writer (see
 | `commit` | `fn commit(&mut self) -> Result<()>` | Take one barrier covering everything appended by `deferred` (fsync `data`, then `log`). A no-op when no barrier is owed, so the ordinary path pays nothing. Narrower than `flush`: no segment seal, no working-set publish. |
 | `compact` | `fn compact(&mut self) -> Result<()>` | Rewrite `data` to reclaim dead rows. |
 | `sweep_expired` | `fn sweep_expired(&mut self) -> Result<usize>` | Delete every entry across every collection whose `nidus.expires_at` has passed, then compact to reclaim the rows, in one call. Returns the number of entries deleted. Available in every build, no feature flag. |
+| `reinforce` | `fn reinforce(&mut self, collection: &str, ids: &[&str], extend_ttl_seconds: Option<i64>) -> Result<usize>` | Stamp `nidus.access_count` / `nidus.last_accessed` on `ids`, optionally pushing an existing `nidus.expires_at` forward. The durable half of a reinforced recall; absent ids are skipped, not an error. Refused on a read-only store. Available in every build, no feature flag. |
 | `refresh` | `fn refresh(&mut self) -> Result<bool>` | Adopt a separate writer's newer committed state into a lock-free [`ReadOnly`](/reference/configuration/#openmode) handle without reopening; it picks up appends, deletes, seals, and compactions at one consistent point. Returns `true` when newer state was adopted, `false` when already current (the cheap case) or for a `ReadWrite`/in-memory handle. See [refreshing a reader](/guides/storage/#refreshing-a-reader). |
 | `refresh_to` | `fn refresh_to(&mut self, version: u64) -> Result<()>` | Move a `ReadOnly` handle to a pinned snapshot at that past commit version, at one consistent point (a failure leaves the prior snapshot serving). Errors, naming the oldest readable version, when that version's bytes are gone. See [point-in-time reads](/guides/storage/#point-in-time-reads). |
 | `versions` | `fn versions(&self) -> Result<StoreVersions>` | The commit-version landscape: the current `commit_version`, the `oldest_readable` one, this handle's `pinned` version, and the full `readable` set. Costs one backend listing, so call it out of band rather than per query. |
@@ -332,6 +333,9 @@ pub struct Decay {
     pub decay: f32,     // factor at one `scale` of age; default 0.5 (a half-life)
     pub lambda: f32,    // score a fully-decayed hit gives up; default 1.0
     pub missing: f32,   // factor when the attr is absent/unusable; default 1.0
+    pub count_field: Option<String>, // reinforcement count attr; None skips the term
+    pub count_scale: f32,   // saturation constant k in n / (n + k); default 10.0
+    pub count_lambda: f32,  // penalty an unreinforced record pays; default 1.0
 }
 ```
 
@@ -344,6 +348,16 @@ for raw BM25, not just cosine.
 enabling decay never buries data that predates the field. `rank_by` does not force the
 exact path; over an ANN or quantized result set it reorders within an approximate
 candidate set. A ranked scan runs single-threaded.
+
+`count_field` layers a second, independent penalty on top of the recency one: set it
+with `.count_field(_)` (plus optional `.count_scale(_)` / `.count_lambda(_)`) to read an
+integer count attribute, typically `nidus.access_count` from a
+[reinforced recall](/guides/remember-and-recall/#reinforcement), and subtract
+`count_lambda * (1 − n / (n + count_scale))` from the score. A high count pays a small
+penalty; a record with no count at all pays the full `count_lambda`, on purpose: the
+point of the term is that memories nothing ever recalls sink. `field` may be empty when
+only the count term is wanted. `count_field` defaults to `None`, so an existing `Decay`
+with no count knobs set ranks exactly as it always has.
 
 ## `LimitPer`
 
@@ -757,7 +771,7 @@ impl Memory {
     pub fn with_summarizer(mut self, summarizer: AnySummarizer) -> Self;
     pub async fn remember(&mut self, collection: &str, id: &str, text: &str, opts: RememberOpts) -> Result<Remembered>;
     pub async fn remember_chunked(&mut self, collection: &str, parent_id: &str, text: &str, chunk_opts: &ChunkOpts, opts: RememberOpts) -> Result<ChunkedRemembered>;
-    pub async fn recall(&self, collection: &str, query_text: &str, opts: &RecallOpts) -> Result<Vec<Hit>>;
+    pub async fn recall(&mut self, collection: &str, query_text: &str, opts: &RecallOpts) -> Result<Vec<Hit>>;
     pub fn db(&self) -> &Nidus;       // the raw Vec<f32> API escape hatch
     pub fn db_mut(&mut self) -> &mut Nidus;
     pub fn into_inner(self) -> Nidus; // drops the embedder/summarizer
@@ -792,6 +806,10 @@ pub struct RecallOpts {
     pub top_k: usize,           // 0 means "use the default" (10)
     pub min_score: f32,         // drop hits scoring below this cosine similarity; 0.0 applies no floor
     pub filter: Option<Filter>, // optional pre-scoring metadata filter
+    pub diversity: Option<f32>, // MMR lambda spreading the recalled window; None skips the pass
+    pub reinforce: bool,        // stamp nidus.access_count / nidus.last_accessed on every returned entry
+    pub extend_ttl_seconds: Option<i64>, // with reinforce, push an existing expiry forward
+    pub rank_by: Option<RankBy>, // ranking expression over the metric, e.g. a reinforcement term
 }
 ```
 
@@ -799,6 +817,20 @@ pub struct RecallOpts {
 `RememberOpts { ttl_seconds: Some(3600), ..Default::default() }` is the idiomatic call.
 `RememberMode::Raw` embeds and stores the text as given; `Summarize` needs a summarizer
 attached via `with_summarizer` and additionally requires the `summarize` feature.
+
+`reinforce` and `extend_ttl_seconds` opt into
+[reinforcement](/guides/remember-and-recall/#reinforcement), off by default so a plain
+`recall` stays a pure read. Setting `reinforce` makes the call a **write**: it takes the
+writer lock to stamp the returned entries. On a store opened
+[`OpenMode::ReadOnly`](/reference/configuration/#openmode), that stamp is skipped with a
+warning rather than failing the recall, the same way across `Memory::recall`, the HTTP
+and MCP surfaces, and the CLI: an optional bookkeeping write must not sink an otherwise
+good recall. Reaching a *writable* handle in the first place is the part that can fail
+outright: `nidus recall --reinforce` opens the store read-write for the call, and that
+open is refused if another process, such as a live `nidus serve`, already holds the
+writer lock. `extend_ttl_seconds` only pushes an **existing** `nidus.expires_at`
+forward; it never creates an expiry on an entry that had none, and never moves one
+backwards.
 
 `remember_chunked` splits `text` with [`chunk_text`](#chunk-chunkstrategy-chunkopts-chunk--chunk_text)
 under `chunk_opts`, embeds every chunk in one batched call, and writes one record per
@@ -841,6 +873,8 @@ Attr and collection-meta keys `remember`/`recall` stamp and read. All gated on
 | `META_EXPIRES_AT` | `nidus.expires_at` | ungated. `Value::DateTime` after which an entry is expired; absent means it never expires. Consulted by `Nidus::sweep_expired` |
 | `META_PARENT_ID` | `nidus.parent_id` | ungated. `Value::Str`: the id of the document a chunk was split from. Stamped by `remember_chunked` on every chunk record |
 | `META_CHUNK_INDEX` | `nidus.chunk_index` | ungated. `Value::Int`: the chunk's 0-based position within its parent document. Stamped by `remember_chunked`; lets a stale tail be deleted with a `Ge` filter |
+| `META_ACCESS_COUNT` | `nidus.access_count` | ungated. `Value::Int`: how many reinforced recalls have returned this entry. Absent means never recalled. Stamped only by `Nidus::reinforce`/a reinforced recall, and stripped from caller-supplied attrs like every other reserved key |
+| `META_LAST_ACCESSED` | `nidus.last_accessed` | ungated. `Value::DateTime` (UTC epoch ms): the last reinforced recall. Stamped alongside `META_ACCESS_COUNT` |
 
 ## `chunk`: `ChunkStrategy`, `ChunkOpts`, `Chunk` & `chunk_text`
 

@@ -269,6 +269,10 @@ out = db.remember("notes", "c", "the quick brown fox", ttl_seconds=3600, dedupe_
 
 # Embed the query text and search, best first
 hits = db.recall("notes", "quick fox", top_k=5, min_score=0.2, filter=[f.eq("tag", "x")])
+
+# reinforce=True bumps each returned entry's nidus.access_count (a write, so it needs a
+# writable server) and extend_ttl_seconds pushes an existing expiry further out.
+db.recall("notes", "quick fox", reinforce=True, extend_ttl_seconds=3600)
 ```
 
 `remember` returns a `RememberResult` — `id`, `upserted`, `deduped`. Read `id` from it
@@ -356,6 +360,11 @@ by default, and a record whose timestamp is missing or unusable is **not** penal
 (`missing` defaults to 1.0). `origin` takes an aware `datetime` or epoch milliseconds and
 `scale` a `timedelta` or milliseconds; `lambda_` carries the underscore because `lambda`
 is a reserved word, and travels as `lambda`.
+
+`count_field`, `count_scale`, and `count_lambda` add a second, independent term that reads
+a reinforcement count off `count_field` (see `reinforce` below) and subtracts a penalty the
+same way: a much-recalled entry pays less, never more, and the term applies only when
+`count_field` is set.
 
 ## Three things the client refuses to send
 

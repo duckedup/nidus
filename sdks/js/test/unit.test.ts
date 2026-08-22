@@ -467,6 +467,50 @@ describe("NidusClient request shaping", () => {
     });
   });
 
+  it("rankBy with count knobs maps to snake_case", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    await db.search({
+      query: [1, 0, 0],
+      rankBy: {
+        decay: {
+          field: "ts",
+          origin: 1700000000000,
+          countField: "nidus.access_count",
+          countScale: 20,
+          countLambda: 0.5,
+        },
+      },
+    });
+    expect(calls[0]!.json).toMatchObject({
+      rank_by: {
+        Decay: {
+          field: "ts",
+          origin: 1700000000000,
+          count_field: "nidus.access_count",
+          count_scale: 20,
+          count_lambda: 0.5,
+        },
+      },
+    });
+  });
+
+  it("a rankBy without count knobs is byte-identical to before", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    await db.search({
+      query: [1, 0, 0],
+      rankBy: { decay: { field: "ts", origin: 1700000000000 } },
+    });
+    const decay = (calls[0]!.json as { rank_by: { Decay: object } }).rank_by.Decay;
+    expect(Object.keys(decay)).toEqual(["field", "origin"]);
+    expect("count_field" in decay).toBe(false);
+    expect("count_scale" in decay).toBe(false);
+    expect("count_lambda" in decay).toBe(false);
+  });
+
   it("keeps the single-field text query spelling and adds the clause list", async () => {
     const { fn, calls } = mockFetch([]);
     const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
@@ -899,6 +943,42 @@ describe("memory (remember/recall)", () => {
     expect(calls[0]!.json).toEqual({ query: "hello", filter: [] });
   });
 
+  it("recall omits reinforce when unset", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.recall("notes", "hello");
+    const body = calls[0]!.json as Record<string, unknown>;
+    expect("reinforce" in body).toBe(false);
+    expect("extend_ttl_seconds" in body).toBe(false);
+  });
+
+  it("recall sends reinforce and extend_ttl_seconds in snake_case", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.recall("notes", "hello", { reinforce: true, extendTtlSeconds: 3600 });
+    expect(calls[0]!.json).toEqual({
+      query: "hello",
+      filter: [],
+      reinforce: true,
+      extend_ttl_seconds: 3600,
+    });
+  });
+
+  it("recall sends rankBy, and omits it when unset", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.recall("notes", "hello", {
+      rankBy: { decay: { field: "", origin: 0, countField: "nidus.access_count" } },
+    });
+    expect(calls[0]!.json).toEqual({
+      query: "hello",
+      filter: [],
+      rank_by: { Decay: { field: "", origin: 0, count_field: "nidus.access_count" } },
+    });
+    await db.recall("notes", "hello");
+    expect("rank_by" in (calls[1]!.json as Record<string, unknown>)).toBe(false);
+  });
+
   it("surfaces a 400 (no embedder configured) as a NidusError", async () => {
     const { fn } = mockFetch(
       { error: "nidus serve was started without an embedder; pass --embed-provider …" },
@@ -1076,3 +1156,4 @@ describe("ops surface (ready/cluster/refresh)", () => {
     expect(await dbFalse.refresh()).toBe(false);
   });
 });
+

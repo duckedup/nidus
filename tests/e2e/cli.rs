@@ -912,6 +912,260 @@ fn recall_runs_against_a_dir_a_server_holds() {
     assert!(err.contains("locked"), "{err}");
 }
 
+/// `--reinforce` opens ReadWrite, so unlike a plain recall it collides with a server
+/// holding the writer lock — the new failure mode this unit introduces. It must fail
+/// loudly, naming the lock, not silently skip the stamp.
+#[cfg(all(feature = "mcp", feature = "embed-ollama"))]
+#[test]
+fn reinforce_recall_refuses_while_a_server_holds_the_writer_lock() {
+    use crate::mcp::support::{DIM, per_text_embedder_server};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+    let url = crate::mcp::support::mock_embedder_per_text(DIM);
+    let e = embed_args(&url);
+    let (p, b) = (e[0].as_str(), e[1].as_str());
+    let (u, v) = (e[2].as_str(), e[3].as_str());
+
+    ok(
+        &[
+            "remember",
+            "--dir",
+            dir,
+            p,
+            b,
+            u,
+            v,
+            "--id",
+            "seeded",
+            "notes",
+            "deploys run at noon",
+        ],
+        "",
+    );
+
+    let server = per_text_embedder_server(tmp.path(), DIM);
+    assert_eq!(server.get("/health").0, 200);
+
+    let err = fails(
+        &[
+            "recall",
+            "--dir",
+            dir,
+            p,
+            b,
+            u,
+            v,
+            "--reinforce",
+            "-k",
+            "5",
+            "notes",
+            "deploys",
+        ],
+        "",
+    );
+    assert!(err.contains("locked"), "{err}");
+}
+
+/// With nothing holding the writer lock, `--reinforce` stamps `nidus.access_count`
+/// durably; a second reinforced recall bumps it again, proving the stamp lands on disk
+/// rather than only in the printed hits (which `recall` would show either way).
+#[cfg(all(feature = "mcp", feature = "embed-ollama"))]
+#[test]
+fn reinforce_recall_stamps_when_nothing_holds_the_lock() {
+    use crate::mcp::support::DIM;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+    let url = crate::mcp::support::mock_embedder_per_text(DIM);
+    let e = embed_args(&url);
+    let (p, b) = (e[0].as_str(), e[1].as_str());
+    let (u, v) = (e[2].as_str(), e[3].as_str());
+
+    ok(
+        &[
+            "remember",
+            "--dir",
+            dir,
+            p,
+            b,
+            u,
+            v,
+            "--id",
+            "seeded",
+            "notes",
+            "deploys run at noon",
+        ],
+        "",
+    );
+
+    ok(
+        &[
+            "recall",
+            "--dir",
+            dir,
+            p,
+            b,
+            u,
+            v,
+            "--reinforce",
+            "-k",
+            "5",
+            "notes",
+            "deploys",
+        ],
+        "",
+    );
+    let recs = ok(&["get", "--dir", dir, "notes"], "");
+    let seeded = recs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "seeded")
+        .expect("seeded record");
+    assert_eq!(
+        seeded["attrs"]["nidus.access_count"],
+        json!({"Int": 1}),
+        "{recs}"
+    );
+
+    ok(
+        &[
+            "recall",
+            "--dir",
+            dir,
+            p,
+            b,
+            u,
+            v,
+            "--reinforce",
+            "-k",
+            "5",
+            "notes",
+            "deploys",
+        ],
+        "",
+    );
+    let recs = ok(&["get", "--dir", dir, "notes"], "");
+    let seeded = recs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "seeded")
+        .expect("seeded record");
+    assert_eq!(
+        seeded["attrs"]["nidus.access_count"],
+        json!({"Int": 2}),
+        "{recs}"
+    );
+}
+
+/// `--read-only` and `--reinforce` together are refused before the store is even opened
+/// (the existing mutating-command guard), not left to fail obscurely once reinforcement
+/// tries to write.
+#[cfg(all(feature = "mcp", feature = "embed-ollama"))]
+#[test]
+fn read_only_plus_reinforce_is_refused_before_opening() {
+    use crate::mcp::support::DIM;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+    let url = crate::mcp::support::mock_embedder_per_text(DIM);
+    let e = embed_args(&url);
+    let (p, b) = (e[0].as_str(), e[1].as_str());
+    let (u, v) = (e[2].as_str(), e[3].as_str());
+
+    ok(
+        &[
+            "remember",
+            "--dir",
+            dir,
+            p,
+            b,
+            u,
+            v,
+            "--id",
+            "seeded",
+            "notes",
+            "deploys run at noon",
+        ],
+        "",
+    );
+
+    let err = fails(
+        &[
+            "recall",
+            "--dir",
+            dir,
+            "--read-only",
+            p,
+            b,
+            u,
+            v,
+            "--reinforce",
+            "-k",
+            "5",
+            "notes",
+            "deploys",
+        ],
+        "",
+    );
+    assert!(
+        err.contains("--read-only was set, but this command mutates the store"),
+        "{err}"
+    );
+}
+
+/// A plain recall (no `--reinforce`) stamps nothing — the unreinforced behaviour this
+/// unit must leave unchanged.
+#[cfg(all(feature = "mcp", feature = "embed-ollama"))]
+#[test]
+fn a_plain_recall_still_stamps_nothing() {
+    use crate::mcp::support::DIM;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().expect("utf-8 temp path");
+    let url = crate::mcp::support::mock_embedder_per_text(DIM);
+    let e = embed_args(&url);
+    let (p, b) = (e[0].as_str(), e[1].as_str());
+    let (u, v) = (e[2].as_str(), e[3].as_str());
+
+    ok(
+        &[
+            "remember",
+            "--dir",
+            dir,
+            p,
+            b,
+            u,
+            v,
+            "--id",
+            "seeded",
+            "notes",
+            "deploys run at noon",
+        ],
+        "",
+    );
+    ok(
+        &[
+            "recall", "--dir", dir, p, b, u, v, "-k", "5", "notes", "deploys",
+        ],
+        "",
+    );
+
+    let recs = ok(&["get", "--dir", dir, "notes"], "");
+    let seeded = recs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "seeded")
+        .expect("seeded record");
+    assert!(
+        seeded["attrs"].get("nidus.access_count").is_none(),
+        "{recs}"
+    );
+}
+
 /// Both subcommands need an embedder, and the refusal must name the flag that supplies
 /// one — the store is otherwise perfectly openable, so the error is the only signal.
 #[cfg(all(feature = "mcp", feature = "embed-ollama"))]

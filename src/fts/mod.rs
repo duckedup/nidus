@@ -71,6 +71,12 @@ impl FieldIndex {
         self.cfg.analyzer
     }
 
+    /// Postings held for this field, live and tombstoned. Test-only (see `Fts::posting_count`).
+    #[cfg(test)]
+    pub(crate) fn posting_count(&self) -> usize {
+        self.postings.values().map(|v| v.len()).sum()
+    }
+
     /// Index (or re-index) document `id` with this field's `text`. Re-indexing an
     /// existing id tombstones its previous docnum first (lazy delete — the old postings
     /// stay but are skipped via hint-verify). O(terms in `text`).
@@ -197,6 +203,13 @@ impl Fts {
     /// all FTS work on the hot path.
     pub(crate) fn is_active(&self) -> bool {
         !self.schema.is_empty()
+    }
+
+    /// Total postings held, live and tombstoned. Test-only: the observable for "this write
+    /// did not re-append", which scores cannot show because `index` corrects live counts.
+    #[cfg(test)]
+    pub(crate) fn posting_count(&self) -> usize {
+        self.fields.values().map(|idx| idx.posting_count()).sum()
     }
 
     /// The on-disk cache validity key: format version plus the full declared schema —

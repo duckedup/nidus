@@ -325,7 +325,9 @@ fn is_mutation(method: &Method, path: &str) -> bool {
     if method == Method::GET || method == Method::HEAD {
         return false;
     }
-    // Read-shaped POSTs, and the per-collection `recall` (a search over text).
+    // Read-shaped POSTs, and the per-collection `recall` (a search over text). An
+    // opted-in `reinforce` recall does write, but the middleware can't see the body to
+    // know that; the stamp is bounded (one log record per hit), so the read deadline stands.
     !(matches!(
         path,
         "/search" | "/text-search" | "/hybrid-search" | "/list"

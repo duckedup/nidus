@@ -9018,3 +9018,257 @@ fn diversity_handles_a_text_only_hit() {
     // second copy rather than burying or dropping it.
     assert_eq!(ids, ["vec0", "textual", "vec1"], "{ids:?}");
 }
+
+// ── Reinforcement stamp (nidus-gk6) ──────────────────────────────────────────
+
+use crate::findex::FilterIndexField;
+use crate::meta::{META_ACCESS_COUNT, META_EXPIRES_AT, META_LAST_ACCESSED};
+
+#[test]
+fn reinforce_increments_from_absent_and_then_from_a_prior_count() {
+    let mut store = Store::in_memory(2).unwrap();
+    store.upsert("docs", &[rec("a", vec![1.0, 0.0])]).unwrap();
+
+    assert_eq!(store.reinforce("docs", &["a"], 1_000, None).unwrap(), 1);
+    let first = store.get("docs", "a").unwrap();
+    assert_eq!(first.attrs.get(META_ACCESS_COUNT), Some(&Value::Int(1)));
+    assert_eq!(
+        first.attrs.get(META_LAST_ACCESSED),
+        Some(&Value::DateTime(1_000))
+    );
+
+    store.reinforce("docs", &["a"], 2_000, None).unwrap();
+    let second = store.get("docs", "a").unwrap();
+    assert_eq!(second.attrs.get(META_ACCESS_COUNT), Some(&Value::Int(2)));
+    assert_eq!(
+        second.attrs.get(META_LAST_ACCESSED),
+        Some(&Value::DateTime(2_000))
+    );
+}
+
+/// The regression test for the `UpsertText` vector-stripping trap: reinforcing a vectored
+/// doc must leave its row and score untouched, not just leave `row` as `Some`.
+#[test]
+fn reinforce_leaves_the_row_and_every_other_attr_alone() {
+    let mut store = Store::in_memory(2).unwrap();
+    store
+        .upsert(
+            "docs",
+            &[rec_with(
+                "a",
+                vec![1.0, 0.0],
+                BTreeMap::from([("keep".to_string(), Value::Str("mine".to_string()))]),
+            )],
+        )
+        .unwrap();
+    let before = store
+        .search(&["docs"], &[1.0, 0.0], &default_opts(1))
+        .unwrap();
+    assert_eq!(before.len(), 1, "must be searchable before reinforcing");
+
+    store.reinforce("docs", &["a"], 1_000, None).unwrap();
+
+    let after = store
+        .search(&["docs"], &[1.0, 0.0], &default_opts(1))
+        .unwrap();
+    assert_eq!(
+        after.len(),
+        1,
+        "the doc must still be searchable — its row must survive"
+    );
+    assert_eq!(
+        after[0].score, before[0].score,
+        "reinforce must not change the score — the vector/row is untouched"
+    );
+    assert_eq!(
+        after[0].attrs.get("keep"),
+        Some(&Value::Str("mine".to_string())),
+        "every other attr must survive untouched"
+    );
+}
+
+#[test]
+fn reinforce_does_not_count_a_dead_row() {
+    let mut store = Store::in_memory(2).unwrap();
+    store.upsert("docs", &[rec("a", vec![1.0, 0.0])]).unwrap();
+    let before = store.dead_rows;
+    for i in 0..5 {
+        store.reinforce("docs", &["a"], 1_000 + i, None).unwrap();
+    }
+    assert_eq!(
+        store.dead_rows, before,
+        "pure reads must never fire compaction bookkeeping"
+    );
+}
+
+#[cfg_attr(miri, ignore)] // fsync — syscalls Miri does not implement
+#[test]
+fn reinforce_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store.upsert("docs", &[rec("a", vec![1.0, 0.0])]).unwrap();
+        store.reinforce("docs", &["a"], 5_000, None).unwrap();
+    }
+    let store = Store::open(Config::new(&path, 2)).unwrap();
+    let record = store.get("docs", "a").unwrap();
+    assert_eq!(record.attrs.get(META_ACCESS_COUNT), Some(&Value::Int(1)));
+    assert_eq!(
+        record.attrs.get(META_LAST_ACCESSED),
+        Some(&Value::DateTime(5_000))
+    );
+}
+
+#[test]
+fn reinforce_skips_an_absent_id_without_erroring() {
+    let mut store = Store::in_memory(2).unwrap();
+    store.upsert("docs", &[rec("a", vec![1.0, 0.0])]).unwrap();
+    let stamped = store
+        .reinforce("docs", &["a", "ghost"], 1_000, None)
+        .unwrap();
+    assert_eq!(stamped, 1, "only the present id is stamped");
+    assert_eq!(
+        store
+            .reinforce("no-such-collection", &["a"], 1_000, None)
+            .unwrap(),
+        0,
+        "an absent collection is skipped too, not an error"
+    );
+}
+
+#[cfg_attr(miri, ignore)] // fsync — syscalls Miri does not implement
+#[test]
+fn reinforce_is_refused_on_a_read_only_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store.upsert("docs", &[rec("a", vec![1.0, 0.0])]).unwrap();
+    }
+    let mut store = Store::open(Config::new(&path, 2).open_mode(OpenMode::ReadOnly)).unwrap();
+    assert!(store.reinforce("docs", &["a"], 1_000, None).is_err());
+}
+
+#[test]
+fn extend_ttl_moves_an_existing_expiry_forward_only() {
+    let mut store = Store::in_memory(2).unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                rec("no-expiry", vec![1.0, 0.0]),
+                rec_with(
+                    "near-expiry",
+                    vec![0.0, 1.0],
+                    BTreeMap::from([(META_EXPIRES_AT.to_string(), Value::DateTime(1_500))]),
+                ),
+                rec_with(
+                    "far-expiry",
+                    vec![1.0, 1.0],
+                    BTreeMap::from([(META_EXPIRES_AT.to_string(), Value::DateTime(10_000))]),
+                ),
+            ],
+        )
+        .unwrap();
+
+    // now = 1_000, extend = 5s → a floor of 6_000.
+    store
+        .reinforce(
+            "docs",
+            &["no-expiry", "near-expiry", "far-expiry"],
+            1_000,
+            Some(5),
+        )
+        .unwrap();
+
+    let no_expiry = store.get("docs", "no-expiry").unwrap();
+    assert!(
+        !no_expiry.attrs.contains_key(META_EXPIRES_AT),
+        "never had an expiry, must not gain one"
+    );
+    let near = store.get("docs", "near-expiry").unwrap();
+    assert_eq!(
+        near.attrs.get(META_EXPIRES_AT),
+        Some(&Value::DateTime(6_000)),
+        "a nearer expiry moves out to now + extend"
+    );
+    let far = store.get("docs", "far-expiry").unwrap();
+    assert_eq!(
+        far.attrs.get(META_EXPIRES_AT),
+        Some(&Value::DateTime(10_000)),
+        "an already-further expiry must not move back"
+    );
+}
+
+#[test]
+fn reinforce_makes_the_count_filterable() {
+    let mut store = Store::in_memory(2).unwrap();
+    store.upsert("docs", &[rec("a", vec![1.0, 0.0])]).unwrap();
+    store
+        .set_filter_index("docs", &[FilterIndexField::new(META_ACCESS_COUNT)])
+        .unwrap();
+
+    store.reinforce("docs", &["a"], 1_000, None).unwrap();
+
+    let hits = store
+        .list(
+            &["docs"],
+            &ListOpts {
+                filter: Filter(vec![Predicate::Ge(
+                    META_ACCESS_COUNT.to_string(),
+                    Value::Int(1),
+                )]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "the reinforced doc must be found via the filter"
+    );
+}
+
+/// A stamp writes only the two reinforcement attrs, so a collection whose FTS schema covers
+/// something else must not be reindexed: `FieldIndex::index` tombstones and re-appends, so a
+/// reindex per recall would leak a dead posting set per stamp on a read path.
+#[test]
+fn reinforce_does_not_reindex_a_collection_it_does_not_touch() {
+    let mut store = Store::in_memory(2).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    let mut attrs = BTreeMap::new();
+    attrs.insert("body".to_string(), Value::Str("deploys run at noon".into()));
+    store
+        .upsert(
+            "docs",
+            &[Record {
+                id: "a".into(),
+                vector: Some(vec![1.0, 0.0]),
+                attrs,
+            }],
+        )
+        .unwrap();
+    let before = store.fts_posting_count();
+
+    for _ in 0..5 {
+        store.reinforce("docs", &["a"], 1_000, None).unwrap();
+    }
+
+    assert_eq!(
+        store.fts_posting_count(),
+        before,
+        "a stamp touching no indexed field must not re-append postings"
+    );
+    // And the text is still findable, so skipping the reindex did not drop the doc.
+    let hits = store
+        .text_search(
+            &["docs"],
+            &FtsQuery::new("body", "deploys"),
+            &default_opts(10),
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1, "the doc must still be findable by text");
+}

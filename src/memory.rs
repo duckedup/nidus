@@ -8,8 +8,9 @@ use crate::diag::diag;
 use crate::embed::{AnyEmbedder, Embedder, embedder_identity};
 use crate::meta::now_ms;
 use crate::{
-    Expand, Filter, FtsField, Hit, LimitPer, META_CHAR_START, META_CHUNK_INDEX, META_EXPIRES_AT,
-    META_PARENT_ID, Nidus, Predicate, Record, SearchOpts, Value,
+    Expand, Filter, FtsField, Hit, LimitPer, META_ACCESS_COUNT, META_CHAR_START,
+    META_CHUNK_INDEX, META_EXPIRES_AT, META_LAST_ACCESSED, META_PARENT_ID, Nidus, Predicate,
+    Record, SearchOpts, Value,
 };
 
 #[cfg(feature = "summarize")]
@@ -112,6 +113,17 @@ pub struct RecallOpts {
     /// Read a chunked corpus as documents: best chunk per parent, widened with its
     /// neighbours. `None` (the default) returns raw chunk hits.
     pub rollup: Option<Rollup>,
+    /// Ranking expression layered over cosine: recency decay over `nidus.last_accessed`,
+    /// a reinforcement term over `nidus.access_count`, or both. `None` is the bare metric.
+    pub rank_by: Option<crate::RankBy>,
+    /// Stamp `nidus.access_count` / `nidus.last_accessed` on every returned entry. `false`
+    /// (the default) leaves recall a pure read. On a ReadOnly store the stamp is skipped
+    /// with a warning, never attempted.
+    pub reinforce: bool,
+    /// Push an existing `nidus.expires_at` forward to `now + this` on every returned
+    /// entry. Only honoured when `reinforce` is set; never creates an expiry on an entry
+    /// that had none, and never moves one backwards.
+    pub extend_ttl_seconds: Option<i64>,
 }
 
 /// Read a chunked corpus as documents rather than fragments: keep a document's best
@@ -249,12 +261,12 @@ impl Memory {
 
     /// Recall the nearest remembered records to `query_text` from `collection`.
     pub async fn recall(
-        &self,
+        &mut self,
         collection: &str,
         query_text: &str,
         opts: &RecallOpts,
     ) -> anyhow::Result<Vec<Hit>> {
-        recall_with(&self.db, &self.embedder, collection, query_text, opts).await
+        recall_with(&mut self.db, &self.embedder, collection, query_text, opts).await
     }
 
     /// Borrow the underlying store (raw `Vec<f32>` API escape hatch).
@@ -286,7 +298,13 @@ pub(crate) fn default_fts_fields() -> Vec<FtsField> {
 /// overwritten anyway, but `expires_at` survives when no TTL is passed — letting a caller
 /// set an expiry that never went through `ttl_seconds`.
 pub(crate) fn strip_reserved_recency(attrs: &mut BTreeMap<String, Value>) {
-    for key in [META_CREATED_AT, META_UPDATED_AT, META_EXPIRES_AT] {
+    for key in [
+        META_CREATED_AT,
+        META_UPDATED_AT,
+        META_EXPIRES_AT,
+        META_ACCESS_COUNT,
+        META_LAST_ACCESSED,
+    ] {
         attrs.remove(key);
     }
 }
@@ -771,9 +789,10 @@ fn warn_once(collection: &str, identity: &str) -> bool {
     true
 }
 
-/// Embed `query_text` as a query and run a vector search mapped from `opts`.
+/// Embed `query_text` as a query and run a vector search mapped from `opts`, then — when
+/// asked — stamp reinforcement counters on the hits before returning them.
 async fn recall_with<E: Embedder>(
-    db: &Nidus,
+    db: &mut Nidus,
     embedder: &E,
     collection: &str,
     query_text: &str,
@@ -800,10 +819,59 @@ async fn recall_with<E: Embedder>(
         diversity: opts.diversity,
         limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
         expand: rollup.map(|(_, e)| e),
+        rank_by: opts.rank_by.clone(),
         // No `offset` on `RecallOpts` by design (nidus-m50.15): the memory API stays lean.
         ..Default::default()
     };
-    db.search(collection, &query, &search_opts)
+    let hits = db.search(collection, &query, &search_opts)?;
+    // Skip rather than fail: an in-process caller may not own `open_mode`, and an optional
+    // bookkeeping write must not lose it an otherwise good recall. The wire surfaces do the
+    // opposite — they were asked for the write explicitly, so they propagate the refusal.
+    if opts.reinforce && !hits.is_empty() {
+        if db.config().open_mode == crate::OpenMode::ReadOnly {
+            diag!(
+                crate::diag::Level::Warn,
+                "memory",
+                "recall asked to reinforce a read-only store; the stamp is skipped",
+                "collection" => collection,
+            );
+        } else {
+            reinforce_hits(db, collection, &hits, opts.extend_ttl_seconds)?;
+        }
+    }
+    Ok(hits)
+}
+
+/// Search and stamp under one write lock. The server surfaces embed off-lock themselves
+/// and call this; `recall_with` is the in-process equivalent. Always stamps every returned
+/// hit — the caller decides whether to call this or a plain `db.search` at all.
+pub(crate) fn commit_recall(
+    db: &mut Nidus,
+    collection: &str,
+    query: &[f32],
+    search_opts: &SearchOpts,
+    extend_ttl_seconds: Option<i64>,
+) -> anyhow::Result<Vec<Hit>> {
+    let hits = db.search(collection, query, search_opts)?;
+    reinforce_hits(db, collection, &hits, extend_ttl_seconds)?;
+    Ok(hits)
+}
+
+/// Stamp a hit set the caller already has (the rerank path: hits are re-scored after the
+/// search already ran). Propagates a ReadOnly refusal: a caller that asked for the write
+/// over the wire must not be told it happened. `recall_with` skips instead, see there.
+pub(crate) fn reinforce_hits(
+    db: &mut Nidus,
+    collection: &str,
+    hits: &[Hit],
+    extend_ttl_seconds: Option<i64>,
+) -> anyhow::Result<()> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    db.reinforce(collection, &ids, extend_ttl_seconds)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -973,7 +1041,7 @@ mod tests {
         .unwrap();
 
         let hits = recall_with(
-            &db,
+            &mut db,
             &emb,
             "notes",
             "the quick brown fox",
@@ -1171,7 +1239,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            ids(recall_with(&db, &emb, "notes", "query", &plain)
+            ids(recall_with(&mut db, &emb, "notes", "query", &plain)
                 .await
                 .unwrap()),
             ["dup0", "dup1"]
@@ -1181,7 +1249,7 @@ mod tests {
             ..plain.clone()
         };
         assert_eq!(
-            ids(recall_with(&db, &emb, "notes", "query", &spread)
+            ids(recall_with(&mut db, &emb, "notes", "query", &spread)
                 .await
                 .unwrap()),
             ["dup0", "novel"]
@@ -1194,7 +1262,7 @@ mod tests {
             ..plain
         };
         assert_eq!(
-            ids(recall_with(&db, &emb, "notes", "query", &pure)
+            ids(recall_with(&mut db, &emb, "notes", "query", &pure)
                 .await
                 .unwrap()),
             ["dup0", "novel"]
@@ -1226,14 +1294,14 @@ mod tests {
         // Same dimension, different model → the recall guard must refuse rather
         // than return meaningless cross-space rankings.
         let emb_v2 = FakeEmbedder::new(8, "fake", "v2");
-        let err = recall_with(&db, &emb_v2, "notes", "hello", &RecallOpts::default())
+        let err = recall_with(&mut db, &emb_v2, "notes", "hello", &RecallOpts::default())
             .await
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("fake/v1") && msg.contains("fake/v2"), "{msg}");
 
         // The matching embedder still recalls fine.
-        recall_with(&db, &emb_v1, "notes", "hello", &RecallOpts::default())
+        recall_with(&mut db, &emb_v1, "notes", "hello", &RecallOpts::default())
             .await
             .unwrap();
     }
@@ -1258,7 +1326,7 @@ mod tests {
         upsert_unpinned(&mut db, "notes", 8);
 
         let emb = FakeEmbedder::new(8, "fake", "v1");
-        let err = recall_with(&db, &emb, "notes", "hello", &RecallOpts::default())
+        let err = recall_with(&mut db, &emb, "notes", "hello", &RecallOpts::default())
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -1277,7 +1345,7 @@ mod tests {
         upsert_unpinned(&mut db, "notes", 8);
 
         let emb = FakeEmbedder::new(8, "fake", "v1");
-        recall_with(&db, &emb, "notes", "hello", &RecallOpts::default())
+        recall_with(&mut db, &emb, "notes", "hello", &RecallOpts::default())
             .await
             .expect("an unpinned collection warns, it does not refuse");
     }
@@ -1319,7 +1387,7 @@ mod tests {
             db.get_meta("notes").get(META_EMBEDDER).map(String::as_str),
             Some("fake/v1")
         );
-        recall_with(&db, &emb, "notes", "hello", &RecallOpts::default())
+        recall_with(&mut db, &emb, "notes", "hello", &RecallOpts::default())
             .await
             .expect("the collection is pinned now, so recall is checkable");
     }
@@ -1344,7 +1412,7 @@ mod tests {
         // top_k = 0 (RecallOpts default) must fall back to a sensible default,
         // not return zero hits.
         let hits = recall_with(
-            &db,
+            &mut db,
             &emb,
             "notes",
             "content number 1",
@@ -1373,9 +1441,15 @@ mod tests {
         );
         db.upsert("notes", &[expired]).unwrap();
 
-        let hits = recall_with(&db, &emb, "notes", "durable note", &RecallOpts::default())
-            .await
-            .unwrap();
+        let hits = recall_with(
+            &mut db,
+            &emb,
+            "notes",
+            "durable note",
+            &RecallOpts::default(),
+        )
+        .await
+        .unwrap();
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
         assert!(
             ids.contains(&"kept"),
@@ -1501,6 +1575,133 @@ mod tests {
         );
     }
 
+    /// Mirrors `caller_supplied_recency_attrs_are_stripped`: a caller cannot hand-write
+    /// `nidus.access_count` either — only a reinforced recall may stamp it.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn remember_strips_a_caller_supplied_access_count() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+
+        let forged = BTreeMap::from([(META_ACCESS_COUNT.to_string(), Value::Int(99))]);
+        remember_raw(&mut db, &emb, "notes", "a", "text", forged)
+            .await
+            .unwrap();
+
+        let stored = db.get("notes", "a").unwrap().attrs;
+        assert!(
+            !stored.contains_key(META_ACCESS_COUNT),
+            "a forged access_count must not survive a write"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn recall_is_unchanged_when_reinforce_is_off() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        remember_raw(&mut db, &emb, "notes", "a", "hello world", BTreeMap::new())
+            .await
+            .unwrap();
+
+        let hits = recall_with(
+            &mut db,
+            &emb,
+            "notes",
+            "hello world",
+            &RecallOpts::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!hits.is_empty());
+
+        assert!(
+            !db.get("notes", "a")
+                .unwrap()
+                .attrs
+                .contains_key(META_ACCESS_COUNT),
+            "a plain recall must not stamp anything"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn a_reinforced_recall_stamps_every_returned_entry_and_not_the_others() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        remember_raw(&mut db, &emb, "notes", "a", "hello world", BTreeMap::new())
+            .await
+            .unwrap();
+        remember_raw(
+            &mut db,
+            &emb,
+            "notes",
+            "unrelated",
+            "completely different topic zzz",
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let opts = RecallOpts {
+            top_k: 1,
+            reinforce: true,
+            ..Default::default()
+        };
+        let hits = recall_with(&mut db, &emb, "notes", "hello world", &opts)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "a");
+        assert!(
+            !hits[0].attrs.contains_key(META_ACCESS_COUNT),
+            "the returned hit carries the pre-stamp attrs"
+        );
+
+        let stamped = db.get("notes", "a").unwrap().attrs;
+        assert_eq!(stamped.get(META_ACCESS_COUNT), Some(&Value::Int(1)));
+
+        let untouched = db.get("notes", "unrelated").unwrap().attrs;
+        assert!(
+            !untouched.contains_key(META_ACCESS_COUNT),
+            "an entry that did not match must not be stamped"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs; opens the store read-only via a path on disk
+    async fn a_reinforced_recall_on_a_read_only_store_returns_hits_and_stamps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        {
+            let mut db = Nidus::open_dir(dir.path(), 8).unwrap();
+            remember_raw(&mut db, &emb, "notes", "a", "hello world", BTreeMap::new())
+                .await
+                .unwrap();
+        }
+
+        let cfg = crate::Config::new(dir.path(), 8).open_mode(crate::OpenMode::ReadOnly);
+        let mut db = Nidus::open(cfg).unwrap();
+        let opts = RecallOpts {
+            reinforce: true,
+            ..Default::default()
+        };
+        let hits = recall_with(&mut db, &emb, "notes", "hello world", &opts)
+            .await
+            .unwrap();
+        assert!(
+            !hits.is_empty(),
+            "a reinforced recall still returns its hits"
+        );
+        assert!(
+            !db.get("notes", "a")
+                .unwrap()
+                .attrs
+                .contains_key(META_ACCESS_COUNT),
+            "a ReadOnly store must never attempt the stamp"
+        );
+    }
+
     #[tokio::test]
     #[cfg_attr(miri, ignore)] // upsert fsyncs
     async fn ttl_sets_expires_at_and_hides_the_entry_from_recall() {
@@ -1531,9 +1732,15 @@ mod tests {
                 .attrs
                 .contains_key(META_EXPIRES_AT)
         );
-        let hits = recall_with(&db, &emb, "notes", "ephemeral note", &RecallOpts::default())
-            .await
-            .unwrap();
+        let hits = recall_with(
+            &mut db,
+            &emb,
+            "notes",
+            "ephemeral note",
+            &RecallOpts::default(),
+        )
+        .await
+        .unwrap();
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
         assert_eq!(
             ids,

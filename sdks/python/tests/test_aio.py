@@ -464,6 +464,19 @@ async def test_remember_and_recall_bodies() -> None:
         assert mock.json == {"query": "hello", "filter": []}
 
 
+async def test_recall_sends_reinforce_and_extend_ttl_seconds() -> None:
+    """Same case as the sync client, so the two cannot drift."""
+    mock = MockServer([])
+    async with client(mock) as db:
+        await db.recall("notes", "hello", reinforce=True, extend_ttl_seconds=3600)
+    assert mock.json == {
+        "query": "hello",
+        "filter": [],
+        "reinforce": True,
+        "extend_ttl_seconds": 3600,
+    }
+
+
 async def test_remember_sends_ttl_and_dedupe_and_returns_what_was_written() -> None:
     """The async twin decodes the redirected id exactly as the sync one does."""
     mock = MockServer({"ok": True, "upserted": 1, "id": "older", "deduped": True})

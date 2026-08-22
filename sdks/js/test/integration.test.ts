@@ -281,4 +281,20 @@ describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
     expect(err).toBeInstanceOf(NidusError);
     expect([400, 404]).toContain(err.status);
   });
+
+  // This binary is built with `--features cli` only (no embedder), so `reinforce`
+  // and `extendTtlSeconds` cannot be proven end-to-end here (that needs `memory`
+  // plus `--embed-provider`, which this harness does not wire up). What this proves:
+  // the two new options travel to the server without a client-side error, and the
+  // call still fails visibly, with a status, exactly like a plain recall does above.
+  it("recall with reinforce fails visibly with a status when the server has no embedder", async () => {
+    const err = (await db
+      .recall("notes", "the quick brown fox", { reinforce: true, extendTtlSeconds: 3600 })
+      .then(
+        () => null,
+        (e) => e,
+      )) as NidusError;
+    expect(err).toBeInstanceOf(NidusError);
+    expect([400, 404]).toContain(err.status);
+  });
 });

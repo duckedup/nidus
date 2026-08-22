@@ -480,6 +480,9 @@ export class NidusClient {
       diversity: opts.diversity,
       rollup: encodeRollup(opts.rollup),
       rerank: encodeRerank(opts.rerank),
+      reinforce: opts.reinforce,
+      extend_ttl_seconds: opts.extendTtlSeconds,
+      rank_by: encodeRankBy(opts.rankBy),
     });
   }
 
@@ -635,6 +638,9 @@ function encodeRankBy(rank: RankBy | undefined): unknown {
       decay: d.decay,
       lambda: d.lambda,
       missing: d.missing,
+      count_field: d.countField,
+      count_scale: d.countScale,
+      count_lambda: d.countLambda,
     }),
   };
 }

@@ -47,6 +47,28 @@ def test_decay_sends_every_knob_under_the_servers_own_name() -> None:
     }
 
 
+def test_decay_count_knobs_are_included() -> None:
+    """The count knobs travel under their own names, alongside the recency ones."""
+    assert rank.decay("ts", ORIGIN_MS, count_field="n", count_scale=5.0, count_lambda=0.5) == {
+        "Decay": {
+            "field": "ts",
+            "origin": ORIGIN_MS,
+            "count_field": "n",
+            "count_scale": 5.0,
+            "count_lambda": 0.5,
+        }
+    }
+
+
+def test_decay_without_count_knobs_is_unchanged() -> None:
+    """No ``count_*`` key reaches the wire when unset — generalising ``Decay`` must not
+    change the body a caller who never asked for the count term already sends."""
+    out = rank.decay("ts", ORIGIN_MS)["Decay"]
+    assert "count_field" not in out
+    assert "count_scale" not in out
+    assert "count_lambda" not in out
+
+
 def test_an_explicit_zero_knob_is_sent_rather_than_pruned() -> None:
     """``missing=0.0`` (penalize an undated record fully) is a real value, not "unset"."""
     assert rank.decay("ts", ORIGIN_MS, missing=0.0)["Decay"]["missing"] == 0.0

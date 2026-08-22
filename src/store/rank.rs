@@ -19,7 +19,10 @@ pub(crate) fn validate(rank_by: Option<&RankBy>) -> Result<()> {
     let Some(RankBy::Decay(d)) = rank_by else {
         return Ok(());
     };
-    if d.field.is_empty() {
+    // An empty `field` is legal when `count_field` is set: a count-only ranking
+    // expression is a real use case, and forcing a caller to pass a timestamp field
+    // they do not want ranked on would be worse than skipping the recency term.
+    if d.field.is_empty() && d.count_field.is_none() {
         bail!("Decay needs a timestamp field name");
     }
     if d.scale <= 0 {
@@ -37,6 +40,15 @@ pub(crate) fn validate(rank_by: Option<&RankBy>) -> Result<()> {
     if !(d.missing >= 0.0 && d.missing <= 1.0) {
         bail!("Decay missing must be in [0, 1], got {}", d.missing);
     }
+    if d.count_field.is_some() && d.count_scale <= 0.0 {
+        bail!("Decay count_scale must be positive, got {}", d.count_scale);
+    }
+    if !d.count_lambda.is_finite() || d.count_lambda < 0.0 {
+        bail!(
+            "Decay count_lambda must be finite and non-negative, got {}",
+            d.count_lambda
+        );
+    }
     Ok(())
 }
 
@@ -52,13 +64,36 @@ fn factor(d: &Decay, attrs: &BTreeMap<String, Value>) -> f32 {
     d.decay.powf((age / d.scale as f64) as f32)
 }
 
+/// The count factor for one record: `n / (n + count_scale)`, so an un-recalled record sits
+/// at 0 and a much-recalled one approaches 1. A missing or non-integer attribute reads as
+/// `n = 0` — which is the point: memories nothing ever recalls sink.
+fn count_factor(d: &Decay, attrs: &BTreeMap<String, Value>) -> f32 {
+    let Some(field) = &d.count_field else {
+        return 0.0;
+    };
+    let n = match attrs.get(field) {
+        Some(Value::Int(n)) | Some(Value::DateTime(n)) => (*n).max(0) as f64,
+        _ => 0.0,
+    };
+    (n / (n + d.count_scale as f64)) as f32
+}
+
 /// Apply the ranking expression to one base score: `base − lambda × (1 − factor)`. It
 /// **subtracts**; multiplying would be sound only for Cosine and would need a negative-score
 /// clamp, whereas a subtraction is a translation every metric survives (nidus-m50.15 #7).
 pub(super) fn adjust(rank_by: Option<&RankBy>, base: f32, attrs: &BTreeMap<String, Value>) -> f32 {
     match rank_by {
         None => base,
-        Some(RankBy::Decay(d)) => base - d.lambda * (1.0 - factor(d, attrs)),
+        Some(RankBy::Decay(d)) => {
+            let mut out = base;
+            if !d.field.is_empty() {
+                out -= d.lambda * (1.0 - factor(d, attrs));
+            }
+            if d.count_field.is_some() {
+                out -= d.count_lambda * (1.0 - count_factor(d, attrs));
+            }
+            out
+        }
     }
 }
 
@@ -249,5 +284,117 @@ mod tests {
         assert!(validate(Some(&RankBy::Decay(ok.clone().missing(1.5)))).is_err());
         assert!(validate(Some(&RankBy::Decay(Decay::new("", 0, 1)))).is_err());
         assert!(validate(None).is_ok());
+    }
+
+    #[test]
+    fn count_factor_saturates_and_reads_a_missing_count_as_zero() {
+        let d = Decay::new("ts", 0, 1_000)
+            .count_field("n")
+            .count_scale(10.0);
+        assert_eq!(
+            count_factor(&d, &attrs(&[])),
+            0.0,
+            "missing count reads as 0"
+        );
+        assert_eq!(
+            count_factor(&d, &attrs(&[("n", Value::Int(10))])),
+            0.5,
+            "n == count_scale is the half-saturation point"
+        );
+        let near_one = count_factor(&d, &attrs(&[("n", Value::Int(1_000_000))]));
+        assert!(
+            near_one > 0.999,
+            "a huge count approaches 1, got {near_one}"
+        );
+    }
+
+    #[test]
+    fn an_un_reinforced_record_pays_the_full_count_penalty_and_a_hot_one_pays_none() {
+        let rank = RankBy::Decay(
+            Decay::new("ts", 0, 1_000)
+                .lambda(0.0)
+                .count_field("n")
+                .count_scale(10.0)
+                .count_lambda(1.0),
+        );
+        let cold = adjust(Some(&rank), 1.0, &attrs(&[]));
+        assert!(
+            (cold - 0.0).abs() < 1e-6,
+            "no reinforcement: full penalty, got {cold}"
+        );
+        let hot = adjust(
+            Some(&rank),
+            1.0,
+            &attrs(&[("n", Value::Int(1_000_000_000))]),
+        );
+        assert!(
+            (hot - 1.0).abs() < 1e-3,
+            "saturated count: ~no penalty, got {hot}"
+        );
+    }
+
+    #[test]
+    fn a_decay_without_count_field_keeps_the_pre_gk6_defaults() {
+        let via_builder = Decay::new("ts", 10_000, 1_000).lambda(0.7);
+        // The pre-nidus-gk6 shape, spelled out explicitly (mirroring model.rs's private
+        // `default_*` fns) rather than through the builder, so a default drifting would
+        // show up here instead of being silently absorbed by both sides matching.
+        let via_literal = Decay {
+            field: "ts".to_string(),
+            origin: 10_000,
+            scale: 1_000,
+            decay: 0.5,
+            lambda: 0.7,
+            missing: 1.0,
+            count_field: None,
+            count_scale: 10.0,
+            count_lambda: 1.0,
+        };
+        assert_eq!(via_builder, via_literal);
+    }
+
+    #[test]
+    // Float ULP: `factor` goes through `powf`, whose last bit Miri deliberately varies
+    // between calls, so an exact-bits assertion fails there while the ranking is identical.
+    #[cfg_attr(miri, ignore)]
+    fn a_decay_without_count_field_ranks_exactly_as_before() {
+        let d = Decay::new("ts", 10_000, 1_000).lambda(0.7);
+        let a = &attrs(&[("ts", Value::Int(9_500))]);
+        let with_count_absent = adjust(Some(&RankBy::Decay(d.clone())), 0.42, a);
+        // The pre-nidus-gk6 formula, by hand: the count term must contribute nothing at all
+        // rather than a zero-valued penalty that happens to round the same way.
+        let expected = 0.42 - 0.7 * (1.0 - 0.5f32.powf(500.0 / 1_000.0));
+        assert_eq!(
+            with_count_absent, expected,
+            "no count_field must rank bit-identically to the pre-nidus-gk6 formula"
+        );
+        assert!(
+            d.count_field.is_none(),
+            "the guard above only means anything while count_field is unset"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_non_positive_count_scale_and_accepts_an_empty_field_with_a_count() {
+        let d = Decay::new("", 0, 1_000).count_field("n");
+        assert!(
+            validate(Some(&RankBy::Decay(d.clone()))).is_ok(),
+            "an empty timestamp field is fine once count_field is set"
+        );
+        assert!(validate(Some(&RankBy::Decay(d.clone().count_scale(0.0)))).is_err());
+        assert!(validate(Some(&RankBy::Decay(d.clone().count_scale(-1.0)))).is_err());
+        assert!(validate(Some(&RankBy::Decay(d.count_lambda(-1.0)))).is_err());
+    }
+
+    /// The additive-default promise the SDKs' `rank_by` round-trip tests depend on: a
+    /// `Decay` with no `count_field` set serialises with that key absent (`count_scale`/
+    /// `count_lambda` carry plain numeric defaults, not `Option`, so they always serialise).
+    #[cfg(feature = "cli")]
+    #[test]
+    fn a_decay_with_no_count_field_serialises_with_no_count_field_key() {
+        let d = Decay::new("ts", 0, 1_000);
+        let json = serde_json::to_value(&d).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(!obj.contains_key("count_field"));
     }
 }
