@@ -178,7 +178,8 @@ parallel without touching each other's files. Rules:
 - Put a unit in a later group only when it genuinely depends on an earlier one's code.
 - Each unit's \`verify\` is the exact just recipes that cover it. Remember \`just ci\` does NOT
   compile src/cli, src/server or src/bin — those need \`just ci-cli\`; the MCP surface needs
-  \`--features mcp\`; codec and kernel changes need \`just miri\`.
+  \`--features mcp\`. Never list \`just miri\`: CI's required Miri job covers codec/kernel
+  changes on the PR, and the interpreter is too slow for a unit's verify loop.
 - Flag anything that must stay in ONE unit because splitting it would break the build.
 
 Then split what you do not know into two piles, because they are consumed differently.

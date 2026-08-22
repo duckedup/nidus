@@ -346,16 +346,28 @@ test('lanes: the MCP surface pulls its feature build as a directory too', () => 
   }
 })
 
-test('lanes: codec changes pull Miri', () => {
-  eq(lanes(['src/log/mod.rs']).run.map(l => l.recipe).includes('just miri'), true, 'miri')
+// Miri is deferred to CI (nidus-a9l): the required `Miri` job runs the suite on every
+// PR, and the interpreter is too slow to gate the local loop. Named, never in `run`.
+test('lanes: codec changes name Miri as CI-covered, not a local run', () => {
+  const r = lanes(['src/log/mod.rs'])
+  eq(r.ci.map(l => l.recipe), ['just miri'], 'ci-covered')
+  eq(r.run.map(l => l.recipe).includes('just miri'), false, 'not local')
 })
 
 // The search-parity epic (#75) added these pure-logic kernels; the lane map missed
 // them on day one, which is the whole reason it is tested rather than described.
-test('lanes: the ranking/fusion/BM25 kernels pull Miri too', () => {
+test('lanes: the ranking/fusion/BM25 kernels are Miri-covered too', () => {
   for (const f of ['src/fuse.rs', 'src/annotate.rs', 'src/store/rank.rs', 'src/store/aggregate.rs', 'src/store/text.rs', 'src/filter/pattern.rs']) {
-    eq(lanes([f]).run.map(l => l.recipe).includes('just miri'), true, `miri for ${f}`)
+    eq(lanes([f]).ci.map(l => l.recipe).includes('just miri'), true, `miri for ${f}`)
   }
+})
+
+// A deferred lane that vanished from the report entirely would read as "no Miri
+// needed" — the section must still name it so the PR author expects the CI lane.
+test('lanes: the CI-covered section is printed, not silently dropped', () => {
+  const out = formatLanes(lanes(['src/log/mod.rs']))
+  eq(/CI enforces these on the PR/.test(out), true, `ci section present in: ${out}`)
+  eq(/just miri/.test(out), true, 'names the recipe')
 })
 
 test('lanes: cluster tests are manual, not automatic', () => {
