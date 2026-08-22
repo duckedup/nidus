@@ -144,6 +144,32 @@ export function versionBackwards(baseCargo, headCargo, originCargo, changed) {
     'release.yml only tags a version it has not seen, so merging this ships NOTHING, silently. Pick a version strictly above origin/main.')]
 }
 
+// The residual gap versionBackwards cannot see (nidus-zin): a version strictly ABOVE
+// origin/main whose tag already exists, so release.yml skips it and the merge ships
+// nothing. Reachable when a tag was cut and main reverted, when one was pushed by hand,
+// or when a branch is cut from a point a release has since moved past.
+//
+// An error: claiming a released version ALWAYS ships nothing, so there is no legitimate
+// case to soften. The offline/fresh-clone risk is handled by the tag guard below, not by
+// severity — no readable tag list means no finding at all.
+//
+// Gated on this branch actually changing nidus, exactly as versionBump is. Two reasons:
+// a skill/docs/CI-only branch is not competing for a release at all, and a stale two-dot
+// base makes the version *look* changed on a branch that never touched Cargo.toml, which
+// would fire this on someone else's bump (the hole versionBackwards' own gate closes).
+export function versionAlreadyTagged(baseCargo, headCargo, tags, changed) {
+  const touched = (changed || []).filter(f => BEHAVIOURAL.some(re => re.test(f)))
+  if (!touched.includes('Cargo.toml')) return []
+  const base = versionOf(baseCargo)
+  const head = versionOf(headCargo)
+  if (!head || base === head) return []
+  if (!tags || typeof tags.has !== 'function' || tags.size === 0) return []
+  if (!tags.has(`v${head}`)) return []
+  return [finding('version-already-tagged', 'error', 'Cargo.toml', 1,
+    `version ${head} is already released as v${head}`,
+    'release.yml cuts a release only when the tag is new, so merging this ships NOTHING even though the version is ahead of main. Bump past the tag.')]
+}
+
 const SNIPPET_FILES = ['README.md', 'docs/src/content/docs/getting-started.md']
 
 export function docsVersionSync(baseCargo, headCargo, texts) {
