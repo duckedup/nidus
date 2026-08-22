@@ -471,6 +471,52 @@ test('laws: a version equal to origin/main is caught (nidus-7nk)', () => {
   eq(out[0].severity, 'error', 'error, not a warning')
 })
 
+// nidus-zin: the residual gap. A version ABOVE origin/main whose tag exists still ships
+// nothing, and versionBackwards passes it clean — it never sees a tag.
+test('laws: a version ahead of main but already tagged is caught (nidus-zin)', () => {
+  const base = CARGO('0.74.0'), head = CARGO('0.75.0')
+  const tags = new Set(['v0.74.0', 'v0.75.0'])
+  eq(laws.versionBackwards(base, head, CARGO('0.74.0'), ['Cargo.toml']).length, 0,
+    'versionBackwards passes it: 0.75.0 IS above main')
+  const out = laws.versionAlreadyTagged(base, head, tags, ['Cargo.toml', 'src/lib.rs'])
+  eq(out.length, 1, 'one finding')
+  eq(out[0].id, 'version-already-tagged', 'id')
+  eq(out[0].severity, 'error', 'blocks: claiming a released version always ships nothing')
+  eq(/v0\.75\.0/.test(out[0].summary), true, 'names the tag it collides with')
+})
+
+// What lets the finding above be a hard error rather than a warning: an unreadable or
+// absent tag list must produce NO finding, so a fresh or offline clone never sees a false one.
+test('laws: an unreadable tag list produces no version-already-tagged finding', () => {
+  const base = CARGO('0.74.0'), head = CARGO('0.75.0'), ch = ['Cargo.toml']
+  eq(laws.versionAlreadyTagged(base, head, new Set(), ch).length, 0, 'empty set (fresh clone)')
+  eq(laws.versionAlreadyTagged(base, head, null, ch).length, 0, 'null')
+  eq(laws.versionAlreadyTagged(base, head, undefined, ch).length, 0, 'undefined')
+  eq(laws.versionAlreadyTagged(base, head, {}, ch).length, 0, 'not a Set')
+})
+
+test('laws: an untagged bump, and an unchanged version, stay clean', () => {
+  const tags = new Set(['v0.74.0']), ch = ['Cargo.toml']
+  eq(laws.versionAlreadyTagged(CARGO('0.74.0'), CARGO('0.75.0'), tags, ch).length, 0, 'tag is free')
+  // No bump at all is versionBump's business, not this law's.
+  eq(laws.versionAlreadyTagged(CARGO('0.74.0'), CARGO('0.74.0'), tags, ch).length, 0, 'unchanged')
+})
+
+// Only when nidus itself is changing, same exemption versionBump applies. A skill/docs/CI
+// branch is not competing for a release, and a stale two-dot base can make the version look
+// changed on a branch that never touched Cargo.toml — that must not fire on someone else's bump.
+test('laws: version-already-tagged fires only when Cargo.toml itself changed', () => {
+  const base = CARGO('0.74.0'), head = CARGO('0.75.0'), tags = new Set(['v0.75.0'])
+  eq(laws.versionAlreadyTagged(base, head, tags, ['.claude/skills/nidus/SKILL.md']).length, 0,
+    'skill-only branch, version diff came from a stale base')
+  eq(laws.versionAlreadyTagged(base, head, tags, ['docs/src/content/docs/guides/search.md']).length, 0,
+    'docs-only')
+  eq(laws.versionAlreadyTagged(base, head, tags, ['src/lib.rs']).length, 0,
+    'src changed but Cargo.toml did not: versionBump owns that, not this law')
+  eq(laws.versionAlreadyTagged(base, head, tags, []).length, 0, 'no changed list at all')
+  eq(laws.versionAlreadyTagged(base, head, tags, ['Cargo.toml']).length, 1, 'a real bump fires')
+})
+
 // The reason equality was originally allowed: a branch may edit Cargo.toml for a
 // dependency and never claim a version. Gating on base !== head keeps that clean.
 test('laws: a dependency-only Cargo.toml edit at the same version is fine (nidus-7nk)', () => {

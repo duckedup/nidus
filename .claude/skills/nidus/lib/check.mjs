@@ -78,6 +78,9 @@ function runLaws() {
     // invisible from inside the branch, which is why no existing law catches it.
     const originCargo = git.readAtRef('origin/main', 'Cargo.toml')
     if (originCargo) findings.push(...laws.versionBackwards(baseCargo, headCargo, originCargo, changed))
+    // nidus-zin: the case above cannot see, since a tagged version can still be ahead
+    // of main. Degrades to silence when the tag list is empty (fresh or offline clone).
+    findings.push(...laws.versionAlreadyTagged(baseCargo, headCargo, git.releasedTags(), changed))
     findings.push(...laws.docsVersionSync(baseCargo, headCargo, {
       'README.md': git.readAt(t, 'README.md'),
       'docs/src/content/docs/getting-started.md': git.readAt(t, 'docs/src/content/docs/getting-started.md'),
