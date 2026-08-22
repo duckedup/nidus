@@ -40,6 +40,7 @@ impl MistralEmbedder {
             &self.model,
             texts,
             None,
+            None,
             "Mistral API",
         )
         .await

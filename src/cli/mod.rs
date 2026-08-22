@@ -460,8 +460,9 @@ struct IngestArgs {
     /// and self-hosted gateways).
     #[arg(long, env = "NIDUS_EMBED_BASE_URL")]
     embed_base_url: Option<String>,
-    /// Ask for a narrower/wider embedding than the model's native width
-    /// (Voyage Matryoshka models: 256, 512, 1024, 2048). Omit for native.
+    /// Ask for a narrower embedding than the model's native width (Voyage
+    /// Matryoshka: 256, 512, 1024, 2048; OpenAI text-embedding-3: any width up
+    /// to native). Omit for native.
     #[arg(long, env = "NIDUS_EMBED_DIMENSION")]
     embed_dimension: Option<usize>,
 

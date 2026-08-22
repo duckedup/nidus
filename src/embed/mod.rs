@@ -167,7 +167,7 @@ impl EmbedProvider {
     /// none (`""`) — the caller must supply a model.
     pub fn default_model(&self) -> &'static str {
         match self {
-            EmbedProvider::Voyage => "voyage-3",
+            EmbedProvider::Voyage => "voyage-4",
             EmbedProvider::OpenAi => "text-embedding-3-small",
             EmbedProvider::Ollama => "nomic-embed-text",
             EmbedProvider::Cohere => "embed-english-v3.0",
@@ -179,9 +179,10 @@ impl EmbedProvider {
     }
 
     /// Whether the adapter honours [`EmbedConfig::output_dimension`]. Voyage's
-    /// Matryoshka models are the only ones wired for it today.
+    /// Matryoshka models and OpenAI's `text-embedding-3` pair are wired for it;
+    /// each adapter still rejects a width its own model cannot serve.
     pub fn supports_output_dimension(&self) -> bool {
-        matches!(self, EmbedProvider::Voyage)
+        matches!(self, EmbedProvider::Voyage | EmbedProvider::OpenAi)
     }
 }
 
@@ -598,11 +599,15 @@ pub(crate) mod openai_shaped {
         model: &str,
         texts: &[&str],
         task: Option<&str>,
+        dimensions: Option<usize>,
         label: &str,
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
         let mut body = serde_json::json!({ "model": model, "input": texts });
         if let Some(t) = task {
             body["task"] = serde_json::Value::String(t.to_string());
+        }
+        if let Some(d) = dimensions {
+            body["dimensions"] = serde_json::json!(d);
         }
         let policy = RetryPolicy::standard(3, 1000);
         let resp: Resp = post_json(client, &policy, label, url, api_key, headers, &body).await?;
@@ -777,10 +782,10 @@ mod tests {
     }
 
     #[test]
-    fn only_voyage_advertises_output_dimension() {
+    fn only_voyage_and_openai_advertise_output_dimension() {
         assert!(EmbedProvider::Voyage.supports_output_dimension());
+        assert!(EmbedProvider::OpenAi.supports_output_dimension());
         for p in [
-            EmbedProvider::OpenAi,
             EmbedProvider::Ollama,
             EmbedProvider::Cohere,
             EmbedProvider::Gemini,
@@ -794,10 +799,10 @@ mod tests {
 
     #[tokio::test]
     async fn build_rejects_output_dimension_a_provider_cannot_honour() {
-        let cfg = EmbedConfig::new("text-embedding-3-small")
+        let cfg = EmbedConfig::new("embed-english-v3.0")
             .api_key("k")
             .output_dimension(256);
-        match AnyEmbedder::build(EmbedProvider::OpenAi, cfg).await {
+        match AnyEmbedder::build(EmbedProvider::Cohere, cfg).await {
             Err(EmbedError::Config(m)) => assert!(m.contains("output_dimension"), "{m}"),
             Err(other) => panic!("expected Config error, got {other:?}"),
             Ok(_) => panic!("expected output_dimension to be rejected"),
@@ -816,7 +821,7 @@ mod tests {
             EmbedProvider::OpenAi.default_model(),
             "text-embedding-3-small"
         );
-        assert_eq!(EmbedProvider::Voyage.default_model(), "voyage-3");
+        assert_eq!(EmbedProvider::Voyage.default_model(), "voyage-4");
         assert_eq!(EmbedProvider::OpenAiCompat.default_model(), "");
     }
 
