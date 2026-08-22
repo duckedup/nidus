@@ -1413,6 +1413,97 @@ fn cli_diversity_reshapes_a_text_search() {
     );
 }
 
+/// `text-search`'s ranking and projection knobs through the real binary: the same
+/// `--limit-per`/`--rank-by`/`--include-attr` the route has always carried (nidus-33g).
+#[test]
+fn cli_text_search_ranking_knobs_reshape_the_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(
+        &["set-fts-schema", "--dir", dir, "docs", "--field", "body"],
+        "",
+    );
+    // BM25 orders these d1 > d2 > d3 > d4 on "alpha" (falling tf, rising length); three of
+    // the four share one `file`, and only d1 is old enough for the decay below to bury.
+    let seed = json!([
+        {"id": "d1", "vector": [1, 0, 0], "attrs": {
+            "body": {"Str": "alpha alpha alpha"}, "file": {"Str": "a.md"}, "ts": {"Int": 0}}},
+        {"id": "d2", "vector": [0, 1, 0], "attrs": {
+            "body": {"Str": "alpha alpha"}, "file": {"Str": "a.md"}, "ts": {"Int": 1000000}}},
+        {"id": "d3", "vector": [0, 0, 1], "attrs": {
+            "body": {"Str": "alpha"}, "file": {"Str": "a.md"}, "ts": {"Int": 1000000}}},
+        {"id": "d4", "vector": [1, 1, 0], "attrs": {
+            "body": {"Str": "alpha beta"}, "file": {"Str": "b.md"}, "ts": {"Int": 1000000}}}
+    ])
+    .to_string();
+    ok(&["upsert", "--dir", dir, "docs"], &seed);
+
+    let base = ["text-search", "--dir", dir, "--in", "docs", "-k", "4"];
+    let query = ["body", "alpha"];
+    let hits = |extra: &[&str]| -> Value {
+        let mut args: Vec<&str> = base.to_vec();
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&query);
+        ok(&args, "")
+    };
+
+    assert_eq!(ids(&hits(&[])), ["d1", "d2", "d3", "d4"]);
+
+    // One hit per `file`, so two of the three a.md docs are dropped even though k=4.
+    assert_eq!(
+        ids(&hits(&["--limit-per", "file", "--limit-per-max", "1"])),
+        ["d1", "d4"],
+        "--limit-per did not cap the text-search page"
+    );
+    assert_eq!(
+        ids(&hits(&["--limit-per", "file", "--limit-per-max", "2"])),
+        ["d1", "d2", "d4"],
+        "--limit-per-max 2 kept the wrong number per file"
+    );
+
+    // A half-life of 1s with a lambda far above any BM25 gap here buries d1 outright.
+    let decayed = hits(&[
+        "--rank-by",
+        r#"{"Decay":{"field":"ts","origin":1000000,"scale":1000,"lambda":100.0}}"#,
+    ]);
+    assert_eq!(
+        ids(&decayed).last().map(String::as_str),
+        Some("d1"),
+        "--rank-by did not apply the recency penalty"
+    );
+
+    let projected = hits(&["--include-attr", "file"]);
+    let attrs = &projected[0]["attrs"];
+    assert_eq!(attrs["file"], json!({"Str": "a.md"}));
+    assert!(
+        attrs.get("body").is_none() && attrs.get("ts").is_none(),
+        "--include-attr did not drop the other attrs: {attrs}"
+    );
+
+    // Both projection sides at once is an error, not a precedence rule.
+    let err = fails(
+        &[
+            "text-search",
+            "--dir",
+            dir,
+            "--in",
+            "docs",
+            "--include-attr",
+            "file",
+            "--exclude-attr",
+            "body",
+            "body",
+            "alpha",
+        ],
+        "",
+    );
+    assert!(
+        err.contains("include") || err.contains("exclude"),
+        "unhelpful projection error: {err}"
+    );
+}
+
 /// `recall --diversity` through the binary. `remember` pins the collection and provisions the
 /// store at the embedder's dimension; the crowded corpus is then written as raw vectors built
 /// in the query's own embedding space, so which hits are redundant is computed, not guessed.

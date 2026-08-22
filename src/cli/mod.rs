@@ -1126,6 +1126,21 @@ enum Command {
         /// AND-filter as JSON (same form as `search --where`).
         #[arg(long = "where")]
         filter: Option<String>,
+        /// Return only this attr (repeatable). Mutually exclusive with --exclude-attr.
+        #[arg(long = "include-attr")]
+        include_attributes: Vec<String>,
+        /// Return every attr but this one (repeatable). Mutually exclusive with --include-attr.
+        #[arg(long = "exclude-attr")]
+        exclude_attributes: Vec<String>,
+        /// Ranking expression as JSON (same form as `search --rank-by`), applied to the BM25 score.
+        #[arg(long = "rank-by")]
+        rank_by: Option<String>,
+        /// Cap hits per distinct value of this attribute (needs --limit-per-max).
+        #[arg(long = "limit-per", requires = "limit_per_max")]
+        limit_per: Option<String>,
+        /// Maximum hits kept per distinct --limit-per value.
+        #[arg(long = "limit-per-max", requires = "limit_per")]
+        limit_per_max: Option<usize>,
         /// MMR lambda spreading hits in vector space: 1.0 pure relevance, 0.0 pure spread.
         #[arg(long = "diversity")]
         diversity: Option<f32>,
@@ -1704,6 +1719,11 @@ pub fn run(cli: Cli) -> Result<()> {
             offset,
             min_score,
             filter,
+            include_attributes,
+            exclude_attributes,
+            rank_by,
+            limit_per,
+            limit_per_max,
             diversity,
             #[cfg(feature = "rerank")]
             rerank,
@@ -1726,6 +1746,12 @@ pub fn run(cli: Cli) -> Result<()> {
                 min_score,
                 filter,
                 explain: text.explain,
+                projection: projection(include_attributes, exclude_attributes)?,
+                rank_by: rank_by.map(|s| serde_json::from_str(&s)).transpose()?,
+                // clap's `requires` pairing means either both flags are present or neither is.
+                limit_per: limit_per
+                    .zip(limit_per_max)
+                    .map(|(f, m)| LimitPer::new(f, m)),
                 diversity,
                 #[cfg(feature = "rerank")]
                 rerank: resolved.as_ref().map(|(_, o, _)| o.clone()),
@@ -2687,6 +2713,65 @@ mod tests {
             Command::TextSearch { diversity, .. } => assert_eq!(diversity, Some(1.0)),
             _ => panic!("expected TextSearch"),
         }
+    }
+
+    /// `text-search` takes the same ranking and projection knobs as `search`, because the
+    /// route it mirrors has always carried them (nidus-33g).
+    #[test]
+    fn text_search_parses_the_ranking_and_projection_knobs() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "text-search",
+            "--dir",
+            "/tmp/s",
+            "body",
+            "alpha",
+            "--rank-by",
+            r#"{"Decay":{"field":"ts","origin":0}}"#,
+            "--limit-per",
+            "file",
+            "--limit-per-max",
+            "2",
+            "--include-attr",
+            "path",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::TextSearch {
+                rank_by,
+                limit_per,
+                limit_per_max,
+                include_attributes,
+                exclude_attributes,
+                ..
+            } => {
+                assert!(rank_by.is_some());
+                assert_eq!(limit_per.as_deref(), Some("file"));
+                assert_eq!(limit_per_max, Some(2));
+                assert_eq!(include_attributes, vec!["path"]);
+                assert!(exclude_attributes.is_empty());
+            }
+            _ => panic!("expected TextSearch"),
+        }
+        // The cap's two halves are useless apart, so clap requires them together.
+        assert!(
+            Cli::try_parse_from([
+                "nidus",
+                "text-search",
+                "--dir",
+                "/tmp/s",
+                "body",
+                "alpha",
+                "--limit-per",
+                "file",
+            ])
+            .is_err()
+        );
+        // A projection naming both sides is rejected, not silently resolved by precedence.
+        assert!(
+            projection(vec!["path".to_string()], vec!["body".to_string()]).is_err(),
+            "include + exclude must be an error"
+        );
     }
 
     /// `recall` mirrors `search`'s query knobs (`-k`, `--min-score`, `--where`).
