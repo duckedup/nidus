@@ -1419,6 +1419,42 @@ The general rule this encodes: a change to the *segment format* needs a named ca
 because it is the one layer where being wrong is expensive to walk back. Query-path
 features do not carry that burden and are judged on their own merits.
 
+#### The Voyage default model — DECIDED, 2026-08 (nidus-0hq)
+
+`EmbedProvider::Voyage.default_model()` moves from `voyage-3` to `voyage-4`. The
+question was whether a default may move at all once callers have stores written under
+it, and the answer turns on a fact the ticket was filed without: a default flip is
+**loud, not silent**. `guard_recall_identity` (§ memory) pins `provider/model` in
+collection meta and hard-bails on a mismatch, so a collection written as
+`voyage/voyage-3` refuses recall under the new default rather than quietly returning
+cross-space rankings. Both Voyage generations are 1024-wide, so the store's pinned
+dimension is unaffected and nothing has to be re-embedded — the caller pins
+`--embed-model voyage-3` and is exactly where they were.
+
+That makes the cost a one-line migration with an error message that names it, which is
+worth paying to keep the zero-config path on the current generation. The rule this sets:
+a provider default may move when the identity guard turns the move into a refusal, and
+may not when it would be absorbed silently. A default that changes *dimension* is a
+different question and is not settled here.
+
+#### Provider-side embedding quantization (`output_dtype`) — deferred, 2026-08 (nidus-9zj)
+
+Voyage 4 can return int8/uint8/binary/ubinary embeddings on the wire. Not built, and the
+reason is not the trait churn alone.
+
+`Embedder` returns `Vec<f32>`, so expressing this means widening that return type across
+all eight adapters, `AnyEmbedder`, the embedding cache and `Memory` — seven providers
+rewritten to wrap floats in a type only one of them can populate. Against that, the
+saving is narrower than it looks: `Config::quantization` already stores int8 and binary,
+so the 4×/32× win on disk and in RAM is **already banked**, and provider-side dtype buys
+only the bytes in flight during ingest. It also forecloses something: local quantization
+keeps the f32 for the rerank pass that restores accuracy, and an embedding that arrived
+as int8 never had an f32 to rerank against.
+
+Revisit when a caller names ingest bandwidth as a real cost (a large backfill over a slow
+or metered link is the plausible one), or when the rerank-accuracy objection is measured
+and turns out not to bite. The decision is "not yet", not "never".
+
 ### 9.1 A bundled zero-config local embedder — RESOLVED (not shipping)
 
 Every shipped embedder (voyage, openai, ollama, cohere, gemini, mistral, jina,

@@ -1,4 +1,4 @@
-//! Voyage AI embedding adapter (`voyage-3` default), including the Voyage 4
+//! Voyage AI embedding adapter (`voyage-4` default), including the Voyage 4
 //! family and its Matryoshka `output_dimension`.
 
 use serde::Deserialize;
@@ -246,6 +246,8 @@ mod tests {
     #[test]
     fn dimension_lookup() {
         assert_eq!(dimension_for_model("voyage-3"), 1024);
+        // The fallback is 1024 too, so assert the arm exists, not the width.
+        assert_eq!(known_dimension("voyage-code-3"), Some(1024));
         assert_eq!(dimension_for_model("voyage-3-lite"), 512);
         assert_eq!(dimension_for_model("voyage-code-2"), 1536);
         assert_eq!(dimension_for_model("voyage-large-2"), 1536);

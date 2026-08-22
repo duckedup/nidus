@@ -42,6 +42,7 @@ impl JinaEmbedder {
             &self.model,
             texts,
             Some(task),
+            None,
             "Jina API",
         )
         .await

@@ -22,7 +22,7 @@ to bind. This is the shape most local clients expect:
 
 ```bash
 claude mcp add nidus -- nidus mcp --dir ~/.nidus --dim 1024 \
-  --embed-provider voyage --embed-model voyage-3
+  --embed-provider voyage --embed-model voyage-4
 ```
 
 `--dim` is optional here as long as `~/.nidus` does not exist yet: with an
@@ -55,7 +55,7 @@ you:
 
 ```bash
 nidus serve --dir ./store --dim 1024 \
-  --embed-provider voyage --embed-model voyage-3 \
+  --embed-provider voyage --embed-model voyage-4 \
   --token "$NIDUS_TOKEN"
 ```
 

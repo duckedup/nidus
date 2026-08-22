@@ -31,7 +31,7 @@ So run one `nidus serve`, and let both the model and the hooks talk to it:
 ```bash
 nidus serve --dir ~/.nidus --dim 1024 \
   --addr 127.0.0.1:7700 \
-  --embed-provider voyage --embed-model voyage-3
+  --embed-provider voyage --embed-model voyage-4
 ```
 
 Point the agent's MCP client at that server's `/mcp` endpoint rather than spawning

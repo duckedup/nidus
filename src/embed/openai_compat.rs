@@ -72,6 +72,7 @@ impl OpenAiCompatEmbedder {
             &self.model,
             texts,
             None,
+            None,
             "OpenAI-compatible API",
         )
         .await

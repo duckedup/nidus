@@ -83,7 +83,7 @@ let embedder = AnyEmbedder::build(
 
 | Provider | Feature | Enum | Default model |
 |---|---|---|---|
-| Voyage | `embed-voyage` | `EmbedProvider::Voyage` | `voyage-3` |
+| Voyage | `embed-voyage` | `EmbedProvider::Voyage` | `voyage-4` |
 | OpenAI | `embed-openai` | `EmbedProvider::OpenAi` | `text-embedding-3-small` |
 | Ollama | `embed-ollama` | `EmbedProvider::Ollama` | `nomic-embed-text` |
 | Cohere | `embed-cohere` | `EmbedProvider::Cohere` | `embed-english-v3.0` |
@@ -96,9 +96,17 @@ Voyage's current generation is the **Voyage 4** family (`voyage-4-large`,
 `voyage-4`, `voyage-4-lite`, `voyage-code-4`, and the open-weight
 `voyage-4-nano`): 1024 dimensions natively, a 32K-token context, and Matryoshka
 truncation to 256, 512, or 2048 via `EmbedConfig::output_dimension` (the
-`--embed-dimension` flag). The default model is still `voyage-3`, so nothing
-re-embeds itself under you; pass `--embed-model voyage-4` to opt in. Since the
-store pins its dimension at creation, choose the width before the first upsert.
+`--embed-dimension` flag). Since the store pins its dimension at creation,
+choose the width before the first upsert.
+
+:::caution[The Voyage default moved to `voyage-4` in 0.77.0]
+It was `voyage-3` through 0.76.x. Both are 1024 dimensions natively, so no store
+needs re-creating and nothing is re-embedded behind your back. What does change:
+a collection written through the memory API carries a pinned `voyage/voyage-3`
+identity, and a recall under the new default refuses with an embedder-mismatch
+error rather than returning cross-space results. Pass `--embed-model voyage-3`
+(or `EmbedConfig::new("voyage-3")`) to stay exactly where you were.
+:::
 
 ```rust
 let cfg = EmbedConfig::new("voyage-4-large")
@@ -106,10 +114,16 @@ let cfg = EmbedConfig::new("voyage-4-large")
     .output_dimension(256);
 ```
 
+**OpenAI** honours `output_dimension` too, on `text-embedding-3-small` and
+`text-embedding-3-large`. Those take any width from 1 up to the model's native
+size (1536 and 3072 respectively) rather than a fixed set, so
+`output_dimension(768)` is valid against `text-embedding-3-large` where the
+Voyage equivalent is not.
+
 Asking for a width a model cannot honour is an error, not a silent fallback:
-fixed-width Voyage models and every non-Voyage provider reject
-`output_dimension` at construction rather than pinning the store to a dimension
-the API will not fill.
+fixed-width Voyage models, `text-embedding-ada-002`, and every provider that
+does not advertise the capability reject `output_dimension` at construction
+rather than pinning the store to a dimension the API will not fill.
 
 The **OpenAI-compatible** adapter is the catch-all: point its `base_url` at any
 service that speaks the standard `/v1/embeddings` shape: Azure OpenAI, Together,
