@@ -199,6 +199,10 @@ Needs blueprints. If none exist for this target, run **Spec** first (including i
    against the merged tree: agents passing individually does not mean the merged result passes.
    Lanes the checker reports as `ci` (Miri today) are required PR checks — do not run them
    locally; the PR is where they run once. Debugging a red CI lane is the exception.
+   In the full pipeline, start these lanes in the background and launch **Review**'s fan-out
+   immediately: both only read the merged tree, so they overlap safely and the wall clock is
+   the slower of the two, not the sum. The one rule the overlap adds: do not edit the tree —
+   review fixes included — until the lanes report, or the green proves a tree nobody has.
 7. Report failures from the workflow with their blockers and log paths, and ask whether to
    investigate, skip, or abort.
 8. On success delete the blueprint files, then continue to **Review**.
@@ -296,7 +300,11 @@ worse than none, since `scope` would then review against the wrong requirements.
    alone leaves every claim and close on your machine.
 6. **Offer the PR** with `AskUserQuestion` — open it, or stop with the branch pushed. When
    opening: `gh pr create --assignee @me`, title = the commit subject verbatim, body = what
-   changed and why plus `Closes nidus-<n>`. Print the URL.
+   changed and why plus `Closes nidus-<n>`. Then `gh pr merge --auto --squash`: the queue
+   still retests, and the PR merges the moment checks go green instead of waiting for
+   someone to come back and press the button. Print the URL.
+   Auto-merge makes step 3's bead close easy to orphan — nobody is watching when it lands —
+   so close it at your next touch of the repo rather than assuming someone saw it merge.
 
 Ask before the commit. Never commit or push without the user choosing to.
 

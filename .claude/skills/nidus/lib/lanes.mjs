@@ -124,6 +124,37 @@ const RULES = [
   },
 ]
 
+// Which changed paths exercise each heavy CI job. The guard step in ci.yml /
+// integration.yml skips a job's WORK when nothing here matches — never its report,
+// so required checks still report (the QUEUE_LITE pattern). Keys are ci.yml job ids.
+const RUST = [
+  /^src\//, /^tests\//, /^examples\//, /^benchmarks\//,
+  /^Cargo\.(toml|lock)$/, /^rust-toolchain\.toml$/, /^\.cargo\//,
+  /^\.github\/workflows\/ci\.yml$/,
+]
+export const CI_JOBS = {
+  'test': RUST,
+  'test-extended': RUST,
+  'release': RUST,
+  'miri': RUST,
+  'miri-integration': RUST,
+  'build-budget': RUST,
+  'bench-compiles': RUST,
+  'build-thesis': RUST,
+  'sdk-integration': [...RUST, /^sdks\//],
+  'e2e': [...RUST.slice(0, -1), /^scripts\/e2e-services\.sh$/, /^\.github\/workflows\/integration\.yml$/],
+}
+
+// Fail open twice over: an empty file list runs everything (a guard that saw
+// nothing must not skip), and an unknown job throws (a renamed job fails loud).
+export function ciGuard(job, paths) {
+  const rules = CI_JOBS[job]
+  if (!rules) throw new Error(`ci-guard: unknown job '${job}' — add it to CI_JOBS in lanes.mjs`)
+  const files = (paths || []).filter(Boolean)
+  const cause = files.find(f => rules.some(re => re.test(f))) || null
+  return { job, run: !files.length || !!cause, cause, examined: files.length }
+}
+
 // Paths that need no build lane at all — reported so the caller can say why
 // nothing ran, instead of silently returning an empty set.
 const INERT = [/^\.claude\//, /^\.github\//, /^[^/]*\.md$/, /^LICENSE$/, /^\.gitignore$/, /LICENSE$/, /^sdks\/[^/]+\/.*\.md$/]

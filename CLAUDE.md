@@ -457,9 +457,10 @@ mmap (`src/data/mmap.rs`) — so check §9 rather than trusting a list here.
   `merge_group` and still reports — each short-circuits via a per-step
   `if: env.QUEUE_LITE != 'true'` guard, never a job-level `if`, because a job that
   is skipped outright is exactly the check that never reports. So the rule above is
-  unchanged: the trigger is mandatory, the *work* is what got trimmed. `test` and
-  `Miri` are excluded because queue entries are serialized and those are the two
-  slowest lanes, so their cost is paid per entry; what the queue still buys is
+  unchanged: the trigger is mandatory, the *work* is what got trimmed. The test and
+  Miri lanes (each split into two required jobs, nidus-0bs) are excluded because
+  queue entries are serialized and those are the slowest lanes, so their cost is
+  paid per entry; what the queue still buys is
   `clippy` + `release` compiling **every feature set of the merged tree**, which is
   where two individually-green PRs usually collide (#135 + #137 was a compile
   break). The trade is deliberate and it is now wider: a pair of PRs that is

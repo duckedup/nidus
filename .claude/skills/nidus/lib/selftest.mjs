@@ -4,7 +4,7 @@
 import * as laws from './laws.mjs'
 import * as fleet from './fleet.mjs'
 import * as pre from './preflight.mjs'
-import { lanes, formatLanes } from './lanes.mjs'
+import { lanes, formatLanes, ciGuard } from './lanes.mjs'
 
 const cases = []
 const test = (name, fn) => cases.push({ name, fn })
@@ -425,6 +425,43 @@ test('lanes: each SDK lane runs every step its CI job runs (#172)', () => {
   for (const step of ['ruff check', 'ruff format --check', 'mypy src', 'pytest']) {
     eq(py.includes(step), true, `python lane runs ${step}`)
   }
+})
+
+// ── ci-guard: the per-job skip oracle (nidus-0bs) ───────────────────────────
+// A wrong `skip` silently unguards a required check's work, so the failure modes
+// are pinned: docs-only skips, src runs, empty runs, unknown job throws.
+
+test('ci-guard: a docs/skill-only change skips the Rust jobs', () => {
+  for (const job of ['test', 'test-extended', 'miri', 'miri-integration', 'release', 'build-budget']) {
+    eq(ciGuard(job, ['docs/src/content/docs/api.md', '.claude/skills/nidus/SKILL.md', 'README.md']).run, false, `${job} skips`)
+  }
+})
+
+test('ci-guard: any src or manifest change runs every Rust job', () => {
+  for (const f of ['src/lib.rs', 'Cargo.toml', 'Cargo.lock', 'tests/integration.rs', 'rust-toolchain.toml']) {
+    eq(ciGuard('miri', ['docs/x.md', f]).run, true, `miri runs for ${f}`)
+  }
+})
+
+test('ci-guard: an SDK change runs sdk-integration but not miri', () => {
+  eq(ciGuard('sdk-integration', ['sdks/js/src/client.ts']).run, true, 'sdk-integration runs')
+  eq(ciGuard('miri', ['sdks/js/src/client.ts']).run, false, 'miri skips')
+})
+
+test('ci-guard: a workflow edit runs its own jobs', () => {
+  eq(ciGuard('test', ['.github/workflows/ci.yml']).run, true, 'ci.yml runs test')
+  eq(ciGuard('e2e', ['.github/workflows/integration.yml']).run, true, 'integration.yml runs e2e')
+  eq(ciGuard('e2e', ['scripts/e2e-services.sh']).run, true, 'services script runs e2e')
+})
+
+test('ci-guard: an empty diff runs everything — a guard that saw nothing must not skip', () => {
+  eq(ciGuard('test', []).run, true, 'fail open')
+})
+
+test('ci-guard: an unknown job is an error, never a skip', () => {
+  let threw = false
+  try { ciGuard('renamed-job', ['src/lib.rs']) } catch { threw = true }
+  eq(threw, true, 'throws')
 })
 
 // ── #173: a check must not report success without having run ───────────────
