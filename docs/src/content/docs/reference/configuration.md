@@ -271,3 +271,23 @@ pub enum OpenMode {
 A `ReadOnly` handle reads a consistent, possibly-stale, lock-free snapshot; many
 can coexist with a single writer. See
 [cross-process readers](/guides/storage/#cross-process-readers).
+
+## Diagnostics environment variables
+
+These sit outside `Config`: they tune the process-wide diagnostics in `src/diag.rs`
+rather than any one store, so there is no builder setter for them.
+
+### `NIDUS_LOG`
+
+Log level: `error`, `warn`, `info` (the default), `debug`, `trace`, or `off`. See
+[logs](/guides/http-server/#logs) for what each level emits.
+
+### `NIDUS_SLOW_QUERY_MS`
+
+Unset by default, which disables the slow-query line entirely. Set it to a millisecond
+threshold and any `search`/`search_similar`/`hybrid_search` call whose total time meets
+or exceeds it logs one `warn`-level line: the [query path](/reference/http-api/#query-plans-how-a-query-ran)
+taken, `total_us`, rows scanned, and candidate survival. It needs **no per-query
+opt-in**: it reads every query's timing regardless of whether that query asked for a
+full `plan`, which is what makes it useful for catching a slow query you did not know
+to instrument in advance. `0` or an unparseable value also disables it.

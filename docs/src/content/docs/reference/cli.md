@@ -220,6 +220,7 @@ Nearest-neighbour search; the query vector is a JSON array of floats. Usage:
 | `--rerank-query <TEXT>` (`rerank` feature) | none | Text scored against each candidate by the cross-encoder. |
 | `--rerank-overscan <N>` (`rerank` feature) | none | Candidates retrieved per `top_k` before the cross-encoder rerank (default `10`). |
 | `--rerank-text-attr <ATTR>` (`rerank` feature) | none | Attr holding each candidate's text for the cross-encoder rerank (default `nidus.text`). |
+| `--plan` | none | Print `{hits, plan}` instead of the bare hit array: path taken, rows scanned, candidate survival, timings. See [Query plans](/reference/http-api/#query-plans-how-a-query-ran). |
 
 ### `similar`
 
@@ -341,6 +342,7 @@ flags as `text-search` above, plus:
 | `--rerank-query <TEXT>` (`rerank` feature) | none | Text scored against each candidate by the cross-encoder. |
 | `--rerank-overscan <N>` (`rerank` feature) | none | Candidates retrieved per `top_k` before the cross-encoder rerank (default `10`). |
 | `--rerank-text-attr <ATTR>` (`rerank` feature) | none | Attr holding each candidate's text for the cross-encoder rerank (default `nidus.text`). |
+| `--plan` | none | Print `{hits, plan}` instead of the bare hit array: path taken, rows scanned, candidate survival, timings. See [Query plans](/reference/http-api/#query-plans-how-a-query-ran). |
 
 ### `get`
 

@@ -384,6 +384,7 @@ curl -s localhost:7700/search \
 | `diversity` | none | MMR lambda spreading hits apart in vector space (`1.0` relevance, `0.0` variety) |
 | `expand` | none | widen each hit with its document's neighbouring chunks; see [`expand`](#expand-widen-a-hit-with-its-neighbouring-chunks) |
 | `rerank` | none | re-score the candidate window with a hosted cross-encoder; see below |
+| `plan` | `false` | report how the query ran alongside the hits; see [Query plans](#query-plans-how-a-query-ran) |
 
 Omitting `rerank` leaves the response byte-identical to a nidus without the feature.
 `rerank` is only compiled in under the `rerank` feature (part of the `serve` umbrella);
@@ -512,6 +513,7 @@ curl -s localhost:7700/search/similar \
 | `limit_per` | none | cap hits per distinct value of an attribute |
 | `diversity` | none | MMR lambda spreading hits apart in vector space (`1.0` relevance, `0.0` variety) |
 | `expand` | none | widen each hit with its document's neighbouring chunks; see [`expand`](#expand-widen-a-hit-with-its-neighbouring-chunks) |
+| `plan` | `false` | report how the query ran alongside the hits; see [Query plans](#query-plans-how-a-query-ran) |
 
 The one difference from `/search`: an omitted or empty `scope` searches only the source's
 own collection, not every collection in the store.
@@ -569,12 +571,17 @@ fall back to, so a rerank there must name `rerank.query` itself; omitting it is 
 See [the `/search` entry above](#post-search) and the [reranking guide](/guides/rerank/)
 for the field shape and the passthrough/score-scale rules, which apply here unchanged.
 
+`/text-search` has no `plan` field: it always runs the same BM25 postings walk, so there is
+no branch worth reporting. [Query plans](#query-plans-how-a-query-ran) below cover only
+`/search`, `/search/similar`, and `/hybrid-search`.
+
 ### `POST /hybrid-search`
 
 Fuse a vector query and a BM25 text query with Reciprocal Rank Fusion. Takes `vector`
 plus the text leg (`field` + `text`, or the same `clauses` + `combine` as `/text-search`),
 plus `top_k`, `offset` (which pages the **fused** ranking, never a leg),
-`filter`, `rrf_k` (default 60), `candidates` (default 100), and `explain`/`highlight`.
+`filter`, `rrf_k` (default 60), `candidates` (default 100), `explain`/`highlight`, and
+`plan` (report how the query ran; see [Query plans](#query-plans-how-a-query-ran)).
 There is no `min_score` (a fused RRF score has no absolute scale). It also takes `expand`,
 applied after fusion so the RRF order is untouched. Returns the same hit shape as `/search`.
 
@@ -670,6 +677,78 @@ key is **absent** otherwise: an unannotated response is byte-for-byte what it al
 as the document spells it: a query for `run` marks `running`. Highlighting reads the
 stored text, so it still works on a field `include_attributes`/`exclude_attributes`
 dropped from the payload: that pairing (drop the long body, keep the snippet) is the point.
+
+### Query plans: how a query ran
+
+`plan: true` on `/search`, `/search/similar`, or `/hybrid-search` wraps the response in an
+object carrying both the hits and a `plan` describing how the query was answered. `false`
+(the default) keeps the response the bare hit array, byte-identical to a nidus without the
+feature. `/text-search` has no `plan`: it always runs the same BM25 postings walk, so there
+is no branch worth reporting.
+
+```bash
+curl -s localhost:7700/search \
+  -H 'content-type: application/json' \
+  -d '{"query": [1,0,0], "top_k": 5, "plan": true}'
+```
+
+```json
+{
+  "hits": [{"collection": "docs", "id": "a", "score": 0.98, "attrs": {}}],
+  "plan": {
+    "path": "quantized",
+    "rows_scanned": 12000,
+    "candidates": {
+      "surfaced": 400, "survived": 55,
+      "dropped_out_of_scope": 0, "dropped_stale": 0,
+      "dropped_filtered": 340, "dropped_min_score": 5
+    },
+    "narrowing": {"state": "inactive"},
+    "timings": {"first_pass_us": 120, "rescore_us": 340, "total_us": 610}
+  }
+}
+```
+
+`path` names which branch of the search answered the query:
+
+| `path` | Meaning |
+| --- | --- |
+| `ann` | the HNSW/IVF index was walked for an over-fetched candidate set |
+| `ann_prefilter_fallback` | a selective filter made the index walk too thin, so an exact scan ran instead |
+| `segmented` | a per-segment IVF index merged with an exhaustive scan of the active segment and any sealed segment below the indexing threshold |
+| `quantized` | the int8/binary first pass, then an exact f32 rerank |
+| `exact` | brute-force cosine over every row in scope |
+
+Thin results paired with `ann_prefilter_fallback` is the operator story this section exists
+for: it means a filter narrow enough to starve the ANN walk, before the walk ever ran, not
+a broken index. Widening the filter, or raising `--ann-overscan` so the walk over-fetches a
+larger candidate set, are the two levers.
+
+`rows_scanned` is the row count fed to a brute-force scan, and is **absent**, not `0`, on
+the `ann` and `segmented` paths: no full scan happens on either, so a number there would
+claim precision the walk never had. `candidates` breaks an index walk's surfaced set down by
+why each candidate did not survive: `surfaced`, `survived`, and `dropped_out_of_scope` /
+`dropped_stale` / `dropped_filtered` / `dropped_min_score`; it is absent on paths that never
+surface an index candidate set (`exact`, `quantized`).
+
+`narrowing` reports whether the opt-in [filter index](/guides/search/#indexing-the-text-predicates)
+narrowed the scan before it ran, one of three states:
+
+| `state` | Meaning |
+| --- | --- |
+| `inactive` | no collection in scope declares a filter index |
+| `declined` | an index exists but could not answer this filter, so the full scan ran anyway |
+| `narrowed` | the index cut the scan down to `candidates` rows |
+
+`timings` reports per-phase wall time in **microseconds**: `narrow_us`, `gather_us`,
+`walk_us`, `resolve_us`, `first_pass_us`, `rescore_us`, `score_us`, each present only for
+the phases the path taken actually runs, plus `total_us`, which always runs and covers the
+whole query.
+
+`NIDUS_SLOW_QUERY_MS` (see [Configuration](/reference/configuration/)) logs the short form
+of this same plan, path/`total_us`/rows scanned/candidates, for any query crossing that
+threshold, unconditionally: it needs no per-query `plan: true`, since an operator chasing a
+slow store cannot annotate every query in advance.
 
 ### `POST /list`
 

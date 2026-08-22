@@ -1212,3 +1212,92 @@ def test_request_headers_does_not_alias_the_caller_mapping() -> None:
     extra = {"x-trace": "1"}
     _wire.request_headers("t", extra, has_body=True)
     assert extra == {"x-trace": "1"}
+
+
+# ── Query plans (`*_with_plan`) ──────────────────────────────────────────────────────
+
+
+def test_plan_is_omitted_from_every_body_unless_asked_for() -> None:
+    """The three plan-capable bodies never send the key unless a ``_with_plan`` method asks."""
+    assert "plan" not in _wire.search_body([1.0])
+    assert "plan" not in _wire.similar_body("notes", "a")
+    assert "plan" not in _wire.hybrid_search_body([1.0], "body", "fox")
+    assert _wire.search_body([1.0], plan=True)["plan"] is True
+    assert _wire.similar_body("notes", "a", plan=True)["plan"] is True
+    assert _wire.hybrid_search_body([1.0], "body", "fox", plan=True)["plan"] is True
+
+
+PLAN_PAYLOAD = {
+    "path": "ann_prefilter_fallback",
+    "rows_scanned": 1234,
+    "candidates": {
+        "surfaced": 100,
+        "survived": 12,
+        "dropped_out_of_scope": 0,
+        "dropped_stale": 0,
+        "dropped_filtered": 88,
+        "dropped_min_score": 0,
+    },
+    "narrowing": {"state": "narrowed", "candidates": 42},
+    "timings": {
+        "narrow_us": 12,
+        "gather_us": 300,
+        "walk_us": 900,
+        "resolve_us": 50,
+        "score_us": 20,
+        "total_us": 1300,
+    },
+}
+
+
+def test_decode_plan_decodes_every_part() -> None:
+    plan = _wire.decode_plan(PLAN_PAYLOAD)
+    assert plan.path == "ann_prefilter_fallback"
+    assert plan.rows_scanned == 1234
+    assert plan.candidates is not None
+    assert plan.candidates.surfaced == 100
+    assert plan.candidates.dropped_filtered == 88
+    assert plan.narrowing.state == "narrowed"
+    assert plan.narrowing.candidates == 42
+    assert plan.timings.total_us == 1300
+    assert plan.timings.walk_us == 900
+    assert plan.timings.first_pass_us is None
+    assert plan.timings.rescore_us is None
+
+
+def test_decode_plan_treats_an_unknown_path_as_an_open_string() -> None:
+    """A newer server may add a path this SDK has never heard of; it must not raise."""
+    plan = _wire.decode_plan({**PLAN_PAYLOAD, "path": "some_future_path"})
+    assert plan.path == "some_future_path"
+
+
+def test_decode_plan_omits_rows_scanned_and_candidates_when_absent() -> None:
+    """``rows_scanned``/``candidates`` are absent, not ``null``, on the ``ann`` path."""
+    payload = {
+        "path": "ann",
+        "narrowing": {"state": "inactive"},
+        "timings": {"total_us": 50},
+    }
+    plan = _wire.decode_plan(payload)
+    assert plan.rows_scanned is None
+    assert plan.candidates is None
+    assert plan.narrowing.state == "inactive"
+    assert plan.narrowing.candidates is None
+
+
+def test_decode_hits_and_plan_splits_the_wrapped_response() -> None:
+    hits, plan = _wire.decode_hits_and_plan(
+        {
+            "hits": [{"collection": "c", "id": "i", "score": 0.9, "attrs": {}}],
+            "plan": PLAN_PAYLOAD,
+        }
+    )
+    assert len(hits) == 1
+    assert hits[0].id == "i"
+    assert plan.path == "ann_prefilter_fallback"
+
+
+def test_decode_hits_and_plan_rejects_a_bare_array() -> None:
+    """A bare hits array is what ``plan`` omitted looks like — not what was asked for here."""
+    with pytest.raises(NidusError):
+        _wire.decode_hits_and_plan([{"collection": "c", "id": "i", "score": 0.9, "attrs": {}}])

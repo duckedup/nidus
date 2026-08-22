@@ -22,6 +22,10 @@ import type {
   HybridSearchOptions,
   ListOptions,
   NidusRecord,
+  PlanCandidates,
+  PlanNarrowing,
+  PlanTimings,
+  QueryPlan,
   RankBy,
   Readiness,
   RecallOptions,
@@ -259,9 +263,53 @@ export class NidusClient {
     });
   }
 
+  /** Like {@link NidusClient.search}, but also reports the scan strategy the server took. */
+  searchWithPlan(
+    opts: SearchOptions,
+  ): Promise<{ hits: Hit[]; plan: QueryPlan }> {
+    return this.searchRequestWithPlan("/search", {
+      query: opts.query,
+      scope: opts.scope ?? [],
+      top_k: opts.topK,
+      offset: opts.offset,
+      min_score: opts.minScore,
+      filter: opts.filter ?? [],
+      exact: opts.exact,
+      include_attributes: opts.includeAttributes,
+      exclude_attributes: opts.excludeAttributes,
+      rank_by: encodeRankBy(opts.rankBy),
+      limit_per: opts.limitPer,
+      diversity: opts.diversity,
+      expand: encodeExpand(opts.expand),
+      rerank: encodeRerank(opts.rerank),
+    });
+  }
+
   /** Records most like an existing one. The source record itself is never returned. */
   searchSimilar(opts: SimilarSearchOptions): Promise<Hit[]> {
     return this.searchRequest("/search/similar", {
+      collection: opts.collection,
+      id: opts.id,
+      scope: opts.scope ?? [],
+      top_k: opts.topK,
+      offset: opts.offset,
+      min_score: opts.minScore,
+      filter: opts.filter ?? [],
+      exact: opts.exact,
+      include_attributes: opts.includeAttributes,
+      exclude_attributes: opts.excludeAttributes,
+      rank_by: encodeRankBy(opts.rankBy),
+      limit_per: opts.limitPer,
+      diversity: opts.diversity,
+      expand: encodeExpand(opts.expand),
+    });
+  }
+
+  /** Like {@link NidusClient.searchSimilar}, but also reports the scan strategy taken. */
+  searchSimilarWithPlan(
+    opts: SimilarSearchOptions,
+  ): Promise<{ hits: Hit[]; plan: QueryPlan }> {
+    return this.searchRequestWithPlan("/search/similar", {
       collection: opts.collection,
       id: opts.id,
       scope: opts.scope ?? [],
@@ -311,6 +359,30 @@ export class NidusClient {
    */
   hybridSearch(opts: HybridSearchOptions): Promise<Hit[]> {
     return this.searchRequest("/hybrid-search", {
+      vector: opts.vector,
+      ...(opts.clauses
+        ? { clauses: opts.clauses, combine: opts.combine }
+        : { field: opts.field, text: opts.text }),
+      scope: opts.scope ?? [],
+      top_k: opts.topK,
+      offset: opts.offset,
+      filter: opts.filter ?? [],
+      rrf_k: opts.rrfK,
+      candidates: opts.candidates,
+      explain: opts.explain,
+      highlight: encodeHighlight(opts.highlight),
+      vector_weight: opts.vectorWeight,
+      text_weight: opts.textWeight,
+      expand: encodeExpand(opts.expand),
+      rerank: encodeRerank(opts.rerank),
+    });
+  }
+
+  /** Like {@link NidusClient.hybridSearch}, but also reports the scan strategy taken. */
+  hybridSearchWithPlan(
+    opts: HybridSearchOptions,
+  ): Promise<{ hits: Hit[]; plan: QueryPlan }> {
+    return this.searchRequestWithPlan("/hybrid-search", {
       vector: opts.vector,
       ...(opts.clauses
         ? { clauses: opts.clauses, combine: opts.combine }
@@ -515,6 +587,22 @@ export class NidusClient {
     return hits.map((h) => this.decodeHit(h));
   }
 
+  /** Like {@link NidusClient.searchRequest}, asking for `plan: true` and decoding it too. */
+  private async searchRequestWithPlan(
+    path: string,
+    body: Record<string, unknown>,
+  ): Promise<{ hits: Hit[]; plan: QueryPlan }> {
+    const res = await this.request<{ hits: RawHit[]; plan: RawQueryPlan }>(
+      "POST",
+      path,
+      prune({ ...body, plan: true }),
+    );
+    return {
+      hits: res.hits.map((h) => this.decodeHit(h)),
+      plan: decodeQueryPlan(res.plan),
+    };
+  }
+
   /** One wire hit into a {@link Hit}. Shared so every search surface decodes identically. */
   private decodeHit(h: RawHit): Hit {
     return {
@@ -590,6 +678,64 @@ interface RawHit {
   attrs: Record<string, Value>;
   annotations?: WireAnnotations;
   context?: string;
+}
+
+/** A `QueryPlan` as it arrives on the wire (snake_case), before camelCasing. */
+interface RawQueryPlan {
+  path: string;
+  rows_scanned?: number;
+  candidates?: {
+    surfaced: number;
+    survived: number;
+    dropped_out_of_scope: number;
+    dropped_stale: number;
+    dropped_filtered: number;
+    dropped_min_score: number;
+  };
+  narrowing: { state: PlanNarrowing["state"]; candidates?: number };
+  timings: {
+    narrow_us?: number;
+    gather_us?: number;
+    walk_us?: number;
+    resolve_us?: number;
+    score_us?: number;
+    total_us: number;
+  };
+}
+
+/** Wire `QueryPlan` into its camelCase {@link QueryPlan} shape. */
+function decodeQueryPlan(p: RawQueryPlan): QueryPlan {
+  const candidates: PlanCandidates | undefined = p.candidates
+    ? {
+        surfaced: p.candidates.surfaced,
+        survived: p.candidates.survived,
+        droppedOutOfScope: p.candidates.dropped_out_of_scope,
+        droppedStale: p.candidates.dropped_stale,
+        droppedFiltered: p.candidates.dropped_filtered,
+        droppedMinScore: p.candidates.dropped_min_score,
+      }
+    : undefined;
+  const t = p.timings;
+  const timings: PlanTimings = {
+    ...(t.narrow_us !== undefined ? { narrowUs: t.narrow_us } : {}),
+    ...(t.gather_us !== undefined ? { gatherUs: t.gather_us } : {}),
+    ...(t.walk_us !== undefined ? { walkUs: t.walk_us } : {}),
+    ...(t.resolve_us !== undefined ? { resolveUs: t.resolve_us } : {}),
+    ...(t.score_us !== undefined ? { scoreUs: t.score_us } : {}),
+    totalUs: t.total_us,
+  };
+  return {
+    path: p.path,
+    ...(p.rows_scanned !== undefined ? { rowsScanned: p.rows_scanned } : {}),
+    ...(candidates ? { candidates } : {}),
+    narrowing: {
+      state: p.narrowing.state,
+      ...(p.narrowing.candidates !== undefined
+        ? { candidates: p.narrowing.candidates }
+        : {}),
+    },
+    timings,
+  };
 }
 
 /** An `/aggregate` response, whose sums arrive as tagged {@link Value}s. */

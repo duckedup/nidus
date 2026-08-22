@@ -69,6 +69,10 @@ from .types import (
     LegScore,
     LimitPer,
     OrderBy,
+    PlanCandidates,
+    PlanNarrowing,
+    PlanTimings,
+    QueryPlan,
     Readiness,
     Record,
     RecordInput,
@@ -300,6 +304,7 @@ def search_body(
     diversity: Optional[float] = None,
     expand: Optional[Expand] = None,
     rerank: Optional[RerankOpts] = None,
+    plan: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /search`` (vector nearest-neighbour).
 
@@ -307,7 +312,8 @@ def search_body(
     "every collection" and an empty filter means "match everything", so the empty array is
     the real value, not a missing one. Every other knob is pruned when unset, so an omitted
     ``offset`` (or projection, or ranking expression) is byte-identical to the request
-    before it existed. ``rerank`` is documented on :class:`~nidus.types.RerankOpts`.
+    before it existed. ``rerank`` is documented on :class:`~nidus.types.RerankOpts`. ``plan``
+    is set only by the ``*_with_plan`` methods.
     """
     return prune(
         {
@@ -324,6 +330,7 @@ def search_body(
             "diversity": diversity,
             "expand": _expand(expand),
             "rerank": _rerank(rerank),
+            "plan": plan,
         }
     )
 
@@ -343,13 +350,14 @@ def similar_body(
     limit_per: Optional[LimitPer] = None,
     diversity: Optional[float] = None,
     expand: Optional[Expand] = None,
+    plan: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /search/similar`` ("more like this" over an existing record).
 
     ``scope`` is sent as ``[]`` when unset, same spelling as :func:`search_body` — but here
     the empty value means the source's *own* collection, not every collection, which is the
     one place this route's defaulting differs from ``/search``. Every other knob prunes
-    exactly as it does there.
+    exactly as it does there. ``plan`` is set only by the ``*_with_plan`` methods.
     """
     return prune(
         {
@@ -366,6 +374,7 @@ def similar_body(
             "limit_per": _limit_per(limit_per),
             "diversity": diversity,
             "expand": _expand(expand),
+            "plan": plan,
         }
     )
 
@@ -435,6 +444,7 @@ def hybrid_search_body(
     text_weight: Optional[float] = None,
     expand: Optional[Expand] = None,
     rerank: Optional[RerankOpts] = None,
+    plan: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /hybrid-search`` (vector + BM25 fused via RRF).
 
@@ -442,7 +452,7 @@ def hybrid_search_body(
     the server offers no floor for it. ``offset`` pages the *fused* ranking. The text leg
     takes the same two spellings as ``/text-search``, except that its single-field text is
     called ``text``; a clause's is ``query`` on both routes. ``rerank`` is documented on
-    :class:`~nidus.types.RerankOpts`.
+    :class:`~nidus.types.RerankOpts`. ``plan`` is set only by the ``*_with_plan`` methods.
     """
     return prune(
         {
@@ -461,6 +471,7 @@ def hybrid_search_body(
             "text_weight": text_weight,
             "expand": _expand(expand),
             "rerank": _rerank(rerank),
+            "plan": plan,
         }
     )
 
@@ -662,6 +673,69 @@ def decode_annotations(payload: Any) -> Optional[Annotations]:
         text=_leg_score(payload.get("text")),
         clauses=[_clause_score(c) for c in payload.get("clauses") or ()],
         highlights=[_highlight_of(h) for h in payload.get("highlights") or ()],
+    )
+
+
+def decode_hits_and_plan(payload: Any) -> tuple[list[Hit], QueryPlan]:
+    """Decode a ``*_with_plan`` response: ``{"hits": [...], "plan": {...}}``.
+
+    Unlike a bare :func:`decode_hits` call, a query plan was explicitly requested, so a
+    payload that is not this shape is a malformed response, not an absent optional.
+    """
+    if not isinstance(payload, Mapping):
+        raise NidusError(f"expected a {{hits, plan}} object (got {payload!r})", 0)
+    return decode_hits(payload.get("hits")), decode_plan(payload.get("plan"))
+
+
+def decode_plan(payload: Any) -> QueryPlan:
+    """Decode one hit response's ``plan`` object, mirroring the server's ``QueryPlan``."""
+    if not isinstance(payload, Mapping):
+        raise NidusError(f"expected a plan object (got {payload!r})", 0)
+    candidates = payload.get("candidates")
+    return QueryPlan(
+        path=str(payload["path"]),
+        narrowing=decode_narrowing(payload.get("narrowing")),
+        timings=decode_timings(payload.get("timings")),
+        rows_scanned=_opt_int(payload.get("rows_scanned")),
+        candidates=decode_candidates(candidates) if candidates is not None else None,
+    )
+
+
+def decode_candidates(payload: Mapping[str, Any]) -> PlanCandidates:
+    """Decode a plan's ``candidates`` object. Every field is mandatory on the wire."""
+    return PlanCandidates(
+        surfaced=int(payload["surfaced"]),
+        survived=int(payload["survived"]),
+        dropped_out_of_scope=int(payload["dropped_out_of_scope"]),
+        dropped_stale=int(payload["dropped_stale"]),
+        dropped_filtered=int(payload["dropped_filtered"]),
+        dropped_min_score=int(payload["dropped_min_score"]),
+    )
+
+
+def decode_narrowing(payload: Any) -> PlanNarrowing:
+    """Decode a plan's ``narrowing`` object. ``state`` is an open string, not an enum."""
+    if not isinstance(payload, Mapping):
+        raise NidusError(f"expected a narrowing object (got {payload!r})", 0)
+    return PlanNarrowing(
+        state=str(payload["state"]),
+        candidates=_opt_int(payload.get("candidates")),
+    )
+
+
+def decode_timings(payload: Any) -> PlanTimings:
+    """Decode a plan's ``timings`` object. Only ``total_us`` is guaranteed present."""
+    if not isinstance(payload, Mapping):
+        raise NidusError(f"expected a timings object (got {payload!r})", 0)
+    return PlanTimings(
+        total_us=int(payload["total_us"]),
+        narrow_us=_opt_int(payload.get("narrow_us")),
+        gather_us=_opt_int(payload.get("gather_us")),
+        walk_us=_opt_int(payload.get("walk_us")),
+        resolve_us=_opt_int(payload.get("resolve_us")),
+        first_pass_us=_opt_int(payload.get("first_pass_us")),
+        rescore_us=_opt_int(payload.get("rescore_us")),
+        score_us=_opt_int(payload.get("score_us")),
     )
 
 

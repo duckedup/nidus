@@ -79,6 +79,12 @@ VERSIONS_PAYLOAD = {
     "readable": [3, 4, 5, 6, 7, 8, 9],
 }
 
+PLAN_PAYLOAD = {
+    "path": "exact",
+    "narrowing": {"state": "inactive"},
+    "timings": {"total_us": 100},
+}
+
 
 class Call(NamedTuple):
     """One request as the transport saw it — raw, before any decoding."""
@@ -388,6 +394,61 @@ def test_search_similar_sends_the_source_and_decodes_hit_attrs() -> None:
     assert len(hits) == 1
     assert hits[0].id == "b"
     assert hits[0].attrs == {"lang": "rust"}
+
+
+def test_search_with_plan_sends_plan_true_and_returns_hits_and_plan() -> None:
+    stub = StubTransport(
+        {
+            "hits": [{"collection": "docs", "id": "a", "score": 0.9, "attrs": {}}],
+            "plan": PLAN_PAYLOAD,
+        }
+    )
+    hits, plan = client(stub).search_with_plan(query=[1.0, 0.0, 0.0], top_k=5)
+    assert stub.last.json == {
+        "query": [1.0, 0.0, 0.0],
+        "scope": [],
+        "top_k": 5,
+        "filter": [],
+        "plan": True,
+    }
+    assert len(hits) == 1
+    assert hits[0].id == "a"
+    assert plan.path == "exact"
+    assert plan.timings.total_us == 100
+
+
+def test_search_similar_with_plan_sends_plan_true() -> None:
+    stub = StubTransport({"hits": [], "plan": PLAN_PAYLOAD})
+    hits, plan = client(stub).search_similar_with_plan(collection="notes", id="a")
+    assert stub.last.json["plan"] is True
+    assert hits == []
+    assert plan.narrowing.state == "inactive"
+
+
+def test_hybrid_search_with_plan_sends_plan_true() -> None:
+    stub = StubTransport({"hits": [], "plan": PLAN_PAYLOAD})
+    hits, plan = client(stub).hybrid_search_with_plan(vector=[1.0], field="body", text="fox")
+    assert stub.last.json["plan"] is True
+    assert hits == []
+    assert plan.path == "exact"
+
+
+def test_the_three_existing_search_methods_do_not_send_plan() -> None:
+    """The plain methods are untouched: no ``plan`` key, and no unwrapping expected."""
+    stub = StubTransport([])
+    client(stub).search(query=[1.0])
+    assert "plan" not in stub.last.json
+    client(stub).search_similar(collection="notes", id="a")
+    assert "plan" not in stub.last.json
+    client(stub).hybrid_search(vector=[1.0], field="body", text="fox")
+    assert "plan" not in stub.last.json
+
+
+def test_an_unknown_plan_path_decodes_without_raising() -> None:
+    """A newer server may introduce a path this SDK predates; it must not raise here."""
+    stub = StubTransport({"hits": [], "plan": {**PLAN_PAYLOAD, "path": "brand_new_path"}})
+    _, plan = client(stub).search_with_plan(query=[1.0])
+    assert plan.path == "brand_new_path"
 
 
 def test_a_multi_clause_text_search_reaches_the_wire_with_its_combine_rule() -> None:

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Aggregation, AnnConfig, AnnKind, Annotations, Expand, Filter, FilterIndexField, Footprint,
     FtsClause, FtsCombine, FtsField, HighlightOpts, Hit, Language, LimitPer, ListOpts, OrderBy,
-    Projection, RankBy, Record, StoreVersions, Value,
+    Projection, QueryPlan, RankBy, Record, StoreVersions, Value,
 };
 
 /// Body of `POST /collections/{name}/upsert`.
@@ -122,6 +122,10 @@ pub struct SearchRequest {
     #[cfg(feature = "rerank")]
     #[serde(default)]
     pub rerank: Option<RerankRequest>,
+    /// Report how the query ran alongside the hits: `{"hits": [...], "plan": {...}}` instead
+    /// of the bare array. Default `false` keeps today's response byte-identical.
+    #[serde(default)]
+    pub plan: bool,
 }
 
 /// The opt-in cross-encoder stage on a search request. `query` back-fills from the request's
@@ -172,6 +176,10 @@ pub struct SimilarRequest {
     /// MMR lambda spreading the page in vector space: `1.0` pure relevance, `0.0` pure spread.
     #[serde(default)]
     pub diversity: Option<f32>,
+    /// Report how the query ran alongside the hits: `{"hits": [...], "plan": {...}}` instead
+    /// of the bare array. Default `false` keeps today's response byte-identical.
+    #[serde(default)]
+    pub plan: bool,
 }
 
 /// Most queries one batch may carry. Matches turbopuffer's documented cap; the point is that
@@ -211,6 +219,34 @@ pub struct BatchSearchResponse {
     pub results: Option<Vec<Vec<HitDto>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fused: Option<Vec<HitDto>>,
+}
+
+/// Either the bare hit array (no plan asked for) or `{hits, plan}`. Untagged, so an
+/// unasked response is byte-identical to what every existing client already parses.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum SearchResponse {
+    Hits(Vec<HitDto>),
+    Explained {
+        hits: Vec<HitDto>,
+        /// Boxed: the plan dwarfs the bare-array variant, and serde flattens it either way.
+        plan: Box<QueryPlan>,
+    },
+}
+
+impl SearchResponse {
+    /// `plan` present iff the caller asked for one; kept as a constructor so the three
+    /// handlers that can return a plan cannot each re-derive this branch differently.
+    pub fn new(hits: Vec<Hit>, plan: Option<QueryPlan>) -> Self {
+        let hits = hits.into_iter().map(HitDto::from).collect();
+        match plan {
+            Some(plan) => Self::Explained {
+                hits,
+                plan: Box::new(plan),
+            },
+            None => Self::Hits(hits),
+        }
+    }
 }
 
 /// Resolve a request's projection fields. The two are spelled out on each request rather than
@@ -347,6 +383,10 @@ pub struct HybridSearchRequest {
     #[cfg(feature = "rerank")]
     #[serde(default)]
     pub rerank: Option<RerankRequest>,
+    /// Report how the query ran alongside the hits: `{"hits": [...], "plan": {...}}` instead
+    /// of the bare array. Default `false` keeps today's response byte-identical.
+    #[serde(default)]
+    pub plan: bool,
 }
 
 fn default_weight() -> f32 {
@@ -1131,5 +1171,32 @@ mod tests {
             serde_json::to_value(&p).unwrap(),
             serde_json::json!({ "Not": { "Any": [{ "Contains": ["tags", { "Str": "wip" }] }] } })
         );
+    }
+
+    fn dummy_plan() -> QueryPlan {
+        QueryPlan {
+            path: crate::QueryPath::Exact,
+            rows_scanned: Some(3),
+            candidates: None,
+            narrowing: crate::Narrowing::Inactive,
+            timings: crate::Timings::default(),
+        }
+    }
+
+    #[test]
+    fn a_search_response_with_no_plan_is_a_bare_array() {
+        // The compatibility contract: an old client parsing a plain `Vec<HitDto>` must see
+        // no change when `plan` was never asked for.
+        let out = serde_json::to_value(SearchResponse::new(vec![], None)).unwrap();
+        assert!(out.is_array());
+        assert_eq!(out, json!([]));
+    }
+
+    #[test]
+    fn a_search_response_with_a_plan_is_an_object_carrying_both_keys() {
+        let out = serde_json::to_value(SearchResponse::new(vec![], Some(dummy_plan()))).unwrap();
+        assert!(out.is_object());
+        assert!(out.get("hits").unwrap().is_array());
+        assert_eq!(out.get("plan").unwrap().get("path").unwrap(), "exact");
     }
 }

@@ -744,6 +744,114 @@ describe("NidusClient request shaping", () => {
   });
 });
 
+describe("*WithPlan search methods", () => {
+  /** A `{hits, plan}` response, as the server sends it when `plan: true`. */
+  function planResponse() {
+    return {
+      hits: [
+        { collection: "docs", id: "a", score: 0.9, attrs: { lang: { Str: "rust" } } },
+      ],
+      plan: {
+        path: "ann_prefilter_fallback",
+        rows_scanned: 1234,
+        candidates: {
+          surfaced: 100,
+          survived: 12,
+          dropped_out_of_scope: 0,
+          dropped_stale: 0,
+          dropped_filtered: 88,
+          dropped_min_score: 0,
+        },
+        narrowing: { state: "narrowed", candidates: 42 },
+        timings: {
+          narrow_us: 12,
+          gather_us: 300,
+          walk_us: 900,
+          resolve_us: 50,
+          score_us: 20,
+          total_us: 1300,
+        },
+      },
+    };
+  }
+
+  it("searchWithPlan sends plan:true and decodes hits and the plan", async () => {
+    const { fn, calls } = mockFetch(planResponse());
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const { hits, plan } = await db.searchWithPlan({ query: [1, 0, 0], topK: 5 });
+    expect(calls[0]!.url).toBe("http://x/search");
+    expect((calls[0]!.json as { plan: unknown }).plan).toBe(true);
+    expect(hits[0]).toEqual({
+      collection: "docs",
+      id: "a",
+      score: 0.9,
+      attrs: { lang: "rust" },
+    });
+    expect(plan).toEqual({
+      path: "ann_prefilter_fallback",
+      rowsScanned: 1234,
+      candidates: {
+        surfaced: 100,
+        survived: 12,
+        droppedOutOfScope: 0,
+        droppedStale: 0,
+        droppedFiltered: 88,
+        droppedMinScore: 0,
+      },
+      narrowing: { state: "narrowed", candidates: 42 },
+      timings: {
+        narrowUs: 12,
+        gatherUs: 300,
+        walkUs: 900,
+        resolveUs: 50,
+        scoreUs: 20,
+        totalUs: 1300,
+      },
+    });
+  });
+
+  it("searchSimilarWithPlan posts to /search/similar with plan:true", async () => {
+    const { fn, calls } = mockFetch(planResponse());
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const { plan } = await db.searchSimilarWithPlan({ collection: "docs", id: "a" });
+    expect(calls[0]!.url).toBe("http://x/search/similar");
+    expect((calls[0]!.json as { plan: unknown }).plan).toBe(true);
+    expect(plan.path).toBe("ann_prefilter_fallback");
+  });
+
+  it("hybridSearchWithPlan posts to /hybrid-search with plan:true", async () => {
+    const { fn, calls } = mockFetch(planResponse());
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const { plan } = await db.hybridSearchWithPlan({
+      vector: [1, 0, 0],
+      field: "body",
+      text: "rust",
+    });
+    expect(calls[0]!.url).toBe("http://x/hybrid-search");
+    expect((calls[0]!.json as { plan: unknown }).plan).toBe(true);
+    expect(plan.path).toBe("ann_prefilter_fallback");
+  });
+
+  it("does not throw on an unknown path string, absent rowsScanned/candidates", async () => {
+    const { fn } = mockFetch({
+      hits: [],
+      plan: {
+        path: "some_future_path",
+        narrowing: { state: "inactive" },
+        timings: { total_us: 5 },
+      },
+    });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const { hits, plan } = await db.searchWithPlan({ query: [1, 0, 0] });
+    expect(hits).toEqual([]);
+    expect(plan.path).toBe("some_future_path");
+    expect(plan.rowsScanned).toBeUndefined();
+    expect(plan.candidates).toBeUndefined();
+    expect(plan.narrowing).toEqual({ state: "inactive" });
+    expect(plan.timings).toEqual({ totalUs: 5 });
+  });
+});
+
 describe("hit annotations", () => {
   /** A one-hit response carrying whatever annotations the case is about. */
   function annotated(annotations?: unknown) {

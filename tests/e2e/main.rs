@@ -13,6 +13,7 @@ mod ingest;
 mod mcp;
 #[cfg(feature = "mcp")]
 mod memory_http;
+mod plan;
 mod profile;
 #[cfg(all(feature = "mcp", feature = "embed-ollama", feature = "rerank-cohere"))]
 mod rerank;

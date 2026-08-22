@@ -422,6 +422,14 @@ func (c *Client) Search(ctx context.Context, req SearchRequest) ([]Hit, error) {
 	return c.hits(ctx, "/search", req)
 }
 
+// SearchWithPlan is [Client.Search] plus a [QueryPlan] explaining how the server
+// answered it: which code path ran, how much it scanned, and where candidates were
+// dropped. Req.Plan is set for you; it need not (and must not) be set by the caller.
+func (c *Client) SearchWithPlan(ctx context.Context, req SearchRequest) ([]Hit, *QueryPlan, error) {
+	req.Plan = true
+	return c.hitsWithPlan(ctx, "/search", req)
+}
+
 // TextSearch runs a BM25 full-text query over one field declared with
 // [Client.SetFtsSchema]. Scores are raw BM25, not cosine: unbounded above and not
 // comparable between queries.
@@ -437,11 +445,25 @@ func (c *Client) HybridSearch(ctx context.Context, req HybridSearchRequest) ([]H
 	return c.hits(ctx, "/hybrid-search", req)
 }
 
+// HybridSearchWithPlan is [Client.HybridSearch] plus a [QueryPlan]. Req.Plan is set
+// for you; it need not (and must not) be set by the caller.
+func (c *Client) HybridSearchWithPlan(ctx context.Context, req HybridSearchRequest) ([]Hit, *QueryPlan, error) {
+	req.Plan = true
+	return c.hitsWithPlan(ctx, "/hybrid-search", req)
+}
+
 // SearchSimilar returns the records most like an existing one, found by id rather than by
 // a query vector. The source record is never in the results, but a true duplicate of it is.
 // An empty Scope searches the source's own collection.
 func (c *Client) SearchSimilar(ctx context.Context, req SimilarRequest) ([]Hit, error) {
 	return c.hits(ctx, "/search/similar", req)
+}
+
+// SearchSimilarWithPlan is [Client.SearchSimilar] plus a [QueryPlan]. Req.Plan is set
+// for you; it need not (and must not) be set by the caller.
+func (c *Client) SearchSimilarWithPlan(ctx context.Context, req SimilarRequest) ([]Hit, *QueryPlan, error) {
+	req.Plan = true
+	return c.hitsWithPlan(ctx, "/search/similar", req)
 }
 
 // List returns records by metadata alone — no query vector — paginated by Offset and
@@ -576,6 +598,19 @@ func (c *Client) hits(ctx context.Context, path string, body any) ([]Hit, error)
 		return nil, err
 	}
 	return out, nil
+}
+
+// hitsWithPlan is [Client.hits] for a request with Plan: true, where the response is
+// the {hits, plan} envelope rather than a bare array.
+func (c *Client) hitsWithPlan(ctx context.Context, path string, body any) ([]Hit, *QueryPlan, error) {
+	var out struct {
+		Hits []Hit     `json:"hits"`
+		Plan QueryPlan `json:"plan"`
+	}
+	if err := c.request(ctx, http.MethodPost, path, body, &out); err != nil {
+		return nil, nil, err
+	}
+	return out.Hits, &out.Plan, nil
 }
 
 // deleted posts a body to a collection's /delete route and returns the count, shared

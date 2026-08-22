@@ -4,6 +4,7 @@
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 /// Severity, ordered least to most verbose. `Off` silences everything.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -61,6 +62,32 @@ pub(crate) fn level() -> Level {
 /// Whether an event at `lvl` would be emitted. Callers use this to skip formatting.
 pub(crate) fn enabled(lvl: Level) -> bool {
     lvl <= level()
+}
+
+/// Parse `NIDUS_SLOW_QUERY_MS`'s raw value. Unset, unparseable, and `0` all mean
+/// disabled (`None`), never "every query is slow" — a pure fn so it is unit-testable
+/// without the `OnceLock`'s once-per-process caching getting in the way.
+fn parse_slow_query_ms(v: Option<&str>) -> Option<Duration> {
+    let ms: u64 = v?.trim().parse().ok()?;
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
+/// `NIDUS_SLOW_QUERY_MS`, read once. `None` disables the slow-query line entirely.
+pub(crate) fn slow_query_threshold() -> Option<Duration> {
+    static THRESHOLD: OnceLock<Option<Duration>> = OnceLock::new();
+    *THRESHOLD
+        .get_or_init(|| parse_slow_query_ms(std::env::var("NIDUS_SLOW_QUERY_MS").ok().as_deref()))
+}
+
+/// Whether `elapsed` at `threshold` counts as slow. Pure, so it is directly testable;
+/// `is_slow` below is the impure wrapper the search paths actually call.
+fn crosses(elapsed: Duration, threshold: Option<Duration>) -> bool {
+    threshold.is_some_and(|t| elapsed >= t)
+}
+
+/// Whether `elapsed` crosses the configured threshold.
+pub(crate) fn is_slow(elapsed: Duration) -> bool {
+    crosses(elapsed, slow_query_threshold())
 }
 
 /// Emit one logfmt line. Called only from [`diag!`], which has already checked the level.
@@ -222,6 +249,41 @@ mod tests {
         let mut s = String::new();
         write_value(&mut s, &"");
         assert_eq!(s, "\"\"");
+    }
+
+    #[test]
+    fn slow_query_ms_parse_disables_on_bad_input() {
+        assert_eq!(parse_slow_query_ms(None), None);
+        assert_eq!(parse_slow_query_ms(Some("")), None);
+        assert_eq!(parse_slow_query_ms(Some("nope")), None);
+        assert_eq!(parse_slow_query_ms(Some("-5")), None);
+        // `0` disables rather than meaning "every query is slow".
+        assert_eq!(parse_slow_query_ms(Some("0")), None);
+        assert_eq!(
+            parse_slow_query_ms(Some("250")),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            parse_slow_query_ms(Some(" 250 ")),
+            Some(Duration::from_millis(250))
+        );
+    }
+
+    #[test]
+    fn crosses_is_disabled_when_threshold_is_none() {
+        assert!(!crosses(Duration::from_secs(1), None));
+        assert!(!crosses(
+            Duration::from_millis(99),
+            Some(Duration::from_millis(100))
+        ));
+        assert!(crosses(
+            Duration::from_millis(100),
+            Some(Duration::from_millis(100))
+        ));
+        assert!(crosses(
+            Duration::from_millis(101),
+            Some(Duration::from_millis(100))
+        ));
     }
 
     #[test]

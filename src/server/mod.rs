@@ -29,8 +29,8 @@ use crate::{
 use dto::{
     AggregateRequest, AggregationDto, AnnDto, BatchFuse, BatchSearchRequest, BatchSearchResponse,
     CompactRequest, DeleteRequest, FilterIndexRequest, FootprintDto, FtsSchemaRequest, HitDto,
-    HybridSearchRequest, ListRequest, MAX_BATCH_QUERIES, MAX_TOP_K, SearchRequest, SimilarRequest,
-    TextSearchRequest, UpsertRequest, VersionsDto,
+    HybridSearchRequest, ListRequest, MAX_BATCH_QUERIES, MAX_TOP_K, SearchRequest, SearchResponse,
+    SimilarRequest, TextSearchRequest, UpsertRequest, VersionsDto,
 };
 
 // ── AI-ingest (memory) imports: only under the `memory` feature (pulled by the
@@ -46,9 +46,9 @@ use dto::{RecallRequest, RememberRequest};
 // too, unlike `summarize`. Only `rerank_hits` is used — the `&Nidus`-holding
 // `search_reranked`/`hybrid_reranked` wrappers would hold the store lock across the await.
 #[cfg(feature = "rerank")]
-use crate::Hit;
-#[cfg(feature = "rerank")]
 use crate::rerank::{AnyReranker, rerank_hits};
+#[cfg(feature = "rerank")]
+use crate::{Hit, QueryPlan};
 #[cfg(feature = "rerank")]
 use dto::RerankRequest;
 
@@ -801,7 +801,7 @@ async fn records(
 async fn search(
     State(st): State<AppState>,
     Json(req): Json<SearchRequest>,
-) -> Result<Json<Vec<HitDto>>, ApiError> {
+) -> Result<Json<SearchResponse>, ApiError> {
     let SearchPlan {
         scope,
         query,
@@ -811,16 +811,26 @@ async fn search(
     #[cfg(feature = "rerank")]
     if let Some(rerank_query) = rerank_query {
         let reranker = st.reranker.clone().ok_or_else(missing_reranker_error)?;
-        let hits = rerank_search_and_finish(st, reranker, scope, query, rerank_query, opts).await?;
-        return Ok(Json(hits.into_iter().map(HitDto::from).collect()));
+        let (hits, plan) =
+            rerank_search_and_finish(st, reranker, scope, query, rerank_query, opts).await?;
+        return Ok(Json(SearchResponse::new(hits, plan)));
     }
     #[cfg(not(feature = "rerank"))]
     let _ = rerank_query;
-    let hits = run_read(st, move |db| {
-        scoped(&scope, |s| db.search(s, &query, &opts))
-    })
-    .await?;
-    Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+    let (hits, plan) = if opts.plan {
+        let (hits, plan) = run_read(st, move |db| {
+            scoped(&scope, |s| db.search_with_plan(s, &query, &opts))
+        })
+        .await?;
+        (hits, Some(plan))
+    } else {
+        let hits = run_read(st, move |db| {
+            scoped(&scope, |s| db.search(s, &query, &opts))
+        })
+        .await?;
+        (hits, None)
+    };
+    Ok(Json(SearchResponse::new(hits, plan)))
 }
 
 /// Widen the search to [`store::rerank::rerank_depth`] inside `run_read`, await the reranker
@@ -834,16 +844,26 @@ async fn rerank_search_and_finish(
     query: Vec<f32>,
     rerank_query: String,
     opts: SearchOpts,
-) -> Result<Vec<Hit>, ApiError> {
+) -> Result<(Vec<Hit>, Option<QueryPlan>), ApiError> {
     let rerank_opts = opts.rerank.clone().unwrap_or_default();
     let (widened, kept) = crate::store::rerank::widened_opts(&opts);
-    let hits = run_read(st.clone(), move |db| {
-        scoped(&scope, |s| db.search(s, &query, &widened))
+    // The plan (when asked for) describes this widened pre-rerank scan, not the caller's
+    // page — rerank and retrim below are metadata-only and never rescan the store.
+    let (hits, plan) = run_read(st.clone(), move |db| {
+        scoped(&scope, |s| {
+            if widened.plan {
+                let (hits, plan) = db.search_with_plan(s, &query, &widened)?;
+                Ok((hits, Some(plan)))
+            } else {
+                Ok((db.search(s, &query, &widened)?, None))
+            }
+        })
     })
     .await?;
     let mut reranked = rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts).await?;
     crate::store::rerank::retrim(&mut reranked, &opts, kept);
-    run_read(st, move |db| Ok(db.store().finish(reranked, &opts))).await
+    let hits = run_read(st, move |db| Ok(db.store().finish(reranked, &opts))).await?;
+    Ok((hits, plan))
 }
 
 /// One wire `SearchRequest` resolved into what `db.search` needs. `rerank_query` is carried
@@ -876,6 +896,7 @@ fn plan_search(req: SearchRequest) -> Result<SearchPlan, ApiError> {
         projection,
         // Vector search has one score to report; annotations are a text/hybrid surface.
         explain: false,
+        plan: req.plan,
         rank_by: req.rank_by,
         limit_per: req.limit_per,
         diversity: req.diversity,
@@ -898,7 +919,7 @@ fn plan_search(req: SearchRequest) -> Result<SearchPlan, ApiError> {
 async fn search_similar(
     State(st): State<AppState>,
     Json(req): Json<SimilarRequest>,
-) -> Result<Json<Vec<HitDto>>, ApiError> {
+) -> Result<Json<SearchResponse>, ApiError> {
     check_page(req.offset, req.top_k)?;
     let projection = check_projection(req.include_attributes, req.exclude_attributes)?;
     let opts = SearchOpts {
@@ -909,6 +930,7 @@ async fn search_similar(
         exact: req.exact,
         projection,
         explain: false,
+        plan: req.plan,
         rank_by: req.rank_by,
         limit_per: req.limit_per,
         diversity: req.diversity,
@@ -923,11 +945,22 @@ async fn search_similar(
         req.scope
     };
     let (collection, id) = (req.collection, req.id);
-    let hits = run_read(st, move |db| {
-        scoped(&scope, |s| db.search_similar(s, &collection, &id, &opts))
-    })
-    .await?;
-    Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+    let (hits, plan) = if opts.plan {
+        let (hits, plan) = run_read(st, move |db| {
+            scoped(&scope, |s| {
+                db.search_similar_with_plan(s, &collection, &id, &opts)
+            })
+        })
+        .await?;
+        (hits, Some(plan))
+    } else {
+        let hits = run_read(st, move |db| {
+            scoped(&scope, |s| db.search_similar(s, &collection, &id, &opts))
+        })
+        .await?;
+        (hits, None)
+    };
+    Ok(Json(SearchResponse::new(hits, plan)))
 }
 
 /// `POST /search/batch`: answer up to [`MAX_BATCH_QUERIES`] vector queries in one round-trip,
@@ -1206,7 +1239,7 @@ async fn text_search(
 async fn hybrid_search(
     State(st): State<AppState>,
     Json(req): Json<HybridSearchRequest>,
-) -> Result<Json<Vec<HitDto>>, ApiError> {
+) -> Result<Json<SearchResponse>, ApiError> {
     check_page(req.offset, req.top_k)?;
     let HybridSearchRequest {
         vector,
@@ -1227,6 +1260,7 @@ async fn hybrid_search(
         expand,
         #[cfg(feature = "rerank")]
         rerank,
+        plan,
     } = req;
     let clauses = check_clauses(field, text, clauses)?;
     #[cfg(feature = "rerank")]
@@ -1243,6 +1277,7 @@ async fn hybrid_search(
         rrf_k,
         candidates,
         explain,
+        plan,
         vector_weight,
         text_weight,
         expand: expand.map(Into::into),
@@ -1259,18 +1294,29 @@ async fn hybrid_search(
     #[cfg(feature = "rerank")]
     if let Some(rerank_query) = rerank_query {
         let reranker = st.reranker.clone().ok_or_else(missing_reranker_error)?;
-        let hits =
+        let (hits, plan) =
             rerank_hybrid_and_finish(st, reranker, scope, vector, q, rerank_query, opts).await?;
-        return Ok(Json(hits.into_iter().map(HitDto::from).collect()));
+        return Ok(Json(SearchResponse::new(hits, plan)));
     }
     #[cfg(not(feature = "rerank"))]
     let _ = rerank_query;
 
-    let hits = run_read(st, move |db| {
-        scoped(&scope, |s| db.hybrid_search(s, &vector, &q, &opts))
-    })
-    .await?;
-    Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+    let (hits, plan) = if opts.plan {
+        let (hits, plan) = run_read(st, move |db| {
+            scoped(&scope, |s| {
+                db.hybrid_search_with_plan(s, &vector, &q, &opts)
+            })
+        })
+        .await?;
+        (hits, Some(plan))
+    } else {
+        let hits = run_read(st, move |db| {
+            scoped(&scope, |s| db.hybrid_search(s, &vector, &q, &opts))
+        })
+        .await?;
+        (hits, None)
+    };
+    Ok(Json(SearchResponse::new(hits, plan)))
 }
 
 /// Hybrid analogue of [`rerank_search_and_finish`]: widen inside `run_read`, rerank outside
@@ -1284,7 +1330,7 @@ async fn rerank_hybrid_and_finish(
     q: FtsQuery,
     rerank_query: String,
     opts: HybridOpts,
-) -> Result<Vec<Hit>, ApiError> {
+) -> Result<(Vec<Hit>, Option<QueryPlan>), ApiError> {
     let rerank_opts = opts.rerank.clone().unwrap_or_default();
     let overscan = rerank_opts.overscan.max(1);
     let widened = HybridOpts {
@@ -1296,12 +1342,22 @@ async fn rerank_hybrid_and_finish(
         candidates: opts.candidates.saturating_mul(overscan),
         ..opts.clone()
     };
-    let hits = run_read(st.clone(), move |db| {
-        scoped(&scope, |s| db.hybrid_search(s, &vector, &q, &widened))
+    // The plan (when asked for) describes this widened pre-rerank fusion, not the caller's
+    // page — rerank below is metadata-only and never rescans the store.
+    let (hits, plan) = run_read(st.clone(), move |db| {
+        scoped(&scope, |s| {
+            if widened.plan {
+                let (hits, plan) = db.hybrid_search_with_plan(s, &vector, &q, &widened)?;
+                Ok((hits, Some(plan)))
+            } else {
+                Ok((db.hybrid_search(s, &vector, &q, &widened)?, None))
+            }
+        })
     })
     .await?;
     let reranked = rerank_hits(reranker.as_ref(), &rerank_query, hits, &rerank_opts).await?;
-    run_read(st, move |db| Ok(db.store().finish_hybrid(reranked, &opts))).await
+    let hits = run_read(st, move |db| Ok(db.store().finish_hybrid(reranked, &opts))).await?;
+    Ok((hits, plan))
 }
 
 /// Text analogue of [`rerank_search_and_finish`]: widen inside `run_read`, rerank outside
@@ -3991,6 +4047,97 @@ mod tests {
         let err = anyhow!("vector length 4 does not match store dimension 8")
             .context("while upserting into 'docs'");
         assert_eq!(classify(&err), StatusCode::BAD_REQUEST);
+    }
+
+    /// Seed one record with a vector and a "body" text attr, and declare it in the FTS
+    /// schema, so `/hybrid-search` and `/text-search` have something to match too.
+    async fn plan_test_fixture() -> Router {
+        let app = test_router(3);
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/fts-schema",
+                json!({"fields": ["body"]}),
+            ))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/collections/docs/upsert",
+                json!({"records": [
+                    {"id": "a", "vector": [1, 0, 0], "attrs": {"body": {"Str": "hello world"}}}
+                ]}),
+            ))
+            .await
+            .unwrap();
+        app
+    }
+
+    /// The compatibility contract (nidus-cvz): an old client sending no `plan` field must
+    /// see the exact same bare array it always has.
+    #[tokio::test]
+    async fn search_without_plan_returns_a_bare_array() {
+        let app = plan_test_fixture().await;
+        for (path, body) in [
+            ("/search", json!({"query": [1, 0, 0], "top_k": 5})),
+            (
+                "/search/similar",
+                json!({"collection": "docs", "id": "a", "top_k": 5}),
+            ),
+            (
+                "/hybrid-search",
+                json!({"vector": [1, 0, 0], "field": "body", "text": "hello", "top_k": 5}),
+            ),
+        ] {
+            let resp = app.clone().oneshot(post(path, body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            assert!(json_body(resp).await.is_array(), "{path}");
+        }
+    }
+
+    /// `plan: true` switches the response to `{hits, plan}`, with a real path name.
+    #[tokio::test]
+    async fn search_with_plan_returns_hits_and_plan() {
+        let app = plan_test_fixture().await;
+        for (path, body) in [
+            (
+                "/search",
+                json!({"query": [1, 0, 0], "top_k": 5, "plan": true}),
+            ),
+            (
+                "/search/similar",
+                json!({"collection": "docs", "id": "a", "top_k": 5, "plan": true}),
+            ),
+            (
+                "/hybrid-search",
+                json!({
+                    "vector": [1, 0, 0], "field": "body", "text": "hello",
+                    "top_k": 5, "plan": true
+                }),
+            ),
+        ] {
+            let resp = app.clone().oneshot(post(path, body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let out = json_body(resp).await;
+            assert!(out.is_object(), "{path}: {out}");
+            assert!(out["hits"].is_array(), "{path}: {out}");
+            let path_name = out["plan"]["path"].as_str().unwrap_or_default();
+            assert!(!path_name.is_empty(), "{path}: {out}");
+        }
+    }
+
+    /// `/text-search` grows no `plan` field: the flag is silently ignored, not a `400`.
+    #[tokio::test]
+    async fn text_search_with_plan_in_the_body_is_still_an_array() {
+        let app = plan_test_fixture().await;
+        let resp = app
+            .oneshot(post(
+                "/text-search",
+                json!({"field": "body", "query": "hello", "plan": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(json_body(resp).await.is_array());
     }
 }
 

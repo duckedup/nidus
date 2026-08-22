@@ -1124,6 +1124,44 @@ the only form the MCP surface offers: a model means "one result per document, wi
 set of attr names. Every recall surface maps it through `Rollup::as_opts`, so the in-process,
 HTTP and MCP reads cannot drift.
 
+### 7.11 Query plans
+
+A `Hit` list answers *what* matched; it says nothing about *how* the query got there. The
+`plan` field on `SearchOpts` / `HybridOpts` does (nidus-cvz), returned by the `*_with_plan`
+sibling of `search`/`search_similar`/`hybrid_search` as a `QueryPlan` that is `None` unless
+asked (the same shape §7.8 follows for `explain`/`highlight`: the unasked response is
+byte-identical). `text_search` has no plan; it always runs the same BM25 postings walk, so
+there is no branch worth reporting.
+
+**Path.** `QueryPath` names which branch of `Store::search` answered the query: `Ann` (the
+HNSW/IVF index walk), `AnnPrefilterFallback` (a selective filter made the index walk too
+thin, so the store fell back to an exact scan), `Segmented` (a per-segment IVF index merged
+with an exhaustive tail, §9's per-segment indexing at scale), `Quantized` (the int8/binary
+first pass plus f32 rerank), or `Exact` (brute-force cosine over every row). Thin results
+paired with `AnnPrefilterFallback` is the diagnostic this section exists for: a filter narrow
+enough to starve the ANN walk, not a broken index.
+
+**Counts.** `rows_scanned` is the row count fed to a brute-force scan, and is **absent** on
+the `Ann` and `Segmented` paths, not zero: no full scan happens on either path, so a number
+there would claim precision the walk never had, where absence says "not applicable" rather
+than lying with a `0`. `Candidates` breaks an index walk's surfaced set down by why each
+candidate did not survive: `surfaced`, `survived`, and `dropped_out_of_scope` /
+`dropped_stale` / `dropped_filtered` / `dropped_min_score`.
+
+**Narrowing.** Whether the opt-in filter index (§7.4.1) narrowed the scan before it ran, one
+of three states: `Inactive` (no collection in scope declares a filter index), `Declined` (an
+index exists but could not answer this filter, so the full scan ran anyway), or
+`Narrowed { candidates }` (the index cut the scan down to that many rows).
+
+**Timings.** Per-phase wall time in **microseconds**, one field per phase a path can run:
+`narrow_us`, `gather_us`, `walk_us`, `resolve_us`, `first_pass_us`, `rescore_us`, `score_us`.
+Each is present only for the phases the path taken actually runs; `total_us` always runs and
+covers the whole traced call.
+
+`NIDUS_SLOW_QUERY_MS` logs the short form (path, `total_us`, rows scanned, candidates) for any
+query crossing that threshold, unconditionally: it needs no per-query `plan` opt-in, since an
+operator chasing a slow store cannot annotate every query in advance.
+
 ## 8. Compaction
 
 Deletes and overwrites leave dead rows in `data` and superseded records in `log`.
@@ -1582,6 +1620,8 @@ src/
 ├── model.rs      Shared type vocabulary: Value (+ its little-endian codec), Record,
 │                 Predicate/Filter, Op, Distance, Quantization, AnnConfig,
 │                 FtsQuery/FtsClause/FtsCombine (pure defs + serde)
+├── plan.rs       QueryPlan/QueryPath/Candidates/Narrowing/Timings, the opt-in
+│                 how-did-this-query-run report (§7.11)
 ├── glob/         minimal * ? [..] matcher (§7.1)
 ├── filter/       Filter/Predicate evaluation against a record's attrs: mod.rs
 │                 (dispatch + per-query validate/prepare), text.rs (Levenshtein +
@@ -1625,7 +1665,8 @@ src/
                   rank.rs (recency decay + ORDER BY, §7.6), aggregate.rs (count/sum +
                   group_by + limit_per, §7.7), diversity.rs (MMR spread, §7.7),
                   expand.rs (parent rollup + neighbour expansion, §7.10),
-                  write.rs (upsert/delete/flush/compact),
+                  plan.rs (the query-plan recorder threaded through search/similar/
+                  hybrid, §7.11), write.rs (upsert/delete/flush/compact),
                   memtier.rs (working-set publish/adopt), rerank.rs (pure over-fetch/
                   passthrough/re-sort tail, unconditional, §9), tests.rs
 

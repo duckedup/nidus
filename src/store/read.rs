@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 
 use super::aggregate::LIMIT_PER_OVERFETCH;
 use super::diversity::MMR_OVERFETCH;
+use super::plan::{Phase, PlanRec};
 use super::rank;
 use super::scoring::{PARALLEL_SCAN_WORK_FLOOR, parallel_topk, score_chunk};
 use super::{ScanOrder, Store, oom};
@@ -17,7 +18,17 @@ use crate::filter;
 use crate::model::{
     AnnConfig, Distance, Filter, Footprint, Hit, HybridOpts, ListOpts, Projection, SearchOpts,
 };
+use crate::plan::{Candidates, Narrowing, QueryPath, QueryPlan};
 use crate::search::{TopK, dot, euclidean_neg_sq, normalize};
+
+/// The query-side inputs `offer_candidates` needs, bundled so the two index-walk callers
+/// pass one borrow rather than four.
+struct CandidateCtx<'a> {
+    scope: &'a std::collections::HashSet<&'a str>,
+    q: &'a [f32],
+    score_fn: fn(&[f32], &[f32]) -> f32,
+    opts: &'a SearchOpts,
+}
 
 /// How deep a search path must rank: one page (`offset + top_k`), multiplied by the over-fetch
 /// factor when a per-value cap will thin the ranking (nidus-m50.6) or MMR will reorder it
@@ -50,6 +61,14 @@ fn deepened(opts: &SearchOpts) -> SearchOpts {
 /// The marker every caller-fault query rejection carries, so the HTTP layer answers `400`
 /// rather than `500` for a malformed knob (`server::classify` keys off it).
 pub(crate) const BAD_QUERY: &str = "invalid query option";
+
+/// How [`Store::narrowed_scan`] fared, for [`QueryPlan::narrowing`] to report.
+#[derive(Clone, Copy)]
+enum NarrowOutcome {
+    Inactive,
+    Declined,
+    Narrowed(usize),
+}
 
 /// Refuse the knobs that shape a ranking, once per query rather than once per record. Beside
 /// `filter::validate`, which the `Nidus` entry points already run.
@@ -341,12 +360,15 @@ impl Store {
         Ok(self.scan_order.read().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// Build the in-scope, filter-passing scan **in row order** and hand it to `f`.
+    /// Build the in-scope, filter-passing scan **in row order** and hand it to `f` along
+    /// with `rec` (a parameter, not a capture — capturing it would borrow it mutably twice
+    /// at once, here and inside `f`). Passing `&mut PlanRec::Off` costs nothing extra.
     fn with_sorted_scan<R>(
         &self,
         collections: &[&str],
         filter: &Filter,
-        f: impl for<'b> FnOnce(&mut [(u64, &'b str, &'b str)]) -> Result<R>,
+        rec: &mut PlanRec,
+        f: impl for<'b> FnOnce(&mut [(u64, &'b str, &'b str)], &mut PlanRec) -> Result<R>,
     ) -> Result<R> {
         // Count only vector-bearing docs — text-only docs never enter a vector scan.
         let scan_cap: usize = self.scannable_in_scope(collections);
@@ -357,11 +379,27 @@ impl Store {
         // Try the filter index first. It applies to whole-store and subset scope alike,
         // and it only reports success when every in-scope collection could be narrowed —
         // a partial narrowing would silently omit the collections it skipped.
-        if self.narrowed_scan(collections, filter, &mut scan) {
-            scan.sort_unstable_by_key(|&(row, _, _)| row);
-            return f(&mut scan);
+        let outcome = rec.phase(Phase::Narrow, || {
+            self.narrowed_scan(collections, filter, &mut scan)
+        });
+        if let NarrowOutcome::Narrowed(n) = outcome {
+            // Unconditional: the aggregate must not depend on whether a plan was asked for.
+            crate::metrics::metrics().search_findex_narrowed.inc();
+            rec.narrowing(Narrowing::Narrowed {
+                candidates: n as u64,
+            });
+            rec.phase(Phase::Gather, || {
+                scan.sort_unstable_by_key(|&(row, _, _)| row)
+            });
+            return f(&mut scan, rec);
         }
+        rec.narrowing(match outcome {
+            NarrowOutcome::Inactive => Narrowing::Inactive,
+            NarrowOutcome::Declined => Narrowing::Declined,
+            NarrowOutcome::Narrowed(_) => unreachable!("handled above"),
+        });
 
+        let gather = rec.start();
         if scan_cap == self.scannable_doc_count() {
             // Whole-store scope: draw from the cached row-sorted order (no per-query
             // sort). The cache covers every live doc, so every entry is in scope.
@@ -390,7 +428,8 @@ impl Store {
                 scan.push((*row, col.as_str(), id.as_str()));
             }
             // `scan` inherits the cache's row order — already sorted, no sort call.
-            f(&mut scan)
+            rec.stop(Phase::Gather, gather);
+            f(&mut scan, rec)
         } else {
             // Strict subset: iterate only the in-scope collections, then sort that
             // (smaller) scan.
@@ -407,21 +446,21 @@ impl Store {
                 }
             }
             scan.sort_unstable_by_key(|&(row, _, _)| row);
-            f(&mut scan)
+            rec.stop(Phase::Gather, gather);
+            f(&mut scan, rec)
         }
     }
 
-    /// Fill `scan` from the filter index, or report `false` and leave it untouched.
-    /// All-or-nothing: a scan built from only the narrowable collections would be missing
-    /// the others' matches entirely.
+    /// Fill `scan` from the filter index, or report why not. All-or-nothing: a scan built
+    /// from only the narrowable collections would be missing the others' matches entirely.
     fn narrowed_scan<'b>(
         &'b self,
         collections: &[&'b str],
         filter: &Filter,
         scan: &mut Vec<(u64, &'b str, &'b str)>,
-    ) -> bool {
+    ) -> NarrowOutcome {
         if !self.findex.is_active() {
-            return false;
+            return NarrowOutcome::Inactive;
         }
         let mut narrowed: Vec<(&'b str, Vec<String>)> = Vec::new();
         for &col_name in collections {
@@ -430,7 +469,7 @@ impl Store {
             }
             match filter::candidate_ids(&self.findex, col_name, filter) {
                 Some(ids) => narrowed.push((col_name, ids)),
-                None => return false,
+                None => return NarrowOutcome::Declined,
             }
         }
         for (col_name, ids) in narrowed {
@@ -450,7 +489,7 @@ impl Store {
                 scan.push((row, col_name, id.as_str()));
             }
         }
-        true
+        NarrowOutcome::Narrowed(scan.len())
     }
 
     // ── Search ──────────────────────────────────────────────────────────────────
@@ -476,6 +515,36 @@ impl Store {
         collections: &[&str],
         query: &[f32],
         opts: &SearchOpts,
+    ) -> Result<Vec<Hit>> {
+        Ok(self
+            .traced(opts.plan, |rec| {
+                self.search_inner(collections, query, opts, rec)
+            })?
+            .0)
+    }
+
+    /// Like [`Store::search`], but also returns the [`QueryPlan`] describing how the query
+    /// ran: path taken, rows scanned, candidate survival, phase timings (nidus-cvz).
+    pub fn search_with_plan(
+        &self,
+        collections: &[&str],
+        query: &[f32],
+        opts: &SearchOpts,
+    ) -> Result<(Vec<Hit>, QueryPlan)> {
+        let (hits, plan) =
+            self.traced(true, |rec| self.search_inner(collections, query, opts, rec))?;
+        Ok((hits, plan.expect("traced(true, _) always finishes a plan")))
+    }
+
+    /// The instrumented body shared by [`Store::search`] and [`Store::search_with_plan`].
+    /// `pub(super)`: `super::text::hybrid_search_inner` also drives it directly, so the
+    /// hybrid path's vector leg lands in the *same* recorder instead of starting its own.
+    pub(super) fn search_inner(
+        &self,
+        collections: &[&str],
+        query: &[f32],
+        opts: &SearchOpts,
+        rec: &mut PlanRec,
     ) -> Result<Vec<Hit>> {
         // Before the metric: a request the store refuses is not a query it served, so
         // counting it would overstate `search_queries` and skew every ratio built on it.
@@ -509,22 +578,25 @@ impl Store {
             // recall traded for speed. A selective filter/scope can starve the walk, so `search_ann`
             // falls back to an exact prefilter when survivors are few (nidus-0ou).
             m.search_ann.inc();
-            self.search_ann(collections, &q, &deep, score_fn)?
+            rec.path(QueryPath::Ann);
+            self.search_ann(collections, &q, &deep, score_fn, rec)?
         } else if self.seg_indexes.iter().any(Option::is_some) && !deep.exact {
             // Per-segment fan-out: walk each cold segment's IVF index and brute-force the tail (the
             // active segment plus any sub-threshold sealed one), merged into one ranking (SPEC
             // §14.3). Engaged only once a sealed segment has crossed `segment_index_min_rows`.
             m.search_segmented.inc();
-            self.search_segmented(collections, &q, &deep, score_fn)?
+            rec.path(QueryPath::Segmented);
+            self.search_segmented(collections, &q, &deep, score_fn, rec)?
         } else {
             // Gather in-scope, filter-passing rows in physical-row order, for sequential `data`
             // access (nidus-33k). `with_sorted_scan` reuses the cached whole-store order where it
             // can, so the sort is not redone every query (nidus-dxt).
-            self.with_sorted_scan(collections, &deep.filter, |scan| {
+            self.with_sorted_scan(collections, &deep.filter, rec, |scan, rec| {
                 // Only the brute-force paths reach here, which is exactly why the counter lives
                 // here: "rows scanned" is a meaningful cost on a linear scan and meaningless on
                 // an ANN walk, so counting it in one place keeps the metric honest.
                 m.search_vectors_scanned.add(scan.len() as u64);
+                rec.rows_scanned(scan.len() as u64);
 
                 // Decide once whether this query splits across workers (configured threads +
                 // enough scan work to amortize spawn cost).
@@ -533,13 +605,16 @@ impl Store {
                 // Two-pass quantized search if enabled and the quantized matrix is populated;
                 // otherwise the standard exact f32 brute-force path.
                 if !deep.exact
-                    && let Some(res) = self.search_quantized(&q, scan, &deep, score_fn, workers)
+                    && let Some(res) =
+                        self.search_quantized(&q, scan, &deep, score_fn, workers, rec)
                 {
                     m.search_quantized.inc();
+                    rec.path(QueryPath::Quantized);
                     return res;
                 }
                 m.search_exact.inc();
-                self.rank_scan(&q, scan, score_fn, &deep)
+                rec.path(QueryPath::Exact);
+                rec.phase(Phase::Score, || self.rank_scan(&q, scan, score_fn, &deep))
             })?
         };
         Ok(self.finish(ranked, opts))
@@ -554,6 +629,38 @@ impl Store {
         collection: &str,
         id: &str,
         opts: &SearchOpts,
+    ) -> Result<Vec<Hit>> {
+        Ok(self
+            .traced(opts.plan, |rec| {
+                self.search_similar_inner(collections, collection, id, opts, rec)
+            })?
+            .0)
+    }
+
+    /// Like [`Store::search_similar`], but also returns the [`QueryPlan`] for the vector
+    /// search it runs under the hood (nidus-cvz).
+    pub fn search_similar_with_plan(
+        &self,
+        collections: &[&str],
+        collection: &str,
+        id: &str,
+        opts: &SearchOpts,
+    ) -> Result<(Vec<Hit>, QueryPlan)> {
+        let (hits, plan) = self.traced(true, |rec| {
+            self.search_similar_inner(collections, collection, id, opts, rec)
+        })?;
+        Ok((hits, plan.expect("traced(true, _) always finishes a plan")))
+    }
+
+    /// The instrumented body shared by [`Store::search_similar`] and
+    /// [`Store::search_similar_with_plan`].
+    fn search_similar_inner(
+        &self,
+        collections: &[&str],
+        collection: &str,
+        id: &str,
+        opts: &SearchOpts,
+        rec: &mut PlanRec,
     ) -> Result<Vec<Hit>> {
         let entry = self
             .collections
@@ -579,7 +686,7 @@ impl Store {
             diversity: None,
             ..opts.clone()
         };
-        let ranked = self.search(collections, &query, &wide)?;
+        let ranked = self.search_inner(collections, &query, &wide, rec)?;
         let ranked: Vec<Hit> = ranked
             .into_iter()
             .filter(|h| !(h.collection == collection && h.id == id))
@@ -644,6 +751,7 @@ impl Store {
         q: &[f32],
         opts: &SearchOpts,
         score_fn: fn(&[f32], &[f32]) -> f32,
+        rec: &mut PlanRec,
     ) -> Result<Vec<Hit>> {
         let Some(ann) = self.ann.as_ref() else {
             return Ok(Vec::new());
@@ -665,7 +773,9 @@ impl Store {
             let cap = (total / overscan).max(n_candidates);
             if let Some(mut scan) = self.collect_selective_scan(collections, &opts.filter, cap) {
                 // Row-sort for cache-friendly sequential `data` access, then score
-                // exactly through the shared brute-force tail.
+                // exactly through the shared brute-force tail. Overwrites the `Ann` path
+                // the caller set, since this query never actually walked the graph.
+                rec.path(QueryPath::AnnPrefilterFallback);
                 scan.sort_unstable_by_key(|&(row, _, _)| row);
                 return self.rank_scan(q, &mut scan, score_fn, opts);
             }
@@ -675,10 +785,22 @@ impl Store {
         // on (the graph/lists were built in that space), else exact f32 (nidus-ndu).
         let walk =
             super::quant::ann_walk_for(self.quant.as_ref(), &self.data, self.config.distance);
-        let candidates = ann.search(&walk, q, n_candidates);
+        let candidates = rec.phase(Phase::Walk, || ann.search(&walk, q, n_candidates));
 
         let mut topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
-        self.offer_candidates(&candidates, &scope, q, score_fn, opts, &mut topk);
+        let mut acc = Candidates::default();
+        rec.phase(Phase::Resolve, || {
+            let ctx = CandidateCtx {
+                scope: &scope,
+                q,
+                score_fn,
+                opts,
+            };
+            self.offer_candidates(&candidates, &ctx, &mut topk, &mut acc);
+        });
+        if let Some(c) = rec.candidates() {
+            *c = acc;
+        }
         Ok(self.hits_from_topk(topk, &opts.projection))
     }
 
@@ -688,29 +810,40 @@ impl Store {
     fn offer_candidates<'b>(
         &'b self,
         candidates: &[(u64, f32)],
-        scope: &std::collections::HashSet<&str>,
-        q: &[f32],
-        score_fn: fn(&[f32], &[f32]) -> f32,
-        opts: &SearchOpts,
+        ctx: &CandidateCtx<'_>,
         topk: &mut TopK<(&'b str, &'b str)>,
+        acc: &mut Candidates,
     ) {
+        let CandidateCtx {
+            scope,
+            q,
+            score_fn,
+            opts,
+        } = ctx;
+        acc.surfaced += candidates.len() as u64;
         for (row, _) in candidates {
             let Some(Some((col_name, id))) = self.row_to_doc.get(*row as usize) else {
+                acc.dropped_stale += 1;
                 continue;
             };
             if !scope.contains(col_name.as_str()) {
+                acc.dropped_out_of_scope += 1;
                 continue;
             }
             let Some(col) = self.collections.get(col_name) else {
+                acc.dropped_stale += 1;
                 continue;
             };
             let Some(entry) = col.docs.get(id) else {
+                acc.dropped_stale += 1;
                 continue;
             };
             if entry.row != Some(*row) {
-                continue; // stale reverse-map hint — row was overwritten/cleared
+                acc.dropped_stale += 1; // stale reverse-map hint — row was overwritten/cleared
+                continue;
             }
             if !filter::matches(&opts.filter, &entry.attrs) {
+                acc.dropped_filtered += 1;
                 continue;
             }
             // The entry is already in hand, so the ranking expression costs nothing extra here —
@@ -720,8 +853,10 @@ impl Store {
             if let Some(min) = opts.min_score
                 && score < min
             {
+                acc.dropped_min_score += 1;
                 continue;
             }
+            acc.survived += 1;
             topk.offer(score, (col_name.as_str(), id.as_str()));
         }
     }
@@ -735,6 +870,7 @@ impl Store {
         q: &[f32],
         opts: &SearchOpts,
         score_fn: fn(&[f32], &[f32]) -> f32,
+        rec: &mut PlanRec,
     ) -> Result<Vec<Hit>> {
         if opts.top_k == 0 {
             return Ok(Vec::new());
@@ -778,9 +914,21 @@ impl Store {
         let n_candidates = opts.top_k.saturating_mul(overscan).max(opts.top_k);
         let walk = Walk::exact(&self.data, self.config.distance);
         let mut ivf_topk: TopK<(&str, &str)> = TopK::new(opts.top_k);
-        for ix in self.seg_indexes.iter().flatten() {
-            let candidates = ix.search(&walk, q, n_candidates);
-            self.offer_candidates(&candidates, &scope, q, score_fn, opts, &mut ivf_topk);
+        let mut acc = Candidates::default();
+        let ctx = CandidateCtx {
+            scope: &scope,
+            q,
+            score_fn,
+            opts,
+        };
+        rec.phase(Phase::Walk, || {
+            for ix in self.seg_indexes.iter().flatten() {
+                let candidates = ix.search(&walk, q, n_candidates);
+                self.offer_candidates(&candidates, &ctx, &mut ivf_topk, &mut acc);
+            }
+        });
+        if let Some(c) = rec.candidates() {
+            *c = acc;
         }
         hits.extend(self.hits_from_topk(ivf_topk, &opts.projection));
 

@@ -33,6 +33,9 @@ import (
 
 // capture is a fake nidus server: it records what it received and replies with a
 // canned status and body. One instance serves one test.
+// planEnvelope is the minimal {hits, plan} body the *WithPlan methods decode.
+const planEnvelope = `{"hits":[],"plan":{"path":"exact","narrowing":{"state":"inactive"},"timings":{"total_us":5}}}`
+
 type capture struct {
 	mu     sync.Mutex
 	calls  int
@@ -324,6 +327,20 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 			_, err := c.SearchSimilar(ctx, SimilarRequest{Collection: "docs", ID: "a"})
 			return err
 		}},
+		{"SearchWithPlan", planEnvelope, http.MethodPost, "/search", func(c *Client) error {
+			_, _, err := c.SearchWithPlan(ctx, SearchRequest{Query: []float32{1, 0, 0}})
+			return err
+		}},
+		{"HybridSearchWithPlan", planEnvelope, http.MethodPost, "/hybrid-search", func(c *Client) error {
+			_, _, err := c.HybridSearchWithPlan(ctx, HybridSearchRequest{
+				Vector: []float32{1, 0, 0}, Field: "body", Text: "fox",
+			})
+			return err
+		}},
+		{"SearchSimilarWithPlan", planEnvelope, http.MethodPost, "/search/similar", func(c *Client) error {
+			_, _, err := c.SearchSimilarWithPlan(ctx, SimilarRequest{Collection: "docs", ID: "a"})
+			return err
+		}},
 		{"List", `[]`, http.MethodPost, "/list", func(c *Client) error {
 			_, err := c.List(ctx, ListRequest{Scope: []string{"docs"}})
 			return err
@@ -604,6 +621,159 @@ func TestSearchSimilarSendsIDNotQuery(t *testing.T) {
 		`"min_score":0,"exact":true}`
 	if body := fake.sentBody(t); body != want {
 		t.Errorf("body = %s, want %s", body, want)
+	}
+}
+
+// TestSearchWithPlanSendsPlanAndDecodesEnvelope pins the two things a *WithPlan method
+// adds over its plain sibling: the request carries "plan":true, and the response is
+// read from the {hits, plan} envelope rather than a bare array.
+func TestSearchWithPlanSendsPlanAndDecodesEnvelope(t *testing.T) {
+	fake := &capture{reply: `{
+		"hits": [{"collection":"docs","id":"a","score":0.9,"attrs":{}}],
+		"plan": {
+			"path": "ann_prefilter_fallback",
+			"rows_scanned": 1234,
+			"candidates": {
+				"surfaced": 100, "survived": 12,
+				"dropped_out_of_scope": 0, "dropped_stale": 0,
+				"dropped_filtered": 88, "dropped_min_score": 0
+			},
+			"narrowing": {"state": "narrowed", "candidates": 42},
+			"timings": {"narrow_us": 12, "gather_us": 300, "walk_us": 900,
+				"resolve_us": 50, "score_us": 20, "total_us": 1300}
+		}
+	}`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	hits, plan, err := db.SearchWithPlan(ctx, SearchRequest{Query: []float32{1, 0, 0}})
+	if err != nil {
+		t.Fatalf("SearchWithPlan failed: %v", err)
+	}
+	if body := fake.sentBody(t); body != `{"query":[1,0,0],"plan":true}` {
+		t.Errorf("body = %s, want plan:true set", body)
+	}
+	if len(hits) != 1 || hits[0].ID != "a" {
+		t.Fatalf("hits = %+v, want one hit for id a", hits)
+	}
+	if plan == nil {
+		t.Fatal("plan = nil, want a populated QueryPlan")
+	}
+	if plan.Path != "ann_prefilter_fallback" {
+		t.Errorf("plan.Path = %q, want ann_prefilter_fallback", plan.Path)
+	}
+	if plan.RowsScanned == nil || *plan.RowsScanned != 1234 {
+		t.Errorf("plan.RowsScanned = %v, want 1234", plan.RowsScanned)
+	}
+	if plan.Candidates == nil || plan.Candidates.Survived != 12 || plan.Candidates.DroppedFiltered != 88 {
+		t.Errorf("plan.Candidates = %+v, want survived 12, dropped_filtered 88", plan.Candidates)
+	}
+	if plan.Narrowing.State != "narrowed" || plan.Narrowing.Candidates == nil || *plan.Narrowing.Candidates != 42 {
+		t.Errorf("plan.Narrowing = %+v, want narrowed with candidates 42", plan.Narrowing)
+	}
+	if plan.Timings.TotalUs != 1300 {
+		t.Errorf("plan.Timings.TotalUs = %d, want 1300", plan.Timings.TotalUs)
+	}
+
+	// Search itself must never send plan. It decodes a bare array, so the fake has to
+	// answer with one rather than the envelope above.
+	fake.mu.Lock()
+	fake.reply = `[]`
+	fake.mu.Unlock()
+	if _, err := db.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}}); err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if body := fake.sentBody(t); strings.Contains(body, "plan") {
+		t.Errorf("body = %s, must not mention plan from the plain Search method", body)
+	}
+}
+
+// TestPlanAbsentFieldsDecodeToNilNotZero is the test that would actually fail if
+// RowsScanned or Candidates were value types instead of pointers: the server omits
+// them on paths where they don't apply, and that must decode to nil, not 0.
+func TestPlanAbsentFieldsDecodeToNilNotZero(t *testing.T) {
+	fake := &capture{reply: `{
+		"hits": [],
+		"plan": {
+			"path": "ann",
+			"narrowing": {"state": "inactive"},
+			"timings": {"total_us": 40}
+		}
+	}`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	_, plan, err := db.SearchWithPlan(ctx, SearchRequest{Query: []float32{1, 0, 0}})
+	if err != nil {
+		t.Fatalf("SearchWithPlan failed: %v", err)
+	}
+	if plan.RowsScanned != nil {
+		t.Errorf("plan.RowsScanned = %v, want nil when the server omits it", *plan.RowsScanned)
+	}
+	if plan.Candidates != nil {
+		t.Errorf("plan.Candidates = %+v, want nil when no index walk ran", *plan.Candidates)
+	}
+	if plan.Narrowing.Candidates != nil {
+		t.Errorf("plan.Narrowing.Candidates = %v, want nil when State is inactive", *plan.Narrowing.Candidates)
+	}
+	if plan.Timings.NarrowUs != nil {
+		t.Errorf("plan.Timings.NarrowUs = %v, want nil when the server omits it", *plan.Timings.NarrowUs)
+	}
+}
+
+// TestSearchSimilarAndHybridSearchWithPlanHitTheRightRouteAndSetPlan checks the other
+// two *WithPlan methods hit the same route as their plain sibling and set plan:true.
+func TestSearchSimilarAndHybridSearchWithPlanHitTheRightRouteAndSetPlan(t *testing.T) {
+
+	fake := &capture{reply: planEnvelope}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, plan, err := db.SearchSimilarWithPlan(ctx, SimilarRequest{Collection: "docs", ID: "a"}); err != nil {
+		t.Fatalf("SearchSimilarWithPlan failed: %v", err)
+	} else if plan.Path != "exact" {
+		t.Errorf("plan.Path = %q, want exact", plan.Path)
+	}
+	if snap := fake.snapshot(); snap.path != "/search/similar" {
+		t.Errorf("path = %s, want /search/similar", snap.path)
+	}
+	if body := fake.sentBody(t); body != `{"collection":"docs","id":"a","plan":true}` {
+		t.Errorf("body = %s, want plan:true", body)
+	}
+
+	if _, plan, err := db.HybridSearchWithPlan(ctx, HybridSearchRequest{
+		Vector: []float32{1, 0, 0}, Field: "body", Text: "fox",
+	}); err != nil {
+		t.Fatalf("HybridSearchWithPlan failed: %v", err)
+	} else if plan.Path != "exact" {
+		t.Errorf("plan.Path = %q, want exact", plan.Path)
+	}
+	if snap := fake.snapshot(); snap.path != "/hybrid-search" {
+		t.Errorf("path = %s, want /hybrid-search", snap.path)
+	}
+	want := `{"vector":[1,0,0],"field":"body","text":"fox","plan":true}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+
+	// Neither plain method must ever send plan.
+	// The plain method decodes a bare array, so switch the fake off the envelope.
+	fake.mu.Lock()
+	fake.reply = `[]`
+	fake.mu.Unlock()
+	if _, err := db.SearchSimilar(ctx, SimilarRequest{Collection: "docs", ID: "a"}); err != nil {
+		t.Fatalf("SearchSimilar failed: %v", err)
+	}
+	if body := fake.sentBody(t); strings.Contains(body, "plan") {
+		t.Errorf("body = %s, must not mention plan from SearchSimilar", body)
+	}
+	if _, err := db.HybridSearch(ctx, HybridSearchRequest{
+		Vector: []float32{1, 0, 0}, Field: "body", Text: "fox",
+	}); err != nil {
+		t.Fatalf("HybridSearch failed: %v", err)
+	}
+	if body := fake.sentBody(t); strings.Contains(body, "plan") {
+		t.Errorf("body = %s, must not mention plan from HybridSearch", body)
 	}
 }
 

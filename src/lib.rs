@@ -51,6 +51,7 @@ mod meta;
 // in-process by an embedding application (nidus-abx.4).
 pub mod metrics;
 mod model;
+mod plan;
 mod profile;
 mod search;
 mod store;
@@ -119,6 +120,7 @@ pub use model::{
     Projection, QuantKind, Quantization, RankBy, Record, RerankOpts, Role, SearchOpts,
     StoreVersions, Value,
 };
+pub use plan::{Candidates, Narrowing, QueryPath, QueryPlan, Timings};
 pub use profile::OpenProfile;
 pub use store::Readiness;
 pub use store::SegmentReport;
@@ -419,6 +421,20 @@ impl Nidus {
         self.store.search(&refs, query, opts)
     }
 
+    /// Like [`Nidus::search`], but also reports how the query ran (nidus-cvz): path
+    /// taken, rows scanned, candidate survival, phase timings.
+    pub fn search_with_plan<'a>(
+        &self,
+        scope: impl Into<Scope<'a>>,
+        query: &[f32],
+        opts: &SearchOpts,
+    ) -> Result<(Vec<Hit>, QueryPlan)> {
+        filter::validate(&opts.filter)?;
+        let names = self.scope_names(scope);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.store.search_with_plan(&refs, query, opts)
+    }
+
     /// "More like this": search a [`Scope`] with the vector already stored at
     /// `collection`/`id`, dropping that source record from the results. `scope` need not be
     /// `collection` itself — one embedding space means any scope can be searched.
@@ -433,6 +449,21 @@ impl Nidus {
         let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.search_similar(&refs, collection, id, opts)
+    }
+
+    /// Like [`Nidus::search_similar`], but also reports how the query ran (nidus-cvz).
+    pub fn search_similar_with_plan<'a>(
+        &self,
+        scope: impl Into<Scope<'a>>,
+        collection: &str,
+        id: &str,
+        opts: &SearchOpts,
+    ) -> Result<(Vec<Hit>, QueryPlan)> {
+        filter::validate(&opts.filter)?;
+        let names = self.scope_names(scope);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.store
+            .search_similar_with_plan(&refs, collection, id, opts)
     }
 
     /// Full-text (BM25) search over a [`Scope`], merged into one ranking. Requires the field to be
@@ -464,6 +495,22 @@ impl Nidus {
         let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.hybrid_search(&refs, vector, text, opts)
+    }
+
+    /// Like [`Nidus::hybrid_search`], but also reports how the vector leg ran (nidus-cvz).
+    /// `text_search` alone has no plan; the hybrid plan describes its vector leg only.
+    pub fn hybrid_search_with_plan<'a>(
+        &self,
+        scope: impl Into<Scope<'a>>,
+        vector: &[f32],
+        text: &FtsQuery,
+        opts: &HybridOpts,
+    ) -> Result<(Vec<Hit>, QueryPlan)> {
+        filter::validate(&opts.filter)?;
+        let names = self.scope_names(scope);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.store
+            .hybrid_search_with_plan(&refs, vector, text, opts)
     }
 
     // ── Group commit (nidus-xb9.1) ───────────────────────────────────────

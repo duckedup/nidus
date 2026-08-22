@@ -348,6 +348,9 @@ type SearchRequest struct {
 	Diversity *float32       `json:"diversity,omitempty"`
 	Expand    *Expand        `json:"expand,omitempty"`
 	Rerank    *RerankOptions `json:"rerank,omitempty"`
+	// Plan is set by [Client.SearchWithPlan], never by [Client.Search]; do not set it
+	// by hand.
+	Plan bool `json:"plan,omitempty"`
 	Projection
 }
 
@@ -387,7 +390,59 @@ type SimilarRequest struct {
 	// A pointer because &0 is a meaningful lambda that omitempty would drop.
 	Diversity *float32 `json:"diversity,omitempty"`
 	Expand    *Expand  `json:"expand,omitempty"`
+	// Plan is set by [Client.SearchSimilarWithPlan], never by [Client.SearchSimilar];
+	// do not set it by hand.
+	Plan bool `json:"plan,omitempty"`
 	Projection
+}
+
+// A QueryPlan explains how the server answered a [Client.SearchWithPlan],
+// [Client.SearchSimilarWithPlan] or [Client.HybridSearchWithPlan] call: which code
+// path ran, how much it scanned, and where candidates were dropped along the way.
+//
+// Pointer fields follow the omit-vs-zero rule at the top of this file: the server
+// omits RowsScanned and Candidates entirely when they do not apply to the path that
+// ran, rather than sending a zero that would look like "scanned nothing".
+type QueryPlan struct {
+	// Path is one of "ann", "ann_prefilter_fallback", "segmented", "quantized" or
+	// "exact" today, but treat it as open: a newer server may add one, and an
+	// unrecognized value should be handled like any other string, not rejected.
+	Path        string          `json:"path"`
+	RowsScanned *uint64         `json:"rows_scanned,omitempty"`
+	Candidates  *PlanCandidates `json:"candidates,omitempty"`
+	Narrowing   PlanNarrowing   `json:"narrowing"`
+	Timings     PlanTimings     `json:"timings"`
+}
+
+// PlanCandidates accounts for every candidate the walk surfaced and where it was
+// dropped, if it was. Surfaced is the count considered; Survived is what made the
+// final ranking; the Dropped* fields explain the rest.
+type PlanCandidates struct {
+	Surfaced          uint64 `json:"surfaced"`
+	Survived          uint64 `json:"survived"`
+	DroppedOutOfScope uint64 `json:"dropped_out_of_scope"`
+	DroppedStale      uint64 `json:"dropped_stale"`
+	DroppedFiltered   uint64 `json:"dropped_filtered"`
+	DroppedMinScore   uint64 `json:"dropped_min_score"`
+}
+
+// PlanNarrowing reports whether the filter index narrowed the scan. State is one of
+// "inactive", "declined" or "narrowed" (open, like [QueryPlan.Path]); Candidates is
+// present only when State is "narrowed".
+type PlanNarrowing struct {
+	State      string  `json:"state"`
+	Candidates *uint64 `json:"candidates,omitempty"`
+}
+
+// PlanTimings breaks the query down by phase, all in microseconds. Every field is
+// optional except Total, since not every path runs every phase.
+type PlanTimings struct {
+	NarrowUs  *uint64 `json:"narrow_us,omitempty"`
+	GatherUs  *uint64 `json:"gather_us,omitempty"`
+	WalkUs    *uint64 `json:"walk_us,omitempty"`
+	ResolveUs *uint64 `json:"resolve_us,omitempty"`
+	ScoreUs   *uint64 `json:"score_us,omitempty"`
+	TotalUs   uint64  `json:"total_us"`
 }
 
 // An FtsField is one entry of a [Client.SetFtsFields] schema: the attribute to
@@ -536,6 +591,9 @@ type HybridSearchRequest struct {
 	TextWeight   *float32       `json:"text_weight,omitempty"`
 	Expand       *Expand        `json:"expand,omitempty"`
 	Rerank       *RerankOptions `json:"rerank,omitempty"`
+	// Plan is set by [Client.HybridSearchWithPlan], never by [Client.HybridSearch]; do
+	// not set it by hand.
+	Plan bool `json:"plan,omitempty"`
 }
 
 // A ListRequest is a metadata-only query: no vector, paginated, filter-driven.
