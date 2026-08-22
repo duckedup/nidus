@@ -9230,6 +9230,38 @@ fn reinforce_makes_the_count_filterable() {
     );
 }
 
+/// `extend_ttl_seconds` and a stored count both arrive unvalidated (the wire for the first,
+/// a raw `upsert` for the second), so the arithmetic must saturate rather than panic in debug
+/// and wrap in release, exactly as `stamp_recency` already does.
+#[test]
+fn reinforce_saturates_instead_of_overflowing() {
+    let mut store = Store::in_memory(2).unwrap();
+    let mut attrs = BTreeMap::new();
+    attrs.insert(META_ACCESS_COUNT.to_string(), Value::Int(i64::MAX));
+    attrs.insert(META_EXPIRES_AT.to_string(), Value::DateTime(i64::MAX - 1));
+    store
+        .upsert(
+            "docs",
+            &[Record {
+                id: "a".into(),
+                vector: Some(vec![1.0, 0.0]),
+                attrs,
+            }],
+        )
+        .unwrap();
+
+    store
+        .reinforce("docs", &["a"], 1_000, Some(i64::MAX))
+        .unwrap();
+
+    let got = store.attrs_of("docs", "a").unwrap();
+    assert_eq!(got.get(META_ACCESS_COUNT), Some(&Value::Int(i64::MAX)));
+    // Saturated to i64::MAX, which is still *forward* of the old MAX - 1. The bug this
+    // guards is the wrap: an unchecked multiply lands on a past instant and expires the
+    // entry the recall was extending.
+    assert_eq!(got.get(META_EXPIRES_AT), Some(&Value::DateTime(i64::MAX)));
+}
+
 /// A stamp writes only the two reinforcement attrs, so a collection whose FTS schema covers
 /// something else must not be reindexed: `FieldIndex::index` tombstones and re-appends, so a
 /// reindex per recall would leak a dead posting set per stamp on a read path.

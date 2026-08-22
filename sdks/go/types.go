@@ -283,9 +283,10 @@ type Decay struct {
 	// The count at which the penalty reduction reaches CountLambda. The server rejects
 	// a zero, so 0 safely means "take the default" (10).
 	CountScale float32 `json:"count_scale,omitempty"`
-	// How much of the age penalty a fully-reinforced hit gets back. A high count means
-	// a smaller subtracted penalty, not an added bonus.
-	CountLambda float32 `json:"count_lambda,omitempty"`
+	// The penalty an entirely un-reinforced hit pays. A pointer for the same reason Lambda
+	// is: the server accepts a zero (no count penalty at all), so a plain value could not
+	// tell "disable the term" from "take the default".
+	CountLambda *float32 `json:"count_lambda,omitempty"`
 }
 
 // A LimitPer caps how many hits may carry any one value of an attribute — "at most two

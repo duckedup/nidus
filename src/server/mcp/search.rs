@@ -499,7 +499,14 @@ impl NidusMcp {
         if opts.rerank.is_some() {
             let reranker = self.reranker()?;
             let hits = self
-                .rerank_recall_and_finish(reranker, embedder, collection, vector, query, opts)
+                .rerank_recall_and_finish(
+                    reranker,
+                    embedder,
+                    collection,
+                    vector,
+                    (query, reinforce.then_some(extend_ttl_seconds)),
+                    opts,
+                )
                 .await?;
             return Ok(hits_content(hits.into_iter().map(HitDto::from).collect()));
         }
@@ -700,11 +707,13 @@ impl NidusMcp {
         embedder: std::sync::Arc<crate::embed::AnyEmbedder>,
         collection: String,
         vector: Vec<f32>,
-        rerank_query: String,
+        query_and_reinforce: (String, Option<Option<i64>>),
         opts: SearchOpts,
     ) -> Result<Vec<crate::Hit>, McpError> {
+        let (rerank_query, reinforce) = query_and_reinforce;
         let rerank_opts = opts.rerank.clone().unwrap_or_default();
         let (widened, kept) = crate::store::rerank::widened_opts(&opts);
+        let name = collection.clone();
         let hits = crate::server::run_read(self.state.clone(), move |db| {
             crate::memory::guard_recall_identity(db, embedder.as_ref(), &collection)?;
             db.search(collection.as_str(), &vector, &widened)
@@ -716,11 +725,22 @@ impl NidusMcp {
                 .await
                 .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
         crate::store::rerank::retrim(&mut reranked, &opts, kept);
-        crate::server::run_read(self.state.clone(), move |db| {
-            Ok(db.store().finish(reranked, &opts))
-        })
-        .await
-        .map_err(api_error)
+        // Stamp the **finished** page, never the overscanned candidate set — same rule the
+        // HTTP handler follows, and the reason this cannot just call `finish` under a read.
+        match reinforce {
+            None => crate::server::run_read(self.state.clone(), move |db| {
+                Ok(db.store().finish(reranked, &opts))
+            })
+            .await
+            .map_err(api_error),
+            Some(extend_ttl_seconds) => crate::server::run_write(self.state.clone(), move |db| {
+                let finished = db.store().finish(reranked, &opts);
+                crate::memory::reinforce_hits(db, &name, &finished, extend_ttl_seconds)?;
+                Ok(finished)
+            })
+            .await
+            .map_err(api_error),
+        }
     }
 
     async fn rerank_text_search_and_finish(
@@ -915,6 +935,80 @@ mod tests {
             vec!["c", "b", "a"],
             "rerank must reverse the tied order"
         );
+    }
+
+    /// `reinforce` must survive the rerank fork. It used to be dropped silently there: the
+    /// rerank branch returns early, so a caller asking for both got the reranked page and no
+    /// stamp, with nothing to say so.
+    #[cfg(all(
+        feature = "memory",
+        feature = "embed-openai-compat",
+        feature = "rerank-voyage"
+    ))]
+    #[tokio::test]
+    async fn a_reranked_recall_still_reinforces() {
+        use crate::embed::{AnyEmbedder, EmbedConfig, EmbedProvider};
+        use crate::rerank::testutil::mock_once;
+        use crate::rerank::{AnyReranker, RerankConfig, RerankProvider};
+
+        const SCORES: &str = r#"{"data":[{"index":0,"relevance_score":0.9},
+            {"index":1,"relevance_score":0.5}]}"#;
+
+        let embed_base = crate::server::memory_tests::spawn_embed_mock();
+        let embedder = AnyEmbedder::build(
+            EmbedProvider::OpenAiCompat,
+            EmbedConfig::new("mock-model").base_url(embed_base),
+        )
+        .await
+        .expect("build mock embedder");
+        let mock = mock_once(200, SCORES);
+        let reranker = AnyReranker::build(
+            RerankProvider::Voyage,
+            RerankConfig::new("mock-rerank")
+                .api_key("k")
+                .base_url(&mock.base_url),
+        )
+        .unwrap();
+
+        let mut db = crate::Nidus::open_in_memory(crate::server::memory_tests::DIM).unwrap();
+        for id in ["a", "b"] {
+            let mut attrs = std::collections::BTreeMap::new();
+            attrs.insert(
+                crate::META_TEXT.to_string(),
+                crate::Value::Str(format!("doc-{id}")),
+            );
+            db.upsert(
+                "notes",
+                &[crate::Record::new(id, vec![0.1, 0.2, 0.3], attrs)],
+            )
+            .unwrap();
+        }
+        let state = crate::server::AppState {
+            embedder: Some(std::sync::Arc::new(embedder)),
+            reranker: Some(std::sync::Arc::new(reranker)),
+            ..crate::server::test_state(Some(db))
+        };
+        let mcp = NidusMcp::new(state);
+
+        mcp.recall(&obj(json!({
+            "collection": "notes", "query": "anything", "top_k": 2,
+            "rerank": true, "reinforce": true
+        })))
+        .await
+        .unwrap();
+
+        let guard = mcp.state.db.read().expect("lock");
+        let db = guard.as_ref().expect("store");
+        for id in ["a", "b"] {
+            let rec = db
+                .get("notes", id)
+                .unwrap_or_else(|| panic!("{id} must still exist"));
+            assert_eq!(
+                rec.attrs.get(crate::meta::META_ACCESS_COUNT),
+                Some(&crate::Value::Int(1)),
+                "a reranked recall must stamp the page it returned ({id})"
+            );
+        }
     }
 
     /// Pull the `id` list out of a search tool's rendered JSON content.

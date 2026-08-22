@@ -32,10 +32,13 @@ pub struct SegmentReport {
     pub integrity: SegmentIntegrity,
 }
 
-/// The two attrs a reinforcement stamp writes. A schema over anything else is untouched by
-/// a stamp, so the doc needs no reindex.
+/// The attrs a reinforcement stamp can write — `expires_at` included, since
+/// `extend_ttl_seconds` moves it. A schema over anything else is untouched by a stamp, so
+/// the doc needs no reindex.
 fn is_reinforced_attr(field: &str) -> bool {
-    field == crate::meta::META_ACCESS_COUNT || field == crate::meta::META_LAST_ACCESSED
+    field == crate::meta::META_ACCESS_COUNT
+        || field == crate::meta::META_LAST_ACCESSED
+        || field == crate::meta::META_EXPIRES_AT
 }
 
 impl Store {
@@ -833,16 +836,19 @@ impl Store {
             let Some(entry) = col.docs.get(id) else {
                 continue;
             };
+            // Saturating: a raw `upsert` can put any `Int` here (the raw store API is
+            // unguarded by design), and a plain add would panic in debug and wrap in release.
             let access_count = match entry.attrs.get(crate::meta::META_ACCESS_COUNT) {
-                Some(Value::Int(n)) => *n + 1,
+                Some(Value::Int(n)) => n.saturating_add(1),
                 _ => 1,
             };
             // Only ever moves an *existing* expiry forward; never creates one on an
             // entry that had none (a never-expiring memory must not turn mortal).
+            // Saturating for the same reason `stamp_recency` is: wire-supplied seconds.
             let expires_at = extend_ttl_seconds.and_then(|secs| {
                 match entry.attrs.get(crate::meta::META_EXPIRES_AT) {
                     Some(Value::DateTime(cur)) => {
-                        Some((*cur).max(now_ms.saturating_add(secs * 1000)))
+                        Some((*cur).max(now_ms.saturating_add(secs.saturating_mul(1000))))
                     }
                     _ => None,
                 }
@@ -873,13 +879,16 @@ impl Store {
         }
 
         // Barrier: log only. No row was created or referenced, so the §6.2 write order
-        // is untouched and there is nothing for a `data` fsync to protect here.
+        // is untouched and there is nothing for a `data` fsync to protect here. That is why
+        // this cannot call `maybe_sync`, so the two counters it owns are taken by hand.
+        crate::metrics::metrics().write_batches.inc();
         let barrier_now = self.barrier_now();
         if barrier_now {
             if let Err(e) = self.log.sync() {
                 self.rollback(data_mark, log_mark)?;
                 return Err(e);
             }
+            crate::metrics::metrics().durability_barriers.inc();
         } else {
             self.pending_barrier = true;
         }
@@ -935,8 +944,10 @@ impl Store {
             self.findex_dirty = true;
         }
 
+        // #229 widened this from the cluster counter to the addressable commit point a pinned
+        // read can target, so a stamp needs it for the same reason every other write does.
         if barrier_now {
-            self.note_cluster_commit()?;
+            self.note_commit_point()?;
         }
         Ok(count)
     }

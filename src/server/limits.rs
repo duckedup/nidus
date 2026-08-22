@@ -325,9 +325,9 @@ fn is_mutation(method: &Method, path: &str) -> bool {
     if method == Method::GET || method == Method::HEAD {
         return false;
     }
-    // Read-shaped POSTs, and the per-collection `recall` (a search over text). An
-    // opted-in `reinforce` recall does write, but the middleware can't see the body to
-    // know that; the stamp is bounded (one log record per hit), so the read deadline stands.
+    // Read-shaped POSTs, and the per-collection `recall`. A `reinforce` recall does write and
+    // does queue behind other writes, so it can time out on the read deadline where a
+    // `remember` would not — the body is unread here, so it cannot be told apart (nidus-gk6).
     !(matches!(
         path,
         "/search" | "/text-search" | "/hybrid-search" | "/list"

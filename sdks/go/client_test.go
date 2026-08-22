@@ -2610,7 +2610,7 @@ func TestDecayCountKnobsMarshal(t *testing.T) {
 		Query: []float32{1},
 		RankBy: DecayRank(Decay{
 			Field: "ts", Origin: 1700000000000,
-			CountField: "nidus.access_count", CountScale: 20, CountLambda: 0.5,
+			CountField: "nidus.access_count", CountScale: 20, CountLambda: f32(0.5),
 		}),
 	})
 	if err != nil {
@@ -2646,7 +2646,7 @@ func TestDecayWithoutCountKnobsIsUnchanged(t *testing.T) {
 // be absent when unset: a recall that names no ranking expression is the plain metric.
 func TestRecallRankByMarshalsAndIsOmittedWhenUnset(t *testing.T) {
 	withRankBy := RecallOptions{
-		RankBy: DecayRank(Decay{CountField: "nidus.access_count", CountLambda: 10}),
+		RankBy: DecayRank(Decay{CountField: "nidus.access_count", CountLambda: f32(10)}),
 	}.wire("hello")
 	b, err := json.Marshal(withRankBy)
 	if err != nil {
@@ -2666,6 +2666,15 @@ func TestRecallRankByMarshalsAndIsOmittedWhenUnset(t *testing.T) {
 	}
 	if d["count_field"] != "nidus.access_count" {
 		t.Errorf("count_field = %v, want nidus.access_count", d["count_field"])
+	}
+
+	// A zero must reach the wire, not be swallowed as "unset": it disables the term.
+	zero, err := json.Marshal(DecayRank(Decay{CountField: "n", CountLambda: f32(0)}))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.Contains(zero, []byte(`"count_lambda":0`)) {
+		t.Errorf("an explicit CountLambda of 0 must be sent: %s", zero)
 	}
 
 	plain, err := json.Marshal(RecallOptions{}.wire("hello"))

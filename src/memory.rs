@@ -8,9 +8,9 @@ use crate::diag::diag;
 use crate::embed::{AnyEmbedder, Embedder, embedder_identity};
 use crate::meta::now_ms;
 use crate::{
-    Expand, Filter, FtsField, Hit, LimitPer, META_ACCESS_COUNT, META_CHAR_START,
-    META_CHUNK_INDEX, META_EXPIRES_AT, META_LAST_ACCESSED, META_PARENT_ID, Nidus, Predicate,
-    Record, SearchOpts, Value,
+    Expand, Filter, FtsField, Hit, LimitPer, META_ACCESS_COUNT, META_CHAR_START, META_CHUNK_INDEX,
+    META_EXPIRES_AT, META_LAST_ACCESSED, META_PARENT_ID, Nidus, Predicate, Record, SearchOpts,
+    Value,
 };
 
 #[cfg(feature = "summarize")]
@@ -842,9 +842,10 @@ async fn recall_with<E: Embedder>(
     Ok(hits)
 }
 
-/// Search and stamp under one write lock. The server surfaces embed off-lock themselves
-/// and call this; `recall_with` is the in-process equivalent. Always stamps every returned
-/// hit — the caller decides whether to call this or a plain `db.search` at all.
+/// Search and stamp under one write lock, for the `cli`-gated server surfaces that embed
+/// off-lock themselves and are this function's only callers (`recall_with` is the
+/// in-process equivalent). Always stamps every returned hit.
+#[cfg(feature = "cli")]
 pub(crate) fn commit_recall(
     db: &mut Nidus,
     collection: &str,
@@ -2140,7 +2141,7 @@ mod tests {
             rollup: Some(Rollup::new(1)),
             ..Default::default()
         };
-        let hits = recall_with(&db, &emb, "docs", "doc-1", &opts)
+        let hits = recall_with(&mut db, &emb, "docs", "doc-1", &opts)
             .await
             .unwrap();
         let mut parents: Vec<String> = hits

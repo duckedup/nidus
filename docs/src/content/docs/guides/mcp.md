@@ -181,8 +181,8 @@ additionally pushes an existing `nidus.expires_at` forward by that many seconds
 (only with `reinforce` set, and only on entries that already expire). Rank on
 `nidus.access_count` with the [count-decay knobs](/guides/search/#ranking-by-reinforcement)
 so memories that keep getting recalled float up and memories nothing ever recalls
-sink. Setting `reinforce` makes the call a write, so it is skipped with a warning,
-not an error, against a store opened read-only.
+sink. Setting `reinforce` makes the call a write, so against a store opened read-only
+the tool call is refused rather than answered as though the stamp happened.
 
 ### Expiry and duplicates
 

@@ -1110,9 +1110,11 @@ fn read_only_plus_reinforce_is_refused_before_opening() {
         ],
         "",
     );
+    // Matches on the two load-bearing halves rather than the whole sentence: #229 reworded
+    // this to cover `--at-version` too, and the exact prose is not what the test is about.
     assert!(
-        err.contains("--read-only was set, but this command mutates the store"),
-        "{err}"
+        err.contains("read-only") && err.contains("mutates"),
+        "the refusal must name the cause: {err}"
     );
 }
 
