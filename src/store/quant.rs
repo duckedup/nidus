@@ -5,6 +5,7 @@
 use anyhow::{Result, bail};
 
 use super::Store;
+use super::plan::{Phase, PlanRec};
 use super::scoring::{parallel_topk, score_chunk_bin, score_chunk_i8};
 use crate::ann::Walk;
 use crate::data::Segments;
@@ -198,16 +199,17 @@ impl Store {
         opts: &SearchOpts,
         score_fn: fn(&[f32], &[f32]) -> f32,
         workers: usize,
+        rec: &mut PlanRec,
     ) -> Option<Result<Vec<Hit>>> {
         if self.data.dimension() == 0 {
             return None;
         }
         match self.quant {
             Some(Quant::Int8(ref s)) if !s.vectors.is_empty() => {
-                Some(self.search_int8(q, scan, opts, score_fn, workers))
+                Some(self.search_int8(q, scan, opts, score_fn, workers, rec))
             }
             Some(Quant::Binary(ref s)) if !s.words.is_empty() => {
-                Some(self.search_binary(q, scan, opts, score_fn, workers))
+                Some(self.search_binary(q, scan, opts, score_fn, workers, rec))
             }
             _ => None,
         }
@@ -223,6 +225,7 @@ impl Store {
         opts: &SearchOpts,
         score_fn: fn(&[f32], &[f32]) -> f32,
         workers: usize,
+        rec: &mut PlanRec,
     ) -> Result<Vec<Hit>> {
         let Some(Quant::Int8(s)) = self.quant.as_ref() else {
             return Ok(Vec::new());
@@ -238,17 +241,21 @@ impl Store {
         // f32 (shared symmetric scale), so it picks the right set; exact scores come from the rerank
         // below. Parallel when engaged, else serial.
         let is_euclidean = self.config.distance == Distance::Euclidean;
-        let topk_q = if workers > 1 {
-            parallel_topk(scan, workers, overscan, |chunk| {
-                score_chunk_i8(&s.vectors, dim, chunk, &q_i8, is_euclidean, overscan)
-            })?
-        } else {
-            // `scan` arrives row-sorted from `with_sorted_scan` — score it in place.
-            score_chunk_i8(&s.vectors, dim, scan, &q_i8, is_euclidean, overscan)?
-        };
+        let topk_q = rec.phase(Phase::FirstPass, || {
+            if workers > 1 {
+                parallel_topk(scan, workers, overscan, |chunk| {
+                    score_chunk_i8(&s.vectors, dim, chunk, &q_i8, is_euclidean, overscan)
+                })
+            } else {
+                // `scan` arrives row-sorted from `with_sorted_scan` — score it in place.
+                score_chunk_i8(&s.vectors, dim, scan, &q_i8, is_euclidean, overscan)
+            }
+        })?;
 
         let candidates = topk_q.into_sorted_desc();
-        Ok(self.rerank_candidates(q, &candidates, score_fn, opts))
+        Ok(rec.phase(Phase::Rescore, || {
+            self.rerank_candidates(q, &candidates, score_fn, opts)
+        }))
     }
 
     /// Two-pass binary search: a Hamming first-pass over the 32×-smaller sign-bit matrix
@@ -261,6 +268,7 @@ impl Store {
         opts: &SearchOpts,
         score_fn: fn(&[f32], &[f32]) -> f32,
         workers: usize,
+        rec: &mut PlanRec,
     ) -> Result<Vec<Hit>> {
         let Some(Quant::Binary(s)) = self.quant.as_ref() else {
             return Ok(Vec::new());
@@ -273,17 +281,21 @@ impl Store {
 
         // First pass: Hamming scoring selects overscan candidates. Score = -(hamming),
         // monotone with cosine rank for unit vectors; exact scores come from the rerank.
-        let topk_q = if workers > 1 {
-            parallel_topk(scan, workers, overscan, |chunk| {
-                score_chunk_bin(&s.words, wpr, chunk, &q_words, overscan)
-            })?
-        } else {
-            // `scan` arrives row-sorted from `with_sorted_scan` — score it in place.
-            score_chunk_bin(&s.words, wpr, scan, &q_words, overscan)?
-        };
+        let topk_q = rec.phase(Phase::FirstPass, || {
+            if workers > 1 {
+                parallel_topk(scan, workers, overscan, |chunk| {
+                    score_chunk_bin(&s.words, wpr, chunk, &q_words, overscan)
+                })
+            } else {
+                // `scan` arrives row-sorted from `with_sorted_scan` — score it in place.
+                score_chunk_bin(&s.words, wpr, scan, &q_words, overscan)
+            }
+        })?;
 
         let candidates = topk_q.into_sorted_desc();
-        Ok(self.rerank_candidates(q, &candidates, score_fn, opts))
+        Ok(rec.phase(Phase::Rescore, || {
+            self.rerank_candidates(q, &candidates, score_fn, opts)
+        }))
     }
 
     /// Exact f32 rerank of first-pass candidates → final ranked `Hit`s. Shared by both

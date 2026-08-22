@@ -19,6 +19,8 @@ use rmcp::{
     },
 };
 
+use crate::QueryPlan;
+
 use super::{AppState, dto::HitDto};
 
 mod admin;
@@ -130,6 +132,18 @@ fn hits_content(hits: Vec<HitDto>) -> CallToolResult {
         )]);
     }
     let rendered = serde_json::to_string_pretty(&hits).unwrap_or_else(|_| "[]".to_string());
+    CallToolResult::success(vec![ContentBlock::text(rendered)])
+}
+
+/// Like [`hits_content`], but attaches a [`QueryPlan`] when one was produced (`recall`/
+/// `related` with `plan: true`). The empty-hits sentence still wins over an attached plan:
+/// a model handed `[]` should still retry or broaden, not read a plan object instead.
+fn hits_with_plan_content(hits: Vec<HitDto>, plan: Option<QueryPlan>) -> CallToolResult {
+    let Some(plan) = plan.filter(|_| !hits.is_empty()) else {
+        return hits_content(hits);
+    };
+    let rendered = serde_json::to_string_pretty(&serde_json::json!({ "hits": hits, "plan": plan }))
+        .unwrap_or_else(|_| "{}".to_string());
     CallToolResult::success(vec![ContentBlock::text(rendered)])
 }
 

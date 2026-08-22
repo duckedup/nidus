@@ -44,6 +44,10 @@ from nidus import (
     LimitPer,
     NidusClient,
     OrderBy,
+    PlanCandidates,
+    PlanNarrowing,
+    PlanTimings,
+    QueryPlan,
     Record,
     RecordInput,
     RememberResult,
@@ -71,6 +75,10 @@ PUBLIC_SHAPES = [
     HighlightOpts,
     LimitPer,
     OrderBy,
+    PlanCandidates,
+    PlanNarrowing,
+    PlanTimings,
+    QueryPlan,
 ]
 
 # Every method of the sync client — the whole documented call surface, plus the dunders a

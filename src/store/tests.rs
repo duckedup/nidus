@@ -9304,3 +9304,190 @@ fn reinforce_does_not_reindex_a_collection_it_does_not_touch() {
         .unwrap();
     assert_eq!(hits.len(), 1, "the doc must still be findable by text");
 }
+
+// ── Query plan (nidus-cvz) ───────────────────────────────────────────────────
+
+use crate::plan::{Candidates, Narrowing, QueryPath};
+
+#[test]
+fn plan_reports_exact_path_with_rows_scanned() {
+    let data = random_unit_vectors(20, 3, 1);
+    let store = exact_store(3, &data);
+    let q = random_unit_vectors(1, 3, 2).pop().unwrap();
+    let (hits, plan) = store
+        .search_with_plan(&["col"], &q, &default_opts(5))
+        .unwrap();
+    assert!(!hits.is_empty());
+    assert_eq!(plan.path, QueryPath::Exact);
+    assert_eq!(plan.rows_scanned, Some(20));
+    assert_eq!(plan.narrowing, Narrowing::Inactive);
+}
+
+#[test]
+fn plan_reports_quantized_path_with_rows_scanned() {
+    let mut store = quantized_store(3);
+    store.create_collection("col").unwrap();
+    store
+        .upsert(
+            "col",
+            &[
+                rec("a", vec![0.9, 0.1, 0.0]),
+                rec("b", vec![0.5, 0.5, 0.0]),
+                rec("c", vec![0.0, 0.0, 1.0]),
+            ],
+        )
+        .unwrap();
+    let (hits, plan) = store
+        .search_with_plan(&["col"], &[1.0, 0.0, 0.0], &default_opts(3))
+        .unwrap();
+    assert!(!hits.is_empty());
+    assert_eq!(plan.path, QueryPath::Quantized);
+    assert_eq!(plan.rows_scanned, Some(3));
+}
+
+#[test]
+fn plan_reports_ann_path_with_no_rows_scanned() {
+    let data = random_unit_vectors(50, 4, 3);
+    let store = ann_store(4, AnnConfig::hnsw(), &data);
+    let q = random_unit_vectors(1, 4, 4).pop().unwrap();
+    let (hits, plan) = store
+        .search_with_plan(&["col"], &q, &default_opts(5))
+        .unwrap();
+    assert!(!hits.is_empty());
+    assert_eq!(plan.path, QueryPath::Ann);
+    assert_eq!(plan.rows_scanned, None);
+    assert!(plan.candidates.is_some());
+}
+
+#[test]
+fn plan_reports_ann_prefilter_fallback_on_a_selective_filter() {
+    let data = random_unit_vectors(50, 4, 5);
+    let mut store = ann_store(4, AnnConfig::hnsw(), &data);
+    let mut attrs = BTreeMap::new();
+    attrs.insert("tag".to_string(), Value::Int(1));
+    // The only tagged doc: a maximally selective filter, narrow enough to starve the
+    // ANN walk and force the exact-prefilter fallback (nidus-0ou).
+    store
+        .upsert(
+            "col",
+            &[rec_with("tagged", vec![1.0, 0.0, 0.0, 0.0], attrs)],
+        )
+        .unwrap();
+    let opts = SearchOpts {
+        filter: Filter(vec![Predicate::Eq("tag".to_string(), Value::Int(1))]),
+        ..default_opts(5)
+    };
+    let (hits, plan) = store
+        .search_with_plan(&["col"], &[1.0, 0.0, 0.0, 0.0], &opts)
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(plan.path, QueryPath::AnnPrefilterFallback);
+    assert_eq!(
+        plan.rows_scanned, None,
+        "the fallback is not the counted brute-force scan"
+    );
+}
+
+#[test]
+fn plan_reports_segmented_path() {
+    let mut s = segmented_store(2, 4, 2);
+    s.create_collection("col").unwrap();
+    for i in 0..5 {
+        s.upsert(
+            "col",
+            &[
+                rec(&format!("a{i}"), vec![(i as f32).cos(), (i as f32).sin()]),
+                rec(
+                    &format!("b{i}"),
+                    vec![(-(i as f32)).sin(), (i as f32).cos()],
+                ),
+            ],
+        )
+        .unwrap();
+    }
+    let (hits, plan) = s
+        .search_with_plan(&["col"], &[1.0, 0.0], &default_opts(5))
+        .unwrap();
+    assert!(!hits.is_empty());
+    assert_eq!(plan.path, QueryPath::Segmented);
+    assert_eq!(plan.rows_scanned, None);
+}
+
+#[test]
+fn plan_candidates_survived_and_dropped_sum_to_surfaced() {
+    let data = random_unit_vectors(80, 4, 7);
+    let store = ann_store(4, AnnConfig::hnsw(), &data);
+    let q = random_unit_vectors(1, 4, 8).pop().unwrap();
+    let (_, plan) = store
+        .search_with_plan(&["col"], &q, &default_opts(5))
+        .unwrap();
+    let c: Candidates = plan.candidates.unwrap();
+    assert!(c.surfaced >= c.survived);
+    let dropped =
+        c.dropped_out_of_scope + c.dropped_stale + c.dropped_filtered + c.dropped_min_score;
+    assert_eq!(c.surfaced, c.survived + dropped);
+}
+
+#[test]
+fn plan_narrowing_reports_inactive_declined_and_narrowed() {
+    let mut store = Store::in_memory(2).unwrap();
+    store
+        .upsert(
+            "col",
+            &[
+                rec_with(
+                    "a",
+                    vec![1.0, 0.0],
+                    BTreeMap::from([("tag".to_string(), Value::Str("hello world".into()))]),
+                ),
+                rec("b", vec![0.0, 1.0]),
+            ],
+        )
+        .unwrap();
+
+    // No filter index declared anywhere in the store: Inactive.
+    let (_, plan) = store
+        .search_with_plan(&["col"], &[1.0, 0.0], &default_opts(5))
+        .unwrap();
+    assert_eq!(plan.narrowing, Narrowing::Inactive);
+
+    store
+        .set_filter_index("col", &[FilterIndexField::new("tag")])
+        .unwrap();
+
+    // `Eq` is not a text predicate the filter index can answer: Declined.
+    let opts = SearchOpts {
+        filter: Filter(vec![Predicate::Eq(
+            "tag".to_string(),
+            Value::Str("hello world".into()),
+        )]),
+        ..default_opts(5)
+    };
+    let (_, plan) = store
+        .search_with_plan(&["col"], &[1.0, 0.0], &opts)
+        .unwrap();
+    assert_eq!(plan.narrowing, Narrowing::Declined);
+
+    // `ContainsAllTokens` on the indexed field: Narrowed.
+    let opts = SearchOpts {
+        filter: Filter(vec![Predicate::ContainsAllTokens(
+            "tag".to_string(),
+            "hello".to_string(),
+        )]),
+        ..default_opts(5)
+    };
+    let (_, plan) = store
+        .search_with_plan(&["col"], &[1.0, 0.0], &opts)
+        .unwrap();
+    assert!(matches!(plan.narrowing, Narrowing::Narrowed { .. }));
+}
+
+#[test]
+fn plan_opt_out_search_ignores_the_plan_but_still_answers() {
+    let data = random_unit_vectors(10, 3, 9);
+    let store = exact_store(3, &data);
+    let hits = store
+        .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(5))
+        .unwrap();
+    assert!(!hits.is_empty());
+}

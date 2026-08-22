@@ -758,6 +758,9 @@ pub struct SearchOpts {
     /// Annotate each hit with why it matched (nidus-m50.5). On a `text_search` that is each
     /// clause's own BM25 score; vector `search` ignores it, having a single score to report.
     pub explain: bool,
+    /// Record how the query ran — path taken, rows scanned, candidate survival, phase
+    /// timings — returned by the `*_with_plan` methods. Costs nothing when `false`.
+    pub plan: bool,
     /// A ranking expression layered over the distance metric. Deliberately does **not** force
     /// the exact path (that is [`SearchOpts::exact`]): over an ANN or quantized result set it
     /// inherits that path's approximation (nidus-m50.15 #9).
@@ -822,6 +825,9 @@ pub struct HybridOpts {
     /// Annotate each hit with each leg's own rank and score plus every matched BM25
     /// clause's contribution (nidus-m50.5). Default `false`.
     pub explain: bool,
+    /// Record how the query ran — path taken, rows scanned, candidate survival, phase
+    /// timings — returned by the `*_with_plan` methods. Costs nothing when `false`.
+    pub plan: bool,
     /// Weight on the vector leg's RRF contribution. Default `1.0`; both legs at `1.0`
     /// reproduces unweighted RRF bit for bit.
     pub vector_weight: f32,
@@ -844,6 +850,7 @@ impl Default for HybridOpts {
             rrf_k: 60.0,
             candidates: 100,
             explain: false,
+            plan: false,
             rerank: None,
             vector_weight: 1.0,
             text_weight: 1.0,

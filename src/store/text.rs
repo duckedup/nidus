@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use super::Store;
+use super::plan::PlanRec;
 use super::rank;
 use super::read::{check_query_opts, check_weight, depth, paginate};
 use crate::annotate::{Annotations, ClauseScore, Highlight, HighlightOpts, LegScore};
@@ -13,6 +14,7 @@ use crate::filter;
 use crate::fts::Analyzer;
 use crate::fuse::{FusionLeg, rrf_fuse};
 use crate::model::{FtsClause, FtsCombine, FtsQuery, Hit, HybridOpts, SearchOpts};
+use crate::plan::QueryPlan;
 use crate::search::TopK;
 
 /// A document's BM25 score per clause, in clause order; `None` where that clause did not match.
@@ -132,6 +134,38 @@ impl Store {
         text: &FtsQuery,
         opts: &HybridOpts,
     ) -> Result<Vec<Hit>> {
+        Ok(self
+            .traced(opts.plan, |rec| {
+                self.hybrid_search_inner(collections, vector, text, opts, rec)
+            })?
+            .0)
+    }
+
+    /// Like [`Store::hybrid_search`], but also returns the [`QueryPlan`] for the vector leg
+    /// (nidus-cvz). `text_search` alone has no plan; the hybrid plan describes its vector leg.
+    pub fn hybrid_search_with_plan(
+        &self,
+        collections: &[&str],
+        vector: &[f32],
+        text: &FtsQuery,
+        opts: &HybridOpts,
+    ) -> Result<(Vec<Hit>, QueryPlan)> {
+        let (hits, plan) = self.traced(true, |rec| {
+            self.hybrid_search_inner(collections, vector, text, opts, rec)
+        })?;
+        Ok((hits, plan.expect("traced(true, _) always finishes a plan")))
+    }
+
+    /// The instrumented body shared by [`Store::hybrid_search`] and
+    /// [`Store::hybrid_search_with_plan`].
+    fn hybrid_search_inner(
+        &self,
+        collections: &[&str],
+        vector: &[f32],
+        text: &FtsQuery,
+        opts: &HybridOpts,
+        rec: &mut PlanRec,
+    ) -> Result<Vec<Hit>> {
         // Ahead of the `top_k == 0` shortcut, not after: the vector leg validates, but the
         // shortcut returns before the leg runs. Validating here means a bad query does not change
         // verdict based on `top_k`.
@@ -151,7 +185,7 @@ impl Store {
             explain: opts.explain,
             ..Default::default()
         };
-        let vector_leg = self.search(collections, vector, &leg_opts)?;
+        let vector_leg = self.search_inner(collections, vector, &leg_opts, rec)?;
         // The leg is scored but not highlighted: highlighting the whole candidate set would be
         // work thrown away on the documents fusion drops.
         let mut text_leg = self.text_search(

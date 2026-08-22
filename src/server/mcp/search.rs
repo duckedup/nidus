@@ -17,7 +17,7 @@ use super::NidusMcp;
 use super::args::{
     api_error, optional_bool, optional_f32, optional_top_k, optional_usize, required_str, tool,
 };
-use super::{HitDto, hits_content};
+use super::{HitDto, hits_content, hits_with_plan_content};
 
 /// A tagged [`crate::Value`]: `{"Str": "x"}`, `{"Int": 5}`, `{"Float": 1.5}`, `{"Bool":
 /// true}`, or `{"List": ["a", "b"]}` for a list attribute (what `Contains`/`ContainsAny`
@@ -228,6 +228,17 @@ pub(super) fn with_ttl_guard(filter: Option<Filter>) -> Filter {
     filter
 }
 
+/// `plan`: opt into a [`crate::QueryPlan`] alongside the hits, shared by `recall` and
+/// `related` (the two vector-path tools; `text_search` has no plan).
+fn plan_schema() -> JsonValue {
+    json!({
+        "type": "boolean",
+        "description": "Also report how the search ran: which index path answered it, how \
+            many rows were scanned, and where the time went. Useful when results look thin \
+            or a search is slow. Off by default."
+    })
+}
+
 /// `diversity`: the MMR knob, shared by every tool whose ranking `Store::finish` shapes.
 fn diversity_schema() -> JsonValue {
     json!({
@@ -333,6 +344,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "rollup": rollup_schema(),
                     "rerank": rerank_bool_schema(),
                     "rerank_overscan": rerank_overscan_schema(),
+                    "plan": plan_schema(),
                     "reinforce": {
                         "type": "boolean",
                         "description": "Record that these entries were useful. Entries you recall with this set float up in later searches that rank on reinforcement, and entries nothing ever recalls sink. Leave it off for a plain lookup."
@@ -453,7 +465,8 @@ pub(super) fn related_tool() -> Tool {
                 },
                 "filter": filter_schema(),
                 "diversity": diversity_schema(),
-                "rollup": rollup_schema()
+                "rollup": rollup_schema(),
+                "plan": plan_schema()
             },
             "required": ["collection", "id"],
             "additionalProperties": false
@@ -477,6 +490,7 @@ impl NidusMcp {
         let rerank = parse_rerank(args)?;
         let reinforce = optional_bool(args, "reinforce")?;
         let extend_ttl_seconds = optional_usize(args, "extend_ttl_seconds")?.map(|s| s as i64);
+        let plan = optional_bool(args, "plan")?;
 
         let vector = embedder
             .embed_query(&query)
@@ -491,6 +505,7 @@ impl NidusMcp {
             limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
             expand: rollup.map(|(_, e)| e),
             rerank,
+            plan,
             ..Default::default()
         };
         check_rerank_search_depth(&opts)?;
@@ -498,7 +513,7 @@ impl NidusMcp {
         #[cfg(feature = "rerank")]
         if opts.rerank.is_some() {
             let reranker = self.reranker()?;
-            let hits = self
+            let (hits, plan) = self
                 .rerank_recall_and_finish(
                     reranker,
                     embedder,
@@ -508,7 +523,10 @@ impl NidusMcp {
                     opts,
                 )
                 .await?;
-            return Ok(hits_content(hits.into_iter().map(HitDto::from).collect()));
+            return Ok(hits_with_plan_content(
+                hits.into_iter().map(HitDto::from).collect(),
+                plan,
+            ));
         }
         #[cfg(not(feature = "rerank"))]
         if opts.rerank.is_some() {
@@ -519,10 +537,23 @@ impl NidusMcp {
             ));
         }
 
-        let hits = if reinforce {
+        let (hits, plan) = if reinforce {
             crate::server::run_write(self.state.clone(), move |db| {
                 crate::memory::guard_recall_identity(db, embedder.as_ref(), &collection)?;
-                crate::memory::commit_recall(db, &collection, &vector, &opts, extend_ttl_seconds)
+                if opts.plan {
+                    let (hits, plan) = db.search_with_plan(collection.as_str(), &vector, &opts)?;
+                    crate::memory::reinforce_hits(db, &collection, &hits, extend_ttl_seconds)?;
+                    Ok((hits, Some(plan)))
+                } else {
+                    let hits = crate::memory::commit_recall(
+                        db,
+                        &collection,
+                        &vector,
+                        &opts,
+                        extend_ttl_seconds,
+                    )?;
+                    Ok((hits, None))
+                }
             })
             .await
             .map_err(api_error)?
@@ -531,13 +562,21 @@ impl NidusMcp {
                 // Recalling with a different embedder than wrote the collection returns
                 // nonsense, so the same guard the HTTP route uses refuses it.
                 crate::memory::guard_recall_identity(db, embedder.as_ref(), &collection)?;
-                db.search(collection.as_str(), &vector, &opts)
+                if opts.plan {
+                    let (hits, plan) = db.search_with_plan(collection.as_str(), &vector, &opts)?;
+                    Ok((hits, Some(plan)))
+                } else {
+                    Ok((db.search(collection.as_str(), &vector, &opts)?, None))
+                }
             })
             .await
             .map_err(api_error)?
         };
 
-        Ok(hits_content(hits.into_iter().map(HitDto::from).collect()))
+        Ok(hits_with_plan_content(
+            hits.into_iter().map(HitDto::from).collect(),
+            plan,
+        ))
     }
 
     pub(super) async fn text_search(
@@ -667,8 +706,9 @@ impl NidusMcp {
         let filter = parse_filter(args)?;
         let diversity = optional_f32(args, "diversity")?;
         let rollup = parse_rollup(args)?;
+        let plan = optional_bool(args, "plan")?;
 
-        let hits = crate::server::run_read(self.state.clone(), move |db| {
+        let (hits, plan) = crate::server::run_read(self.state.clone(), move |db| {
             if let Some(source) = db.get(&collection, &id) {
                 let guard = Filter(vec![not_expired_predicate(now_ms())]);
                 if !crate::filter::matches(&guard, &source.attrs) {
@@ -685,14 +725,34 @@ impl NidusMcp {
                 diversity,
                 limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
                 expand: rollup.map(|(_, e)| e),
+                plan,
                 ..Default::default()
             };
-            db.search_similar(collection.as_str(), collection.as_str(), id.as_str(), &opts)
+            if opts.plan {
+                let (hits, plan) = db.search_similar_with_plan(
+                    collection.as_str(),
+                    collection.as_str(),
+                    id.as_str(),
+                    &opts,
+                )?;
+                Ok((hits, Some(plan)))
+            } else {
+                let hits = db.search_similar(
+                    collection.as_str(),
+                    collection.as_str(),
+                    id.as_str(),
+                    &opts,
+                )?;
+                Ok((hits, None))
+            }
         })
         .await
         .map_err(api_error)?;
 
-        Ok(hits_content(hits.into_iter().map(HitDto::from).collect()))
+        Ok(hits_with_plan_content(
+            hits.into_iter().map(HitDto::from).collect(),
+            plan,
+        ))
     }
 }
 
@@ -709,14 +769,21 @@ impl NidusMcp {
         vector: Vec<f32>,
         query_and_reinforce: (String, Option<Option<i64>>),
         opts: SearchOpts,
-    ) -> Result<Vec<crate::Hit>, McpError> {
+    ) -> Result<(Vec<crate::Hit>, Option<crate::QueryPlan>), McpError> {
         let (rerank_query, reinforce) = query_and_reinforce;
         let rerank_opts = opts.rerank.clone().unwrap_or_default();
         let (widened, kept) = crate::store::rerank::widened_opts(&opts);
         let name = collection.clone();
-        let hits = crate::server::run_read(self.state.clone(), move |db| {
+        // The plan (when asked for) describes this widened pre-rerank scan, not the
+        // caller's page — rerank and retrim below are metadata-only and never rescan.
+        let (hits, plan) = crate::server::run_read(self.state.clone(), move |db| {
             crate::memory::guard_recall_identity(db, embedder.as_ref(), &collection)?;
-            db.search(collection.as_str(), &vector, &widened)
+            if widened.plan {
+                let (hits, plan) = db.search_with_plan(collection.as_str(), &vector, &widened)?;
+                Ok((hits, Some(plan)))
+            } else {
+                Ok((db.search(collection.as_str(), &vector, &widened)?, None))
+            }
         })
         .await
         .map_err(api_error)?;
@@ -727,20 +794,21 @@ impl NidusMcp {
         crate::store::rerank::retrim(&mut reranked, &opts, kept);
         // Stamp the **finished** page, never the overscanned candidate set — same rule the
         // HTTP handler follows, and the reason this cannot just call `finish` under a read.
-        match reinforce {
+        let hits = match reinforce {
             None => crate::server::run_read(self.state.clone(), move |db| {
                 Ok(db.store().finish(reranked, &opts))
             })
             .await
-            .map_err(api_error),
+            .map_err(api_error)?,
             Some(extend_ttl_seconds) => crate::server::run_write(self.state.clone(), move |db| {
                 let finished = db.store().finish(reranked, &opts);
                 crate::memory::reinforce_hits(db, &name, &finished, extend_ttl_seconds)?;
                 Ok(finished)
             })
             .await
-            .map_err(api_error),
-        }
+            .map_err(api_error)?,
+        };
+        Ok((hits, plan))
     }
 
     async fn rerank_text_search_and_finish(

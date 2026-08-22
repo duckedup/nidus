@@ -111,6 +111,69 @@ class Hit:
 
 
 @dataclass(frozen=True)
+class PlanCandidates:
+    """What an index walk surfaced vs what survived, mirroring the server's ``Candidates``.
+
+    Present only when a walk actually ran (absent on the ``ann``/``segmented`` paths, which
+    skip the walk entirely).
+    """
+
+    surfaced: int
+    survived: int
+    dropped_out_of_scope: int
+    dropped_stale: int
+    dropped_filtered: int
+    dropped_min_score: int
+
+
+@dataclass(frozen=True)
+class PlanNarrowing:
+    """Whether the opt-in filter index narrowed the scan before it ran.
+
+    ``state`` is a plain ``str`` (``"inactive"``, ``"declined"``, or ``"narrowed"``), not an
+    enum, so a value a newer server invents does not raise here. ``candidates`` is present
+    only when ``state == "narrowed"``.
+    """
+
+    state: str
+    candidates: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class PlanTimings:
+    """Per-phase wall time in **microseconds**; a phase that did not run is ``None``.
+
+    ``total_us`` is the only key every plan carries.
+    """
+
+    total_us: int
+    narrow_us: Optional[int] = None
+    gather_us: Optional[int] = None
+    walk_us: Optional[int] = None
+    resolve_us: Optional[int] = None
+    first_pass_us: Optional[int] = None
+    rescore_us: Optional[int] = None
+    score_us: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class QueryPlan:
+    """How a query was answered, returned alongside the hits by a ``*_with_plan`` method.
+
+    ``path`` is a plain ``str`` (``"ann"``, ``"ann_prefilter_fallback"``, ``"segmented"``,
+    ``"quantized"``, ``"exact"``), not an enum, so an unknown value from a newer server
+    decodes rather than raising. ``rows_scanned`` is absent on the ``ann``/``segmented``
+    paths, where no full scan happens.
+    """
+
+    path: str
+    narrowing: PlanNarrowing
+    timings: PlanTimings
+    rows_scanned: Optional[int] = None
+    candidates: Optional[PlanCandidates] = None
+
+
+@dataclass(frozen=True)
 class Aggregation:
     """The answer to :meth:`~nidus.NidusClient.aggregate`: a count plus one sum per field.
 

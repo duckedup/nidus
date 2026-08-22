@@ -27,6 +27,7 @@ pub(crate) mod aggregate;
 mod diversity;
 mod expand;
 mod memtier;
+mod plan;
 mod quant;
 mod rank;
 mod read;

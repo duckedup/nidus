@@ -97,6 +97,8 @@ pub struct Metrics {
     pub search_vectors_scanned: Counter,
     /// Candidates reranked in f32 by the quantized path's second pass.
     pub search_reranked: Counter,
+    /// Queries whose filter was narrowed by the opt-in filter index before scanning.
+    pub search_findex_narrowed: Counter,
 }
 
 impl Metrics {
@@ -119,6 +121,7 @@ impl Metrics {
             search_exact: Counter::new(),
             search_vectors_scanned: Counter::new(),
             search_reranked: Counter::new(),
+            search_findex_narrowed: Counter::new(),
         }
     }
 
@@ -142,6 +145,7 @@ impl Metrics {
             search_exact,
             search_vectors_scanned,
             search_reranked,
+            search_findex_narrowed,
         } = self;
         vec![
             (
@@ -228,6 +232,11 @@ impl Metrics {
                 "nidus_search_reranked_total",
                 "Candidates reranked in f32 by the quantized second pass",
                 search_reranked.get(),
+            ),
+            (
+                "nidus_search_findex_narrowed_total",
+                "Queries whose filter was narrowed by the filter index before scanning",
+                search_findex_narrowed.get(),
             ),
         ]
     }

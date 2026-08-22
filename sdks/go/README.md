@@ -296,6 +296,27 @@ record whose timestamp is missing or unusable is *not* penalized by default; set
 `Missing: &zero` to bury it instead. `RankBy`, `LimitPer` and `Expand` ride on `/search`
 and `/text-search`; `OrderBy` on `/list`; `Rollup` on `/recall`.
 
+## Explaining a query plan
+
+`Search`, `SearchSimilar` and `HybridSearch` each have a `WithPlan` sibling that
+returns a `*nidus.QueryPlan` alongside the hits: which code path answered the query,
+how many rows it scanned, and where candidates were dropped along the way. The plain
+methods never send the extra request field, so they stay byte-identical to before.
+
+```go
+hits, plan, err := db.SearchWithPlan(ctx, nidus.SearchRequest{
+    Query: []float32{0.1, 0.2, 0.3},
+})
+fmt.Println(plan.Path) // e.g. "ann_prefilter_fallback"
+if plan.Candidates != nil {
+    fmt.Println(plan.Candidates.DroppedFiltered)
+}
+```
+
+`RowsScanned` and `Candidates` are `nil`, not zero, when the path that ran doesn't
+produce them; `QueryPlan.Path` and `PlanNarrowing.State` are plain strings rather than
+closed enums, since a newer server may report a value this SDK predates.
+
 ## Remembering and recalling (text-native)
 
 When the server is started with an embedder (`nidus serve --embed-provider …`), you can

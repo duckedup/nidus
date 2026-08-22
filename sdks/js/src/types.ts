@@ -144,6 +144,57 @@ export interface Annotations {
 }
 
 /**
+ * The scan strategy a `*WithPlan` query actually took. An open string, not a closed
+ * union: known values today are `"ann"`, `"ann_prefilter_fallback"`, `"segmented"`,
+ * `"quantized"`, `"exact"`, but a newer server may report one this SDK predates.
+ */
+export type QueryPath = string;
+
+/** How many candidates survived each stage of a `*WithPlan` query, per {@link QueryPlan}. */
+export interface PlanCandidates {
+  surfaced: number;
+  survived: number;
+  droppedOutOfScope: number;
+  droppedStale: number;
+  droppedFiltered: number;
+  droppedMinScore: number;
+}
+
+/** Whether a `*WithPlan` query's filter index narrowed the scan, per {@link QueryPlan}. */
+export interface PlanNarrowing {
+  state: "inactive" | "declined" | "narrowed";
+  /** Present only when `state` is `"narrowed"`. */
+  candidates?: number;
+}
+
+/** Per-stage timings of a `*WithPlan` query, in integer microseconds. */
+export interface PlanTimings {
+  narrowUs?: number;
+  gatherUs?: number;
+  walkUs?: number;
+  resolveUs?: number;
+  firstPassUs?: number;
+  rescoreUs?: number;
+  scoreUs?: number;
+  totalUs: number;
+}
+
+/**
+ * How the server answered a `*WithPlan` query, returned alongside its hits by
+ * {@link NidusClient.searchWithPlan}, {@link NidusClient.searchSimilarWithPlan}, and
+ * {@link NidusClient.hybridSearchWithPlan}.
+ */
+export interface QueryPlan {
+  path: QueryPath;
+  /** Absent on the `ann`/`segmented` paths, where it does not apply. */
+  rowsScanned?: number;
+  /** Absent when no filter-index walk ran. */
+  candidates?: PlanCandidates;
+  narrowing: PlanNarrowing;
+  timings: PlanTimings;
+}
+
+/**
  * A {@link Value} decoded back to a plain JS value. A `DateTime` comes back as a
  * `Date`, not a number, so a decoded `attrs` map re-encodes to what it came from.
  */

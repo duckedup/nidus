@@ -12,7 +12,7 @@ use clap::{
 };
 use serde::Serialize;
 
-use crate::server::dto::{AnnDto, FootprintDto, HitDto};
+use crate::server::dto::{AnnDto, FootprintDto, HitDto, SearchResponse};
 use crate::{
     AggregateOpts, AnnConfig, Config, Distance, Expand, Filter, Fsync, FtsClause, FtsCombine,
     FtsField, FtsQuery, HighlightOpts, HybridOpts, LeaseWait, LimitPer, ListOpts, Nidus, OpenMode,
@@ -32,8 +32,8 @@ use crate::embed::{AnyEmbedder, EmbedConfig, EmbedProvider, Embedder};
 use crate::RerankOpts;
 #[cfg(feature = "rerank")]
 use crate::rerank::{
-    AnyReranker, RerankConfig, RerankProvider, hybrid_reranked, search_reranked,
-    text_search_reranked,
+    AnyReranker, RerankConfig, RerankProvider, hybrid_reranked, hybrid_reranked_with_plan,
+    search_reranked, search_reranked_with_plan, text_search_reranked,
 };
 #[cfg(all(feature = "memory", feature = "summarize"))]
 use crate::summarize::{AnySummarizer, SummarizeConfig, SummarizeProvider};
@@ -1045,6 +1045,9 @@ enum Command {
         /// MMR lambda spreading hits in vector space: 1.0 pure relevance, 0.0 pure spread.
         #[arg(long = "diversity")]
         diversity: Option<f32>,
+        /// Report how the query ran — path taken, rows scanned, candidate survival, timings.
+        #[arg(long)]
+        plan: bool,
         #[command(flatten)]
         expand: ExpandArgs,
         #[cfg(feature = "rerank")]
@@ -1094,6 +1097,9 @@ enum Command {
         /// MMR lambda spreading hits in vector space: 1.0 pure relevance, 0.0 pure spread.
         #[arg(long = "diversity")]
         diversity: Option<f32>,
+        /// Report how the query ran — path taken, rows scanned, candidate survival, timings.
+        #[arg(long)]
+        plan: bool,
         #[command(flatten)]
         expand: ExpandArgs,
     },
@@ -1253,6 +1259,9 @@ enum Command {
         /// Weight on the BM25 leg's fused contribution.
         #[arg(long, default_value_t = 1.0)]
         text_weight: f32,
+        /// Report how the query ran — path taken, rows scanned, candidate survival, timings.
+        #[arg(long)]
+        plan: bool,
         #[command(flatten)]
         expand: ExpandArgs,
         #[cfg(feature = "rerank")]
@@ -1593,6 +1602,7 @@ pub fn run(cli: Cli) -> Result<()> {
             limit_per,
             limit_per_max,
             diversity,
+            plan,
             #[cfg(feature = "rerank")]
             rerank,
             expand,
@@ -1620,6 +1630,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     .map(|(f, m)| LimitPer::new(f, m)),
                 diversity,
                 expand: expand.resolve(),
+                plan,
                 #[cfg(feature = "rerank")]
                 rerank: resolved.as_ref().map(|(_, o, _)| o.clone()),
                 ..Default::default()
@@ -1635,6 +1646,17 @@ pub fn run(cli: Cli) -> Result<()> {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
+                if plan {
+                    let (hits, p) = rt.block_on(search_reranked_with_plan(
+                        &db,
+                        &reranker,
+                        scope,
+                        &query,
+                        &query_text,
+                        &opts,
+                    ))?;
+                    return print_json(&SearchResponse::new(hits, Some(p)));
+                }
                 let hits = rt.block_on(search_reranked(
                     &db,
                     &reranker,
@@ -1645,6 +1667,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 ))?;
                 let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
                 return print_json(&out);
+            }
+            if plan {
+                let (hits, plan) = db.search_with_plan(scope, &query, &opts)?;
+                return print_json(&SearchResponse::new(hits, Some(plan)));
             }
             let hits = db.search(scope, &query, &opts)?;
             let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
@@ -1666,6 +1692,7 @@ pub fn run(cli: Cli) -> Result<()> {
             limit_per,
             limit_per_max,
             diversity,
+            plan,
             expand,
         } => {
             let db = open(&store, false)?;
@@ -1687,6 +1714,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     .map(|(f, m)| LimitPer::new(f, m)),
                 diversity,
                 expand: expand.resolve(),
+                plan,
                 ..Default::default()
             };
             // Empty --scope defaults to the source collection, not every collection.
@@ -1695,6 +1723,15 @@ pub fn run(cli: Cli) -> Result<()> {
             } else {
                 scope.iter().map(String::as_str).collect()
             };
+            if plan {
+                let (hits, plan) = db.search_similar_with_plan(
+                    Scope::Collections(&refs),
+                    &collection,
+                    &id,
+                    &opts,
+                )?;
+                return print_json(&SearchResponse::new(hits, Some(plan)));
+            }
             let hits = db.search_similar(Scope::Collections(&refs), &collection, &id, &opts)?;
             let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
             print_json(&out)
@@ -1898,6 +1935,7 @@ pub fn run(cli: Cli) -> Result<()> {
             candidates,
             vector_weight,
             text_weight,
+            plan,
             #[cfg(feature = "rerank")]
             rerank,
             expand,
@@ -1923,6 +1961,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 vector_weight,
                 text_weight,
                 expand: expand.resolve(),
+                plan,
                 #[cfg(feature = "rerank")]
                 rerank: resolved.as_ref().map(|(_, o, _)| o.clone()),
                 #[cfg(not(feature = "rerank"))]
@@ -1939,6 +1978,18 @@ pub fn run(cli: Cli) -> Result<()> {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
+                if plan {
+                    let (hits, p) = rt.block_on(hybrid_reranked_with_plan(
+                        &db,
+                        &reranker,
+                        scope,
+                        &vector,
+                        &q,
+                        &query_text,
+                        &opts,
+                    ))?;
+                    return print_json(&SearchResponse::new(hits, Some(p)));
+                }
                 let hits = rt.block_on(hybrid_reranked(
                     &db,
                     &reranker,
@@ -1950,6 +2001,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 ))?;
                 let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
                 return print_json(&out);
+            }
+            if plan {
+                let (hits, plan) = db.hybrid_search_with_plan(scope, &vector, &q, &opts)?;
+                return print_json(&SearchResponse::new(hits, Some(plan)));
             }
             let hits = db.hybrid_search(scope, &vector, &q, &opts)?;
             let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
@@ -3126,6 +3181,56 @@ mod tests {
                 "docs",
                 "--limit-per",
                 "file"
+            ])
+            .is_err()
+        );
+    }
+
+    /// `--plan` exists on `search`, `similar`, `hybrid-search` (nidus-cvz); `text-search`
+    /// has no plan (it matches core and HTTP), so the flag must be rejected there.
+    #[test]
+    fn plan_flag_is_wired_to_the_right_commands() {
+        let cli = Cli::try_parse_from([
+            "nidus", "search", "--dir", "/tmp/s", "--dim", "3", "docs", "--plan",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Search { plan, .. } => assert!(plan),
+            _ => panic!("expected Search"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["nidus", "similar", "--dir", "/tmp/s", "coll", "a", "--plan"])
+                .unwrap();
+        match cli.command {
+            Command::Similar { plan, .. } => assert!(plan),
+            _ => panic!("expected Similar"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "hybrid-search",
+            "--dir",
+            "/tmp/s",
+            "body",
+            "quantum",
+            "--plan",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::HybridSearch { plan, .. } => assert!(plan),
+            _ => panic!("expected HybridSearch"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "nidus",
+                "text-search",
+                "--dir",
+                "/tmp/s",
+                "body",
+                "quantum",
+                "--plan",
             ])
             .is_err()
         );

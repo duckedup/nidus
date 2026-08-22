@@ -68,6 +68,12 @@ VERSIONS_PAYLOAD = {
     "readable": [3, 4, 5, 6, 7, 8, 9],
 }
 
+PLAN_PAYLOAD = {
+    "path": "exact",
+    "narrowing": {"state": "inactive"},
+    "timings": {"total_us": 100},
+}
+
 
 class MockServer:
     """A recording ``httpx.MockTransport``: canned response out, every request kept.
@@ -184,6 +190,27 @@ ENDPOINTS: list[tuple[str, Callable[[AsyncNidusClient], Any], str, str, Any]] = 
         "POST",
         "/hybrid-search",
         [],
+    ),
+    (
+        "search_with_plan",
+        lambda db: db.search_with_plan(query=[1.0, 0.0, 0.0]),
+        "POST",
+        "/search",
+        {"hits": [], "plan": PLAN_PAYLOAD},
+    ),
+    (
+        "search_similar_with_plan",
+        lambda db: db.search_similar_with_plan(collection="notes", id="a"),
+        "POST",
+        "/search/similar",
+        {"hits": [], "plan": PLAN_PAYLOAD},
+    ),
+    (
+        "hybrid_search_with_plan",
+        lambda db: db.hybrid_search_with_plan(vector=[1.0], field="body", text="fox"),
+        "POST",
+        "/hybrid-search",
+        {"hits": [], "plan": PLAN_PAYLOAD},
     ),
     ("list", lambda db: db.list(), "POST", "/list", []),
     ("aggregate", lambda db: db.aggregate(), "POST", "/aggregate", {"count": 0, "sums": {}}),
@@ -353,6 +380,50 @@ async def test_search_similar_sends_the_source_and_decodes_hit_attrs() -> None:
     }
     assert hits[0].id == "b"
     assert hits[0].attrs == {"lang": "rust"}
+
+
+async def test_search_with_plan_sends_plan_true_and_returns_hits_and_plan() -> None:
+    mock = MockServer(
+        {
+            "hits": [{"collection": "docs", "id": "a", "score": 0.9, "attrs": {}}],
+            "plan": PLAN_PAYLOAD,
+        }
+    )
+    async with client(mock) as db:
+        hits, plan = await db.search_with_plan(query=[1.0, 0.0, 0.0], top_k=5)
+    assert mock.json["plan"] is True
+    assert len(hits) == 1
+    assert hits[0].id == "a"
+    assert plan.path == "exact"
+    assert plan.timings.total_us == 100
+
+
+async def test_hybrid_search_with_plan_sends_plan_true() -> None:
+    mock = MockServer({"hits": [], "plan": PLAN_PAYLOAD})
+    async with client(mock) as db:
+        hits, plan = await db.hybrid_search_with_plan(vector=[1.0], field="body", text="fox")
+    assert mock.json["plan"] is True
+    assert hits == []
+    assert plan.path == "exact"
+
+
+async def test_the_three_existing_search_methods_do_not_send_plan() -> None:
+    """The plain async methods are untouched: no ``plan`` key on the wire."""
+    mock = MockServer([])
+    async with client(mock) as db:
+        await db.search(query=[1.0])
+        assert "plan" not in mock.json
+        await db.search_similar(collection="notes", id="a")
+        assert "plan" not in mock.json
+        await db.hybrid_search(vector=[1.0], field="body", text="fox")
+        assert "plan" not in mock.json
+
+
+async def test_an_unknown_plan_path_decodes_without_raising_on_the_async_path_too() -> None:
+    mock = MockServer({"hits": [], "plan": {**PLAN_PAYLOAD, "path": "brand_new_path"}})
+    async with client(mock) as db:
+        _, plan = await db.search_with_plan(query=[1.0])
+    assert plan.path == "brand_new_path"
 
 
 async def test_the_multi_clause_and_ranking_knobs_reach_the_same_wire() -> None:

@@ -248,6 +248,25 @@ at the call site rather than answered as "no matches". `hit.annotations` is `Non
 `rank` and `score`, which is the only way to see a leg's rank, since the returned score is
 the fused one.
 
+## Query plans
+
+`search`, `search_similar`, and `hybrid_search` each have a `_with_plan` sibling that
+returns `(hits, plan)` instead of just `hits`, describing how the query actually ran:
+
+```python
+hits, plan = db.search_with_plan(query=[0.1, 0.2, 0.3], top_k=10)
+print(plan.path, plan.timings.total_us)
+if plan.candidates is not None:
+    print(plan.candidates.surfaced, plan.candidates.survived)
+```
+
+`plan.path` is a plain string (`"ann"`, `"ann_prefilter_fallback"`, `"segmented"`,
+`"quantized"`, or `"exact"`), not an enum, so a value a newer server introduces still
+decodes rather than raising. `plan.rows_scanned` and `plan.candidates` are `None` when they
+do not apply to the path taken; every `plan.timings` field is in microseconds and `None`
+when that phase did not run, except `total_us`, which always does. `text_search` has no
+`_with_plan` sibling: it has no plan to report.
+
 ## Remembering and recalling (text-native)
 
 When the server is started with an embedder (`nidus serve --embed-provider …`) you can

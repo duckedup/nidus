@@ -48,6 +48,7 @@ from .types import (
     Hits,
     LimitPer,
     OrderBy,
+    QueryPlan,
     Readiness,
     Record,
     RecordInput,
@@ -246,6 +247,49 @@ class AsyncNidusClient:
             ),
         )
 
+    async def search_with_plan(
+        self,
+        *,
+        query: Sequence[float],
+        scope: Optional[Sequence[str]] = None,
+        top_k: Optional[int] = None,
+        offset: Optional[int] = None,
+        min_score: Optional[float] = None,
+        filter: Optional[Filter] = None,  # noqa: A002
+        exact: Optional[bool] = None,
+        include_attributes: Optional[Sequence[str]] = None,
+        exclude_attributes: Optional[Sequence[str]] = None,
+        rank_by: Optional[RankBy] = None,
+        limit_per: Optional[LimitPer] = None,
+        diversity: Optional[float] = None,
+        expand: Optional[Expand] = None,
+        rerank: Optional[RerankOpts] = None,
+    ) -> tuple[Hits, QueryPlan]:
+        """Like :meth:`search`, but also returns the :class:`~nidus.QueryPlan` that answered it.
+
+        Same rules as :meth:`nidus.client.NidusClient.search_with_plan`.
+        """
+        return await self._search_with_plan(
+            _wire.SEARCH,
+            _wire.search_body(
+                query,
+                scope=scope,
+                top_k=top_k,
+                offset=offset,
+                min_score=min_score,
+                filter=filter,
+                exact=exact,
+                include_attributes=include_attributes,
+                exclude_attributes=exclude_attributes,
+                rank_by=rank_by,
+                limit_per=limit_per,
+                diversity=diversity,
+                expand=expand,
+                rerank=rerank,
+                plan=True,
+            ),
+        )
+
     async def search_similar(
         self,
         *,
@@ -287,6 +331,46 @@ class AsyncNidusClient:
                 limit_per=limit_per,
                 diversity=diversity,
                 expand=expand,
+            ),
+        )
+
+    async def search_similar_with_plan(
+        self,
+        *,
+        collection: str,
+        id: str,  # noqa: A002
+        scope: Optional[Sequence[str]] = None,
+        top_k: Optional[int] = None,
+        offset: Optional[int] = None,
+        min_score: Optional[float] = None,
+        filter: Optional[Filter] = None,  # noqa: A002
+        exact: Optional[bool] = None,
+        include_attributes: Optional[Sequence[str]] = None,
+        exclude_attributes: Optional[Sequence[str]] = None,
+        rank_by: Optional[RankBy] = None,
+        limit_per: Optional[LimitPer] = None,
+        diversity: Optional[float] = None,
+        expand: Optional[Expand] = None,
+    ) -> tuple[Hits, QueryPlan]:
+        """Like :meth:`search_similar`, but also returns the :class:`~nidus.QueryPlan`."""
+        return await self._search_with_plan(
+            _wire.SIMILAR,
+            _wire.similar_body(
+                collection,
+                id,
+                scope=scope,
+                top_k=top_k,
+                offset=offset,
+                min_score=min_score,
+                filter=filter,
+                exact=exact,
+                include_attributes=include_attributes,
+                exclude_attributes=exclude_attributes,
+                rank_by=rank_by,
+                limit_per=limit_per,
+                diversity=diversity,
+                expand=expand,
+                plan=True,
             ),
         )
 
@@ -389,6 +473,52 @@ class AsyncNidusClient:
                 text_weight=text_weight,
                 expand=expand,
                 rerank=rerank,
+            ),
+        )
+
+    async def hybrid_search_with_plan(
+        self,
+        *,
+        vector: Sequence[float],
+        field: Optional[str] = None,
+        text: Optional[str] = None,
+        scope: Optional[Sequence[str]] = None,
+        top_k: Optional[int] = None,
+        offset: Optional[int] = None,
+        filter: Optional[Filter] = None,  # noqa: A002
+        rrf_k: Optional[float] = None,
+        candidates: Optional[int] = None,
+        clauses: Optional[Sequence[FtsClause]] = None,
+        combine: Optional[str] = None,
+        explain: Optional[bool] = None,
+        highlight: Optional[Union[bool, HighlightOpts]] = None,
+        vector_weight: Optional[float] = None,
+        text_weight: Optional[float] = None,
+        expand: Optional[Expand] = None,
+        rerank: Optional[RerankOpts] = None,
+    ) -> tuple[Hits, QueryPlan]:
+        """Like :meth:`hybrid_search`, but also returns the :class:`~nidus.QueryPlan`."""
+        return await self._search_with_plan(
+            _wire.HYBRID_SEARCH,
+            _wire.hybrid_search_body(
+                vector,
+                field,
+                text,
+                scope=scope,
+                top_k=top_k,
+                offset=offset,
+                filter=filter,
+                rrf_k=rrf_k,
+                candidates=candidates,
+                clauses=clauses,
+                combine=combine,
+                explain=explain,
+                highlight=highlight,
+                vector_weight=vector_weight,
+                text_weight=text_weight,
+                expand=expand,
+                rerank=rerank,
+                plan=True,
             ),
         )
 
@@ -571,6 +701,10 @@ class AsyncNidusClient:
     async def _search(self, path: str, body: Mapping[str, Any]) -> Hits:
         """Run a search-family POST and decode the hits (attrs to plain Python values)."""
         return _wire.decode_hits(await self._request("POST", path, body))
+
+    async def _search_with_plan(self, path: str, body: Mapping[str, Any]) -> tuple[Hits, QueryPlan]:
+        """Run a ``plan: true`` search-family POST and decode both the hits and the plan."""
+        return _wire.decode_hits_and_plan(await self._request("POST", path, body))
 
     async def _request(self, method: str, path: str, body: Any = None) -> Any:
         """Issue a request and hand the raw ``(status, body)`` to ``_wire`` to interpret."""

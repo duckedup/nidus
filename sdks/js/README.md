@@ -201,6 +201,21 @@ converts them for you: `fragment.spans` are JS string indices, and `fragment.tex
 is the matched term. If you compare them against the raw HTTP response, expect the
 numbers to differ wherever the excerpt is not ASCII.
 
+## Inspecting how a query was answered
+
+`searchWithPlan`, `searchSimilarWithPlan`, and `hybridSearchWithPlan` are siblings of
+`search`/`searchSimilar`/`hybridSearch` that return `{ hits, plan }` instead of a bare
+`Hit[]` — the plan reports which scan strategy the server took (`ann`, `exact`, …), how
+many rows it scanned, and per-stage timings in microseconds. `textSearch` has no plan.
+
+```ts
+const { hits, plan } = await db.searchWithPlan({ query: [0.1, 0.2, 0.3], topK: 10 });
+console.log(plan.path, plan.timings.totalUs);
+```
+
+`plan.path` is a plain string, not a closed union: treat an unrecognized value as
+"some scan strategy newer than this SDK" rather than an error.
+
 ## Ranking, grouping, ordering, and aggregating
 
 ```ts
