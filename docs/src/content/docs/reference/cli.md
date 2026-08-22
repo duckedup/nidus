@@ -211,6 +211,7 @@ Nearest-neighbour search; the query vector is a JSON array of floats. Usage:
 | `--rank-by <EXPR>` | none | Ranking expression as JSON, e.g. a recency-decay expression. |
 | `--limit-per <ATTR>` | none | Cap hits per distinct value of this attribute; needs `--limit-per-max`. |
 | `--limit-per-max <N>` | none | Maximum hits kept per distinct `--limit-per` value. |
+| `--diversity <LAMBDA>` | none | MMR lambda spreading hits in vector space: `1.0` pure relevance, `0.0` pure spread. |
 | `--expand-radius <N>` | none | Widen each hit with this many neighbouring chunks of its own document, either side. Adds a `context` field; changes nothing about the ranking. |
 | `--expand-parent-field <ATTR>` | none | Attr grouping a document's chunks (default `nidus.parent_id`); needs `--expand-radius`. |
 | `--expand-index-field <ATTR>` | none | Attr ordering the chunks within a document (default `nidus.chunk_index`); needs `--expand-radius`. |
@@ -517,6 +518,7 @@ the [ingest flags](#ingest-flags-memory-feature), plus:
 | `-k, --top-k <N>` | none | Hits to return (default `10`). |
 | `--min-score <SCORE>` | none | Drop hits scoring below this cosine similarity. |
 | `--where <FILTER>` | none | AND-filter as JSON (same form as `search --where`). |
+| `--diversity <LAMBDA>` | none | MMR lambda spreading hits in vector space: `1.0` pure relevance, `0.0` pure spread. |
 | `--rollup <N>` | none | Read the collection as a chunked corpus: keep this many chunks per document. |
 | `--neighbours <N>` | none | Chunks stitched either side of each survivor, into the hit's `context`; needs `--rollup`. |
 | `--rerank` (`rerank` feature) | none | Re-score the candidate window with the configured cross-encoder. |
