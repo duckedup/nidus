@@ -31,6 +31,7 @@ env:
   CARGO_INCREMENTAL: "0"
   # See ci.yml: in the queue this check reports without re-running, since the tree it
   # would test is the one the PR already tested. Guarded per STEP so it still reports.
+  # SKIP_LANE is the PR-time analogue — see the Lane guard step and ci.yml's env note.
   QUEUE_LITE: ${{ github.event_name == 'merge_group' }}
 
 jobs:
@@ -44,13 +45,24 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Lane guard — skip the work when no changed path exercises this job
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --quiet --depth=1 origin "$BASE_SHA"
+          files="$(git diff --name-only "$BASE_SHA" HEAD | paste -sd, -)"
+          if [ -n "$files" ] && [ "$(.claude/skills/nidus/bin/nidus-check ci-guard e2e --paths "$files")" = "skip" ]; then
+            echo "SKIP_LANE=true" >> "$GITHUB_ENV"
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
-        if: ${{ env.QUEUE_LITE != 'true' }}
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
 
       # Same cache shape as ci.yml's matrix jobs, with its own key so it neither
       # evicts nor is evicted by them.
       - uses: actions/cache@v5
-        if: ${{ env.QUEUE_LITE != 'true' }}
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         with:
           path: |
             ~/.cargo/registry/index
@@ -66,7 +78,7 @@ jobs:
       # The embed/summarize features gate suites driven by hand-rolled TCP mocks — no
       # real services — so leaving them off would silently compile them away (#111).
       - name: Build the test binary and the nidus binary
-        if: ${{ env.QUEUE_LITE != 'true' }}
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e --no-run
 
       # Started via the same script `just e2e-services-up` runs, so a developer
@@ -75,7 +87,7 @@ jobs:
       # minio needs `server /data`. The script waits for real readiness
       # (minio /health/live, valkey PING) rather than sleeping.
       - name: Start minio + valkey + fake-gcs-server
-        if: ${{ env.QUEUE_LITE != 'true' }}
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: ./scripts/e2e-services.sh up
 
       # --include-ignored runs the cluster suite (#[ignore]d because it needs the
@@ -89,7 +101,7 @@ jobs:
       # NIDUS_E2E_GCS_ENDPOINT opts the gs:// lane in — without it that one test
       # skips itself, so the suite stays green for a developer without the emulator.
       - name: Run end-to-end tests
-        if: ${{ env.QUEUE_LITE != 'true' }}
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e -- --include-ignored --test-threads=2
         env:
           NIDUS_E2E_GCS_ENDPOINT: http://127.0.0.1:4650
@@ -100,11 +112,11 @@ jobs:
       # purely by NIDUS_E2E_REDIS_URL, so there is no second copy to maintain.
       # Linux-only (needs real host networking), which is exactly what this runner is.
       - name: Start Valkey Cluster
-        if: ${{ env.QUEUE_LITE != 'true' }}
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: ./scripts/e2e-services.sh up-cluster
 
       - name: Run cluster tests against Valkey Cluster
-        if: ${{ env.QUEUE_LITE != 'true' }}
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: |
           NIDUS_E2E_REDIS_URL="$(./scripts/e2e-services.sh cluster-url)" \
             cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e cluster:: -- --ignored --test-threads=2
@@ -113,7 +125,7 @@ jobs:
       # harness already attaches each nidus process's stderr to its failure; these
       # are the backing services' side of the story.
       - name: Service logs (on failure)
-        if: ${{ failure() && env.QUEUE_LITE != 'true' }}
+        if: ${{ failure() && env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: |
           echo "::group::minio"
           docker logs nidus-e2e-minio 2>&1 | tail -100 || true
@@ -135,7 +147,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Stop services
-        if: ${{ always() && env.QUEUE_LITE != 'true' }}
+        if: ${{ always() && env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: |
           ./scripts/e2e-services.sh down
           ./scripts/e2e-services.sh down-cluster

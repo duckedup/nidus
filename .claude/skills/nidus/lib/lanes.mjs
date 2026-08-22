@@ -3,7 +3,8 @@
 // src/bin, or any feature-gated layer, so a blanket `just ci` proves very little.
 
 // Ordered cheapest-first. `manual` lanes need services or a release build, so they
-// are reported as advisory rather than run automatically.
+// are reported as advisory rather than run automatically. `ci` lanes are enforced
+// by a required check on every PR and are too slow to gate the local loop.
 const RULES = [
   {
     recipe: 'just deps',
@@ -41,8 +42,11 @@ const RULES = [
     match: [/^src\/memory\.rs$/],
   },
   {
+    // The interpreter is orders of magnitude slower than `cargo test` and the same
+    // suite is a required PR check (ci.yml `Miri`), so a local run buys nothing.
     recipe: 'just miri',
-    why: 'pure-logic codec/kernel code changed — Miri covers all of it',
+    why: 'pure-logic codec/kernel code changed — CI enforces Miri on the PR',
+    ci: true,
     match: [
       /^src\/log\//, /^src\/glob\//, /^src\/filter\//, /^src\/search\//,
       /^src\/data\//, /^src\/ann\//, /^src\/fts\//, /^src\/manifest\//,
@@ -120,6 +124,37 @@ const RULES = [
   },
 ]
 
+// Which changed paths exercise each heavy CI job. The guard step in ci.yml /
+// integration.yml skips a job's WORK when nothing here matches — never its report,
+// so required checks still report (the QUEUE_LITE pattern). Keys are ci.yml job ids.
+const RUST = [
+  /^src\//, /^tests\//, /^examples\//, /^benchmarks\//,
+  /^Cargo\.(toml|lock)$/, /^rust-toolchain\.toml$/, /^\.cargo\//,
+  /^\.github\/workflows\/ci\.yml$/,
+]
+export const CI_JOBS = {
+  'test': RUST,
+  'test-extended': RUST,
+  'release': RUST,
+  'miri': RUST,
+  'miri-integration': RUST,
+  'build-budget': RUST,
+  'bench-compiles': RUST,
+  'build-thesis': RUST,
+  'sdk-integration': [...RUST, /^sdks\//],
+  'e2e': [...RUST.slice(0, -1), /^scripts\/e2e-services\.sh$/, /^\.github\/workflows\/integration\.yml$/],
+}
+
+// Fail open twice over: an empty file list runs everything (a guard that saw
+// nothing must not skip), and an unknown job throws (a renamed job fails loud).
+export function ciGuard(job, paths) {
+  const rules = CI_JOBS[job]
+  if (!rules) throw new Error(`ci-guard: unknown job '${job}' — add it to CI_JOBS in lanes.mjs`)
+  const files = (paths || []).filter(Boolean)
+  const cause = files.find(f => rules.some(re => re.test(f))) || null
+  return { job, run: !files.length || !!cause, cause, examined: files.length }
+}
+
 // Paths that need no build lane at all — reported so the caller can say why
 // nothing ran, instead of silently returning an empty set.
 const INERT = [/^\.claude\//, /^\.github\//, /^[^/]*\.md$/, /^LICENSE$/, /^\.gitignore$/, /LICENSE$/, /^sdks\/[^/]+\/.*\.md$/]
@@ -131,7 +166,7 @@ export function lanes(paths) {
   const hit = []
   for (const rule of RULES) {
     const cause = files.find(f => covers(rule, f))
-    if (cause) hit.push({ recipe: rule.recipe, why: rule.why, cause, manual: !!rule.manual })
+    if (cause) hit.push({ recipe: rule.recipe, why: rule.why, cause, manual: !!rule.manual, ci: !!rule.ci })
   }
   const covered = new Set(hit.flatMap(h => files.filter(f => covers(RULES.find(r => r.recipe === h.recipe), f))))
   const inert = files.filter(f => !covered.has(f) && INERT.some(re => re.test(f)))
@@ -140,8 +175,9 @@ export function lanes(paths) {
     // What the answer is *about*. Without it, an empty file list and a change that
     // genuinely needs no lane are the same output, and the first reads as the second.
     examined: files.length,
-    run: hit.filter(h => !h.manual),
+    run: hit.filter(h => !h.manual && !h.ci),
     manual: hit.filter(h => h.manual),
+    ci: hit.filter(h => h.ci),
     inert,
     unmatched,
   }
@@ -163,6 +199,10 @@ export function formatLanes(result) {
   if (result.manual.length) {
     out.push('', 'Needs a deliberate run (services or release build):')
     for (const l of result.manual) out.push(`  ${l.recipe}\n      ↳ ${l.why} (${l.cause})`)
+  }
+  if (result.ci?.length) {
+    out.push('', 'CI enforces these on the PR — skip locally unless debugging that lane:')
+    for (const l of result.ci) out.push(`  ${l.recipe}\n      ↳ ${l.why} (${l.cause})`)
   }
   if (result.unmatched.length) {
     out.push('', `Unmapped paths (no lane knows about these — check by hand): ${result.unmatched.join(', ')}`)

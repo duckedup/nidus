@@ -1,7 +1,7 @@
 // Entry point for bin/nidus-check. Wires the pure detectors in laws.mjs and the
 // lane map in lanes.mjs to real git/gh IO.
 
-import { lanes, formatLanes } from './lanes.mjs'
+import { lanes, formatLanes, ciGuard } from './lanes.mjs'
 import * as laws from './laws.mjs'
 import * as fleet from './fleet.mjs'
 import * as pre from './preflight.mjs'
@@ -32,6 +32,22 @@ function runLanes() {
   const result = lanes(files)
   if (asJson) { console.log(JSON.stringify({ files, ...result }, null, 2)); return 0 }
   console.log(formatLanes(result))
+  return 0
+}
+
+// Stdout is the verdict alone (`run` | `skip`) so a CI step can test it; the
+// reason goes to stderr. Exit 0 either way — only an unknown job is a failure.
+function runCiGuard() {
+  const job = argv[1]
+  const explicit = flag('paths')
+  const files = typeof explicit === 'string' ? explicit.split(',').map(s => s.trim()) : git.changedFiles(target())
+  let r
+  try { r = ciGuard(job, files) } catch (e) { console.error(String(e.message || e)); return 1 }
+  if (asJson) { console.log(JSON.stringify(r)); return 0 }
+  console.error(r.run
+    ? (r.cause ? `run: ${r.cause} exercises ${job}` : 'run: no files examined, so everything runs')
+    : `skip: none of ${r.examined} changed file(s) exercise ${job}`)
+  console.log(r.run ? 'run' : 'skip')
   return 0
 }
 
@@ -191,6 +207,11 @@ const USAGE = `nidus-check — deterministic checks for this repo's laws and ver
       Which just recipes actually cover the change. Core \`just ci\` does not
       compile src/cli, src/server or src/bin, so this is not one blanket gate.
 
+  nidus-check ci-guard <job> [--paths a,b] [--json]
+      Should this CI job's steps run for these changed files? Prints \`run\` or
+      \`skip\` on stdout (reason on stderr). Used by the per-step lane guards in
+      ci.yml/integration.yml; job ids live in CI_JOBS in lanes.mjs.
+
   nidus-check laws   [--base <ref>] [--pr <n>] [--json] [--strict]
       The CLAUDE.md rules as detectors: 3-line comment cap, unsafe, version bump,
       stale install snippets, bot-stamped files, heavy deps, test placement,
@@ -223,6 +244,7 @@ With no --base/--pr, both compare the working tree against HEAD.`
 const exit = (() => {
   switch (cmd) {
     case 'lanes': return runLanes()
+    case 'ci-guard': return runCiGuard()
     case 'laws': return runLaws()
     case 'fleet': return runFleet()
     case 'preflight': return runPreflight()
