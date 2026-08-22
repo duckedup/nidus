@@ -98,10 +98,13 @@ pub(super) async fn backpressure(
     // ── Phase 1: receive the body, WITHOUT a store permit (nidus-6c2) ───────────────
     // The permit used to come first, and the handler awaits the body, so a silent client pinned one
     // for the whole deadline. Body-first keeps a stalled client off the store's pool; still bounded.
-    match receive_body(limits, req).await {
-        Ok(received) => req = received,
+    let body = match receive_body(limits, req).await {
+        Ok((received, body)) => {
+            req = received;
+            body
+        }
         Err(response) => return response,
-    }
+    };
 
     // ── Phase 2: do the work, holding a store permit ────────────────────────────────
     let Ok(_permit) = limits.permits.try_acquire() else {
@@ -116,7 +119,7 @@ pub(super) async fn backpressure(
         return overloaded(limits.limit);
     };
 
-    let timeout = if is_mutation(req.method(), req.uri().path()) {
+    let timeout = if is_mutation(req.method(), req.uri().path(), body.as_ref()) {
         limits.write_timeout
     } else {
         limits.read_timeout
@@ -196,8 +199,9 @@ fn timed_out(after: Duration) -> Response {
 }
 
 /// Read the request body to completion under the idle timeout and the size cap, holding a
-/// body slot rather than a store permit.
-async fn receive_body(limits: &Limits, req: Request) -> Result<Request, Response> {
+/// body slot rather than a store permit. The collected bytes come back alongside the rebuilt
+/// request so the deadline can be classified from them (nidus-a34).
+async fn receive_body(limits: &Limits, req: Request) -> Result<(Request, Option<Bytes>), Response> {
     let declared = req
         .headers()
         .get(axum::http::header::CONTENT_LENGTH)
@@ -209,7 +213,7 @@ async fn receive_body(limits: &Limits, req: Request) -> Result<Request, Response
     // Nothing to receive: skip the slot entirely so a bodyless GET never queues behind
     // uploads.
     if declared == Some(0) {
-        return Ok(req);
+        return Ok((req, None));
     }
 
     let Ok(_slot) = limits.body_slots.try_acquire() else {
@@ -230,7 +234,11 @@ async fn receive_body(limits: &Limits, req: Request) -> Result<Request, Response
         None => body,
     };
     match axum::body::to_bytes(body, limits.max_body_bytes).await {
-        Ok(bytes) => Ok(Request::from_parts(parts, Body::from(bytes))),
+        // `Bytes::clone` is a refcount bump, so the request still carries the one buffer.
+        Ok(bytes) => Ok((
+            Request::from_parts(parts, Body::from(bytes.clone())),
+            Some(bytes),
+        )),
         // `to_bytes` reports "too large" and "the connection died" as the same error type.
         // Reporting 413 is right for the case a client can act on, and for a dead
         // connection the response goes nowhere anyway.
@@ -321,44 +329,158 @@ impl http_body::Body for IdleTimeoutBody {
 }
 
 /// Whether a request mutates the store, and so gets the longer deadline.
-fn is_mutation(method: &Method, path: &str) -> bool {
+fn is_mutation(method: &Method, path: &str, body: Option<&Bytes>) -> bool {
     if method == Method::GET || method == Method::HEAD {
         return false;
     }
-    // Read-shaped POSTs, and the per-collection `recall`. A `reinforce` recall does write and
-    // does queue behind other writes, so it can time out on the read deadline where a
-    // `remember` would not — the body is unread here, so it cannot be told apart (nidus-gk6).
-    !(matches!(
+    // A `reinforce` recall queues through the write committer, so it is judged on the write
+    // deadline; a plain one stays a read and keeps the scan bound that buys (nidus-a34).
+    if path.ends_with("/recall") {
+        return body.is_some_and(reinforce_requested);
+    }
+    !matches!(
         path,
         "/search" | "/text-search" | "/hybrid-search" | "/list"
-    ) || path.ends_with("/recall"))
+    )
+}
+
+/// Whether a recall body opts into reinforcement. Serde ignores the rest of `RecallRequest`,
+/// so this never has to track it; a body that will not parse stays a read, because the
+/// handler's own `400` needs no write deadline.
+fn reinforce_requested(body: &Bytes) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Peek {
+        #[serde(default)]
+        reinforce: bool,
+    }
+    serde_json::from_slice::<Peek>(body).is_ok_and(|p| p.reinforce)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const RECALL: &str = "/collections/notes/recall";
+
+    /// `is_mutation` over a body, for the cases that do not care about one.
+    fn classify(method: &Method, path: &str) -> bool {
+        is_mutation(method, path, None)
+    }
+
+    /// `is_mutation` with a body, as `backpressure` calls it after Phase 1.
+    fn classify_body(path: &str, body: &str) -> bool {
+        is_mutation(
+            &Method::POST,
+            path,
+            Some(&Bytes::copy_from_slice(body.as_bytes())),
+        )
+    }
+
     #[test]
     fn search_shaped_posts_are_reads() {
         for p in ["/search", "/text-search", "/hybrid-search", "/list"] {
-            assert!(!is_mutation(&Method::POST, p), "{p} is a read");
+            assert!(!classify(&Method::POST, p), "{p} is a read");
         }
-        assert!(!is_mutation(&Method::POST, "/collections/notes/recall"));
-        assert!(!is_mutation(&Method::GET, "/stats"));
+        assert!(!classify(&Method::GET, "/stats"));
     }
 
     #[test]
     fn mutating_routes_get_the_write_deadline() {
-        assert!(is_mutation(&Method::POST, "/collections/docs/upsert"));
-        assert!(is_mutation(&Method::POST, "/collections/docs/delete"));
-        assert!(is_mutation(&Method::POST, "/compact"));
-        assert!(is_mutation(&Method::POST, "/flush"));
-        assert!(is_mutation(&Method::POST, "/refresh"));
-        assert!(is_mutation(&Method::DELETE, "/collections/docs"));
-        assert!(is_mutation(&Method::PUT, "/collections/docs/meta"));
-        assert!(is_mutation(&Method::POST, "/collections/notes/remember"));
+        assert!(classify(&Method::POST, "/collections/docs/upsert"));
+        assert!(classify(&Method::POST, "/collections/docs/delete"));
+        assert!(classify(&Method::POST, "/compact"));
+        assert!(classify(&Method::POST, "/flush"));
+        assert!(classify(&Method::POST, "/refresh"));
+        assert!(classify(&Method::DELETE, "/collections/docs"));
+        assert!(classify(&Method::PUT, "/collections/docs/meta"));
+        assert!(classify(&Method::POST, "/collections/notes/remember"));
         // An unrecognised mutating route defaults to "write" — the safe direction.
-        assert!(is_mutation(&Method::POST, "/something-new"));
+        assert!(classify(&Method::POST, "/something-new"));
+    }
+
+    /// A plain recall reads, so it keeps the read deadline and the scan bound (nidus-a34).
+    #[test]
+    fn recall_without_reinforce_is_a_read() {
+        assert!(!classify(&Method::POST, RECALL), "no body at all");
+        for body in [
+            "{}",
+            r#"{"query":"x"}"#,
+            r#"{"query":"x","reinforce":false}"#,
+        ] {
+            assert!(!classify_body(RECALL, body), "{body} is a read");
+        }
+    }
+
+    /// A reinforced recall stamps through the write committer, so it earns write_timeout.
+    #[test]
+    fn recall_with_reinforce_is_a_write() {
+        assert!(classify_body(RECALL, r#"{"query":"x","reinforce":true}"#));
+        // The peek must ignore the rest of `RecallRequest` rather than track it.
+        assert!(classify_body(
+            RECALL,
+            r#"{"query":"x","top_k":5,"rerank":{},"rank_by":{"field":"nidus.updated_at"},"reinforce":true}"#
+        ));
+    }
+
+    /// A body the handler will reject needs no write deadline, so it stays a read.
+    #[test]
+    fn an_unparseable_recall_body_stays_a_read() {
+        assert!(!classify_body(RECALL, "not json"));
+        assert!(!classify_body(RECALL, r#"{"reinforce":"yes"}"#));
+        assert!(!classify_body(RECALL, ""));
+    }
+
+    /// The peek is scoped to `*/recall`: the word elsewhere changes nothing.
+    #[test]
+    fn reinforce_elsewhere_does_not_change_a_classification() {
+        assert!(!classify_body("/search", r#"{"reinforce":true}"#));
+        assert!(classify_body(
+            "/collections/docs/upsert",
+            r#"{"reinforce":false}"#
+        ));
+    }
+
+    /// Classifying from the body must not consume it — the handler still has to parse the
+    /// same bytes. Without this, a peek that drained the body would only fail in e2e.
+    #[tokio::test]
+    async fn the_collected_body_survives_classification() {
+        let limits = Limits::new(2, None, None, None, 1024);
+        let sent = r#"{"query":"x","reinforce":true}"#;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(RECALL)
+            .header(axum::http::header::CONTENT_LENGTH, sent.len())
+            .body(Body::from(sent))
+            .expect("build request");
+
+        let (req, body) = receive_body(&limits, req).await.expect("body received");
+        let peeked = body.expect("bytes kept for the classifier");
+        assert_eq!(&peeked[..], sent.as_bytes());
+        assert!(is_mutation(&Method::POST, RECALL, Some(&peeked)));
+
+        let delivered = axum::body::to_bytes(req.into_body(), 1024)
+            .await
+            .expect("handler still reads the body");
+        assert_eq!(
+            &delivered[..],
+            sent.as_bytes(),
+            "the handler's copy is intact"
+        );
+    }
+
+    /// A bodyless request skips Phase 1's slot entirely, and so reaches the classifier with
+    /// no bytes — which must still be a read for `*/recall`.
+    #[tokio::test]
+    async fn a_zero_length_body_is_not_collected() {
+        let limits = Limits::new(2, None, None, None, 1024);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(RECALL)
+            .header(axum::http::header::CONTENT_LENGTH, 0)
+            .body(Body::empty())
+            .expect("build request");
+        let (_req, body) = receive_body(&limits, req).await.expect("body received");
+        assert!(body.is_none(), "nothing was collected");
     }
 
     #[test]

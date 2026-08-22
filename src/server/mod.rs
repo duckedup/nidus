@@ -4082,6 +4082,34 @@ mod memory_tests {
         router(state, 16 * 1024 * 1024)
     }
 
+    /// A mock-embedder router **plus its state**, with explicit deadlines. The state is what
+    /// lets a test hold the store lock and stall the work a deadline is measured against.
+    async fn router_and_state_with_deadlines(
+        read: std::time::Duration,
+        write: std::time::Duration,
+    ) -> (Router, AppState) {
+        let base = spawn_embed_mock();
+        let embedder = AnyEmbedder::build(
+            EmbedProvider::OpenAiCompat,
+            EmbedConfig::new("mock-model").base_url(base),
+        )
+        .await
+        .expect("build mock embedder");
+        let db = Nidus::open_in_memory(DIM).unwrap();
+        let state = AppState {
+            embedder: Some(Arc::new(embedder)),
+            limits: Arc::new(limits::Limits::new(
+                8,
+                Some(read),
+                Some(write),
+                None,
+                16 * 1024 * 1024,
+            )),
+            ..test_state(Some(db))
+        };
+        (router(state.clone(), 16 * 1024 * 1024), state)
+    }
+
     /// A router with NO embedder configured — memory routes must answer `400`.
     fn router_without_embedder() -> Router {
         let state = test_state(Some(Nidus::open_in_memory(DIM).unwrap()));
@@ -4100,6 +4128,62 @@ mod memory_tests {
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap()
+    }
+
+    /// A `reinforce` recall stamps through the write committer, so it must be judged on the
+    /// write deadline, not the read one (nidus-a34). The held store lock stalls both: the plain
+    /// recall dies on the 50ms deadline, the reinforced one is still waiting far past it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_reinforced_recall_is_judged_on_the_write_deadline() {
+        let (app, state) = router_and_state_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/collections/notes/remember",
+                json!({"id": "a", "text": "something worth recalling"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let guard = state.db.write().unwrap();
+
+        let plain = app
+            .clone()
+            .oneshot(post("/collections/notes/recall", json!({"query": "x"})))
+            .await
+            .unwrap();
+        assert_eq!(
+            plain.status(),
+            StatusCode::GATEWAY_TIMEOUT,
+            "a plain recall is a read and keeps the read deadline"
+        );
+        assert_eq!(json_body(plain).await["retryable"], false);
+
+        // The same request plus `reinforce`, so the flag is the only difference.
+        let reinforced = tokio::spawn(app.clone().oneshot(post(
+            "/collections/notes/recall",
+            json!({"query": "x", "reinforce": true}),
+        )));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !reinforced.is_finished(),
+            "a reinforced recall outlived the read deadline 6x over, so it was judged on \
+             the write deadline"
+        );
+
+        drop(guard);
+        let resp = reinforced.await.unwrap().unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "and it completes once the writer lock frees"
+        );
     }
 
     /// `rollup` over `/recall`: the text-native knob collapses a chunked corpus to one hit

@@ -251,8 +251,8 @@ and how *long*.
 | Flag | Default | What it does |
 | --- | --- | --- |
 | `--max-concurrent-requests <n>` | `0` (auto) | Cap on store-touching requests in flight. Past it, requests are **shed** with `503`. Auto is 8× CPU cores, floored at 64. |
-| `--read-timeout <seconds>` | `30` | Deadline for a read (search, list, stats). `0` disables. |
-| `--write-timeout <seconds>` | `600` | Deadline for a mutation (upsert, delete, compact). `0` disables. |
+| `--read-timeout <seconds>` | `30` | Deadline for a read (search, list, stats, a plain recall). `0` disables. |
+| `--write-timeout <seconds>` | `600` | Deadline for a mutation (upsert, delete, compact, a `reinforce` recall). `0` disables. |
 | `--body-idle-timeout <seconds>` | `15` | Abandon a request body that stops delivering data. `0` disables. |
 
 **A shed request is a retryable `503`.** It carries `Retry-After: 1` and a body of
@@ -497,8 +497,8 @@ See [Backpressure](#backpressure) above for how these interact.
 | --- | --- | --- | --- |
 | `NIDUS_MAX_BODY_BYTES` | `--max-body-bytes` | Request/upsert size limit; a body over it gets `413` | 256 MiB |
 | `NIDUS_MAX_CONCURRENT_REQUESTS` | `--max-concurrent-requests` | In-flight cap; past it, requests are shed with `503` | `0` (auto: 8× CPU cores, floored at 64) |
-| `NIDUS_READ_TIMEOUT` | `--read-timeout` | Read deadline in seconds (search, list, stats); `0` disables | `30` |
-| `NIDUS_WRITE_TIMEOUT` | `--write-timeout` | Write deadline in seconds (upsert, delete, compact); `0` disables | `600` |
+| `NIDUS_READ_TIMEOUT` | `--read-timeout` | Read deadline in seconds (search, list, stats, a plain recall); `0` disables | `30` |
+| `NIDUS_WRITE_TIMEOUT` | `--write-timeout` | Write deadline in seconds (upsert, delete, compact, a `reinforce` recall); `0` disables | `600` |
 | `NIDUS_BODY_IDLE_TIMEOUT` | `--body-idle-timeout` | Abandon a request body that stops delivering data; `0` disables | `15` |
 
 ### Cluster and lease
