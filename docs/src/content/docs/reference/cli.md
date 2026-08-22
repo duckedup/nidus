@@ -293,6 +293,12 @@ Full-text (BM25) search of fields declared via `set-fts-schema`. Usage:
 | `--offset <N>` | none | Skip this many top-ranked hits before returning (default `0`). |
 | `--min-score <SCORE>` | none | Drop hits scoring below this raw BM25 score. |
 | `--where <FILTER>` | none | AND-filter as JSON (same form as `search --where`). |
+| `--include-attr <ATTR>` | none | Return only this attr (repeatable). Exclusive with `--exclude-attr`. |
+| `--exclude-attr <ATTR>` | none | Return every attr but this one (repeatable). Exclusive with `--include-attr`. |
+| `--rank-by <EXPR>` | none | Ranking expression as JSON (same form as `search --rank-by`), applied to the BM25 score. |
+| `--limit-per <ATTR>` | none | Cap hits per distinct value of this attribute; needs `--limit-per-max`. |
+| `--limit-per-max <N>` | none | Maximum hits kept per distinct `--limit-per` value. |
+| `--diversity <LAMBDA>` | none | MMR lambda spreading hits in vector space: `1.0` pure relevance, `0.0` pure spread. |
 | `--rerank` (`rerank` feature) | none | Re-score the candidate window with the configured cross-encoder. |
 | `--rerank-query <TEXT>` (`rerank` feature) | none | Text scored against each candidate by the cross-encoder. Defaults to the positional `QUERY` when the `--clause` spelling is not used; with `--clause`, omitting it is an error. |
 | `--rerank-overscan <N>` (`rerank` feature) | none | Candidates retrieved per `top_k` before the cross-encoder rerank (default `10`). |
