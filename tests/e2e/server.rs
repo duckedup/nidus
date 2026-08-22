@@ -1104,3 +1104,102 @@ fn diversity_reshapes_a_page_over_real_http() {
     let (status, _) = server.post("/search", &json!({"query": [1, 0, 0], "diversity": 2.0}));
     assert_eq!(status, 400, "an out-of-range lambda is a caller fault");
 }
+
+/// Ingest A,B, record the commit version, then ingest C and delete A, and shut down cleanly
+/// so a second server can open `dir`. `--history-versions` must be set here too — history
+/// is opt-in, so nothing would be recorded to pin to otherwise.
+fn history_and_a_recorded_version(dir: &std::path::Path) -> u64 {
+    let server = Server::new(dir, 3)
+        .args(["--history-versions", "3"])
+        .start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(server.post("/collections/docs/upsert", &records()).0, 200);
+
+    let (status, versions) = server.get("/versions");
+    assert_eq!(status, 200, "{versions}");
+    let v = versions["commit_version"].as_u64().expect("commit_version");
+
+    let (status, body) = server.post(
+        "/collections/docs/upsert",
+        &json!({"records": [{"id": "c", "vector": [0, 0, 1], "attrs": {}}]}),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = server.post("/collections/docs/delete", &json!({"ids": ["a"]}));
+    assert_eq!(status, 200, "{body}");
+
+    assert!(
+        server.shutdown(),
+        "first server should flush and exit cleanly"
+    );
+    v
+}
+
+/// A pinned instance serves exactly the older snapshot: A and B, never the post-pin C, and
+/// not the post-pin deletion of A either.
+#[test]
+fn pinned_instance_serves_the_older_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let v = history_and_a_recorded_version(dir.path());
+
+    let server = Server::new(dir.path(), 3)
+        .args(["--history-versions", "3", "--at-version", &v.to_string()])
+        .start();
+
+    let (status, hits) = server.post("/search", &json!({"query": [1, 0, 0], "top_k": 10}));
+    assert_eq!(status, 200, "{hits}");
+    let mut ids: Vec<&str> = hits
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|h| h["id"].as_str().expect("id"))
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        ["a", "b"],
+        "a pinned search must not see the post-pin insert (c) or delete (a): {hits}"
+    );
+}
+
+/// A pinned instance is read-only over the wire, with the status `classify` maps
+/// "read-only store" errors to, and `/refresh` never crosses the pin.
+#[test]
+fn pinned_instance_refuses_writes_and_refresh_is_a_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let v = history_and_a_recorded_version(dir.path());
+
+    let server = Server::new(dir.path(), 3)
+        .args(["--history-versions", "3", "--at-version", &v.to_string()])
+        .start();
+
+    let (status, body) = server.post("/collections/docs/upsert", &records());
+    assert_eq!(status, 403, "a pinned store must refuse writes: {body}");
+
+    let (status, body) = server.post("/refresh", &json!({}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["adopted"], false,
+        "refresh must never cross a pin: {body}"
+    );
+}
+
+/// `GET /versions` on a pinned instance reports the pin and the oldest still-readable
+/// version, distinct from a fresh unpinned store (see `versions_endpoint_reports_commit_and_no_pin`
+/// in the in-process suite).
+#[test]
+fn versions_endpoint_reports_the_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let v = history_and_a_recorded_version(dir.path());
+
+    let server = Server::new(dir.path(), 3)
+        .args(["--history-versions", "3", "--at-version", &v.to_string()])
+        .start();
+
+    let (status, versions) = server.get("/versions");
+    assert_eq!(status, 200, "{versions}");
+    assert_eq!(versions["pinned"], v, "{versions}");
+    assert!(
+        versions["oldest_readable"].is_u64(),
+        "history is recording, so this must not be null: {versions}"
+    );
+}

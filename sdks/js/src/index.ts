@@ -52,6 +52,7 @@ export type {
   SearchOptions,
   SimilarSearchOptions,
   Stats,
+  StoreVersions,
   TextClause,
   TextQuerySpelling,
   TextSearchBase,

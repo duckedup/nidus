@@ -202,6 +202,17 @@ func (c *Client) Cluster(ctx context.Context) (*ClusterStatus, error) {
 	return &out, nil
 }
 
+// Versions reads the commit-version landscape of this store's recorded
+// history: the current commit, the oldest still-readable version, this
+// instance's pin (if any), and every recorded version still readable.
+func (c *Client) Versions(ctx context.Context) (*StoreVersions, error) {
+	var out StoreVersions
+	if err := c.request(ctx, http.MethodGet, "/versions", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // Stats reads store-wide introspection: dimension, distance metric, ANN
 // configuration, collection names, and the footprint. Stats.Ann is nil when the store
 // does exact brute-force search, which is the default rather than a fault.

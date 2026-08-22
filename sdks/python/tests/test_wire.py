@@ -1081,6 +1081,13 @@ def test_decode_stats_names_a_missing_body_instead_of_leaking_an_attribute_error
     assert caught.value.is_transport_error
 
 
+def test_decode_versions_names_a_missing_body_instead_of_leaking_an_attribute_error() -> None:
+    """Every ``StoreVersions`` field is required, so a non-object payload is malformed."""
+    with pytest.raises(NidusError, match="/versions") as caught:
+        _wire.decode_versions(None)
+    assert caught.value.is_transport_error
+
+
 def test_decode_collections_and_meta() -> None:
     assert _wire.decode_collections(["docs", "notes"]) == ["docs", "notes"]
     assert _wire.decode_collections(None) == []

@@ -1071,9 +1071,9 @@ func TestServerErrorsCarryTheirStatus(t *testing.T) {
 	})
 }
 
-// TestOpsSurfaceAgainstARealServer covers Ready, Cluster, and Refresh against a real
-// single-instance server — not what those fields mean for a cluster, only that this
-// SDK decodes the shape the running binary actually sends.
+// TestOpsSurfaceAgainstARealServer covers Ready, Cluster, Versions, and Refresh
+// against a real single-instance server — not what those fields mean for a cluster,
+// only that this SDK decodes the shape the running binary actually sends.
 func TestOpsSurfaceAgainstARealServer(t *testing.T) {
 	db := startServer(t)
 	ctx := context.Background()
@@ -1095,6 +1095,17 @@ func TestOpsSurfaceAgainstARealServer(t *testing.T) {
 	}
 	if status.Role == "" {
 		t.Error("Cluster.Role is empty")
+	}
+
+	versions, err := db.Versions(ctx)
+	if err != nil {
+		t.Fatalf("Versions failed: %v", err)
+	}
+	if versions.CommitVersion == 0 {
+		t.Error("Versions.CommitVersion is 0, want a set commit version")
+	}
+	if versions.Pinned != nil {
+		t.Errorf("Versions.Pinned = %v, want nil on an unpinned instance", *versions.Pinned)
 	}
 
 	if _, err := db.Refresh(ctx); err != nil {

@@ -177,6 +177,30 @@ impl OpLog {
         Ok((OpLog { appender }, ops))
     }
 
+    /// Open a log bounded to its first `limit` bytes — the pinned-snapshot path (nidus-bnf).
+    /// Never truncates the backing object (a pinned reader must not write); `limit` above
+    /// the on-disk length means the log was rewritten (a compaction) since it was recorded.
+    pub fn open_bounded(mut appender: Box<dyn Appender>, limit: u64) -> Result<(OpLog, Vec<Op>)> {
+        let mut data = Vec::new();
+        appender.read_to_end(&mut data).context("read log file")?;
+        if (data.len() as u64) < limit {
+            bail!(
+                "pinned log offset {limit} exceeds the log's current length {} bytes — the \
+                 log was rewritten (a compaction) since this version was recorded",
+                data.len()
+            );
+        }
+        let bound = &data[..limit as usize];
+        let (ops, good_len) = parse_all_frames(bound)?;
+        if good_len != bound.len() {
+            bail!(
+                "log is torn inside the pinned region (offset {limit}): the recorded commit \
+                 point does not end on a frame boundary — the store is corrupt"
+            );
+        }
+        Ok((OpLog { appender }, ops))
+    }
+
     /// An in-memory-only log (no backing file). For tests and in-memory stores.
     pub fn in_memory() -> OpLog {
         OpLog {
@@ -394,6 +418,84 @@ mod tests {
         assert!(log.offset().unwrap() > mark);
         log.truncate_to(mark).unwrap();
         assert_eq!(log.offset().unwrap(), mark);
+    }
+
+    #[test]
+    fn open_bounded_replays_only_the_pinned_prefix() {
+        let orig = make_ops();
+        let mut buf = Vec::new();
+        let mut offset_after_two = 0usize;
+        for (i, op) in orig.iter().enumerate() {
+            frame(op, &mut buf).unwrap();
+            if i == 1 {
+                offset_after_two = buf.len();
+            }
+        }
+        let full_len = buf.len() as u64;
+        let appender: Box<dyn Appender> = Box::new(MemAppender::from_bytes(buf));
+        let (log, ops) = OpLog::open_bounded(appender, offset_after_two as u64).unwrap();
+        assert_eq!(ops, orig[..2].to_vec());
+        assert_eq!(
+            log.offset().unwrap(),
+            full_len,
+            "open_bounded must not truncate the object"
+        );
+    }
+
+    #[test]
+    fn open_bounded_rejects_a_limit_past_a_rewritten_shorter_log() {
+        let orig = make_ops();
+        let mut buf = Vec::new();
+        for op in &orig {
+            frame(op, &mut buf).unwrap();
+        }
+        let recorded_limit = buf.len() as u64;
+        // Simulate a compaction: the log is rewritten shorter than the pinned offset.
+        buf.truncate(4);
+        let appender: Box<dyn Appender> = Box::new(MemAppender::from_bytes(buf));
+        let err = OpLog::open_bounded(appender, recorded_limit)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rewritten"), "{err}");
+    }
+
+    #[test]
+    fn open_bounded_rejects_a_corrupt_frame_inside_the_pinned_region() {
+        let orig = make_ops();
+        let mut buf = Vec::new();
+        for op in &orig {
+            frame(op, &mut buf).unwrap();
+        }
+        // Corrupt a byte inside the first frame's payload so its CRC fails, then pin past it.
+        buf[5] ^= 0xFF;
+        let limit = buf.len() as u64;
+        let appender: Box<dyn Appender> = Box::new(MemAppender::from_bytes(buf));
+        assert!(OpLog::open_bounded(appender, limit).is_err());
+    }
+
+    /// A pin landing *mid-frame* is the only thing the frame-boundary check catches: the
+    /// frames before it parse cleanly, so nothing else in `open_bounded` rejects it and a
+    /// recorded offset that is not a commit boundary would silently replay a short log.
+    #[test]
+    fn open_bounded_rejects_a_pin_that_does_not_end_on_a_frame_boundary() {
+        let orig = make_ops();
+        let mut buf = Vec::new();
+        let mut first_two = 0usize;
+        for (i, op) in orig.iter().enumerate() {
+            frame(op, &mut buf).unwrap();
+            if i == 1 {
+                first_two = buf.len();
+            }
+        }
+        assert!(buf.len() > first_two + 3, "need a third frame to cut into");
+        let limit = (first_two + 3) as u64;
+        let appender: Box<dyn Appender> = Box::new(MemAppender::from_bytes(buf));
+        let err = OpLog::open_bounded(appender, limit)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("torn inside the pinned region"), "{err}");
     }
 
     #[test]

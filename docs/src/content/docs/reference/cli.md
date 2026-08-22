@@ -50,6 +50,8 @@ one, where a mismatch is a hard error.
 | `--dim <DIM>` | `NIDUS_DIM` | Embedding dimension. Inferred from an existing store; required to create one. |
 | `--distance <cosine\|euclidean\|dot>` | `NIDUS_DISTANCE` | Distance metric. Inferred from an existing store; defaults to `cosine` at creation. |
 | `--read-only` | `NIDUS_READ_ONLY` | Open without taking the writer lock (rejects mutations). |
+| `--history-versions <N>` | `NIDUS_HISTORY_VERSIONS` | Keep the last N commit points addressable by `--at-version`. Off by default: enabling it makes every durable batch a commit point, so the write path pays for it. |
+| `--at-version <N>` | `NIDUS_AT_VERSION` | Open a read-only snapshot pinned to that past commit version instead of the current state. Forces the store read-only, so a subcommand that writes is refused. |
 | `--ann <hnsw\|ivf>` | `NIDUS_ANN` | Opt into an approximate-nearest-neighbour index. Omit for exact brute-force. |
 | `--ann-m <N>` | `NIDUS_ANN_M` | HNSW: max neighbours per node above layer 0. |
 | `--ann-ef-construction <N>` | `NIDUS_ANN_EF_CONSTRUCTION` | HNSW: build-time beam width. |
@@ -422,6 +424,23 @@ See [Checking a live store](/guides/cli-and-server/#checking-a-live-store).
 
 Print store footprint and collections as JSON. Usage:
 `nidus stats [OPTIONS] --dir <DIR>`. No flags beyond the store flags.
+
+### `versions`
+
+Print the commit-version landscape as JSON: `commit_version` (now), `oldest_readable`,
+`pinned`, and `readable` (every addressable commit point). Usage:
+`nidus versions [OPTIONS] --dir <DIR>`. No flags beyond the store flags.
+
+```bash
+nidus versions --dir ./store
+# → {"commit_version":42,"oldest_readable":31,"pinned":null,"readable":[31, ..., 42]}
+
+# Re-run a query against the index as it was at version 31.
+nidus search --dir ./store --at-version 31 docs --text "…"
+```
+
+`readable` is empty unless the store was written with `--history-versions N`. See
+[Point-in-time reads](/guides/storage/#point-in-time-reads).
 
 ### `tune`
 

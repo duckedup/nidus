@@ -33,7 +33,17 @@ from typing import Any, Callable, NamedTuple
 
 import pytest
 
-from nidus import ClusterStatus, NidusClient, NidusError, Readiness, RememberResult, f, rank, v
+from nidus import (
+    ClusterStatus,
+    NidusClient,
+    NidusError,
+    Readiness,
+    RememberResult,
+    StoreVersions,
+    f,
+    rank,
+    v,
+)
 
 # Canned response payloads, one per shape the client has to decode. Kept beside the
 # endpoint table below so a row and its response read together.
@@ -60,6 +70,13 @@ CLUSTER_PAYLOAD = {
     "commit_version": 42,
     "staleness_secs": 0,
     "max_staleness_secs": 30,
+}
+
+VERSIONS_PAYLOAD = {
+    "commit_version": 9,
+    "oldest_readable": 3,
+    "pinned": 5,
+    "readable": [3, 4, 5, 6, 7, 8, 9],
 }
 
 
@@ -134,6 +151,7 @@ ENDPOINTS: list[tuple[str, Callable[[NidusClient], Any], str, str, Any]] = [
         {"ready": True, "role": "Leader", "staleness_secs": 0},
     ),
     ("cluster", lambda db: db.cluster(), "GET", "/cluster", CLUSTER_PAYLOAD),
+    ("versions", lambda db: db.versions(), "GET", "/versions", VERSIONS_PAYLOAD),
     ("stats", lambda db: db.stats(), "GET", "/stats", STATS_PAYLOAD),
     ("collections", lambda db: db.collections(), "GET", "/collections", ["docs"]),
     ("create_collection", lambda db: db.create_collection("docs"), "POST", "/collections/docs", {}),
@@ -781,6 +799,28 @@ def test_cluster_decodes_null_lease_owner_and_max_staleness_as_none() -> None:
     out = client(stub).cluster()
     assert out.lease_owner is None
     assert out.max_staleness_secs is None
+
+
+def test_versions_decodes_every_field_including_the_nullable_ones() -> None:
+    stub = StubTransport(VERSIONS_PAYLOAD)
+    out = client(stub).versions()
+    assert stub.last.method == "GET"
+    assert stub.last.url == "http://x/versions"
+    assert out == StoreVersions(
+        commit_version=9,
+        oldest_readable=3,
+        pinned=5,
+        readable=[3, 4, 5, 6, 7, 8, 9],
+    )
+
+
+def test_versions_decodes_null_oldest_readable_and_pinned_as_none() -> None:
+    stub = StubTransport(
+        {"commit_version": 1, "oldest_readable": None, "pinned": None, "readable": [1]}
+    )
+    out = client(stub).versions()
+    assert out.oldest_readable is None
+    assert out.pinned is None
 
 
 @pytest.mark.parametrize("adopted", [True, False])

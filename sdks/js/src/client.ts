@@ -33,6 +33,7 @@ import type {
   SearchOptions,
   SimilarSearchOptions,
   Stats,
+  StoreVersions,
   TextSearchOptions,
   Value,
 } from "./types.js";
@@ -115,6 +116,11 @@ export class NidusClient {
   /** Cluster role, writer-handle state, fencing token, commit counter, staleness. */
   cluster(): Promise<ClusterStatus> {
     return this.request<ClusterStatus>("GET", "/cluster");
+  }
+
+  /** The readable commit points and this instance's pin, if any. */
+  versions(): Promise<StoreVersions> {
+    return this.request<StoreVersions>("GET", "/versions");
   }
 
   /** List every collection name. */

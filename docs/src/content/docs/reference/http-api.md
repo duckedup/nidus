@@ -42,6 +42,7 @@ so the same id appears in your logs and the server's.
 | `POST /refresh` | adopt another instance's newer committed state | `refresh` |
 | `GET /ready` | whether this instance can serve (store open, not fenced, not stale) | – |
 | `GET /cluster` | role, writer-handle state, fencing token, commit counter, staleness | `cluster_status` |
+| `GET /versions` | the commit versions a pinned read can address, and this instance's pin | `versions` |
 | `GET /metrics` | Prometheus scrape: traffic, search path, lease counters (always unauthenticated) | – |
 | `POST /collections/{name}/remember`* | text in, optionally summarize, embed, and upsert | – |
 | `POST /collections/{name}/recall`* | text in, embed, and search with TTL filtering | `search` |
@@ -959,6 +960,30 @@ curl -s -X POST localhost:7700/compact \
   -H 'content-type: application/json' \
   -d '{"expired": true}'   # → {"ok": true}
 ```
+
+### `GET /versions`
+
+The commit-version landscape a point-in-time read can address: what this store is at now,
+how far back it can be read, and whether this instance is itself pinned. Requires the token
+when one is configured, like `GET /cluster`.
+
+```json
+{
+  "commit_version": 42,
+  "oldest_readable": 31,
+  "pinned": null,
+  "readable": [31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42]
+}
+```
+
+`readable` is empty and `oldest_readable` is `null` unless the store was written with
+history recording on (`--history-versions N`, off by default). `pinned` is the version this
+instance was started at with `--at-version`, or `null` for an ordinary instance.
+
+A pinned instance is read-only end to end: every mutating route refuses, and `POST /refresh`
+answers `{"adopted": false}` rather than quietly advancing off the pin. See
+[Point-in-time reads](/guides/storage/#point-in-time-reads) for what is addressable and how
+far back it survives.
 
 ### `POST /refresh`
 

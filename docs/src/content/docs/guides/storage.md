@@ -236,6 +236,53 @@ set; a seal/compaction takes the full re-open. And when a shared
 [memory tier](/guides/memory-stores/) holds a snapshot matching the new state, the reader
 adopts it and skips the log replay entirely.
 
+## Point-in-time reads
+
+A reader can also be pinned to the store as it was at an earlier **commit version**:
+re-run last week's queries against last week's index, bisect a ranking regression across
+store versions, or hold one consistent view across a batch job that outlives the writes
+running beside it.
+
+History is **off by default** and has to be recorded before it can be read:
+
+```rust
+use nidus::{Config, Nidus, OpenMode};
+
+// The writer records the last 128 commit points.
+let mut writer = Nidus::open(Config::new("/path/to/store", 768).history_versions(Some(128)))?;
+# let _ = &mut writer;
+
+// A reader pinned to one of them. Always read-only.
+let pinned = Nidus::open_at(
+    Config::new("/path/to/store", 768).open_mode(OpenMode::ReadOnly),
+    31,
+)?;
+# let _ = pinned;
+# anyhow::Ok(())
+```
+
+`Nidus::versions()` (and `GET /versions`, and `nidus versions`) reports what is
+addressable: the current `commit_version`, the `oldest_readable` one, this handle's `pinned`
+version, and the full `readable` set.
+
+Three things are worth knowing before you rely on it.
+
+**You cannot travel back to before you turned it on.** Recording history makes every
+durable batch a commit point, which costs a small object write per batch, so it is opt-in
+rather than something every store pays for. A store written without it has no addressable
+past, and `versions()` reports an empty `readable` set.
+
+**Compaction is a hard floor.** `compact()` rewrites the base segment in place and
+renumbers rows, so every version older than the last compaction is gone for good. There is
+no knob that keeps them. Asking for one is an error naming the oldest version that is still
+readable; a nearest surviving version is never served in its place, because a snapshot that
+quietly answers for a different point in time is worse than no answer.
+
+**A pin does not drift.** `refresh()` returns `false` on a pinned handle rather than
+advancing it, and `refresh_to(version)` is the explicit way to move. Every write path
+refuses, whether you reach it through the library, `nidus serve --at-version N` (which runs
+the whole instance pinned and read-only), or the CLI.
+
 Only one **writer** (`OpenMode::ReadWrite`, the default) may hold a store at a
 time, enforced by the `O_EXCL` `lock` file. A stale lock left by a crashed writer
 is reclaimed after [`Config::lock_ttl`](/reference/configuration/#lock_ttl)

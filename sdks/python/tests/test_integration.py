@@ -469,6 +469,10 @@ def test_ready_cluster_and_refresh_against_a_real_server(server: str) -> None:
         # A standalone instance has no writer lease to adopt from.
         assert isinstance(db.refresh(), bool)
 
+        versions = db.versions()
+        assert isinstance(versions.commit_version, int)
+        assert versions.pinned is None
+
 
 def test_a_collection_name_with_a_slash_and_a_space_round_trips(server: str) -> None:
     """Path escaping, proven against the real router rather than against a string assertion."""

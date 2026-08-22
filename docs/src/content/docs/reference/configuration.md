@@ -228,6 +228,23 @@ case is an error instead: recall against an unpinned collection fails, and `reme
 that already holds rows fails rather than claiming those vectors as nidus's own. See
 [remember and recall](/guides/remember-and-recall/#dimension-and-embedder-identity-pinning).
 
+### `history_versions`
+
+`Option<usize>`, default `None`. Keep the last N commit points addressable by
+[`at_version`](#at_version). Off by default, and the cost is why: recording history makes
+every durable batch a commit point, which is a small object write per batch. A store written
+without it has no addressable past, so this has to be on **before** the state you will want
+to read back. Compaction is a hard floor regardless of N: versions older than the last
+compaction are gone. See [point-in-time reads](/guides/storage/#point-in-time-reads).
+
+### `at_version`
+
+`Option<u64>`, default `None`. Open the store as it was at that commit version instead of
+its current state. Requires [`open_mode`](#open_mode) `ReadOnly` (a pin is a past state, so
+nothing may be written through it) and requires [`history_versions`](#history_versions) to
+have recorded the version. A pinned handle does not drift: `refresh()` returns `false`
+rather than advancing it, and `refresh_to(version)` is the explicit move.
+
 ## `Fsync`
 
 ```rust

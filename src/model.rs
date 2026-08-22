@@ -909,6 +909,21 @@ pub struct ClusterStatus {
     pub staleness_secs: u64,
 }
 
+/// The commit-version landscape of a store's recorded history (nidus-bnf, SPEC §14.2),
+/// from [`Nidus::versions`](crate::Nidus::versions).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreVersions {
+    /// The current live manifest version.
+    pub commit_version: u64,
+    /// The oldest version still readable via `at_version`; `None` when no history is
+    /// recorded at all (`Config::history_versions` is off and nothing was ever written).
+    pub oldest_readable: Option<u64>,
+    /// The version this handle is pinned to, if any (mirrors `Store::pinned`).
+    pub pinned: Option<u64>,
+    /// Every recorded version still `>= oldest_readable`, ascending.
+    pub readable: Vec<u64>,
+}
+
 /// A mutating operation recorded in the op log (the commit stream). `row` indexes
 /// into the data segment. The on-disk log is a sequence of framed, checksummed,
 /// bincode-encoded `Op`s (see `log` module + SPEC.md §5.2).

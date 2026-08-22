@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Aggregation, AnnConfig, AnnKind, Annotations, Expand, Filter, FilterIndexField, Footprint,
     FtsClause, FtsCombine, FtsField, HighlightOpts, Hit, Language, LimitPer, ListOpts, OrderBy,
-    Projection, RankBy, Record, Value,
+    Projection, RankBy, Record, StoreVersions, Value,
 };
 
 /// Body of `POST /collections/{name}/upsert`.
@@ -686,6 +686,26 @@ impl From<Footprint> for FootprintDto {
             vector_bytes: f.vector_bytes,
             doc_count: f.doc_count,
             filter_index_bytes: f.filter_index_bytes,
+        }
+    }
+}
+
+/// Serializable mirror of [`crate::StoreVersions`] for `GET /versions`.
+#[derive(Debug, Serialize)]
+pub struct VersionsDto {
+    pub commit_version: u64,
+    pub oldest_readable: Option<u64>,
+    pub pinned: Option<u64>,
+    pub readable: Vec<u64>,
+}
+
+impl From<StoreVersions> for VersionsDto {
+    fn from(v: StoreVersions) -> Self {
+        Self {
+            commit_version: v.commit_version,
+            oldest_readable: v.oldest_readable,
+            pinned: v.pinned,
+            readable: v.readable,
         }
     }
 }
