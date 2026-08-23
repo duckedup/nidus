@@ -183,6 +183,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
 
+      # Needed by the `docs` mode of scripts/e2e-wasm.sh: it builds docs/ (bun
+      # install + astro build) and drives docs/e2e/terminal.mjs via bun.
+      - name: Setup Bun
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
       # NOT the action's `targets:` input. `rust-toolchain.toml` pins 1.96.0, so every
       # cargo call resolves there while `targets:` would add wasm32 to `stable` instead,
       # and the build would fail with "can't find crate for `core`". `rustup target add`
@@ -225,6 +233,13 @@ jobs:
       - name: Browser suite (wasm_opfs, real headless browser)
         if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: ./scripts/e2e-wasm.sh test
+
+      # Builds the docs site (which embeds the wasm binding) and drives a real
+      # terminal demo over OPFS in the same browser, so a stale demo fails here
+      # rather than silently shipping (nidus-7pj).
+      - name: Docs terminal E2E (OPFS demo, real headless browser)
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: ./scripts/e2e-wasm.sh docs
 
       - name: Clean up
         if: ${{ always() && env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}

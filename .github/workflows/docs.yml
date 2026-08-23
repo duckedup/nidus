@@ -8,11 +8,15 @@ on:
   pull_request:
     paths:
       - "docs/**"
+      - "src/**"
+      - "bindings/wasm/**"
       - ".github/workflows/docs.yml"
   push:
     branches: [main]
     paths:
       - "docs/**"
+      - "src/**"
+      - "bindings/wasm/**"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
@@ -50,12 +54,66 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: actions/configure-pages@v6
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      # NOT the action's `targets:` input. `rust-toolchain.toml` pins 1.96.0, so every
+      # cargo call resolves there while `targets:` would add wasm32 to `stable` instead,
+      # and the build would fail with "can't find crate for `core`". `rustup target add`
+      # honours the toolchain-file override, so it lands on whatever cargo actually uses.
+      - name: Add the wasm32 target to the pinned toolchain
+        working-directory: ${{ github.workspace }}
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Ensure `just` is available
+        working-directory: ${{ github.workspace }}
+        run: command -v just >/dev/null 2>&1 || cargo install just --locked
+
+      # Own cache key, same shape as the other wasm jobs, so it neither evicts nor
+      # is evicted by them.
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-docs-wasm-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-docs-wasm-
+
+      - name: Install wasm-bindgen-cli (pinned to match Cargo.lock)
+        working-directory: ${{ github.workspace }}
+        run: cargo install wasm-bindgen-cli --version 0.2.122 --locked
+
+      - name: Build the wasm binding
+        working-directory: ${{ github.workspace }}
+        run: just build-wasm-binding
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # `--bun` forces Astro to run on Bun's runtime instead of shelling out to Node.
+      # `bun run` (not `bunx astro build`) so the `prebuild` hook stages the wasm
+      # artifact via copy-wasm.mjs before Astro builds; `--bun` runs it on Bun's
+      # runtime. NIDUS_WASM_REQUIRED makes a missing artifact fail here, on the PR gate.
       - name: Build with Astro
-        run: bunx --bun astro build
+        env:
+          NIDUS_WASM_REQUIRED: "1"
+        run: bun --bun run build
+
+      # Vite emits the payload hashed (dist/_astro/nidus_wasm_bg-<hash>.wasm), so glob for
+      # it. Exactly one must exist: zero means the demo silently degraded to its fallback.
+      - name: Assert the wasm artifact reached the build output, and report its size
+        run: |
+          count=$(find dist -name 'nidus_wasm_bg*.wasm' | wc -l | tr -d ' ')
+          if [ "$count" -ne 1 ]; then
+            echo "::error::expected exactly 1 wasm artifact in dist, found ${count}" >&2
+            exit 1
+          fi
+          found=$(find dist -name 'nidus_wasm_bg*.wasm')
+          raw=$(wc -c < "$found")
+          gz=$(gzip -9 -c "$found" | wc -c)
+          echo "### wasm artifact size" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${found}\`: raw ${raw} bytes, gzip ${gz} bytes" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Pages artifact
         if: github.event_name != 'pull_request'

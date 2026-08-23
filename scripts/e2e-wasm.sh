@@ -121,12 +121,45 @@ down() {
     rm -rf "$STATE_DIR"
 }
 
+# Builds the wasm binding + docs site, serves docs/dist over loopback HTTP (OPFS
+# needs a secure context — file:// does not qualify, 127.0.0.1 does) on a free
+# port, and drives docs/e2e/terminal.mjs against it in the detected browser.
+docs_cmd() {
+    up
+    driver="$(cat "$STATE_DIR/driver")"
+    var="${driver%%:*}"
+    path="${driver#*:}"
+    export "${var}=${path}"
+
+    just build-wasm-binding
+    just docs-build
+
+    port="$(python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()')"
+
+    python3 -m http.server "$port" --bind 127.0.0.1 --directory docs/dist \
+        >"$STATE_DIR/docs-http.log" 2>&1 &
+    server_pid=$!
+    trap 'kill "$server_pid" >/dev/null 2>&1 || true' EXIT
+
+    for _ in $(seq 1 50); do
+        curl -sf "http://127.0.0.1:${port}/" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+
+    bun docs/e2e/terminal.mjs "http://127.0.0.1:${port}"
+}
+
 case "${1:-}" in
 up) up ;;
 test) test_cmd ;;
+docs) docs_cmd ;;
 down) down ;;
 *)
-    echo "usage: $0 {up|test|down}" >&2
+    echo "usage: $0 {up|test|docs|down}" >&2
     exit 2
     ;;
 esac

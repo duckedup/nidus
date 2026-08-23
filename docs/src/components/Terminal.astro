@@ -1,0 +1,235 @@
+---
+/**
+ * nidus-7pj: a real nidus, compiled to wasm32, running in a terminal on the docs
+ * home page. Server-rendered fallback first (a static example, no JS needed); a
+ * click loads the wasm worker and makes it live. See docs/BLUEPRINT-nidus-7pj.md.
+ */
+import { EXAMPLE_QUERY, EXAMPLE_OUTPUT } from "../terminal/corpus.js";
+---
+
+<div class="nd-term not-content">
+  <div class="nd-term__frame">
+    <div class="nd-term__bar">
+      <span class="nd-term__dot"></span>
+      <span class="nd-term__dot"></span>
+      <span class="nd-term__dot"></span>
+      <span class="nd-term__title">nidus, in your browser</span>
+    </div>
+
+    <div id="nd-term-output" class="nd-term__output" aria-live="polite">
+      <p class="nd-term__line">
+        <span class="nd-term__prompt" aria-hidden="true">$</span> search {EXAMPLE_QUERY}
+      </p>
+      {
+        EXAMPLE_OUTPUT.map((hit) => (
+          <div class="nd-term__hit" data-id={hit.id}>
+            <span class="nd-term__hit-id">{hit.id}</span>
+            <span class="nd-term__score">{hit.score.toFixed(3)}</span>
+          </div>
+        ))
+      }
+    </div>
+
+    <form class="nd-term__form" id="nd-term-form">
+      <label class="nd-term__label" for="nd-term-input">Terminal command</label>
+      <span class="nd-term__prompt" aria-hidden="true">$</span>
+      <input
+        id="nd-term-input"
+        class="nd-term__input"
+        type="text"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="search filters"
+        disabled
+        hidden
+      />
+      <button id="nd-term-run" class="nd-term__run" type="button" hidden>
+        Run it live &middot; 485 KB wasm
+      </button>
+    </form>
+  </div>
+
+  <p class="nd-term__disclosure">
+    There is no embedding model in your browser, so text is turned into a vector by
+    character trigrams plus a small hand-written concept map. The store, the ranking
+    and the scores are real nidus; the vectors are a stand-in, and the concept map
+    only knows the words someone wrote down. Data persists in
+    <a href="/guides/wasm/">OPFS</a>, private to this origin.
+  </p>
+</div>
+
+<script>
+  function initTerminal() {
+    const root = document.querySelector(".nd-term");
+    const runBtn = root?.querySelector<HTMLButtonElement>("#nd-term-run");
+    const output = root?.querySelector<HTMLDivElement>("#nd-term-output");
+    const input = root?.querySelector<HTMLInputElement>("#nd-term-input");
+    const form = root?.querySelector<HTMLFormElement>("#nd-term-form");
+    if (!root || !runBtn || !output || !input || !form || runBtn.dataset.wired) return;
+    runBtn.dataset.wired = "1";
+
+    const staticOutputHTML = output.innerHTML;
+    let worker: Worker | null = null;
+    let nextId = 0;
+    const pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
+
+    function send(cmd: string, payload?: unknown): Promise<any> {
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        worker!.postMessage({ id, cmd, payload });
+      });
+    }
+
+    function appendLine(text: string, cls?: string) {
+      const p = document.createElement("p");
+      p.className = cls ? `nd-term__line ${cls}` : "nd-term__line";
+      p.textContent = text;
+      output.appendChild(p);
+      output.scrollTop = output.scrollHeight;
+    }
+
+    function appendHits(hits: Array<{ id: string; score: number }>) {
+      if (!hits.length) {
+        appendLine("(no hits)");
+        return;
+      }
+      for (const hit of hits) {
+        const row = document.createElement("div");
+        row.className = "nd-term__hit";
+        row.dataset.id = hit.id;
+        const idEl = document.createElement("span");
+        idEl.className = "nd-term__hit-id";
+        idEl.textContent = hit.id;
+        const scoreEl = document.createElement("span");
+        scoreEl.className = "nd-term__score";
+        scoreEl.textContent = hit.score.toFixed(3);
+        row.append(idEl, scoreEl);
+        output.appendChild(row);
+      }
+    }
+
+    // Restore the static example rather than leaving an empty box or a stuck
+    // spinner, and let the reader retry.
+    function fail(message: string) {
+      output.innerHTML = staticOutputHTML;
+      appendLine(`Live mode unavailable: ${message}`, "nd-term__error");
+      runBtn.hidden = false;
+      runBtn.disabled = false;
+      runBtn.textContent = "Run it live · 485 KB wasm";
+      input.hidden = true;
+      input.disabled = true;
+    }
+
+    async function boot() {
+      runBtn.disabled = true;
+      runBtn.textContent = "Loading…";
+      try {
+        worker?.terminate();
+        worker = new Worker(new URL("../terminal/worker.js", import.meta.url), { type: "module" });
+        worker.onerror = (ev) => fail(ev.message || "the worker failed to start");
+        worker.onmessage = (ev) => {
+          const { id, ok, result, error } = ev.data;
+          const p = pending.get(id);
+          if (!p) return;
+          pending.delete(id);
+          ok ? p.resolve(result) : p.reject(new Error(error));
+        };
+
+        const { mode, reason, restored } = await send("init");
+
+        output.innerHTML = "";
+        const modeLine = document.createElement("p");
+        modeLine.id = "nd-term-mode";
+        modeLine.className = "nd-term__line nd-term__mode";
+        modeLine.dataset.mode = mode;
+        modeLine.textContent =
+          mode === "opfs"
+            ? "Live. Data persists in this browser's OPFS storage."
+            : `Live, in memory only${reason ? ` (${reason})` : ""}. Data will not persist across reloads.`;
+        output.appendChild(modeLine);
+        if (restored > 0) {
+          appendLine(
+            `Reopened the store you left last time: ${restored} record${restored === 1 ? "" : "s"} were already here.`,
+            "nd-term__restored",
+          );
+        }
+        appendLine('Seeded the store. Try "search how do I keep data safe", then reload the page.');
+
+        runBtn.hidden = true;
+        input.hidden = false;
+        input.disabled = false;
+        input.focus();
+      } catch (e) {
+        fail(e instanceof Error ? e.message : String(e));
+      }
+    }
+
+    // Inert without JS, so it ships hidden and is revealed only once this runs.
+    runBtn.hidden = false;
+    runBtn.addEventListener("click", boot);
+
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const line = input.value.trim();
+      if (!line) return;
+      input.value = "";
+      appendLine(`$ ${line}`, "nd-term__echo");
+
+      const [cmd, ...rest] = line.split(/\s+/);
+      try {
+        switch (cmd) {
+          case "help":
+            appendLine("commands: search <text>, similar <id>, upsert <id> <text>, stats, clear, help");
+            break;
+          case "search": {
+            const text = rest.join(" ");
+            if (!text) {
+              appendLine("usage: search <text>");
+              break;
+            }
+            appendHits(await send("search", { text, topK: 5 }));
+            break;
+          }
+          case "similar": {
+            const [id] = rest;
+            if (!id) {
+              appendLine("usage: similar <id>   (an id from any search result)");
+              break;
+            }
+            appendHits(await send("similar", { id, topK: 4 }));
+            break;
+          }
+          case "upsert": {
+            const [id, ...words] = rest;
+            const text = words.join(" ");
+            if (!id || !text) {
+              appendLine("usage: upsert <id> <text>");
+              break;
+            }
+            await send("upsert", { id, text });
+            appendLine(`upserted ${id}`);
+            break;
+          }
+          case "stats": {
+            const fp = await send("stats");
+            appendLine(
+              `rows ${fp.rows}, dead_rows ${fp.dead_rows}, doc_count ${fp.doc_count}, vector_bytes ${fp.vector_bytes}`,
+            );
+            break;
+          }
+          case "clear":
+            await send("clear");
+            appendLine("store cleared and reseeded");
+            break;
+          default:
+            appendLine(`unknown command "${cmd}". Type "help".`);
+        }
+      } catch (e) {
+        appendLine(`error: ${e instanceof Error ? e.message : String(e)}`, "nd-term__error");
+      }
+    });
+  }
+
+  document.addEventListener("astro:page-load", initTerminal);
+</script>

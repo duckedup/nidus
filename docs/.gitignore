@@ -4,6 +4,8 @@ dist/
 .astro/
 # dependencies
 node_modules/
+# the wasm artifact copied in from bindings/wasm/pkg by scripts/copy-wasm.mjs
+src/generated/
 # environment
 .env
 .env.production
