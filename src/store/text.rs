@@ -9,7 +9,7 @@ use super::Store;
 use super::plan::PlanRec;
 use super::rank;
 use super::read::{check_query_opts, check_weight, depth, paginate};
-use crate::annotate::{Annotations, ClauseScore, Highlight, HighlightOpts, LegScore};
+use crate::annotate::{Annotations, ClauseScore, Expansion, Highlight, HighlightOpts, LegScore};
 use crate::filter;
 use crate::fts::Analyzer;
 use crate::fuse::{FusionLeg, rrf_fuse};
@@ -36,14 +36,22 @@ fn combine(per_clause: &PerClause, mode: FtsCombine) -> f32 {
 }
 
 /// The matched clauses' scores, in query order — the reportable form of a [`PerClause`].
-fn clause_scores(per_clause: &PerClause, clauses: &[FtsClause]) -> Vec<ClauseScore> {
+/// `expansions` carries each prefix clause's truncation report, `None` for a non-prefix clause
+/// or one this collection doesn't index — aligned with `clauses` the same way `per_clause` is.
+fn clause_scores(
+    per_clause: &PerClause,
+    clauses: &[FtsClause],
+    expansions: &[Option<Expansion>],
+) -> Vec<ClauseScore> {
     clauses
         .iter()
         .zip(per_clause)
-        .filter_map(|(c, s)| {
+        .zip(expansions)
+        .filter_map(|((c, s), exp)| {
             s.map(|score| ClauseScore {
                 field: c.field.clone(),
                 score,
+                expansion: *exp,
             })
         })
         .collect()
@@ -69,6 +77,10 @@ impl Store {
         // Analyze each clause once per distinct field analyzer across the scope (collections
         // usually share one), not once per collection.
         let mut analyzed: HashMap<(usize, Analyzer), Vec<String>> = HashMap::new();
+        // Head terms + fragment for a prefix clause are analyzer-keyed like `analyzed`, but the
+        // *expansion* against them is per `(collection, field)` and must not be cached here (D6).
+        let mut prefix_analyzed: HashMap<(usize, Analyzer), (Vec<String>, Option<String>)> =
+            HashMap::new();
         let mut breakdown = Breakdown::new();
 
         for &col_name in collections {
@@ -78,17 +90,38 @@ impl Store {
             // Accumulate every clause's score per doc before folding, so `Sum`/`Max` see the
             // whole row and a doc matching two clauses is ranked once, not twice.
             let mut acc: HashMap<&str, PerClause> = HashMap::new();
+            let mut expansions: Vec<Option<Expansion>> = vec![None; query.clauses.len()];
             for (ci, clause) in query.clauses.iter().enumerate() {
                 let Some(cfg) = self.fts.field_analyzer(col_name, &clause.field) else {
                     continue; // this collection doesn't full-text-index the clause's field
                 };
-                analyzed
-                    .entry((ci, cfg))
-                    .or_insert_with(|| crate::fts::analyze(&clause.text, cfg));
-                let terms = &analyzed[&(ci, cfg)];
-                for (id, score) in self.fts.score(col_name, &clause.field, terms) {
-                    acc.entry(id)
-                        .or_insert_with(|| vec![None; query.clauses.len()])[ci] = Some(score);
+                if clause.prefix {
+                    let (heads, fragment) = prefix_analyzed
+                        .entry((ci, cfg))
+                        .or_insert_with(|| crate::fts::analyze_with_prefix(&clause.text, cfg));
+                    let mut terms = heads.clone();
+                    if let Some(fragment) = fragment {
+                        let (expanded, matched) =
+                            self.fts.expand_prefix(col_name, &clause.field, fragment);
+                        expansions[ci] = Some(Expansion {
+                            matched,
+                            scored: expanded.len(),
+                        });
+                        terms.extend(expanded);
+                    }
+                    for (id, score) in self.fts.score(col_name, &clause.field, &terms) {
+                        acc.entry(id)
+                            .or_insert_with(|| vec![None; query.clauses.len()])[ci] = Some(score);
+                    }
+                } else {
+                    analyzed
+                        .entry((ci, cfg))
+                        .or_insert_with(|| crate::fts::analyze(&clause.text, cfg));
+                    let terms = &analyzed[&(ci, cfg)];
+                    for (id, score) in self.fts.score(col_name, &clause.field, terms) {
+                        acc.entry(id)
+                            .or_insert_with(|| vec![None; query.clauses.len()])[ci] = Some(score);
+                    }
                 }
             }
             for (id, per_clause) in acc {
@@ -113,7 +146,7 @@ impl Store {
                 if opts.explain {
                     breakdown.insert(
                         (col_name.to_string(), id.to_string()),
-                        clause_scores(&per_clause, &query.clauses),
+                        clause_scores(&per_clause, &query.clauses, &expansions),
                     );
                 }
             }
@@ -248,6 +281,10 @@ impl Store {
             return;
         }
         let mut breakdown = breakdown;
+        // A prefix expansion is the same for every hit sharing a (collection, field, clause),
+        // so expand once per page rather than once per hit — highlighting is typeahead's
+        // usual companion, and the page would otherwise repeat the range scan `top_k` times.
+        let mut expansions: HashMap<(String, usize), Vec<String>> = HashMap::new();
         for hit in hits.iter_mut() {
             let a = hit.annotations.get_or_insert_with(Annotations::default);
             if let Some(b) = breakdown.as_deref_mut() {
@@ -256,7 +293,8 @@ impl Store {
                     .unwrap_or_default();
             }
             if let Some(opts) = &query.highlight {
-                a.highlights = self.highlights_for(&hit.collection, &hit.id, query, opts);
+                a.highlights =
+                    self.highlights_for(&hit.collection, &hit.id, query, opts, &mut expansions);
             }
         }
     }
@@ -270,6 +308,7 @@ impl Store {
         id: &str,
         query: &FtsQuery,
         opts: &HighlightOpts,
+        expansions: &mut HashMap<(String, usize), Vec<String>>,
     ) -> Vec<Highlight> {
         let Some(entry) = self
             .collections
@@ -279,12 +318,30 @@ impl Store {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for clause in &query.clauses {
+        for (ci, clause) in query.clauses.iter().enumerate() {
             let Some(cfg) = self.fts.field_analyzer(collection, &clause.field) else {
                 continue;
             };
             let text = crate::fts::field_text(&entry.attrs, &clause.field);
-            let terms = crate::fts::analyze(&clause.text, cfg);
+            // Highlight the same expanded term list a prefix clause scored against, so a
+            // prefix match highlights with no change to `highlight.rs` itself (D6).
+            let terms = if clause.prefix {
+                expansions
+                    .entry((collection.to_string(), ci))
+                    .or_insert_with(|| {
+                        let (mut terms, fragment) =
+                            crate::fts::analyze_with_prefix(&clause.text, cfg);
+                        if let Some(fragment) = fragment {
+                            let (expanded, _) =
+                                self.fts.expand_prefix(collection, &clause.field, &fragment);
+                            terms.extend(expanded);
+                        }
+                        terms
+                    })
+                    .clone()
+            } else {
+                crate::fts::analyze(&clause.text, cfg)
+            };
             let fragments = crate::fts::fragments(&text, cfg, &terms, opts);
             if !fragments.is_empty() {
                 out.push(Highlight {

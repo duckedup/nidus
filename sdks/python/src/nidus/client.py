@@ -416,6 +416,7 @@ class NidusClient:
         min_score: Optional[float] = None,
         filter: Optional[Filter] = None,  # noqa: A002
         clauses: Optional[Sequence[FtsClause]] = None,
+        prefix: Optional[bool] = None,
         combine: Optional[str] = None,
         explain: Optional[bool] = None,
         highlight: Optional[Union[bool, HighlightOpts]] = None,
@@ -435,12 +436,14 @@ class NidusClient:
         default) rewards a document matching in two fields, ``"Max"`` takes the strongest
         clause so a long body cannot out-accumulate a precise title match.
 
-        ``explain=True`` reports each matched clause's own score, and ``highlight=True``
-        (or a ``{"max_fragments": …, "fragment_chars": …}`` mapping) returns fragments of
-        the stored text; both land on ``hit.annotations``. Highlighting reads the stored
-        text, so it still works on a field the projection dropped. ``rerank`` is documented
-        on :class:`~nidus.RerankOpts`; on the single-field spelling its ``query`` defaults
-        to this method's own ``query``.
+        ``prefix=True`` expands the query's final term as a prefix (typeahead); on the
+        ``clauses`` spelling, set it per clause instead via ``{"field": …, "query": …,
+        "prefix": True}``. ``explain=True`` reports each matched clause's own score, and
+        ``highlight=True`` (or a ``{"max_fragments": …, "fragment_chars": …}`` mapping)
+        returns fragments of the stored text; both land on ``hit.annotations``.
+        Highlighting reads the stored text, so it still works on a field the projection
+        dropped. ``rerank`` is documented on :class:`~nidus.RerankOpts`; on the
+        single-field spelling its ``query`` defaults to this method's own ``query``.
         """
         return self._search(
             _wire.TEXT_SEARCH,
@@ -453,6 +456,7 @@ class NidusClient:
                 min_score=min_score,
                 filter=filter,
                 clauses=clauses,
+                prefix=prefix,
                 combine=combine,
                 explain=explain,
                 highlight=highlight,
@@ -479,6 +483,7 @@ class NidusClient:
         rrf_k: Optional[float] = None,
         candidates: Optional[int] = None,
         clauses: Optional[Sequence[FtsClause]] = None,
+        prefix: Optional[bool] = None,
         combine: Optional[str] = None,
         explain: Optional[bool] = None,
         highlight: Optional[Union[bool, HighlightOpts]] = None,
@@ -492,7 +497,8 @@ class NidusClient:
         ``offset`` pages the *fused* ranking, never a leg — a leg's rank is an input to
         the fused score. The text leg takes ``field`` + ``text`` or a ``clauses`` list, on
         the same either/or rule as :meth:`text_search`; a clause spells its text ``query``
-        on both routes.
+        on both routes. ``prefix=True`` expands the shorthand's final term as a prefix; on
+        the ``clauses`` spelling, set it per clause instead.
 
         ``vector_weight``/``text_weight`` scale each leg's contribution to the fused score
         (both default to 1.0, which is the unweighted fusion exactly). With ``explain=True``
@@ -513,6 +519,7 @@ class NidusClient:
                 rrf_k=rrf_k,
                 candidates=candidates,
                 clauses=clauses,
+                prefix=prefix,
                 combine=combine,
                 explain=explain,
                 highlight=highlight,
@@ -536,6 +543,7 @@ class NidusClient:
         rrf_k: Optional[float] = None,
         candidates: Optional[int] = None,
         clauses: Optional[Sequence[FtsClause]] = None,
+        prefix: Optional[bool] = None,
         combine: Optional[str] = None,
         explain: Optional[bool] = None,
         highlight: Optional[Union[bool, HighlightOpts]] = None,
@@ -558,6 +566,7 @@ class NidusClient:
                 rrf_k=rrf_k,
                 candidates=candidates,
                 clauses=clauses,
+                prefix=prefix,
                 combine=combine,
                 explain=explain,
                 highlight=highlight,

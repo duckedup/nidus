@@ -550,6 +550,62 @@ describe("NidusClient request shaping", () => {
     });
   });
 
+  it("carries prefix on the shorthand and per-clause, omitted from the body when unset", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    await db.textSearch({ field: "title", query: "ru", prefix: true });
+    expect(calls[0]!.json).toEqual({
+      field: "title",
+      query: "ru",
+      prefix: true,
+      scope: [],
+      filter: [],
+    });
+
+    await db.textSearch({ field: "title", query: "ru" });
+    expect(calls[1]!.json).toEqual({
+      field: "title",
+      query: "ru",
+      scope: [],
+      filter: [],
+    });
+    expect(calls[1]!.json).not.toHaveProperty("prefix");
+
+    await db.textSearch({
+      clauses: [
+        { field: "title", query: "ru", prefix: true },
+        { field: "body", query: "async" },
+      ],
+    });
+    expect(calls[2]!.json).toEqual({
+      clauses: [
+        { field: "title", query: "ru", prefix: true },
+        { field: "body", query: "async" },
+      ],
+      scope: [],
+      filter: [],
+    });
+
+    await db.hybridSearch({
+      vector: [1, 0, 0],
+      field: "title",
+      text: "ru",
+      prefix: true,
+    });
+    expect(calls[3]!.json).toEqual({
+      vector: [1, 0, 0],
+      field: "title",
+      text: "ru",
+      prefix: true,
+      scope: [],
+      filter: [],
+    });
+
+    await db.hybridSearch({ vector: [1, 0, 0], field: "title", text: "ru" });
+    expect(calls[4]!.json).not.toHaveProperty("prefix");
+  });
+
   it("spells the hybrid text leg as field+text or clauses, and weights each leg", async () => {
     const { fn, calls } = mockFetch([]);
     const db = new NidusClient({ baseUrl: "http://x", fetch: fn });

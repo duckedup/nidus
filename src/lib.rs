@@ -103,7 +103,9 @@ pub use memory::{
 #[cfg(all(feature = "memory", feature = "summarize"))]
 pub use memory::{META_SOURCE, META_SUMMARY};
 
-pub use annotate::{Annotations, ClauseScore, Fragment, Highlight, HighlightOpts, LegScore};
+pub use annotate::{
+    Annotations, ClauseScore, Expansion, Fragment, Highlight, HighlightOpts, LegScore,
+};
 pub use anyhow::Result;
 pub use backend::{
     Appender, BackendLock, CasOutcome, ClusterLease, LeaseLost, LeaseRenewer, LocalFs, LocalRam,

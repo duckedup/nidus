@@ -205,10 +205,20 @@ hybrid_hits = db.hybrid_search(
     text="vector store",
     top_k=10,
 )
+
+# Prefix match for typeahead: only the final word of `query` expands
+typeahead_hits = db.text_search(field="title", query="quick br", prefix=True, top_k=10)
 ```
 
 `hybrid_search` takes no `min_score`: its score is a fused RRF rank, not a similarity, so
 there is no meaningful floor to set. `rrf_k` and `candidates` tune the fusion.
+
+`prefix` (default `False`, and omitted from the request body when unset) expands only the
+final word of the query text to every indexed term carrying it as a prefix, for
+autocomplete as a caller is still typing; earlier words still match exactly. It is capped
+at 256 expansions, past which the commonest completions win rather than the call failing.
+`FtsClause` (the `clauses` spelling for several fields) carries the same key, so a
+multi-clause query can prefix-match one field while another stays exact.
 
 ## Batch search and aggregation
 

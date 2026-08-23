@@ -205,12 +205,23 @@ hybrid, err := db.HybridSearch(ctx, nidus.HybridSearchRequest{
     Text:   "vector store",
     TopK:   10,
 })
+
+// Prefix match for typeahead: only the final word of Query expands
+truePrefix := true
+typeahead, err := db.TextSearch(ctx, nidus.TextSearchRequest{
+    Field: "title", Query: "quick br", Prefix: &truePrefix, TopK: 10,
+})
 ```
 
 `RRFK` and `Candidates` are `*float32` / `*int`: `nil` takes the server's defaults (60 and
 100). They are pointers because zero is a real request for both: the server fuses with
 `1/(rrf_k + rank + 1)`, so an `RRFK` of `0` is the maximally top-heavy weighting, and a
 `Candidates` of `0` fuses exactly `TopK` deep with no over-fetch.
+
+`Prefix` is `*bool`, same idiom: `nil` (the zero value) means the final term must match a
+word exactly, `true` expands it to any indexed term carrying it as a prefix (autocomplete),
+capped at 256 expansions. `FtsClause` also carries its own `Prefix *bool`, so a multi-clause
+query can prefix-match one field while another stays exact.
 
 ## Batch search and aggregation
 

@@ -57,6 +57,7 @@ from .types import (
     ClauseScore,
     ClusterStatus,
     Expand,
+    Expansion,
     FilterIndexField,
     Footprint,
     Fragment,
@@ -388,6 +389,7 @@ def text_search_body(
     min_score: Optional[float] = None,
     filter: Optional[Filter] = None,  # noqa: A002
     clauses: Optional[Sequence[FtsClause]] = None,
+    prefix: Optional[bool] = None,
     combine: Optional[str] = None,
     explain: Optional[bool] = None,
     highlight: Optional[Union[bool, HighlightOpts]] = None,
@@ -403,11 +405,13 @@ def text_search_body(
 
     The query is named either as ``field`` + ``query`` or as a ``clauses`` list, never both
     — see :func:`_fts_query`. A single-field call is sent in exactly the spelling it always
-    was. ``rerank`` is documented on :class:`~nidus.types.RerankOpts`.
+    was. ``prefix`` expands that call's final term as a prefix (typeahead); a ``clauses``
+    call sets it per clause instead. ``rerank`` is documented on
+    :class:`~nidus.types.RerankOpts`.
     """
     return prune(
         {
-            **_fts_query("text_search", field, query, clauses, text_key="query"),
+            **_fts_query("text_search", field, query, clauses, text_key="query", prefix=prefix),
             "combine": combine,
             "scope": _scope(scope),
             "top_k": top_k,
@@ -437,6 +441,7 @@ def hybrid_search_body(
     rrf_k: Optional[float] = None,
     candidates: Optional[int] = None,
     clauses: Optional[Sequence[FtsClause]] = None,
+    prefix: Optional[bool] = None,
     combine: Optional[str] = None,
     explain: Optional[bool] = None,
     highlight: Optional[Union[bool, HighlightOpts]] = None,
@@ -451,13 +456,15 @@ def hybrid_search_body(
     Note there is no ``min_score``: the score is a fused RRF rank, not a similarity, so
     the server offers no floor for it. ``offset`` pages the *fused* ranking. The text leg
     takes the same two spellings as ``/text-search``, except that its single-field text is
-    called ``text``; a clause's is ``query`` on both routes. ``rerank`` is documented on
-    :class:`~nidus.types.RerankOpts`. ``plan`` is set only by the ``*_with_plan`` methods.
+    called ``text``; a clause's is ``query`` on both routes. ``prefix`` expands the
+    shorthand's final term; a ``clauses`` call sets it per clause instead. ``rerank`` is
+    documented on :class:`~nidus.types.RerankOpts`. ``plan`` is set only by the
+    ``*_with_plan`` methods.
     """
     return prune(
         {
             "vector": _guards.float_sequence(vector, "hybrid_search(vector=...)"),
-            **_fts_query("hybrid_search", field, text, clauses, text_key="text"),
+            **_fts_query("hybrid_search", field, text, clauses, text_key="text", prefix=prefix),
             "combine": combine,
             "scope": _scope(scope),
             "top_k": top_k,
@@ -1025,13 +1032,16 @@ def _fts_query(
     clauses: Optional[Sequence[FtsClause]],
     *,
     text_key: str,
+    prefix: Optional[bool] = None,
 ) -> dict[str, Any]:
     """The keys naming a text query, from whichever of the two spellings the caller used.
 
     Both spellings at once, neither, half of the single one, or an empty clause list are all
     refused here rather than sent. The server refuses them too — and must, since it also
     answers other clients — but an empty result would otherwise read as "no matches" when it
-    means "no query", and failing here names the argument at the call site.
+    means "no query", and failing here names the argument at the call site. ``prefix`` names
+    the shorthand's own flag; a clause dict carries its own and the server ignores this one
+    when ``clauses`` is sent, so it is left off that branch entirely.
     """
     if clauses is not None:
         if field is not None or text is not None:
@@ -1041,12 +1051,16 @@ def _fts_query(
         _guards.reject_bare_string(clauses, f"{who}(clauses=...)")
         if not clauses:
             raise ValueError(f"{who}: clauses must not be empty — an empty query matches nothing")
-        return {"clauses": [_spec(c, f"{who}(clauses=...)", ("field", "query")) for c in clauses]}
+        return {
+            "clauses": [
+                _spec(c, f"{who}(clauses=...)", ("field", "query"), ("prefix",)) for c in clauses
+            ]
+        }
     if field is None and text is None:
         raise ValueError(f"{who} needs a field plus its {text_key}, or a clauses list")
     if field is None or text is None:
         raise ValueError(f"{who}: field and {text_key} must be sent together")
-    return {"field": field, text_key: text}
+    return {"field": field, text_key: text, "prefix": prefix}
 
 
 def _highlight(highlight: Optional[Union[bool, HighlightOpts]]) -> Optional[dict[str, Any]]:
@@ -1148,7 +1162,16 @@ def _leg_score(payload: Any) -> Optional[LegScore]:
 
 
 def _clause_score(payload: Mapping[str, Any]) -> ClauseScore:
-    return ClauseScore(field=str(payload["field"]), score=float(payload["score"]))
+    exp = payload.get("expansion")
+    return ClauseScore(
+        field=str(payload["field"]),
+        score=float(payload["score"]),
+        expansion=(
+            Expansion(matched=int(exp["matched"]), scored=int(exp["scored"]))
+            if isinstance(exp, Mapping)
+            else None
+        ),
+    )
 
 
 def _highlight_of(payload: Mapping[str, Any]) -> Highlight:

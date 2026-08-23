@@ -149,11 +149,25 @@ const hybrid = await db.hybridSearch({
   text: "vector store",
   topK: 10,
 });
+
+// Prefix match for typeahead: only the final word of `query` expands
+const typeahead = await db.textSearch({
+  field: "title",
+  query: "quick br",
+  prefix: true,
+  topK: 10,
+});
 ```
 
-Both accept `clauses` (a `TextClause[]`, each `{ field, query }`) instead of a single
-`field`/`query`, folded by `combine` (`"Sum"` by default, or `"Max"`). Naming the field
-both ways at once is a `400`.
+Both accept `clauses` (a `TextClause[]`, each `{ field, query, prefix? }`) instead of a
+single `field`/`query`, folded by `combine` (`"Sum"` by default, or `"Max"`). Naming the
+field both ways at once is a `400`.
+
+`prefix` (default `false`, omitted from the request body when unset) expands only the
+final word of that field's query text to every indexed term carrying it as a prefix, for
+autocomplete as a caller is still typing; earlier words still match exactly. It is capped
+at 256 expansions, past which the commonest completions win rather than the call failing.
+Set it on the shorthand `field`/`query` call, or per-entry inside `clauses`.
 
 ## Remembering and recalling
 

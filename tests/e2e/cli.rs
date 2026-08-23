@@ -1995,6 +1995,52 @@ fn cli_text_search_ranking_knobs_reshape_the_page() {
     );
 }
 
+/// `text-search --prefix`, through the real binary: a truncated query matches only with the
+/// flag. Asserting solely the prefix case would pass against a binary that ignores it.
+#[test]
+fn cli_text_search_prefix_matches_a_truncated_query() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(
+        &["set-fts-schema", "--dir", dir, "docs", "--field", "body"],
+        "",
+    );
+    let seed = json!([
+        {"id": "d1", "vector": [1, 0, 0], "attrs": {"body": {"Str": "an elephant walked slowly"}}}
+    ])
+    .to_string();
+    ok(&["upsert", "--dir", dir, "docs"], &seed);
+
+    let hits = ok(
+        &["text-search", "--dir", dir, "-k", "5", "body", "elep"],
+        "",
+    );
+    assert!(
+        ids(&hits).is_empty(),
+        "an exact query must not prefix-match: {hits}"
+    );
+
+    let hits = ok(
+        &[
+            "text-search",
+            "--dir",
+            dir,
+            "-k",
+            "5",
+            "--prefix",
+            "body",
+            "elep",
+        ],
+        "",
+    );
+    assert_eq!(
+        ids(&hits),
+        ["d1"],
+        "--prefix must match the truncated term: {hits}"
+    );
+}
+
 /// `recall --diversity` through the binary. `remember` pins the collection and provisions the
 /// store at the embedder's dimension; the crowded corpus is then written as raw vectors built
 /// in the query's own embedding space, so which hits are redundant is computed, not guessed.

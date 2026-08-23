@@ -107,6 +107,16 @@ type LegScore struct {
 type ClauseScore struct {
 	Field string  `json:"field"`
 	Score float32 `json:"score"`
+	// Expansion is set only for a prefix clause. Matched > Scored means the expansion
+	// cap truncated the term list, so the score covers only the commonest completions.
+	Expansion *Expansion `json:"expansion,omitempty"`
+}
+
+// An Expansion reports how far a prefix clause's final term expanded: how many indexed
+// terms carried the prefix, and how many were actually scored after the cap.
+type Expansion struct {
+	Matched int `json:"matched"`
+	Scored  int `json:"scored"`
 }
 
 // A Highlight is the fragments found in one full-text field.
@@ -481,9 +491,14 @@ type FilterIndexField struct {
 
 // An FtsClause is one clause of a multi-field text query: an indexed field and the raw
 // query text for it, so title:"rust" plus body:"async runtime" is a single query.
+//
+// Prefix expands the clause's final term as a prefix match (typeahead): earlier terms
+// still require an exact stem match. A pointer because nil (the common case) omits the
+// field from the wire entirely, matching the server's "omitted means false" default.
 type FtsClause struct {
-	Field string `json:"field"`
-	Query string `json:"query"`
+	Field  string `json:"field"`
+	Query  string `json:"query"`
+	Prefix *bool  `json:"prefix,omitempty"`
 }
 
 // How several [FtsClause]s fold into one text score, for the Combine field of a text or
@@ -539,9 +554,12 @@ type RerankOptions struct {
 // Explain reports each matched clause's own BM25 score on every hit, and Highlight
 // returns excerpts; both land in [Hit.Annotations].
 type TextSearchRequest struct {
-	Field     string         `json:"field,omitempty"`
-	Query     string         `json:"query,omitempty"`
-	Clauses   []FtsClause    `json:"clauses,omitempty"`
+	Field   string      `json:"field,omitempty"`
+	Query   string      `json:"query,omitempty"`
+	Clauses []FtsClause `json:"clauses,omitempty"`
+	// Prefix expands the final term of the Field+Query shorthand as a prefix match.
+	// Ignored (Clauses carries its own per-entry flag instead) when Clauses is set.
+	Prefix    *bool          `json:"prefix,omitempty"`
 	Combine   string         `json:"combine,omitempty"` // CombineSum (default) or CombineMax
 	Scope     []string       `json:"scope,omitempty"`
 	TopK      int            `json:"top_k,omitempty"`
@@ -576,10 +594,13 @@ type TextSearchRequest struct {
 // of &0 drops that leg's contribution entirely. nil, not zero, is how you ask for the
 // server's default (60.0, 100, 1.0 and 1.0).
 type HybridSearchRequest struct {
-	Vector       []float32      `json:"vector"`
-	Field        string         `json:"field,omitempty"`
-	Text         string         `json:"text,omitempty"`
-	Clauses      []FtsClause    `json:"clauses,omitempty"`
+	Vector  []float32   `json:"vector"`
+	Field   string      `json:"field,omitempty"`
+	Text    string      `json:"text,omitempty"`
+	Clauses []FtsClause `json:"clauses,omitempty"`
+	// Prefix expands the final term of the Field+Text shorthand as a prefix match.
+	// Ignored (Clauses carries its own per-entry flag instead) when Clauses is set.
+	Prefix       *bool          `json:"prefix,omitempty"`
 	Combine      string         `json:"combine,omitempty"`
 	Scope        []string       `json:"scope,omitempty"`
 	TopK         int            `json:"top_k,omitempty"`

@@ -22,7 +22,11 @@ interface WireHighlight {
 export interface WireAnnotations {
   vector?: { rank: number; score: number };
   text?: { rank: number; score: number };
-  clauses?: { field: string; score: number }[];
+  clauses?: {
+    field: string;
+    score: number;
+    expansion?: { matched: number; scored: number };
+  }[];
   highlights?: WireHighlight[];
 }
 

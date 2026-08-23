@@ -555,13 +555,28 @@ curl -s localhost:7700/text-search \
 | field | default | meaning |
 | --- | --- | --- |
 | `field` + `query` | – | the single-clause spelling |
-| `clauses` | – | `[{field, query}, …]`, one entry per field searched |
+| `prefix` | `false` | expand the `field`+`query` shorthand's final term as a prefix; ignored when `clauses` is sent |
+| `clauses` | – | `[{field, query, prefix}, …]`, one entry per field searched |
 | `combine` | `"Sum"` | `"Sum"` adds every matched clause's score; `"Max"` takes the strongest |
 | `explain` | `false` | report each matched clause's own BM25 score |
 | `highlight` | absent | `{}` for defaults, or `{"max_fragments": 2, "fragment_chars": 120}` |
 
 `field`+`query` and `clauses` are **mutually exclusive**, and an empty `clauses` list is a
 `400`: an empty result set would otherwise read as "no matches" rather than "no query".
+
+Each clause's `prefix` (default `false`, absent means `false`) matches only that clause's
+**final** term as a prefix, for autocomplete/typeahead; earlier terms still match exactly:
+
+```bash
+curl -s localhost:7700/text-search \
+  -H 'content-type: application/json' \
+  -d '{"field": "title", "query": "quick br", "prefix": true, "top_k": 5}'
+```
+
+The expansion is capped at 256 terms; past the cap the match keeps the commonest
+completions rather than erroring. With `explain: true`, a hit's clause score carries
+`"expansion": {"matched": N, "scored": M}`, `matched > scored` meaning the cap
+truncated it. See [prefix matching for typeahead](/guides/search/#prefix-matching-for-typeahead).
 
 `/text-search` also takes the same `rerank` field as `/search` (`overscan` default `10`,
 `text_attr` default `"nidus.text"`). `query` is optional when the query is named as one
@@ -572,14 +587,15 @@ See [the `/search` entry above](#post-search) and the [reranking guide](/guides/
 for the field shape and the passthrough/score-scale rules, which apply here unchanged.
 
 `/text-search` has no `plan` field: it always runs the same BM25 postings walk, so there is
-no branch worth reporting. [Query plans](#query-plans-how-a-query-ran) below cover only
-`/search`, `/search/similar`, and `/hybrid-search`.
+no branch worth a `plan`. [Query plans](#query-plans-how-a-query-ran) below cover only
+`/search`, `/search/similar`, and `/hybrid-search`. A prefix clause's expansion cap is
+reported through `explain` instead, as `expansion` on that clause's score.
 
 ### `POST /hybrid-search`
 
 Fuse a vector query and a BM25 text query with Reciprocal Rank Fusion. Takes `vector`
-plus the text leg (`field` + `text`, or the same `clauses` + `combine` as `/text-search`),
-plus `top_k`, `offset` (which pages the **fused** ranking, never a leg),
+plus the text leg (`field` + `text`, or the same `clauses` + `combine` + `prefix` as
+`/text-search`), plus `top_k`, `offset` (which pages the **fused** ranking, never a leg),
 `filter`, `rrf_k` (default 60), `candidates` (default 100), `explain`/`highlight`, and
 `plan` (report how the query ran; see [Query plans](#query-plans-how-a-query-ran)).
 There is no `min_score` (a fused RRF score has no absolute scale). It also takes `expand`,

@@ -471,6 +471,24 @@ async def test_the_multi_clause_and_ranking_knobs_reach_the_same_wire() -> None:
             )
 
 
+async def test_prefix_reaches_the_wire_on_the_async_client_too() -> None:
+    """The sync client's ``prefix`` coverage (both spellings, both routes), awaited."""
+    mock = MockServer([])
+    async with client(mock) as db:
+        await db.text_search(field="body", query="ru")
+        assert "prefix" not in mock.json
+        await db.text_search(field="body", query="ru", prefix=True)
+        assert mock.json["prefix"] is True
+        await db.text_search(clauses=[{"field": "body", "query": "ru", "prefix": True}])
+        assert mock.json["clauses"][0]["prefix"] is True
+        await db.hybrid_search(vector=[1.0], field="body", text="ru", prefix=True)
+        assert mock.json["prefix"] is True
+        await db.hybrid_search(
+            vector=[1.0], clauses=[{"field": "body", "query": "ru", "prefix": True}]
+        )
+        assert mock.json["clauses"][0]["prefix"] is True
+
+
 async def test_rerank_reaches_the_wire_on_every_rerankable_method() -> None:
     """``rerank`` on ``search``/``text_search``/``hybrid_search``/``recall``, async client."""
     mock = MockServer([])

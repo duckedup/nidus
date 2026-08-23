@@ -248,6 +248,21 @@ at the call site rather than answered as "no matches". `hit.annotations` is `Non
 `rank` and `score`, which is the only way to see a leg's rank, since the returned score is
 the fused one.
 
+`prefix=True` expands a clause's **final** term as a prefix instead of an exact stem
+match, for typeahead:
+
+```python
+# Matches "running", "runtime", … — every indexed term "run" is a prefix of.
+db.text_search(field="title", query="run", prefix=True)
+
+# On the clauses spelling it is set per clause, not on the call as a whole.
+db.text_search(clauses=[{"field": "title", "query": "run", "prefix": True}])
+```
+
+Only the clause's last term expands; earlier terms still need an exact stem match. The
+index holds stems, so `"runn"` will not prefix-match indexed `"run"` — the fragment itself
+is not stemmed, only fold-normalized (lowercased, accent-stripped).
+
 ## Query plans
 
 `search`, `search_similar`, and `hybrid_search` each have a `_with_plan` sibling that

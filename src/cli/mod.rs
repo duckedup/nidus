@@ -850,6 +850,12 @@ struct TextQueryArgs {
     /// field + query pair, never alongside it.
     #[arg(long = "clause")]
     clauses: Vec<String>,
+    /// An extra clause whose final term is a prefix, `field=text` (repeatable).
+    #[arg(long = "prefix-clause")]
+    prefix_clauses: Vec<String>,
+    /// Match the positional query's final term as a prefix (typeahead).
+    #[arg(long)]
+    prefix: bool,
     /// How several clauses fold into one score.
     #[arg(long, value_enum, default_value_t = CombineArg::Sum)]
     combine: CombineArg,
@@ -871,22 +877,36 @@ impl TextQueryArgs {
     /// Build the query, taking the clauses from the positional `field`/`text` pair or from
     /// repeated `--clause field=text` — the same either/or the HTTP body enforces.
     fn query(&self, field: Option<String>, text: Option<String>) -> anyhow::Result<FtsQuery> {
-        let clauses = match (field, text, self.clauses.is_empty()) {
-            (Some(f), Some(t), true) => vec![FtsClause::new(f, t)],
-            (None, None, false) => self
-                .clauses
-                .iter()
-                .map(|c| {
-                    c.split_once('=')
-                        .map(|(f, t)| FtsClause::new(f, t))
-                        .ok_or_else(|| anyhow::anyhow!("--clause must be field=text, got '{c}'"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?,
+        let no_clauses = self.clauses.is_empty() && self.prefix_clauses.is_empty();
+        let clauses = match (field, text, no_clauses) {
+            (Some(f), Some(t), true) => {
+                let clause = FtsClause::new(f, t);
+                vec![if self.prefix { clause.prefix() } else { clause }]
+            }
+            (None, None, false) => {
+                if self.prefix {
+                    anyhow::bail!(
+                        "--prefix applies to the positional field/text pair; use --prefix-clause for --clause"
+                    );
+                }
+                Self::parse_clauses(&self.clauses, "--clause", false)?
+                    .into_iter()
+                    .chain(Self::parse_clauses(
+                        &self.prefix_clauses,
+                        "--prefix-clause",
+                        true,
+                    )?)
+                    .collect()
+            }
             (None, None, true) => {
-                anyhow::bail!("give a field and its query text, or one or more --clause field=text")
+                anyhow::bail!(
+                    "give a field and its query text, or one or more --clause/--prefix-clause field=text"
+                )
             }
             _ => {
-                anyhow::bail!("the positional field/text pair and --clause are mutually exclusive")
+                anyhow::bail!(
+                    "the positional field/text pair and --clause/--prefix-clause are mutually exclusive"
+                )
             }
         };
         let mut q = FtsQuery::multi(clauses).combine(self.combine.into());
@@ -898,6 +918,24 @@ impl TextQueryArgs {
             );
         }
         Ok(q)
+    }
+
+    /// Parse `field=text` entries into clauses, flagging each `prefix` per `is_prefix`.
+    fn parse_clauses(
+        raw: &[String],
+        flag: &str,
+        is_prefix: bool,
+    ) -> anyhow::Result<Vec<FtsClause>> {
+        raw.iter()
+            .map(|c| {
+                c.split_once('=')
+                    .map(|(f, t)| {
+                        let clause = FtsClause::new(f, t);
+                        if is_prefix { clause.prefix() } else { clause }
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("{flag} must be field=text, got '{c}'"))
+            })
+            .collect()
     }
 }
 
@@ -3263,6 +3301,96 @@ mod tests {
             }
             _ => panic!("expected TextSearch"),
         }
+    }
+
+    /// `--prefix-clause` alone must not fall into the "give a field and its query text"
+    /// bail, and must flag its clause `prefix == true`.
+    #[test]
+    fn prefix_clause_alone_yields_one_prefix_flagged_clause() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "text-search",
+            "--dir",
+            "/tmp/s",
+            "--prefix-clause",
+            "title=nid",
+        ])
+        .unwrap();
+        let Command::TextSearch { text, .. } = cli.command else {
+            panic!("expected TextSearch");
+        };
+        let q = text.query(None, None).unwrap();
+        assert_eq!(q.clauses.len(), 1);
+        assert!(q.clauses[0].prefix);
+    }
+
+    #[test]
+    fn clause_and_prefix_clause_together_yield_both_flagged_correspondingly() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "text-search",
+            "--dir",
+            "/tmp/s",
+            "--clause",
+            "body=quantum",
+            "--prefix-clause",
+            "title=nid",
+        ])
+        .unwrap();
+        let Command::TextSearch { text, .. } = cli.command else {
+            panic!("expected TextSearch");
+        };
+        let q = text.query(None, None).unwrap();
+        assert_eq!(q.clauses.len(), 2);
+        assert!(!q.clauses[0].prefix);
+        assert!(q.clauses[1].prefix);
+    }
+
+    #[test]
+    fn positional_pair_with_prefix_flags_the_single_clause() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "text-search",
+            "--dir",
+            "/tmp/s",
+            "--prefix",
+            "title",
+            "nid",
+        ])
+        .unwrap();
+        let Command::TextSearch {
+            text, field, query, ..
+        } = cli.command
+        else {
+            panic!("expected TextSearch");
+        };
+        let q = text.query(field, query).unwrap();
+        assert_eq!(q.clauses.len(), 1);
+        assert!(q.clauses[0].prefix);
+    }
+
+    /// The positional pair and `--prefix-clause` stay mutually exclusive, same as `--clause`.
+    #[test]
+    fn prefix_clause_alongside_positional_pair_still_errors() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "text-search",
+            "--dir",
+            "/tmp/s",
+            "--prefix-clause",
+            "title=nid",
+            "body",
+            "quantum",
+        ])
+        .unwrap();
+        let Command::TextSearch {
+            text, field, query, ..
+        } = cli.command
+        else {
+            panic!("expected TextSearch");
+        };
+        let err = text.query(field, query).expect_err("expected an error");
+        assert!(err.to_string().contains("--prefix-clause"), "{err}");
     }
 
     #[cfg(feature = "rerank")]

@@ -16,6 +16,7 @@ export type {
   Annotations,
   AttrInput,
   ClauseScore,
+  Expansion,
   ClusterStatus,
   Decay,
   DecodedRecord,

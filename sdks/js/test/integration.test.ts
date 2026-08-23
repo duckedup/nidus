@@ -259,6 +259,37 @@ describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
     expect(hybrid[0]!.annotations!.text).toBeDefined();
   });
 
+  // A truncated query matches only with `prefix: true` — asserting solely the positive case
+  // would pass against a client that drops the field entirely.
+  it("prefix expands a truncated clause's final term, on both spellings", async () => {
+    await db.createCollection("m51");
+    await db.setFtsSchema("m51", ["title"]);
+    await db.upsert("m51", [
+      { id: "a", vector: [1, 0, 0], attrs: { title: "running quickly" } },
+    ]);
+
+    const noPrefix = await db.textSearch({
+      scope: ["m51"],
+      field: "title",
+      query: "ru",
+    });
+    expect(noPrefix.map((h) => h.id)).toEqual([]);
+
+    const shorthand = await db.textSearch({
+      scope: ["m51"],
+      field: "title",
+      query: "ru",
+      prefix: true,
+    });
+    expect(shorthand.map((h) => h.id)).toEqual(["a"]);
+
+    const clauseForm = await db.textSearch({
+      scope: ["m51"],
+      clauses: [{ field: "title", query: "ru", prefix: true }],
+    });
+    expect(clauseForm.map((h) => h.id)).toEqual(["a"]);
+  });
+
   it("deletes and reflects the change in stats", async () => {
     expect(await db.delete("docs", { ids: ["b"] })).toBe(1);
     const remaining = await db.records("docs");

@@ -1002,6 +1002,36 @@ let q = q.combine(FtsCombine::Max);
 - `FtsQuery::new(field, text)` is the one-clause shorthand, and a single clause scores
   exactly the same under either combine mode. `min_score` applies to the combined score.
 
+### Prefix matching for typeahead
+
+A clause can match its final term as a **prefix** instead of a complete word, for
+autocomplete as a caller is still typing. Set `prefix` on the clause:
+
+```rust
+use nidus::{FtsClause, FtsQuery};
+
+let q = FtsQuery::multi([FtsClause::new("title", "quick br").prefix()]);
+let hits = db.text_search("docs", &q, &SearchOpts { top_k: 10, ..Default::default() })?;
+# anyhow::Ok(())
+```
+
+Only the **final** term of the clause's text expands: `"quick br"` with `prefix` set
+matches any indexed term starting with `br` (`brown`, `bread`, …), while `quick` still
+has to match exactly. Each expanded term keeps its own idf and scores as its own
+disjunct, so a rare completion can outrank a common one rather than all completions
+scoring identically.
+
+The expansion is capped at 256 terms. Past the cap, the match keeps the most common
+completions (highest document frequency first) rather than erroring: a caller typing
+one character expects *something* back, not a rejection. When `explain: true` is set,
+each hit's `ClauseScore` carries an `expansion: {matched, scored}` so a caller can tell
+when the cap has truncated a broad prefix.
+
+**Limitation:** the prefix fragment is folded (lowercased, optionally ASCII-folded) but
+not stemmed, while the index holds stems. So `"runn"` will not match an indexed `run`
+even though `run` is what `"running"` stems to: matching against surface forms as well
+as stems would lift this and is a larger, separate change.
+
 ### Tuning a field
 
 Each declared field is an `FtsField`, and every knob has a default that reproduces

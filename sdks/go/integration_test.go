@@ -795,6 +795,29 @@ func TestRankingAndAnnotationsAgainstARealServer(t *testing.T) {
 		}
 	})
 
+	t.Run("prefix expands a truncated final term", func(t *testing.T) {
+		on := true
+		hits, err := db.TextSearch(ctx, TextSearchRequest{
+			Field: "body", Query: "sched", Prefix: &on,
+		})
+		if err != nil {
+			t.Fatalf("TextSearch failed: %v", err)
+		}
+		if !sameSet(ids(hits), []string{"b"}) {
+			t.Fatalf("hits = %v, want just b (schedules -> sched*)", ids(hits))
+		}
+
+		// The same truncated term unset must not exact-stem-match; only asserting the
+		// positive case above would pass against a client that silently drops Prefix.
+		hits, err = db.TextSearch(ctx, TextSearchRequest{Field: "body", Query: "sched"})
+		if err != nil {
+			t.Fatalf("TextSearch failed: %v", err)
+		}
+		if len(hits) != 0 {
+			t.Fatalf("hits = %v, want none without Prefix", ids(hits))
+		}
+	})
+
 	t.Run("hybrid explain reports each leg, and a zero weight drops one", func(t *testing.T) {
 		hits, err := db.HybridSearch(ctx, HybridSearchRequest{
 			Vector: []float32{1, 0, 0}, Field: "title", Text: "rust", Explain: true,

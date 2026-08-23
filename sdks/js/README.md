@@ -171,6 +171,16 @@ const hits = await db.textSearch({
 });
 ```
 
+Set `prefix` to expand a clause's *final* term as a prefix match, for typeahead: `query:
+"ru"` with `prefix: true` matches an indexed term like `"running"`; earlier terms in a
+clause still require an exact stem match. On the `clauses` spelling, set `prefix` per
+entry instead of at the top level.
+
+```ts
+await db.textSearch({ field: "title", query: "ru", prefix: true });
+await db.textSearch({ clauses: [{ field: "title", query: "ru", prefix: true }] });
+```
+
 ## Explaining and highlighting a hit
 
 `explain` reports what each leg and each matched clause contributed; `highlight` returns
