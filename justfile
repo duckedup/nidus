@@ -177,6 +177,11 @@ test-wasm:
 test-wasm-e2e:
     ./scripts/e2e-wasm.sh test
 
+# Builds the docs site (with the wasm binding embedded) and drives the terminal
+# demo over OPFS in a real headless browser. Needs a driver AND a docs build.
+test-wasm-e2e-docs:
+    ./scripts/e2e-wasm.sh docs
+
 # Drives the SAME pinned `wasm-bindgen` the test runner uses, rather than wasm-pack: one
 # tool, one version to keep matching Cargo.lock. `release-wasm` is the size profile.
 build-wasm-binding:

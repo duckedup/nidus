@@ -317,9 +317,11 @@ test('tickets: an issue with no resolvable open title is not flagged', () => {
 
 // ── lanes ──────────────────────────────────────────────────────────────────
 
+// The docs site now embeds the wasm binding built from src/, so a store change
+// also advises a docs rebuild (nidus-7pj) alongside the pure-library gate.
 test('lanes: a store change runs the pure-library gate', () => {
   const r = lanes(['src/store/write.rs'])
-  eq(r.run.map(l => l.recipe), ['just ci'], 'recipes')
+  eq(r.run.map(l => l.recipe), ['just ci', 'just docs-build'], 'recipes')
 })
 
 // `just ci-cli` runs `test-cli`, which already includes the e2e suite — so a plain
@@ -327,7 +329,7 @@ test('lanes: a store change runs the pure-library gate', () => {
 // is the only recipe that builds with `--features cli,mcp`.
 test('lanes: a server change adds the cli gate that `just ci` skips', () => {
   const r = lanes(['src/server/mod.rs'])
-  eq(r.run.map(l => l.recipe), ['just ci', 'just ci-cli'], 'recipes')
+  eq(r.run.map(l => l.recipe), ['just ci', 'just ci-cli', 'just docs-build'], 'recipes')
 })
 
 test('lanes: the MCP surface pulls its own feature build', () => {
@@ -379,7 +381,24 @@ test('lanes: cluster tests are manual, not automatic', () => {
 test('lanes: the wasm_opfs browser suite and justfile are manual, not unmapped (nidus-3hc)', () => {
   const r = lanes(['tests/wasm_opfs/main.rs', 'justfile'])
   eq(r.unmatched, [], 'nothing unmapped')
-  eq(r.manual.map(l => l.recipe), ['just test-wasm-e2e'], 'manual')
+  // Both browser recipes live in the justfile, so editing it recommends both.
+  eq(r.manual.map(l => l.recipe), ['just test-wasm-e2e-docs', 'just test-wasm-e2e'], 'manual')
+})
+
+test('lanes: editing the docs-terminal recipe recommends that recipe (nidus-7pj)', () => {
+  const r = lanes(['justfile'])
+  eq(r.unmatched, [], 'nothing unmapped')
+  eq(
+    r.manual.map(l => l.recipe).includes('just test-wasm-e2e-docs'),
+    true,
+    'the recipe whose body lives in the justfile is recommended',
+  )
+})
+
+test('lanes: the docs terminal harness needs a browser (nidus-7pj)', () => {
+  const r = lanes(['docs/e2e/terminal.mjs'])
+  eq(r.unmatched, [], 'nothing unmapped')
+  eq(r.manual.map(l => l.recipe), ['just test-wasm-e2e-docs'], 'manual')
 })
 
 test('lanes: skill-only changes are inert', () => {
@@ -466,8 +485,11 @@ test('ci-guard: the wasm lanes (nidus-y67) key off src, the justfile and the bin
     // The recipes ARE the lane, so a justfile edit must not skip it.
     eq(ciGuard(job, ['justfile']).run, true, `${job} runs for the justfile`)
     eq(ciGuard(job, ['bindings/wasm/src/lib.rs']).run, true, `${job} runs for the binding`)
-    eq(ciGuard(job, ['docs/src/content/docs/guides/wasm.md']).run, false, `${job} skips docs`)
   }
+  // `wasm` never touches docs/; `wasm-e2e` now runs the docs terminal E2E too
+  // (nidus-7pj), so a docs change must wake it and only it.
+  eq(ciGuard('wasm', ['docs/src/content/docs/guides/wasm.md']).run, false, 'wasm skips docs')
+  eq(ciGuard('wasm-e2e', ['docs/src/content/docs/guides/wasm.md']).run, true, 'wasm-e2e runs for docs')
 })
 
 test('ci-guard: sdks/js runs wasm (nidus-3hc, the job now packs the ./wasm subpath)', () => {

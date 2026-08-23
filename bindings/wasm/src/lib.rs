@@ -53,6 +53,14 @@ impl NidusHandle {
         Nidus::open(cfg).map(NidusHandle).map_err(js_err)
     }
 
+    /// Open a RAM-only store, no persistence config. The terminal's fallback when the
+    /// worker/OPFS handshake fails.
+    pub fn open_in_memory(dimension: u32) -> Result<NidusHandle, JsValue> {
+        Nidus::open_in_memory(dimension as usize)
+            .map(NidusHandle)
+            .map_err(js_err)
+    }
+
     /// Upsert records given as a JS array of `{id, vector?, attrs}` (mirrors
     /// `server::dto::UpsertRequest`'s `Record` shape); returns the count written.
     pub fn upsert(&mut self, collection: &str, records: JsValue) -> Result<u32, JsValue> {
@@ -83,6 +91,18 @@ impl NidusHandle {
         self.0.flush().map_err(js_err)
     }
 
+    /// A RAM/disk footprint snapshot, shaped like `FootprintDto`. The terminal's `stats`.
+    pub fn footprint(&self) -> Result<JsValue, JsValue> {
+        let dto = FootprintDto::from(self.0.footprint());
+        serde_wasm_bindgen::to_value(&dto).map_err(js_value_err)
+    }
+
+    /// Drop a collection's rows. The terminal's `clear` — dropping rather than deleting
+    /// OPFS files underneath the pool's open handles.
+    pub fn drop_collection(&mut self, collection: &str) -> Result<(), JsValue> {
+        self.0.drop_collection(collection).map_err(js_err)
+    }
+
     /// Close the store. Consumes the handle: nidus's `Drop` releases the writer lock (a
     /// trivial always-held guard on OPFS), and the JS wrapper is invalidated with it.
     pub fn close(self) {}
@@ -105,6 +125,31 @@ impl From<nidus::Hit> for HitDto {
             id: h.id,
             score: h.score,
             attrs: h.attrs,
+        }
+    }
+}
+
+/// Serializable mirror of `nidus::Footprint` (which carries no serde derive, only
+/// `Clone, Copy, Debug, PartialEq, Eq`) — same pattern as `HitDto` above.
+#[derive(Serialize)]
+struct FootprintDto {
+    rows: u64,
+    dead_rows: u64,
+    dimension: usize,
+    vector_bytes: u64,
+    doc_count: usize,
+    filter_index_bytes: u64,
+}
+
+impl From<nidus::Footprint> for FootprintDto {
+    fn from(f: nidus::Footprint) -> Self {
+        Self {
+            rows: f.rows,
+            dead_rows: f.dead_rows,
+            dimension: f.dimension,
+            vector_bytes: f.vector_bytes,
+            doc_count: f.doc_count,
+            filter_index_bytes: f.filter_index_bytes,
         }
     }
 }

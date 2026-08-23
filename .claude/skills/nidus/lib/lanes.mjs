@@ -62,7 +62,18 @@ const RULES = [
   {
     recipe: 'just docs-build',
     why: 'the docs site changed — the Astro build is the only gate on it',
-    match: [/^docs\//],
+    match: [/^docs\//, /^src\//, /^bindings\/wasm\//],
+  },
+  {
+    // Kept separate from the `docs-build` rule above so a plain docs/ prose
+    // change does not also demand a browser: only the harness or the driver
+    // script itself should recommend the real e2e run.
+    recipe: 'just test-wasm-e2e-docs',
+    why: 'the docs terminal E2E harness or its driver script changed — needs a real headless browser',
+    manual: true,
+    // `justfile` counts because the recipe itself lives there, the same reason the
+    // test-wasm-e2e rule below matches it.
+    match: [/^docs\/e2e\//, /^scripts\/e2e-wasm\.sh$/, /^justfile$/],
   },
   // Each SDK lane mirrors its CI job step for step (ci.yml `sdk-js`/`sdk-go`/`sdk-python`,
   // as of 2026-08-09). A lane that runs a subset is a subset wearing a total: it reports
@@ -157,7 +168,7 @@ export const CI_JOBS = {
   // `sdks/js/` (nidus-3hc): the `wasm` job now builds and packs the ./wasm subpath.
   'wasm': [...RUST, /^justfile$/, /^bindings\//, /^sdks\/js\//],
   'wasm-e2e': [
-    ...RUST.slice(0, -1), /^justfile$/, /^bindings\//,
+    ...RUST.slice(0, -1), /^justfile$/, /^bindings\//, /^docs\//,
     /^scripts\/e2e-wasm\.sh$/, /^\.github\/workflows\/integration\.yml$/,
   ],
 }

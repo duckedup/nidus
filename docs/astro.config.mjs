@@ -6,6 +6,9 @@ import starlight from "@astrojs/starlight";
 // Custom domain serves from the root, so `base` stays "/".
 export default defineConfig({
   site: "https://nidus.duckedup.org",
+  // The home page terminal's worker dynamically imports the wasm binding, so it is a
+  // code-splitting build. Vite's default worker format is iife, which cannot split.
+  vite: { worker: { format: "es" } },
   // The combined "backends" guide was split into Storage + Memory pages.
   redirects: {
     "/guides/backends/": "/guides/storage-backends/",

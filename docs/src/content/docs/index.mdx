@@ -14,6 +14,7 @@ hero:
 ---
 
 import { Code } from '@astrojs/starlight/components';
+import Terminal from '../../components/Terminal.astro';
 
 <p class="lede not-content">
   <strong>nidus (Latin, "nest") is two things in one small, pure-Rust package.</strong>
@@ -41,6 +42,8 @@ let hits = memory.recall("notes", "how do users sign in?", &RecallOpts {
     top_k: 5,
     ..Default::default()
 }).await?;`} lang="rust" />
+
+<Terminal />
 
 <p class="section-kicker not-content">Why it exists</p>
 
