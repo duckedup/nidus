@@ -376,6 +376,12 @@ test('lanes: cluster tests are manual, not automatic', () => {
   eq(r.manual.map(l => l.recipe), ['just e2e-services-up && just test-e2e-cluster'], 'manual')
 })
 
+test('lanes: the wasm_opfs browser suite and justfile are manual, not unmapped (nidus-3hc)', () => {
+  const r = lanes(['tests/wasm_opfs/main.rs', 'justfile'])
+  eq(r.unmatched, [], 'nothing unmapped')
+  eq(r.manual.map(l => l.recipe), ['just test-wasm-e2e'], 'manual')
+})
+
 test('lanes: skill-only changes are inert', () => {
   const r = lanes(['.claude/skills/nidus/SKILL.md'])
   eq(r.run.length, 0, 'no lanes')
@@ -462,6 +468,11 @@ test('ci-guard: the wasm lanes (nidus-y67) key off src, the justfile and the bin
     eq(ciGuard(job, ['bindings/wasm/src/lib.rs']).run, true, `${job} runs for the binding`)
     eq(ciGuard(job, ['docs/src/content/docs/guides/wasm.md']).run, false, `${job} skips docs`)
   }
+})
+
+test('ci-guard: sdks/js runs wasm (nidus-3hc, the job now packs the ./wasm subpath)', () => {
+  eq(ciGuard('wasm', ['sdks/js/src/wasm-helper.ts']).run, true, 'wasm runs for sdks/js')
+  eq(ciGuard('wasm-e2e', ['sdks/js/src/wasm-helper.ts']).run, false, 'wasm-e2e does not claim sdks/js')
 })
 
 test('ci-guard: the browser bring-up script runs wasm-e2e only', () => {

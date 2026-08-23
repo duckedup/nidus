@@ -22,6 +22,15 @@ name: Release JS SDK
 # push trigger could not guarantee.
 #
 # Tag namespace `js-v*`, distinct from the crate's `v*`.
+#
+# ## The `./wasm` subpath is built and asserted here, not taken from `ci.yml`
+#
+# This is a separate workflow run from `ci.yml` and is also its own `workflow_dispatch`
+# entry point, so it can never rely on a CI-job artifact — it must build
+# `bindings/wasm/pkg` itself. The assertion (via `just verify-wasm-subpath`) runs after
+# `Build` and before `Publish`, matching "verify AFTER stamping" above: the tree about
+# to publish is the one that must be proven, and a silently-missing subpath is exactly
+# what nidus-3hc exists to catch.
 
 on:
   workflow_call:
@@ -97,9 +106,37 @@ jobs:
         working-directory: sdks/js
         run: npm run test:unit
 
+      # Same pinned toolchain subtlety as ci.yml:390-395 — `targets:` would add wasm32
+      # to `stable` rather than the 1.96.0 `rust-toolchain.toml` pin, so `rustup target
+      # add` is used instead. wasm-bindgen version MUST match ci.yml and
+      # scripts/e2e-wasm.sh: it is keyed to Cargo.lock's `wasm-bindgen`.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Add the wasm32 target to the pinned toolchain
+        run: rustup target add wasm32-unknown-unknown
+      - name: Ensure `just` is available
+        run: command -v just >/dev/null 2>&1 || cargo install just --locked
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.122 --locked
+      - name: Build the browser binding
+        run: just build-wasm-binding
+
       - name: Build
         working-directory: sdks/js
         run: npm run build
+
+      # `just verify-wasm-subpath` is the same recipe the `wasm` CI job runs, so CI and
+      # a local run cannot drift. The subpath is advertised in package.json's `exports`
+      # map; a failure here means the wasm build step above failed or was skipped.
+      - name: Verify the wasm subpath is in the published tarball
+        run: |
+          set -euo pipefail
+          if ! just verify-wasm-subpath; then
+            echo "::error::the ./wasm subpath (dist/wasm/nidus_wasm.js, .d.ts," \
+                 "nidus_wasm_bg.wasm, index.js, index.d.ts) is advertised in" \
+                 "sdks/js/package.json's exports but ABSENT from the npm tarball. The" \
+                 "wasm build step above likely failed or was skipped. See nidus-3hc."
+            exit 1
+          fi
 
       # Idempotent: a version already on the registry is a no-op success, not a failed
       # release — the crate's own publish step takes the same stance.

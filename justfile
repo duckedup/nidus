@@ -185,6 +185,36 @@ build-wasm-binding:
         --out-dir bindings/wasm/pkg \
         target/wasm32-unknown-unknown/release-wasm/nidus_wasm.wasm
 
+# Builds bindings/wasm/pkg then the sdks/js package (main entry + the `./wasm` subpath).
+# Safe to run on a fresh checkout: `npm run build`'s copy step no-ops if the artifact
+# is somehow still absent (nidus-3hc).
+build-wasm-subpath: build-wasm-binding
+    cd sdks/js && npm run build
+
+# Strict variant for CI/release: fails if bindings/wasm/pkg is missing, then asserts
+# `npm pack` ships EVERY file the `./wasm` export resolves to — one place CI and a local
+# run share, the same reason scripts/e2e-wasm.sh exists.
+verify-wasm-subpath: build-wasm-binding
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd sdks/js
+    npm run build:wasm-required
+    # Match on the whole trailing field, so `index.js` is not satisfied by `index.js.map`,
+    # and require EVERY path: a grep alternation would pass on any single match.
+    packed="$(npm pack --dry-run 2>&1 | awk '{print $NF}')"
+    missing=()
+    for f in dist/wasm/index.js dist/wasm/index.d.ts \
+             dist/wasm/nidus_wasm.js dist/wasm/nidus_wasm.d.ts dist/wasm/nidus_wasm_bg.wasm; do
+        grep -qxF "$f" <<<"$packed" || missing+=("$f")
+    done
+    if [ "${#missing[@]}" -ne 0 ]; then
+        echo "::error::the ./wasm subpath is advertised in sdks/js/package.json's exports" >&2
+        echo "but these files are ABSENT from the npm tarball (see nidus-3hc):" >&2
+        printf '  %s\n' "${missing[@]}" >&2
+        exit 1
+    fi
+    echo "npm pack ships the whole ./wasm subpath (5 files asserted)"
+
 # ── AI ingest layer (the opt-in embed/summarize/memory features) ────────────
 # The off-by-default async network edge (reqwest → hyper → rustls/ring; NO new C
 # tree, NO aws-lc/OpenSSL) that turns nidus into an all-in-one "memory". Like

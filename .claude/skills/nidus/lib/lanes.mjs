@@ -111,6 +111,15 @@ const RULES = [
     ],
   },
   {
+    // Same services-class shape as the cluster lane above, but the "service" is a
+    // headless browser driver rather than minio/valkey — see scripts/e2e-wasm.sh.
+    // `justfile` counts because the recipe itself lives there (nidus-3hc).
+    recipe: 'just test-wasm-e2e',
+    why: 'the wasm_opfs browser suite or its justfile recipe changed — needs a real headless browser',
+    manual: true,
+    match: [/^tests\/wasm_opfs\//, /^justfile$/],
+  },
+  {
     recipe: 'just bench',
     why: 'benchmarks changed — release build, run deliberately',
     manual: true,
@@ -145,7 +154,8 @@ export const CI_JOBS = {
   'e2e': [...RUST.slice(0, -1), /^scripts\/e2e-services\.sh$/, /^\.github\/workflows\/integration\.yml$/],
   // wasm32 (nidus-y67). `justfile` counts because the recipes ARE the lane, and
   // `bindings/` because the binding is the only consumer of the browser backend.
-  'wasm': [...RUST, /^justfile$/, /^bindings\//],
+  // `sdks/js/` (nidus-3hc): the `wasm` job now builds and packs the ./wasm subpath.
+  'wasm': [...RUST, /^justfile$/, /^bindings\//, /^sdks\/js\//],
   'wasm-e2e': [
     ...RUST.slice(0, -1), /^justfile$/, /^bindings\//,
     /^scripts\/e2e-wasm\.sh$/, /^\.github\/workflows\/integration\.yml$/,

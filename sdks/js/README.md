@@ -1,6 +1,6 @@
 # @duckedup/nidus
 
-The JavaScript/TypeScript client for [nidus](https://nidus.duckedup.org) — a small,
+The JavaScript/TypeScript client for [nidus](https://nidus.duckedup.org), a small,
 fast vector store. This package connects to a running `nidus serve` instance over
 HTTP, whether it's on your laptop or a remote host.
 
@@ -18,7 +18,7 @@ wire contract lines up.
 
 ## Connecting
 
-"Local vs remote" is just the base URL — point the client at a local `nidus serve`
+"Local vs remote" is just the base URL: point the client at a local `nidus serve`
 or any reachable host.
 
 ```ts
@@ -36,8 +36,8 @@ const db = new NidusClient({
 
 ## Upserting and searching
 
-`attrs` accept plain JS values — strings, numbers, booleans, string arrays, `Date`s,
-and `null` — and are normalized to nidus's typed values for you. (For an explicit
+`attrs` accept plain JS values (strings, numbers, booleans, string arrays, `Date`s,
+and `null`) and are normalized to nidus's typed values for you. (For an explicit
 type, use the `v.*` helpers.)
 
 ```ts
@@ -46,7 +46,7 @@ await db.createCollection("docs");
 await db.upsert("docs", [
   { id: "a", vector: [0.1, 0.2, 0.3], attrs: { lang: "rust", year: 2024 } },
   { id: "b", vector: [0.4, 0.5, 0.6], attrs: { lang: "go", year: 2023 } },
-  // a text-only doc — omit the vector
+  // a text-only doc, omit the vector
   { id: "c", attrs: { body: "vector stores are neat" } },
 ]);
 
@@ -57,7 +57,7 @@ for (const hit of hits) {
 ```
 
 nidus has separate `Int` and `Float` attribute types and compares them same-type only,
-but JS has one `number` and `1.0 === 1` — so a plain number becomes an `Int` when
+but JS has one `number` and `1.0 === 1`, so a plain number becomes an `Int` when
 `Number.isInteger` says so and a `Float` otherwise. That means a whole-numbered
 measurement lands as an `Int` in whichever records it came out round, and a `Float`
 range filter then skips exactly those. Pin such a field with `v.float`:
@@ -70,7 +70,7 @@ await db.upsert("docs", [
     id: "d",
     attrs: {
       score: v.float(1), // a Float even though the value is whole
-      ratio: 0.75, // already a Float — not an integer
+      ratio: 0.75, // already a Float, not an integer
       year: 2024, // an Int
       seen: new Date(), // a DateTime: a UTC instant, epoch milliseconds
     },
@@ -80,7 +80,7 @@ await db.upsert("docs", [
 
 A `DateTime` carries no timezone and has millisecond resolution; it decodes back to a
 `Date`, so a decoded `attrs` map re-encodes to what it came from. `NaN` and `Infinity`
-throw — JSON has no spelling for them. The Go and Python SDKs have the numeric types JS
+throw: JSON has no spelling for them. The Go and Python SDKs have the numeric types JS
 lacks and decide from those instead, so a Python `2.0` or a Go `float64(2)` is a
 `Float` where a bare `2` here is an `Int`.
 
@@ -88,7 +88,7 @@ lacks and decide from those instead, so a Python `2.0` or a Go `float64(2)` is a
 
 Build an AND-filter with the `f.*` helpers. Each predicate is a positive assertion
 about a present attribute (an absent key matches nothing). Comparisons are same-type
-only, so an operand must encode to the attribute's type — `f.ge("score", v.float(2))`,
+only, so an operand must encode to the attribute's type: `f.ge("score", v.float(2))`,
 not `f.ge("score", 2)`, for a `Float` attribute.
 
 ```ts
@@ -106,7 +106,7 @@ const hits = await db.search({
 });
 ```
 
-Beyond the comparisons there are text predicates — approximate, token-wise, and
+Beyond the comparisons there are text predicates: approximate, token-wise, and
 regular-expression matching over a plain attribute (no full-text index required):
 
 ```ts
@@ -156,7 +156,7 @@ const hybrid = await db.hybridSearch({
 ```
 
 A query can search several fields at once, each with its own text, by sending `clauses`
-instead of the single field — folded by `combine`, `"Sum"` (a doc hitting title *and*
+instead of the single field, folded by `combine`, `"Sum"` (a doc hitting title *and*
 body outranks one hitting either) or `"Max"` (a long body cannot out-accumulate a
 precise title match). Weight the two hybrid legs with `vectorWeight`/`textWeight`.
 
@@ -196,7 +196,7 @@ for (const { field, fragments } of hits[0]?.annotations?.highlights ?? []) {
 ```
 
 nidus reports a span as a **UTF-8 byte** range, but a JS string is indexed in UTF-16
-code units — so a raw span slices the wrong text out of any non-ASCII excerpt. This SDK
+code units, so a raw span slices the wrong text out of any non-ASCII excerpt. This SDK
 converts them for you: `fragment.spans` are JS string indices, and `fragment.text.slice`
 is the matched term. If you compare them against the raw HTTP response, expect the
 numbers to differ wherever the excerpt is not ASCII.
@@ -205,7 +205,7 @@ numbers to differ wherever the excerpt is not ASCII.
 
 `searchWithPlan`, `searchSimilarWithPlan`, and `hybridSearchWithPlan` are siblings of
 `search`/`searchSimilar`/`hybridSearch` that return `{ hits, plan }` instead of a bare
-`Hit[]` — the plan reports which scan strategy the server took (`ann`, `exact`, …), how
+`Hit[]`: the plan reports which scan strategy the server took (`ann`, `exact`, …), how
 many rows it scanned, and per-stage timings in microseconds. `textSearch` has no plan.
 
 ```ts
@@ -260,7 +260,7 @@ with no usable timestamp is not penalized at all (`missing` defaults to `1`).
 ## Remembering and recalling (text-native)
 
 When the server is started with an embedder (`nidus serve --embed-provider …`), you
-can send **text** and let the server embed it — no need to compute vectors client-side.
+can send **text** and let the server embed it, no need to compute vectors client-side.
 `remember` embeds and upserts; `recall` embeds the query and vector-searches.
 
 ```ts
@@ -295,7 +295,7 @@ later near-duplicate.
 
 Both throw a `NidusError` with status `400` if the server has no embedder configured
 (the message names `--embed-provider`); `mode: "summarize"` without a summarizer is
-likewise a `400`. Dedupe needs that same embedder — it is a vector search under the
+likewise a `400`. Dedupe needs that same embedder: it is a vector search under the
 hood.
 
 Pass `reinforce: true` to have a `recall` stamp `nidus.access_count` and
@@ -318,6 +318,19 @@ await db.flush(); await db.compact();
 await db.dropCollection("docs");
 ```
 
+## Running in the browser (wasm)
+
+A separate, ESM-only subpath, `@duckedup/nidus/wasm`, runs nidus itself inside the
+browser via WebAssembly, storing data in the browser's Origin Private File System
+instead of talking to a `nidus serve` over HTTP. It is lazily imported so the default
+entry point above stays small.
+
+```ts
+import { acquireOpfsPool } from "@duckedup/nidus/wasm";
+```
+
+See https://nidus.duckedup.org for the full guide.
+
 ## Errors
 
 A failed request throws a `NidusError` carrying the HTTP status the server reported,
@@ -338,7 +351,7 @@ try {
 ```
 
 A status of `0` means a transport-level failure (the server was unreachable, or the
-request timed out — configure `timeoutMs` on the client).
+request timed out; configure `timeoutMs` on the client).
 
 ## License
 

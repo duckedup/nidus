@@ -3986,7 +3986,7 @@ dependencies = [
 
 [[package]]
 name = "nidus"
-version = "0.83.0"
+version = "0.84.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4016,6 +4016,7 @@ dependencies = [
  "ureq",
  "url",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "wasm-bindgen-test",
 ]
 

@@ -35,6 +35,10 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
+    },
+    "./wasm": {
+      "types": "./dist/wasm/index.d.ts",
+      "import": "./dist/wasm/index.js"
     }
   },
   "sideEffects": false,
@@ -46,12 +50,14 @@
     "provenance": true
   },
   "scripts": {
-    "build": "tsup",
+    "build": "npm run clean && tsup && node scripts/build-wasm-subpath.mjs",
+    "build:wasm-required": "npm run clean && tsup && NIDUS_WASM_REQUIRED=1 node scripts/build-wasm-subpath.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:unit": "vitest run test/unit.test.ts",
+    "test:unit": "vitest run test/unit.test.ts test/wasm-subpath.test.ts",
     "test:integration": "vitest run test/integration.test.ts",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
