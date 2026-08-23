@@ -144,19 +144,20 @@ This is the only spelling MCP offers. The HTTP and CLI surfaces also take a raw
 something other than nidus; a model asking for one result per document does not
 need it.
 
-### Prefix matching for typeahead
+### Prefix matching (search as you type)
 
 `text_search` and `hybrid_search` both take an optional `prefix` boolean. When set,
 the final word of `query` is treated as a partial word and matched against any
-indexed term starting with it, for autocomplete/typeahead as a caller is still
-typing; earlier words must still match exactly. It is off by default:
+indexed term starting with it, so a partial last word still finds documents while a
+caller is typing; earlier words must still match exactly. It is off by default:
 
 ```json
 {"collection": "docs", "field": "title", "query": "quick br", "prefix": true}
 ```
 
 The match expands to at most 256 terms; past that it keeps the commonest
-completions rather than failing the call.
+completions rather than failing the call. Both tools return matching documents, not a
+list of candidate words to complete with.
 
 ### No setup step
 

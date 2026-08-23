@@ -1002,10 +1002,11 @@ let q = q.combine(FtsCombine::Max);
 - `FtsQuery::new(field, text)` is the one-clause shorthand, and a single clause scores
   exactly the same under either combine mode. `min_score` applies to the combined score.
 
-### Prefix matching for typeahead
+### Prefix matching (search as you type)
 
-A clause can match its final term as a **prefix** instead of a complete word, for
-autocomplete as a caller is still typing. Set `prefix` on the clause:
+A clause can match its final term as a **prefix** instead of a complete word, so a
+partial last word still finds documents while a caller is typing. Set `prefix` on the
+clause:
 
 ```rust
 use nidus::{FtsClause, FtsQuery};
@@ -1026,6 +1027,10 @@ completions (highest document frequency first) rather than erroring: a caller ty
 one character expects *something* back, not a rejection. When `explain: true` is set,
 each hit's `ClauseScore` carries an `expansion: {matched, scored}` so a caller can tell
 when the cap has truncated a broad prefix.
+
+**This returns documents, not completions.** A prefix clause ranks matching *records*,
+the same as any other clause. It does not hand back a list of candidate words to show in
+an autocomplete dropdown, and there is no suggest API today.
 
 **Limitation:** the prefix fragment is folded (lowercased, optionally ASCII-folded) but
 not stemmed, while the index holds stems. So `"runn"` will not match an indexed `run`

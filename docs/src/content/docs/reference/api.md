@@ -529,7 +529,7 @@ several, with `.combine(...)` and `.highlight(...)` builders. See
 `FtsClause::new(field, text).prefix()` sets the flag: only the clause's **final** term
 expands, to every indexed term carrying it as a prefix, capped at 256 expansions (past
 the cap, the commonest completions win rather than the query erroring). See
-[prefix matching for typeahead](/guides/search/#prefix-matching-for-typeahead).
+[prefix matching for typeahead](/guides/search/#prefix-matching-search-as-you-type).
 
 ## `FtsField` & `Analyzer`
 

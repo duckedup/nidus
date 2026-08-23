@@ -576,7 +576,7 @@ curl -s localhost:7700/text-search \
 The expansion is capped at 256 terms; past the cap the match keeps the commonest
 completions rather than erroring. With `explain: true`, a hit's clause score carries
 `"expansion": {"matched": N, "scored": M}`, `matched > scored` meaning the cap
-truncated it. See [prefix matching for typeahead](/guides/search/#prefix-matching-for-typeahead).
+truncated it. See [prefix matching for typeahead](/guides/search/#prefix-matching-search-as-you-type).
 
 `/text-search` also takes the same `rerank` field as `/search` (`overscan` default `10`,
 `text_attr` default `"nidus.text"`). `query` is optional when the query is named as one
