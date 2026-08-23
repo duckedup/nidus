@@ -14,7 +14,33 @@ of the tree compile: the core store, search, and the local/RAM/OPFS backends bui
 there, while the S3, GCS, and Redis-family backends are simply absent (their client crates
 depend on native TLS and certificate stores that do not target `wasm32-unknown-unknown`).
 
-## Building
+## Installing
+
+```sh
+npm install @duckedup/nidus
+```
+
+```ts
+import { acquireOpfsPool } from "@duckedup/nidus/wasm";
+
+const pool = await acquireOpfsPool({ slots: 8 });
+const store = pool.NidusHandle.open("opfs://my-store", /* dimension */ 3);
+```
+
+`@duckedup/nidus/wasm` is a separate, **ESM-only** subpath of the JS SDK: it resolves its
+wasm payload relative to `import.meta.url`, so it works from `import` but not `require`.
+It is a subpath rather than part of the package's default entry precisely so the wasm
+payload (roughly 477 KB) never lands in a bundle that only wanted the plain HTTP client.
+Import it lazily, from the dedicated worker that needs it (see below), not from your
+app's top level.
+
+`acquireOpfsPool` does the handle acquisition and pool registration described in the next
+two sections for you, so a consumer never has to hand-write that loop.
+
+## Building from the repo
+
+Most consumers only need `npm install @duckedup/nidus` above. Build straight from the
+repo instead when you are working on the binding itself:
 
 ```bash
 # Build the library for the target (no --features needed)
@@ -31,9 +57,6 @@ directly:
 import init, { NidusHandle, init_opfs_pool, grow_opfs_pool } from "./pkg/nidus_wasm.js";
 ```
 
-The binding is not published to npm yet, so build it from the repo for now. It is tracked
-separately from this guide.
-
 A full working example, including the worker and a page that drives it, lives in
 [`bindings/wasm/demo`](https://github.com/duckedup/nidus/tree/main/bindings/wasm/demo).
 Serve it over `http://localhost` or any secure context; OPFS is unavailable on a plain
@@ -49,7 +72,8 @@ The demo's `worker.js` shows the shape: the main page only ever posts messages t
 worker and awaits replies; every actual store call happens inside the worker's own message
 handler.
 
-Two async browser calls do the handle acquisition, once, up front:
+Two async browser calls do the handle acquisition, once, up front: this is exactly what
+`acquireOpfsPool` runs for you, in a loop, one slot at a time:
 
 ```js
 const root = await navigator.storage.getDirectory();
@@ -58,6 +82,9 @@ const syncHandle = await fileHandle.createSyncAccessHandle();
 ```
 
 Everything after that, every nidus call, is synchronous.
+
+nidus's own browser test suite (`tests/wasm_opfs`) follows the same rule and drives its
+handles from a dedicated worker too, for the same reason.
 
 ## The pool handshake
 

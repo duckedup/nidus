@@ -306,6 +306,23 @@ a metric whose scores are negative or unbounded. `limitPer` thins an already-ran
 result rather than searching deeper to refill the cap, so it is approximate. `highlight`
 reads the stored text, so it still works on a field a projection dropped.
 
+## Running fully in the browser
+
+`@duckedup/nidus` also ships a separate, **ESM-only** subpath, `@duckedup/nidus/wasm`,
+that runs nidus itself inside the browser via WebAssembly and stores data in the
+browser's Origin Private File System, rather than talking to a `nidus serve` over
+HTTP. It is a distinct entry point from the `NidusClient` documented above, kept out
+of the default import so its wasm payload never lands in a bundle that only wanted
+the HTTP client. Import it lazily, from wherever your app actually runs in the
+browser:
+
+```ts
+import { acquireOpfsPool } from "@duckedup/nidus/wasm";
+```
+
+See [Running in the browser](/guides/wasm/) for the full walkthrough, including the
+dedicated-worker requirement OPFS imposes.
+
 ## The rest of the API
 
 Every data-plane endpoint of the [HTTP API](/reference/http-api/) has a typed method.

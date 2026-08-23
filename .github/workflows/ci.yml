@@ -423,6 +423,23 @@ jobs:
           cargo install wasm-bindgen-cli --version 0.2.122 --locked
           just build-wasm-binding
 
+      # The pkg is already built above; proving the `sdks/js` subpath packs it is
+      # cheapest here (Node + a copy) rather than adding a Rust build to `sdk-js`,
+      # which must stay Rust-free.
+      - uses: actions/setup-node@v5
+        if: ${{ !cancelled() && env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdks/js/package-lock.json
+      - name: npm install (sdks/js)
+        if: ${{ !cancelled() && env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: npm install
+        working-directory: sdks/js
+      - name: verify the wasm subpath builds and packs
+        if: ${{ !cancelled() && env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: just verify-wasm-subpath
+
   # The JS SDK (sdks/js) is independent of the Rust build: typecheck, unit tests
   # (mocked fetch — no server needed), and the bundle build. The integration test
   # against a real `nidus serve` runs in `sdk-integration` below (#125).
