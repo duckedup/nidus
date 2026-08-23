@@ -473,6 +473,34 @@ def test_a_multi_clause_text_search_reaches_the_wire_with_its_combine_rule() -> 
     }
 
 
+def test_prefix_is_omitted_when_unset_on_both_spellings_and_both_search_routes() -> None:
+    """An unset ``prefix`` never reaches the wire, not even as ``false``."""
+    stub = StubTransport([])
+    db = client(stub)
+    db.text_search(field="body", query="ru")
+    assert "prefix" not in stub.last.json
+    db.text_search(clauses=[{"field": "body", "query": "ru"}])
+    assert "prefix" not in stub.last.json["clauses"][0]
+    db.hybrid_search(vector=[1.0], field="body", text="ru")
+    assert "prefix" not in stub.last.json
+    db.hybrid_search(vector=[1.0], clauses=[{"field": "body", "query": "ru"}])
+    assert "prefix" not in stub.last.json["clauses"][0]
+
+
+def test_prefix_reaches_the_wire_when_set_on_both_spellings_and_both_search_routes() -> None:
+    """A set ``prefix`` carries through, on the shorthand and on a ``clauses`` entry."""
+    stub = StubTransport([])
+    db = client(stub)
+    db.text_search(field="body", query="ru", prefix=True)
+    assert stub.last.json["prefix"] is True
+    db.text_search(clauses=[{"field": "body", "query": "ru", "prefix": True}])
+    assert stub.last.json["clauses"][0]["prefix"] is True
+    db.hybrid_search(vector=[1.0], field="body", text="ru", prefix=True)
+    assert stub.last.json["prefix"] is True
+    db.hybrid_search(vector=[1.0], clauses=[{"field": "body", "query": "ru", "prefix": True}])
+    assert stub.last.json["clauses"][0]["prefix"] is True
+
+
 def test_diversity_reaches_the_wire_on_every_search_route() -> None:
     """The kwarg has to be plumbed on all four routes, and ``0.0`` must survive the prune."""
     stub = StubTransport([])

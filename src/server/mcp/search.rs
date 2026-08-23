@@ -310,6 +310,17 @@ fn rerank_overscan_schema() -> JsonValue {
     })
 }
 
+/// `prefix`: expand the query's final word as a typeahead prefix instead of requiring an
+/// exact stem match, shared by `text_search` and `hybrid_search`. Earlier words stay exact.
+fn prefix_schema() -> JsonValue {
+    json!({
+        "type": "boolean",
+        "description": "Treat the final word of `query` as a partial word and match any \
+            indexed term starting with it, for autocomplete/typeahead as the caller is \
+            still typing. Earlier words must still match exactly. Off by default."
+    })
+}
+
 pub(super) fn tools() -> Vec<Tool> {
     vec![
         tool(
@@ -380,6 +391,7 @@ pub(super) fn tools() -> Vec<Tool> {
                         "type": "string",
                         "description": "Keywords to match."
                     },
+                    "prefix": prefix_schema(),
                     "top_k": {
                         "type": "integer",
                         "description": "How many results to return.",
@@ -416,6 +428,7 @@ pub(super) fn tools() -> Vec<Tool> {
                         "type": "string",
                         "description": "Natural language, used for BOTH the semantic and the keyword half of the search."
                     },
+                    "prefix": prefix_schema(),
                     "top_k": {
                         "type": "integer",
                         "description": "How many results to return.",
@@ -602,7 +615,11 @@ impl NidusMcp {
             ..Default::default()
         };
         check_rerank_search_depth(&opts)?;
-        let q = crate::FtsQuery::new(field, query.clone());
+        let mut clause = crate::FtsClause::new(field, query.clone());
+        if optional_bool(args, "prefix")? {
+            clause = clause.prefix();
+        }
+        let q = crate::FtsQuery::multi([clause]);
 
         #[cfg(feature = "rerank")]
         if opts.rerank.is_some() {
@@ -659,7 +676,11 @@ impl NidusMcp {
             ..Default::default()
         };
         check_rerank_hybrid_depth(&opts)?;
-        let q = crate::FtsQuery::new(field, query.clone());
+        let mut clause = crate::FtsClause::new(field, query.clone());
+        if optional_bool(args, "prefix")? {
+            clause = clause.prefix();
+        }
+        let q = crate::FtsQuery::multi([clause]);
 
         #[cfg(feature = "rerank")]
         if opts.rerank.is_some() {

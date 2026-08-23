@@ -385,6 +385,7 @@ class AsyncNidusClient:
         min_score: Optional[float] = None,
         filter: Optional[Filter] = None,  # noqa: A002
         clauses: Optional[Sequence[FtsClause]] = None,
+        prefix: Optional[bool] = None,
         combine: Optional[str] = None,
         explain: Optional[bool] = None,
         highlight: Optional[Union[bool, HighlightOpts]] = None,
@@ -399,7 +400,8 @@ class AsyncNidusClient:
         """BM25 full-text search, paginated by ``offset``.
 
         One field (``field`` + ``query``) or several (``clauses`` + ``combine``), never
-        both; ``explain``/``highlight`` fill ``hit.annotations``. Same rules as
+        both; ``explain``/``highlight`` fill ``hit.annotations``. ``prefix`` expands the
+        query's final term as a prefix (a clause sets it per-entry instead). Same rules as
         :meth:`nidus.client.NidusClient.text_search`, including ``rerank``.
         """
         return await self._search(
@@ -413,6 +415,7 @@ class AsyncNidusClient:
                 min_score=min_score,
                 filter=filter,
                 clauses=clauses,
+                prefix=prefix,
                 combine=combine,
                 explain=explain,
                 highlight=highlight,
@@ -439,6 +442,7 @@ class AsyncNidusClient:
         rrf_k: Optional[float] = None,
         candidates: Optional[int] = None,
         clauses: Optional[Sequence[FtsClause]] = None,
+        prefix: Optional[bool] = None,
         combine: Optional[str] = None,
         explain: Optional[bool] = None,
         highlight: Optional[Union[bool, HighlightOpts]] = None,
@@ -450,8 +454,8 @@ class AsyncNidusClient:
         """Hybrid search: fuse a vector query and a BM25 text query via RRF.
 
         ``offset`` pages the *fused* ranking, never a leg — a leg's rank is an input to
-        the fused score. The text leg, the weights, ``explain`` and ``rerank`` behave
-        exactly as in :meth:`nidus.client.NidusClient.hybrid_search`.
+        the fused score. The text leg, ``prefix``, the weights, ``explain`` and ``rerank``
+        behave exactly as in :meth:`nidus.client.NidusClient.hybrid_search`.
         """
         return await self._search(
             _wire.HYBRID_SEARCH,
@@ -466,6 +470,7 @@ class AsyncNidusClient:
                 rrf_k=rrf_k,
                 candidates=candidates,
                 clauses=clauses,
+                prefix=prefix,
                 combine=combine,
                 explain=explain,
                 highlight=highlight,
@@ -489,6 +494,7 @@ class AsyncNidusClient:
         rrf_k: Optional[float] = None,
         candidates: Optional[int] = None,
         clauses: Optional[Sequence[FtsClause]] = None,
+        prefix: Optional[bool] = None,
         combine: Optional[str] = None,
         explain: Optional[bool] = None,
         highlight: Optional[Union[bool, HighlightOpts]] = None,
@@ -511,6 +517,7 @@ class AsyncNidusClient:
                 rrf_k=rrf_k,
                 candidates=candidates,
                 clauses=clauses,
+                prefix=prefix,
                 combine=combine,
                 explain=explain,
                 highlight=highlight,

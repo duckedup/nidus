@@ -704,6 +704,48 @@ fn multi_field_text_search_and_annotations_survive_a_reopen() {
     assert_eq!(marked, vec!["running"]);
 }
 
+/// A prefix (typeahead) clause through the public API, surviving a reopen — proving the
+/// rebuilt fts cache (nidus-p1n's `FTS_CACHE_VERSION` bump) still serves prefix queries.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn prefix_clause_survives_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    {
+        let mut db = Nidus::open(Config::new(&path, 3)).unwrap();
+        db.create_collection_with_fts("docs", &[FtsField::new("body")])
+            .unwrap();
+        let doc = |id: &str, body: &str| {
+            let mut attrs = BTreeMap::new();
+            attrs.insert("body".to_string(), Value::Str(body.to_string()));
+            Record::text_only(id, attrs)
+        };
+        db.upsert(
+            "docs",
+            &[
+                doc("a", "the carbon fiber panel"),
+                doc("b", "an unrelated document"),
+            ],
+        )
+        .unwrap();
+        db.flush().unwrap();
+    }
+
+    let db = Nidus::open(Config::new(&path, 3)).unwrap();
+    let query = FtsQuery::multi([FtsClause::new("body", "car").prefix()])
+        .highlight(HighlightOpts::default());
+    let hits = db.text_search("docs", &query, &opts(10)).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "a");
+    let hl = &hits[0].annotations.as_ref().unwrap().highlights;
+    let marked: Vec<&str> = hl[0].fragments[0]
+        .spans
+        .iter()
+        .map(|&(s, e)| &hl[0].fragments[0].text[s..e])
+        .collect();
+    assert_eq!(marked, vec!["carbon"]);
+}
+
 /// The ranking-expression and aggregation surface through the public API, on a file-backed
 /// store reopened between writing and querying (nidus-m50.3, nidus-m50.6).
 #[test]

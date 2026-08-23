@@ -255,6 +255,20 @@ for _, hit := range hits {
 search `Explain` additionally fills `Annotations.Vector` and `Annotations.Text` with each
 leg's own rank and score, before fusion flattened them into one number.
 
+Set `Prefix` (on a clause, or on the `Field`+`Query`/`Field`+`Text` shorthand) to match
+a truncated final term as a prefix instead of an exact word, for typeahead:
+
+```go
+on := true
+hits, err := db.TextSearch(ctx, nidus.TextSearchRequest{
+    Field: "body", Query: "sched", Prefix: &on, // matches "schedules", "scheduler", …
+})
+```
+
+`Prefix` is a `*bool` so an unset (`nil`) field is dropped from the request entirely;
+only the clause's or shorthand's own *final* term expands, and only against the index's
+stemmed vocabulary (so `"runn"` will not find `"run"`).
+
 ## Reshaping the ranking
 
 ```go

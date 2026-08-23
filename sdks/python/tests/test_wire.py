@@ -531,6 +531,24 @@ def test_a_text_query_must_use_exactly_one_of_the_two_spellings(
         build(field="body")
 
 
+def test_prefix_is_omitted_from_the_body_unless_set() -> None:
+    """An unset ``prefix`` never serializes as ``false`` — it stays absent on both routes."""
+    assert "prefix" not in _wire.text_search_body("body", "ru")
+    assert "prefix" not in _wire.hybrid_search_body([1.0], "body", "ru")
+    assert _wire.text_search_body("body", "ru", prefix=True)["prefix"] is True
+    assert _wire.hybrid_search_body([1.0], "body", "ru", prefix=True)["prefix"] is True
+
+
+def test_prefix_on_a_clause_survives_the_body_builder_untouched() -> None:
+    """A clause's own ``prefix`` passes through ``_spec`` like any other optional key."""
+    body = _wire.text_search_body(clauses=[{"field": "title", "query": "ru", "prefix": True}])
+    assert body["clauses"] == [{"field": "title", "query": "ru", "prefix": True}]
+    # The top-level shorthand `prefix` plays no part once `clauses` is sent.
+    assert "prefix" not in _wire.hybrid_search_body(
+        [1.0], clauses=[{"field": "title", "query": "ru"}]
+    )
+
+
 def test_a_clause_must_be_a_mapping_naming_a_field_and_its_query() -> None:
     """``text`` is the *single-field* key on the hybrid route; a clause always says ``query``."""
     with pytest.raises(TypeError, match="unknown key"):

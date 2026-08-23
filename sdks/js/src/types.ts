@@ -110,6 +110,17 @@ export interface LegScore {
 export interface ClauseScore {
   field: string;
   score: number;
+  /** Set only for a prefix clause. `matched > scored` means the cap truncated it. */
+  expansion?: Expansion;
+}
+
+/**
+ * How far a prefix clause's final term expanded: how many indexed terms carried the
+ * prefix, and how many were scored after the expansion cap.
+ */
+export interface Expansion {
+  matched: number;
+  scored: number;
 }
 
 /**
@@ -377,6 +388,8 @@ export type FtsCombine = "Sum" | "Max";
 export interface TextClause {
   field: string;
   query: string;
+  /** Expand the clause's final term as a prefix (typeahead). Omitted means `false`. */
+  prefix?: boolean;
 }
 
 /** How much text a highlight carries. `fragmentChars` is a character budget, not bytes. */
@@ -464,12 +477,20 @@ export interface SimilarSearchOptions extends ProjectionOptions, RankingOptions 
  * empty result would otherwise read as "no matches" rather than "no query".
  */
 export type TextQuerySpelling =
-  | { field: string; query: string; clauses?: never; combine?: never }
+  | {
+      field: string;
+      query: string;
+      /** Expand the shorthand's final term as a prefix (typeahead). Omitted means `false`. */
+      prefix?: boolean;
+      clauses?: never;
+      combine?: never;
+    }
   | {
       clauses: TextClause[];
       combine?: FtsCombine;
       field?: never;
       query?: never;
+      prefix?: never;
     };
 
 /** The knobs of {@link TextSearchOptions} that do not name what to search. */
@@ -529,12 +550,20 @@ export interface FilterIndexField {
 
 /** {@link TextQuerySpelling} for hybrid search, whose single form spells the text `text`. */
 export type HybridQuerySpelling =
-  | { field: string; text: string; clauses?: never; combine?: never }
+  | {
+      field: string;
+      text: string;
+      /** Expand the shorthand's final term as a prefix (typeahead). Omitted means `false`. */
+      prefix?: boolean;
+      clauses?: never;
+      combine?: never;
+    }
   | {
       clauses: TextClause[];
       combine?: FtsCombine;
       field?: never;
       text?: never;
+      prefix?: never;
     };
 
 /** The knobs of {@link HybridSearchOptions} that do not name what the text leg searches. */

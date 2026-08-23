@@ -1175,6 +1175,7 @@ async fn text_search(
         field,
         query,
         clauses,
+        prefix,
         combine,
         scope,
         top_k,
@@ -1194,7 +1195,7 @@ async fn text_search(
     } = req;
     #[cfg(feature = "rerank")]
     let default_rerank_query = query.clone();
-    let clauses = check_clauses(field, query, clauses)?;
+    let clauses = check_clauses(field, query, clauses, prefix)?;
     let projection = check_projection(include_attributes, exclude_attributes)?;
     #[cfg(feature = "rerank")]
     let (rerank, rerank_query) = match check_rerank(rerank, default_rerank_query.as_deref())? {
@@ -1253,6 +1254,7 @@ async fn hybrid_search(
         field,
         text,
         clauses,
+        prefix,
         combine,
         scope,
         top_k,
@@ -1269,7 +1271,7 @@ async fn hybrid_search(
         rerank,
         plan,
     } = req;
-    let clauses = check_clauses(field, text, clauses)?;
+    let clauses = check_clauses(field, text, clauses, prefix)?;
     #[cfg(feature = "rerank")]
     let (rerank, rerank_query) = match check_rerank(rerank, None)? {
         Some((ro, q)) => (Some(ro), Some(q)),
@@ -1846,8 +1848,9 @@ fn check_clauses(
     field: Option<String>,
     text: Option<String>,
     clauses: Option<Vec<dto::FtsClauseDto>>,
+    prefix: bool,
 ) -> Result<Vec<crate::FtsClause>, ApiError> {
-    dto::resolve_clauses(field, text, clauses)
+    dto::resolve_clauses(field, text, clauses, prefix)
         .map_err(|msg| ApiError::bad_request(anyhow::anyhow!(msg)))
 }
 

@@ -635,6 +635,56 @@ fn multi_clause_text_search_and_annotations_over_http() {
     assert!(hits[0]["annotations"]["text"]["rank"].is_number(), "{hits}");
 }
 
+/// A truncated query matches only when `prefix: true` rides the wire — proving the flag is
+/// actually threaded through, not merely accepted and ignored (nidus-p1n).
+#[test]
+fn prefix_clause_matches_a_truncated_query_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/fts-schema",
+                &json!({"fields": ["title"]})
+            )
+            .0,
+        200
+    );
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/upsert",
+                &json!({"records": [
+                    {"id": "a", "attrs": {"title": {"Str": "running quickly"}}}
+                ]}),
+            )
+            .0,
+        200
+    );
+
+    let (status, hits) = server.post(
+        "/text-search",
+        &json!({"field": "title", "query": "ru", "top_k": 5}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(hits.as_array().map(Vec::len), Some(0), "no exact stem 'ru'");
+
+    let (status, hits) = server.post(
+        "/text-search",
+        &json!({"field": "title", "query": "ru", "prefix": true, "top_k": 5}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(hits[0]["id"], "a", "prefix expands 'ru' to 'run': {hits}");
+
+    let (status, hits) = server.post(
+        "/text-search",
+        &json!({"clauses": [{"field": "title", "query": "ru", "prefix": true}], "top_k": 5}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(hits[0]["id"], "a", "prefix on a clauses entry: {hits}");
+}
+
 /// A batch and a grouped aggregate over the REAL binary: both are new routes, and a route
 /// that is wired in-process can still be missing from the built router (nidus-m50.11,
 /// nidus-bmh).

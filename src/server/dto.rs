@@ -284,6 +284,9 @@ fn default_candidates() -> usize {
 pub struct FtsClauseDto {
     pub field: String,
     pub query: String,
+    /// Expand the clause's final term as a prefix (typeahead). Omitted means `false`.
+    #[serde(default)]
+    pub prefix: bool,
 }
 
 /// Body of `POST /text-search` (BM25). An empty `scope` searches every collection. Name the
@@ -296,6 +299,10 @@ pub struct TextSearchRequest {
     pub query: Option<String>,
     #[serde(default)]
     pub clauses: Option<Vec<FtsClauseDto>>,
+    /// Expand the final term of the `field`+`query` shorthand as a prefix. Ignored (the
+    /// `clauses` list carries its own per-entry flag instead) when `clauses` is sent.
+    #[serde(default)]
+    pub prefix: bool,
     /// How several clauses fold into one score: `"Sum"` (default) or `"Max"`.
     #[serde(default)]
     pub combine: FtsCombine,
@@ -350,6 +357,10 @@ pub struct HybridSearchRequest {
     pub text: Option<String>,
     #[serde(default)]
     pub clauses: Option<Vec<FtsClauseDto>>,
+    /// Expand the final term of the `field`+`text` shorthand as a prefix. Ignored (the
+    /// `clauses` list carries its own per-entry flag instead) when `clauses` is sent.
+    #[serde(default)]
+    pub prefix: bool,
     #[serde(default)]
     pub combine: FtsCombine,
     #[serde(default)]
@@ -400,12 +411,19 @@ pub(super) fn resolve_clauses(
     field: Option<String>,
     text: Option<String>,
     clauses: Option<Vec<FtsClauseDto>>,
+    prefix: bool,
 ) -> Result<Vec<FtsClause>, &'static str> {
     match (field, text, clauses) {
-        (Some(f), Some(t), None) => Ok(vec![FtsClause::new(f, t)]),
+        (Some(f), Some(t), None) => {
+            let clause = FtsClause::new(f, t);
+            Ok(vec![if prefix { clause.prefix() } else { clause }])
+        }
         (None, None, Some(list)) if !list.is_empty() => Ok(list
             .into_iter()
-            .map(|c| FtsClause::new(c.field, c.query))
+            .map(|c| {
+                let clause = FtsClause::new(c.field, c.query);
+                if c.prefix { clause.prefix() } else { clause }
+            })
             .collect()),
         (None, None, Some(_)) => Err("clauses must not be empty"),
         (None, None, None) => Err("a text query needs a field plus its text, or a clauses list"),
@@ -860,7 +878,7 @@ mod tests {
     /// Decode a `/text-search` body and resolve its clauses exactly as the handler does.
     fn clauses(json: serde_json::Value) -> Result<Vec<FtsClause>, &'static str> {
         let req: TextSearchRequest = serde_json::from_value(json).unwrap();
-        resolve_clauses(req.field, req.query, req.clauses)
+        resolve_clauses(req.field, req.query, req.clauses, req.prefix)
     }
 
     #[test]
@@ -899,6 +917,31 @@ mod tests {
         ] {
             assert!(clauses(body.clone()).is_err(), "{body}");
         }
+    }
+
+    #[test]
+    fn prefix_omitted_means_false() {
+        let got = clauses(json!({"field": "body", "query": "run"})).unwrap();
+        assert!(!got[0].prefix);
+        let got = clauses(json!({"clauses": [{"field": "body", "query": "run"}]})).unwrap();
+        assert!(!got[0].prefix);
+    }
+
+    #[test]
+    fn prefix_on_a_clauses_entry_survives_into_the_fts_clause() {
+        let got = clauses(json!({"clauses": [
+            {"field": "title", "query": "ru", "prefix": true},
+            {"field": "body", "query": "async"}
+        ]}))
+        .unwrap();
+        assert!(got[0].prefix);
+        assert!(!got[1].prefix);
+    }
+
+    #[test]
+    fn prefix_on_the_field_query_shorthand_survives_into_the_clause() {
+        let got = clauses(json!({"field": "body", "query": "ru", "prefix": true})).unwrap();
+        assert!(got[0].prefix);
     }
 
     #[test]
@@ -943,6 +986,7 @@ mod tests {
             clauses: vec![crate::ClauseScore {
                 field: "title".into(),
                 score: 1.5,
+                expansion: None,
             }],
             highlights: vec![crate::Highlight {
                 field: "body".into(),

@@ -515,6 +515,7 @@ pub struct FtsQuery {
 pub struct FtsClause {
     pub field: String,  // a full-text-indexed attribute field
     pub text: String,   // raw query text for this field
+    pub prefix: bool,   // expand the final term as a prefix (typeahead); default false
 }
 
 pub enum FtsCombine { Sum, Max }  // add every matched clause, or take the strongest
@@ -524,6 +525,11 @@ pub enum Language { English }     // the analyzer; extensible (US English today)
 `FtsQuery::new(field, text)` is the one-clause shorthand; `FtsQuery::multi([...])` takes
 several, with `.combine(...)` and `.highlight(...)` builders. See
 [searching several fields at once](/guides/search/#searching-several-fields-at-once).
+
+`FtsClause::new(field, text).prefix()` sets the flag: only the clause's **final** term
+expands, to every indexed term carrying it as a prefix, capped at 256 expansions (past
+the cap, the commonest completions win rather than the query erroring). See
+[prefix matching for typeahead](/guides/search/#prefix-matching-search-as-you-type).
 
 ## `FtsField` & `Analyzer`
 
@@ -573,7 +579,12 @@ pub struct Annotations {
 }
 
 pub struct LegScore    { pub rank: usize, pub score: f32 }  // rank is 0-based
-pub struct ClauseScore { pub field: String, pub score: f32 }
+pub struct ClauseScore {
+    pub field: String,
+    pub score: f32,
+    pub expansion: Option<Expansion>, // prefix clauses only; see FtsClause::prefix
+}
+pub struct Expansion   { pub matched: usize, pub scored: usize } // matched > scored = capped
 pub struct Highlight   { pub field: String, pub fragments: Vec<Fragment> }
 pub struct Fragment {
     pub text: String,                 // an excerpt of the stored text

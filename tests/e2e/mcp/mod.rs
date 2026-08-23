@@ -232,6 +232,32 @@ fn tools_list_is_complete_ordered_and_cacheable() {
         !rendered.contains("\"vector\""),
         "no MCP tool may take a raw vector argument: {rendered}"
     );
+
+    // Only the two BM25-clause tools take a typeahead `prefix` boolean (nidus-p1n).
+    let tools = result["tools"].as_array().expect("tools array");
+    for want in ["text_search", "hybrid_search"] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == want)
+            .unwrap_or_else(|| panic!("no `{want}` tool"));
+        let prefix = &tool["inputSchema"]["properties"]["prefix"];
+        assert_eq!(
+            prefix["type"], "boolean",
+            "`{want}` should advertise a boolean `prefix`: {tool}"
+        );
+        assert!(
+            prefix["description"].as_str().is_some_and(|d| d.len() > 20),
+            "`{want}`'s `prefix` needs a hand-written description: {tool}"
+        );
+    }
+    let recall = tools
+        .iter()
+        .find(|t| t["name"] == "recall")
+        .expect("no `recall` tool");
+    assert!(
+        recall["inputSchema"]["properties"]["prefix"].is_null(),
+        "recall has no BM25 clause, so it must not advertise `prefix`: {recall}"
+    );
 }
 
 /// Walk a schema and collect every `$ref` fragment and every `$defs` key path it declares.
@@ -365,6 +391,67 @@ fn tools_read_the_same_store_the_http_routes_write() {
     assert!(
         !hits.contains("\"b\""),
         "text_search should not return the non-matching record: {hits}"
+    );
+}
+
+/// `text_search`'s `prefix` flag expands the final word as a typeahead match against the
+/// indexed vocabulary; without it, a truncated word is not itself an indexed term and finds
+/// nothing (nidus-p1n). Proves the flag actually reaches the store, not just the schema.
+#[test]
+fn text_search_prefix_matches_a_truncated_final_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+
+    assert_eq!(server.post("/collections/notes", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post(
+                "/collections/notes/fts-schema",
+                &json!({"fields": ["body"]})
+            )
+            .0,
+        200
+    );
+    let (status, _) = server.post(
+        "/collections/notes/upsert",
+        &json!({"records": [
+            {"id": "a", "vector": [1, 0, 0], "attrs": {"body": {"Str": "banana bread"}}}
+        ]}),
+    );
+    assert_eq!(status, 200);
+
+    let (status, body) = mcp(
+        &server,
+        "tools/call",
+        Some("text_search"),
+        &call(
+            1,
+            "text_search",
+            json!({"collection": "notes", "field": "body", "query": "ban", "prefix": true}),
+        ),
+    );
+    assert_eq!(status, 200, "text_search failed: {body}");
+    let hits = text(&result(&body));
+    assert!(
+        hits.contains("\"a\""),
+        "prefix:true should match the truncated final word: {hits}"
+    );
+
+    let (status, body) = mcp(
+        &server,
+        "tools/call",
+        Some("text_search"),
+        &call(
+            2,
+            "text_search",
+            json!({"collection": "notes", "field": "body", "query": "ban"}),
+        ),
+    );
+    assert_eq!(status, 200, "text_search failed: {body}");
+    let hits = text(&result(&body));
+    assert!(
+        !hits.contains("\"a\""),
+        "without prefix, a truncated word must not match: {hits}"
     );
 }
 

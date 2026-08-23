@@ -342,6 +342,8 @@ pub struct FtsClause {
     pub field: String,
     /// Raw query text for this field.
     pub text: String,
+    /// Expand the clause's final term as a prefix (typeahead). Earlier terms stay exact.
+    pub prefix: bool,
 }
 
 impl FtsClause {
@@ -350,7 +352,14 @@ impl FtsClause {
         Self {
             field: field.into(),
             text: text.into(),
+            prefix: false,
         }
+    }
+
+    /// Expand the clause's final term as a prefix (typeahead). Earlier terms stay exact.
+    pub fn prefix(mut self) -> Self {
+        self.prefix = true;
+        self
     }
 }
 

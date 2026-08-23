@@ -50,11 +50,21 @@ class LegScore:
 
 
 @dataclass(frozen=True)
+class Expansion:
+    """A prefix clause's expansion: ``matched > scored`` means the cap truncated it."""
+
+    matched: int
+    scored: int
+
+
+@dataclass(frozen=True)
 class ClauseScore:
     """One text clause's own BM25 contribution. Only clauses that matched are reported."""
 
     field: str
     score: float
+    #: Present only for a prefix clause; the server omits it for an exact one.
+    expansion: Optional[Expansion] = None
 
 
 @dataclass(frozen=True)
@@ -381,15 +391,22 @@ class FilterIndexField(_FilterIndexFieldRequired, total=False):
     trigrams: bool
 
 
-class FtsClause(TypedDict):
-    """One clause of a multi-field text query: an indexed field and *its own* query text.
-
-    Both keys are required, and the text key is ``query`` in every clause — including
-    :meth:`~nidus.NidusClient.hybrid_search`, whose single-field spelling calls it ``text``.
-    """
+class _FtsClauseRequired(TypedDict):
+    """The two keys every clause must carry (split out so the rest can be optional)."""
 
     field: str
     query: str
+
+
+class FtsClause(_FtsClauseRequired, total=False):
+    """One clause of a multi-field text query: an indexed field and *its own* query text.
+
+    ``field``/``query`` are required, and the text key is ``query`` in every clause,
+    including :meth:`~nidus.NidusClient.hybrid_search`'s single-field spelling (``text``).
+    ``prefix`` matches the clause's final term as a prefix; unset stays absent on the wire.
+    """
+
+    prefix: bool
 
 
 class HighlightOpts(TypedDict, total=False):

@@ -591,6 +591,25 @@ def test_the_ranking_and_annotation_surface(server: str) -> None:
         assert db.aggregate(scope=["posts"], sum=["absent"]).sums == {"absent": 0}
 
 
+def test_prefix_matches_a_truncated_query_against_a_real_server(server: str) -> None:
+    """A truncated query matches only with ``prefix=True`` — both spellings, both routes.
+
+    Asserting only the positive case would pass against a client that silently drops the
+    field; the same truncated query without ``prefix`` must return nothing first.
+    """
+    with NidusClient(server, timeout=10.0) as db:
+        db.set_fts_schema("docs", ["title"])
+        assert db.upsert("docs", [{"id": "a", "attrs": {"title": v.str("running quickly")}}]) == 1
+
+        assert db.text_search(field="title", query="ru", top_k=5) == []
+        hits = db.text_search(field="title", query="ru", prefix=True, top_k=5)
+        assert hits[0].id == "a"
+
+        assert db.text_search(clauses=[{"field": "title", "query": "ru"}], top_k=5) == []
+        hits = db.text_search(clauses=[{"field": "title", "query": "ru", "prefix": True}], top_k=5)
+        assert hits[0].id == "a"
+
+
 def test_ready_cluster_and_refresh_against_a_real_server(server: str) -> None:
     """Shape, not specific values: a standalone server is ready, decodes, and adopts nothing."""
     with NidusClient(server, timeout=10.0) as db:

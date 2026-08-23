@@ -671,6 +671,27 @@ reliable guard there is to refuse work *before* allocating:
   folded score. `hybrid_search` fuses one vector leg with the *combined* text leg, so the RRF
   numbers for a single-clause query are unchanged and per-clause weights stay out of scope
   (they belong to the ranking ticket).
+- **A clause can prefix-match its final term** (`FtsClause::prefix`, nidus-p1n), for
+  autocomplete/typeahead. Only the **final** term of the clause's text expands to every
+  indexed term carrying it as a prefix; earlier terms are complete words and keep exact-stem
+  semantics — `title:"quick br"` with `prefix` set expands only `br`, not `quick`. Scoring is
+  a **disjunction over the expanded terms**: each keeps its own idf, so a rare completion can
+  outrank a common one, and `FieldIndex::score`/`highlight::fragments` consume the expanded
+  `Vec<String>` exactly as they consume any other term list. The expansion is capped at
+  `MAX_PREFIX_EXPANSION` (256) terms; past the cap the match **truncates** by
+  `(df desc, term asc)` rather than erroring, keeping the commonest completions with a
+  deterministic tie-break. The cap bounds the terms **scored**, not the terms examined:
+  ranking by df means every term sharing the prefix is df-scanned before the truncation, so
+  a one-character prefix still costs a range scan proportional to its fan-out (nidus-clv) — an over-budget fuzzy edit (`MAX_FUZZY_EDITS`) is a caller mistake
+  and rejected, but a one-character prefix is the normal first keystroke of typeahead, so
+  truncating keeps it usable. The truncation is reported through the existing explain path
+  (§7.8's `ClauseScore.expansion`), not through a `QueryPlan` (§7.11). The prefix fragment is
+  analyzed **fold-only**: character-level normalization (lowercase, ASCII folding, the
+  token-length cap) applies, but word-level normalization (stemming, stopwords) does not,
+  because a fragment is not a complete word. This is a **documented limitation**: the index
+  holds stems, so a fragment like `runn` will not match an indexed `run` (stemmed from
+  "running"). Storing surface forms alongside stems would lift this and is a separate, larger
+  change.
 - **Ranking expressions are additive and off by default** (§7.6): `SearchOpts::rank_by`
   layers a recency decay over the metric (subtracting an age penalty, so it holds for every
   `Distance` and for BM25), `HybridOpts::vector_weight`/`text_weight` weight the fused legs,
@@ -1130,8 +1151,11 @@ A `Hit` list answers *what* matched; it says nothing about *how* the query got t
 `plan` field on `SearchOpts` / `HybridOpts` does (nidus-cvz), returned by the `*_with_plan`
 sibling of `search`/`search_similar`/`hybrid_search` as a `QueryPlan` that is `None` unless
 asked (the same shape §7.8 follows for `explain`/`highlight`: the unasked response is
-byte-identical). `text_search` has no plan; it always runs the same BM25 postings walk, so
-there is no branch worth reporting.
+byte-identical). `text_search` still has no plan; it always runs the same BM25 postings walk,
+so there is no branch worth a `QueryPlan`. A **prefix clause's expansion cap is** such a
+branch (nidus-p1n), but it surfaces through the existing explain path instead: `ClauseScore`
+carries an `expansion: Option<Expansion>` reporting `{matched, scored}`, `matched > scored`
+meaning the cap truncated the term list.
 
 **Path.** `QueryPath` names which branch of `Store::search` answered the query: `Ann` (the
 HNSW/IVF index walk), `AnnPrefilterFallback` (a selective filter made the index walk too
@@ -1382,7 +1406,11 @@ build until a real need exists.
   by vector search — coexisting with vector-bearing docs in one collection (a new
   append-only `UpsertText` op carries it; the `data` format is unchanged). The FTS index
   is a derived cache like ANN; today it rebuilds from the replayed docs on `open` (an
-  on-disk `fts` cache, sharing the ANN cache codec, is the planned follow-up).
+  on-disk `fts` cache, sharing the ANN cache codec, is the planned follow-up). Because it is
+  a derived cache, its validity key can move without a migration: prefix clauses (§7,
+  nidus-p1n) needed `FieldIndex.postings` to become a `BTreeMap` so expansion is a range scan,
+  which bumped `FTS_CACHE_VERSION` 2 → 3. Every store rebuilds its fts cache once on next
+  open under the new layout, at the one-time cost of that rebuild and never a loss of data.
 - **Shared index-cache codec.** ANN and the forthcoming FTS cache share one framing
   module (`NIDUS\0` header + validity key + watermark + `bincode` + CRC32, atomic
   temp/fsync/rename), so a derived index persists/loads through a single source.

@@ -12,8 +12,8 @@ mod fold;
 mod highlight;
 mod schema;
 
-pub(crate) use analyzer::analyze;
 pub use analyzer::{Analyzer, Language};
+pub(crate) use analyzer::{analyze, analyze_with_prefix};
 pub(crate) use highlight::fragments;
 pub use schema::FtsField;
 pub(crate) use schema::validate;
@@ -43,8 +43,9 @@ struct Posting {
 pub(crate) struct FieldIndex {
     /// The field's declared BM25 params + analyzer — what this index was built under.
     cfg: FtsField,
-    /// term → postings, appended in docnum order.
-    postings: HashMap<String, Vec<Posting>>,
+    /// term → postings, appended in docnum order. Ordered (not a `HashMap`) so prefix
+    /// expansion is a range scan rather than a full vocabulary sweep (D1).
+    postings: BTreeMap<String, Vec<Posting>>,
     /// docnum → field length in terms (`0` once tombstoned).
     doc_len: Vec<u32>,
     /// docnum → owning doc id, or `None` for a tombstoned slot.
@@ -182,12 +183,43 @@ impl FieldIndex {
             .collect()
     }
 
+    /// Terms carrying `fragment` as a prefix, commonest first, truncated to the cap. Returns the
+    /// terms scored and how many matched, so `explain` can report a truncation.
+    pub(crate) fn expand_prefix(&self, fragment: &str) -> (Vec<String>, usize) {
+        let mut matches: Vec<(&String, f32)> = self
+            .postings
+            .range(fragment.to_string()..)
+            .take_while(|(t, _)| t.starts_with(fragment))
+            .filter_map(|(t, postings)| {
+                let df = postings
+                    .iter()
+                    .filter(|p| self.docnum_to_id[p.docnum as usize].is_some())
+                    .count();
+                (df > 0).then_some((t, df as f32))
+            })
+            .collect();
+        let matched = matches.len();
+        // (df desc, term asc): the tie-break is load-bearing, or two equal-df terms
+        // truncate in whatever order the sort happened to leave them.
+        matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then_with(|| a.0.cmp(b.0)));
+        matches.truncate(MAX_PREFIX_EXPANSION);
+        (
+            matches.into_iter().map(|(t, _)| t.clone()).collect(),
+            matched,
+        )
+    }
+
     /// Whether this index currently holds document `id` (live).
     #[cfg(test)]
     fn contains(&self, id: &str) -> bool {
         self.id_to_docnum.contains_key(id)
     }
 }
+
+/// The most terms one prefix clause may **score**. Ranking by df means every matching term
+/// is still df-scanned first, so this bounds the BM25 disjunction, not the range scan.
+/// Truncates rather than erroring: typeahead's first keystroke must still answer.
+pub(crate) const MAX_PREFIX_EXPANSION: usize = 256;
 
 /// All FTS state for a store: the per-`(collection, field)` indexes plus the declared schema
 /// (`collection → [FtsField]`). The schema is the source of truth for which attrs are
@@ -216,9 +248,10 @@ impl Fts {
     /// every field's name, BM25 `k1`/`b`, and analyzer — deterministically ordered. Any
     /// change flips it, so [`crate::index_cache`] rejects the stale cache and rebuilds.
     pub(crate) fn cache_key(&self) -> Vec<u8> {
-        /// Bump when the inverted-index layout or analyzer behaviour changes. `2` = per-field
+        /// Bump when the inverted-index layout or analyzer behaviour changes. `3` = postings
+        /// became a `BTreeMap` (changes the bincode encoding of `FieldIndex`); `2` = per-field
         /// BM25/analyzer params (`1` keyed the two store-wide constants separately).
-        const FTS_CACHE_VERSION: u8 = 2;
+        const FTS_CACHE_VERSION: u8 = 3;
         let mut key = vec![FTS_CACHE_VERSION];
         // BTreeMap iterates key-sorted, so the encoding is deterministic. Serializing a
         // BTreeMap of owned/Copy types is infallible; a silent drop here would weaken the
@@ -342,6 +375,23 @@ impl Fts {
         {
             Some(idx) => idx.score(query_terms),
             None => Vec::new(),
+        }
+    }
+
+    /// Terms carrying `fragment` as a prefix in `collection`.`field` (see
+    /// [`FieldIndex::expand_prefix`]). `(vec![], 0)` when the field isn't indexed.
+    pub(crate) fn expand_prefix(
+        &self,
+        collection: &str,
+        field: &str,
+        fragment: &str,
+    ) -> (Vec<String>, usize) {
+        match self
+            .fields
+            .get(&(collection.to_string(), field.to_string()))
+        {
+            Some(idx) => idx.expand_prefix(fragment),
+            None => (Vec::new(), 0),
         }
     }
 }
@@ -541,6 +591,65 @@ mod tests {
         assert_eq!(idx.doc_len[0], 2);
     }
 
+    // ── prefix expansion ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn expand_prefix_returns_every_matching_term_and_nothing_else() {
+        let idx = idx_with(&[("d1", "cat car cap dog")]);
+        let (mut terms, matched) = idx.expand_prefix("ca");
+        terms.sort();
+        assert_eq!(terms, vec!["cap", "car", "cat"]);
+        assert_eq!(matched, 3);
+    }
+
+    #[test]
+    fn a_term_whose_postings_are_all_tombstoned_is_not_returned() {
+        let mut idx = idx_with(&[("d1", "cat"), ("d2", "car")]);
+        idx.tombstone("d1");
+        let (terms, matched) = idx.expand_prefix("ca");
+        assert_eq!(terms, vec!["car"]);
+        assert_eq!(
+            matched, 1,
+            "the tombstoned \"cat\" must not count as matched"
+        );
+    }
+
+    /// `n` distinct single-term documents sharing the prefix `zz`, each its own term so
+    /// every one has `df == 1` (a controlled tie, since the cap's boundary must not
+    /// depend on which terms happen to sort first by relevance).
+    fn zz_corpus(n: usize) -> FieldIndex {
+        let docs: Vec<(String, String)> = (0..n)
+            .map(|i| (format!("d{i}"), format!("zz{i:05}")))
+            .collect();
+        let refs: Vec<(&str, &str)> = docs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        idx_with(&refs)
+    }
+
+    #[test]
+    fn exactly_the_cap_scores_every_matching_term() {
+        let idx = zz_corpus(MAX_PREFIX_EXPANSION);
+        let (terms, matched) = idx.expand_prefix("zz");
+        assert_eq!(matched, MAX_PREFIX_EXPANSION);
+        assert_eq!(terms.len(), MAX_PREFIX_EXPANSION);
+    }
+
+    #[test]
+    fn one_past_the_cap_truncates_and_reports_it() {
+        let idx = zz_corpus(MAX_PREFIX_EXPANSION + 1);
+        let (terms, matched) = idx.expand_prefix("zz");
+        assert_eq!(matched, MAX_PREFIX_EXPANSION + 1);
+        assert_eq!(terms.len(), MAX_PREFIX_EXPANSION);
+        assert!(matched > terms.len(), "truncation must be reportable");
+    }
+
+    #[test]
+    fn truncation_is_deterministic_across_repeated_calls() {
+        let idx = zz_corpus(MAX_PREFIX_EXPANSION + 1);
+        let first = idx.expand_prefix("zz");
+        let second = idx.expand_prefix("zz");
+        assert_eq!(first, second);
+    }
+
     // ── cache invalidation ────────────────────────────────────────────────────────
 
     /// The cache key a store would carry with `fields` declared on one collection.
@@ -573,6 +682,14 @@ mod tests {
         assert_ne!(baseline, key_for(&[base.clone(), FtsField::new("title")]));
         // Redeclaring the same schema must keep the key, or every reopen would rebuild.
         assert_eq!(baseline, key_for(&[base]));
+    }
+
+    #[test]
+    fn cache_key_carries_the_bumped_version_for_btreemap_postings() {
+        // Guards the D1 bump: a store built under the old `HashMap` layout (version 2)
+        // must not be read back as valid by today's `FieldIndex` bincode shape.
+        let key = key_for(&[FtsField::new("body")]);
+        assert_eq!(key[0], 3, "FTS_CACHE_VERSION must be 3, not the old 2");
     }
 
     #[test]

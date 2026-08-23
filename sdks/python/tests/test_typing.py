@@ -97,6 +97,21 @@ def test_public_shapes_resolve_their_type_hints(shape: Any) -> None:
     assert hints, f"{shape.__name__} has no annotations at all — the test is not looking"
 
 
+def test_fts_clause_prefix_is_not_required() -> None:
+    """``prefix`` is the one optional key of ``FtsClause``; the other two stay required.
+
+    mypy --strict accepts a clause with ``prefix`` omitted and rejects a non-``bool`` value
+    for it; this asserts the half of that fact ``get_type_hints`` can observe on any floor
+    interpreter — the hint resolves at all — plus both literal forms actually construct.
+    """
+    hints = typing.get_type_hints(FtsClause)
+    assert set(hints) == {"field", "query", "prefix"}
+    bare: FtsClause = {"field": "title", "query": "ru"}
+    assert "prefix" not in bare
+    with_prefix: FtsClause = {"field": "title", "query": "ru", "prefix": True}
+    assert with_prefix["prefix"] is True
+
+
 @pytest.mark.parametrize("name", CLIENT_METHODS)
 def test_client_signatures_resolve_their_type_hints(name: str) -> None:
     """Same for the call surface: ``help()``, autodoc, and any decorator reading hints."""

@@ -335,7 +335,7 @@ export class NidusClient {
     return this.searchRequest("/text-search", {
       ...(opts.clauses
         ? { clauses: opts.clauses, combine: opts.combine }
-        : { field: opts.field, query: opts.query }),
+        : { field: opts.field, query: opts.query, prefix: opts.prefix }),
       scope: opts.scope ?? [],
       top_k: opts.topK,
       offset: opts.offset,
@@ -362,7 +362,7 @@ export class NidusClient {
       vector: opts.vector,
       ...(opts.clauses
         ? { clauses: opts.clauses, combine: opts.combine }
-        : { field: opts.field, text: opts.text }),
+        : { field: opts.field, text: opts.text, prefix: opts.prefix }),
       scope: opts.scope ?? [],
       top_k: opts.topK,
       offset: opts.offset,
@@ -386,7 +386,7 @@ export class NidusClient {
       vector: opts.vector,
       ...(opts.clauses
         ? { clauses: opts.clauses, combine: opts.combine }
-        : { field: opts.field, text: opts.text }),
+        : { field: opts.field, text: opts.text, prefix: opts.prefix }),
       scope: opts.scope ?? [],
       top_k: opts.topK,
       offset: opts.offset,

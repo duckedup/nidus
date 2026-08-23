@@ -95,6 +95,25 @@ pub(crate) fn analyze_spans(text: &str, cfg: Analyzer) -> Vec<TermSpan> {
     }
 }
 
+/// Split `text` for a prefix clause: every term but the last analyzed normally, the last
+/// left fold-only (a fragment is not a word). The final **token** decides the fragment, not
+/// the final surviving term, so a trailing stopword still becomes it rather than being dropped.
+pub(crate) fn analyze_with_prefix(text: &str, cfg: Analyzer) -> (Vec<String>, Option<String>) {
+    let mut tokens = tokenize(text, cfg.ascii_folding, cfg.max_token_len);
+    let Some(fragment) = tokens.pop() else {
+        return (Vec::new(), None);
+    };
+    let heads = match cfg.language {
+        Language::English => tokens
+            .into_iter()
+            .filter(|t| !is_stopword(&t.term))
+            .map(|t| stem(&t.term))
+            .filter(|t| !t.is_empty())
+            .collect(),
+    };
+    (heads, Some(fragment.term))
+}
+
 /// Split `text` into lowercased tokens on runs of Unicode alphanumerics, everything else being a
 /// separator. Lowercasing is std's `char::to_lowercase`, which covers the Latin script we target —
 /// a pragmatic stand-in for full UAX #29 segmentation that stays dependency-free.
@@ -724,5 +743,43 @@ mod tests {
                 "query term {q} should match an indexed term"
             );
         }
+    }
+
+    #[test]
+    fn prefix_fragment_is_folded_but_not_stemmed_or_stopworded() {
+        // "runni" would stem to "runni" itself (not a recognized inflection) — the point
+        // is that stemming and the stopword filter never touch the fragment.
+        let (heads, frag) = analyze_with_prefix("async runni", Analyzer::default());
+        assert_eq!(heads, vec!["async".to_string()]);
+        assert_eq!(frag, Some("runni".to_string()));
+
+        // A trailing stopword still becomes the fragment, not "async" promoted alone.
+        let (heads, frag) = analyze_with_prefix("async the", Analyzer::default());
+        assert_eq!(heads, vec!["async".to_string()]);
+        assert_eq!(frag, Some("the".to_string()));
+    }
+
+    #[test]
+    fn prefix_fragment_applies_folding_like_any_token() {
+        let cfg = Analyzer::default().ascii_folding(true);
+        let (heads, frag) = analyze_with_prefix("cafe RÉSU", cfg);
+        assert_eq!(heads, vec!["cafe".to_string()]);
+        assert_eq!(frag, Some("resu".to_string()));
+    }
+
+    #[test]
+    fn prefix_split_of_empty_or_separator_only_text_is_empty() {
+        assert_eq!(analyze_with_prefix("", Analyzer::default()), (vec![], None));
+        assert_eq!(
+            analyze_with_prefix("   ---  ", Analyzer::default()),
+            (vec![], None)
+        );
+    }
+
+    #[test]
+    fn a_single_token_clause_is_entirely_the_fragment() {
+        let (heads, frag) = analyze_with_prefix("runni", Analyzer::default());
+        assert!(heads.is_empty());
+        assert_eq!(frag, Some("runni".to_string()));
     }
 }

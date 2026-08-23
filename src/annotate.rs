@@ -54,6 +54,16 @@ pub struct LegScore {
 pub struct ClauseScore {
     pub field: String,
     pub score: f32,
+    /// For a prefix clause: how many terms matched, and how many were scored after the cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expansion: Option<Expansion>,
+}
+
+/// A prefix clause's expansion: `matched > scored` means the cap truncated it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Expansion {
+    pub matched: usize,
+    pub scored: usize,
 }
 
 /// An excerpt of a field's stored text plus the byte ranges **within `text`** that a

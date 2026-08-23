@@ -2368,6 +2368,56 @@ func TestTextQuerySpellings(t *testing.T) {
 	}
 }
 
+// TestPrefixOmitsWhenUnset — Prefix is a pointer so the unset (nil) case must drop the
+// key entirely, protecting every existing caller's request body; setting it must carry
+// "prefix":true through both the clause and the field+query shorthand.
+func TestPrefixOmitsWhenUnset(t *testing.T) {
+	fake := &capture{reply: `[]`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.TextSearch(ctx, TextSearchRequest{
+		Clauses: []FtsClause{{Field: "title", Query: "ru"}},
+	}); err != nil {
+		t.Fatalf("TextSearch failed: %v", err)
+	}
+	if body := fake.sentBody(t); strings.Contains(body, "prefix") {
+		t.Errorf("body = %s, must omit prefix when it is unset", body)
+	}
+
+	on := true
+	_, err := db.TextSearch(ctx, TextSearchRequest{
+		Clauses: []FtsClause{{Field: "title", Query: "ru", Prefix: &on}},
+	})
+	if err != nil {
+		t.Fatalf("TextSearch failed: %v", err)
+	}
+	want := `{"clauses":[{"field":"title","query":"ru","prefix":true}]}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+
+	_, err = db.TextSearch(ctx, TextSearchRequest{Field: "title", Query: "ru", Prefix: &on})
+	if err != nil {
+		t.Fatalf("TextSearch failed: %v", err)
+	}
+	want = `{"field":"title","query":"ru","prefix":true}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+
+	_, err = db.HybridSearch(ctx, HybridSearchRequest{
+		Vector: []float32{1, 0, 0}, Text: "ru", Prefix: &on,
+	})
+	if err != nil {
+		t.Fatalf("HybridSearch failed: %v", err)
+	}
+	want = `{"vector":[1,0,0],"text":"ru","prefix":true}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+}
+
 // TestExplainAndHighlightAreAdditive — both are off unless asked for, and an empty
 // HighlightOpts is the request for the server's defaults rather than for zero
 // fragments of zero characters.

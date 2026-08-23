@@ -291,6 +291,8 @@ Full-text (BM25) search of fields declared via `set-fts-schema`. Usage:
 | Flag | Env | Description |
 | --- | --- | --- |
 | `--clause <FIELD=TEXT>` | none | An extra query clause (repeatable). Use instead of the positional field/query pair, never alongside it. |
+| `--prefix-clause <FIELD=TEXT>` | none | An extra clause whose final term is a prefix (repeatable, for typeahead). Combine with `--clause`; never with the positional pair. |
+| `--prefix` | none | Match the positional `QUERY`'s final term as a prefix instead of a complete word. Applies only to the positional field/query pair; use `--prefix-clause` with `--clause`. |
 | `--combine <sum\|max>` | none | How several clauses fold into one score (default `sum`). |
 | `--explain` | none | Annotate each hit with its per-clause (and, for hybrid, per-leg) scores. |
 | `--highlight` | none | Return highlighted fragments of the matched text. |
@@ -316,12 +318,17 @@ Full-text (BM25) search of fields declared via `set-fts-schema`. Usage:
 | `--rerank-overscan <N>` (`rerank` feature) | none | Candidates retrieved per `top_k` before the cross-encoder rerank (default `10`). |
 | `--rerank-text-attr <ATTR>` (`rerank` feature) | none | Attr holding each candidate's text for the cross-encoder rerank (default `nidus.text`). |
 
+A prefix match expands only the clause's final term, capped at 256 expansions (past the
+cap, the commonest completions win rather than the command erroring). With `--explain`,
+each hit's clause score reports `expansion: {matched, scored}` when the clause was a
+prefix match. See [prefix matching for typeahead](/guides/search/#prefix-matching-search-as-you-type).
+
 ### `hybrid-search`
 
 Fuse a vector query and a BM25 text query with Reciprocal Rank Fusion. Usage:
 `nidus hybrid-search [OPTIONS] --dir <DIR> [FIELD] [TEXT]`. Takes the same
-`--clause`/`--combine`/`--explain`/`--highlight`/`--max-fragments`/`--fragment-chars`
-flags as `text-search` above, plus:
+`--clause`/`--prefix-clause`/`--prefix`/`--combine`/`--explain`/`--highlight`/
+`--max-fragments`/`--fragment-chars` flags as `text-search` above, plus:
 
 | Flag | Env | Description |
 | --- | --- | --- |
