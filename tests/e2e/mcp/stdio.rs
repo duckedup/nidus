@@ -63,7 +63,7 @@ fn initialize_reports_protocol_and_server_info() {
     );
 }
 
-/// The ten tools, in the same order HTTP reports them — the split must not have forked
+/// The eleven tools, in the same order HTTP reports them — the split must not have forked
 /// the list by transport.
 #[test]
 fn tools_list_matches_http_order() {
@@ -86,6 +86,7 @@ fn tools_list_matches_http_order() {
             "get",
             "browse",
             "related",
+            "suggest",
         ],
         "stdio's tool list/order must match HTTP's: {listed}"
     );

@@ -7,10 +7,10 @@ Every flag the `nidus` binary accepts, generated from `nidus --help` and each su
 own `--help`. For a guided tour with worked examples, see the [command-line
 guide](/guides/cli-and-server/); this page is the exhaustive reference.
 
-The binary has **27 subcommands**: `serve`, `mcp`, `collections`, `create`, `drop`,
-`upsert`, `search`, `similar`, `aggregate`, `list`, `set-fts-schema`, `text-search`,
-`hybrid-search`, `get`, `delete`, `compact`, `versions`, `configure`, `backup`,
-`restore`, `verify`, `check`, `stats`, `tune`, `ingest`, `remember`, `recall`.
+The binary has **28 subcommands**: `serve`, `mcp`, `collections`, `create`, `drop`,
+`upsert`, `search`, `similar`, `aggregate`, `list`, `set-fts-schema`, `suggest`,
+`text-search`, `hybrid-search`, `get`, `delete`, `compact`, `versions`, `configure`,
+`backup`, `restore`, `verify`, `check`, `stats`, `tune`, `ingest`, `remember`, `recall`.
 
 ## Feature gating
 
@@ -19,7 +19,7 @@ binary was built:
 
 | Install | Command | Surface |
 | --- | --- | --- |
-| `cargo binstall nidus` (prebuilt), or the install script | n/a | Everything below: all 27 subcommands, every `--embed-*`/`--summarize-*` flag, `mcp`, `ingest`, `remember`, `recall` |
+| `cargo binstall nidus` (prebuilt), or the install script | n/a | Everything below: all 28 subcommands, every `--embed-*`/`--summarize-*` flag, `mcp`, `ingest`, `remember`, `recall` |
 | `cargo install nidus --features cli` | build from source | No `mcp`, `ingest`, `remember`, or `recall` subcommand, and `serve` has **no** `--embed-*`/`--summarize-*` flags |
 
 The prebuilt binaries (`cargo binstall`, the install script, and the release
@@ -282,6 +282,33 @@ the affected field indexes.
 | `--b <N>` | none | BM25 length normalization, `0..=1` (default `0.75`). |
 | `--ascii-folding` | none | Fold Latin diacritics to ASCII, so "café" and "cafe" share a term. |
 | `--max-token-len <N>` | none | Drop tokens longer than this many characters (default: no limit). |
+
+### `suggest`
+
+Ranked term completions for a prefix from a full-text-indexed field's vocabulary, the kind
+of list an autocomplete dropdown shows. Usage:
+`nidus suggest [OPTIONS] --dir <DIR> <COLLECTION> <FIELD> <PREFIX>`. Completions are ranked
+by document frequency (commonest first), the opposite of how a prefix clause ranks
+*documents* by idf. The response's `matched` exceeds the returned count when the 256-term
+cap truncated the match set. Completions are real words: the field's surface forms are
+indexed alongside its stems, so every keystroke of `running` completes to `running`.
+
+| Flag | Env | Description |
+| --- | --- | --- |
+| `-n, --limit <N>` | none | How many completions to return (default `10`). |
+
+```
+nidus suggest --dir ./store --dim 384 docs body nid --limit 5
+```
+```json
+{
+  "suggestions": [
+    { "term": "nidus", "df": 42 },
+    { "term": "nidification", "df": 3 }
+  ],
+  "matched": 2
+}
+```
 
 ### `text-search`
 

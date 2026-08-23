@@ -223,6 +223,21 @@ word exactly, `true` expands it to any indexed term carrying it as a prefix (aut
 capped at 256 expansions. `FtsClause` also carries its own `Prefix *bool`, so a multi-clause
 query can prefix-match one field while another stays exact.
 
+For an autocomplete dropdown itself, `Suggest` returns the completions directly, ranked
+by how many live documents contain them (commonest first) rather than by BM25:
+
+```go
+sug, err := db.Suggest(ctx, "docs", nidus.SuggestRequest{
+    Field: "title", Prefix: "quick br", Limit: 5,
+})
+for _, s := range sug.Suggestions {
+    fmt.Println(s.Term, s.DF)
+}
+```
+
+`Limit` is a plain `int`; leave it zero for the server's default of 10. `Suggest`
+matches the same stemmed, folded vocabulary `Prefix` does.
+
 ## Batch search and aggregation
 
 `BatchSearch` answers several vector queries in one round-trip (16 max), saving a hop

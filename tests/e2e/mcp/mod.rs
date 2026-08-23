@@ -199,6 +199,7 @@ fn tools_list_is_complete_ordered_and_cacheable() {
             "get",
             "browse",
             "related",
+            "suggest",
         ],
         "tool list changed — if this is deliberate, append rather than reorder"
     );
@@ -452,6 +453,101 @@ fn text_search_prefix_matches_a_truncated_final_word() {
     assert!(
         !hits.contains("\"a\""),
         "without prefix, a truncated word must not match: {hits}"
+    );
+}
+
+/// `suggest` ranks completions by live document frequency, commonest first — the opposite
+/// of the idf a prefix *clause* would rank documents by (nidus-ux0). Asserting order and
+/// counts, not just success, so a handler stubbed to an empty list would still fail this.
+#[test]
+fn suggest_tool_completes_a_prefix_ranked_by_document_frequency() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+
+    assert_eq!(server.post("/collections/notes", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post(
+                "/collections/notes/fts-schema",
+                &json!({"fields": ["body"]})
+            )
+            .0,
+        200
+    );
+    let (status, _) = server.post(
+        "/collections/notes/upsert",
+        &json!({"records": [
+            {"id": "a", "vector": [1, 0, 0], "attrs": {"body": {"Str": "the banana bread"}}},
+            {"id": "b", "vector": [0, 1, 0], "attrs": {"body": {"Str": "another banana muffin"}}},
+            {"id": "c", "vector": [0, 0, 1], "attrs": {"body": {"Str": "bandit raid"}}}
+        ]}),
+    );
+    assert_eq!(status, 200);
+
+    let (status, body) = mcp(
+        &server,
+        "tools/call",
+        Some("suggest"),
+        &call(
+            1,
+            "suggest",
+            json!({"collection": "notes", "field": "body", "prefix": "ban"}),
+        ),
+    );
+    assert_eq!(status, 200, "suggest failed: {body}");
+    let out = text(&result(&body));
+    let banana_at = out.find("\"banana\"").expect("banana in response");
+    let bandit_at = out.find("\"bandit\"").expect("bandit in response");
+    assert!(
+        banana_at < bandit_at,
+        "the commonest term (df 2) must come before the rarer one (df 1): {out}"
+    );
+    assert!(
+        out.contains("\"df\": 2") && out.contains("\"df\": 1"),
+        "each completion's document frequency must be reported: {out}"
+    );
+}
+
+/// A prefix matching no indexed term says so in a sentence, not `[]`, mirroring the same
+/// empty-result rule the other search tools follow.
+#[test]
+fn suggest_tool_says_so_when_nothing_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+
+    assert_eq!(server.post("/collections/notes", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post(
+                "/collections/notes/fts-schema",
+                &json!({"fields": ["body"]})
+            )
+            .0,
+        200
+    );
+    let (status, _) = server.post(
+        "/collections/notes/upsert",
+        &json!({"records": [
+            {"id": "a", "vector": [1, 0, 0], "attrs": {"body": {"Str": "banana bread"}}}
+        ]}),
+    );
+    assert_eq!(status, 200);
+
+    let (status, body) = mcp(
+        &server,
+        "tools/call",
+        Some("suggest"),
+        &call(
+            1,
+            "suggest",
+            json!({"collection": "notes", "field": "body", "prefix": "zzz"}),
+        ),
+    );
+    assert_eq!(status, 200, "suggest failed: {body}");
+    let said = text(&result(&body));
+    assert!(
+        said.contains("No indexed terms start with that prefix."),
+        "an empty completion list should explain itself, not return `[]`: {said}"
     );
 }
 

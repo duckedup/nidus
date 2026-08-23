@@ -1030,12 +1030,24 @@ when the cap has truncated a broad prefix.
 
 **This returns documents, not completions.** A prefix clause ranks matching *records*,
 the same as any other clause. It does not hand back a list of candidate words to show in
-an autocomplete dropdown, and there is no suggest API today.
+an autocomplete dropdown. For that, use [`Nidus::suggest`](/reference/api/#suggestion--suggestions):
+it reuses the same range scan a prefix clause runs, but ranks the terms themselves by
+document frequency (commonest first) rather than folding them into a document ranking.
+
+```rust
+let got = db.suggest("docs", "body", "nid", 10);
+// got.suggestions: [{ term: "nidus", df: 42 }, { term: "nidification", df: 3 }, ...]
+```
 
 **Limitation:** the prefix fragment is folded (lowercased, optionally ASCII-folded) but
 not stemmed, while the index holds stems. So `"runn"` will not match an indexed `run`
-even though `run` is what `"running"` stems to: matching against surface forms as well
-as stems would lift this and is a larger, separate change.
+even though `run` is what `"running"` stems to: matching a prefix *clause* against surface
+forms as well as stems would lift this and is a larger, separate change.
+
+`suggest` does not share the limitation. It matches a per-field surface-form map instead of
+the stem-keyed postings, so it completes `"runn"` to `"running"` and keeps answering at
+every keystroke, where a stem-keyed scan would go empty as soon as the typed prefix grew
+longer than the stem.
 
 ### Tuning a field
 

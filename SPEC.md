@@ -692,6 +692,26 @@ reliable guard there is to refuse work *before* allocating:
   holds stems, so a fragment like `runn` will not match an indexed `run` (stemmed from
   "running"). Storing surface forms alongside stems would lift this and is a separate, larger
   change.
+- **`Nidus::suggest(collection, field, prefix, limit)` hands back ranked term completions**
+  (nidus-ux0), the typeahead surface a prefix *clause* does not provide: a clause ranks
+  *documents*, `suggest` ranks *terms*. It reuses the same range scan `FieldIndex::expand_prefix`
+  already runs (`expand_prefix_scored` is the shared implementation; `expand_prefix` is now a
+  two-line wrapper over it, so a prefix clause's scoring is unchanged), keeping each matching
+  term's live `df` instead of discarding it. Ranking is **`df` desc, term asc**, the opposite
+  of the per-term idf a prefix clause scores documents by: a dropdown wants the common
+  completion (`nid` → `nidus`) above the rare one (`nidification`), while ranking documents
+  correctly wants the rare term to lift its doc. The 256-term `MAX_PREFIX_EXPANSION` cap is
+  the same one prefix clauses hit; `limit` only truncates further, and the returned `matched`
+  count (from the same cap accounting `ClauseScore.expansion` uses) lets a caller detect
+  truncation. The prefix is normalized the same fold-only way a prefix clause's fragment is
+  (via `analyze_with_prefix`, discarding its stemmed heads), but it is matched against a
+  per-field **surface-form** map (`FieldIndex::surface`, folded spelling → its stem) rather
+  than against the stem-keyed postings, because a stem-keyed scan goes empty exactly as the
+  typist finishes the word (`nidus` stems to `nidu`). So completions are real words, each
+  carrying the live `df` of the stem it maps to, and two spellings of one stem are two
+  completions. Prefix *clauses* still key on stems, unchanged, so `runn` still matches no
+  document (that is nidus-dnm). An unindexed field or unknown collection returns an empty
+  `Suggestions`, not an error.
 - **Ranking expressions are additive and off by default** (§7.6): `SearchOpts::rank_by`
   layers a recency decay over the metric (subtracting an age penalty, so it holds for every
   `Distance` and for BM25), `HybridOpts::vector_weight`/`text_weight` weight the fused legs,

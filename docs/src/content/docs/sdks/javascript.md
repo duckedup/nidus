@@ -169,6 +169,29 @@ autocomplete as a caller is still typing; earlier words still match exactly. It 
 at 256 expansions, past which the commonest completions win rather than the call failing.
 Set it on the shorthand `field`/`query` call, or per-entry inside `clauses`.
 
+## Suggesting completions
+
+`suggest` completes a partial word from an indexed field's vocabulary, ranked by document
+frequency (the commonest term first) rather than the idf-based ranking `textSearch` uses
+for documents. That makes it a separate method built for an autocomplete dropdown: `"nid"`
+should surface a common term like `"nidus"` above a rare one like `"nidification"`, the
+opposite of how a prefix clause would rank the documents containing them.
+
+```ts
+const { suggestions, matched } = await db.suggest({
+  collection: "docs",
+  field: "body",
+  prefix: "vec",
+  limit: 10, // the server default; capped at 256 matching terms overall
+});
+for (const { term, df } of suggestions) console.log(term, df);
+```
+
+`matched` counts every term the prefix matched before the 256-term cap, so
+`matched > suggestions.length` means the cap truncated the list. Unlike `prefix` above,
+which matches stems, `suggest` matches surface forms, so completions are real words:
+every keystroke of `"running"` completes to `"running"`.
+
 ## Remembering and recalling
 
 When the server is started with an embedder

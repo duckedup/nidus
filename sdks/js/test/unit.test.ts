@@ -338,6 +338,39 @@ describe("NidusClient request shaping", () => {
     expect(calls[0]!.json).toEqual({ fields: [] });
   });
 
+  it("suggest sends the collection in the path and the rest in the body", async () => {
+    const { fn, calls } = mockFetch({ suggestions: [], matched: 0 });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.suggest({ collection: "docs", field: "body", prefix: "nid", limit: 5 });
+    expect(calls[0]!.url).toBe("http://x/collections/docs/suggest");
+    expect(calls[0]!.init.method).toBe("POST");
+    expect(calls[0]!.json).toEqual({ field: "body", prefix: "nid", limit: 5 });
+  });
+
+  it("suggest omits limit when unset", async () => {
+    const { fn, calls } = mockFetch({ suggestions: [], matched: 0 });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.suggest({ collection: "docs", field: "body", prefix: "nid" });
+    const body = calls[0]!.json as Record<string, unknown>;
+    expect(body).toEqual({ field: "body", prefix: "nid" });
+    expect("limit" in body).toBe(false);
+  });
+
+  it("suggest returns the parsed suggestions", async () => {
+    const { fn } = mockFetch({ suggestions: [{ term: "nidus", df: 3 }], matched: 1 });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const result = await db.suggest({ collection: "docs", field: "body", prefix: "nid" });
+    expect(result).toEqual({ suggestions: [{ term: "nidus", df: 3 }], matched: 1 });
+    expect(result.suggestions[0]!.df).toBe(3);
+  });
+
+  it("suggest escapes a collection name", async () => {
+    const { fn, calls } = mockFetch({ suggestions: [], matched: 0 });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.suggest({ collection: "my docs", field: "body", prefix: "nid" });
+    expect(calls[0]!.url).toBe("http://x/collections/my%20docs/suggest");
+  });
+
   it("sends diversity only when set, and keeps a zero lambda", async () => {
     const { fn, calls } = mockFetch([]);
     const db = new NidusClient({ baseUrl: "http://x", fetch: fn });

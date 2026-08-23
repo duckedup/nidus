@@ -82,6 +82,8 @@ from .types import (
     Rollup,
     Stats,
     StoreVersions,
+    Suggestion,
+    Suggestions,
 )
 from .values import AttrInput, Value, decode_attrs, decode_value, encode_attrs
 
@@ -147,6 +149,11 @@ def remember_path(name: str) -> str:
 
 def recall_path(name: str) -> str:
     return f"{collection_path(name)}/recall"
+
+
+def suggest_path(name: str) -> str:
+    """Path for ``POST /collections/{name}/suggest``."""
+    return f"{collection_path(name)}/suggest"
 
 
 # ── Request bodies ───────────────────────────────────────────────────────────────────
@@ -288,6 +295,19 @@ def _filter_index_field(
     body: dict[str, Any] = {"field": str(knobs["field"])}
     body.update({k: knobs[k] for k in _FILTER_INDEX_KNOBS if k in knobs})
     return body
+
+
+def suggest_body(
+    field: str,
+    prefix: str,
+    limit: Optional[int] = None,
+) -> dict[str, Any]:
+    """Body for ``POST /collections/{name}/suggest``.
+
+    ``limit`` is omitted when unset so the server's default of 10 applies; sending it as
+    ``None`` would be a 422.
+    """
+    return prune({"field": field, "prefix": prefix, "limit": limit})
 
 
 def search_body(
@@ -927,6 +947,20 @@ def decode_upserted(payload: Any) -> int:
 def decode_deleted(payload: Any) -> int:
     """The count from either delete form's response."""
     return _count(payload, "deleted")
+
+
+def decode_suggestions(payload: Any) -> Suggestions:
+    """Decode ``POST /collections/{name}/suggest``. Ranked ``df`` desc, term asc."""
+    if not isinstance(payload, Mapping):
+        raise NidusError(f"suggest returned no JSON object (got {payload!r})", 0)
+    return Suggestions(
+        suggestions=[_suggestion_of(s) for s in payload.get("suggestions") or ()],
+        matched=int(payload.get("matched", 0)),
+    )
+
+
+def _suggestion_of(payload: Mapping[str, Any]) -> Suggestion:
+    return Suggestion(term=str(payload["term"]), df=int(payload["df"]))
 
 
 def decode_remember(payload: Any, requested_id: str) -> RememberResult:

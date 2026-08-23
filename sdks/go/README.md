@@ -269,6 +269,22 @@ hits, err := db.TextSearch(ctx, nidus.TextSearchRequest{
 only the clause's or shorthand's own *final* term expands, and only against the index's
 stemmed vocabulary (so `"runn"` will not find `"run"`).
 
+For an autocomplete dropdown, `Suggest` ranks completions by how many live documents
+contain them (commonest first), the opposite of how `TextSearch` scores documents:
+
+```go
+sug, err := db.Suggest(ctx, "docs", nidus.SuggestRequest{
+    Field: "body", Prefix: "sched", Limit: 5,
+})
+for _, s := range sug.Suggestions {
+    fmt.Println(s.Term, s.DF) // e.g. "schedule" 12
+}
+```
+
+Unlike `Prefix` above, which matches stems, `Suggest` matches surface forms, so
+completions are real words. Leave `Limit` zero for the server's default of 10; the Go
+spelling cannot ask for zero completions, which would return an empty list anyway.
+
 ## Reshaping the ranking
 
 ```go

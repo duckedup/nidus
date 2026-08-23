@@ -1,9 +1,10 @@
-//! The four search tools — `recall`, `text_search`, `hybrid_search`, `related` — and the
-//! metadata `filter` they share (nidus-k28.3). `recall`'s `reinforce` flag also writes.
+//! The five search tools — `recall`, `text_search`, `hybrid_search`, `related`, `suggest`
+//! — and the metadata `filter` they share (nidus-k28.3). `recall`'s `reinforce` flag also
+//! writes.
 
 use rmcp::{
     ErrorData as McpError,
-    model::{CallToolResult, Tool},
+    model::{CallToolResult, ContentBlock, Tool},
 };
 use serde_json::{Map, Value as JsonValue, json};
 
@@ -11,6 +12,7 @@ use serde_json::{Map, Value as JsonValue, json};
 use crate::embed::Embedder;
 use crate::memory::not_expired_predicate;
 use crate::meta::now_ms;
+use crate::server::dto::SuggestionsDto;
 use crate::{Filter, HybridOpts, SearchOpts};
 
 use super::NidusMcp;
@@ -487,6 +489,44 @@ pub(super) fn related_tool() -> Tool {
     )
 }
 
+/// `suggest`'s schema, kept separate from [`tools`] so [`super::tools`] can register it last
+/// without disturbing this module's own three-tool order (SEP-2549).
+pub(super) fn suggest_tool() -> Tool {
+    tool(
+        "suggest",
+        "Complete a partial word from a collection's indexed vocabulary, ranked \
+         commonest-first. Use this to turn a half-typed word into the real terms that \
+         actually occur in the corpus before searching, or to check what vocabulary a \
+         field even contains. This returns words with their document counts, not entries \
+         — call text_search with a completion to get the entries themselves. Only the \
+         final token of the prefix is completed.",
+        json!({
+            "type": "object",
+            "properties": {
+                "collection": {
+                    "type": "string",
+                    "description": "Which collection's vocabulary to complete from."
+                },
+                "field": {
+                    "type": "string",
+                    "description": "The full-text-indexed field whose vocabulary to complete from."
+                },
+                "prefix": {
+                    "type": "string",
+                    "description": "The partial word to complete. Only its final token is completed, so \"the nid\" completes \"nid\"."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "How many completions to return. Defaults to 10.",
+                    "minimum": 1
+                }
+            },
+            "required": ["collection", "field", "prefix"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 impl NidusMcp {
     pub(super) async fn recall(
         &self,
@@ -774,6 +814,41 @@ impl NidusMcp {
             hits.into_iter().map(HitDto::from).collect(),
             plan,
         ))
+    }
+
+    /// Ranked term completions for a typeahead dropdown, `df` desc then term asc — see
+    /// [`crate::Nidus::suggest`]. Infallible past argument parsing: a read of an in-RAM map.
+    pub(super) async fn suggest(
+        &self,
+        args: &Map<String, JsonValue>,
+    ) -> Result<CallToolResult, McpError> {
+        let collection = required_str(args, "collection")?;
+        let field = required_str(args, "field")?;
+        let prefix = required_str(args, "prefix")?;
+        let limit = optional_usize(args, "limit")?.unwrap_or(10);
+        if limit > crate::server::dto::MAX_TOP_K {
+            return Err(McpError::invalid_params(
+                format!("`limit` must not exceed {}", crate::server::dto::MAX_TOP_K),
+                None,
+            ));
+        }
+
+        let out = crate::server::run_read(self.state.clone(), move |db| {
+            Ok(db.suggest(&collection, &field, &prefix, limit))
+        })
+        .await
+        .map_err(api_error)?;
+
+        if out.suggestions.is_empty() {
+            // A sentence, not `[]`: mirrors `hits_content` (mod.rs) so a model broadens
+            // instead of retrying the identical prefix.
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                "No indexed terms start with that prefix.".to_string(),
+            )]));
+        }
+        let dto = SuggestionsDto::from(out);
+        let rendered = serde_json::to_string_pretty(&dto).unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![ContentBlock::text(rendered)]))
     }
 }
 

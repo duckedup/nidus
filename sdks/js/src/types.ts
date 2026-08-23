@@ -510,6 +510,32 @@ export interface TextSearchBase
 /** Options for {@link NidusClient.textSearch} (BM25). */
 export type TextSearchOptions = TextSearchBase & TextQuerySpelling;
 
+/** Options for {@link NidusClient.suggest}. */
+export interface SuggestOptions {
+  collection: string;
+  /** The full-text-indexed field whose vocabulary to complete from. */
+  field: string;
+  /** The partial word being typed. Only its final token is completed. */
+  prefix: string;
+  /** How many completions to return. The server defaults to 10. */
+  limit?: number;
+}
+
+/** One completion: an indexed term and how many live documents contain it. */
+export interface Suggestion {
+  term: string;
+  df: number;
+}
+
+/**
+ * {@link NidusClient.suggest}'s result. `matched` counts every term the prefix matched
+ * before the server's 256-term cap, so `matched > suggestions.length` means it truncated.
+ */
+export interface Suggestions {
+  suggestions: Suggestion[];
+  matched: number;
+}
+
 /**
  * One entry of {@link NidusClient.setFtsSchema}'s `fields`: the attribute to index
  * plus any BM25/analyzer knobs to override. Every knob is optional — omit them all

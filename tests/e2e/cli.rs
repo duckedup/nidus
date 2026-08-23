@@ -2041,6 +2041,91 @@ fn cli_text_search_prefix_matches_a_truncated_query() {
     );
 }
 
+/// `nidus suggest`, through the real binary: completions come back ranked by document
+/// frequency (commonest first), not the exit code alone — a disabled feature could still
+/// exit 0 with an empty result.
+#[test]
+fn cli_suggest_ranks_completions_by_document_frequency() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(
+        &["set-fts-schema", "--dir", dir, "docs", "--field", "body"],
+        "",
+    );
+    // Nonsense tokens keep the df arithmetic obvious. Real words would work too: `suggest`
+    // completes surface forms, so a stem like "nidu" for "nidus" never reaches the output.
+    let seed = json!([
+        {"id": "d1", "vector": [1, 0, 0], "attrs": {"body": {"Str": "nida nida nida"}}},
+        {"id": "d2", "vector": [0, 1, 0], "attrs": {"body": {"Str": "nida nida"}}},
+        {"id": "d3", "vector": [0, 0, 1], "attrs": {"body": {"Str": "nidb"}}}
+    ])
+    .to_string();
+    ok(&["upsert", "--dir", dir, "docs"], &seed);
+
+    let out = ok(&["suggest", "--dir", dir, "docs", "body", "nid"], "");
+    assert_eq!(
+        out["suggestions"],
+        json!([
+            {"term": "nida", "df": 2},
+            {"term": "nidb", "df": 1},
+        ]),
+        "expected df-desc, term-asc order: {out}"
+    );
+    assert_eq!(out["matched"], 2, "unexpected match count: {out}");
+}
+
+/// `--limit` truncates the returned list but `matched` still reports the true count, so a
+/// caller can detect truncation.
+#[test]
+fn cli_suggest_limit_truncates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(
+        &["set-fts-schema", "--dir", dir, "docs", "--field", "body"],
+        "",
+    );
+    let seed = json!([
+        {"id": "d1", "vector": [1, 0, 0], "attrs": {"body": {"Str": "nida nida"}}},
+        {"id": "d2", "vector": [0, 1, 0], "attrs": {"body": {"Str": "nidb"}}}
+    ])
+    .to_string();
+    ok(&["upsert", "--dir", dir, "docs"], &seed);
+
+    let out = ok(
+        &[
+            "suggest", "--dir", dir, "docs", "body", "nid", "--limit", "1",
+        ],
+        "",
+    );
+    let suggestions = out["suggestions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected an array, got {out}"));
+    assert_eq!(suggestions.len(), 1, "unexpected suggestions: {out}");
+    assert_eq!(out["matched"], 2, "unexpected match count: {out}");
+}
+
+/// A field the collection never declared for FTS is silent-empty, not an error.
+#[test]
+fn cli_suggest_on_an_unindexed_field_prints_an_empty_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    let seed = json!([
+        {"id": "d1", "vector": [1, 0, 0], "attrs": {"body": {"Str": "nidus"}}}
+    ])
+    .to_string();
+    ok(&["upsert", "--dir", dir, "docs"], &seed);
+
+    let out = ok(&["suggest", "--dir", dir, "docs", "body", "nid"], "");
+    assert_eq!(
+        out,
+        json!({"suggestions": [], "matched": 0}),
+        "unindexed field must be silent-empty: {out}"
+    );
+}
+
 /// `recall --diversity` through the binary. `remember` pins the collection and provisions the
 /// store at the embedder's dimension; the crowded corpus is then written as raw vectors built
 /// in the query's own embedding space, so which hits are redundant is computed, not guessed.

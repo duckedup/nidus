@@ -107,6 +107,7 @@ def test_prune_drops_only_none_valued_keys() -> None:
         (_wire.filter_index_path, "/collections/docs/filter-index"),
         (_wire.remember_path, "/collections/docs/remember"),
         (_wire.recall_path, "/collections/docs/recall"),
+        (_wire.suggest_path, "/collections/docs/suggest"),
     ],
 )
 def test_collection_paths(builder: Callable[[str], str], expected: str) -> None:
@@ -122,6 +123,10 @@ def test_collection_names_are_escaped_to_a_single_path_segment() -> None:
     assert _wire.collection_path("q?x#y") == "/collections/q%3Fx%23y"
     # Non-ASCII is percent-encoded UTF-8, which is what the server's path decoder expects.
     assert _wire.collection_path("nøtes") == "/collections/n%C3%B8tes"
+
+
+def test_suggest_path_escapes_the_collection_name() -> None:
+    assert _wire.suggest_path("a/b c") == "/collections/a%2Fb%20c/suggest"
 
 
 # ── Request bodies ───────────────────────────────────────────────────────────────────
@@ -756,6 +761,29 @@ def test_fts_schema_body_refuses_a_misspelled_knob() -> None:
         _wire.fts_schema_body([{"field": "body", "asciiFolding": True}])  # type: ignore[list-item]
     with pytest.raises(TypeError, match="'field' key"):
         _wire.fts_schema_body([{"k1": 1.5}])  # type: ignore[list-item]
+
+
+def test_suggest_body_carries_field_and_prefix() -> None:
+    assert _wire.suggest_body("body", "nid") == {"field": "body", "prefix": "nid"}
+
+
+def test_suggest_body_omits_limit_when_unset() -> None:
+    """The client must not fork the server's own default of 10."""
+    body = _wire.suggest_body("body", "nid")
+    assert "limit" not in body
+    assert _wire.suggest_body("body", "nid", limit=5) == {
+        "field": "body",
+        "prefix": "nid",
+        "limit": 5,
+    }
+
+
+def test_decode_suggestions_decodes_terms_and_df() -> None:
+    result = _wire.decode_suggestions({"suggestions": [{"term": "nidus", "df": 3}], "matched": 1})
+    assert result.matched == 1
+    assert len(result.suggestions) == 1
+    assert result.suggestions[0].term == "nidus"
+    assert result.suggestions[0].df == 3
 
 
 def test_filter_index_body() -> None:

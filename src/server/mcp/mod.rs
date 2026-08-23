@@ -116,9 +116,10 @@ fn tools() -> Vec<Tool> {
     v.extend(search::tools());
     v.extend(admin::tools());
     v.extend(hygiene::tools());
-    // `related` is defined in `search.rs` but registered here, last, so it does not shift
-    // the position of any tool that predates it (SEP-2549).
+    // `related` and `suggest` are defined in `search.rs` but registered here, last, so
+    // neither shifts the position of any tool that predates it (SEP-2549).
     v.push(search::related_tool());
+    v.push(search::suggest_tool());
     v
 }
 
@@ -186,7 +187,7 @@ impl ServerHandler for NidusMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<rmcp::RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        // Unpaginated: ten tools fit any client's budget.
+        // Unpaginated: eleven tools fit any client's budget.
         Ok(ListToolsResult::with_all_items(tools())
             .with_ttl_ms(TOOLS_TTL_MS)
             .with_cache_scope(CacheScope::Public))
@@ -209,6 +210,7 @@ impl ServerHandler for NidusMcp {
             "get" => self.get(&args).await,
             "browse" => self.browse(&args).await,
             "related" => self.related(&args).await,
+            "suggest" => self.suggest(&args).await,
             other => Err(McpError::invalid_params(
                 format!("unknown tool `{other}`"),
                 None,

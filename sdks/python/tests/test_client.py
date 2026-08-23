@@ -225,6 +225,13 @@ ENDPOINTS: list[tuple[str, Callable[[NidusClient], Any], str, str, Any]] = [
         {"ok": True},
     ),
     ("recall", lambda db: db.recall("notes", "hello"), "POST", "/collections/notes/recall", []),
+    (
+        "suggest",
+        lambda db: db.suggest("docs", field="body", prefix="nid"),
+        "POST",
+        "/collections/docs/suggest",
+        {"suggestions": [], "matched": 0},
+    ),
     ("flush", lambda db: db.flush(), "POST", "/flush", {"ok": True}),
     ("compact", lambda db: db.compact(), "POST", "/compact", {"ok": True}),
     ("refresh", lambda db: db.refresh(), "POST", "/refresh", {"adopted": True}),
@@ -839,6 +846,27 @@ def test_records_keeps_an_absent_vector_as_none() -> None:
     assert records[0].vector == [1.0, 0.0, 0.0]
     assert records[1].vector is None
     assert records[1].attrs == {"body": "text only"}
+
+
+def test_suggest_posts_to_the_collection_path() -> None:
+    stub = StubTransport({"suggestions": [], "matched": 0})
+    client(stub).suggest("docs", field="body", prefix="nid", limit=5)
+    assert stub.last.method == "POST"
+    assert stub.last.url == "http://x/collections/docs/suggest"
+    assert stub.last.json == {"field": "body", "prefix": "nid", "limit": 5}
+
+
+def test_suggest_returns_the_decoded_result() -> None:
+    stub = StubTransport(
+        {
+            "suggestions": [{"term": "nidus", "df": 3}, {"term": "nidification", "df": 1}],
+            "matched": 2,
+        }
+    )
+    result = client(stub).suggest("docs", field="body", prefix="nid")
+    assert [s.term for s in result.suggestions] == ["nidus", "nidification"]
+    assert [s.df for s in result.suggestions] == [3, 1]
+    assert result.matched == 2
 
 
 @pytest.mark.parametrize("status", [200, 201, 204, 299])

@@ -38,8 +38,8 @@ serve` below when several clients need to share one.
 
 Pass `--read-only` to open without taking that lock: any number of read-only
 sessions can run alongside a writer. `recall`, `text_search`, `hybrid_search`,
-`get`, `browse`, and `related` all work; `remember` and `forget` fail, since
-they write.
+`get`, `browse`, `related`, and `suggest` all work; `remember` and `forget`
+fail, since they write.
 
 ## Over HTTP (`nidus serve`)
 
@@ -98,6 +98,7 @@ client's writes rather than each client racing for its own.
 | `get` | Fetch one memory by id: its id and attrs, never its vector. |
 | `browse` | List a collection's contents, bounded and optionally filtered, without a query. |
 | `related` | Find entries like one you already have, using its own stored vector as the query. |
+| `suggest` | Complete a partial word from a field's indexed vocabulary, ranked commonest-first. |
 
 Every one of them takes **natural language, never vectors**. That is deliberate:
 a model cannot write a 1024-float array as a tool argument, so the raw
@@ -138,6 +139,16 @@ adjacent chunks dropped rather than repeated. Read `context` when it is there an
 
 `rollup` only changes the payload. The results, their scores and their order are
 exactly what the same call returns without it.
+
+### Typeahead with `suggest`
+
+`suggest` completes the last word of a `prefix` against a field's indexed
+vocabulary, returning words with their document counts, not entries, ranked
+commonest-first (the opposite of the ranking a prefix search itself uses to
+rank documents). Call `text_search` with a completion once you have one to get
+the entries themselves. Completions are real words: surface forms are indexed
+alongside stems, so every keystroke of `running` completes to `running` rather
+than to the stem `run`.
 
 This is the only spelling MCP offers. The HTTP and CLI surfaces also take a raw
 `expand` naming the chunk attrs directly, which matters for a corpus chunked by

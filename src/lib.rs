@@ -122,7 +122,7 @@ pub use model::{
     Distance, Expand, Filter, Footprint, FtsClause, FtsCombine, FtsQuery, Group, Hit, HybridOpts,
     LimitPer, ListOpts, META_CHAR_START, META_CHUNK_INDEX, META_PARENT_ID, OrderBy, Predicate,
     Projection, QuantKind, Quantization, RankBy, Record, RerankOpts, Role, SearchOpts,
-    StoreVersions, Value,
+    StoreVersions, Suggestion, Suggestions, Value,
 };
 pub use plan::{Candidates, Narrowing, QueryPath, QueryPlan, Timings};
 pub use profile::OpenProfile;
@@ -483,6 +483,19 @@ impl Nidus {
         let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store.text_search(&refs, query, opts)
+    }
+
+    /// Ranked term completions for `prefix` from `field`'s full-text vocabulary, what an
+    /// autocomplete dropdown shows. Ranked by document frequency (commonest first), not by
+    /// the idf a prefix clause scores documents with.
+    pub fn suggest(
+        &self,
+        collection: &str,
+        field: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> Suggestions {
+        self.store.suggest(collection, field, prefix, limit)
     }
 
     /// Hybrid search over a [`Scope`]: fuse a vector query and a BM25 text query into one ranking

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Aggregation, AnnConfig, AnnKind, Annotations, Expand, Filter, FilterIndexField, Footprint,
     FtsClause, FtsCombine, FtsField, HighlightOpts, Hit, Language, LimitPer, ListOpts, OrderBy,
-    Projection, QueryPlan, RankBy, Record, StoreVersions, Value,
+    Projection, QueryPlan, RankBy, Record, StoreVersions, Suggestion, Suggestions, Value,
 };
 
 /// Body of `POST /collections/{name}/upsert`.
@@ -44,6 +44,22 @@ pub(super) fn default_top_k() -> usize {
 /// allocation demand rather than a query — no store returns ten thousand hits usefully — and
 /// the bounded top-k kernel would otherwise be handed a `k` it must defend against itself.
 pub(super) const MAX_TOP_K: usize = 10_000;
+
+/// Body of `POST /collections/{name}/suggest`. `prefix` is the partial word being typed;
+/// the collection comes from the path.
+#[derive(Debug, Deserialize)]
+pub struct SuggestRequest {
+    pub field: String,
+    pub prefix: String,
+    /// How many completions to return. Small by default: this feeds a dropdown, not a page.
+    #[serde(default = "default_suggest_limit")]
+    pub limit: usize,
+}
+
+/// A dropdown shows a handful of rows, so `top_k`'s default would be wrong here.
+pub(super) fn default_suggest_limit() -> usize {
+    10
+}
 
 /// Wire form of [`crate::Expand`]: widen each hit with its document's neighbouring chunks.
 /// Every field but `radius` defaults to the reserved chunk attrs, so `{"radius": 1}` is the
@@ -730,6 +746,39 @@ impl From<Hit> for HitDto {
             attrs: h.attrs,
             annotations: h.annotations,
             context: h.context,
+        }
+    }
+}
+
+/// One completion on the wire.
+#[derive(Debug, Serialize)]
+pub struct SuggestionDto {
+    pub term: String,
+    pub df: usize,
+}
+
+/// `POST /collections/{name}/suggest`'s response. `matched` counts every term the prefix
+/// matched, so `matched > suggestions.len()` tells a caller the 256-term cap truncated.
+#[derive(Debug, Serialize)]
+pub struct SuggestionsDto {
+    pub suggestions: Vec<SuggestionDto>,
+    pub matched: usize,
+}
+
+impl From<Suggestion> for SuggestionDto {
+    fn from(s: Suggestion) -> Self {
+        Self {
+            term: s.term,
+            df: s.df,
+        }
+    }
+}
+
+impl From<Suggestions> for SuggestionsDto {
+    fn from(s: Suggestions) -> Self {
+        Self {
+            suggestions: s.suggestions.into_iter().map(SuggestionDto::from).collect(),
+            matched: s.matched,
         }
     }
 }

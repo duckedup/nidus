@@ -610,6 +610,25 @@ def test_prefix_matches_a_truncated_query_against_a_real_server(server: str) -> 
         assert hits[0].id == "a"
 
 
+def test_suggest_ranks_by_document_frequency_against_a_real_server(server: str) -> None:
+    """``nid`` should rank the commoner ``nidus`` above the rarer ``nidification`` by df."""
+    with NidusClient(server, timeout=10.0) as db:
+        db.set_fts_schema("docs", ["title"])
+        db.upsert(
+            "docs",
+            [
+                {"id": "a", "attrs": {"title": v.str("nidus")}},
+                {"id": "b", "attrs": {"title": v.str("nidus")}},
+                {"id": "c", "attrs": {"title": v.str("nidification")}},
+            ],
+        )
+
+        result = db.suggest("docs", field="title", prefix="nid")
+        assert [s.term for s in result.suggestions] == ["nidus", "nidification"]
+        assert [s.df for s in result.suggestions] == [2, 1]
+        assert result.matched == 2
+
+
 def test_ready_cluster_and_refresh_against_a_real_server(server: str) -> None:
     """Shape, not specific values: a standalone server is ready, decodes, and adopts nothing."""
     with NidusClient(server, timeout=10.0) as db:

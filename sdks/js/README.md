@@ -181,6 +181,26 @@ await db.textSearch({ field: "title", query: "ru", prefix: true });
 await db.textSearch({ clauses: [{ field: "title", query: "ru", prefix: true }] });
 ```
 
+## Suggesting completions
+
+`suggest` completes a partial word from an indexed field's vocabulary, ranked by
+document frequency (the commonest term first), for an autocomplete dropdown. That is
+the opposite of how a prefix clause ranks documents, so it is its own method rather
+than a `textSearch` option. Completions are real words: surface forms are indexed
+alongside stems, so every keystroke of `"running"` completes to `"running"` rather
+than to the stem `"run"`.
+
+```ts
+const { suggestions, matched } = await db.suggest({
+  collection: "docs",
+  field: "body",
+  prefix: "vec",
+  limit: 10,
+});
+for (const { term, df } of suggestions) console.log(term, df);
+// matched > suggestions.length means the server's 256-term cap truncated the list.
+```
+
 ## Explaining and highlighting a hit
 
 `explain` reports what each leg and each matched clause contributed; `highlight` returns

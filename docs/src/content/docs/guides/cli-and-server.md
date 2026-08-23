@@ -142,6 +142,9 @@ nidus text-search --dir ./store --clause title=rust --clause body="async runtime
 nidus text-search --dir ./store body "running" --explain --highlight \
   --max-fragments 2 --fragment-chars 120
 
+# Autocomplete: ranked term completions for a prefix, commonest first
+nidus suggest --dir ./store docs body run --limit 5
+
 # Hybrid search: fuse a vector (stdin) and a BM25 text query with RRF
 echo '[1,0,0]' | nidus hybrid-search --dir ./store body "vector database" -k 5
 # …leaning on the keyword leg (both weights default to 1.0)

@@ -415,6 +415,21 @@ impl FtsQuery {
     }
 }
 
+/// One prefix completion: an indexed term and how many live documents contain it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Suggestion {
+    pub term: String,
+    pub df: usize,
+}
+
+/// [`crate::Nidus::suggest`]'s answer. `matched` counts every term the prefix matched before
+/// the 256-term cap, so `matched > suggestions.len()` is the truncation signal.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Suggestions {
+    pub suggestions: Vec<Suggestion>,
+    pub matched: usize,
+}
+
 /// Which attrs a [`Hit`] carries. An enum, not a pair of lists, so "include *and* exclude"
 /// is unrepresentable rather than a precedence rule nobody remembers (nidus-m50.15); the
 /// HTTP layer answers `400` for the wire form that sends both.
