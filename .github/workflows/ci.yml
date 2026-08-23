@@ -362,6 +362,67 @@ jobs:
           echo "ingest TLS backend is rustls + ring only"
           echo "::endgroup::"
 
+  # nidus-y67: cheap bit-rot guard for the wasm32 target. Both runtime hazards
+  # (the clock read, `thread::scope`) compile cleanly, so this catches only a
+  # compile break; the real behavioural check is `wasm-e2e` in integration.yml,
+  # which runs the suites in Node and a real headless browser.
+  wasm:
+    name: wasm (build + clippy, wasm32-unknown-unknown)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Lane guard — skip the work when no changed path exercises this job
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --quiet --depth=1 origin "$BASE_SHA"
+          files="$(git diff --name-only "$BASE_SHA" HEAD | paste -sd, -)"
+          if [ -n "$files" ] && [ "$(.claude/skills/nidus/bin/nidus-check ci-guard wasm --paths "$files")" = "skip" ]; then
+            echo "SKIP_LANE=true" >> "$GITHUB_ENV"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+
+      # NOT the action's `targets:` input. `rust-toolchain.toml` pins 1.96.0, so every
+      # cargo call resolves there while `targets:` would add wasm32 to `stable` instead,
+      # and the build would fail with "can't find crate for `core`". `rustup target add`
+      # honours the toolchain-file override, so it lands on whatever cargo actually uses.
+      - name: Add the wasm32 target to the pinned toolchain
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: rustup target add wasm32-unknown-unknown
+      - name: Ensure `just` is available
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: command -v just >/dev/null 2>&1 || cargo install just --locked
+      - uses: actions/cache@v5
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-wasm-
+      - name: build (lib only)
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: just build-wasm
+      - name: clippy (--all-targets)
+        if: ${{ !cancelled() && env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: just lint-wasm
+
+      # The binding is the only consumer of the OPFS backend, and it is NOT a workspace
+      # default-member, so nothing above compiles it. Without this the browser half could
+      # break and every other lane would still be green.
+      - name: build the browser binding
+        if: ${{ !cancelled() && env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: |
+          cargo install wasm-bindgen-cli --version 0.2.122 --locked
+          just build-wasm-binding
+
   # The JS SDK (sdks/js) is independent of the Rust build: typecheck, unit tests
   # (mocked fetch — no server needed), and the bundle build. The integration test
   # against a real `nidus serve` runs in `sdk-integration` below (#125).

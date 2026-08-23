@@ -454,6 +454,23 @@ test('ci-guard: a workflow edit runs its own jobs', () => {
   eq(ciGuard('e2e', ['scripts/e2e-services.sh']).run, true, 'services script runs e2e')
 })
 
+test('ci-guard: the wasm lanes (nidus-y67) key off src, the justfile and the binding', () => {
+  for (const job of ['wasm', 'wasm-e2e']) {
+    eq(ciGuard(job, ['src/backend/opfs.rs']).run, true, `${job} runs for the backend`)
+    // The recipes ARE the lane, so a justfile edit must not skip it.
+    eq(ciGuard(job, ['justfile']).run, true, `${job} runs for the justfile`)
+    eq(ciGuard(job, ['bindings/wasm/src/lib.rs']).run, true, `${job} runs for the binding`)
+    eq(ciGuard(job, ['docs/src/content/docs/guides/wasm.md']).run, false, `${job} skips docs`)
+  }
+})
+
+test('ci-guard: the browser bring-up script runs wasm-e2e only', () => {
+  eq(ciGuard('wasm-e2e', ['scripts/e2e-wasm.sh']).run, true, 'wasm-e2e runs')
+  // ci.yml's cheap lane never invokes the script, so it must not be woken by it.
+  eq(ciGuard('wasm', ['scripts/e2e-wasm.sh']).run, false, 'wasm skips')
+  eq(ciGuard('test', ['scripts/e2e-wasm.sh']).run, false, 'test skips')
+})
+
 test('ci-guard: an empty diff runs everything — a guard that saw nothing must not skip', () => {
   eq(ciGuard('test', []).run, true, 'fail open')
 })

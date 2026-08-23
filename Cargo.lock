@@ -3893,6 +3893,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "minicov"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3aa3aa12b448ac225b3102217d1ac5cc717908f02722926524b0599c933c7a0"
+dependencies = [
+ "cc",
+ "walkdir",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3976,7 +3986,7 @@ dependencies = [
 
 [[package]]
 name = "nidus"
-version = "0.82.0"
+version = "0.83.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3987,6 +3997,7 @@ dependencies = [
  "flate2",
  "http",
  "http-body",
+ "js-sys",
  "memmap2",
  "redis",
  "regex",
@@ -4004,6 +4015,8 @@ dependencies = [
  "tower",
  "ureq",
  "url",
+ "wasm-bindgen",
+ "wasm-bindgen-test",
 ]
 
 [[package]]
@@ -4023,6 +4036,18 @@ dependencies = [
  "tempfile",
  "tokio",
  "ureq",
+]
+
+[[package]]
+name = "nidus_wasm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "js-sys",
+ "nidus",
+ "serde",
+ "serde-wasm-bindgen",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -5325,6 +5350,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-wasm-bindgen"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
+dependencies = [
+ "js-sys",
+ "serde",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "serde_core"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6421,6 +6457,45 @@ checksum = "9a929b2c61f11ba3e9bc35b50c1f25cb38e0e892c0c231ae2b8cf78d5dad4437"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "wasm-bindgen-test"
+version = "0.3.72"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74fde991ccdc895cb7fbaa14b137d62af74d9011be67b71c694bfc40edd3119c"
+dependencies = [
+ "async-trait",
+ "cast",
+ "js-sys",
+ "libm",
+ "minicov",
+ "nu-ansi-term",
+ "num-traits",
+ "oorandom",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test-macro",
+ "wasm-bindgen-test-shared",
+]
+
+[[package]]
+name = "wasm-bindgen-test-macro"
+version = "0.3.72"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e925354648d2a4d1bf205412e36d520a800280622eef4719678d268e5d40e978"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "wasm-bindgen-test-shared"
+version = "0.2.122"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "684365b586a9a6256c1cc3544eee8680de48d6041142f581776ec7b139622ae9"
 
 [[package]]
 name = "wasm-encoder"

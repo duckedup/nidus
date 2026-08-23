@@ -29,6 +29,8 @@ mod cancel;
 // Pure text -> ordered spans chunking for the memory layer (nidus-lvo.1). Ungated: it
 // must run under `just miri` and ship to every `cargo add nidus`, not just `memory`.
 pub mod chunk;
+// The crate's single time seam (nidus-y67): wall-clock and monotonic reads, native and wasm.
+mod clock;
 mod config;
 mod data;
 // Levelled, logfmt diagnostics (`NIDUS_LOG`). Internal: what an embedding application

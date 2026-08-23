@@ -150,6 +150,41 @@ serve-memory DIR DIM *ARGS:
 # Pre-PR checks for the serve feature: format clean, no clippy warnings, tests green
 ci-serve: fmt-check lint-serve test-serve
 
+# ── wasm32 target (browser / edge) ──────────────────────────────────────────
+# The wasm-hostile deps (ureq/ring, tame-oauth, redis, rusty-s3, tame-gcs, url) are
+# target-cfg'd out, so no feature flag is needed: the target selects the tree.
+build-wasm:
+    cargo build --target wasm32-unknown-unknown --lib
+
+lint-wasm:
+    cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
+
+ci-wasm: build-wasm lint-wasm
+
+# Executes under Node: the clock hazard, the thread-degradation clamp, ranking. Needs
+# `cargo install wasm-bindgen-cli --version 0.2.122` (the runner must match wasm-bindgen).
+test-wasm:
+    # --lib too, not just the integration target: the wasm-gated unit tests (e.g. that
+    # s3://+redis:// are hard errors on wasm32) live in the lib and would otherwise
+    # compile without ever running.
+    CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+        cargo test --target wasm32-unknown-unknown --lib
+    CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+        cargo test --target wasm32-unknown-unknown --test wasm
+
+# Executes in a REAL headless browser (the `wasm_opfs` target). Brought up by the same
+# script CI uses, because a browser driver is the part that differs per machine.
+test-wasm-e2e:
+    ./scripts/e2e-wasm.sh test
+
+# Drives the SAME pinned `wasm-bindgen` the test runner uses, rather than wasm-pack: one
+# tool, one version to keep matching Cargo.lock. `release-wasm` is the size profile.
+build-wasm-binding:
+    cargo build -p nidus_wasm --target wasm32-unknown-unknown --profile release-wasm
+    wasm-bindgen --target web \
+        --out-dir bindings/wasm/pkg \
+        target/wasm32-unknown-unknown/release-wasm/nidus_wasm.wasm
+
 # ── AI ingest layer (the opt-in embed/summarize/memory features) ────────────
 # The off-by-default async network edge (reqwest → hyper → rustls/ring; NO new C
 # tree, NO aws-lc/OpenSSL) that turns nidus into an all-in-one "memory". Like

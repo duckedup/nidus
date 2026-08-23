@@ -161,11 +161,7 @@ struct Timestamp(u64);
 
 impl Timestamp {
     fn now() -> Timestamp {
-        Timestamp(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis() as u64),
-        )
+        Timestamp(crate::clock::now_unix_millis().max(0) as u64)
     }
 }
 

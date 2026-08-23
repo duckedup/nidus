@@ -625,3 +625,245 @@ fn local_fs_lock_excludes_then_releases() {
     drop(guard);
     assert!(fs.try_lock("lock", ttl).unwrap().is_some());
 }
+
+// ── OpfsFs pool (pure/in-RAM via a fake SyncHandle, Miri-clean) ─────────────────
+
+use super::opfs::test_support::FakeHandle;
+
+fn fake_pool(body_slots: usize) -> Vec<Box<dyn SyncHandle>> {
+    (0..=body_slots)
+        .map(|_| Box::new(FakeHandle::new()) as Box<dyn SyncHandle>)
+        .collect()
+}
+
+#[test]
+fn opfs_pool_allocates_reuses_and_exhausts_slots() {
+    let fs = OpfsFs::adopt(fake_pool(2)).unwrap(); // 1 directory slot + 2 body slots
+
+    fs.put("a", b"1").unwrap();
+    fs.put("b", b"2").unwrap();
+    let err = fs.put("c", b"3").unwrap_err().to_string();
+    assert!(err.contains("exhausted"), "{err}");
+
+    // Freeing a slot lets a new key reuse it.
+    fs.delete("a").unwrap();
+    fs.put("c", b"3").unwrap();
+    assert_eq!(fs.get("c").unwrap().as_deref(), Some(b"3".as_slice()));
+    assert!(fs.get("a").unwrap().is_none());
+    assert_eq!(fs.list().unwrap(), vec!["b".to_string(), "c".to_string()]);
+}
+
+#[test]
+fn opfs_directory_map_round_trips_across_reopen() {
+    let fakes: Vec<FakeHandle> = (0..=2).map(|_| FakeHandle::new()).collect();
+    let as_handles = |fakes: &[FakeHandle]| -> Vec<Box<dyn SyncHandle>> {
+        fakes
+            .iter()
+            .cloned()
+            .map(|h| Box::new(h) as Box<dyn SyncHandle>)
+            .collect()
+    };
+
+    let fs = OpfsFs::adopt(as_handles(&fakes)).unwrap();
+    fs.put("k1", b"hello").unwrap();
+    fs.put("k2", b"world").unwrap();
+    fs.delete("k1").unwrap();
+    drop(fs);
+
+    // "Reopen": fresh handles cloned from the same underlying fakes, exactly as a real
+    // worker would acquire fresh sync access handles over the same OPFS files.
+    let reopened = OpfsFs::adopt(as_handles(&fakes)).unwrap();
+    assert_eq!(reopened.list().unwrap(), vec!["k2".to_string()]);
+    assert_eq!(
+        reopened.get("k2").unwrap().as_deref(),
+        Some(b"world".as_slice())
+    );
+    assert!(reopened.get("k1").unwrap().is_none());
+}
+
+#[test]
+fn opfs_a_body_write_without_a_map_update_stays_invisible() {
+    let fakes: Vec<FakeHandle> = (0..=1).map(|_| FakeHandle::new()).collect();
+    let handles: Vec<Box<dyn SyncHandle>> = fakes
+        .iter()
+        .cloned()
+        .map(|h| Box::new(h) as Box<dyn SyncHandle>)
+        .collect();
+    let fs = OpfsFs::adopt(handles).unwrap();
+
+    // Simulate a crash between step 1 (body write) and step 2 (map write): write
+    // straight into the body slot, bypassing `put`, so the directory map never learns
+    // about it.
+    fakes[1].write_at(0, b"orphaned").unwrap();
+
+    assert!(
+        fs.list().unwrap().is_empty(),
+        "an orphaned body must not appear in list()"
+    );
+    assert!(
+        fs.get("ghost").unwrap().is_none(),
+        "no key names the orphaned slot, so get() finds nothing"
+    );
+    // The slot is still unreferenced by the map, so a real put safely reuses it.
+    fs.put("real", b"data").unwrap();
+    assert_eq!(fs.get("real").unwrap().as_deref(), Some(b"data".as_slice()));
+}
+
+#[test]
+fn opfs_rejects_bad_keys() {
+    let fs = OpfsFs::adopt(fake_pool(1)).unwrap();
+    assert!(fs.get("../escape").is_err());
+    assert!(fs.put("a/b", b"x").is_err());
+    assert!(fs.delete("").is_err());
+}
+
+#[test]
+fn opfs_adopt_rejects_an_empty_pool() {
+    assert!(OpfsFs::adopt(Vec::new()).is_err());
+}
+
+#[test]
+fn opfs_adopt_rejects_a_corrupt_directory_map() {
+    let dir = FakeHandle::new();
+    dir.write_at(0, b"not a valid directory map frame").unwrap();
+    let handles: Vec<Box<dyn SyncHandle>> = vec![Box::new(dir)];
+    assert!(OpfsFs::adopt(handles).is_err());
+}
+
+#[test]
+fn opfs_overwrite_does_not_reuse_the_key_s_own_slot() {
+    // `Persistence::put` promises old-or-new, never torn. An in-place overwrite of the
+    // key's own slot breaks that on a crash mid-write, so assert the slot MOVES.
+    let fakes: Vec<FakeHandle> = (0..3).map(|_| FakeHandle::new()).collect();
+    let handles: Vec<Box<dyn SyncHandle>> = fakes
+        .iter()
+        .cloned()
+        .map(|h| Box::new(h) as Box<dyn SyncHandle>)
+        .collect();
+    let fs = OpfsFs::adopt(handles).unwrap();
+    fs.put("k", b"old").unwrap();
+    let first = fakes.iter().position(|h| h.bytes() == b"old").unwrap();
+    fs.put("k", b"new").unwrap();
+    let second = fakes.iter().position(|h| h.bytes() == b"new").unwrap();
+    assert_ne!(
+        first, second,
+        "overwrite reused the slot it was reading from"
+    );
+    assert_eq!(fs.get("k").unwrap().as_deref(), Some(b"new".as_slice()));
+    // The old bytes are still on disk, unreferenced — that is what makes the put atomic.
+    assert_eq!(fakes[first].bytes(), b"old");
+}
+
+#[test]
+fn opfs_try_lock_is_trivially_held_and_reports_reality() {
+    let fs = OpfsFs::adopt(fake_pool(0)).unwrap();
+    assert!(
+        fs.try_lock("lock", Duration::from_secs(1))
+            .unwrap()
+            .is_some()
+    );
+    // The two capability flags are trait defaults, so assert them on the `Persistence`
+    // a caller actually gets (the fieldless proxy), not on the pool behind it.
+    std::thread::spawn(|| {
+        super::opfs::register_pool(OpfsFs::adopt(fake_pool(0)).unwrap());
+        let p = super::opfs::open_registered("s").unwrap();
+        assert!(p.has_native_lock(), "an OPFS sync handle is exclusive");
+        assert!(!p.supports_cas(), "no second writer to fence in one worker");
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn opfs_grow_increases_capacity_for_new_writes() {
+    let fs = OpfsFs::adopt(fake_pool(0)).unwrap(); // directory slot only
+    assert_eq!(fs.capacity(), 1);
+    assert!(fs.put("a", b"1").is_err(), "no body slots yet");
+
+    fs.grow(vec![Box::new(FakeHandle::new()) as Box<dyn SyncHandle>])
+        .unwrap();
+    assert_eq!(fs.capacity(), 2);
+    fs.put("a", b"1").unwrap();
+    assert_eq!(fs.get("a").unwrap().as_deref(), Some(b"1".as_slice()));
+}
+
+#[test]
+fn open_persistence_opfs_scheme_is_wasm_only_on_native() {
+    // `Box<dyn Persistence>` is not Debug, so `unwrap_err` will not do here.
+    let Err(err) = open_persistence("opfs://anything") else {
+        panic!("opfs:// resolved on a native target");
+    };
+    let err = err.to_string();
+    assert!(err.contains("wasm32"), "{err}");
+}
+
+// ── OPFS registry handoff (pure/in-RAM, Miri-clean) ─────────────────────────────
+// Each case spawns a fresh OS thread, so its `thread_local` registry always starts
+// empty regardless of how the test harness reuses threads across other tests.
+
+#[test]
+fn opfs_open_registered_without_a_pool_names_the_init_call() {
+    let err = std::thread::spawn(|| match super::opfs::open_registered("mystore") {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("resolved an opfs:// store with no registered pool"),
+    })
+    .join()
+    .unwrap();
+    assert!(err.contains("register_pool"), "{err}");
+}
+
+#[test]
+fn opfs_open_registered_resolves_after_register_pool() {
+    std::thread::spawn(|| {
+        assert!(super::opfs::open_registered("mystore").is_err());
+        super::opfs::register_pool(OpfsFs::adopt(fake_pool(1)).unwrap());
+        let p = super::opfs::open_registered("mystore").unwrap();
+        p.put("k", b"v").unwrap();
+        assert_eq!(p.get("k").unwrap().as_deref(), Some(b"v".as_slice()));
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn opfs_grow_pool_adds_capacity_for_new_keys() {
+    std::thread::spawn(|| {
+        super::opfs::register_pool(OpfsFs::adopt(fake_pool(0)).unwrap()); // no body slots yet
+        let p = super::opfs::open_registered("s").unwrap();
+        assert!(p.put("a", b"1").is_err(), "no body slots yet");
+        grow_pool(vec![Box::new(FakeHandle::new())]).unwrap();
+        p.put("a", b"1").unwrap();
+        assert_eq!(p.get("a").unwrap().as_deref(), Some(b"1".as_slice()));
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn opfs_grow_pool_errors_without_a_registered_pool() {
+    std::thread::spawn(|| {
+        let err = grow_pool(vec![Box::new(FakeHandle::new())])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("register_pool"), "{err}");
+    })
+    .join()
+    .unwrap();
+}
+
+// ── wasm-only: cloud backends must not silently fall back (nidus-y67) ──────────
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen_test::wasm_bindgen_test]
+fn wasm_rejects_cloud_persistence_and_memory_tier_backends() {
+    // Neither `Box<dyn Persistence>` nor `Box<dyn MemoryTier>` is Debug, so `unwrap_err`
+    // will not compile here.
+    let Err(err) = open_persistence("s3://bucket/key") else {
+        panic!("s3:// resolved on wasm32");
+    };
+    assert!(err.to_string().contains("wasm32"), "{err}");
+    let Err(err) = open_memory_tier("redis://host:6379") else {
+        panic!("redis:// resolved on wasm32");
+    };
+    assert!(err.to_string().contains("wasm32"), "{err}");
+}

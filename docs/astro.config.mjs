@@ -68,6 +68,7 @@ export default defineConfig({
             { label: "How it works", link: "/guides/how-it-works/" },
             { label: "Storage & durability", link: "/guides/storage/" },
             { label: "Storage backends", link: "/guides/storage-backends/" },
+            { label: "Running in the browser", link: "/guides/wasm/" },
             { label: "Memory stores", link: "/guides/memory-stores/" },
             { label: "Search & filters", link: "/guides/search/" },
             { label: "Reranking", link: "/guides/rerank/" },

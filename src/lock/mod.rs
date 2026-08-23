@@ -73,10 +73,7 @@ fn try_create_lock(path: &Path) -> std::io::Result<WriteLock> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
 
     let pid = std::process::id();
-    let unix_millis = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_millis();
+    let unix_millis = crate::clock::now_unix_millis();
     write!(file, "{pid} {unix_millis}")?;
     file.flush()?;
 
@@ -92,10 +89,14 @@ fn is_stale(path: &Path, ttl: Duration) -> Result<bool> {
     let mtime = metadata
         .modified()
         .with_context(|| format!("failed to read mtime of lock file at {}", path.display()))?;
-    let age = SystemTime::now()
-        .duration_since(mtime)
-        .unwrap_or(Duration::ZERO);
-    Ok(age > ttl)
+    let mtime_millis = mtime
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let age_millis = crate::clock::now_unix_millis()
+        .saturating_sub(mtime_millis)
+        .max(0) as u64;
+    Ok(Duration::from_millis(age_millis) > ttl)
 }
 
 impl Drop for WriteLock {

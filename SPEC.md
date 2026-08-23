@@ -1462,6 +1462,44 @@ build until a real need exists.
   server cannot walk the caller's disk), so there is no HTTP, MCP or SDK leg. No on-disk
   format change: the cache is a derived, rebuildable object.
 
+- **wasm32 target, in the browser (nidus-y67).** `wasm32-unknown-unknown` is a supported
+  build target for the core library. Gating is by **target cfg, not a Cargo feature**: the
+  target itself selects the tree, so the native dependency graph is byte-identical and the
+  §13.6 "`file://` → `s3://` is a runtime switch, not a recompile" decision survives intact.
+  The audit, kept because the surprising numbers are what stop the next person re-deriving
+  them:
+  - Blockers were `ureq` (pulls `ring` + `getrandom 0.2`, neither of which targets
+    `wasm32-unknown-unknown`), `tame-oauth` (same `ring` dependency), and `redis`
+    (`rustls-native-certs`) — every one of them in the S3/GCS/Redis backend stack, and
+    **nothing in `src/` itself**.
+  - `rusty-s3` and `tame-gcs` pass clean: sans-IO request signing has no platform
+    dependency, so only the transport (`ureq`) is hostile, not the signing logic.
+  - `memmap2`/`bytemuck` pass too, so `src/data/` needed no change at all.
+  - The two real hazards **compile cleanly and fail only at runtime** — a raw
+    `Instant::now`/`SystemTime::now` panics (no epoch on this target) and
+    `std::thread::scope` panics (no threads), which is exactly why the wasm CI lane
+    *executes* the test suite rather than merely building it. Both were observed failing
+    without their fixes, naming the standard-library files where the target has no real
+    implementation: `library/std/src/sys/time/unsupported.rs` for the clock,
+    `library/std/src/thread/scoped.rs` for threads.
+
+  **The clock seam is now an invariant, not a convention** — the kind of thing that rots
+  silently if left as a norm rather than a stated rule. `src/clock.rs` is the crate's one
+  time seam: every wall-clock or monotonic read a wasm build compiles routes through it
+  (`SystemTime`/`Instant` natively, `Date.now()`/`performance.now()` on `wasm32`). A raw
+  `Instant::now`/`SystemTime::now` elsewhere is allowed only where wasm never compiles it:
+  `backend/object.rs` and `backend/aws_creds.rs` (native-only, `#[cfg(not(target_family =
+  "wasm"))]`), and `server/metrics.rs` / `cli/backup.rs` (`cli`-gated, which wasm never
+  enables). `src/tune.rs` is the worked example of why this needs stating: it is an
+  ungated library file with no feature gate to hide behind, so an un-migrated raw clock
+  read there was a latent wasm panic until it moved onto the seam.
+
+  Threads have the same shape without a seam of their own: `Config::query_threads` and the
+  parallel HNSW build (§9, above) simply have nothing to parallelize onto on `wasm32` — no
+  API change, the setting is accepted and silently has no effect rather than erroring. See
+  §13 for the browser storage backend this target makes possible, and §13.4 for why it
+  needed no trait change.
+
 ### Still deferred (designed-for, not built)
 
 - **Pluggable storage & memory backends.** Generalize the §5 local directory along two
@@ -1652,11 +1690,15 @@ src/
 ├── cancel.rs     cooperative query cancellation: Cancel token + ambient scope
 ├── metrics.rs    in-process counters/gauges (pub mod metrics; scraped by the server)
 ├── diag.rs       levelled logfmt diagnostics to stderr (NIDUS_LOG)
+├── clock.rs      the crate's one time seam (§9): wall/monotonic reads route here so a
+│                 wasm32 build (no Instant/SystemTime epoch, no threads) compiles and runs
 ├── backend/      pluggable storage & memory (§13): mod.rs (Persistence/Appender/
 │                 MemoryTier/BackendLock traits + URL routing), local.rs (LocalFs +
 │                 FileAppender), ram.rs (LocalRam + MemAppender), object.rs
 │                 (ObjectAppender + object_try_lock), cloud.rs (shared ureq Http),
-│                 s3.rs, aws_creds.rs, gcs.rs, redis.rs, tests.rs
+│                 s3.rs, aws_creds.rs, gcs.rs, redis.rs, opfs.rs (the wasm32 browser
+│                 backend over a pre-opened OPFS handle pool, §13.8; compiled for
+│                 wasm32 and under cfg(test), dead code on a native build), tests.rs
 └── store/        the integrator: mod.rs (Store type, open/in_memory ctors, lock +
                   ANN lifecycle glue), scoring.rs (scan kernels + parallel engine),
                   quant.rs (int8/binary state + quantized two-pass search), read.rs
@@ -1927,6 +1969,23 @@ pub trait MemoryTier: Send + Sync {        // local RAM is the trivial impl
 Selection is by **URL scheme** — persistence: `file://`, `s3://`, `gs://`; memory: local
 (default), `redis://`/`valkey://`/`keydb://`/`dragonfly://` (plain) and `rediss://`/`valkeys://` (TLS).
 
+**This decision survived the wasm32/OPFS backend (§13.8) completely unchanged — no public
+API change at all (nidus-y67).** Reason 4 above predicted that an async-only client would
+need a quarantined `block_on` bridge; OPFS is exactly that shape (synchronous file IO,
+asynchronous handle acquisition), and it forced neither the bridge nor any trait change.
+
+Worth recording *why*, because the obvious approach is the wrong one and will tempt the
+next reader: relaxing `Persistence`'s `Send + Sync` supertrait on `wasm32` to accommodate a
+`!Send` `JsValue` handle does not contain. `Segments`, `OpLog`, `Store`, and
+`parallel_topk` all depend on those bounds, so relaxing it cascades into 11 errors across
+`data/`, `log/`, `ann/`, and `store/`. What works instead: the JS handles never enter a
+trait object at all. They live in a `thread_local` registry (`src/backend/opfs.rs`), and
+the `Persistence` the `opfs://` arm hands back is a **fieldless proxy** that resolves that
+registry per call — trivially `Send + Sync` with no `unsafe` and no laundering one
+dependency's problem into another's. The cost lands elsewhere: thread affinity.
+`register_pool`, `open`, and every later call on that store must run on the one worker
+that owns the handles, or the call fails naming the missing registration.
+
 ### 13.5 Effect on speed (independent of both axes)
 
 **Search is backend-independent.** Every path — exact cosine, ANN walk (HNSW/IVF),
@@ -2047,6 +2106,42 @@ minute — CI asserts it (§9, the build-time gate).**
   not capture the sidecar either (`src/cli/backup.rs`'s `is_store_object` excludes it, the
   same way it excludes the `ann`/`fts` caches): a sidecar is read where it lives, by
   `nidus check` against a live store, not by `nidus verify`/`restore` against an archive.
+
+### 13.8 Browser backend (`opfs://`, nidus-y67)
+
+A fourth persistence scheme, `opfs://`, over the browser's Origin Private File System —
+available only in `wasm32` builds (§9). It exists because OPFS is the one persistence
+substrate a page can use without a server: every byte stays in the browser's own storage,
+scoped to the origin.
+
+**The constraint that shapes the design:** OPFS gives a `FileSystemSyncAccessHandle`
+**synchronous** read/write/truncate/flush, exactly what `Persistence` needs, but only
+**asynchronous** handle *acquisition* (`getFileHandle`/`createSyncAccessHandle` are both
+promises). nidus mints new object keys at runtime (sealing a segment writes
+`seg-NNNNNNNN`), so a synchronous `put()` for a brand-new key cannot itself open a handle.
+The backend (`OpfsFs`, `src/backend/opfs.rs`) is therefore a **pre-opened handle pool** —
+the same shape sqlite-wasm's `opfs-sahpool` VFS uses: every handle it will ever need is
+opened asynchronously, in JS, *before* any synchronous call happens. Slot 0 holds a
+`[len][bincode(key → slot)][crc32]`-framed directory map and is the commit point; slots
+`1..N` hold object bodies. `put` writes and flushes the body first, then rewrites and
+flushes slot 0 — the same order discipline as `data`-then-`log` (§6): a crash between the
+two steps leaves an orphaned body, recoverable, never a torn or half-visible object. A pool
+that runs out of free body slots fails the write with a clear error rather than blocking;
+growing the pool is the caller's async step (open more handles, hand them to the binding's
+`grow_opfs_pool`), which cannot happen from inside a synchronous call.
+
+**The binding is worker-shaped.** OPFS sync access handles exist only inside the one
+worker (or window) that opened them, so `bindings/wasm` registers the adopted pool in a
+`thread_local` (`src/backend/opfs.rs`) and every later call against that `opfs://` store —
+open, upsert, search, flush — must run on that same thread. This is also what makes the
+§13.4 trait survive unchanged; see there for the mechanism.
+
+**`Atomics.wait` over async OPFS was considered and rejected.** It would let a synchronous
+call block a worker on an async handle open without a pool, which looks simpler. It needs
+`SharedArrayBuffer` plus COOP/COEP cross-origin isolation headers on *every* page that hosts
+the worker — a deployment requirement nidus cannot impose on an embedding application, and
+one many static-hosting setups cannot meet at all. The pre-opened pool needs no isolation
+header: all the async work happens once, up front, in ordinary JS.
 
 ---
 
