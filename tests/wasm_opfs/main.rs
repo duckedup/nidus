@@ -401,5 +401,8 @@ async fn a_faulty_body_write_never_corrupts_the_directory_map() {
         Some(b"v1".as_slice()),
         "a failed write must never corrupt the previously-committed value"
     );
-    assert_eq!(backend.list().expect("list must succeed"), vec!["k".to_string()]);
+    assert_eq!(
+        backend.list().expect("list must succeed"),
+        vec!["k".to_string()]
+    );
 }
