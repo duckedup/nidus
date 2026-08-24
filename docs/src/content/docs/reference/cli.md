@@ -318,18 +318,26 @@ the affected field indexes.
 
 Ranked term completions for a prefix from a full-text-indexed field's vocabulary, the kind
 of list an autocomplete dropdown shows. Usage:
-`nidus suggest [OPTIONS] --dir <DIR> <COLLECTION> <FIELD> <PREFIX>`. Completions are ranked
-by document frequency (commonest first), the opposite of how a prefix clause ranks
-*documents* by idf. The response's `matched` exceeds the returned count when the 256-term
-cap truncated the match set. Completions are real words: the field's surface forms are
-indexed alongside its stems, so every keystroke of `running` completes to `running`.
+`nidus suggest [OPTIONS] --dir <DIR> <FIELD> <PREFIX> [COLLECTIONS]...`. Omit the collection
+list to complete from every collection. Completions are ranked by document frequency
+(commonest first), the opposite of how a prefix clause ranks *documents* by idf. The
+response's `matched` exceeds the returned count when the 256-term cap truncated the match
+set. Completions are real words: the field's surface forms are indexed alongside its stems,
+so every keystroke of `running` completes to `running`.
+
+Only the final token of `<PREFIX>` is completed, but the words before it are not discarded:
+a completion's `df` counts only documents that also carry them, so `"quick br"` completes
+against the documents that say "quick" and a `brown` that never co-occurs with it is not
+offered. A single-token prefix, or one whose earlier words are all stopwords, is
+unconditioned.
 
 | Flag | Env | Description |
 | --- | --- | --- |
 | `-n, --limit <N>` | none | How many completions to return (default `10`). |
+| `--where <JSON>` | none | AND-filter (same form as `search --where`). Each completion's `df` counts only matching documents, so a completion no match carries is not offered. |
 
 ```
-nidus suggest --dir ./store --dim 384 docs body nid --limit 5
+nidus suggest --dir ./store body nid docs --limit 5
 ```
 ```json
 {
@@ -339,6 +347,11 @@ nidus suggest --dir ./store --dim 384 docs body nid --limit 5
   ],
   "matched": 2
 }
+```
+
+```
+nidus suggest --dir ./store body "quick br" docs \
+  --where '[{"Eq":["tenant",{"Str":"acme"}]}]'
 ```
 
 ### `text-search`

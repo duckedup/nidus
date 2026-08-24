@@ -1,7 +1,7 @@
 //! Full-text and hybrid search: multi-clause BM25 (nidus-m50.10) and the RRF fusion of a
 //! vector leg with it, plus the opt-in annotations that explain a hit (nidus-m50.5).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::Result;
 
@@ -14,7 +14,8 @@ use crate::filter;
 use crate::fts::Analyzer;
 use crate::fuse::{FusionLeg, rrf_fuse};
 use crate::model::{
-    FtsClause, FtsCombine, FtsQuery, Hit, HybridOpts, SearchOpts, Suggestion, Suggestions,
+    FtsClause, FtsCombine, FtsQuery, Hit, HybridOpts, SearchOpts, SuggestOpts, Suggestion,
+    Suggestions,
 };
 use crate::plan::QueryPlan;
 use crate::search::TopK;
@@ -159,34 +160,77 @@ impl Store {
         Ok(hits)
     }
 
-    /// Ranked prefix completions from `field`'s vocabulary, `df` desc then term asc, the
-    /// opposite of the idf a prefix *clause* scores by, because a dropdown wants the common
-    /// completion first. Empty when the field isn't full-text indexed.
+    /// Ranked prefix completions from `field`'s vocabulary across `collections`, `df` desc then
+    /// term asc, because a dropdown wants the common completion first. Each `df` counts only docs
+    /// passing `opts.filter` and carrying every head term the prefix spelled (SPEC §7).
     pub fn suggest(
         &self,
-        collection: &str,
+        collections: &[&str],
         field: &str,
         prefix: &str,
-        limit: usize,
-    ) -> Suggestions {
-        let Some(cfg) = self.fts.field_analyzer(collection, field) else {
-            return Suggestions::default();
-        };
-        // The trailing token, folded exactly as a prefix clause folds it. Not stemmed:
-        // a half-typed word has no meaningful stem, and the scan it feeds keys on surface
-        // forms anyway (the postings' own keys are stems, which is why it cannot use them).
-        let (_, Some(fragment)) = crate::fts::analyze_with_prefix(prefix, cfg) else {
-            return Suggestions::default();
-        };
-        let (mut scored, matched) = self.fts.suggest(collection, field, &fragment);
-        scored.truncate(limit);
-        Suggestions {
+        opts: &SuggestOpts,
+    ) -> Result<Suggestions> {
+        filter::validate(&opts.filter)?;
+        // Merged by term across the scope: one dropdown, so a completion two collections share is
+        // one row whose `df` is the sum. `matched` is the distinct count before the cap.
+        let mut merged: BTreeMap<String, usize> = BTreeMap::new();
+        for &col_name in collections {
+            let Some(cfg) = self.fts.field_analyzer(col_name, field) else {
+                continue;
+            };
+            let Some(col) = self.collections.get(col_name) else {
+                continue;
+            };
+            // Fold-only, exactly as a prefix clause folds its fragment. The heads ARE kept here,
+            // unlike before nidus-ucl; they condition the df rather than being scored.
+            let (heads, Some(fragment)) = crate::fts::analyze_with_prefix(prefix, cfg) else {
+                continue;
+            };
+            let head_docs = self.fts.head_docs(col_name, field, &heads);
+            // No heads means unconditioned; an empty head set means nothing continues the phrase,
+            // so every completion is dropped rather than falling back to the whole corpus.
+            if head_docs.as_ref().is_some_and(HashSet::is_empty) {
+                continue;
+            }
+            let filtered = !opts.filter.0.is_empty();
+            let admit = |docnum: u32, id: &str| {
+                if let Some(docs) = head_docs.as_ref()
+                    && !docs.contains(&docnum)
+                {
+                    return false;
+                }
+                if !filtered {
+                    return true;
+                }
+                col.docs
+                    .get(id)
+                    .is_some_and(|entry| filter::matches(&opts.filter, &entry.attrs))
+            };
+            // Un-conditioned stays on the cheap path: no closure, so a tombstone-free index reads
+            // each posting list's length instead of walking it (nidus-clv stage 1).
+            let scored = if head_docs.is_none() && !filtered {
+                self.fts.suggest(col_name, field, &fragment, None)
+            } else {
+                self.fts.suggest(col_name, field, &fragment, Some(&admit))
+            };
+            for (term, df) in scored {
+                *merged.entry(term).or_insert(0) += df;
+            }
+        }
+        let matched = merged.len();
+        // (df desc, term asc): the tie-break is load-bearing, or two equal-df completions
+        // truncate in whatever order the sort happened to leave them.
+        let mut scored: Vec<(String, usize)> = merged.into_iter().collect();
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        scored.truncate(crate::fts::MAX_PREFIX_EXPANSION);
+        scored.truncate(opts.limit);
+        Ok(Suggestions {
             suggestions: scored
                 .into_iter()
                 .map(|(term, df)| Suggestion { term, df })
                 .collect(),
             matched,
-        }
+        })
     }
 
     /// Hybrid search: fuse a vector and a BM25 leg with Reciprocal Rank Fusion. Each leg runs

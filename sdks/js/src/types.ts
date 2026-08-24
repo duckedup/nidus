@@ -512,13 +512,22 @@ export type TextSearchOptions = TextSearchBase & TextQuerySpelling;
 
 /** Options for {@link NidusClient.suggest}. */
 export interface SuggestOptions {
-  collection: string;
+  /** Collections whose vocabulary to complete from. Omit or leave empty for all of them. */
+  scope?: string[];
   /** The full-text-indexed field whose vocabulary to complete from. */
   field: string;
-  /** The partial word being typed. Only its final token is completed. */
+  /**
+   * The phrase typed so far. Its final token is completed; the words before it narrow the
+   * completions to documents that also contain them, so send the whole phrase.
+   */
   prefix: string;
   /** How many completions to return. The server defaults to 10. */
   limit?: number;
+  /**
+   * Each completion's `df` counts only documents matching this filter, so a completion no
+   * matching document carries is not offered at all.
+   */
+  filter?: Filter;
 }
 
 /** One completion: an indexed term and how many live documents contain it. */

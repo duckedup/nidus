@@ -12,8 +12,8 @@ use crate::Fsync;
 use crate::Nidus;
 use crate::data::SegmentIntegrity;
 use crate::model::{
-    Filter, Hit, ListOpts, Predicate, Projection, Quantization, Record, SearchOpts, Suggestions,
-    Value,
+    Filter, Hit, ListOpts, Predicate, Projection, Quantization, Record, SearchOpts, SuggestOpts,
+    Suggestions, Value,
 };
 use crate::search::normalize;
 
@@ -4249,6 +4249,30 @@ fn text_search_across_collections_analyzes_once() {
 
 // ── suggest: ranked term completions (nidus-ux0) ─────────────────────────────────
 
+/// `Store::suggest` over one collection with no filter — the shape every pre-nidus-3j8 test used.
+fn sug(store: &Store, collection: &str, field: &str, prefix: &str, limit: usize) -> Suggestions {
+    store
+        .suggest(
+            &[collection],
+            field,
+            prefix,
+            &SuggestOpts {
+                limit,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+}
+
+/// The completions `sug` returns, as `(term, df)` pairs — the readable form for an assertion.
+fn sug_terms(store: &Store, collection: &str, prefix: &str) -> Vec<(String, usize)> {
+    sug(store, collection, "body", prefix, 10)
+        .suggestions
+        .into_iter()
+        .map(|s| (s.term, s.df))
+        .collect()
+}
+
 #[test]
 fn suggest_ranks_by_document_frequency_not_idf() {
     let mut store = Store::in_memory(3).unwrap();
@@ -4269,7 +4293,7 @@ fn suggest_ranks_by_document_frequency_not_idf() {
 
     // The ticket's own criterion, asserted as words: typing "nid" offers "nidus" above
     // "nidification". Surface forms, not the stems "nidu"/"nidif" a dropdown cannot show.
-    let got = store.suggest("docs", "body", "nid", 10);
+    let got = sug(&store, "docs", "body", "nid", 10);
     assert_eq!(
         got.suggestions
             .iter()
@@ -4332,12 +4356,12 @@ fn suggest_folds_the_prefix_like_a_prefix_clause() {
         .upsert("docs", &[doc("a", "nidus"), doc("b", "café")])
         .unwrap();
 
-    let upper = store.suggest("docs", "body", "NID", 10);
-    let lower = store.suggest("docs", "body", "nid", 10);
+    let upper = sug(&store, "docs", "body", "NID", 10);
+    let lower = sug(&store, "docs", "body", "nid", 10);
     assert_eq!(upper, lower);
     assert_eq!(upper.suggestions.len(), 1, "{upper:?}");
 
-    let folded = store.suggest("docs", "body", "caf", 10);
+    let folded = sug(&store, "docs", "body", "caf", 10);
     assert_eq!(folded.suggestions[0].term, "cafe");
 }
 
@@ -4350,8 +4374,8 @@ fn suggest_takes_only_the_trailing_token() {
     store.upsert("docs", &[doc("a", "nidus store")]).unwrap();
 
     assert_eq!(
-        store.suggest("docs", "body", "the nid", 10),
-        store.suggest("docs", "body", "nid", 10)
+        sug(&store, "docs", "body", "the nid", 10),
+        sug(&store, "docs", "body", "nid", 10)
     );
 }
 
@@ -4364,11 +4388,11 @@ fn suggest_is_empty_for_an_unindexed_field_and_an_unknown_collection() {
     store.upsert("docs", &[doc("a", "nidus")]).unwrap();
 
     assert_eq!(
-        store.suggest("docs", "title", "nid", 10),
+        sug(&store, "docs", "title", "nid", 10),
         Suggestions::default()
     );
     assert_eq!(
-        store.suggest("nope", "body", "nid", 10),
+        sug(&store, "nope", "body", "nid", 10),
         Suggestions::default()
     );
 }
@@ -4383,7 +4407,7 @@ fn suggest_of_an_empty_prefix_is_empty() {
 
     for prefix in ["", "  ", "!!"] {
         assert_eq!(
-            store.suggest("docs", "body", prefix, 10),
+            sug(&store, "docs", "body", prefix, 10),
             Suggestions::default(),
             "prefix {prefix:?} must yield no suggestions"
         );
@@ -4409,7 +4433,7 @@ fn suggest_limit_truncates_and_matched_still_reports_the_full_count() {
         )
         .unwrap();
 
-    let got = store.suggest("docs", "body", "nid", 2);
+    let got = sug(&store, "docs", "body", "nid", 2);
     assert_eq!(got.suggestions.len(), 2);
     assert_eq!(got.matched, 5);
 }
@@ -4422,9 +4446,353 @@ fn suggest_limit_zero_is_empty() {
         .unwrap();
     store.upsert("docs", &[doc("a", "nidus")]).unwrap();
 
-    let got = store.suggest("docs", "body", "nid", 0);
+    let got = sug(&store, "docs", "body", "nid", 0);
     assert!(got.suggestions.is_empty());
     assert_eq!(got.matched, 1);
+}
+
+// ── suggest: scope, filter and head conditioning (nidus-3j8, nidus-ucl) ──────────
+
+/// A `doc` carrying one extra attribute — what a filtered `suggest` narrows on.
+fn doc_attr(id: &str, body: &str, key: &str, value: Value) -> Record {
+    let mut attrs = BTreeMap::new();
+    attrs.insert("body".to_string(), Value::Str(body.to_string()));
+    attrs.insert(key.to_string(), value);
+    Record::text_only(id, attrs)
+}
+
+/// A store with one FTS field on `docs`, upserted from `(id, body)` pairs.
+fn fts_store(docs: &[(&str, &str)]) -> Store {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    let recs: Vec<Record> = docs.iter().map(|(id, body)| doc(id, body)).collect();
+    store.upsert("docs", &recs).unwrap();
+    store
+}
+
+/// nidus-3j8's headline criterion: a completion whose only documents the filter excludes is
+/// **absent**, not present with a whole-corpus `df` describing documents the caller cannot read.
+#[test]
+fn a_filtered_out_completions_only_docs_make_it_vanish_rather_than_leak_a_df() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                doc_attr("a", "nidus", "tenant", Value::Str("acme".into())),
+                doc_attr("b", "nidus", "tenant", Value::Str("acme".into())),
+                doc_attr("c", "nidification", "tenant", Value::Str("other".into())),
+            ],
+        )
+        .unwrap();
+
+    let unscoped = sug(&store, "docs", "body", "nid", 10);
+    assert_eq!(unscoped.suggestions.len(), 2, "{unscoped:?}");
+
+    let scoped = store
+        .suggest(
+            &["docs"],
+            "body",
+            "nid",
+            &SuggestOpts {
+                limit: 10,
+                filter: Filter(vec![Predicate::Eq(
+                    "tenant".into(),
+                    Value::Str("acme".into()),
+                )]),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        scoped
+            .suggestions
+            .iter()
+            .map(|s| (s.term.as_str(), s.df))
+            .collect::<Vec<_>>(),
+        vec![("nidus", 2)],
+        "the other tenant's only completion must not appear at all: {scoped:?}"
+    );
+    assert_eq!(scoped.matched, 1, "matched counts the admissible terms too");
+}
+
+/// The df a filtered call reports is the filtered count, not the corpus count.
+#[test]
+fn a_filtered_df_counts_only_matching_live_docs() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                doc_attr("a", "nidus", "keep", Value::Bool(true)),
+                doc_attr("b", "nidus", "keep", Value::Bool(true)),
+                doc_attr("c", "nidus", "keep", Value::Bool(false)),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(sug_terms(&store, "docs", "nid"), vec![("nidus".into(), 3)]);
+    let filtered = store
+        .suggest(
+            &["docs"],
+            "body",
+            "nid",
+            &SuggestOpts {
+                limit: 10,
+                filter: Filter(vec![Predicate::Eq("keep".into(), Value::Bool(true))]),
+            },
+        )
+        .unwrap();
+    assert_eq!(filtered.suggestions[0].df, 2, "{filtered:?}");
+}
+
+/// nidus-ucl's headline criterion: "quick br" completes against the documents that also say
+/// "quick", so a `brown` that never co-occurs with `quick` is not offered first — it is dropped
+/// entirely (the DECIDED zero-head-match rule).
+#[test]
+fn a_multi_word_prefix_conditions_completions_on_its_head_terms() {
+    let store = fts_store(&[
+        ("a", "quick bracket"),
+        ("b", "brown bear"),
+        ("c", "brown owl"),
+        ("d", "brown fox"),
+    ]);
+
+    // Unconditioned, "brown" is far commoner than "bracket".
+    assert_eq!(
+        sug_terms(&store, "docs", "br"),
+        vec![("brown".into(), 3), ("bracket".into(), 1)]
+    );
+
+    // Conditioned on "quick", only "bracket" continues the phrase, and "brown" is gone.
+    assert_eq!(
+        sug_terms(&store, "docs", "quick br"),
+        vec![("bracket".into(), 1)],
+        "brown shares no document with quick, so it must not be offered"
+    );
+}
+
+/// The whole conjunction, not just the nearest word: a completion must share a document with
+/// every head term.
+#[test]
+fn head_conditioning_ands_the_heads_together() {
+    let store = fts_store(&[("a", "quick brown fox"), ("b", "slow brown bear")]);
+
+    assert_eq!(sug_terms(&store, "docs", "bro"), vec![("brown".into(), 2)]);
+    assert_eq!(
+        sug_terms(&store, "docs", "quick bro"),
+        vec![("brown".into(), 1)]
+    );
+    // No document carries both heads, so nothing continues the phrase.
+    assert!(sug_terms(&store, "docs", "quick slow bro").is_empty());
+}
+
+/// The unconditioned shapes must be byte-identical to pre-nidus-ucl behaviour: a single token
+/// has no heads, and `analyze_with_prefix` filters stopwords out of the heads, so "the br" has
+/// none either. Proved by comparison, not by inspection.
+#[test]
+fn a_single_token_or_all_stopword_prefix_is_unconditioned() {
+    let store = fts_store(&[("a", "quick bracket"), ("b", "brown bear")]);
+
+    let bare = sug(&store, "docs", "body", "br", 10);
+    assert_eq!(bare.suggestions.len(), 2, "{bare:?}");
+    for prefix in ["the br", "of the br", "a br"] {
+        assert_eq!(
+            sug(&store, "docs", "body", prefix, 10),
+            bare,
+            "prefix {prefix:?} has only stopword heads and must behave as \"br\" does"
+        );
+    }
+}
+
+/// A head term the corpus never spells describes no documents, so nothing completes it — the
+/// same rule as a head that simply never co-occurs.
+#[test]
+fn a_head_term_absent_from_the_corpus_yields_no_completions() {
+    let store = fts_store(&[("a", "quick bracket")]);
+    assert_eq!(
+        sug_terms(&store, "docs", "bra"),
+        vec![("bracket".into(), 1)]
+    );
+    assert!(sug_terms(&store, "docs", "zzzz bra").is_empty());
+}
+
+/// nidus-3j8's other half: a scope, not one collection. A completion two collections share is
+/// one row whose `df` is the sum, because it feeds one dropdown.
+#[test]
+fn suggest_spans_a_collection_scope_and_sums_a_shared_completions_df() {
+    let mut store = Store::in_memory(3).unwrap();
+    for col in ["docs", "notes"] {
+        store.set_fts_schema(col, &[FtsField::new("body")]).unwrap();
+    }
+    store.upsert("docs", &[doc("a", "nidus")]).unwrap();
+    store
+        .upsert("notes", &[doc("b", "nidus"), doc("c", "nidification")])
+        .unwrap();
+
+    let opts = SuggestOpts {
+        limit: 10,
+        ..Default::default()
+    };
+    let one = store.suggest(&["docs"], "body", "nid", &opts).unwrap();
+    assert_eq!(one.suggestions.len(), 1, "{one:?}");
+    assert_eq!(one.suggestions[0].df, 1);
+
+    let both = store
+        .suggest(&["docs", "notes"], "body", "nid", &opts)
+        .unwrap();
+    assert_eq!(
+        both.suggestions
+            .iter()
+            .map(|s| (s.term.as_str(), s.df))
+            .collect::<Vec<_>>(),
+        vec![("nidus", 2), ("nidification", 1)],
+        "{both:?}"
+    );
+    assert_eq!(both.matched, 2, "matched is over the merged scope");
+}
+
+/// A collection in scope that does not index the field contributes nothing rather than erroring
+/// or emptying the answer.
+#[test]
+fn a_collection_without_the_field_drops_out_of_the_scope() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    store.upsert("docs", &[doc("a", "nidus")]).unwrap();
+    store.upsert("plain", &[doc("b", "nidus")]).unwrap();
+
+    let opts = SuggestOpts {
+        limit: 10,
+        ..Default::default()
+    };
+    let got = store
+        .suggest(&["docs", "plain", "nope"], "body", "nid", &opts)
+        .unwrap();
+    assert_eq!(got.suggestions.len(), 1, "{got:?}");
+    assert_eq!(got.suggestions[0].df, 1);
+}
+
+/// The cap is over the merged scope, and `matched` reports the real fan-out through it.
+#[test]
+fn the_cap_applies_over_the_merged_scope() {
+    let mut store = Store::in_memory(3).unwrap();
+    for col in ["docs", "notes"] {
+        store.set_fts_schema(col, &[FtsField::new("body")]).unwrap();
+    }
+    // Each collection alone stays under the cap; together they exceed it.
+    let half = crate::fts::MAX_PREFIX_EXPANSION / 2 + 10;
+    let mk = |offset: usize| -> Vec<Record> {
+        (0..half)
+            .map(|i| doc(&format!("d{}", offset + i), &format!("zz{}", offset + i)))
+            .collect()
+    };
+    store.upsert("docs", &mk(0)).unwrap();
+    store.upsert("notes", &mk(10_000)).unwrap();
+
+    let got = store
+        .suggest(
+            &["docs", "notes"],
+            "body",
+            "zz",
+            &SuggestOpts {
+                limit: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(got.matched, half * 2, "matched reports the real fan-out");
+    assert_eq!(
+        got.suggestions.len(),
+        crate::fts::MAX_PREFIX_EXPANSION,
+        "the cap is over the union, not per collection"
+    );
+}
+
+/// The DECIDED cap order, as an assertion that can fail. 300 decoys each sit in two documents
+/// and none says "quick", so a raw-`df` cap of 256 would discard the one completion that does
+/// continue the phrase before conditioning ever saw it. Conditioning first, it survives alone.
+#[test]
+fn conditioning_runs_before_the_cap_not_after_it() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    let decoys = crate::fts::MAX_PREFIX_EXPANSION + 44;
+    let mut recs: Vec<Record> = Vec::new();
+    for i in 0..decoys {
+        // Two documents each, so every decoy out-ranks the target on raw df.
+        recs.push(doc(&format!("x{i}"), &format!("brzz{i}")));
+        recs.push(doc(&format!("y{i}"), &format!("brzz{i}")));
+    }
+    recs.push(doc("target", "quick bracket"));
+    store.upsert("docs", &recs).unwrap();
+
+    let unconditioned = sug(&store, "docs", "body", "br", usize::MAX);
+    assert_eq!(unconditioned.matched, decoys + 1);
+    assert_eq!(
+        unconditioned.suggestions.len(),
+        crate::fts::MAX_PREFIX_EXPANSION,
+        "the raw fan-out really does exceed the cap"
+    );
+    assert!(
+        !unconditioned
+            .suggestions
+            .iter()
+            .any(|s| s.term == "bracket"),
+        "and the target really is cut by a raw-df cap, which is what makes this test bite"
+    );
+
+    let conditioned = sug(&store, "docs", "body", "quick br", usize::MAX);
+    assert_eq!(
+        conditioned
+            .suggestions
+            .iter()
+            .map(|s| (s.term.as_str(), s.df))
+            .collect::<Vec<_>>(),
+        vec![("bracket", 1)],
+        "conditioning before the cap is the only order that finds it"
+    );
+}
+
+/// The seam with collection aliases (#241): `suggest` reaches a collection through its alias,
+/// which the pre-`Scope` signature could not do. `Nidus::scope_names` resolves it, so this is a
+/// public-API test rather than a `Store` one — `Store::suggest` only ever sees concrete names.
+#[test]
+fn suggest_reaches_a_collection_through_its_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = crate::Nidus::open(crate::Config::new(dir.path(), 3)).unwrap();
+    db.set_fts_schema("docs", &[FtsField::new("body")]).unwrap();
+    db.upsert("docs", &[doc("a", "nidus")]).unwrap();
+    db.set_alias("live", "docs").unwrap();
+
+    let opts = SuggestOpts {
+        limit: 10,
+        ..Default::default()
+    };
+    let direct = db.suggest("docs", "body", "nid", &opts).unwrap();
+    let aliased = db.suggest("live", "body", "nid", &opts).unwrap();
+    assert_eq!(direct.suggestions.len(), 1, "{direct:?}");
+    assert_eq!(aliased, direct, "an alias must answer as its target does");
+}
+
+/// An invalid filter is rejected rather than silently ignored, as it is on every other surface.
+#[test]
+fn suggest_rejects_an_invalid_filter() {
+    let store = fts_store(&[("a", "nidus")]);
+    let bad = SuggestOpts {
+        limit: 10,
+        filter: Filter(vec![Predicate::Regex("body".into(), "([".into())]),
+    };
+    assert!(store.suggest(&["docs"], "body", "nid", &bad).is_err());
 }
 
 // ── FTS schema: per-field BM25 / analyzer configuration (nidus-m50.13) ───────────

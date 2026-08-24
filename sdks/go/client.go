@@ -463,11 +463,12 @@ func (c *Client) TextSearch(ctx context.Context, req TextSearchRequest) ([]Hit, 
 // vocabulary — what an autocomplete dropdown shows. Ranking is by document frequency,
 // commonest first, not the idf [Client.TextSearch] scores documents by.
 //
-// Completions are stems: the prefix is folded but not stemmed, so a corpus indexing
-// "running" as "run" completes "run" and never "running".
-func (c *Client) Suggest(ctx context.Context, collection string, req SuggestRequest) (Suggestions, error) {
+// Completions are real spellings, not stems: a corpus indexing "running" as "run"
+// completes "running". See [SuggestRequest] for how Scope, Filter and the words before
+// the final token narrow the result.
+func (c *Client) Suggest(ctx context.Context, req SuggestRequest) (Suggestions, error) {
 	var out Suggestions
-	if err := c.request(ctx, http.MethodPost, collPath(collection, "/suggest"), req, &out); err != nil {
+	if err := c.request(ctx, http.MethodPost, "/suggest", req, &out); err != nil {
 		return Suggestions{}, err
 	}
 	return out, nil

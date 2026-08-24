@@ -422,6 +422,17 @@ pub struct Suggestion {
     pub df: usize,
 }
 
+/// Query parameters for [`crate::Nidus::suggest`]. Derives `Default` like [`SearchOpts`], so
+/// `limit` defaults to `0` and answers nothing, exactly as `top_k == 0` does.
+#[derive(Clone, Debug, Default)]
+pub struct SuggestOpts {
+    /// Maximum number of completions.
+    pub limit: usize,
+    /// Metadata filter each completion's `df` is counted through (nidus-3j8): a completion no
+    /// matching document carries is dropped, not returned with a whole-corpus count.
+    pub filter: Filter,
+}
+
 /// [`crate::Nidus::suggest`]'s answer. `matched` counts every term the prefix matched before
 /// the 256-term cap, so `matched > suggestions.len()` is the truncation signal.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

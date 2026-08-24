@@ -239,9 +239,9 @@ ENDPOINTS: list[tuple[str, Callable[[AsyncNidusClient], Any], str, str, Any]] = 
     ("recall", lambda db: db.recall("notes", "hello"), "POST", "/collections/notes/recall", []),
     (
         "suggest",
-        lambda db: db.suggest("docs", field="body", prefix="nid"),
+        lambda db: db.suggest(field="body", prefix="nid", scope=["docs"]),
         "POST",
-        "/collections/docs/suggest",
+        "/suggest",
         {"suggestions": [], "matched": 0},
     ),
     ("flush", lambda db: db.flush(), "POST", "/flush", {"ok": True}),
@@ -676,13 +676,19 @@ async def test_records_keeps_an_absent_vector_as_none() -> None:
     assert records[0].attrs == {"body": "text only"}
 
 
-async def test_suggest_posts_to_the_collection_path() -> None:
+async def test_suggest_posts_scope_and_filter_to_the_suggest_route() -> None:
     mock = MockServer({"suggestions": [], "matched": 0})
     async with client(mock) as db:
-        await db.suggest("docs", field="body", prefix="nid", limit=5)
+        await db.suggest(field="body", prefix="nid", scope=["docs"], limit=5)
     assert mock.last.method == "POST"
-    assert str(mock.last.url) == "http://x/collections/docs/suggest"
-    assert mock.json == {"field": "body", "prefix": "nid", "limit": 5}
+    assert str(mock.last.url) == "http://x/suggest"
+    assert mock.json == {
+        "scope": ["docs"],
+        "field": "body",
+        "prefix": "nid",
+        "limit": 5,
+        "filter": [],
+    }
 
 
 async def test_suggest_returns_the_decoded_result() -> None:
@@ -693,7 +699,7 @@ async def test_suggest_returns_the_decoded_result() -> None:
         }
     )
     async with client(mock) as db:
-        result = await db.suggest("docs", field="body", prefix="nid")
+        result = await db.suggest(field="body", prefix="nid", scope=["docs"])
     assert [s.term for s in result.suggestions] == ["nidus", "nidification"]
     assert [s.df for s in result.suggestions] == [3, 1]
     assert result.matched == 2

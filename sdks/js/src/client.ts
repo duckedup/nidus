@@ -373,13 +373,23 @@ export class NidusClient {
   /**
    * Ranked term completions for a partial word, for an autocomplete dropdown. Ranked by
    * document frequency (commonest first), which is the opposite of how a prefix clause
-   * ranks documents. Completions are stems: the prefix is folded, not stemmed.
+   * ranks documents. Completions are real spellings: the prefix is folded, not stemmed.
+   *
+   * The `df` counts only documents passing `filter` and carrying every word already typed
+   * before the final token, so a permission-scoped dropdown is expressible and "quick br"
+   * completes against the documents that also say "quick".
    */
   suggest(opts: SuggestOptions): Promise<Suggestions> {
     return this.request<Suggestions>(
       "POST",
-      `/collections/${enc(opts.collection)}/suggest`,
-      prune({ field: opts.field, prefix: opts.prefix, limit: opts.limit }),
+      "/suggest",
+      prune({
+        scope: opts.scope ?? [],
+        field: opts.field,
+        prefix: opts.prefix,
+        limit: opts.limit,
+        filter: opts.filter ?? [],
+      }),
     );
   }
 

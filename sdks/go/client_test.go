@@ -327,8 +327,8 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 			_, err := c.TextSearch(ctx, TextSearchRequest{Field: "body", Query: "fox"})
 			return err
 		}},
-		{"Suggest", `{"suggestions":[],"matched":0}`, http.MethodPost, "/collections/docs/suggest", func(c *Client) error {
-			_, err := c.Suggest(ctx, "docs", SuggestRequest{Field: "body", Prefix: "fo"})
+		{"Suggest", `{"suggestions":[],"matched":0}`, http.MethodPost, "/suggest", func(c *Client) error {
+			_, err := c.Suggest(ctx, SuggestRequest{Scope: []string{"docs"}, Field: "body", Prefix: "fo"})
 			return err
 		}},
 		{"HybridSearch", `[]`, http.MethodPost, "/hybrid-search", func(c *Client) error {
@@ -2472,39 +2472,48 @@ func TestPrefixOmitsWhenUnset(t *testing.T) {
 	}
 }
 
-// TestSuggestSendsCollectionInThePath — the collection is a path segment, not a body
-// field, so the body carries only the field/prefix/limit trio.
-func TestSuggestSendsCollectionInThePath(t *testing.T) {
+// TestSuggestSendsScopeAndFilterInTheBody — the collection list is a body field now, not a
+// path segment, so /suggest carries the whole query the way /text-search does.
+func TestSuggestSendsScopeAndFilterInTheBody(t *testing.T) {
 	fake := &capture{reply: `{"suggestions":[],"matched":0}`}
 	db := serve(t, fake)
 	ctx := context.Background()
 
-	if _, err := db.Suggest(ctx, "docs", SuggestRequest{Field: "body", Prefix: "nid", Limit: 5}); err != nil {
+	req := SuggestRequest{
+		Scope:  []string{"docs", "notes"},
+		Field:  "body",
+		Prefix: "nid",
+		Limit:  5,
+		Filter: Filter{Eq("tenant", Str("acme"))},
+	}
+	if _, err := db.Suggest(ctx, req); err != nil {
 		t.Fatalf("Suggest failed: %v", err)
 	}
 	snap := fake.snapshot()
-	if snap.path != "/collections/docs/suggest" {
-		t.Errorf("path = %s, want /collections/docs/suggest", snap.path)
+	if snap.path != "/suggest" {
+		t.Errorf("path = %s, want /suggest", snap.path)
 	}
-	want := `{"field":"body","prefix":"nid","limit":5}`
+	want := `{"scope":["docs","notes"],"field":"body","prefix":"nid","limit":5,` +
+		`"filter":[{"Eq":["tenant",{"Str":"acme"}]}]}`
 	if body := string(snap.body); body != want {
 		t.Errorf("body = %s, want %s", body, want)
 	}
 }
 
 // TestSuggestOmitsLimitWhenZero catches a client-side default forking from the
-// server's own default of 10: a zero Limit must not encode a "limit" key at all.
+// server's own default of 10: a zero Limit must not encode a "limit" key at all. An empty
+// Scope and Filter drop out the same way, which is how the server reads "everything".
 func TestSuggestOmitsLimitWhenZero(t *testing.T) {
 	fake := &capture{reply: `{"suggestions":[],"matched":0}`}
 	db := serve(t, fake)
 	ctx := context.Background()
 
-	if _, err := db.Suggest(ctx, "docs", SuggestRequest{Field: "body", Prefix: "nid"}); err != nil {
+	if _, err := db.Suggest(ctx, SuggestRequest{Field: "body", Prefix: "nid"}); err != nil {
 		t.Fatalf("Suggest failed: %v", err)
 	}
 	want := `{"field":"body","prefix":"nid"}`
 	if body := fake.sentBody(t); body != want {
-		t.Errorf("body = %s, want %s (no limit key)", body, want)
+		t.Errorf("body = %s, want %s (no limit/scope/filter keys)", body, want)
 	}
 }
 
@@ -2514,7 +2523,7 @@ func TestSuggestDecodesTheResponse(t *testing.T) {
 	db := serve(t, fake)
 	ctx := context.Background()
 
-	got, err := db.Suggest(ctx, "docs", SuggestRequest{Field: "body", Prefix: "nid"})
+	got, err := db.Suggest(ctx, SuggestRequest{Scope: []string{"docs"}, Field: "body", Prefix: "nid"})
 	if err != nil {
 		t.Fatalf("Suggest failed: %v", err)
 	}
@@ -2526,18 +2535,24 @@ func TestSuggestDecodesTheResponse(t *testing.T) {
 	}
 }
 
-// TestSuggestEscapesTheCollectionName — a collection name needing escaping must land
-// escaped in the path, exactly as every other collPath-routed method.
-func TestSuggestEscapesTheCollectionName(t *testing.T) {
+// TestSuggestNeedsNoEscapingForAnAwkwardName — a name that used to need path escaping now
+// travels in the body verbatim, so there is no encoding step left to get wrong.
+func TestSuggestNeedsNoEscapingForAnAwkwardName(t *testing.T) {
 	fake := &capture{reply: `{"suggestions":[],"matched":0}`}
 	db := serve(t, fake)
 	ctx := context.Background()
 
-	if _, err := db.Suggest(ctx, "notes/2024", SuggestRequest{Field: "body", Prefix: "nid"}); err != nil {
+	req := SuggestRequest{Scope: []string{"notes/2024"}, Field: "body", Prefix: "nid"}
+	if _, err := db.Suggest(ctx, req); err != nil {
 		t.Fatalf("Suggest failed: %v", err)
 	}
-	if got := fake.snapshot().path; got != "/collections/notes%2F2024/suggest" {
-		t.Errorf("path = %s, want /collections/notes%%2F2024/suggest", got)
+	snap := fake.snapshot()
+	if snap.path != "/suggest" {
+		t.Errorf("path = %s, want /suggest", snap.path)
+	}
+	want := `{"scope":["notes/2024"],"field":"body","prefix":"nid"}`
+	if body := string(snap.body); body != want {
+		t.Errorf("body = %s, want %s", body, want)
 	}
 }
 

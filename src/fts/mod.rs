@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +29,11 @@ pub(crate) fn field_text(attrs: &BTreeMap<String, Value>, field: &str) -> String
         _ => String::new(),
     }
 }
+
+/// Whether one posting's document may count toward a `df`, by `(docnum, id)`: the docnum tests
+/// membership of a head-term intersection (nidus-ucl), the id looks the document's attrs up for a
+/// metadata filter (nidus-3j8). `None` everywhere means the unconditioned whole-corpus count.
+pub(crate) type Admit<'a> = &'a dyn Fn(u32, &str) -> bool;
 
 /// One posting: a document's local docnum and the term's frequency in this field.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -199,14 +205,14 @@ impl FieldIndex {
     /// both "runn" and the whole word). Commonest first, capped; `matched` reports a truncation.
     pub(crate) fn expand_prefix(&self, fragment: &str) -> (Vec<String>, usize) {
         // Keyed by stem, so a stem both legs reach is one term in the disjunction. Both legs
-        // read the same `live_df_of`, so the two `df`s agree and either may win.
+        // read the same `df_where`, so the two `df`s agree and either may win.
         let mut hits: BTreeMap<&str, usize> = BTreeMap::new();
         for (term, postings) in self
             .postings
             .range(fragment.to_string()..)
             .take_while(|(t, _)| t.starts_with(fragment))
         {
-            let df = self.live_df_of(postings);
+            let df = self.df_where(postings, None);
             if df > 0 {
                 hits.insert(term, df);
             }
@@ -219,7 +225,7 @@ impl FieldIndex {
             let Some(postings) = self.postings.get(stemmed) else {
                 continue;
             };
-            let df = self.live_df_of(postings);
+            let df = self.df_where(postings, None);
             if df > 0 {
                 hits.insert(stemmed, df);
             }
@@ -236,39 +242,83 @@ impl FieldIndex {
         )
     }
 
-    /// Postings whose owning doc is still live — the `df` every ranking here uses.
-    fn live_df_of(&self, postings: &[Posting]) -> usize {
-        postings
-            .iter()
-            .filter(|p| self.docnum_to_id[p.docnum as usize].is_some())
-            .count()
+    /// Postings whose owning doc is live and, when `admit` is given, admissible — the `df`
+    /// every ranking here uses. With no `admit` and no tombstone every posting counts, so the
+    /// length is the exact answer and nothing is walked (nidus-clv stage 1).
+    fn df_where(&self, postings: &[Posting], admit: Option<Admit<'_>>) -> usize {
+        match admit {
+            None if self.tombstones == 0 => postings.len(),
+            None => postings
+                .iter()
+                .filter(|p| self.docnum_to_id[p.docnum as usize].is_some())
+                .count(),
+            Some(admit) => postings
+                .iter()
+                .filter(|p| {
+                    self.docnum_to_id[p.docnum as usize]
+                        .as_deref()
+                        .is_some_and(|id| admit(p.docnum, id))
+                })
+                .count(),
+        }
     }
 
-    /// Surface forms carrying `fragment` as a prefix, each with the live `df` of the stem it
-    /// maps to, commonest first and truncated to the cap. Two spellings of one stem are two
-    /// completions sharing a `df`, which is what a dropdown wants.
-    pub(crate) fn suggest_scored(&self, fragment: &str) -> (Vec<(String, usize)>, usize) {
-        let mut matches: Vec<(&String, usize)> = self
-            .surface
+    /// Live docnums carrying **every** term in `heads` — the documents a multi-word prefix has
+    /// described so far (nidus-ucl). `None` when there are no heads, which is not an empty set:
+    /// no heads means unconditioned, an empty set means nothing continues the phrase.
+    pub(crate) fn head_docs(&self, heads: &[String]) -> Option<HashSet<u32>> {
+        if heads.is_empty() {
+            return None;
+        }
+        // Rarest head first so the intersection shrinks fastest. A head with no postings makes the
+        // whole conjunction empty rather than dropping out of it.
+        let mut order: Vec<&String> = heads.iter().collect();
+        order.sort_unstable_by_key(|t| self.postings.get(*t).map_or(0, Vec::len));
+        let mut acc: HashSet<u32> = match self.postings.get(order[0]) {
+            Some(ps) => ps
+                .iter()
+                .filter(|p| self.docnum_to_id[p.docnum as usize].is_some())
+                .map(|p| p.docnum)
+                .collect(),
+            None => return Some(HashSet::new()),
+        };
+        for term in &order[1..] {
+            let Some(ps) = self.postings.get(*term) else {
+                return Some(HashSet::new());
+            };
+            acc = ps
+                .iter()
+                .map(|p| p.docnum)
+                .filter(|d| acc.contains(d))
+                .collect();
+            if acc.is_empty() {
+                break;
+            }
+        }
+        Some(acc)
+    }
+
+    /// Surface forms carrying `fragment` as a prefix, each with the `df` of the stem it maps to
+    /// counted through `admit`. Un-capped and unranked: the caller merges the scope's collections
+    /// first, so the cap and its `matched` count are over the whole scope, not one collection.
+    pub(crate) fn suggest_scored(
+        &self,
+        fragment: &str,
+        admit: Option<Admit<'_>>,
+    ) -> Vec<(String, usize)> {
+        self.surface
             .range(fragment.to_string()..)
             .take_while(|(s, _)| s.starts_with(fragment))
             .filter_map(|(s, stemmed)| {
                 let df = self
                     .postings
                     .get(stemmed)
-                    .map_or(0, |ps| self.live_df_of(ps));
-                (df > 0).then_some((s, df))
+                    .map_or(0, |ps| self.df_where(ps, admit));
+                // Dropped, not ranked last: a completion no admissible document carries does not
+                // continue the phrase and must not be offered (nidus-ucl DECIDED).
+                (df > 0).then(|| (s.clone(), df))
             })
-            .collect();
-        let matched = matches.len();
-        // (df desc, term asc), the same tie-break `expand_prefix` needs and for the same
-        // reason: without it two equal-df completions truncate in arbitrary order.
-        matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-        matches.truncate(MAX_PREFIX_EXPANSION);
-        (
-            matches.into_iter().map(|(s, df)| (s.clone(), df)).collect(),
-            matched,
-        )
+            .collect()
     }
 
     /// Whether this index currently holds document `id` (live).
@@ -457,21 +507,35 @@ impl Fts {
         }
     }
 
-    /// Ranked completions for `fragment` in `collection`.`field` with their live `df` (see
-    /// [`FieldIndex::suggest_scored`]). `(vec![], 0)` when the field isn't indexed.
+    /// Un-capped completions for `fragment` in `collection`.`field` with their conditioned `df`
+    /// (see [`FieldIndex::suggest_scored`]). Empty when the field isn't indexed.
     pub(crate) fn suggest(
         &self,
         collection: &str,
         field: &str,
         fragment: &str,
-    ) -> (Vec<(String, usize)>, usize) {
+        admit: Option<Admit<'_>>,
+    ) -> Vec<(String, usize)> {
         match self
             .fields
             .get(&(collection.to_string(), field.to_string()))
         {
-            Some(idx) => idx.suggest_scored(fragment),
-            None => (Vec::new(), 0),
+            Some(idx) => idx.suggest_scored(fragment, admit),
+            None => Vec::new(),
         }
+    }
+
+    /// Live docnums in `collection`.`field` carrying every term in `heads` (see
+    /// [`FieldIndex::head_docs`]). `None` when there are no heads or the field isn't indexed.
+    pub(crate) fn head_docs(
+        &self,
+        collection: &str,
+        field: &str,
+        heads: &[String],
+    ) -> Option<HashSet<u32>> {
+        self.fields
+            .get(&(collection.to_string(), field.to_string()))?
+            .head_docs(heads)
     }
 }
 
@@ -802,46 +866,52 @@ mod tests {
         assert_eq!(idx.expand_prefix("ca"), (vec!["cat".to_string()], 1));
     }
 
+    /// `suggest_scored` ranked the way `Store::suggest` ranks it (df desc, term asc). The cap and
+    /// the `matched` count moved to the store with the scope merge, so they are asserted there.
+    fn sug(idx: &FieldIndex, fragment: &str) -> Vec<(String, usize)> {
+        sug_admit(idx, fragment, None)
+    }
+
+    /// [`sug`] with an admissibility predicate — the conditioned `df` a filter or a head-term
+    /// intersection produces.
+    fn sug_admit(
+        idx: &FieldIndex,
+        fragment: &str,
+        admit: Option<Admit<'_>>,
+    ) -> Vec<(String, usize)> {
+        let mut v = idx.suggest_scored(fragment, admit);
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    }
+
     // ── suggest_scored (surface-form completions) ──────────────────────────────────
 
     #[test]
     fn suggest_returns_live_df_per_completion() {
         let idx = idx_with(&[("d1", "cat"), ("d2", "cat"), ("d3", "cat car")]);
-        let (scored, matched) = idx.suggest_scored("ca");
+        let scored = sug(&idx, "ca");
         assert_eq!(scored, vec![("cat".to_string(), 3), ("car".to_string(), 1)]);
-        assert_eq!(matched, 2);
     }
 
     #[test]
     fn suggest_excludes_a_deleted_docs_only_term() {
         let mut idx = idx_with(&[("d1", "car")]);
         idx.tombstone("d1");
-        let (scored, matched) = idx.suggest_scored("ca");
-        assert!(scored.is_empty());
-        assert_eq!(matched, 0);
+        assert!(sug(&idx, "ca").is_empty());
     }
 
     #[test]
     fn suggest_df_falls_when_one_of_several_docs_is_deleted() {
         let mut idx = idx_with(&[("d1", "car"), ("d2", "car"), ("d3", "car")]);
         idx.tombstone("d1");
-        let (scored, _) = idx.suggest_scored("ca");
-        assert_eq!(scored, vec![("car".to_string(), 2)]);
+        assert_eq!(sug(&idx, "ca"), vec![("car".to_string(), 2)]);
     }
 
     #[test]
     fn suggest_ties_break_on_term_ascending() {
         let idx = idx_with(&[("d1", "cat"), ("d2", "car")]);
-        let (scored, _) = idx.suggest_scored("ca");
+        let scored = sug(&idx, "ca");
         assert_eq!(scored, vec![("car".to_string(), 1), ("cat".to_string(), 1)]);
-    }
-
-    #[test]
-    fn suggest_truncates_at_the_cap_and_reports_matched() {
-        let idx = zz_corpus(MAX_PREFIX_EXPANSION + 1);
-        let (scored, matched) = idx.suggest_scored("zz");
-        assert_eq!(scored.len(), MAX_PREFIX_EXPANSION);
-        assert_eq!(matched, MAX_PREFIX_EXPANSION + 1);
     }
 
     /// The whole reason `surface` exists: "nidus" stems to "nidu", so a stem-keyed scan alone
@@ -851,9 +921,8 @@ mod tests {
     fn suggest_and_a_clause_both_reach_a_word_the_stem_keyed_scan_cannot() {
         let idx = idx_with(&[("d1", "nidus"), ("d2", "nidus")]);
 
-        let (scored, matched) = idx.suggest_scored("nidus");
+        let scored = sug(&idx, "nidus");
         assert_eq!(scored, vec![("nidus".to_string(), 2)], "{scored:?}");
-        assert_eq!(matched, 1);
 
         assert_eq!(idx.expand_prefix("nidus"), (vec!["nidu".to_string()], 1));
         assert_eq!(idx.expand_prefix("nidu"), (vec!["nidu".to_string()], 1));
@@ -864,9 +933,8 @@ mod tests {
     fn suggest_answers_at_every_keystroke_of_a_stemmed_word() {
         let idx = idx_with(&[("d1", "running")]);
         for typed in ["r", "ru", "run", "runn", "runni", "runnin", "running"] {
-            let (scored, _) = idx.suggest_scored(typed);
             assert_eq!(
-                scored,
+                sug(&idx, typed),
                 vec![("running".to_string(), 1)],
                 "prefix {typed:?} must still complete to the word"
             );
@@ -877,13 +945,93 @@ mod tests {
     #[test]
     fn suggest_returns_each_surface_form_of_a_shared_stem() {
         let idx = idx_with(&[("d1", "running"), ("d2", "runs")]);
-        let (scored, matched) = idx.suggest_scored("run");
+        let scored = sug(&idx, "run");
         assert_eq!(
             scored,
             vec![("running".to_string(), 2), ("runs".to_string(), 2)],
             "{scored:?}"
         );
-        assert_eq!(matched, 2);
+    }
+
+    // ── df_where / head_docs: the conditioned df (nidus-clv, nidus-3j8, nidus-ucl) ─
+
+    /// nidus-clv stage 1. The length shortcut and the walk must be the same number, or the fast
+    /// path is a silent wrong answer on exactly the corpus shape it exists for.
+    #[test]
+    fn df_of_a_tombstone_free_index_equals_the_walked_count() {
+        let idx = idx_with(&[("d1", "cat"), ("d2", "cat"), ("d3", "car")]);
+        assert_eq!(idx.tombstones, 0);
+        let postings = &idx.postings["cat"];
+        let walked = postings
+            .iter()
+            .filter(|p| idx.docnum_to_id[p.docnum as usize].is_some())
+            .count();
+        assert_eq!(idx.df_where(postings, None), walked);
+        assert_eq!(idx.df_where(postings, None), 2);
+    }
+
+    /// And once a tombstone exists the shortcut must NOT fire: the length would over-count.
+    #[test]
+    fn df_walks_once_the_index_carries_a_tombstone() {
+        let mut idx = idx_with(&[("d1", "cat"), ("d2", "cat")]);
+        idx.tombstone("d1");
+        let postings = &idx.postings["cat"];
+        assert_eq!(postings.len(), 2, "the dead posting is still there");
+        assert_eq!(idx.df_where(postings, None), 1);
+    }
+
+    #[test]
+    fn df_counts_only_admissible_postings() {
+        let idx = idx_with(&[("d1", "cat"), ("d2", "cat"), ("d3", "cat")]);
+        let postings = &idx.postings["cat"];
+        let only_d2 = |_: u32, id: &str| id == "d2";
+        assert_eq!(idx.df_where(postings, Some(&only_d2)), 1);
+        let none = |_: u32, _: &str| false;
+        assert_eq!(idx.df_where(postings, Some(&none)), 0);
+    }
+
+    #[test]
+    fn head_docs_intersects_and_distinguishes_no_heads_from_no_match() {
+        let idx = idx_with(&[
+            ("d1", "quick brown fox"),
+            ("d2", "quick red fox"),
+            ("d3", "brown bear"),
+        ]);
+        // No heads is unconditioned; it is not the same as an empty conjunction.
+        assert!(idx.head_docs(&[]).is_none());
+
+        let quick = idx.head_docs(&[q("quick")[0].clone()]).unwrap();
+        assert_eq!(quick.len(), 2);
+
+        // AND, not OR: only d1 carries both.
+        let both = idx
+            .head_docs(&[q("quick")[0].clone(), q("brown")[0].clone()])
+            .unwrap();
+        assert_eq!(both.len(), 1);
+
+        // A head the corpus never spells empties the whole conjunction rather than dropping out.
+        let absent = idx
+            .head_docs(&[q("quick")[0].clone(), "zzzz".to_string()])
+            .unwrap();
+        assert!(absent.is_empty());
+    }
+
+    /// nidus-ucl at the index level: the head set, fed in as `admit`, is what narrows the df.
+    #[test]
+    fn suggest_df_narrows_to_the_head_matching_docs() {
+        let idx = idx_with(&[
+            ("d1", "quick brown fox"),
+            ("d2", "brown bear"),
+            ("d3", "brown owl"),
+        ]);
+        assert_eq!(sug(&idx, "brown"), vec![("brown".to_string(), 3)]);
+
+        let heads = idx.head_docs(&[q("quick")[0].clone()]).unwrap();
+        let admit = |docnum: u32, _: &str| heads.contains(&docnum);
+        assert_eq!(
+            sug_admit(&idx, "brown", Some(&admit)),
+            vec![("brown".to_string(), 1)]
+        );
     }
 
     // ── cache invalidation ────────────────────────────────────────────────────────

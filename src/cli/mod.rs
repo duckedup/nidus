@@ -16,7 +16,7 @@ use crate::server::dto::{AnnDto, FootprintDto, HitDto, SearchResponse};
 use crate::{
     AggregateOpts, AnnConfig, Config, Distance, Expand, Filter, Fsync, FtsClause, FtsCombine,
     FtsField, FtsQuery, HighlightOpts, HybridOpts, LeaseWait, LimitPer, ListOpts, Nidus, OpenMode,
-    OrderBy, Projection, Quantization, Record, Scope, SearchOpts,
+    OrderBy, Projection, Quantization, Record, Scope, SearchOpts, SuggestOpts,
 };
 
 // AI-ingest (memory) wiring for `serve`: only under the `memory` feature (pulled
@@ -1235,15 +1235,20 @@ enum Command {
     Suggest {
         #[command(flatten)]
         store: StoreArgs,
-        /// The collection whose vocabulary to complete from.
-        collection: String,
         /// The full-text-indexed field to complete from.
         field: String,
-        /// The partial word being typed. Only its final token is completed.
+        /// The partial word being typed. Its final token is completed; the words before it
+        /// narrow the completions to documents that carry them.
         prefix: String,
+        /// Collections whose vocabulary to complete from; omit for every collection.
+        collections: Vec<String>,
         /// How many completions to return.
         #[arg(long, short = 'n', default_value_t = 10)]
         limit: usize,
+        /// AND-filter as JSON (same form as `search --where`). Each completion's `df` counts
+        /// only matching documents, so a completion no match carries is not offered.
+        #[arg(long = "where")]
+        filter: Option<String>,
     },
     /// Full-text (BM25) search of fields declared via `set-fts-schema`.
     TextSearch {
@@ -1935,13 +1940,27 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Command::Suggest {
             store,
-            collection,
             field,
             prefix,
+            collections,
             limit,
+            filter,
         } => {
             let db = open(&store, false)?;
-            print_json(&db.suggest(&collection, &field, &prefix, limit))
+            let opts = SuggestOpts {
+                limit,
+                filter: match filter {
+                    Some(s) => serde_json::from_str(&s)?,
+                    None => Filter::default(),
+                },
+            };
+            let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
+            let out = if refs.is_empty() {
+                db.suggest(Scope::All, &field, &prefix, &opts)?
+            } else {
+                db.suggest(Scope::Collections(&refs), &field, &prefix, &opts)?
+            };
+            print_json(&out)
         }
         Command::TextSearch {
             store,

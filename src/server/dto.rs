@@ -51,15 +51,21 @@ pub(super) fn default_top_k() -> usize {
 /// the bounded top-k kernel would otherwise be handed a `k` it must defend against itself.
 pub(super) const MAX_TOP_K: usize = 10_000;
 
-/// Body of `POST /collections/{name}/suggest`. `prefix` is the partial word being typed;
-/// the collection comes from the path.
+/// Body of `POST /suggest`. `prefix` is the partial word being typed; `scope` is the collection
+/// list, omitted or empty for every collection, exactly as `/text-search` reads it.
 #[derive(Debug, Deserialize)]
 pub struct SuggestRequest {
+    #[serde(default)]
+    pub scope: Vec<String>,
     pub field: String,
     pub prefix: String,
     /// How many completions to return. Small by default: this feeds a dropdown, not a page.
     #[serde(default = "default_suggest_limit")]
     pub limit: usize,
+    /// Each completion's `df` is counted through this filter, so a scoped dropdown offers only
+    /// vocabulary the caller can retrieve (nidus-3j8).
+    #[serde(default)]
+    pub filter: Filter,
 }
 
 /// A dropdown shows a handful of rows, so `top_k`'s default would be wrong here.
@@ -763,8 +769,8 @@ pub struct SuggestionDto {
     pub df: usize,
 }
 
-/// `POST /collections/{name}/suggest`'s response. `matched` counts every term the prefix
-/// matched, so `matched > suggestions.len()` tells a caller the 256-term cap truncated.
+/// `POST /suggest`'s response. `matched` counts every term the prefix matched, so
+/// `matched > suggestions.len()` tells a caller the 256-term cap truncated.
 #[derive(Debug, Serialize)]
 pub struct SuggestionsDto {
     pub suggestions: Vec<SuggestionDto>,

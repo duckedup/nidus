@@ -623,7 +623,7 @@ def test_suggest_ranks_by_document_frequency_against_a_real_server(server: str) 
             ],
         )
 
-        result = db.suggest("docs", field="title", prefix="nid")
+        result = db.suggest(field="title", prefix="nid", scope=["docs"])
         assert [s.term for s in result.suggestions] == ["nidus", "nidification"]
         assert [s.df for s in result.suggestions] == [2, 1]
         assert result.matched == 2

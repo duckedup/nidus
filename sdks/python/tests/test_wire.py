@@ -107,7 +107,6 @@ def test_prune_drops_only_none_valued_keys() -> None:
         (_wire.filter_index_path, "/collections/docs/filter-index"),
         (_wire.remember_path, "/collections/docs/remember"),
         (_wire.recall_path, "/collections/docs/recall"),
-        (_wire.suggest_path, "/collections/docs/suggest"),
     ],
 )
 def test_collection_paths(builder: Callable[[str], str], expected: str) -> None:
@@ -123,10 +122,6 @@ def test_collection_names_are_escaped_to_a_single_path_segment() -> None:
     assert _wire.collection_path("q?x#y") == "/collections/q%3Fx%23y"
     # Non-ASCII is percent-encoded UTF-8, which is what the server's path decoder expects.
     assert _wire.collection_path("nøtes") == "/collections/n%C3%B8tes"
-
-
-def test_suggest_path_escapes_the_collection_name() -> None:
-    assert _wire.suggest_path("a/b c") == "/collections/a%2Fb%20c/suggest"
 
 
 # ── Request bodies ───────────────────────────────────────────────────────────────────
@@ -764,7 +759,13 @@ def test_fts_schema_body_refuses_a_misspelled_knob() -> None:
 
 
 def test_suggest_body_carries_field_and_prefix() -> None:
-    assert _wire.suggest_body("body", "nid") == {"field": "body", "prefix": "nid"}
+    """An unset scope and filter are sent empty, the way ``text_search_body`` sends them."""
+    assert _wire.suggest_body("body", "nid") == {
+        "scope": [],
+        "field": "body",
+        "prefix": "nid",
+        "filter": [],
+    }
 
 
 def test_suggest_body_omits_limit_when_unset() -> None:
@@ -772,9 +773,25 @@ def test_suggest_body_omits_limit_when_unset() -> None:
     body = _wire.suggest_body("body", "nid")
     assert "limit" not in body
     assert _wire.suggest_body("body", "nid", limit=5) == {
+        "scope": [],
         "field": "body",
         "prefix": "nid",
         "limit": 5,
+        "filter": [],
+    }
+
+
+def test_suggest_body_carries_scope_and_filter() -> None:
+    assert _wire.suggest_body(
+        "body",
+        "quick br",
+        scope=["docs", "notes"],
+        filter=[{"Eq": ["tenant", {"Str": "acme"}]}],
+    ) == {
+        "scope": ["docs", "notes"],
+        "field": "body",
+        "prefix": "quick br",
+        "filter": [{"Eq": ["tenant", {"Str": "acme"}]}],
     }
 
 

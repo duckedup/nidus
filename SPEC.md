@@ -684,7 +684,8 @@ reliable guard there is to refuse work *before* allocating:
   `(df desc, term asc)` rather than erroring, keeping the commonest completions with a
   deterministic tie-break. The cap bounds the terms **scored**, not the terms examined:
   ranking by df means every term sharing the prefix is df-scanned before the truncation, so
-  a one-character prefix still costs a range scan proportional to its fan-out (nidus-clv) — an over-budget fuzzy edit (`MAX_FUZZY_EDITS`) is a caller mistake
+  a one-character prefix still costs a range scan proportional to its fan-out (nidus-clv, whose
+  stage 1 removed the per-term `df` walk from it) — an over-budget fuzzy edit (`MAX_FUZZY_EDITS`) is a caller mistake
   and rejected, but a one-character prefix is the normal first keystroke of typeahead, so
   truncating keeps it usable. The truncation is reported through the existing explain path
   (§7.8's `ClauseScore.expansion`), not through a `QueryPlan` (§7.11). The prefix fragment is
@@ -704,26 +705,67 @@ reliable guard there is to refuse work *before* allocating:
   leg fires only where some indexed spelling carries the fragment, so it widens what a prefix
   reaches without inventing terms the corpus does not spell. No format change: the surface map is already built and
   persisted for `suggest`.
-- **`Nidus::suggest(collection, field, prefix, limit)` hands back ranked term completions**
+- **`Nidus::suggest(scope, field, prefix, &SuggestOpts)` hands back ranked term completions**
   (nidus-ux0), the typeahead surface a prefix *clause* does not provide: a clause ranks
   *documents*, `suggest` ranks *terms*. It runs the same shape of range scan
   `FieldIndex::expand_prefix` runs (`FieldIndex::suggest_scored`, over `surface` rather than
-  `postings`), keeping each matching term's live `df` instead of discarding it. Ranking is **`df` desc, term asc**, the opposite
-  of the per-term idf a prefix clause scores documents by: a dropdown wants the common
-  completion (`nid` → `nidus`) above the rare one (`nidification`), while ranking documents
-  correctly wants the rare term to lift its doc. The 256-term `MAX_PREFIX_EXPANSION` cap is
-  the same one prefix clauses hit; `limit` only truncates further, and the returned `matched`
-  count (from the same cap accounting `ClauseScore.expansion` uses) lets a caller detect
-  truncation. The prefix is normalized the same fold-only way a prefix clause's fragment is
-  (via `analyze_with_prefix`, discarding its stemmed heads), but it is matched against a
-  per-field **surface-form** map (`FieldIndex::surface`, folded spelling → its stem) rather
-  than against the stem-keyed postings, because a stem-keyed scan goes empty exactly as the
-  typist finishes the word (`nidus` stems to `nidu`). So completions are real words, each
-  carrying the live `df` of the stem it maps to, and two spellings of one stem are two
-  completions. A prefix *clause* reads the same map as its second expansion leg (nidus-dnm),
+  `postings`), keeping each matching term's live `df` instead of discarding it. Ranking is
+  **`df` desc, term asc**, the opposite of the per-term idf a prefix clause scores documents
+  by: a dropdown wants the common completion (`nid` → `nidus`) above the rare one
+  (`nidification`), while ranking documents correctly wants the rare term to lift its doc. The
+  256-term `MAX_PREFIX_EXPANSION` cap is the same one prefix clauses hit; `limit` only truncates
+  further, and the returned `matched` count (from the same cap accounting
+  `ClauseScore.expansion` uses) lets a caller detect truncation. The prefix is normalized the
+  same fold-only way a prefix clause's fragment is (via `analyze_with_prefix`), but it is
+  matched against a per-field **surface-form** map (`FieldIndex::surface`, folded spelling → its
+  stem) rather than against the stem-keyed postings, because a stem-keyed scan goes empty
+  exactly as the typist finishes the word (`nidus` stems to `nidu`). So completions are real
+  words, each carrying the live `df` of the stem it maps to, and two spellings of one stem are
+  two completions. A prefix *clause* reads the same map as its second expansion leg (nidus-dnm),
   so the two surfaces agree on what a fragment reaches and differ only in what they rank:
-  `suggest` returns the spelling, a clause returns the documents. An unindexed field or
-  unknown collection returns an empty `Suggestions`, not an error.
+  `suggest` returns the spelling, a clause returns the documents. An unindexed field or unknown
+  collection contributes nothing, so a scope naming only those returns an empty `Suggestions`
+  rather than an error.
+- **`suggest` takes a `Scope` and a filter, and the `df` it reports is a conditioned count**
+  (nidus-3j8, nidus-ucl). It is the same ranked-terms surface; what changed is that every `df`
+  is counted through an admissibility predicate rather than over the whole corpus:
+  - **Scope, not one collection.** `suggest` takes the same `Scope` as `text_search`, and a
+    completion two collections share is **one** row whose `df` is the sum, because it feeds one
+    dropdown. The cap and `matched` are over the merged scope, not per collection.
+  - **`SuggestOpts::filter` narrows the `df`**, so a permission-scoped dropdown is expressible.
+    A completion whose only documents the filter excludes is **absent**, not present with a
+    corpus-wide count — the count itself is disclosure, since the completion list and its
+    frequencies describe documents the caller cannot retrieve.
+  - **The head terms condition the completions.** `analyze_with_prefix` returns the stemmed
+    heads as well as the fragment, and `suggest` no longer discards them: a completion's `df`
+    counts only documents carrying **every** head, so `"quick br"` ranks `br*` by the documents
+    that also say "quick" rather than completing the last word against the whole corpus. This
+    is on by default and has no flag. **No heads is not an empty head set**: a single-token
+    prefix, or one whose heads are all stopwords (`"the br"`), is unconditioned and behaves
+    exactly as `"br"` does, while heads that match no document mean nothing continues the
+    phrase.
+  - **DECIDED: a completion with zero head-matching documents is dropped, not ranked last.** A
+    phrase-completion dropdown must not offer a word that returns documents the phrase never
+    described; it is the same rule as today's `df > 0` drop for a fully-tombstoned completion.
+  - **DECIDED: conditioning runs before the cap, and there is still exactly one cap.** Capping
+    by raw `df` first and conditioning the survivors would be cheaper, but it drops completions
+    at fan-out > 256 for a reason corresponding to nothing the caller can see — the same
+    objection that rejected truncating in term order (nidus-clv). Conditioning is not a new
+    order of cost either: it is the posting walk `df_where` already does, plus an O(1) set
+    membership per posting.
+  - **HTTP is `POST /suggest`** with `scope` in the body, mirroring `/text-search`;
+    `POST /collections/{name}/suggest` is retired, since one capability gets one route. MCP's
+    `suggest` tool stays single-`collection`, as every MCP tool is, but gains `filter`.
+- **A tombstone-free field index reads a `df` instead of walking for it** (nidus-clv stage 1).
+  `FieldIndex::tombstones` is exact: at zero, every posting is live, so `live_df == postings.len()`
+  and the walk is skipped entirely. This is exact rather than approximate, costs no RAM, needs no
+  format change, keeps `tombstone()` O(1), and both of a prefix clause's expansion legs benefit —
+  it covers the common shape of a read-heavy typeahead corpus, freshly built or compacted since
+  the last churn, and so makes compaction a real performance lever. It does **not** apply to a
+  conditioned count (a filter or head set must still walk), and stage 2 (a per-term cached
+  counter) stays deferred: decrementing one needs a forward index `docnum → its terms` that
+  nothing stores, which is new RAM proportional to the corpus token count *and* trades away the
+  O(1) delete. Weigh that against compacting more often.
 - **Ranking expressions are additive and off by default** (§7.6): `SearchOpts::rank_by`
   layers a recency decay over the metric (subtracting an age penalty, so it holds for every
   `Distance` and for BM25), `HybridOpts::vector_weight`/`text_weight` weight the fused legs,
