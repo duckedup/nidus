@@ -1112,6 +1112,41 @@ test('skill lanes: a lane file nobody routes to is a warning', () => {
   eq(found[0].severity, 'warn', 'severity')
 })
 
+// ── context budget and decision pointers (nidus-gmy.4, nidus-gmy.5) ────────
+
+const SCOPED = '---\npaths:\n  - "src/**"\n---\n\n# Rule\n'
+
+test('context budget: a short CLAUDE.md and a scoped rule are fine', () => {
+  eq(ids(laws.contextBudget('a\nb\n', [{ file: '.claude/rules/x.md', text: SCOPED }])), [], 'findings')
+})
+
+test('context budget: CLAUDE.md over the cap is flagged with its line count', () => {
+  const found = laws.contextBudget('x\n'.repeat(201), [])
+  eq(ids(found), ['context-budget'], 'findings')
+  eq(found[0].summary.includes('201 lines'), true, 'matches wc -l')
+})
+
+test('context budget: a rule with no paths: frontmatter is flagged', () => {
+  eq(ids(laws.contextBudget(null, [{ file: '.claude/rules/x.md', text: '# Rule\n' }])), ['rule-not-scoped'], 'findings')
+})
+
+test('context budget: frontmatter without paths: does not count as scoped', () => {
+  const text = '---\ndescription: nope\n---\n'
+  eq(ids(laws.contextBudget(null, [{ file: '.claude/rules/x.md', text }])), ['rule-not-scoped'], 'findings')
+})
+
+test('decision pointers: a cited record that exists is fine', () => {
+  const texts = [{ file: 'CLAUDE.md', text: 'see D0004' }]
+  eq(ids(laws.decisionPointers(texts, ['0004-close-the-ticket.md'])), [], 'findings')
+})
+
+test('decision pointers: a dangling D-number is an error, reported once', () => {
+  const texts = [{ file: 'CLAUDE.md', text: 'see D0099 and again D0099' }]
+  const found = laws.decisionPointers(texts, ['0004-close-the-ticket.md'])
+  eq(ids(found), ['dangling-decision'], 'one finding per pointer per file')
+  eq(found[0].summary.includes('D0099'), true, 'names the pointer')
+})
+
 export function selftest({ json = false } = {}) {
   const failures = []
   for (const c of cases) {
