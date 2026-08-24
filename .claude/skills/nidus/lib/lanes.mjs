@@ -7,6 +7,13 @@
 // by a required check on every PR and are too slow to gate the local loop.
 const RULES = [
   {
+    // The skill's own detectors and hooks: the fixture suite is the only thing that
+    // proves a detector still fires, and it is a required check.
+    recipe: '.claude/skills/nidus/bin/nidus-check selftest',
+    why: "the skill's detectors or hooks changed — the fixture suite proves they still fire",
+    match: [/^\.claude\/skills\/nidus\/lib\//, /^\.claude\/hooks\//],
+  },
+  {
     recipe: 'just deps',
     why: 'Cargo.toml changed — assert the dependency tree stayed minimal',
     match: [/^Cargo\.toml$/],
@@ -185,7 +192,7 @@ export function ciGuard(job, paths) {
 
 // Paths that need no build lane at all — reported so the caller can say why
 // nothing ran, instead of silently returning an empty set.
-const INERT = [/^\.claude\//, /^\.github\//, /^[^/]*\.md$/, /^LICENSE$/, /^\.gitignore$/, /LICENSE$/, /^sdks\/[^/]+\/.*\.md$/]
+const INERT = [/^\.claude\//, /^\.github\//, /^decisions\//, /^[^/]*\.md$/, /^LICENSE$/, /^\.gitignore$/, /LICENSE$/, /^sdks\/[^/]+\/.*\.md$/]
 
 const covers = (rule, f) => rule.match.some(re => re.test(f)) && !(rule.exclude || []).some(re => re.test(f))
 

@@ -6,6 +6,7 @@ import * as fleet from './fleet.mjs'
 import * as pre from './preflight.mjs'
 import { lanes, formatLanes, ciGuard } from './lanes.mjs'
 import * as spec from './specdoc.mjs'
+import * as guards from './guards.mjs'
 
 const cases = []
 const test = (name, fn) => cases.push({ name, fn })
@@ -1145,6 +1146,53 @@ test('decision pointers: a dangling D-number is an error, reported once', () => 
   const found = laws.decisionPointers(texts, ['0004-close-the-ticket.md'])
   eq(ids(found), ['dangling-decision'], 'one finding per pointer per file')
   eq(found[0].summary.includes('D0099'), true, 'names the pointer')
+})
+
+// ── PreToolUse read guard (nidus-gmy.5) ────────────────────────────────────
+
+const blocked = m => (m === null ? [] : ['blocked'])
+
+test('read guard: an unbounded read of a guarded doc is blocked', () => {
+  eq(blocked(guards.specRead({ rel: 'SPEC' + '.md' })), ['blocked'], 'blocked')
+})
+
+test('read guard: a bounded read is allowed, but offset alone is not a bound', () => {
+  eq(blocked(guards.specRead({ rel: 'SPEC' + '.md', offset: 900, limit: 40 })), [], 'allowed')
+  eq(blocked(guards.specRead({ rel: 'SPEC' + '.md', offset: 900 })), ['blocked'], 'offset alone')
+})
+
+test('read guard: an unguarded doc and a missing path are allowed', () => {
+  eq(blocked(guards.specRead({ rel: 'CLAUDE.md' })), [], 'unguarded')
+  eq(blocked(guards.specRead({})), [], 'no path')
+  eq(blocked(guards.specRead()), [], 'no args')
+})
+
+test('read guard: the message names the tool that replaces the read', () => {
+  eq(guards.specRead({ rel: 'SPEC' + '.md' }).includes('just spec toc'), true, 'names the tool')
+})
+
+// ── lane coverage for the agent-facing tree (nidus-gmy.5) ──────────────────
+
+test('lanes: a decision record needs no build lane and is not unmapped', () => {
+  const r = lanes(['decisions/0004-close-the-ticket-yourself.md'])
+  eq(r.unmatched, [], 'nothing unmapped')
+  eq(r.inert.length, 1, 'reported as inert')
+})
+
+test('lanes: touching a detector asks for the fixture suite', () => {
+  const r = lanes(['.claude/skills/nidus/lib/laws.mjs'])
+  eq(r.run.map(l => l.recipe), ['.claude/skills/nidus/bin/nidus-check selftest'], 'selftest')
+  eq(r.inert, [], 'not inert — a detector change has a lane')
+})
+
+test('lanes: touching a hook asks for the fixture suite too', () => {
+  eq(lanes(['.claude/hooks/law-check.mjs']).run.length, 1, 'one lane')
+})
+
+test('lanes: a lane file is still inert — prose has no suite', () => {
+  const r = lanes(['.claude/skills/nidus/lanes/ship.md'])
+  eq(r.run, [], 'no lane')
+  eq(r.unmatched, [], 'not unmapped')
 })
 
 export function selftest({ json = false } = {}) {

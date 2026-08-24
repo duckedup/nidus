@@ -22,6 +22,17 @@
         "matcher": ""
       }
     ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/spec-read-guard\"",
+            "type": "command"
+          }
+        ],
+        "matcher": "Read"
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [
