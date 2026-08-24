@@ -226,7 +226,7 @@ multi-clause query can prefix-match one field while another stays exact.
 dropdown, on both the sync and async clients:
 
 ```python
-result = db.suggest("docs", field="title", prefix="nid", limit=5)
+result = db.suggest(field="title", prefix="nid", scope=["docs"], limit=5)
 for s in result.suggestions:
     print(s.term, s.df)
 print(result.matched)  # > len(result.suggestions) means the 256-term cap truncated
@@ -236,7 +236,27 @@ Completions are ranked by document frequency, commonest first: the opposite of h
 prefix clause ranks documents. Only the prefix's final token is completed. Unlike a
 prefix clause, which matches stems, `suggest` matches surface forms, so a corpus
 indexing "running" completes `running` at every keystroke. `limit` (default 10, a
-dropdown's size rather than a page's) truncates the already-256-capped list.
+dropdown's size rather than a page's) truncates the already-256-capped list. An omitted
+`scope` completes from every collection.
+
+Each `df` is a conditioned count. `filter` narrows it to the matching documents, so a
+completion whose only documents are filtered out is absent rather than present with a
+corpus-wide count. The words before the final token narrow it too, so pass the whole phrase
+typed so far:
+
+```python
+# "brown" is the commonest br* here, but no document says both "quick" and "brown"
+result = db.suggest(
+    field="body",
+    prefix="quick br",
+    scope=["docs"],
+    filter=[{"Eq": ["tenant", {"Str": "acme"}]}],
+)
+# result.suggestions: [Suggestion(term="bracket", df=1)]  — "brown" is not offered
+```
+
+A single-token prefix, or one whose earlier words are all stopwords, has no head terms and
+behaves exactly as the bare fragment does.
 
 ## Batch search and aggregation
 

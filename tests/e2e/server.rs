@@ -715,8 +715,8 @@ fn suggest_returns_completions_ranked_by_document_frequency() {
     );
 
     let (status, body) = server.post(
-        "/collections/docs/suggest",
-        &json!({"field": "body", "prefix": "nid"}),
+        "/suggest",
+        &json!({"scope": ["docs"], "field": "body", "prefix": "nid"}),
     );
     assert_eq!(status, 200);
     assert_eq!(
@@ -755,8 +755,8 @@ fn suggest_still_answers_on_the_whole_word() {
 
     for typed in ["n", "nid", "nidu", "nidus"] {
         let (status, body) = server.post(
-            "/collections/docs/suggest",
-            &json!({"field": "body", "prefix": typed}),
+            "/suggest",
+            &json!({"scope": ["docs"], "field": "body", "prefix": typed}),
         );
         assert_eq!(status, 200);
         assert_eq!(
@@ -791,8 +791,8 @@ fn suggest_limit_truncates_but_matched_reports_the_full_count() {
     );
 
     let (status, body) = server.post(
-        "/collections/docs/suggest",
-        &json!({"field": "body", "prefix": "nid", "limit": 2}),
+        "/suggest",
+        &json!({"scope": ["docs"], "field": "body", "prefix": "nid", "limit": 2}),
     );
     assert_eq!(status, 200);
     assert_eq!(
@@ -801,6 +801,162 @@ fn suggest_limit_truncates_but_matched_reports_the_full_count() {
         "{body}"
     );
     assert_eq!(body["matched"], 5, "{body}");
+}
+
+/// nidus-3j8 through the real socket: `filter` narrows the `df`, and a completion whose only
+/// documents the filter excludes is absent rather than present with a corpus-wide count.
+#[test]
+fn suggest_filter_narrows_the_df_and_drops_an_excluded_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post("/collections/docs/fts-schema", &json!({"fields": ["body"]}))
+            .0,
+        200
+    );
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/upsert",
+                &json!({"records": [
+                    {"id": "a", "attrs": {"body": {"Str": "nidus"}, "tenant": {"Str": "acme"}}},
+                    {"id": "b", "attrs": {"body": {"Str": "nidus"}, "tenant": {"Str": "acme"}}},
+                    {"id": "c", "attrs": {"body": {"Str": "nidification"}, "tenant": {"Str": "other"}}}
+                ]}),
+            )
+            .0,
+        200
+    );
+
+    let (status, body) = server.post(
+        "/suggest",
+        &json!({
+            "scope": ["docs"],
+            "field": "body",
+            "prefix": "nid",
+            "filter": [{"Eq": ["tenant", {"Str": "acme"}]}]
+        }),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["suggestions"],
+        json!([{"term": "nidus", "df": 2}]),
+        "the other tenant's completion must not leak through: {body}"
+    );
+    assert_eq!(body["matched"], 1, "{body}");
+}
+
+/// nidus-ucl through the real socket: the words before the fragment narrow the completions.
+#[test]
+fn suggest_conditions_completions_on_the_words_before_the_fragment() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post("/collections/docs/fts-schema", &json!({"fields": ["body"]}))
+            .0,
+        200
+    );
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/upsert",
+                &json!({"records": [
+                    {"id": "a", "attrs": {"body": {"Str": "quick bracket"}}},
+                    {"id": "b", "attrs": {"body": {"Str": "brown bear"}}},
+                    {"id": "c", "attrs": {"body": {"Str": "brown owl"}}}
+                ]}),
+            )
+            .0,
+        200
+    );
+
+    let bare = server.post(
+        "/suggest",
+        &json!({"scope": ["docs"], "field": "body", "prefix": "br"}),
+    );
+    assert_eq!(
+        bare.1["suggestions"],
+        json!([{"term": "brown", "df": 2}, {"term": "bracket", "df": 1}]),
+        "{:?}",
+        bare.1
+    );
+
+    let phrase = server.post(
+        "/suggest",
+        &json!({"scope": ["docs"], "field": "body", "prefix": "quick br"}),
+    );
+    assert_eq!(phrase.0, 200);
+    assert_eq!(
+        phrase.1["suggestions"],
+        json!([{"term": "bracket", "df": 1}]),
+        "brown shares no document with quick: {:?}",
+        phrase.1
+    );
+}
+
+/// An omitted `scope` means every collection, exactly as it does on `/text-search`, and a
+/// completion two collections share is one row whose `df` is the sum.
+#[test]
+fn suggest_spans_every_collection_when_scope_is_omitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    for col in ["docs", "notes"] {
+        assert_eq!(
+            server.post(&format!("/collections/{col}"), &json!({})).0,
+            200
+        );
+        assert_eq!(
+            server
+                .post(
+                    &format!("/collections/{col}/fts-schema"),
+                    &json!({"fields": ["body"]})
+                )
+                .0,
+            200
+        );
+        assert_eq!(
+            server
+                .post(
+                    &format!("/collections/{col}/upsert"),
+                    &json!({"records": [
+                        {"id": col, "attrs": {"body": {"Str": "nidus"}}}
+                    ]}),
+                )
+                .0,
+            200
+        );
+    }
+
+    let (status, body) = server.post("/suggest", &json!({"field": "body", "prefix": "nid"}));
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["suggestions"],
+        json!([{"term": "nidus", "df": 2}]),
+        "both collections contribute to one dropdown row: {body}"
+    );
+
+    let (_, scoped) = server.post(
+        "/suggest",
+        &json!({"scope": ["docs"], "field": "body", "prefix": "nid"}),
+    );
+    assert_eq!(scoped["suggestions"], json!([{"term": "nidus", "df": 1}]));
+}
+
+/// The retired route is gone, not silently answering the old shape.
+#[test]
+fn the_per_collection_suggest_route_is_retired() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    let (status, _) = server.post(
+        "/collections/docs/suggest",
+        &json!({"field": "body", "prefix": "nid"}),
+    );
+    assert_eq!(status, 404, "POST /suggest replaced it");
 }
 
 /// Omitting `limit` defaults to 10, not the unrelated `top_k` default — the assertion that
@@ -827,8 +983,8 @@ fn suggest_defaults_the_limit_when_omitted() {
     );
 
     let (status, body) = server.post(
-        "/collections/docs/suggest",
-        &json!({"field": "body", "prefix": "nid"}),
+        "/suggest",
+        &json!({"scope": ["docs"], "field": "body", "prefix": "nid"}),
     );
     assert_eq!(status, 200);
     assert_eq!(
@@ -856,8 +1012,8 @@ fn suggest_of_an_unindexed_field_is_an_empty_200() {
     );
 
     let (status, body) = server.post(
-        "/collections/docs/suggest",
-        &json!({"field": "body", "prefix": "nid"}),
+        "/suggest",
+        &json!({"scope": ["docs"], "field": "body", "prefix": "nid"}),
     );
     assert_eq!(status, 200);
     assert_eq!(body, json!({"suggestions": [], "matched": 0}), "{body}");

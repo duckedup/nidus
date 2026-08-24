@@ -242,9 +242,9 @@ ENDPOINTS: list[tuple[str, Callable[[NidusClient], Any], str, str, Any]] = [
     ("recall", lambda db: db.recall("notes", "hello"), "POST", "/collections/notes/recall", []),
     (
         "suggest",
-        lambda db: db.suggest("docs", field="body", prefix="nid"),
+        lambda db: db.suggest(field="body", prefix="nid", scope=["docs"]),
         "POST",
-        "/collections/docs/suggest",
+        "/suggest",
         {"suggestions": [], "matched": 0},
     ),
     ("flush", lambda db: db.flush(), "POST", "/flush", {"ok": True}),
@@ -878,12 +878,42 @@ def test_records_keeps_an_absent_vector_as_none() -> None:
     assert records[1].attrs == {"body": "text only"}
 
 
-def test_suggest_posts_to_the_collection_path() -> None:
+def test_suggest_posts_scope_and_filter_to_the_suggest_route() -> None:
     stub = StubTransport({"suggestions": [], "matched": 0})
-    client(stub).suggest("docs", field="body", prefix="nid", limit=5)
+    client(stub).suggest(field="body", prefix="nid", scope=["docs"], limit=5)
     assert stub.last.method == "POST"
-    assert stub.last.url == "http://x/collections/docs/suggest"
-    assert stub.last.json == {"field": "body", "prefix": "nid", "limit": 5}
+    assert stub.last.url == "http://x/suggest"
+    assert stub.last.json == {
+        "scope": ["docs"],
+        "field": "body",
+        "prefix": "nid",
+        "limit": 5,
+        "filter": [],
+    }
+
+
+def test_suggest_omits_limit_and_sends_empty_scope_and_filter_when_unset() -> None:
+    """An empty ``scope``/``filter`` is how ``/text-search`` spells "everywhere, unfiltered"."""
+    stub = StubTransport({"suggestions": [], "matched": 0})
+    client(stub).suggest(field="body", prefix="nid")
+    assert stub.last.json == {"scope": [], "field": "body", "prefix": "nid", "filter": []}
+    assert "limit" not in stub.last.json
+
+
+def test_suggest_sends_a_filter_verbatim() -> None:
+    stub = StubTransport({"suggestions": [], "matched": 0})
+    client(stub).suggest(
+        field="body",
+        prefix="quick br",
+        scope=["docs"],
+        filter=[{"Eq": ["tenant", {"Str": "acme"}]}],
+    )
+    assert stub.last.json == {
+        "scope": ["docs"],
+        "field": "body",
+        "prefix": "quick br",
+        "filter": [{"Eq": ["tenant", {"Str": "acme"}]}],
+    }
 
 
 def test_suggest_returns_the_decoded_result() -> None:
@@ -893,7 +923,7 @@ def test_suggest_returns_the_decoded_result() -> None:
             "matched": 2,
         }
     )
-    result = client(stub).suggest("docs", field="body", prefix="nid")
+    result = client(stub).suggest(field="body", prefix="nid", scope=["docs"])
     assert [s.term for s in result.suggestions] == ["nidus", "nidification"]
     assert [s.df for s in result.suggestions] == [3, 1]
     assert result.matched == 2

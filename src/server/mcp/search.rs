@@ -134,7 +134,7 @@ pub(super) fn filter_defs() -> JsonValue {
     JsonValue::Object(defs)
 }
 
-/// The `filter` property schema, shared by `recall`, `text_search`, and `hybrid_search`.
+/// The `filter` property schema, shared by `recall`, `text_search`, `hybrid_search` and `suggest`.
 /// Pair every use with [`filter_defs`] at the enclosing schema's root.
 pub(super) fn filter_schema() -> JsonValue {
     json!({
@@ -499,8 +499,10 @@ pub(super) fn suggest_tool() -> Tool {
          actually occur in the corpus before searching, or to check what vocabulary a \
          field even contains. This returns words with their document counts, not entries \
          — call text_search with a completion to get the entries themselves. Only the \
-         final token of the prefix is completed.",
+         final token of the prefix is completed; any words before it narrow the completions \
+         to the entries that also contain them, so send the whole phrase typed so far.",
         json!({
+            "$defs": filter_defs(),
             "type": "object",
             "properties": {
                 "collection": {
@@ -519,7 +521,8 @@ pub(super) fn suggest_tool() -> Tool {
                     "type": "integer",
                     "description": "How many completions to return. Defaults to 10.",
                     "minimum": 1
-                }
+                },
+                "filter": filter_schema()
             },
             "required": ["collection", "field", "prefix"],
             "additionalProperties": false
@@ -832,9 +835,18 @@ impl NidusMcp {
                 None,
             ));
         }
+        let filter = parse_filter(args)?;
 
         let out = crate::server::run_read(self.state.clone(), move |db| {
-            Ok(db.suggest(&collection, &field, &prefix, limit))
+            db.suggest(
+                collection.as_str(),
+                &field,
+                &prefix,
+                &crate::SuggestOpts {
+                    limit,
+                    filter: filter.unwrap_or_default(),
+                },
+            )
         })
         .await
         .map_err(api_error)?;

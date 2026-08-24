@@ -33,7 +33,7 @@ so the same id appears in your logs and the server's.
 | `GET /collections/{name}/records` | every record in a collection | `get_all` |
 | `POST /collections/{name}/fts-schema` | declare full-text-indexed fields | `set_fts_schema` |
 | `POST /collections/{name}/filter-index` | declare filter-indexed fields | `set_filter_index` |
-| `POST /collections/{name}/suggest` | ranked term completions from the full-text vocabulary | `suggest` |
+| `POST /suggest` | ranked term completions from the full-text vocabulary | `suggest` |
 | `POST /search` | nearest-neighbour search | `search` |
 | `POST /search/similar` | "more like this" using a stored record's own vector | `search_similar` |
 | `POST /search/batch` | several queries in one round-trip, optionally RRF-fused | – |
@@ -633,17 +633,19 @@ no branch worth a `plan`. [Query plans](#query-plans-how-a-query-ran) below cove
 `/search`, `/search/similar`, and `/hybrid-search`. A prefix clause's expansion cap is
 reported through `explain` instead, as `expansion` on that clause's score.
 
-### `POST /collections/{name}/suggest`
+### `POST /suggest`
 
 Ranked term completions from a field's full-text vocabulary, for an autocomplete dropdown.
 Ranked by document frequency (commonest first), which is the **opposite** of how a prefix
-*clause* in `/text-search` ranks documents. `limit` defaults to 10 (a dropdown, not a page)
-and is bounded by the same `MAX_TOP_K` ceiling as the other read routes.
+*clause* in `/text-search` ranks documents. `scope` and `filter` are spelled exactly as
+`/text-search` spells them: an omitted or empty `scope` means every collection. `limit`
+defaults to 10 (a dropdown, not a page) and is bounded by the same `MAX_TOP_K` ceiling as the
+other read routes.
 
 ```bash
-curl -s localhost:7700/collections/docs/suggest \
+curl -s localhost:7700/suggest \
   -H 'content-type: application/json' \
-  -d '{"field": "body", "prefix": "nid", "limit": 10}'
+  -d '{"scope": ["docs"], "field": "body", "prefix": "nid", "limit": 10}'
 ```
 
 ```json
@@ -657,8 +659,31 @@ curl -s localhost:7700/collections/docs/suggest \
 ASCII-folded) the same way a prefix clause folds it, and matched against the field's surface
 forms, so completions are real words rather than stems: every keystroke of `running`
 completes to `running`. Two spellings of one stem are two completions sharing that stem's
-`df`. A field with no full-text schema, or a collection that does not exist, returns `200`
-with an empty `suggestions` list rather than an error.
+`df`. A field with no full-text schema, or a collection that does not exist, contributes
+nothing, so a scope naming only those returns `200` with an empty `suggestions` list rather
+than an error.
+
+Each `df` is a **conditioned** count, in two ways:
+
+- **`filter`** narrows it to the matching documents, so a dropdown can be scoped to what the
+  caller is allowed to see. A completion whose only documents the filter excludes does not
+  appear at all, rather than appearing with a corpus-wide count (the count itself would
+  describe documents the caller cannot retrieve).
+- **The words before the final token** narrow it too. Only the final token is *completed*, but
+  the earlier words are not discarded: a completion's `df` counts only documents carrying all
+  of them, so `"quick br"` ranks `br*` by the documents that also say "quick", and a `brown`
+  that never co-occurs with `quick` is not offered. Send the whole phrase typed so far.
+
+A single-token prefix, or one whose earlier words are all stopwords (`"the br"`), has no head
+terms and so is unconditioned: it behaves exactly as `"br"` does.
+
+```bash
+# only vocabulary from this tenant's documents, and only words that continue the phrase
+curl -s localhost:7700/suggest \
+  -H 'content-type: application/json' \
+  -d '{"scope": ["docs"], "field": "body", "prefix": "quick br",
+       "filter": [{"Eq": ["tenant", {"Str": "acme"}]}]}'
+```
 
 ### `POST /hybrid-search`
 

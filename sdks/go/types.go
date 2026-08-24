@@ -542,16 +542,22 @@ type RerankOptions struct {
 	TextAttr string `json:"text_attr,omitempty"`
 }
 
-// SuggestRequest asks for ranked term completions from one field's indexed vocabulary.
-// Collection is sent in the path, not the body.
+// SuggestRequest asks for ranked term completions from one field's indexed vocabulary
+// across Scope, which is every collection when left empty.
 //
-// Only Prefix's final token is completed, so "the nid" completes "nid". Completions are
-// ranked by document frequency, commonest first, which is the opposite of how a prefix
-// clause ranks documents. Limit defaults to 10 server-side when left zero.
+// Only Prefix's final token is completed, so "the nid" completes "nid" — but the words
+// before it are not discarded: they narrow the completions to documents that also carry
+// them, so send the whole phrase typed so far. Completions are ranked by document
+// frequency, commonest first, which is the opposite of how a prefix clause ranks
+// documents. Filter narrows each completion's df to the matching documents, so a
+// completion no matching document carries is not offered at all. Limit defaults to 10
+// server-side when left zero.
 type SuggestRequest struct {
-	Field  string `json:"field"`
-	Prefix string `json:"prefix"`
-	Limit  int    `json:"limit,omitempty"`
+	Scope  []string `json:"scope,omitempty"`
+	Field  string   `json:"field"`
+	Prefix string   `json:"prefix"`
+	Limit  int      `json:"limit,omitempty"`
+	Filter Filter   `json:"filter,omitempty"`
 }
 
 // Suggestion is one completion: an indexed term and how many live documents contain it.

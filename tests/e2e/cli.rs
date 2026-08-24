@@ -2063,7 +2063,7 @@ fn cli_suggest_ranks_completions_by_document_frequency() {
     .to_string();
     ok(&["upsert", "--dir", dir, "docs"], &seed);
 
-    let out = ok(&["suggest", "--dir", dir, "docs", "body", "nid"], "");
+    let out = ok(&["suggest", "--dir", dir, "body", "nid", "docs"], "");
     assert_eq!(
         out["suggestions"],
         json!([
@@ -2095,7 +2095,7 @@ fn cli_suggest_limit_truncates() {
 
     let out = ok(
         &[
-            "suggest", "--dir", dir, "docs", "body", "nid", "--limit", "1",
+            "suggest", "--dir", dir, "body", "nid", "docs", "--limit", "1",
         ],
         "",
     );
@@ -2107,6 +2107,66 @@ fn cli_suggest_limit_truncates() {
 }
 
 /// A field the collection never declared for FTS is silent-empty, not an error.
+/// `--where` narrows each completion's `df` through the real binary, and the words before the
+/// fragment narrow which completions are offered at all (nidus-3j8, nidus-ucl).
+#[test]
+fn cli_suggest_filters_and_conditions_on_the_typed_phrase() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(
+        &["set-fts-schema", "--dir", dir, "docs", "--field", "body"],
+        "",
+    );
+    let seed = json!([
+        {"id": "a", "vector": [1, 0, 0],
+         "attrs": {"body": {"Str": "quick bracket"}, "tenant": {"Str": "acme"}}},
+        {"id": "b", "vector": [0, 1, 0],
+         "attrs": {"body": {"Str": "brown bear"}, "tenant": {"Str": "acme"}}},
+        {"id": "c", "vector": [0, 0, 1],
+         "attrs": {"body": {"Str": "brownstone"}, "tenant": {"Str": "other"}}}
+    ])
+    .to_string();
+    ok(&["upsert", "--dir", dir, "docs"], &seed);
+
+    let bare = ok(&["suggest", "--dir", dir, "body", "br", "docs"], "");
+    assert_eq!(
+        bare["suggestions"],
+        json!([
+            {"term": "bracket", "df": 1},
+            {"term": "brown", "df": 1},
+            {"term": "brownstone", "df": 1},
+        ]),
+        "unexpected: {bare}"
+    );
+
+    let filtered = ok(
+        &[
+            "suggest",
+            "--dir",
+            dir,
+            "body",
+            "br",
+            "docs",
+            "--where",
+            r#"[{"Eq":["tenant",{"Str":"acme"}]}]"#,
+        ],
+        "",
+    );
+    assert_eq!(
+        filtered["suggestions"],
+        json!([{"term": "bracket", "df": 1}, {"term": "brown", "df": 1}]),
+        "the other tenant's only completion must be absent: {filtered}"
+    );
+
+    let phrase = ok(&["suggest", "--dir", dir, "body", "quick br", "docs"], "");
+    assert_eq!(
+        phrase["suggestions"],
+        json!([{"term": "bracket", "df": 1}]),
+        "only bracket shares a document with quick: {phrase}"
+    );
+}
+
 #[test]
 fn cli_suggest_on_an_unindexed_field_prints_an_empty_result() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2118,7 +2178,7 @@ fn cli_suggest_on_an_unindexed_field_prints_an_empty_result() {
     .to_string();
     ok(&["upsert", "--dir", dir, "docs"], &seed);
 
-    let out = ok(&["suggest", "--dir", dir, "docs", "body", "nid"], "");
+    let out = ok(&["suggest", "--dir", dir, "body", "nid", "docs"], "");
     assert_eq!(
         out,
         json!({"suggestions": [], "matched": 0}),

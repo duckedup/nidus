@@ -98,7 +98,7 @@ client's writes rather than each client racing for its own.
 | `get` | Fetch one memory by id: its id and attrs, never its vector. |
 | `browse` | List a collection's contents, bounded and optionally filtered, without a query. |
 | `related` | Find entries like one you already have, using its own stored vector as the query. |
-| `suggest` | Complete a partial word from a field's indexed vocabulary, ranked commonest-first. |
+| `suggest` | Complete a partial word from a field's indexed vocabulary, ranked commonest-first. Takes a `filter`, and the words before the final token narrow it. |
 
 Every one of them takes **natural language, never vectors**. That is deliberate:
 a model cannot write a 1024-float array as a tool argument, so the raw
@@ -149,6 +149,12 @@ rank documents). Call `text_search` with a completion once you have one to get
 the entries themselves. Completions are real words: surface forms are indexed
 alongside stems, so every keystroke of `running` completes to `running` rather
 than to the stem `run`.
+
+Send the whole phrase typed so far, not just the fragment: the words before the
+final token narrow the completions to entries that also contain them, so
+`"quick br"` completes against the entries that say "quick". `filter` narrows each
+completion's count the same way, and a completion no matching entry carries is not
+offered at all. Like every MCP tool, `suggest` takes one `collection`.
 
 This is the only spelling MCP offers. The HTTP and CLI surfaces also take a raw
 `expand` naming the chunk attrs directly, which matters for a corpus chunked by

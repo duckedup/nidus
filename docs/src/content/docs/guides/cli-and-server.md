@@ -143,7 +143,9 @@ nidus text-search --dir ./store body "running" --explain --highlight \
   --max-fragments 2 --fragment-chars 120
 
 # Autocomplete: ranked term completions for a prefix, commonest first
-nidus suggest --dir ./store docs body run --limit 5
+nidus suggest --dir ./store body run docs --limit 5
+# …scoped to what this caller may see, and completing the phrase rather than the last word
+nidus suggest --dir ./store body "quick br" docs --where '[{"Eq":["tenant",{"Str":"acme"}]}]'
 
 # Hybrid search: fuse a vector (stdin) and a BM25 text query with RRF
 echo '[1,0,0]' | nidus hybrid-search --dir ./store body "vector database" -k 5

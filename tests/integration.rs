@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use nidus::{
     AggregateOpts, AnnConfig, Config, Decay, Distance, Filter, FtsClause, FtsField, FtsQuery,
     HighlightOpts, LimitPer, ListOpts, META_EXPIRES_AT, Nidus, OpenMode, OrderBy, Predicate,
-    Quantization, RankBy, Record, Scope, SearchOpts, Value,
+    Quantization, RankBy, Record, Scope, SearchOpts, SuggestOpts, Value,
 };
 
 fn rec(id: &str, vector: Vec<f32>, kind: &str) -> Record {
@@ -774,7 +774,17 @@ fn suggest_survives_a_reopen() {
     }
 
     let db = Nidus::open(Config::new(&path, 3)).unwrap();
-    let got = db.suggest("docs", "body", "car", 10);
+    let got = db
+        .suggest(
+            "docs",
+            "body",
+            "car",
+            &SuggestOpts {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert_eq!(got.matched, 1);
     assert_eq!(got.suggestions.len(), 1);
     assert_eq!(got.suggestions[0].term, "carbon");

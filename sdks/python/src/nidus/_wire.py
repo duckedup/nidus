@@ -157,11 +157,6 @@ def recall_path(name: str) -> str:
     return f"{collection_path(name)}/recall"
 
 
-def suggest_path(name: str) -> str:
-    """Path for ``POST /collections/{name}/suggest``."""
-    return f"{collection_path(name)}/suggest"
-
-
 # ── Request bodies ───────────────────────────────────────────────────────────────────
 
 
@@ -311,14 +306,25 @@ def _filter_index_field(
 def suggest_body(
     field: str,
     prefix: str,
+    scope: Optional[Sequence[str]] = None,
     limit: Optional[int] = None,
+    filter: Optional[Filter] = None,  # noqa: A002
 ) -> dict[str, Any]:
-    """Body for ``POST /collections/{name}/suggest``.
+    """Body for ``POST /suggest``.
 
-    ``limit`` is omitted when unset so the server's default of 10 applies; sending it as
-    ``None`` would be a 422.
+    ``scope`` and ``filter`` are spelled exactly as :func:`text_search_body` spells them: an
+    empty list means every collection, unfiltered. ``limit`` is omitted when unset so the
+    server's default of 10 applies; sending it as ``None`` would be a 422.
     """
-    return prune({"field": field, "prefix": prefix, "limit": limit})
+    return prune(
+        {
+            "scope": _scope(scope),
+            "field": field,
+            "prefix": prefix,
+            "limit": limit,
+            "filter": list(filter) if filter is not None else [],
+        }
+    )
 
 
 def search_body(
@@ -965,7 +971,7 @@ def decode_deleted(payload: Any) -> int:
 
 
 def decode_suggestions(payload: Any) -> Suggestions:
-    """Decode ``POST /collections/{name}/suggest``. Ranked ``df`` desc, term asc."""
+    """Decode ``POST /suggest``. Ranked ``df`` desc, term asc."""
     if not isinstance(payload, Mapping):
         raise NidusError(f"suggest returned no JSON object (got {payload!r})", 0)
     return Suggestions(

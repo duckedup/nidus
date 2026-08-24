@@ -1030,14 +1030,20 @@ when the cap has truncated a broad prefix.
 
 **This returns documents, not completions.** A prefix clause ranks matching *records*,
 the same as any other clause. It does not hand back a list of candidate words to show in
-an autocomplete dropdown. For that, use [`Nidus::suggest`](/reference/api/#suggestion--suggestions):
+an autocomplete dropdown. For that, use [`Nidus::suggest`](/reference/api/#suggestopts-suggestion--suggestions):
 it reuses the same range scan a prefix clause runs, but ranks the terms themselves by
 document frequency (commonest first) rather than folding them into a document ranking.
 
 ```rust
-let got = db.suggest("docs", "body", "nid", 10);
+use nidus::SuggestOpts;
+
+let opts = SuggestOpts { limit: 10, ..Default::default() };
+let got = db.suggest("docs", "body", "nid", &opts)?;
 // got.suggestions: [{ term: "nidus", df: 42 }, { term: "nidification", df: 3 }, ...]
 ```
+
+It takes a `Scope`, like `text_search`, so one dropdown can complete from several
+collections at once (a completion two of them share is one row whose `df` is the sum).
 
 The prefix fragment is folded (lowercased, optionally ASCII-folded) but not stemmed, while
 the index holds stems. So the fragment is matched two ways and the results are unioned:
@@ -1054,6 +1060,38 @@ word is "runs".
 `suggest` scans the same surface forms, so the two surfaces agree on what a fragment reaches.
 They differ in what they hand back: `suggest` gives you the words, a prefix clause gives you
 the documents.
+
+#### Narrowing a dropdown
+
+The `df` on each completion is a conditioned count, which matters for two things a typeahead
+surface usually needs.
+
+**A filter, so the dropdown only offers vocabulary the caller can see.** A completion whose
+only documents the filter excludes is not returned at all, rather than returned with a
+corpus-wide count (that count describes documents the caller cannot retrieve, so it is
+disclosure in its own right).
+
+```rust
+let opts = SuggestOpts {
+    limit: 10,
+    filter: Filter(vec![Predicate::Eq("tenant".into(), Value::Str("acme".into()))]),
+};
+let got = db.suggest("docs", "body", "nid", &opts)?;
+```
+
+**The words already typed, so completions continue the phrase.** Only the final token is
+completed, but the earlier words are not thrown away: a completion's `df` counts only
+documents that also carry them.
+
+```rust
+// "brown" is the commonest br* in the corpus, but no document says both "quick" and "brown"
+let got = db.suggest("docs", "body", "quick br", &opts)?;
+// got.suggestions: [{ term: "bracket", df: 1 }]   — "brown" is not offered at all
+```
+
+Pass the whole phrase typed so far and this happens on its own. A single-token prefix, or one
+whose earlier words are all stopwords (`"the br"`), has no head terms and behaves exactly as
+`"br"` does.
 
 ### Tuning a field
 

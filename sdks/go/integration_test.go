@@ -1038,7 +1038,7 @@ func TestSuggestAgainstARealServer(t *testing.T) {
 		t.Fatalf("Upsert failed: %v", err)
 	}
 
-	got, err := db.Suggest(ctx, "docs", SuggestRequest{Field: "body", Prefix: "nid"})
+	got, err := db.Suggest(ctx, SuggestRequest{Scope: []string{"docs"}, Field: "body", Prefix: "nid"})
 	if err != nil {
 		t.Fatalf("Suggest failed: %v", err)
 	}
@@ -1053,6 +1053,33 @@ func TestSuggestAgainstARealServer(t *testing.T) {
 		if got.Suggestions[i] != s {
 			t.Errorf("Suggestions[%d] = %+v, want %+v", i, got.Suggestions[i], s)
 		}
+	}
+
+	// The words before the fragment narrow it: only "nidus" shares a document with "store".
+	phrase, err := db.Suggest(ctx, SuggestRequest{
+		Scope:  []string{"docs"},
+		Field:  "body",
+		Prefix: "store nid",
+	})
+	if err != nil {
+		t.Fatalf("Suggest failed: %v", err)
+	}
+	if len(phrase.Suggestions) != 1 || phrase.Suggestions[0].Term != "nidus" {
+		t.Errorf("phrase-conditioned Suggest = %+v, want only nidus", phrase.Suggestions)
+	}
+
+	// And a filter narrows each completion's df, dropping one no matching document carries.
+	filtered, err := db.Suggest(ctx, SuggestRequest{
+		Scope:  []string{"docs"},
+		Field:  "body",
+		Prefix: "nid",
+		Filter: Filter{Eq("id", Str("c"))},
+	})
+	if err != nil {
+		t.Fatalf("Suggest failed: %v", err)
+	}
+	if len(filtered.Suggestions) != 0 {
+		t.Errorf("filtered Suggest = %+v, want none (id is not an attr)", filtered.Suggestions)
 	}
 }
 

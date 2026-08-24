@@ -302,10 +302,23 @@ describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
       { id: "d", vector: [1, 1, 0], attrs: { body: "a runner races" } },
     ]);
 
-    const result = await db.suggest({ collection: "m52", field: "body", prefix: "run", limit: 10 });
+    const result = await db.suggest({ scope: ["m52"], field: "body", prefix: "run", limit: 10 });
     expect(result.suggestions.map((s) => s.term)).toEqual(["run", "runner"]);
     expect(result.suggestions.map((s) => s.df)).toEqual([3, 1]);
     expect(result.matched).toBe(2);
+
+    // The words before the fragment narrow it: only "runner" shares a document with "races".
+    const phrase = await db.suggest({ scope: ["m52"], field: "body", prefix: "races run" });
+    expect(phrase.suggestions.map((s) => s.term)).toEqual(["runner"]);
+
+    // And a filter narrows each completion's df to the matching documents.
+    const filtered = await db.suggest({
+      scope: ["m52"],
+      field: "body",
+      prefix: "run",
+      filter: [{ Eq: ["id", { Str: "b" }] }],
+    });
+    expect(filtered.suggestions).toEqual([]);
   });
 
   it("sets an alias and searches through it to the concrete collection", async () => {

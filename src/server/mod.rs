@@ -24,7 +24,7 @@ use tokio::net::TcpListener;
 
 use crate::{
     FilterIndexField, FtsField, FtsQuery, HybridOpts, ListOpts, Nidus, Record, RerankOpts, Scope,
-    SearchOpts,
+    SearchOpts, SuggestOpts,
 };
 use dto::{
     AggregateRequest, AggregationDto, AnnDto, BatchFuse, BatchSearchRequest, BatchSearchResponse,
@@ -460,7 +460,7 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/collections/{name}/records", get(records))
         .route("/collections/{name}/fts-schema", post(set_fts_schema))
         .route("/collections/{name}/filter-index", post(set_filter_index))
-        .route("/collections/{name}/suggest", post(suggest))
+        .route("/suggest", post(suggest))
         .route("/search", post(search))
         .route("/search/batch", post(search_batch))
         .route("/search/similar", post(search_similar))
@@ -1202,16 +1202,22 @@ async fn set_filter_index(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// `POST /collections/{name}/suggest` — ranked term completions for a prefix, for a
-/// typeahead dropdown. Ranked by document frequency, not by the idf `/text-search` uses.
+/// `POST /suggest` — ranked term completions for a prefix, for a typeahead dropdown. Ranked by
+/// document frequency, not by the idf `/text-search` uses; `scope` and `filter` narrow it the
+/// same way they narrow `/text-search`.
 async fn suggest(
     State(st): State<AppState>,
-    Path(name): Path<String>,
     Json(req): Json<SuggestRequest>,
 ) -> Result<Json<SuggestionsDto>, ApiError> {
     check_page(0, req.limit)?;
     let out = run_read(st, move |db| {
-        Ok(db.suggest(&name, &req.field, &req.prefix, req.limit))
+        let opts = SuggestOpts {
+            limit: req.limit,
+            filter: req.filter,
+        };
+        scoped(&req.scope, |scope| {
+            db.suggest(scope, &req.field, &req.prefix, &opts)
+        })
     })
     .await?;
     Ok(Json(out.into()))

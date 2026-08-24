@@ -179,7 +179,7 @@ opposite of how a prefix clause would rank the documents containing them.
 
 ```ts
 const { suggestions, matched } = await db.suggest({
-  collection: "docs",
+  scope: ["docs"], // omit for every collection
   field: "body",
   prefix: "vec",
   limit: 10, // the server default; capped at 256 matching terms overall
@@ -191,6 +191,25 @@ for (const { term, df } of suggestions) console.log(term, df);
 `matched > suggestions.length` means the cap truncated the list. Unlike `prefix` above,
 which matches stems, `suggest` matches surface forms, so completions are real words:
 every keystroke of `"running"` completes to `"running"`.
+
+Each `df` is a conditioned count. `filter` narrows it to the matching documents, so a
+dropdown offers only vocabulary the caller can see and a completion whose only documents are
+filtered out is absent rather than present with a corpus-wide count. The words before the
+final token narrow it too, so send the whole phrase typed so far:
+
+```ts
+// "brown" is the commonest br* here, but no document says both "quick" and "brown"
+const { suggestions } = await db.suggest({
+  scope: ["docs"],
+  field: "body",
+  prefix: "quick br",
+  filter: [{ Eq: ["tenant", { Str: "acme" }] }],
+});
+// suggestions: [{ term: "bracket", df: 1 }]   — "brown" is not offered
+```
+
+A single-token prefix, or one whose earlier words are all stopwords, has no head terms and
+behaves exactly as the bare fragment does.
 
 ## Remembering and recalling
 

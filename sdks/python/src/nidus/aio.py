@@ -444,21 +444,26 @@ class AsyncNidusClient:
 
     async def suggest(
         self,
-        collection: str,
         *,
         field: str,
         prefix: str,
+        scope: Optional[Sequence[str]] = None,
         limit: Optional[int] = None,
+        filter: Optional[Filter] = None,  # noqa: A002
     ) -> Suggestions:
         """Ranked term completions for a partial word, for an autocomplete dropdown.
 
         Ranked by document frequency (commonest first), the opposite of how a prefix clause
-        ranks documents. Only ``prefix``'s final token is completed. Completions are stems:
-        the prefix is folded, not stemmed, so a corpus indexing "running" as "run" completes
-        ``run`` and never ``running``.
+        ranks documents. Completions are real spellings, not stems, so a corpus indexing
+        "running" as ``run`` completes ``running``.
+
+        Only ``prefix``'s final token is completed, but the words before it are not
+        discarded: they narrow the completions to documents that also carry them, so pass
+        the whole phrase typed so far. ``filter`` narrows each completion's ``df`` to the
+        matching documents, so a completion no matching document carries is not offered.
         """
         payload = await self._request(
-            "POST", _wire.suggest_path(collection), _wire.suggest_body(field, prefix, limit)
+            "POST", "/suggest", _wire.suggest_body(field, prefix, scope, limit, filter)
         )
         return _wire.decode_suggestions(payload)
 
