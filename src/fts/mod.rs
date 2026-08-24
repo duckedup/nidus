@@ -194,25 +194,44 @@ impl FieldIndex {
             .collect()
     }
 
-    /// Terms carrying `fragment` as a prefix, commonest first, truncated to the cap. Returns the
-    /// terms scored and how many matched, so `explain` can report a truncation.
+    /// Stems to score for `fragment`: those carrying it, unioned with the stems of the *surface
+    /// forms* carrying it (nidus-dnm — "running" is indexed as "run", so a stem-only scan misses
+    /// both "runn" and the whole word). Commonest first, capped; `matched` reports a truncation.
     pub(crate) fn expand_prefix(&self, fragment: &str) -> (Vec<String>, usize) {
-        let mut matches: Vec<(&String, f32)> = self
+        // Keyed by stem, so a stem both legs reach is one term in the disjunction. Both legs
+        // read the same `live_df_of`, so the two `df`s agree and either may win.
+        let mut hits: BTreeMap<&str, usize> = BTreeMap::new();
+        for (term, postings) in self
             .postings
             .range(fragment.to_string()..)
             .take_while(|(t, _)| t.starts_with(fragment))
-            .filter_map(|(t, postings)| {
-                let df = self.live_df_of(postings);
-                (df > 0).then_some((t, df as f32))
-            })
-            .collect();
-        let matched = matches.len();
+        {
+            let df = self.live_df_of(postings);
+            if df > 0 {
+                hits.insert(term, df);
+            }
+        }
+        for (_, stemmed) in self
+            .surface
+            .range(fragment.to_string()..)
+            .take_while(|(s, _)| s.starts_with(fragment))
+        {
+            let Some(postings) = self.postings.get(stemmed) else {
+                continue;
+            };
+            let df = self.live_df_of(postings);
+            if df > 0 {
+                hits.insert(stemmed, df);
+            }
+        }
+        let matched = hits.len();
         // (df desc, term asc): the tie-break is load-bearing, or two equal-df terms
         // truncate in whatever order the sort happened to leave them.
-        matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then_with(|| a.0.cmp(b.0)));
+        let mut matches: Vec<(&str, usize)> = hits.into_iter().collect();
+        matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
         matches.truncate(MAX_PREFIX_EXPANSION);
         (
-            matches.into_iter().map(|(t, _)| t.clone()).collect(),
+            matches.into_iter().map(|(t, _)| t.to_string()).collect(),
             matched,
         )
     }
@@ -702,12 +721,85 @@ mod tests {
         assert!(matched > terms.len(), "truncation must be reportable");
     }
 
+    /// The surface leg resolves to a *stem*, so a fragment carried by one spelling scores the
+    /// whole stem family. It fires only where some indexed spelling carries the fragment:
+    /// "runs" alone never reaches "run" from "running", since "runs" is the shorter word.
+    #[test]
+    fn the_surface_leg_scores_the_stem_a_spelling_resolves_to() {
+        let idx = idx_with(&[("d1", "running"), ("d2", "runs")]);
+        assert_eq!(idx.expand_prefix("running"), (vec!["run".to_string()], 1));
+        assert_eq!(idx.score(&["run".to_string()]).len(), 2, "both docs score");
+
+        let alone = idx_with(&[("d2", "runs")]);
+        assert_eq!(alone.expand_prefix("running"), (vec![], 0));
+        assert_eq!(alone.expand_prefix("run"), (vec!["run".to_string()], 1));
+    }
+
+    /// Both legs reach every one of these stems, so the cap and `matched` must count the
+    /// union: counting the legs separately would report twice the vocabulary that exists.
+    #[test]
+    fn the_cap_and_matched_count_the_union_not_the_legs() {
+        let docs: Vec<(String, String)> = (0..MAX_PREFIX_EXPANSION + 1)
+            .map(|i| (format!("d{i}"), format!("zz{i:05}ing")))
+            .collect();
+        let refs: Vec<(&str, &str)> = docs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let idx = idx_with(&refs);
+        let (terms, matched) = idx.expand_prefix("zz");
+        assert_eq!(matched, MAX_PREFIX_EXPANSION + 1);
+        assert_eq!(terms.len(), MAX_PREFIX_EXPANSION);
+    }
+
     #[test]
     fn truncation_is_deterministic_across_repeated_calls() {
         let idx = zz_corpus(MAX_PREFIX_EXPANSION + 1);
         let first = idx.expand_prefix("zz");
         let second = idx.expand_prefix("zz");
         assert_eq!(first, second);
+    }
+
+    /// nidus-dnm: the fragment is never stemmed, so before the surface leg was unioned in
+    /// neither the half-typed "runn" nor the whole word "running" reached the stem "run".
+    #[test]
+    fn a_prefix_clause_matches_a_stem_shortened_word() {
+        let idx = idx_with(&[("d1", "running")]);
+        for typed in ["r", "ru", "run", "runn", "runni", "runnin", "running"] {
+            assert_eq!(
+                idx.expand_prefix(typed),
+                (vec!["run".to_string()], 1),
+                "prefix {typed:?} must expand to the indexed stem"
+            );
+        }
+    }
+
+    /// A stem reachable both by the stem scan and through a surface form is ONE term: the
+    /// two legs read the same `df`, so a duplicate would double-count it in the disjunction.
+    #[test]
+    fn a_stem_reachable_by_both_legs_is_returned_once() {
+        let idx = idx_with(&[("d1", "run running runs")]);
+        assert_eq!(idx.expand_prefix("run"), (vec!["run".to_string()], 1));
+    }
+
+    /// The union is a superset of each leg. For "runn": the stem scan alone reaches "runner"
+    /// (its own stem) and never "run"; the surface scan alone reaches "run" (via "running")
+    /// and never "runner", whose surface form outranks the fragment.
+    #[test]
+    fn the_union_keeps_terms_only_one_leg_can_reach() {
+        let idx = idx_with(&[("d1", "runner"), ("d2", "running")]);
+        let (mut terms, matched) = idx.expand_prefix("runn");
+        terms.sort();
+        assert_eq!(terms, vec!["run", "runner"], "{terms:?}");
+        assert_eq!(matched, 2);
+    }
+
+    /// A surface form outlives the doc that introduced it (vocabulary, not per-doc state),
+    /// so the live-df filter is the only thing keeping a dead term out of the expansion.
+    #[test]
+    fn a_surface_form_whose_stem_has_no_live_posting_is_not_returned() {
+        let mut idx = idx_with(&[("d1", "running"), ("d2", "cat")]);
+        idx.tombstone("d1");
+        assert_eq!(idx.expand_prefix("runn"), (vec![], 0));
+        assert_eq!(idx.expand_prefix("run"), (vec![], 0));
+        assert_eq!(idx.expand_prefix("ca"), (vec!["cat".to_string()], 1));
     }
 
     // ── suggest_scored (surface-form completions) ──────────────────────────────────
@@ -752,18 +844,18 @@ mod tests {
         assert_eq!(matched, MAX_PREFIX_EXPANSION + 1);
     }
 
-    /// The whole reason `surface` exists: "nidus" stems to "nidu", so the stem-keyed scan a
-    /// prefix *clause* uses goes empty on the full word while `suggest` still completes it.
+    /// The whole reason `surface` exists: "nidus" stems to "nidu", so a stem-keyed scan alone
+    /// goes empty on the full word. `suggest` returns the spelling, a clause the stem, and
+    /// since nidus-dnm both reach it — the difference is what they rank, not what they find.
     #[test]
-    fn suggest_completes_a_full_word_where_the_stem_keyed_scan_cannot() {
+    fn suggest_and_a_clause_both_reach_a_word_the_stem_keyed_scan_cannot() {
         let idx = idx_with(&[("d1", "nidus"), ("d2", "nidus")]);
 
         let (scored, matched) = idx.suggest_scored("nidus");
         assert_eq!(scored, vec![("nidus".to_string(), 2)], "{scored:?}");
         assert_eq!(matched, 1);
 
-        // Unchanged, and the contrast is the point: the clause path keys on stems.
-        assert_eq!(idx.expand_prefix("nidus"), (vec![], 0));
+        assert_eq!(idx.expand_prefix("nidus"), (vec!["nidu".to_string()], 1));
         assert_eq!(idx.expand_prefix("nidu"), (vec!["nidu".to_string()], 1));
     }
 

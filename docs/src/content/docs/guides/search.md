@@ -1039,15 +1039,21 @@ let got = db.suggest("docs", "body", "nid", 10);
 // got.suggestions: [{ term: "nidus", df: 42 }, { term: "nidification", df: 3 }, ...]
 ```
 
-**Limitation:** the prefix fragment is folded (lowercased, optionally ASCII-folded) but
-not stemmed, while the index holds stems. So `"runn"` will not match an indexed `run`
-even though `run` is what `"running"` stems to: matching a prefix *clause* against surface
-forms as well as stems would lift this and is a larger, separate change.
+The prefix fragment is folded (lowercased, optionally ASCII-folded) but not stemmed, while
+the index holds stems. So the fragment is matched two ways and the results are unioned:
+against the stems directly, and against the field's surface forms (the spellings those stems
+came from). That is what lets `"runn"`, and the whole word `"running"`, match a document
+containing "running" even though the indexed term is `run`.
 
-`suggest` does not share the limitation. It matches a per-field surface-form map instead of
-the stem-keyed postings, so it completes `"runn"` to `"running"` and keeps answering at
-every keystroke, where a stem-keyed scan would go empty as soon as the typed prefix grew
-longer than the stem.
+A surface form resolves to its *stem*, so a fragment one document spells reaches the whole
+stem family: with "running" in the corpus, typing `"running"` also ranks a document that only
+says "runs", exactly as a non-prefix clause for `"running"` would. Nothing is invented from
+spellings the corpus does not contain, so `"running"` finds nothing in a corpus whose only
+word is "runs".
+
+`suggest` scans the same surface forms, so the two surfaces agree on what a fragment reaches.
+They differ in what they hand back: `suggest` gives you the words, a prefix clause gives you
+the documents.
 
 ### Tuning a field
 

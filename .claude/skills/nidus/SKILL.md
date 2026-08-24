@@ -200,9 +200,16 @@ Needs blueprints. If none exist for this target, run **Spec** first (including i
    Lanes the checker reports as `ci` (Miri today) are required PR checks — do not run them
    locally; the PR is where they run once. Debugging a red CI lane is the exception.
    In the full pipeline, start these lanes in the background and launch **Review**'s fan-out
-   immediately: both only read the merged tree, so they overlap safely and the wall clock is
-   the slower of the two, not the sum. The one rule the overlap adds: do not edit the tree —
-   review fixes included — until the lanes report, or the green proves a tree nobody has.
+   immediately, so the wall clock is the slower of the two and not the sum. **What makes that
+   safe is a rule, not a property of reviewing**: `review.workflow.js` forbids its agents from
+   writing any tracked file in this checkout, and tells one that must run *changed* code to
+   copy it into its own worktree first. Reviewing is not inherently read-only — a skeptic
+   confirming a defect by executing it is the review working as intended, and one that added a
+   temporary `#[test]`, ran it and reverted it failed a concurrent `just ci-cli` on a test
+   attributable to nothing in the diff, leaving a byte-identical file behind to diagnose from
+   (nidus-jni). So if you fan out anything else beside the lanes, give it the same rule. The
+   overlap binds you too: do not edit the tree — review fixes included — until the lanes
+   report, or the green proves a tree nobody has.
 7. Report failures from the workflow with their blockers and log paths, and ask whether to
    investigate, skip, or abort.
 8. On success delete the blueprint files, then continue to **Review**.
@@ -516,5 +523,10 @@ back to the user.
   signal that only ever appeared by accident, and a `git log -6` sample that could not have
   disconfirmed the convention it was sampling. A green result from a check that had no failing
   mode is indistinguishable from no check. For a regression test, go and watch it go red.
+- **A green lane run is evidence only about a tree nobody was writing to.** Anything sharing
+  the checkout while the lanes run — an agent, another session, you — can turn a lane red for
+  a reason that is nowhere in the diff and gone before you look. When a lane fails on
+  something the change cannot explain, check whether the tree moved under it (`git status`, a
+  hash against `HEAD`) before believing either "my change broke it" or "the suite is flaky".
 - Peers get worktrees under `.claude/worktrees/`, never a shared tree and never a fresh clone.
   Prune them when the ticket ships.

@@ -4292,6 +4292,34 @@ fn suggest_ranks_by_document_frequency_not_idf() {
     );
 }
 
+/// nidus-dnm: the fragment is folded but never stemmed, so before a prefix clause expanded
+/// over surface forms too, typing the whole word "running" matched no document at all.
+#[test]
+fn a_prefix_clause_matches_a_stem_shortened_word() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    store
+        .upsert("docs", &[doc("a", "running late"), doc("b", "quiet")])
+        .unwrap();
+
+    for typed in ["runn", "runni", "running"] {
+        let hits = store
+            .text_search(
+                &["docs"],
+                &FtsQuery::multi([FtsClause::new("body", typed).prefix()]),
+                &default_opts(10),
+            )
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            vec!["a"],
+            "prefix {typed:?} must match the document that spells it"
+        );
+    }
+}
+
 #[test]
 fn suggest_folds_the_prefix_like_a_prefix_clause() {
     let mut store = Store::in_memory(3).unwrap();
