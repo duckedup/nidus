@@ -1092,6 +1092,26 @@ test('spec: find with no words matches nothing rather than everything', () => {
   eq(spec.search(DOC, ['']), [], 'blank word')
 })
 
+// ── skill lane wiring (nidus-gmy.2) ────────────────────────────────────────
+
+const ROUTER = '| `fit` | `lanes/fit.md` |\n| `ship` | `lanes/ship.md` |'
+
+test('skill lanes: a routed lane that exists is fine', () => {
+  eq(ids(laws.skillLanes(ROUTER, ['fit.md', 'ship.md'])), [], 'findings')
+})
+
+test('skill lanes: a routed lane with no file is an error', () => {
+  const found = laws.skillLanes(ROUTER, ['fit.md'])
+  eq(ids(found), ['skill-lane-missing'], 'findings')
+  eq(found[0].summary.includes('lanes/ship.md'), true, 'names the missing lane')
+})
+
+test('skill lanes: a lane file nobody routes to is a warning', () => {
+  const found = laws.skillLanes(ROUTER, ['fit.md', 'ship.md', 'fleet.md'])
+  eq(ids(found), ['skill-lane-orphan'], 'findings')
+  eq(found[0].severity, 'warn', 'severity')
+})
+
 export function selftest({ json = false } = {}) {
   const failures = []
   for (const c of cases) {

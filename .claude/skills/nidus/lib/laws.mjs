@@ -359,3 +359,26 @@ export const LAW_IDS = [
   'bot-stamped', 'forbidden-dep', 'new-dep', 'test-placement', 'miri-ignore',
   'feature-gating', 'mod-gating', 'stale-ticket',
 ]
+
+// ── The /nidus skill's lane files must stay wired ───────────────────────────
+// SKILL.md is a router: it names a lane file per subcommand and the lane body lives
+// there, so a rename that misses one silently drops a whole subcommand (nidus-gmy.2).
+
+export function skillLanes(skillText, laneFiles) {
+  const referenced = new Set([...skillText.matchAll(/lanes\/([a-z-]+)\.md/g)].map(m => m[1]))
+  const present = new Set(laneFiles.map(f => f.replace(/^.*\//, '').replace(/\.md$/, '')))
+  const out = []
+  for (const name of [...referenced].sort()) {
+    if (present.has(name)) continue
+    out.push(finding('skill-lane-missing', 'error', '.claude/skills/nidus/SKILL.md', 1,
+      `SKILL.md routes to lanes/${name}.md, which does not exist`,
+      'That subcommand has no body to read, so the lane silently does nothing.'))
+  }
+  for (const name of [...present].sort()) {
+    if (referenced.has(name)) continue
+    out.push(finding('skill-lane-orphan', 'warn', `.claude/skills/nidus/lanes/${name}.md`, 1,
+      `lanes/${name}.md is not routed to from SKILL.md`,
+      'Nothing will ever read it. Add it to the Routing table or delete it.'))
+  }
+  return out
+}
