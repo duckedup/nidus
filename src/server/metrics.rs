@@ -41,6 +41,8 @@ const ROUTES: &[&str] = &[
     "/flush",
     "/compact",
     "/refresh",
+    "/aliases",
+    "/aliases/{name}",
     "other",
 ];
 
@@ -156,6 +158,14 @@ fn route_index(path: &str) -> usize {
     // Exact routes first — the common case, and unambiguous.
     if let Some(i) = ROUTES.iter().position(|r| *r == path && !r.contains('{')) {
         return i;
+    }
+    // `/aliases/<name>` — a single segment only; anything deeper is `other`.
+    if let Some(rest) = path.strip_prefix("/aliases/") {
+        return slot(if rest.contains('/') {
+            "other"
+        } else {
+            "/aliases/{name}"
+        });
     }
     // `/collections/<name>[/<verb>]`. Anything else is `other`.
     let Some(rest) = path.strip_prefix("/collections/") else {
@@ -475,6 +485,9 @@ mod tests {
             "/flush",
             "/compact",
             "/refresh",
+            "/aliases",
+            "/aliases/docs",
+            "/aliases/docs/extra",
             "/nope",
             "/collections/docs/nope",
             "/collections/a/b/c",
@@ -511,6 +524,7 @@ mod tests {
             "/flush",
             "/compact",
             "/refresh",
+            "/aliases",
         ];
         for path in served {
             assert_eq!(
@@ -535,6 +549,18 @@ mod tests {
         );
         // The bare create/drop route, whose name segment is the last one.
         assert_eq!(route_label("/collections/notes"), "/collections/{name}");
+    }
+
+    /// An alias name must collapse the same way a collection name does, and a path one
+    /// segment too deep must fall to `other` rather than silently matching.
+    #[test]
+    fn alias_names_are_collapsed() {
+        assert_eq!(route_label("/aliases/docs"), "/aliases/{name}");
+        assert_eq!(
+            route_label("/aliases/other-name"),
+            route_label("/aliases/docs")
+        );
+        assert_eq!(route_label("/aliases/docs/extra"), "other");
     }
 
     #[test]

@@ -201,3 +201,9 @@ func extractError(raw []byte, status int) string {
 func collPath(name, suffix string) string {
 	return "/collections/" + url.PathEscape(name) + suffix
 }
+
+// aliasPath builds /aliases/{name}, escaped the same way collPath escapes a
+// collection name — an alias name is just as opaque a string.
+func aliasPath(name string) string {
+	return "/aliases/" + url.PathEscape(name)
+}

@@ -4,6 +4,7 @@
 mod cli;
 mod harness;
 
+mod aliases;
 mod cluster;
 mod env_flags;
 mod hardening;

@@ -26,6 +26,12 @@ pub struct DeleteRequest {
     pub filter: Option<Filter>,
 }
 
+/// Body of `PUT /aliases/{name}` — the concrete collection the alias resolves to.
+#[derive(Debug, Deserialize)]
+pub struct SetAliasRequest {
+    pub target: String,
+}
+
 /// Body of `POST /compact`. Bodyless (or `{}`) keeps the plain reclaim; `expired: true`
 /// sweeps `nidus.expires_at`-past entries first (nidus-140).
 #[derive(Debug, Default, Deserialize)]

@@ -389,6 +389,9 @@ await db.delete("docs", { ids: ["a"] });
 await db.deleteWhere("docs", f.and(f.lt("year", 2000)));
 await db.flush(); await db.compact();
 await db.dropCollection("docs");
+await db.aliases();                      // { "docs": "docs_v2" }
+await db.setAlias("docs", "docs_v2");    // create or repoint; target must already exist
+await db.dropAlias("docs");              // removes the alias, not the records
 await db.health();                       // boolean
 const r = await db.ready();              // { ready, role, staleness_secs }
 if (!r.ready) console.warn(r.reason);    // a 503 is an answer, not a throw

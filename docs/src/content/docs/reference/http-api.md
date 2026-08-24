@@ -21,6 +21,9 @@ so the same id appears in your logs and the server's.
 | `GET /health` | liveness check: `503` only when unrecoverably broken (always unauthenticated) | – |
 | `GET /stats` | dimension, distance, the resolved open profile (ann, quantization, query_threads, mmap), collections, footprint | `dimension` / `footprint` |
 | `GET /collections` | list collection names | `collections` |
+| `GET /aliases` | list alias to concrete collection mappings | `aliases` |
+| `PUT /aliases/{name}` | create or repoint an alias | `set_alias` |
+| `DELETE /aliases/{name}` | drop an alias | `drop_alias` |
 | `POST /collections/{name}` | create a collection | `create_collection` |
 | `DELETE /collections/{name}` | drop a collection and its records | `drop_collection` |
 | `GET /collections/{name}/meta` | read collection metadata | `get_meta` |
@@ -203,7 +206,8 @@ ANN configuration when the server opened with one, whether from an explicit
 
 ### `GET /collections`
 
-Returns the collection names as a JSON array: `["docs", "notes"]`.
+Returns the collection names as a JSON array: `["docs", "notes"]`. Concrete names only;
+aliases are listed separately by [`GET /aliases`](#get-aliases).
 
 ### `POST /collections/{name}`
 
@@ -294,6 +298,43 @@ curl -s -X POST localhost:7700/collections/docs/filter-index \
   -H 'content-type: application/json' \
   -d '{"fields": ["title", {"field": "tag", "trigrams": false}]}'
 # → {"ok": true}
+```
+
+## Aliases
+
+An alias is an indirect name resolving to one concrete collection, one hop only (an
+alias may not point at another alias). Data routes (`upsert`, `delete`,
+`get`/`records`, `meta`) accept an alias in place of `{name}` and resolve it; the
+structural routes above (create/drop a collection, `fts-schema`, `filter-index`) do
+not, and reject an alias with a `400`. See the
+[blue/green reindex guide](/guides/blue-green-reindex/) for the end-to-end sequence.
+
+### `GET /aliases`
+
+Every alias and the concrete collection it currently points at:
+
+```bash
+curl -s localhost:7700/aliases   # → {"docs": "docs_v2"}
+```
+
+### `PUT /aliases/{name}`
+
+Create or repoint an alias. The body names the target collection, which must already
+exist. Idempotent: repointing an alias that already points there is a no-op.
+
+```bash
+curl -s -X PUT localhost:7700/aliases/docs \
+  -H 'content-type: application/json' \
+  -d '{"target": "docs_v2"}'
+# → {"alias": "docs", "target": "docs_v2"}
+```
+
+### `DELETE /aliases/{name}`
+
+Drop an alias. The underlying collection is untouched.
+
+```bash
+curl -s -X DELETE localhost:7700/aliases/docs   # → {"dropped": "docs"}
 ```
 
 ## Records

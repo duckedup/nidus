@@ -175,6 +175,10 @@ pub struct Store {
     /// drop. `None` outside cluster mode and for readers.
     lease: Option<ClusterLease>,
     collections: HashMap<String, Collection>,
+    /// One-hop collection alias table (nidus-klh), from the manifest. Resolution happens
+    /// above `Store` (in `Nidus`); this layer only stores, refuses on structural verbs, and
+    /// resolves data writes via `resolve_alias`.
+    aliases: BTreeMap<String, String>,
     /// Rows no longer referenced (deleted or overwritten), for compaction tracking.
     dead_rows: usize,
     /// Quantization state (None when quantization is off — the f32 brute-force default).
@@ -494,6 +498,7 @@ impl Store {
             lock,
             lease,
             collections,
+            aliases: manifest.aliases.clone(),
             dead_rows,
             quant,
             ann,
@@ -671,6 +676,7 @@ impl Store {
             lock: None,
             lease: None,
             collections: HashMap::new(),
+            aliases: BTreeMap::new(),
             dead_rows: 0,
             quant,
             ann,
@@ -822,6 +828,7 @@ impl Store {
         // live reader adopts a writer's profile change, reconciling the in-RAM struct too so a
         // toggle actually activates. mmap is skipped: it can't remap open segments mid-refresh.
         self.open_profile = manifest.profile.clone();
+        self.aliases = manifest.aliases.clone();
         let mut merged = self.baseline_config.clone();
         merged.apply_profile(&manifest.profile);
         // Built into a local before any assignment: `Quant::empty` is fallible, and this
@@ -915,6 +922,7 @@ impl Store {
 
         // nidus-141: apply the profile *as recorded at that commit*, matching `open_at`.
         self.open_profile = entry.profile.clone();
+        self.aliases = entry.aliases.clone();
         let mut merged = self.baseline_config.clone();
         merged.apply_profile(&entry.profile);
         let requant = if self.config.quantization == merged.quantization {

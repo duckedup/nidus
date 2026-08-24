@@ -246,6 +246,28 @@ func (c *Client) DropCollection(ctx context.Context, name string) error {
 	return c.request(ctx, http.MethodDelete, collPath(name, ""), nil, nil)
 }
 
+// Aliases reports every alias and the concrete collection it resolves to.
+func (c *Client) Aliases(ctx context.Context) (map[string]string, error) {
+	var out map[string]string
+	if err := c.request(ctx, http.MethodGet, "/aliases", nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SetAlias creates an alias or repoints an existing one, in one idempotent call. The
+// target must already exist, and an alias may not point at another alias.
+func (c *Client) SetAlias(ctx context.Context, name, target string) error {
+	return c.request(ctx, http.MethodPut, aliasPath(name), struct {
+		Target string `json:"target"`
+	}{target}, nil)
+}
+
+// DropAlias removes an alias. It deletes no records.
+func (c *Client) DropAlias(ctx context.Context, name string) error {
+	return c.request(ctx, http.MethodDelete, aliasPath(name), nil, nil)
+}
+
 // GetMeta reads a collection's free-form string metadata.
 func (c *Client) GetMeta(ctx context.Context, name string) (map[string]string, error) {
 	var out map[string]string

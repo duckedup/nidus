@@ -162,6 +162,21 @@ ENDPOINTS: list[tuple[str, Callable[[NidusClient], Any], str, str, Any]] = [
     ("collections", lambda db: db.collections(), "GET", "/collections", ["docs"]),
     ("create_collection", lambda db: db.create_collection("docs"), "POST", "/collections/docs", {}),
     ("drop_collection", lambda db: db.drop_collection("docs"), "DELETE", "/collections/docs", {}),
+    ("aliases", lambda db: db.aliases(), "GET", "/aliases", {"docs": "docs_v2"}),
+    (
+        "set_alias",
+        lambda db: db.set_alias("docs", "docs_v2"),
+        "PUT",
+        "/aliases/docs",
+        {"alias": "docs", "target": "docs_v2"},
+    ),
+    (
+        "drop_alias",
+        lambda db: db.drop_alias("docs"),
+        "DELETE",
+        "/aliases/docs",
+        {"dropped": "docs"},
+    ),
     ("get_meta", lambda db: db.get_meta("docs"), "GET", "/collections/docs/meta", {}),
     ("set_meta", lambda db: db.set_meta("docs", {"a": "b"}), "PUT", "/collections/docs/meta", {}),
     (
@@ -262,8 +277,10 @@ def test_each_method_uses_the_right_verb_and_path(
         (lambda db: db.records("docs"), []),
         (lambda db: db.get_meta("docs"), {}),
         (lambda db: db.drop_collection("docs"), {"dropped": "docs"}),
+        (lambda db: db.aliases(), {"docs": "docs_v2"}),
+        (lambda db: db.drop_alias("docs"), {"dropped": "docs"}),
     ],
-    ids=["stats", "collections", "records", "get_meta", "drop_collection"],
+    ids=["stats", "collections", "records", "get_meta", "drop_collection", "aliases", "drop_alias"],
 )
 def test_a_bodyless_request_sends_no_body_and_no_content_type(
     send: Callable[[NidusClient], Any], payload: Any
@@ -692,6 +709,19 @@ def test_set_meta_sends_the_map_as_the_whole_body() -> None:
     stub = StubTransport({"ok": True})
     client(stub).set_meta("docs", {"owner": "austin"})
     assert stub.last.json == {"owner": "austin"}
+
+
+def test_set_alias_sends_the_target_key() -> None:
+    """A wrong key name would pass a verb-and-path-only assertion, so check the body too."""
+    stub = StubTransport({"alias": "docs", "target": "docs_v2"})
+    client(stub).set_alias("docs", "docs_v2")
+    assert stub.last.json == {"target": "docs_v2"}
+
+
+def test_alias_name_is_percent_escaped_into_one_path_segment() -> None:
+    stub = StubTransport({"target": "docs_v2"})
+    client(stub).set_alias("a/b c", "docs_v2")
+    assert stub.last.url == "http://x/aliases/a%2Fb%20c"
 
 
 def test_delete_and_delete_where_share_a_path_but_not_a_body() -> None:

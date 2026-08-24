@@ -168,6 +168,16 @@ impl Store {
         self.collections.contains_key(name)
     }
 
+    /// A clone of the one-hop alias table (nidus-klh).
+    pub fn aliases(&self) -> BTreeMap<String, String> {
+        self.aliases.clone()
+    }
+
+    /// `Some(target)` iff `name` is an alias — never chained, so `target` is always concrete.
+    pub fn resolve_alias(&self, name: &str) -> Option<String> {
+        self.aliases.get(name).cloned()
+    }
+
     /// Whether `collection` already has a declared FTS schema. The truthful gate for
     /// callers that must call `set_fts_schema` at most once per collection, since that
     /// call rebuilds the field index from every live doc (`store/write.rs`).

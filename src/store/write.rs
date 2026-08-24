@@ -173,7 +173,8 @@ impl Store {
         let Some(p) = self.persistence.clone() else {
             return Ok(());
         };
-        let manifest = self.data.manifest(self.open_profile.clone());
+        let mut manifest = self.data.manifest(self.open_profile.clone());
+        manifest.aliases = self.aliases.clone();
         let result = if !self.config.cluster {
             manifest.store(p.as_ref())
         } else {
@@ -234,6 +235,7 @@ impl Store {
             row_count: self.data.row_count(),
             log_offset,
             profile: manifest.profile.clone(),
+            aliases: manifest.aliases.clone(),
             commit_millis: crate::meta::now_ms().max(0) as u64,
         };
         if let Err(e) = history::store_entry(p, &entry) {
@@ -306,8 +308,67 @@ impl Store {
         self.set_open_profile(&OpenProfile::default())
     }
 
+    /// Refuse a structural verb against an alias name, quoting `verb` in the message
+    /// (root blueprint's exact string) so every call site produces it identically.
+    fn reject_if_alias(&self, verb: &str, name: &str) -> Result<()> {
+        if let Some(target) = self.aliases.get(name) {
+            bail!("`{verb}` requires a concrete collection: `{name}` is an alias for `{target}`");
+        }
+        Ok(())
+    }
+
+    /// Create or repoint an alias in one manifest publish. Repointing at the current target
+    /// is a true no-op (no version bump, no publish). Rolls back the in-RAM map if the
+    /// publish fails, so `aliases()` never claims an uncommitted change.
+    pub fn set_alias(&mut self, name: &str, target: &str) -> Result<()> {
+        self.check_writable()?;
+        crate::manifest::validate_alias(name, target, &self.aliases)?;
+        if self.collections.contains_key(name) {
+            bail!("alias `{name}` cannot be created: a collection named `{name}` already exists");
+        }
+        if !self.collections.contains_key(target) {
+            bail!("alias `{name}` cannot point at `{target}`: no such collection");
+        }
+        let prior = self.aliases.get(name).cloned();
+        if prior.as_deref() == Some(target) {
+            return Ok(());
+        }
+        self.aliases.insert(name.to_string(), target.to_string());
+        self.data.bump_version();
+        if let Err(e) = self.persist_manifest() {
+            match prior {
+                Some(p) => {
+                    self.aliases.insert(name.to_string(), p);
+                }
+                None => {
+                    self.aliases.remove(name);
+                }
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Drop an alias. `Ok(false)` when `name` was not an alias; same rollback discipline
+    /// as `set_alias` on a failed publish.
+    pub fn drop_alias(&mut self, name: &str) -> Result<bool> {
+        self.check_writable()?;
+        let Some(prior) = self.aliases.remove(name) else {
+            return Ok(false);
+        };
+        self.data.bump_version();
+        if let Err(e) = self.persist_manifest() {
+            self.aliases.insert(name.to_string(), prior);
+            return Err(e);
+        }
+        Ok(true)
+    }
+
     pub fn create_collection(&mut self, name: &str) -> Result<()> {
         self.check_writable()?;
+        if self.aliases.contains_key(name) {
+            bail!("collection `{name}` cannot be created: an alias named `{name}` already exists");
+        }
         // Idempotent: only create if absent.
         if !self.collections.contains_key(name) {
             self.collections.insert(name.to_string(), Collection::new());
@@ -321,6 +382,18 @@ impl Store {
 
     pub fn drop_collection(&mut self, name: &str) -> Result<()> {
         self.check_writable()?;
+        self.reject_if_alias("drop_collection", name)?;
+        if let Some(alias) = self
+            .aliases
+            .iter()
+            .find(|(_, target)| target.as_str() == name)
+            .map(|(alias, _)| alias.clone())
+        {
+            bail!(
+                "collection `{name}` cannot be dropped: alias `{alias}` points at it — drop \
+                 the alias first"
+            );
+        }
         if let Some(col) = self.collections.remove(name) {
             // Only rowed docs leave a reclaimable data row behind.
             self.dead_rows += col.docs.values().filter(|e| e.row.is_some()).count();
@@ -348,6 +421,7 @@ impl Store {
     /// collection indexes from its first upsert. Redeclaring rebuilds the affected indexes.
     pub fn set_fts_schema(&mut self, collection: &str, fields: &[FtsField]) -> Result<()> {
         self.check_writable()?;
+        self.reject_if_alias("set_fts_schema", collection)?;
         // Validate before the log append: an unusable k1/b persisted here would be replayed
         // on every subsequent open.
         crate::fts::validate(fields)?;
@@ -383,6 +457,7 @@ impl Store {
         fields: &[FilterIndexField],
     ) -> Result<()> {
         self.check_writable()?;
+        self.reject_if_alias("set_filter_index", collection)?;
         // Validate before the log append: an unusable declaration persisted here would be
         // replayed on every subsequent open.
         crate::findex::validate(fields)?;

@@ -272,6 +272,16 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 			_, err := c.GetMeta(ctx, "docs")
 			return err
 		}},
+		{"Aliases", `{"docs":"docs_v2"}`, http.MethodGet, "/aliases", func(c *Client) error {
+			_, err := c.Aliases(ctx)
+			return err
+		}},
+		{"SetAlias", `{"ok":true}`, http.MethodPut, "/aliases/docs", func(c *Client) error {
+			return c.SetAlias(ctx, "docs", "docs_v2")
+		}},
+		{"DropAlias", `{"dropped":"docs"}`, http.MethodDelete, "/aliases/docs", func(c *Client) error {
+			return c.DropAlias(ctx, "docs")
+		}},
 		{"SetMeta", `{"ok":true}`, http.MethodPut, "/collections/docs/meta", func(c *Client) error {
 			return c.SetMeta(ctx, "docs", map[string]string{"k": "v"})
 		}},
@@ -1104,6 +1114,46 @@ func TestNilSlicesAndMapsBecomeEmptyCollections(t *testing.T) {
 // TestUpsertBodyShape — attrs is `{}` and not `null` for a record built without any
 // (the server's attrs field has no serde default), and the vector is omitted for a
 // text-only doc so "no embedding" stays distinguishable from "an empty one".
+// TestSetAliasBodyShape — the route table only pins method and path, so a wrong field
+// name in the body ("collection" instead of "target") would still pass it.
+func TestSetAliasBodyShape(t *testing.T) {
+	fake := &capture{reply: `{"ok":true}`}
+	db := serve(t, fake)
+
+	if err := db.SetAlias(context.Background(), "docs", "docs_v2"); err != nil {
+		t.Fatalf("SetAlias failed: %v", err)
+	}
+	want := `{"target":"docs_v2"}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+}
+
+// TestAliasNameIsPathEscaped mirrors TestCollectionNameIsPathEscaped: an alias name is
+// just as opaque a string, and aliasPath must escape it the same way.
+func TestAliasNameIsPathEscaped(t *testing.T) {
+	cases := []struct {
+		name     string
+		wantPath string
+	}{
+		{"docs", "/aliases/docs"},
+		{"notes/2024", "/aliases/notes%2F2024"},
+		{"my alias", "/aliases/my%20alias"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &capture{reply: `{"dropped":"x"}`}
+			db := serve(t, fake)
+			if err := db.DropAlias(context.Background(), tc.name); err != nil {
+				t.Fatalf("DropAlias failed: %v", err)
+			}
+			if got := fake.snapshot().path; got != tc.wantPath {
+				t.Errorf("path = %s, want %s", got, tc.wantPath)
+			}
+		})
+	}
+}
+
 func TestUpsertBodyShape(t *testing.T) {
 	fake := &capture{reply: `{"upserted":2}`}
 	db := serve(t, fake)

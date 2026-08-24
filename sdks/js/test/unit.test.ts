@@ -833,6 +833,45 @@ describe("NidusClient request shaping", () => {
   });
 });
 
+describe("aliases", () => {
+  it("PUTs a target and returns void", async () => {
+    const { fn, calls } = mockFetch({ alias: "docs", target: "docs_v2" });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.setAlias("docs", "docs_v2");
+    expect(calls[0]!.url).toBe("http://x/aliases/docs");
+    expect(calls[0]!.init.method).toBe("PUT");
+    expect(calls[0]!.json).toEqual({ target: "docs_v2" });
+  });
+
+  it("DELETEs an alias by name", async () => {
+    const { fn, calls } = mockFetch({ dropped: "docs" });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.dropAlias("docs");
+    expect(calls[0]!.url).toBe("http://x/aliases/docs");
+    expect(calls[0]!.init.method).toBe("DELETE");
+  });
+
+  it("GETs the alias map and returns it decoded", async () => {
+    const { fn, calls } = mockFetch({ docs: "docs_v2" });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    const result = await db.aliases();
+    expect(calls[0]!.url).toBe("http://x/aliases");
+    expect(calls[0]!.init.method).toBe("GET");
+    expect(result).toEqual({ docs: "docs_v2" });
+  });
+
+  it("path-encodes an alias name needing escaping", async () => {
+    const { fn, calls } = mockFetch({});
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.setAlias("a/b", "c d");
+    expect(calls[0]!.url).toBe("http://x/aliases/a%2Fb");
+    expect(calls[0]!.json).toEqual({ target: "c d" });
+
+    await db.dropAlias("a/b");
+    expect(calls[1]!.url).toBe("http://x/aliases/a%2Fb");
+  });
+});
+
 describe("*WithPlan search methods", () => {
   /** A `{hits, plan}` response, as the server sends it when `plan: true`. */
   function planResponse() {

@@ -9,6 +9,7 @@ use super::scoring::PARALLEL_SCAN_WORK_FLOOR;
 use super::write::SegmentReport;
 use super::*;
 use crate::Fsync;
+use crate::Nidus;
 use crate::data::SegmentIntegrity;
 use crate::model::{
     Filter, Hit, ListOpts, Predicate, Projection, Quantization, Record, SearchOpts, Suggestions,
@@ -865,6 +866,7 @@ fn max_vector_bytes_refuses_over_budget_upsert() {
         pending_barrier: false,
         pinned: None,
         pruned_through: 0,
+        aliases: Default::default(),
     };
     store.create_collection("col").unwrap();
     store.upsert("col", &[rec("a", vec![1.0, 0.0])]).unwrap();
@@ -5824,6 +5826,29 @@ mod object_backed {
     }
 
     #[test]
+    fn set_alias_rolls_back_the_in_ram_map_when_the_publish_fails() {
+        let backend: Arc<dyn Persistence> = Arc::new(InMemObjectStore::default());
+        let tier = Arc::new(LocalRam::new());
+        let mut w = cluster_writer(&backend, &tier);
+        w.create_collection("docs").unwrap();
+        w.create_collection("docs_v2").unwrap();
+        w.set_alias("a", "docs").unwrap();
+
+        // Corrupt the CAS token so the next manifest publish is rejected as stale, without
+        // touching the writer lease (a distinct fence from `check_writable`'s renewal).
+        w.manifest_cas = Some("stale-token".to_string());
+        let err = w
+            .set_alias("a", "docs_v2")
+            .expect_err("a stale CAS token must fail the publish");
+        assert!(err.to_string().contains("lease lost"), "{err}");
+        assert_eq!(
+            w.aliases().get("a"),
+            Some(&"docs".to_string()),
+            "a failed repoint must not be reflected in the in-RAM map"
+        );
+    }
+
+    #[test]
     fn cluster_reader_refreshes_on_every_commit() {
         let backend: Arc<dyn Persistence> = Arc::new(InMemObjectStore::default());
         let tier = Arc::new(LocalRam::new());
@@ -9679,4 +9704,335 @@ fn plan_opt_out_search_ignores_the_plan_but_still_answers() {
         .search(&["col"], &[1.0, 0.0, 0.0], &default_opts(5))
         .unwrap();
     assert!(!hits.is_empty());
+}
+
+// ── Collection aliases (nidus-klh) ───────────────────────────────────────────
+
+#[test]
+fn set_alias_creates_and_repoints() {
+    let mut store = Store::in_memory(2).unwrap();
+    store.create_collection("docs").unwrap();
+    store.create_collection("docs_v2").unwrap();
+
+    store.set_alias("a", "docs").unwrap();
+    assert_eq!(store.resolve_alias("a"), Some("docs".to_string()));
+    assert_eq!(store.aliases().get("a"), Some(&"docs".to_string()));
+
+    // Repoint: create-or-repoint is the same call, idempotent in shape.
+    store.set_alias("a", "docs_v2").unwrap();
+    assert_eq!(store.resolve_alias("a"), Some("docs_v2".to_string()));
+}
+
+#[test]
+fn set_alias_rejects_self_reference_through_the_real_store() {
+    let mut store = Store::in_memory(2).unwrap();
+    let err = store.set_alias("loop", "loop").unwrap_err();
+    assert_eq!(err.to_string(), "alias `loop` cannot point at itself");
+}
+
+#[test]
+fn set_alias_rejects_a_chain_through_the_real_store() {
+    let mut store = Store::in_memory(2).unwrap();
+    store.create_collection("docs").unwrap();
+    store.set_alias("a", "docs").unwrap();
+    let err = store.set_alias("b", "a").unwrap_err();
+    assert!(
+        err.to_string().contains("never chained"),
+        "chain must be rejected: {err}"
+    );
+}
+
+#[test]
+fn set_alias_rejects_a_missing_target() {
+    let mut store = Store::in_memory(2).unwrap();
+    let err = store.set_alias("a", "nope").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "alias `a` cannot point at `nope`: no such collection"
+    );
+}
+
+#[test]
+fn set_alias_rejects_a_name_colliding_with_a_collection() {
+    let mut store = Store::in_memory(2).unwrap();
+    store.create_collection("docs").unwrap();
+    store.create_collection("other").unwrap();
+    let err = store.set_alias("docs", "other").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "alias `docs` cannot be created: a collection named `docs` already exists"
+    );
+}
+
+#[test]
+fn create_collection_rejects_a_name_colliding_with_an_alias() {
+    let mut store = Store::in_memory(2).unwrap();
+    store.create_collection("docs").unwrap();
+    store.set_alias("a", "docs").unwrap();
+    let err = store.create_collection("a").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "collection `a` cannot be created: an alias named `a` already exists"
+    );
+}
+
+#[test]
+fn create_collection_with_fts_rejects_an_alias_name_too() {
+    let mut store = Store::in_memory(2).unwrap();
+    store.create_collection("docs").unwrap();
+    store.set_alias("a", "docs").unwrap();
+    let err = store
+        .create_collection_with_fts("a", &[FtsField::new("body")])
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "collection `a` cannot be created: an alias named `a` already exists"
+    );
+}
+
+#[test]
+fn drop_collection_refused_while_aliased_then_allowed_after_drop_alias() {
+    let mut store = Store::in_memory(2).unwrap();
+    store.create_collection("docs").unwrap();
+    store.set_alias("a", "docs").unwrap();
+
+    let err = store.drop_collection("docs").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "collection `docs` cannot be dropped: alias `a` points at it — drop the alias first"
+    );
+
+    assert!(store.drop_alias("a").unwrap());
+    store.drop_collection("docs").unwrap();
+    assert!(!store.has_collection("docs"));
+}
+
+#[test]
+fn drop_collection_refuses_an_alias_name_directly() {
+    let mut store = Store::in_memory(2).unwrap();
+    store.create_collection("docs").unwrap();
+    store.set_alias("a", "docs").unwrap();
+    let err = store.drop_collection("a").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "`drop_collection` requires a concrete collection: `a` is an alias for `docs`"
+    );
+}
+
+#[test]
+fn set_fts_schema_refused_through_an_alias() {
+    let mut store = Store::in_memory(2).unwrap();
+    store.create_collection("docs").unwrap();
+    store.set_alias("a", "docs").unwrap();
+    let err = store
+        .set_fts_schema("a", &[FtsField::new("body")])
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "`set_fts_schema` requires a concrete collection: `a` is an alias for `docs`"
+    );
+}
+
+#[test]
+fn set_filter_index_refused_through_an_alias() {
+    let mut store = Store::in_memory(2).unwrap();
+    store.create_collection("docs").unwrap();
+    store.set_alias("a", "docs").unwrap();
+    let err = store
+        .set_filter_index("a", &[FilterIndexField::new("body")])
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "`set_filter_index` requires a concrete collection: `a` is an alias for `docs`"
+    );
+}
+
+#[test]
+fn drop_alias_returns_false_for_an_unknown_name() {
+    let mut store = Store::in_memory(2).unwrap();
+    assert!(!store.drop_alias("nope").unwrap());
+}
+
+#[test]
+fn aliases_accessor_is_a_clone_not_a_live_view() {
+    let mut store = Store::in_memory(2).unwrap();
+    store.create_collection("docs").unwrap();
+    store.set_alias("a", "docs").unwrap();
+    let mut snapshot = store.aliases();
+    snapshot.insert("b".to_string(), "docs".to_string());
+    assert_eq!(store.aliases().len(), 1, "the store's own map is untouched");
+}
+
+/// The acceptance test: a repoint concurrent with a read never opens a window where the
+/// alias resolves to nothing, and `refresh()` picks up an alias-only commit. Deleting
+/// `bump_version()` from `Store::set_alias` makes the final assertion fail.
+#[cfg_attr(miri, ignore)] // fsync: Miri does not implement sync_all
+#[test]
+fn alias_repoint_is_atomic_and_refresh_adopts_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let mut w = Store::open(Config::new(&path, 2).auto_compact(None)).unwrap();
+    w.create_collection("docs").unwrap();
+    w.create_collection("docs_v2").unwrap();
+    w.upsert("docs", &[rec("a", vec![1.0, 0.0])]).unwrap();
+    w.upsert("docs_v2", &[rec("b", vec![0.0, 1.0])]).unwrap();
+    w.set_alias("docs_alias", "docs").unwrap();
+
+    let mut r = open_reader(&path, 2);
+    assert_eq!(r.resolve_alias("docs_alias"), Some("docs".to_string()));
+    let target = r.resolve_alias("docs_alias").unwrap();
+    let hits = r
+        .search(&[target.as_str()], &[1.0, 0.0], &default_opts(5))
+        .unwrap();
+    assert_eq!(
+        hits[0].collection, "docs",
+        "hits report the concrete collection"
+    );
+
+    // The writer repoints the alias. Before the reader refreshes, it must still resolve
+    // to the old target — never nothing.
+    w.set_alias("docs_alias", "docs_v2").unwrap();
+    assert_eq!(
+        r.resolve_alias("docs_alias"),
+        Some("docs".to_string()),
+        "no window where the alias resolves to nothing"
+    );
+
+    assert!(
+        r.refresh().unwrap(),
+        "an alias-only commit still bumps the version"
+    );
+    assert_eq!(r.resolve_alias("docs_alias"), Some("docs_v2".to_string()));
+    let target = r.resolve_alias("docs_alias").unwrap();
+    let hits = r
+        .search(&[target.as_str()], &[0.0, 1.0], &default_opts(5))
+        .unwrap();
+    assert_eq!(hits[0].collection, "docs_v2");
+}
+
+#[cfg_attr(miri, ignore)] // fsync: Miri does not implement sync_all
+#[test]
+fn refresh_to_resolves_aliases_as_recorded_at_that_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let mut w = Store::open(
+        Config::new(&path, 2)
+            .auto_compact(None)
+            .history_versions(Some(10)),
+    )
+    .unwrap();
+    w.create_collection("docs").unwrap();
+    w.create_collection("docs_v2").unwrap();
+    w.set_alias("a", "docs").unwrap();
+    let v1 = w.data.version();
+
+    w.set_alias("a", "docs_v2").unwrap();
+    assert_eq!(w.resolve_alias("a"), Some("docs_v2".to_string()));
+
+    let mut pinned = open_reader(&path, 2);
+    pinned.refresh_to(v1).unwrap();
+    assert_eq!(
+        pinned.resolve_alias("a"),
+        Some("docs".to_string()),
+        "a pinned open resolves aliases as they stood at that commit"
+    );
+}
+
+#[test]
+fn nidus_upsert_and_reads_resolve_through_an_alias() {
+    let mut db = Nidus::open_in_memory(2).unwrap();
+    db.create_collection("docs").unwrap();
+    db.set_alias("a", "docs").unwrap();
+
+    db.upsert("a", &[rec("x", vec![1.0, 0.0])]).unwrap();
+    assert_eq!(
+        db.get_all("docs").len(),
+        1,
+        "landed in the concrete collection"
+    );
+    assert_eq!(
+        db.get_all("a").len(),
+        1,
+        "readable back through the alias too"
+    );
+    assert!(db.get("a", "x").is_some());
+
+    db.delete("a", &["x"]).unwrap();
+    assert!(db.get_all("docs").is_empty());
+}
+
+#[test]
+fn nidus_search_through_an_alias_reports_the_concrete_collection() {
+    let mut db = Nidus::open_in_memory(2).unwrap();
+    db.create_collection("docs").unwrap();
+    db.set_alias("a", "docs").unwrap();
+    db.upsert("a", &[rec("x", vec![1.0, 0.0])]).unwrap();
+
+    let hits = db.search("a", &[1.0, 0.0], &default_opts(5)).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].collection, "docs");
+}
+
+#[test]
+fn nidus_search_similar_resolves_the_source_collection_through_an_alias() {
+    let mut db = Nidus::open_in_memory(2).unwrap();
+    db.create_collection("docs").unwrap();
+    db.set_alias("a", "docs").unwrap();
+    db.upsert(
+        "a",
+        &[rec("x", vec![1.0, 0.0]), rec("y", vec![0.98, 0.199])],
+    )
+    .unwrap();
+
+    // Naming the source by its alias must work exactly as naming it concretely does.
+    let hits = db.search_similar("a", "a", "x", &default_opts(5)).unwrap();
+    assert_eq!(hits.len(), 1, "the source record is dropped: {hits:?}");
+    assert_eq!(hits[0].id, "y");
+    assert_eq!(hits[0].collection, "docs");
+}
+
+#[test]
+fn set_alias_at_the_current_target_is_a_true_no_op() {
+    let mut store = Store::in_memory(2).unwrap();
+    store.create_collection("docs").unwrap();
+    store.set_alias("a", "docs").unwrap();
+    let after_create = store.data.version();
+
+    store.set_alias("a", "docs").unwrap();
+    assert_eq!(
+        store.data.version(),
+        after_create,
+        "repointing at the current target must not bump the version or republish"
+    );
+    assert_eq!(store.aliases().get("a").map(String::as_str), Some("docs"));
+}
+
+#[test]
+fn nidus_meta_resolves_through_an_alias() {
+    let mut db = Nidus::open_in_memory(2).unwrap();
+    db.create_collection("docs").unwrap();
+    db.set_alias("a", "docs").unwrap();
+
+    let mut meta = BTreeMap::new();
+    meta.insert("k".to_string(), "v".to_string());
+    db.set_meta("a", meta.clone()).unwrap();
+    assert_eq!(db.get_meta("docs"), meta);
+    assert_eq!(db.get_meta("a"), meta);
+}
+
+#[test]
+fn nidus_structural_verbs_refuse_an_alias() {
+    let mut db = Nidus::open_in_memory(2).unwrap();
+    db.create_collection("docs").unwrap();
+    db.set_alias("a", "docs").unwrap();
+
+    assert!(db.drop_collection("a").is_err());
+    assert!(db.set_fts_schema("a", &[FtsField::new("body")]).is_err());
+    assert!(
+        db.set_filter_index("a", &[FilterIndexField::new("body")])
+            .is_err()
+    );
+    assert!(db.create_collection("a").is_err());
 }
