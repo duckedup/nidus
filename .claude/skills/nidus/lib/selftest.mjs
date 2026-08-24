@@ -5,6 +5,7 @@ import * as laws from './laws.mjs'
 import * as fleet from './fleet.mjs'
 import * as pre from './preflight.mjs'
 import { lanes, formatLanes, ciGuard } from './lanes.mjs'
+import * as spec from './specdoc.mjs'
 
 const cases = []
 const test = (name, fn) => cases.push({ name, fn })
@@ -1030,6 +1031,65 @@ test('stale base: equal counts do not claim a difference that is not there', () 
   const found = laws.staleBase({ ref: 'main', hasRemote: true, behind: 2, examined: 10, examinedFresh: 10 })
   eq(ids(found), ['stale-base'], 'still flagged — the range is still wrong')
   eq(found[0].detail.includes('examined 10 file(s)'), false, 'no fabricated count comparison')
+})
+
+// ── spec section addressing (nidus-gmy.1) ──────────────────────────────────
+
+const DOC = [
+  '# Title',                       // 1
+  '',                              // 2
+  '## 1. First',                   // 3
+  'alpha bravo',                   // 4
+  '### 1.1 Nested',                // 5
+  'charlie',                       // 6
+  '## 2. Second',                  // 7
+  'delta alpha',                   // 8
+  '```',                           // 9
+  '## 7. Not a heading',           // 10
+  '```',                           // 11
+  '### Unnumbered Bit',            // 12
+  'echo',                          // 13
+]
+
+test('spec: headings carry level, number and span', () => {
+  const hs = spec.headings(DOC)
+  eq(hs.map(h => h.num), ['1', '1.1', '2', null], 'numbers')
+  eq(hs.map(h => h.line), [3, 5, 7, 12], 'lines')
+  eq(hs.map(h => h.end), [6, 6, 13, 13], 'ends')
+})
+
+test('spec: a heading inside a fence is not a heading', () => {
+  eq(spec.headings(DOC).some(h => h.num === '7'), false, 'fenced ## ignored')
+})
+
+test('spec: a section spans to the next heading of its own level or higher', () => {
+  const h = spec.locate(spec.headings(DOC), '1')
+  eq(spec.section(DOC, h), ['## 1. First', 'alpha bravo', '### 1.1 Nested', 'charlie'], 'section 1')
+})
+
+test('spec: an exact number is not hijacked by a slug substring', () => {
+  eq(spec.locate(spec.headings(DOC), '1').line, 3, 'numeric ref wins')
+  eq(spec.locate(spec.headings(DOC), 'unnumbered').line, 12, 'slug substring resolves')
+  eq(spec.locate(spec.headings(DOC), '9.9'), null, 'unknown ref is null')
+})
+
+test('spec: § and # prefixes are accepted on a ref', () => {
+  eq(spec.locate(spec.headings(DOC), '§1.1').line, 5, 'numeric with §')
+  eq(spec.locate(spec.headings(DOC), '#unnumbered-bit').line, 12, 'slug with #')
+})
+
+test('spec: find needs every word somewhere in the section, not on one line', () => {
+  eq(spec.search(DOC, ['alpha', 'charlie']).map(f => f.ref), ['§1'], 'words split across lines')
+  eq(spec.search(DOC, ['alpha', 'zulu']), [], 'a missing word matches nothing')
+})
+
+test('spec: find reports the innermost matching section, not its parent', () => {
+  eq(spec.search(DOC, ['charlie']).map(f => f.ref), ['§1.1'], 'child only')
+})
+
+test('spec: find with no words matches nothing rather than everything', () => {
+  eq(spec.search(DOC, []), [], 'empty query')
+  eq(spec.search(DOC, ['']), [], 'blank word')
 })
 
 export function selftest({ json = false } = {}) {
