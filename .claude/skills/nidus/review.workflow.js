@@ -89,6 +89,27 @@ mechanical ones, so do not re-report those; use them to judge intent:
 - Wire DTOs in src/server/dto.rs mirror the library's Hit/Footprint — the binary adapts to
   the library, never the reverse.`
 
+// nidus-jni: agents share ONE checkout with the coordinator, which may be running the
+// verification lanes concurrently. A temporary edit that is reverted still fails that run,
+// and leaves no trace to diagnose it by — so the recipe has to be in the prompt.
+const NO_MUTATION = `YOU SHARE ONE CHECKOUT with the coordinator, which may be running the verification lanes
+(\`just ci\`, \`just ci-cli\`, \`just test-e2e\`) right now. Never write a tracked file in it —
+not even temporarily and reverted. A skeptic once added a \`#[test]\` to src/fts/analyzer.rs,
+ran it, and reverted it; the concurrent \`just ci-cli\` failed on a test attributable to
+nothing in the diff, and by the time anyone looked the file was byte-identical to HEAD again.
+
+Fine here: reading anything, \`cargo test\`/\`cargo run\`/\`cargo clippy\` of the code AS IT
+STANDS, and \`gh\`/\`bd\`/\`git\` queries.
+
+To run CHANGED code — a probe, a temporary test, an edit-and-rerun — copy it out first:
+\`\`\`
+git worktree add /tmp/rv-<something-unique> HEAD
+${cfg.diffCmd} | git -C /tmp/rv-<something-unique> apply   # only for an uncommitted target
+\`\`\`
+then edit and run inside that worktree, and \`git worktree remove --force\` it when done.
+Running the code is worth this: a defect confirmed by execution scores far above one argued
+from reading. Just never confirm it in the shared tree.`
+
 const issues = (cfg.issues || []).filter(Boolean)
 const issueList = issues.join(', ')
 
@@ -225,6 +246,8 @@ Changed files: ${(cfg.changed || []).join(', ') || '(see the diff)'}
 
 ${d.prompt}
 
+${NO_MUTATION}
+
 ${HOUSE_RULES}
 
 ${lawsBlock}
@@ -289,6 +312,8 @@ EVIDENCE OFFERED: ${f.evidence}
 Read the actual code (diff: ${cfg.diffCmd}) and try to REFUTE it.
 
 ${angle}
+
+${NO_MUTATION}
 
 ${RUBRIC}`
 }
@@ -394,6 +419,8 @@ this code; do not take its word for anything.
 4. A criterion you cannot demonstrate is \`demonstrated: false\` with the reason. Do not
    mark one demonstrated because the code looks like it would work, and do not soften a
    criterion to fit what shipped.
+
+${NO_MUTATION}
 
 Build with the features the code needs (\`--features cli\`, \`memory\`, \`mcp\`) — \`just ci\`
 compiles the pure library only, so a criterion about the binary needs its own feature flag.`,
