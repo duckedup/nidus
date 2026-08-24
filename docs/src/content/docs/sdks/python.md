@@ -344,12 +344,20 @@ db.delete("docs", ["a"])            # by id
 db.delete_where("docs", f.and_(f.lt("year", 2000)))
 db.flush(); db.compact()
 db.drop_collection("docs")
+db.aliases()                        # dict[str, str]: every alias and its concrete target
+db.set_alias("docs", "docs_v2")     # create or repoint; the target must already exist
+db.drop_alias("docs")               # removes the alias, not the records
 db.health()                         # bool
 r = db.ready()                  # Readiness(ready=..., role=..., staleness_secs=...)
 if not r.ready: print(r.reason) # a 503 is an answer, not an exception
 db.cluster()                    # ClusterStatus
 db.refresh()                    # bool: did it adopt newer state
 ```
+
+`aliases()`, `set_alias()`, and `drop_alias()` exist on both `NidusClient` and
+`AsyncNidusClient` with matching signatures. An alias resolves in one hop: `set_alias`
+refuses a target that is itself an alias, and `drop_collection` refuses while an alias
+still points at the collection.
 
 Optional arguments all default to `None`, which means "omit the key" so the **server's**
 default applies (`top_k = 10`, `limit = 100`, `rrf_k = 60.0`, `candidates = 100`). Those

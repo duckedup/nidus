@@ -2,6 +2,7 @@
 //! service carrying part of its protocol in headers, so an in-process `oneshot` exercises
 //! neither. This file stays HTTP-only; `stdio`/`attrs`/`filters`/`hygiene` are siblings.
 
+mod aliases;
 mod attrs;
 mod dedupe;
 mod filters;
@@ -200,8 +201,12 @@ fn tools_list_is_complete_ordered_and_cacheable() {
             "browse",
             "related",
             "suggest",
+            "list_aliases",
+            "set_alias",
+            "drop_alias",
         ],
-        "tool list changed — if this is deliberate, append rather than reorder"
+        "tool list changed — if this is deliberate, append rather than reorder. The alias \
+         tools must stay last so `related`'s position never shifts (SEP-2549)."
     );
 
     // Required by SEP-2549 on every list result.

@@ -358,6 +358,10 @@ pub(crate) fn ensure_collection_and_pin<E: Embedder>(
     embedder: &E,
     collection: &str,
 ) -> anyhow::Result<()> {
+    // An alias is not a concrete collection, so `create_collection` on one would be refused;
+    // pin the target instead, which is where the rows actually land (nidus-klh).
+    let resolved = db.resolve_alias(collection);
+    let collection = resolved.as_deref().unwrap_or(collection);
     let identity = embedder_identity(embedder);
     let store_dim = db.dimension();
     if embedder.dimension() != store_dim {
@@ -727,6 +731,9 @@ pub(crate) fn guard_recall_identity<E: Embedder>(
     embedder: &E,
     collection: &str,
 ) -> anyhow::Result<()> {
+    // `has_collection` is false for an alias, which would silently skip the guard below.
+    let resolved = db.resolve_alias(collection);
+    let collection = resolved.as_deref().unwrap_or(collection);
     let identity = embedder_identity(embedder);
     match db.get_meta(collection).get(META_EMBEDDER) {
         Some(existing) => bail_if_identity_differs(collection, existing, &identity)?,
@@ -1205,6 +1212,37 @@ mod tests {
         assert!(
             msg.contains('4') && msg.contains('8'),
             "message names both dims: {msg}"
+        );
+    }
+
+    /// An alias is not a concrete collection, so `has_collection` is false for it — both
+    /// guards below would then misfire: the pin would try to *create* a collection whose
+    /// name an alias already owns, and the recall guard would silently skip (nidus-klh).
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // file-backed via open_tmp; also `memory` is off in the Miri lane.
+    async fn the_memory_guards_resolve_an_alias_to_its_target() {
+        let (_dir, mut db) = open_tmp(3);
+        let emb = FakeEmbedder::new(3, "fake", "v1");
+        db.create_collection("notes_v1").unwrap();
+        db.set_alias("notes", "notes_v1").unwrap();
+
+        // Would fail with "a collection named `notes` already exists" without resolution.
+        ensure_collection_and_pin(&mut db, &emb, "notes").unwrap();
+        assert_eq!(
+            db.get_meta("notes_v1")
+                .get(META_EMBEDDER)
+                .map(String::as_str),
+            Some(embedder_identity(&emb).as_str()),
+            "the identity must be pinned on the target, not on the alias name"
+        );
+
+        // A matching identity is now recorded, so the recall guard passes rather than
+        // falling through to the silent no-op arm.
+        guard_recall_identity(&db, &emb, "notes").unwrap();
+        let emb_v2 = FakeEmbedder::new(3, "fake", "v2");
+        assert!(
+            guard_recall_identity(&db, &emb_v2, "notes").is_err(),
+            "a different embedder reached through the alias must still be caught"
         );
     }
 

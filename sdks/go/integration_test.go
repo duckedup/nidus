@@ -660,6 +660,55 @@ func TestLifecycleAgainstARealServer(t *testing.T) {
 	})
 }
 
+// TestAliasesAgainstARealServer proves the one-hop blue/green swap end to end: search
+// through an alias resolves to the concrete collection, and dropping the alias leaves
+// the concrete collection's records reachable under their own name.
+func TestAliasesAgainstARealServer(t *testing.T) {
+	db := startServer(t)
+	ctx := context.Background()
+
+	// Only the target is a real collection: an alias shares the collection namespace, so
+	// "docs" must never have been created as one.
+	if err := db.CreateCollection(ctx, "docs_v2"); err != nil {
+		t.Fatalf("CreateCollection failed: %v", err)
+	}
+	if _, err := db.Upsert(ctx, "docs_v2", []Record{
+		{ID: "a", Vector: []float32{1, 0, 0}},
+	}); err != nil {
+		t.Fatalf("Upsert failed: %v", err)
+	}
+
+	if err := db.SetAlias(ctx, "docs", "docs_v2"); err != nil {
+		t.Fatalf("SetAlias failed: %v", err)
+	}
+	aliases, err := db.Aliases(ctx)
+	if err != nil {
+		t.Fatalf("Aliases failed: %v", err)
+	}
+	if aliases["docs"] != "docs_v2" {
+		t.Errorf("aliases = %v, want docs -> docs_v2", aliases)
+	}
+
+	hits, err := db.Search(ctx, SearchRequest{Scope: []string{"docs"}, Query: []float32{1, 0, 0}})
+	if err != nil {
+		t.Fatalf("Search through alias failed: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Collection != "docs_v2" {
+		t.Fatalf("search through alias = %+v, want one hit reporting collection docs_v2", hits)
+	}
+
+	if err := db.DropAlias(ctx, "docs"); err != nil {
+		t.Fatalf("DropAlias failed: %v", err)
+	}
+	hits, err = db.Search(ctx, SearchRequest{Scope: []string{"docs_v2"}, Query: []float32{1, 0, 0}})
+	if err != nil {
+		t.Fatalf("Search after DropAlias failed: %v", err)
+	}
+	if len(hits) != 1 || hits[0].ID != "a" {
+		t.Fatalf("search on docs_v2 after DropAlias = %+v, want the record still reachable", hits)
+	}
+}
+
 // TestRankingAndAnnotationsAgainstARealServer covers the surface the unit tests can
 // only pin the *bytes* of: the text predicates, multi-clause text queries, the
 // explain/highlight annotations, the ranking knobs, and /aggregate.

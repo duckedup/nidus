@@ -666,6 +666,32 @@ def test_a_collection_name_with_a_slash_and_a_space_round_trips(server: str) -> 
         assert name not in db.collections()
 
 
+def test_alias_lifecycle_against_a_real_server(server: str) -> None:
+    """Alias a fresh name onto a real collection, search through it, then drop it.
+
+    Proves the whole point of an alias: a caller addressing ``docs`` transparently reaches
+    ``docs_v2``'s records, and dropping the alias leaves those records untouched under the
+    concrete name.
+    """
+    with NidusClient(server, timeout=10.0) as db:
+        # Only the target is a real collection: an alias shares the collection namespace,
+        # so "docs" must never have been created as one.
+        db.create_collection("docs_v2")
+        db.upsert("docs_v2", [{"id": "a", "vector": [1.0, 0.0, 0.0], "attrs": {"v": 2}}])
+
+        assert db.aliases() == {}
+        db.set_alias("docs", "docs_v2")
+        assert db.aliases() == {"docs": "docs_v2"}
+
+        hits = db.search(query=[1.0, 0.0, 0.0], scope=["docs"], top_k=1)
+        assert [h.id for h in hits] == ["a"]
+        assert hits[0].collection == "docs_v2"
+
+        db.drop_alias("docs")
+        assert db.aliases() == {}
+        assert [h.id for h in db.list(scope=["docs_v2"])] == ["a"]
+
+
 async def test_the_async_client_drives_the_same_server(server: str) -> None:
     """The async twin against the real thing, so ``httpx``'s own URL handling is covered too.
 

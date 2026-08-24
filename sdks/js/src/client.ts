@@ -144,6 +144,21 @@ export class NidusClient {
     await this.request("DELETE", `/collections/${enc(name)}`);
   }
 
+  /** Every alias and the concrete collection it resolves to. */
+  aliases(): Promise<Record<string, string>> {
+    return this.request<Record<string, string>>("GET", "/aliases");
+  }
+
+  /** Create or repoint an alias. The target must already exist; aliases never chain. */
+  async setAlias(name: string, target: string): Promise<void> {
+    await this.request("PUT", `/aliases/${enc(name)}`, { target });
+  }
+
+  /** Remove an alias. Deletes no records. */
+  async dropAlias(name: string): Promise<void> {
+    await this.request("DELETE", `/aliases/${enc(name)}`);
+  }
+
   /** Read a collection's free-form string metadata. */
   getMeta(name: string): Promise<Record<string, string>> {
     return this.request<Record<string, string>>(

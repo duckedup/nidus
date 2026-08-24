@@ -120,6 +120,9 @@ fn tools() -> Vec<Tool> {
     // neither shifts the position of any tool that predates it (SEP-2549).
     v.push(search::related_tool());
     v.push(search::suggest_tool());
+    // The alias lifecycle tools: appended last for the same reason, so a future edit to
+    // `admin::tools()` never shifts them or anything that predates them.
+    v.extend(admin::alias_tools());
     v
 }
 
@@ -187,7 +190,7 @@ impl ServerHandler for NidusMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<rmcp::RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        // Unpaginated: eleven tools fit any client's budget.
+        // Unpaginated: fourteen tools fit any client's budget.
         Ok(ListToolsResult::with_all_items(tools())
             .with_ttl_ms(TOOLS_TTL_MS)
             .with_cache_scope(CacheScope::Public))
@@ -211,6 +214,9 @@ impl ServerHandler for NidusMcp {
             "browse" => self.browse(&args).await,
             "related" => self.related(&args).await,
             "suggest" => self.suggest(&args).await,
+            "list_aliases" => self.list_aliases().await,
+            "set_alias" => self.set_alias(&args).await,
+            "drop_alias" => self.drop_alias(&args).await,
             other => Err(McpError::invalid_params(
                 format!("unknown tool `{other}`"),
                 None,

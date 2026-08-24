@@ -44,6 +44,18 @@ searchers plus one writer (see
 | `set_fts_schema` | `fn set_fts_schema(&mut self, collection: &str, fields: &[FtsField]) -> Result<()>` | Declare/redeclare full-text fields any time; indexes existing docs once. Each [`FtsField`](/guides/search/#tuning-a-field) carries its own `k1`, `b`, and `Analyzer`. |
 | `set_filter_index` | `fn set_filter_index(&mut self, collection: &str, fields: &[FilterIndexField]) -> Result<()>` | Declare/redeclare [filter-indexed fields](/guides/search/#indexing-the-text-predicates) any time; indexes existing docs once. Speeds up the text predicates, changes no results. Empty list drops it. |
 
+### Aliases
+
+An indirect name resolving to one concrete collection, one hop only; see the
+[blue/green reindex guide](/guides/blue-green-reindex/).
+
+| Method | Signature | Notes |
+| ------ | --------- | ----- |
+| `set_alias` | `fn set_alias(&mut self, name: &str, target: &str) -> Result<()>` | Create or repoint an alias, atomically. Idempotent: repointing to the current target is a no-op. |
+| `drop_alias` | `fn drop_alias(&mut self, name: &str) -> Result<bool>` | Returns `true` if the alias existed. The underlying collection is untouched. |
+| `aliases` | `fn aliases(&self) -> BTreeMap<String, String>` | Every alias and the concrete collection it currently points at. |
+| `resolve_alias` | `fn resolve_alias(&self, name: &str) -> Option<String>` | `Some(target)` iff `name` is an alias; `None` for a concrete collection name or an unknown name. |
+
 ### Records
 
 | Method | Signature | Notes |

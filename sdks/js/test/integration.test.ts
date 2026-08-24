@@ -308,6 +308,20 @@ describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
     expect(result.matched).toBe(2);
   });
 
+  it("sets an alias and searches through it to the concrete collection", async () => {
+    await db.createCollection("docs_v2");
+    await db.upsert("docs_v2", [{ id: "z", vector: [1, 0, 0], attrs: { lang: "rust-v2" } }]);
+    await db.setAlias("docs_alias", "docs_v2");
+    expect(await db.aliases()).toMatchObject({ docs_alias: "docs_v2" });
+
+    const hits = await db.search({ scope: ["docs_alias"], query: [1, 0, 0], topK: 1 });
+    expect(hits[0]!.id).toBe("z");
+    expect(hits[0]!.collection).toBe("docs_v2");
+
+    await db.dropAlias("docs_alias");
+    expect(await db.aliases()).not.toHaveProperty("docs_alias");
+  });
+
   it("deletes and reflects the change in stats", async () => {
     expect(await db.delete("docs", { ids: ["b"] })).toBe(1);
     const remaining = await db.records("docs");

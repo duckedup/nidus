@@ -130,6 +130,7 @@ pub use store::Readiness;
 pub use store::SegmentReport;
 pub use tune::{TuneCell, TuneOpts, TuneReport, recall_at_k, tune};
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -332,46 +333,83 @@ impl Nidus {
         self.store.collections()
     }
 
+    // ── Aliases ──────────────────────────────────────────────────────────
+
+    /// Create or repoint a one-hop collection alias: one atomic manifest publish, so a
+    /// concurrent reader sees the old target or the new one, never nothing. Structural
+    /// verbs refuse an alias name; data verbs (`upsert`, `get`, …) resolve through it.
+    pub fn set_alias(&mut self, name: &str, target: &str) -> Result<()> {
+        self.store.set_alias(name, target)
+    }
+
+    /// Drop an alias. `Ok(false)` when `name` was not an alias.
+    pub fn drop_alias(&mut self, name: &str) -> Result<bool> {
+        self.store.drop_alias(name)
+    }
+
+    pub fn aliases(&self) -> BTreeMap<String, String> {
+        self.store.aliases()
+    }
+
+    /// `Some(target)` iff `name` is an alias.
+    pub fn resolve_alias(&self, name: &str) -> Option<String> {
+        self.store.resolve_alias(name)
+    }
+
     // ── Per-collection metadata ──────────────────────────────────────────
 
     pub fn get_meta(&self, collection: &str) -> BTreeMap<String, String> {
-        self.store.get_meta(collection)
+        self.store.get_meta(&self.concrete(collection))
     }
 
     pub fn set_meta(&mut self, collection: &str, meta: BTreeMap<String, String>) -> Result<()> {
-        self.store.set_meta(collection, meta)
+        let concrete = self.concrete(collection).into_owned();
+        self.store.set_meta(&concrete, meta)
     }
 
     // ── Documents ────────────────────────────────────────────────────────
 
     pub fn upsert(&mut self, collection: &str, records: &[Record]) -> Result<usize> {
-        self.store.upsert(collection, records)
+        let concrete = self.concrete(collection).into_owned();
+        self.store.upsert(&concrete, records)
     }
 
     pub fn delete(&mut self, collection: &str, ids: &[&str]) -> Result<usize> {
-        self.store.delete(collection, ids)
+        let concrete = self.concrete(collection).into_owned();
+        self.store.delete(&concrete, ids)
     }
 
     pub fn delete_where(&mut self, collection: &str, filter: &Filter) -> Result<usize> {
         filter::validate(filter)?;
-        self.store.delete_where(collection, filter)
+        let concrete = self.concrete(collection).into_owned();
+        self.store.delete_where(&concrete, filter)
     }
 
     pub fn get_all(&self, collection: &str) -> Vec<Record> {
-        self.store.get_all(collection)
+        self.store.get_all(&self.concrete(collection))
     }
 
     pub fn get(&self, collection: &str, id: &str) -> Option<Record> {
-        self.store.get(collection, id)
+        self.store.get(&self.concrete(collection), id)
     }
 
-    /// Resolve a [`Scope`] to the concrete collection names it covers — shared by
-    /// `list`/`search`/`text_search`/`hybrid_search` so the resolution lives in one
-    /// place.
+    /// One-hop alias resolution for a bare collection name at a data entry point. Structural
+    /// verbs and `has_collection` do not call this — they refuse or answer about concrete
+    /// names only.
+    fn concrete<'a>(&self, name: &'a str) -> Cow<'a, str> {
+        match self.store.resolve_alias(name) {
+            Some(target) => Cow::Owned(target),
+            None => Cow::Borrowed(name),
+        }
+    }
+
+    /// Resolve a [`Scope`] to the concrete collection names it covers — shared by every
+    /// search-shaped method. `Scope::All` already returns concrete names from
+    /// `Store::collections`, so it gains no alias names (that would double-scan).
     fn scope_names<'a>(&self, scope: impl Into<Scope<'a>>) -> Vec<String> {
         match scope.into() {
-            Scope::Collection(c) => vec![c.to_string()],
-            Scope::Collections(cs) => cs.iter().map(|s| s.to_string()).collect(),
+            Scope::Collection(c) => vec![self.concrete(c).into_owned()],
+            Scope::Collections(cs) => cs.iter().map(|s| self.concrete(s).into_owned()).collect(),
             Scope::All => self.store.collections(),
         }
     }
@@ -452,7 +490,8 @@ impl Nidus {
         filter::validate(&opts.filter)?;
         let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        self.store.search_similar(&refs, collection, id, opts)
+        self.store
+            .search_similar(&refs, &self.concrete(collection), id, opts)
     }
 
     /// Like [`Nidus::search_similar`], but also reports how the query ran (nidus-cvz).
@@ -467,7 +506,7 @@ impl Nidus {
         let names = self.scope_names(scope);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         self.store
-            .search_similar_with_plan(&refs, collection, id, opts)
+            .search_similar_with_plan(&refs, &self.concrete(collection), id, opts)
     }
 
     /// Full-text (BM25) search over a [`Scope`], merged into one ranking. Requires the field to be

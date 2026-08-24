@@ -7,10 +7,11 @@ Every flag the `nidus` binary accepts, generated from `nidus --help` and each su
 own `--help`. For a guided tour with worked examples, see the [command-line
 guide](/guides/cli-and-server/); this page is the exhaustive reference.
 
-The binary has **28 subcommands**: `serve`, `mcp`, `collections`, `create`, `drop`,
+The binary has **31 subcommands**: `serve`, `mcp`, `collections`, `create`, `drop`,
 `upsert`, `search`, `similar`, `aggregate`, `list`, `set-fts-schema`, `suggest`,
 `text-search`, `hybrid-search`, `get`, `delete`, `compact`, `versions`, `configure`,
-`backup`, `restore`, `verify`, `check`, `stats`, `tune`, `ingest`, `remember`, `recall`.
+`backup`, `restore`, `verify`, `check`, `stats`, `tune`, `ingest`, `remember`, `recall`,
+`aliases`, `set-alias`, `drop-alias`.
 
 ## Feature gating
 
@@ -19,7 +20,7 @@ binary was built:
 
 | Install | Command | Surface |
 | --- | --- | --- |
-| `cargo binstall nidus` (prebuilt), or the install script | n/a | Everything below: all 28 subcommands, every `--embed-*`/`--summarize-*` flag, `mcp`, `ingest`, `remember`, `recall` |
+| `cargo binstall nidus` (prebuilt), or the install script | n/a | Everything below: all 31 subcommands, every `--embed-*`/`--summarize-*` flag, `mcp`, `ingest`, `remember`, `recall` |
 | `cargo install nidus --features cli` | build from source | No `mcp`, `ingest`, `remember`, or `recall` subcommand, and `serve` has **no** `--embed-*`/`--summarize-*` flags |
 
 The prebuilt binaries (`cargo binstall`, the install script, and the release
@@ -183,6 +184,36 @@ beyond the store flags.
 
 Drop a collection and its records. Usage: `nidus drop [OPTIONS] --dir <DIR> <NAME>`.
 No flags beyond the store flags.
+
+### `aliases`
+
+List aliases and the collections they resolve to. Usage:
+`nidus aliases [OPTIONS] --dir <DIR>`. No flags beyond the store flags.
+
+```
+nidus aliases --dir ./mystore
+```
+
+### `set-alias`
+
+Create or repoint an alias at a concrete collection, in one call. Usage:
+`nidus set-alias [OPTIONS] --dir <DIR> <NAME> <TARGET>`. No flags beyond the store
+flags. The target must already exist as a concrete collection, and aliases never
+chain: pointing one alias at another is rejected.
+
+```
+nidus set-alias --dir ./mystore docs docs_v2
+```
+
+### `drop-alias`
+
+Remove an alias. Deletes no records; the collection it pointed at is untouched.
+Usage: `nidus drop-alias [OPTIONS] --dir <DIR> <NAME>`. No flags beyond the store
+flags.
+
+```
+nidus drop-alias --dir ./mystore docs
+```
 
 ### `upsert`
 

@@ -1032,6 +1032,24 @@ enum Command {
         store: StoreArgs,
         name: String,
     },
+    /// List aliases and the collections they resolve to.
+    Aliases {
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Create or repoint an alias at a concrete collection.
+    SetAlias {
+        #[command(flatten)]
+        store: StoreArgs,
+        name: String,
+        target: String,
+    },
+    /// Remove an alias. Does not delete any records.
+    DropAlias {
+        #[command(flatten)]
+        store: StoreArgs,
+        name: String,
+    },
     /// Upsert records (JSON array of records) from a file or stdin.
     Upsert {
         #[command(flatten)]
@@ -1628,6 +1646,24 @@ pub fn run(cli: Cli) -> Result<()> {
             let mut db = open(&store, true)?;
             db.drop_collection(&name)?;
             print_json(&serde_json::json!({ "dropped": name }))
+        }
+        Command::Aliases { store } => {
+            let db = open(&store, false)?;
+            print_json(&db.aliases())
+        }
+        Command::SetAlias {
+            store,
+            name,
+            target,
+        } => {
+            let mut db = open(&store, true)?;
+            db.set_alias(&name, &target)?;
+            print_json(&serde_json::json!({ "alias": name, "target": target }))
+        }
+        Command::DropAlias { store, name } => {
+            let mut db = open(&store, true)?;
+            let existed = db.drop_alias(&name)?;
+            print_json(&serde_json::json!({ "dropped": name, "existed": existed }))
         }
         Command::Upsert {
             store,
@@ -3753,6 +3789,37 @@ mod tests {
         match cli.command {
             Command::Collections { store } => assert_eq!(store.dim, None),
             _ => panic!("expected Collections"),
+        }
+    }
+
+    #[test]
+    fn aliases_parses() {
+        let cli = Cli::try_parse_from(["nidus", "aliases", "--dir", "/tmp/s"]).unwrap();
+        match cli.command {
+            Command::Aliases { store } => assert_eq!(store.dir, PathBuf::from("/tmp/s")),
+            _ => panic!("expected Aliases"),
+        }
+    }
+
+    #[test]
+    fn set_alias_parses_name_and_target_in_order() {
+        let cli = Cli::try_parse_from(["nidus", "set-alias", "--dir", "/tmp/s", "docs", "docs_v2"])
+            .unwrap();
+        match cli.command {
+            Command::SetAlias { name, target, .. } => {
+                assert_eq!(name, "docs");
+                assert_eq!(target, "docs_v2");
+            }
+            _ => panic!("expected SetAlias"),
+        }
+    }
+
+    #[test]
+    fn drop_alias_parses_name() {
+        let cli = Cli::try_parse_from(["nidus", "drop-alias", "--dir", "/tmp/s", "docs"]).unwrap();
+        match cli.command {
+            Command::DropAlias { name, .. } => assert_eq!(name, "docs"),
+            _ => panic!("expected DropAlias"),
         }
     }
 

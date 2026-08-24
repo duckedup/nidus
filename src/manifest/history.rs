@@ -1,6 +1,9 @@
 //! Bounded, opt-in history of past commit points (nidus-bnf): enough per entry to
 //! reconstruct the reader snapshot a manifest publish named. New object keys only —
-//! the live `manifest` stays format v2 (SPEC §14.2 history subsection).
+//! this module tracks the live `manifest` format independently (SPEC §14.2 history
+//! subsection).
+
+use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -10,9 +13,10 @@ use crate::backend::Persistence;
 use crate::model::Distance;
 use crate::profile::OpenProfile;
 
-/// History frame format version (there is only v1 so far). `pub(crate)` so `store/write.rs`
-/// can stamp a freshly-built [`HistoryEntry`]/[`HistoryFloor`] without a second constant.
-pub(crate) const HIST_FORMAT_VERSION: u16 = 1;
+/// History frame format version. v2 appends `aliases` to [`HistoryEntry`]; a v1 entry still
+/// loads, lifted with an empty alias map. `pub(crate)` so `store/write.rs` can stamp a
+/// freshly-built [`HistoryEntry`]/[`HistoryFloor`] without a second constant.
+pub(crate) const HIST_FORMAT_VERSION: u16 = 2;
 const HIST_PREFIX: &str = "hist-";
 const FLOOR_KEY: &str = "hist-floor";
 
@@ -32,6 +36,25 @@ pub(crate) struct HistoryEntry {
     pub profile: OpenProfile,
     /// Display only, never addressable (`--at-time` is a purely additive follow-up).
     pub commit_millis: u64,
+    /// Alias table as it stood at this commit (nidus-klh). Added in v2; a lifted v1
+    /// entry gets an empty map.
+    pub aliases: BTreeMap<String, String>,
+}
+
+/// The v1 `HistoryEntry` shape (no `aliases`). Frozen: this is v1's exact historical layout,
+/// so editing it silently breaks reading history entries written before v2.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct HistoryEntryV1 {
+    format_version: u16,
+    version: u64,
+    dimension: u64,
+    distance: Distance,
+    segments: Vec<String>,
+    next_id: u64,
+    row_count: u64,
+    log_offset: u64,
+    profile: OpenProfile,
+    commit_millis: u64,
 }
 
 /// The retention floor: no version below this is readable, whatever objects survive —
@@ -47,30 +70,54 @@ impl HistoryEntry {
     /// Reconstruct the [`Manifest`] this entry named, for `Segments::open` /
     /// `OpLog::open_bounded` to rebuild the pinned snapshot against.
     pub(crate) fn manifest(&self) -> Manifest {
-        Manifest::new(
+        let mut m = Manifest::new(
             self.dimension as usize,
             self.distance,
             self.segments.clone(),
             self.next_id,
             self.version,
             self.profile.clone(),
-        )
+        );
+        m.aliases = self.aliases.clone();
+        m
     }
 
     fn encode(&self) -> Result<Vec<u8>> {
         encode_frame(self)
     }
 
+    /// bincode is positional, not self-describing, so a v1 buffer (no `aliases`) runs out of
+    /// bytes before filling that field — decode into the old shape first, then dispatch on
+    /// its version, mirroring `Manifest::decode` exactly.
     fn decode(bytes: &[u8]) -> Result<HistoryEntry> {
-        let entry: HistoryEntry = decode_frame(bytes, "history entry")?;
-        if entry.format_version != HIST_FORMAT_VERSION {
-            bail!(
+        let payload = checked_payload(bytes, "history entry")?;
+        let v1: HistoryEntryV1 =
+            bincode::deserialize(payload).context("deserialize history entry")?;
+        match v1.format_version {
+            1 => Ok(HistoryEntry {
+                format_version: v1.format_version,
+                version: v1.version,
+                dimension: v1.dimension,
+                distance: v1.distance,
+                segments: v1.segments,
+                next_id: v1.next_id,
+                row_count: v1.row_count,
+                log_offset: v1.log_offset,
+                profile: v1.profile,
+                commit_millis: v1.commit_millis,
+                aliases: BTreeMap::new(),
+            }),
+            2 => {
+                let entry: HistoryEntry =
+                    bincode::deserialize(payload).context("deserialize history entry")?;
+                Ok(entry)
+            }
+            other => bail!(
                 "history entry format version {} is not supported (expected {})",
-                entry.format_version,
+                other,
                 HIST_FORMAT_VERSION
-            );
+            ),
         }
-        Ok(entry)
     }
 }
 
@@ -79,9 +126,12 @@ impl HistoryFloor {
         encode_frame(self)
     }
 
+    /// Unlike `HistoryEntry`, the floor's shape never changed across v1/v2 — widen the
+    /// accepted range instead of freezing a V1 shape, or a v1 floor becomes unreadable
+    /// for no reason.
     fn decode(bytes: &[u8]) -> Result<HistoryFloor> {
         let floor: HistoryFloor = decode_frame(bytes, "history floor")?;
-        if floor.format_version != HIST_FORMAT_VERSION {
+        if !(1..=HIST_FORMAT_VERSION).contains(&floor.format_version) {
             bail!(
                 "history floor format version {} is not supported (expected {})",
                 floor.format_version,
@@ -102,9 +152,10 @@ fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// CRC32-verified decode shared by [`HistoryEntry::decode`] and [`HistoryFloor::decode`];
-/// the format-version check is the caller's, since the two types don't share one.
-fn decode_frame<T: for<'de> Deserialize<'de>>(bytes: &[u8], what: &str) -> Result<T> {
+/// CRC-verify a frame and hand back its payload slice, so a caller that needs to decode into
+/// more than one candidate shape (e.g. [`HistoryEntry::decode`]'s v1/v2 dispatch) does the
+/// CRC check exactly once.
+fn checked_payload<'a>(bytes: &'a [u8], what: &str) -> Result<&'a [u8]> {
     if bytes.len() < 4 {
         bail!(
             "{what} object is truncated: {} bytes (need ≥ 4)",
@@ -120,6 +171,13 @@ fn decode_frame<T: for<'de> Deserialize<'de>>(bytes: &[u8], what: &str) -> Resul
              {what} object is corrupt"
         );
     }
+    Ok(payload)
+}
+
+/// CRC32-verified decode shared by [`HistoryFloor::decode`] and the encode side; the
+/// format-version check is the caller's, since the two types don't share one.
+fn decode_frame<T: for<'de> Deserialize<'de>>(bytes: &[u8], what: &str) -> Result<T> {
+    let payload = checked_payload(bytes, what)?;
     bincode::deserialize(payload).context(format!("deserialize {what}"))
 }
 
@@ -232,6 +290,7 @@ mod tests {
             log_offset: 42,
             profile: OpenProfile::default(),
             commit_millis: 1_700_000_000_000,
+            aliases: BTreeMap::new(),
         }
     }
 
@@ -243,6 +302,61 @@ mod tests {
         let back = load_entry(&p, 7).unwrap().unwrap();
         assert_eq!(back, entry);
         assert!(load_entry(&p, 8).unwrap().is_none());
+    }
+
+    #[test]
+    fn entry_round_trips_with_aliases() {
+        let p = MemBackend::default();
+        let mut entry = sample_entry(9);
+        entry
+            .aliases
+            .insert("docs".to_string(), "docs_v2".to_string());
+        store_entry(&p, &entry).unwrap();
+        let back = load_entry(&p, 9).unwrap().unwrap();
+        assert_eq!(back, entry);
+        assert_eq!(
+            back.manifest().aliases.get("docs"),
+            Some(&"docs_v2".to_string())
+        );
+    }
+
+    /// A hand-built v1 blob (no `aliases`), decoded WITHOUT ever calling the current
+    /// `encode` — the gap that would let a broken lift path go green.
+    #[test]
+    fn entry_decode_lifts_a_hand_built_v1_blob() {
+        let v1 = HistoryEntryV1 {
+            format_version: 1,
+            version: 4,
+            dimension: 8,
+            distance: Distance::Cosine,
+            segments: vec!["data".to_string()],
+            next_id: 1,
+            row_count: 2,
+            log_offset: 10,
+            profile: OpenProfile::default(),
+            commit_millis: 1_700_000_000_000,
+        };
+        let payload = bincode::serialize(&v1).unwrap();
+        let crc = crc32fast::hash(&payload);
+        let mut bytes = Vec::with_capacity(4 + payload.len());
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+
+        let entry = HistoryEntry::decode(&bytes).unwrap();
+        assert_eq!(entry.format_version, 1);
+        assert_eq!(entry.version, 4);
+        assert!(entry.aliases.is_empty());
+    }
+
+    /// A hand-built v1 [`HistoryFloor`] blob still loads under the widened v1..=v2 check.
+    #[test]
+    fn floor_decode_still_loads_a_v1_floor() {
+        let floor = HistoryFloor {
+            format_version: 1,
+            oldest_readable: 3,
+        };
+        let bytes = floor.encode().unwrap();
+        assert_eq!(HistoryFloor::decode(&bytes).unwrap(), floor);
     }
 
     #[test]

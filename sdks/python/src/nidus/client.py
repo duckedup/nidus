@@ -160,6 +160,18 @@ class NidusClient:
         """Drop a collection and all its records."""
         self._request("DELETE", _wire.collection_path(name))
 
+    def aliases(self) -> dict[str, str]:
+        """Every alias and the concrete collection it resolves to."""
+        return _wire.decode_aliases(self._request("GET", _wire.ALIASES))
+
+    def set_alias(self, name: str, target: str) -> None:
+        """Create or repoint an alias. The target must exist; aliases never chain."""
+        self._request("PUT", _wire.alias_path(name), _wire.alias_body(target))
+
+    def drop_alias(self, name: str) -> None:
+        """Remove an alias. Deletes no records."""
+        self._request("DELETE", _wire.alias_path(name))
+
     def get_meta(self, name: str) -> dict[str, str]:
         """Read a collection's free-form string metadata."""
         return _wire.decode_meta(self._request("GET", _wire.meta_path(name)))

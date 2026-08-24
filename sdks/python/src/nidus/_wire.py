@@ -110,11 +110,17 @@ LIST = "/list"
 AGGREGATE = "/aggregate"
 FLUSH = "/flush"
 COMPACT = "/compact"
+ALIASES = "/aliases"
 
 
 def collection_path(name: str) -> str:
     """``/collections/{name}`` — create (POST) or drop (DELETE)."""
     return f"{COLLECTIONS}/{quote(name, safe='')}"
+
+
+def alias_path(name: str) -> str:
+    """``/aliases/{name}`` — set (PUT) or drop (DELETE)."""
+    return f"{ALIASES}/{quote(name, safe='')}"
 
 
 def meta_path(name: str) -> str:
@@ -198,6 +204,11 @@ def meta_body(meta: Mapping[str, str]) -> dict[str, str]:
     serializes only real dicts, and because a caller's ``Mapping`` may hold anything.
     """
     return {str(k): str(val) for k, val in meta.items()}
+
+
+def alias_body(target: str) -> dict[str, str]:
+    """Body for ``PUT /aliases/{name}``."""
+    return {"target": target}
 
 
 def delete_ids_body(ids: Sequence[str]) -> dict[str, Any]:
@@ -936,6 +947,10 @@ def decode_collections(payload: Any) -> list[str]:
 
 
 def decode_meta(payload: Any) -> dict[str, str]:
+    return {str(k): str(val) for k, val in (payload or {}).items()}
+
+
+def decode_aliases(payload: Any) -> dict[str, str]:
     return {str(k): str(val) for k, val in (payload or {}).items()}
 
 

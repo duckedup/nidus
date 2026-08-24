@@ -1151,6 +1151,29 @@ def test_decode_collections_and_meta() -> None:
     assert _wire.decode_meta(None) == {}
 
 
+# ── Aliases ──────────────────────────────────────────────────────────────────────────
+
+
+def test_alias_path() -> None:
+    assert _wire.alias_path("docs") == "/aliases/docs"
+
+
+def test_alias_path_is_escaped_to_a_single_path_segment() -> None:
+    """Same escaping as `collection_path`: a slash or space must not change the route."""
+    assert _wire.alias_path("a/b c") == "/aliases/a%2Fb%20c"
+    assert _wire.alias_path("q?x#y") == "/aliases/q%3Fx%23y"
+
+
+def test_alias_body_uses_the_target_key() -> None:
+    """`{"target": ...}` is the only body key the server accepts for `PUT /aliases/{name}`."""
+    assert _wire.alias_body("docs_v2") == {"target": "docs_v2"}
+
+
+def test_decode_aliases() -> None:
+    assert _wire.decode_aliases({"docs": "docs_v2"}) == {"docs": "docs_v2"}
+    assert _wire.decode_aliases(None) == {}
+
+
 def test_write_counts_are_decoded_by_name_and_default_to_zero() -> None:
     """One decoder per response key, so the key names live here and not in two clients."""
     assert _wire.decode_upserted({"upserted": 2}) == 2

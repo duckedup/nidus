@@ -143,7 +143,9 @@ pub enum Value {
 
 - **Collections** are logical partitions (namespaces) identified by a `&str`. There
   are many; each is created/dropped independently; all share the store's single
-  pinned dimension.
+  pinned dimension. A collection may also have one or more **aliases**: an indirect
+  name resolving to it in one hop, used to repoint a caller's fixed collection name
+  at a freshly built collection atomically (§14.2).
 - **Dimension** is fixed for the life of the store, recorded in the `data` header.
   Reopening with a different dimension is a hard error. One store = one embedding
   model = one comparable vector space. A **query** vector of the wrong length is a
@@ -2243,7 +2245,7 @@ mutated: only created, merged, or dropped. The store becomes three things:
 - a tiny **manifest** naming the live segments (the atomic commit point — swapping it
   publishes a new state).
 
-**The manifest is FORMAT VERSION 2** (nidus-141): besides the enforced pins (dimension,
+**The manifest is FORMAT VERSION 3** (nidus-141): besides the enforced pins (dimension,
 distance — a mismatch on open is a hard error, never silently reconciled) it now also
 carries an *advisory* `OpenProfile`: recorded defaults for `ann`, `quantization`,
 `query_threads`, and `mmap`. These are plain defaults, not invariants — an explicit flag
@@ -2260,9 +2262,42 @@ a bug: the alternative (silently downgrading a v2 manifest's profile away to sta
 v1-readable) would make configuring a store next to a mixed fleet of binary versions look
 like it worked and then silently stop applying.
 
+**Manifest v3: collection aliases (nidus-klh).** v3 appends `aliases:
+BTreeMap<String, String>`, alias name to concrete collection name, so a store can be
+reindexed blue/green: build `docs_v2` beside `docs`, verify it, then atomically repoint
+`docs` at it with one manifest publish. A v3 decode accepts a v1 manifest (empty profile,
+empty aliases) and a v2 manifest (empty aliases) and lifts both in place, so every
+existing store keeps opening. The reverse does not hold: once anything rewrites the
+manifest at v3, a pre-0.89 binary hard-fails with "manifest format version 3 is not
+supported." That is the same accepted, one-time upgrade cost v2 carried pre-0.60, spent
+here knowingly.
+
+**Why the manifest and not the op-log.** Alias state recorded in the log would be
+replay-derived, so `compact()` would have to re-emit it the way it re-emits
+`SetFtsFields`, and forgetting that loses aliases silently. The manifest keeps one source
+of truth for alias state and inherits the cluster `put_cas` fence from the existing
+`persist_manifest` publish path, the same atomicity a segment-set swap gets.
+
+Resolution is **one hop, never chained**: an alias pointing at an alias is rejected at
+write time, not resolved at read time. Resolution happens above the store layer, so every
+scan, filter-index lookup, and `Hit` reports the **concrete** collection name (ids are
+only unique within one collection). Write semantics split by kind: the data verbs
+(`upsert`, `delete`, `delete_where`, `get`, `get_all`, `get_meta`, `set_meta`) resolve
+through an alias; the structural verbs (`drop_collection`, `set_fts_schema`,
+`set_filter_index`, `create_collection_with_fts`) refuse one, so nobody destroys a
+collection through an indirect name. Aliases share the collection namespace: a name
+cannot be both, in either direction. An alias may not name a collection that does not
+exist, and a collection may not be dropped while an alias points at it, so an alias never
+resolves to nothing.
+
+**History follows the format bump.** `HIST_FORMAT_VERSION` goes 1 → 2 and `HistoryEntry`
+records the alias map as it stood at that commit, so a pinned point-in-time read
+(`Config::at_version`) resolves aliases against the historical state rather than against
+live state.
+
 **Manifest history (nidus-bnf): opt-in point-in-time reads.** The live `manifest` object
-is still overwritten on every publish (format unchanged, still v2) — history lives in
-**new object keys** instead: `hist-{version:020}` (a `HistoryEntry` per commit point:
+is still overwritten on every publish (this feature alone did not bump the format) —
+history lives in **new object keys** instead: `hist-{version:020}` (a `HistoryEntry` per commit point:
 the segment set, `next_id`, `row_count`, the *exact log length at that commit*, the
 recorded `OpenProfile`, and a display-only wall-clock stamp) and `hist-floor` (a
 `HistoryFloor{oldest_readable}`, the retention/compaction fence below). Both are CRC32 +

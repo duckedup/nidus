@@ -17,7 +17,7 @@ use axum::{
     http::StatusCode,
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde_json::{Value as JsonValue, json};
 use tokio::net::TcpListener;
@@ -30,7 +30,8 @@ use dto::{
     AggregateRequest, AggregationDto, AnnDto, BatchFuse, BatchSearchRequest, BatchSearchResponse,
     CompactRequest, DeleteRequest, FilterIndexRequest, FootprintDto, FtsSchemaRequest, HitDto,
     HybridSearchRequest, ListRequest, MAX_BATCH_QUERIES, MAX_TOP_K, SearchRequest, SearchResponse,
-    SimilarRequest, SuggestRequest, SuggestionsDto, TextSearchRequest, UpsertRequest, VersionsDto,
+    SetAliasRequest, SimilarRequest, SuggestRequest, SuggestionsDto, TextSearchRequest,
+    UpsertRequest, VersionsDto,
 };
 
 // ── AI-ingest (memory) imports: only under the `memory` feature (pulled by the
@@ -451,6 +452,8 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
             "/collections/{name}",
             post(create_collection).delete(drop_collection),
         )
+        .route("/aliases", get(list_aliases))
+        .route("/aliases/{name}", put(set_alias).delete(drop_alias))
         .route("/collections/{name}/meta", get(get_meta).put(set_meta))
         .route("/collections/{name}/upsert", post(upsert))
         .route("/collections/{name}/delete", post(delete_records))
@@ -743,6 +746,38 @@ async fn drop_collection(
 ) -> Result<Json<JsonValue>, ApiError> {
     let dropped = run_write(st, move |db| {
         db.drop_collection(&name)?;
+        Ok(name)
+    })
+    .await?;
+    Ok(Json(json!({ "dropped": dropped })))
+}
+
+async fn list_aliases(
+    State(st): State<AppState>,
+) -> Result<Json<std::collections::BTreeMap<String, String>>, ApiError> {
+    let aliases = run_read(st, |db| Ok(db.aliases())).await?;
+    Ok(Json(aliases))
+}
+
+async fn set_alias(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<SetAliasRequest>,
+) -> Result<Json<JsonValue>, ApiError> {
+    let (name, target) = run_write(st, move |db| {
+        db.set_alias(&name, &req.target)?;
+        Ok((name, req.target))
+    })
+    .await?;
+    Ok(Json(json!({ "alias": name, "target": target })))
+}
+
+async fn drop_alias(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<JsonValue>, ApiError> {
+    let dropped = run_write(st, move |db| {
+        db.drop_alias(&name)?;
         Ok(name)
     })
     .await?;
@@ -1892,6 +1927,10 @@ fn classify(err: &anyhow::Error) -> StatusCode {
         // A rejected FTS or filter-index declaration, a clause-less text query, or a
         // malformed ranking knob: bad request bodies, not server faults.
         StatusCode::BAD_REQUEST
+    } else if msg.contains("alias") {
+        // Every alias rejection (nidus-klh) — bad name, chain, collision, dangling
+        // target, or a structural verb hitting an alias — is a caller mistake.
+        StatusCode::BAD_REQUEST
     } else if msg.contains("read-only store") {
         StatusCode::FORBIDDEN
     } else if msg.contains("store is locked") {
@@ -2008,6 +2047,23 @@ mod tests {
 
     fn get(path: &str) -> Request<Body> {
         Request::builder().uri(path).body(Body::empty()).unwrap()
+    }
+
+    fn put(path: &str, body: JsonValue) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn delete(path: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap()
     }
 
     /// A genuinely bodyless POST — no `content-type`, no body — the shape every shipped SDK
@@ -4167,6 +4223,135 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(json_body(resp).await.is_array());
+    }
+
+    /// `PUT /aliases/{name}` repoints, and a search scoped to the alias reports the
+    /// concrete target collection on the wire (nidus-klh).
+    #[tokio::test]
+    async fn setting_an_alias_resolves_search_to_the_concrete_collection() {
+        let app = test_router(2);
+        app.clone()
+            .oneshot(post("/collections/docs_v2", json!({})))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/collections/docs_v2/upsert",
+                json!({"records": [{"id": "a", "vector": [1.0, 0.0], "attrs": {}}]}),
+            ))
+            .await
+            .unwrap();
+
+        let resp = app
+            .clone()
+            .oneshot(put("/aliases/docs", json!({"target": "docs_v2"})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["alias"], "docs");
+        assert_eq!(body["target"], "docs_v2");
+
+        let resp = app
+            .oneshot(post(
+                "/search",
+                json!({"query": [1.0, 0.0], "top_k": 5, "scope": ["docs"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = json_body(resp).await;
+        let hits = hits.as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["collection"], "docs_v2");
+    }
+
+    /// `GET /aliases` serves the alias map; `GET /collections` stays a flat array of
+    /// concrete names only, never the alias.
+    #[tokio::test]
+    async fn listing_aliases_is_separate_from_listing_collections() {
+        let app = test_router(2);
+        app.clone()
+            .oneshot(post("/collections/docs_v2", json!({})))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(put("/aliases/docs", json!({"target": "docs_v2"})))
+            .await
+            .unwrap();
+
+        let resp = app.clone().oneshot(get("/aliases")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["docs"], "docs_v2");
+
+        let resp = app.oneshot(get("/collections")).await.unwrap();
+        let names: Vec<String> = serde_json::from_value(json_body(resp).await).unwrap();
+        assert!(names.contains(&"docs_v2".to_string()));
+        assert!(!names.contains(&"docs".to_string()));
+    }
+
+    /// Aliases resolve in one hop only: repointing through an existing alias is a 4xx
+    /// carrying the pinned chain message.
+    #[tokio::test]
+    async fn a_chained_alias_repoint_is_rejected() {
+        let app = test_router(2);
+        app.clone()
+            .oneshot(post("/collections/b", json!({})))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(put("/aliases/a", json!({"target": "b"})))
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(put("/aliases/shortcut", json!({"target": "a"})))
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error(), "{}", resp.status());
+        let body = json_body(resp).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("is itself an alias"),
+            "{body}"
+        );
+    }
+
+    /// Dropping an alias never drops the data it pointed at.
+    #[tokio::test]
+    async fn dropping_an_alias_does_not_drop_its_target_collection() {
+        let app = test_router(2);
+        app.clone()
+            .oneshot(post("/collections/docs_v2", json!({})))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(put("/aliases/docs", json!({"target": "docs_v2"})))
+            .await
+            .unwrap();
+
+        let resp = app.clone().oneshot(delete("/aliases/docs")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["dropped"], "docs");
+
+        let resp = app.oneshot(get("/collections")).await.unwrap();
+        let names: Vec<String> = serde_json::from_value(json_body(resp).await).unwrap();
+        assert!(names.contains(&"docs_v2".to_string()));
+    }
+
+    /// A target that does not exist is refused, never silently accepted as dangling.
+    #[tokio::test]
+    async fn setting_an_alias_at_a_nonexistent_target_is_rejected() {
+        let app = test_router(2);
+        let resp = app
+            .oneshot(put("/aliases/docs", json!({"target": "nope"})))
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error(), "{}", resp.status());
     }
 }
 
