@@ -7,7 +7,7 @@ import * as fleet from './fleet.mjs'
 import * as pre from './preflight.mjs'
 import * as git from './git.mjs'
 import { selftest } from './selftest.mjs'
-import { readFileSync, existsSync } from 'node:fs'
+import { readFileSync, existsSync, readdirSync } from 'node:fs'
 
 const argv = process.argv.slice(2)
 const cmd = argv[0]
@@ -108,6 +108,25 @@ function runLaws() {
   }
 
   findings.push(...laws.testPlacement(added, f => git.readAt(t, f)))
+
+  // The working tree, not a revision: these are broken now, whatever the diff.
+  const repo = new URL('../../../../', import.meta.url).pathname
+  const read = f => (existsSync(`${repo}${f}`) ? readFileSync(`${repo}${f}`, 'utf8') : null)
+  const listMd = d => (existsSync(`${repo}${d}`) ? readdirSync(`${repo}${d}`).filter(f => f.endsWith('.md')) : [])
+  const ruleFiles = listMd('.claude/rules').map(f => ({ file: `.claude/rules/${f}`, text: read(`.claude/rules/${f}`) }))
+  const claudeMd = read('CLAUDE.md')
+  findings.push(...laws.contextBudget(claudeMd, ruleFiles))
+  const decisions = listMd('decisions').filter(f => f !== 'README.md')
+  const citing = [...ruleFiles]
+  if (claudeMd != null) citing.push({ file: 'CLAUDE.md', text: claudeMd })
+  for (const f of listMd('decisions')) citing.push({ file: `decisions/${f}`, text: read(`decisions/${f}`) })
+  findings.push(...laws.decisionPointers(citing, decisions))
+
+  const skillDir = new URL('..', import.meta.url).pathname
+  if (existsSync(`${skillDir}SKILL.md`)) {
+    const lanes = existsSync(`${skillDir}lanes`) ? readdirSync(`${skillDir}lanes`).filter(f => f.endsWith('.md')) : []
+    findings.push(...laws.skillLanes(readFileSync(`${skillDir}SKILL.md`, 'utf8'), lanes))
+  }
   const mentioned = git.mentionedIssues(t)
   findings.push(...laws.unclosedTickets(
     mentioned, git.closingIssues(t), git.issueTitles(mentioned), git.acknowledgedIssues(t),

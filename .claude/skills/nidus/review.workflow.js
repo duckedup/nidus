@@ -72,7 +72,8 @@ DO report, because these are the defects that survive review here:
   a shared temp path, or a global registry is suspect.
 - A test that passes for the wrong reason, or asserts something weaker than it claims to.`
 
-const HOUSE_RULES = `nidus's laws (CLAUDE.md), for context — a deterministic checker already covers the
+const HOUSE_RULES = `nidus's laws (CLAUDE.md, .claude/rules/, and decisions/ for the why), for context —
+a deterministic checker already covers the
 mechanical ones, so do not re-report those; use them to judge intent:
 - Pure-library build stays fast and FFI-light. src/cli, src/server, src/bin and the
   embed/summarize/memory layers are feature-gated and must never be reachable from the

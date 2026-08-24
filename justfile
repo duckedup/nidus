@@ -456,3 +456,11 @@ bd-sync:
     bd dolt pull
     bd dolt push
 
+
+# ── Agent tooling ────────────────────────────────────────────────────────────
+
+# SPEC.md is 2577 lines, and every spec/implement agent used to read it whole (nidus-gmy.1).
+# `toc` is the index, `find <words>` says which section covers a topic, `<ref>` prints one.
+# Fetch one section of a repo doc: just spec toc | just spec 7.4 | just spec find rrf
+spec *ARGS:
+    @.claude/skills/nidus/bin/spec {{ARGS}}

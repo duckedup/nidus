@@ -75,8 +75,10 @@ BLUEPRINT (implement exactly this, nothing outside its scope):
 ${spec.content}
 
 Rules:
-- Follow the repo's CLAUDE.md. Comments cap at 3 lines. Errors are anyhow. On-disk encoding is
-  little-endian, length-prefixed and CRC32-checked.
+- Follow CLAUDE.md and .claude/rules/ (rust-style.md is the one for src/). Comments cap at 3
+  lines. Errors are anyhow. On-disk encoding is little-endian, length-prefixed and CRC32-checked.
+  An Edit or Write of a .rs file runs those two detectors as a hook, so a violation blocks you
+  at the edit rather than at review.
 - Only touch files under this blueprint's scope (${spec.dir}). Another agent owns the rest.
 - Do NOT commit your own work, do NOT switch branches, do NOT push. (The upstream commit
   above, if you were given one, is the sole exception and is bookkeeping only.)

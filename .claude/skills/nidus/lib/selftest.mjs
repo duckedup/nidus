@@ -5,6 +5,8 @@ import * as laws from './laws.mjs'
 import * as fleet from './fleet.mjs'
 import * as pre from './preflight.mjs'
 import { lanes, formatLanes, ciGuard } from './lanes.mjs'
+import * as spec from './specdoc.mjs'
+import * as guards from './guards.mjs'
 
 const cases = []
 const test = (name, fn) => cases.push({ name, fn })
@@ -1030,6 +1032,167 @@ test('stale base: equal counts do not claim a difference that is not there', () 
   const found = laws.staleBase({ ref: 'main', hasRemote: true, behind: 2, examined: 10, examinedFresh: 10 })
   eq(ids(found), ['stale-base'], 'still flagged — the range is still wrong')
   eq(found[0].detail.includes('examined 10 file(s)'), false, 'no fabricated count comparison')
+})
+
+// ── spec section addressing (nidus-gmy.1) ──────────────────────────────────
+
+const DOC = [
+  '# Title',                       // 1
+  '',                              // 2
+  '## 1. First',                   // 3
+  'alpha bravo',                   // 4
+  '### 1.1 Nested',                // 5
+  'charlie',                       // 6
+  '## 2. Second',                  // 7
+  'delta alpha',                   // 8
+  '```',                           // 9
+  '## 7. Not a heading',           // 10
+  '```',                           // 11
+  '### Unnumbered Bit',            // 12
+  'echo',                          // 13
+]
+
+test('spec: headings carry level, number and span', () => {
+  const hs = spec.headings(DOC)
+  eq(hs.map(h => h.num), ['1', '1.1', '2', null], 'numbers')
+  eq(hs.map(h => h.line), [3, 5, 7, 12], 'lines')
+  eq(hs.map(h => h.end), [6, 6, 13, 13], 'ends')
+})
+
+test('spec: a heading inside a fence is not a heading', () => {
+  eq(spec.headings(DOC).some(h => h.num === '7'), false, 'fenced ## ignored')
+})
+
+test('spec: a section spans to the next heading of its own level or higher', () => {
+  const h = spec.locate(spec.headings(DOC), '1')
+  eq(spec.section(DOC, h), ['## 1. First', 'alpha bravo', '### 1.1 Nested', 'charlie'], 'section 1')
+})
+
+test('spec: an exact number is not hijacked by a slug substring', () => {
+  eq(spec.locate(spec.headings(DOC), '1').line, 3, 'numeric ref wins')
+  eq(spec.locate(spec.headings(DOC), 'unnumbered').line, 12, 'slug substring resolves')
+  eq(spec.locate(spec.headings(DOC), '9.9'), null, 'unknown ref is null')
+})
+
+test('spec: § and # prefixes are accepted on a ref', () => {
+  eq(spec.locate(spec.headings(DOC), '§1.1').line, 5, 'numeric with §')
+  eq(spec.locate(spec.headings(DOC), '#unnumbered-bit').line, 12, 'slug with #')
+})
+
+test('spec: find needs every word somewhere in the section, not on one line', () => {
+  eq(spec.search(DOC, ['alpha', 'charlie']).map(f => f.ref), ['§1'], 'words split across lines')
+  eq(spec.search(DOC, ['alpha', 'zulu']), [], 'a missing word matches nothing')
+})
+
+test('spec: find reports the innermost matching section, not its parent', () => {
+  eq(spec.search(DOC, ['charlie']).map(f => f.ref), ['§1.1'], 'child only')
+})
+
+test('spec: find with no words matches nothing rather than everything', () => {
+  eq(spec.search(DOC, []), [], 'empty query')
+  eq(spec.search(DOC, ['']), [], 'blank word')
+})
+
+// ── skill lane wiring (nidus-gmy.2) ────────────────────────────────────────
+
+const ROUTER = '| `fit` | `lanes/fit.md` |\n| `ship` | `lanes/ship.md` |'
+
+test('skill lanes: a routed lane that exists is fine', () => {
+  eq(ids(laws.skillLanes(ROUTER, ['fit.md', 'ship.md'])), [], 'findings')
+})
+
+test('skill lanes: a routed lane with no file is an error', () => {
+  const found = laws.skillLanes(ROUTER, ['fit.md'])
+  eq(ids(found), ['skill-lane-missing'], 'findings')
+  eq(found[0].summary.includes('lanes/ship.md'), true, 'names the missing lane')
+})
+
+test('skill lanes: a lane file nobody routes to is a warning', () => {
+  const found = laws.skillLanes(ROUTER, ['fit.md', 'ship.md', 'fleet.md'])
+  eq(ids(found), ['skill-lane-orphan'], 'findings')
+  eq(found[0].severity, 'warn', 'severity')
+})
+
+// ── context budget and decision pointers (nidus-gmy.4, nidus-gmy.5) ────────
+
+const SCOPED = '---\npaths:\n  - "src/**"\n---\n\n# Rule\n'
+
+test('context budget: a short CLAUDE.md and a scoped rule are fine', () => {
+  eq(ids(laws.contextBudget('a\nb\n', [{ file: '.claude/rules/x.md', text: SCOPED }])), [], 'findings')
+})
+
+test('context budget: CLAUDE.md over the cap is flagged with its line count', () => {
+  const found = laws.contextBudget('x\n'.repeat(201), [])
+  eq(ids(found), ['context-budget'], 'findings')
+  eq(found[0].summary.includes('201 lines'), true, 'matches wc -l')
+})
+
+test('context budget: a rule with no paths: frontmatter is flagged', () => {
+  eq(ids(laws.contextBudget(null, [{ file: '.claude/rules/x.md', text: '# Rule\n' }])), ['rule-not-scoped'], 'findings')
+})
+
+test('context budget: frontmatter without paths: does not count as scoped', () => {
+  const text = '---\ndescription: nope\n---\n'
+  eq(ids(laws.contextBudget(null, [{ file: '.claude/rules/x.md', text }])), ['rule-not-scoped'], 'findings')
+})
+
+test('decision pointers: a cited record that exists is fine', () => {
+  const texts = [{ file: 'CLAUDE.md', text: 'see D0004' }]
+  eq(ids(laws.decisionPointers(texts, ['0004-close-the-ticket.md'])), [], 'findings')
+})
+
+test('decision pointers: a dangling D-number is an error, reported once', () => {
+  const texts = [{ file: 'CLAUDE.md', text: 'see D0099 and again D0099' }]
+  const found = laws.decisionPointers(texts, ['0004-close-the-ticket.md'])
+  eq(ids(found), ['dangling-decision'], 'one finding per pointer per file')
+  eq(found[0].summary.includes('D0099'), true, 'names the pointer')
+})
+
+// ── PreToolUse read guard (nidus-gmy.5) ────────────────────────────────────
+
+const blocked = m => (m === null ? [] : ['blocked'])
+
+test('read guard: an unbounded read of a guarded doc is blocked', () => {
+  eq(blocked(guards.specRead({ rel: 'SPEC' + '.md' })), ['blocked'], 'blocked')
+})
+
+test('read guard: a bounded read is allowed, but offset alone is not a bound', () => {
+  eq(blocked(guards.specRead({ rel: 'SPEC' + '.md', offset: 900, limit: 40 })), [], 'allowed')
+  eq(blocked(guards.specRead({ rel: 'SPEC' + '.md', offset: 900 })), ['blocked'], 'offset alone')
+})
+
+test('read guard: an unguarded doc and a missing path are allowed', () => {
+  eq(blocked(guards.specRead({ rel: 'CLAUDE.md' })), [], 'unguarded')
+  eq(blocked(guards.specRead({})), [], 'no path')
+  eq(blocked(guards.specRead()), [], 'no args')
+})
+
+test('read guard: the message names the tool that replaces the read', () => {
+  eq(guards.specRead({ rel: 'SPEC' + '.md' }).includes('just spec toc'), true, 'names the tool')
+})
+
+// ── lane coverage for the agent-facing tree (nidus-gmy.5) ──────────────────
+
+test('lanes: a decision record needs no build lane and is not unmapped', () => {
+  const r = lanes(['decisions/0004-close-the-ticket-yourself.md'])
+  eq(r.unmatched, [], 'nothing unmapped')
+  eq(r.inert.length, 1, 'reported as inert')
+})
+
+test('lanes: touching a detector asks for the fixture suite', () => {
+  const r = lanes(['.claude/skills/nidus/lib/laws.mjs'])
+  eq(r.run.map(l => l.recipe), ['.claude/skills/nidus/bin/nidus-check selftest'], 'selftest')
+  eq(r.inert, [], 'not inert — a detector change has a lane')
+})
+
+test('lanes: touching a hook asks for the fixture suite too', () => {
+  eq(lanes(['.claude/hooks/law-check.mjs']).run.length, 1, 'one lane')
+})
+
+test('lanes: a lane file is still inert — prose has no suite', () => {
+  const r = lanes(['.claude/skills/nidus/lanes/ship.md'])
+  eq(r.run, [], 'no lane')
+  eq(r.unmatched, [], 'not unmapped')
 })
 
 export function selftest({ json = false } = {}) {

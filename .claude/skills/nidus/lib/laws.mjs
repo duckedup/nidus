@@ -1,5 +1,5 @@
-// Deterministic detectors for nidus's repo laws — the rules in CLAUDE.md that a
-// reviewer restates as prose and an LLM reviewer then forgets. Every check here is
+// Deterministic detectors for nidus's repo laws — the rules in CLAUDE.md and .claude/rules/
+// that a reviewer restates as prose and an LLM reviewer then forgets. Every check here is
 // a pure function over text so lib/selftest.mjs can drive it from fixtures.
 
 const finding = (id, severity, file, line, summary, detail) => ({ id, severity, file, line, summary, detail })
@@ -8,7 +8,7 @@ const finding = (id, severity, file, line, summary, detail) => ({ id, severity, 
 // Counts a whole block: // and /// plus the /// blank separators between them.
 // A ``` doc-example fence is test code, not commentary, so its lines do not count.
 // `//!` is exempt: a module/crate doc is the published rustdoc landing page, not
-// commentary on code (CLAUDE.md §Conventions).
+// commentary on code (D0009).
 
 const COMMENT = /^\s*\/\/(\/|!)?/
 const FENCE = /^\s*\/\/[\/!]?\s*```/
@@ -24,7 +24,7 @@ export function commentCap(text, addedLines = null, file = '') {
       if (touches) {
         out.push(finding('comment-cap', 'error', file, block.firstCounted ?? block.start,
           `comment block is ${block.counted} lines — the cap is 3`,
-          'CLAUDE.md: a comment earns its place by saying what the code cannot. Rationale longer than three lines belongs in the commit message, the PR, SPEC.md, or a GitHub issue.'))
+          '.claude/rules/rust-style.md (D0009): a comment earns its place by saying what the code cannot. Rationale longer than three lines belongs in the commit message, the PR, SPEC.md, or a bd issue.'))
       }
     }
     block = null
@@ -184,7 +184,7 @@ export function docsVersionSync(baseCargo, headCargo, texts) {
     const stale = (text.match(/nidus = "([^"]+)"/) || [])[1]
     out.push(finding('docs-version-sync', 'error', file, 1,
       `install snippet still says nidus = "${stale ?? '?'}" but the crate is ${head}`,
-      'CLAUDE.md: on a major.minor bump, the snippet in README.md and getting-started.md must match the released crate.'))
+      '.claude/rules/release.md (D0007): on a major.minor bump, the snippet in README.md and getting-started.md must match the released crate.'))
   }
   return out
 }
@@ -248,7 +248,7 @@ export function newDeps(baseCargo, headCargo) {
     if (FORBIDDEN_DEP.test(name) && !SYS_NAME_ONLY.test(name)) {
       out.push(finding('forbidden-dep', 'error', 'Cargo.toml', 1,
         `new dependency \`${name}\` looks like a bundled-C / heavy tree`,
-        'CLAUDE.md forbids bundled C/C++, vendored OpenSSL, aws-lc-sys, and Arrow+DataFusion. This is a design change — raise an issue first.'))
+        'D0005 forbids bundled C/C++, vendored OpenSSL, aws-lc-sys, and Arrow+DataFusion. This is a design change — raise an issue first.'))
     } else {
       out.push(finding('new-dep', 'warn', 'Cargo.toml', 1,
         `new dependency \`${name}\` — confirm the clean build stays well under a minute`,
@@ -305,7 +305,7 @@ export function miriIgnore(text, addedLines, file) {
     if (SYSCALLY.test(body)) continue
     out.push(finding('miri-ignore', 'warn', file, i + 1,
       'test is ignored under Miri but touches nothing outside the process',
-      'CLAUDE.md: pure-logic tests (cosine math, glob, filters, codec round-trips) MUST run under Miri — ignore only syscall paths. If the ignore is right (runtime cost, float ULP, or IO the scan cannot see through a helper), record why as `#[cfg_attr(miri, ignore)] // <reason>`; otherwise drop it.'))
+      '.claude/rules/miri.md (D0008): pure-logic tests (cosine math, glob, filters, codec round-trips) MUST run under Miri — ignore only syscall paths. If the ignore is right (runtime cost, float ULP, or IO the scan cannot see through a helper), record why as `#[cfg_attr(miri, ignore)] // <reason>`; otherwise drop it.'))
   }
   return out
 }
@@ -322,7 +322,7 @@ export function featureGating(file, text) {
   const line = text.slice(0, text.indexOf(m[0])).split('\n').length
   return [finding('feature-gating', 'error', file, line,
     `library module imports the binary-only crate \`${m[1]}\``,
-    'CLAUDE.md: those deps compile only under `cli`/`serve`. Using them from a library module breaks the pure `cargo add nidus` install.')]
+    '.claude/rules/cli-feature.md (D0011): those deps compile only under `cli`/`serve`. Using them from a library module breaks the pure `cargo add nidus` install.')]
 }
 
 export function modGating(libText) {
@@ -359,3 +359,70 @@ export const LAW_IDS = [
   'bot-stamped', 'forbidden-dep', 'new-dep', 'test-placement', 'miri-ignore',
   'feature-gating', 'mod-gating', 'stale-ticket',
 ]
+
+// ── The /nidus skill's lane files must stay wired ───────────────────────────
+// SKILL.md is a router: it names a lane file per subcommand and the lane body lives
+// there, so a rename that misses one silently drops a whole subcommand (nidus-gmy.2).
+
+export function skillLanes(skillText, laneFiles) {
+  const referenced = new Set([...skillText.matchAll(/lanes\/([a-z-]+)\.md/g)].map(m => m[1]))
+  const present = new Set(laneFiles.map(f => f.replace(/^.*\//, '').replace(/\.md$/, '')))
+  const out = []
+  for (const name of [...referenced].sort()) {
+    if (present.has(name)) continue
+    out.push(finding('skill-lane-missing', 'error', '.claude/skills/nidus/SKILL.md', 1,
+      `SKILL.md routes to lanes/${name}.md, which does not exist`,
+      'That subcommand has no body to read, so the lane silently does nothing.'))
+  }
+  for (const name of [...present].sort()) {
+    if (referenced.has(name)) continue
+    out.push(finding('skill-lane-orphan', 'warn', `.claude/skills/nidus/lanes/${name}.md`, 1,
+      `lanes/${name}.md is not routed to from SKILL.md`,
+      'Nothing will ever read it. Add it to the Routing table or delete it.'))
+  }
+  return out
+}
+
+// ── The context budget and its pointers ────────────────────────────────────
+// CLAUDE.md loads into every session AND every subagent, so its size is paid per
+// agent; a rule file without `paths:` loads at launch too, defeating the split.
+
+const CLAUDE_MD_MAX = 200
+
+export function contextBudget(claudeMd, rules) {
+  const out = []
+  if (claudeMd != null) {
+    const n = claudeMd.replace(/\n$/, '').split('\n').length
+    if (n > CLAUDE_MD_MAX) {
+      out.push(finding('context-budget', 'error', 'CLAUDE.md', 1,
+        `CLAUDE.md is ${n} lines — the cap is ${CLAUDE_MD_MAX}`,
+        'It loads into every session and every subagent. Move path-scoped detail to .claude/rules/ and rationale to decisions/.'))
+    }
+  }
+  for (const { file, text } of rules) {
+    if (/^---\n(?:.*\n)*?paths:/.test(text)) continue
+    out.push(finding('rule-not-scoped', 'error', file, 1,
+      'rule file has no `paths:` frontmatter, so it loads at launch',
+      'An unscoped rule costs the same as CLAUDE.md. Give it a paths: glob, or move it into CLAUDE.md deliberately.'))
+  }
+  return out
+}
+
+// A `D####` pointer is the whole mechanism for keeping rationale out of context, so a
+// dangling one silently loses the reason a rule exists.
+
+export function decisionPointers(texts, decisionFiles) {
+  const present = new Set(decisionFiles.map(f => (f.match(/^(\d{4})/) || [])[1]).filter(Boolean))
+  const out = []
+  for (const { file, text } of texts) {
+    const seen = new Set()
+    for (const m of text.matchAll(/\bD(\d{4})\b/g)) {
+      if (present.has(m[1]) || seen.has(m[1])) continue
+      seen.add(m[1])
+      out.push(finding('dangling-decision', 'error', file, 1,
+        `cites D${m[1]}, which is not in decisions/`,
+        'The rule keeps its one-liner and the reasoning lives in the record. A dangling pointer loses the reasoning.'))
+    }
+  }
+  return out
+}

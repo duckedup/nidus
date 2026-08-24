@@ -1,0 +1,10 @@
+#!/usr/bin/env sh
+# Prefer bun, fall back to node. Exits 0 when neither is present: this is a convenience
+# gate, and a machine without a JS runtime must still be able to edit files.
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if command -v bun >/dev/null 2>&1; then
+  exec bun "$dir/spec-read-guard.mjs" "$@"
+elif command -v node >/dev/null 2>&1; then
+  exec node "$dir/spec-read-guard.mjs" "$@"
+fi
+exit 0
