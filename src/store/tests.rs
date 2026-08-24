@@ -11,7 +11,8 @@ use super::*;
 use crate::Fsync;
 use crate::data::SegmentIntegrity;
 use crate::model::{
-    Filter, Hit, ListOpts, Predicate, Projection, Quantization, Record, SearchOpts, Value,
+    Filter, Hit, ListOpts, Predicate, Projection, Quantization, Record, SearchOpts, Suggestions,
+    Value,
 };
 use crate::search::normalize;
 
@@ -4242,6 +4243,158 @@ fn text_search_across_collections_analyzes_once() {
         vec!["a1", "b1"],
         "stemmed match across both collections"
     );
+}
+
+// ── suggest: ranked term completions (nidus-ux0) ─────────────────────────────────
+
+#[test]
+fn suggest_ranks_by_document_frequency_not_idf() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                doc("a", "nidus"),
+                doc("b", "nidus"),
+                doc("c", "nidus"),
+                doc("d", "nidification"),
+            ],
+        )
+        .unwrap();
+
+    // The ticket's own criterion, asserted as words: typing "nid" offers "nidus" above
+    // "nidification". Surface forms, not the stems "nidu"/"nidif" a dropdown cannot show.
+    let got = store.suggest("docs", "body", "nid", 10);
+    assert_eq!(
+        got.suggestions
+            .iter()
+            .map(|s| (s.term.as_str(), s.df))
+            .collect::<Vec<_>>(),
+        vec![("nidus", 3), ("nidification", 1)],
+        "{got:?}"
+    );
+    assert_eq!(got.matched, 2);
+
+    // text_search's document ranking is unaffected: the rare term still lifts its doc.
+    let hits = store
+        .text_search(
+            &["docs"],
+            &FtsQuery::multi([FtsClause::new("body", "nid").prefix()]),
+            &default_opts(10),
+        )
+        .unwrap();
+    assert_eq!(
+        hits[0].id, "d",
+        "the rare term's sole doc still ranks first"
+    );
+}
+
+#[test]
+fn suggest_folds_the_prefix_like_a_prefix_clause() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body").ascii_folding(true)])
+        .unwrap();
+    store
+        .upsert("docs", &[doc("a", "nidus"), doc("b", "café")])
+        .unwrap();
+
+    let upper = store.suggest("docs", "body", "NID", 10);
+    let lower = store.suggest("docs", "body", "nid", 10);
+    assert_eq!(upper, lower);
+    assert_eq!(upper.suggestions.len(), 1, "{upper:?}");
+
+    let folded = store.suggest("docs", "body", "caf", 10);
+    assert_eq!(folded.suggestions[0].term, "cafe");
+}
+
+#[test]
+fn suggest_takes_only_the_trailing_token() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    store.upsert("docs", &[doc("a", "nidus store")]).unwrap();
+
+    assert_eq!(
+        store.suggest("docs", "body", "the nid", 10),
+        store.suggest("docs", "body", "nid", 10)
+    );
+}
+
+#[test]
+fn suggest_is_empty_for_an_unindexed_field_and_an_unknown_collection() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    store.upsert("docs", &[doc("a", "nidus")]).unwrap();
+
+    assert_eq!(
+        store.suggest("docs", "title", "nid", 10),
+        Suggestions::default()
+    );
+    assert_eq!(
+        store.suggest("nope", "body", "nid", 10),
+        Suggestions::default()
+    );
+}
+
+#[test]
+fn suggest_of_an_empty_prefix_is_empty() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    store.upsert("docs", &[doc("a", "nidus")]).unwrap();
+
+    for prefix in ["", "  ", "!!"] {
+        assert_eq!(
+            store.suggest("docs", "body", prefix, 10),
+            Suggestions::default(),
+            "prefix {prefix:?} must yield no suggestions"
+        );
+    }
+}
+
+#[test]
+fn suggest_limit_truncates_and_matched_still_reports_the_full_count() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                doc("a", "nid1"),
+                doc("b", "nid2"),
+                doc("c", "nid3"),
+                doc("d", "nid4"),
+                doc("e", "nid5"),
+            ],
+        )
+        .unwrap();
+
+    let got = store.suggest("docs", "body", "nid", 2);
+    assert_eq!(got.suggestions.len(), 2);
+    assert_eq!(got.matched, 5);
+}
+
+#[test]
+fn suggest_limit_zero_is_empty() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    store.upsert("docs", &[doc("a", "nidus")]).unwrap();
+
+    let got = store.suggest("docs", "body", "nid", 0);
+    assert!(got.suggestions.is_empty());
+    assert_eq!(got.matched, 1);
 }
 
 // ── FTS schema: per-field BM25 / analyzer configuration (nidus-m50.13) ───────────

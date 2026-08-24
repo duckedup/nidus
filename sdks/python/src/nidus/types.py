@@ -318,6 +318,26 @@ class StoreVersions:
 
 
 @dataclass(frozen=True)
+class Suggestion:
+    """One completion: an indexed term and how many live documents contain it."""
+
+    term: str
+    df: int
+
+
+@dataclass(frozen=True)
+class Suggestions:
+    """:meth:`~nidus.NidusClient.suggest`'s result.
+
+    ``matched`` counts every term the prefix matched before the server's 256-term cap, so
+    ``matched > len(suggestions)`` means the cap truncated the list.
+    """
+
+    suggestions: list[Suggestion]
+    matched: int
+
+
+@dataclass(frozen=True)
 class RememberResult:
     """What a :meth:`~nidus.NidusClient.remember` actually wrote.
 

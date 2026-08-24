@@ -30,6 +30,7 @@ so the same id appears in your logs and the server's.
 | `GET /collections/{name}/records` | every record in a collection | `get_all` |
 | `POST /collections/{name}/fts-schema` | declare full-text-indexed fields | `set_fts_schema` |
 | `POST /collections/{name}/filter-index` | declare filter-indexed fields | `set_filter_index` |
+| `POST /collections/{name}/suggest` | ranked term completions from the full-text vocabulary | `suggest` |
 | `POST /search` | nearest-neighbour search | `search` |
 | `POST /search/similar` | "more like this" using a stored record's own vector | `search_similar` |
 | `POST /search/batch` | several queries in one round-trip, optionally RRF-fused | – |
@@ -591,6 +592,33 @@ no branch worth a `plan`. [Query plans](#query-plans-how-a-query-ran) below cove
 `/search`, `/search/similar`, and `/hybrid-search`. A prefix clause's expansion cap is
 reported through `explain` instead, as `expansion` on that clause's score.
 
+### `POST /collections/{name}/suggest`
+
+Ranked term completions from a field's full-text vocabulary, for an autocomplete dropdown.
+Ranked by document frequency (commonest first), which is the **opposite** of how a prefix
+*clause* in `/text-search` ranks documents. `limit` defaults to 10 (a dropdown, not a page)
+and is bounded by the same `MAX_TOP_K` ceiling as the other read routes.
+
+```bash
+curl -s localhost:7700/collections/docs/suggest \
+  -H 'content-type: application/json' \
+  -d '{"field": "body", "prefix": "nid", "limit": 10}'
+```
+
+```json
+{ "suggestions": [ { "term": "nidus", "df": 42 },
+                   { "term": "nidification", "df": 3 } ],
+  "matched": 2 }
+```
+
+`matched` counts every term the prefix matched before the 256-term cap; `matched` exceeding
+`suggestions.length` is the truncation signal. The prefix is folded (lowercased, optionally
+ASCII-folded) the same way a prefix clause folds it, and matched against the field's surface
+forms, so completions are real words rather than stems: every keystroke of `running`
+completes to `running`. Two spellings of one stem are two completions sharing that stem's
+`df`. A field with no full-text schema, or a collection that does not exist, returns `200`
+with an empty `suggestions` list rather than an error.
+
 ### `POST /hybrid-search`
 
 Fuse a vector query and a BM25 text query with Reciprocal Rank Fusion. Takes `vector`
@@ -1041,8 +1069,9 @@ separately, so it inherits the body limit, backpressure, bearer auth, and metric
 than reimplementing any of them: a token required elsewhere on this server is required at
 `/mcp` too.
 
-Nine tools, all text-native: `remember`, `recall`, `text_search`, `hybrid_search`,
-`list_collections`, `stats`, `forget`, `get`, `browse`. **No tool takes a raw vector**:
+Eleven tools, all text-native: `remember`, `recall`, `text_search`, `hybrid_search`,
+`list_collections`, `stats`, `forget`, `get`, `browse`, `related`, `suggest`. **No tool
+takes a raw vector**:
 every argument is natural language, which is deliberate, since a model cannot emit a raw
 float array as a tool call, and `tests/e2e/mcp/` asserts the surface stays that way.
 

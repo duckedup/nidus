@@ -542,6 +542,31 @@ type RerankOptions struct {
 	TextAttr string `json:"text_attr,omitempty"`
 }
 
+// SuggestRequest asks for ranked term completions from one field's indexed vocabulary.
+// Collection is sent in the path, not the body.
+//
+// Only Prefix's final token is completed, so "the nid" completes "nid". Completions are
+// ranked by document frequency, commonest first, which is the opposite of how a prefix
+// clause ranks documents. Limit defaults to 10 server-side when left zero.
+type SuggestRequest struct {
+	Field  string `json:"field"`
+	Prefix string `json:"prefix"`
+	Limit  int    `json:"limit,omitempty"`
+}
+
+// Suggestion is one completion: an indexed term and how many live documents contain it.
+type Suggestion struct {
+	Term string `json:"term"`
+	DF   int    `json:"df"`
+}
+
+// Suggestions is [Client.Suggest]'s result. Matched counts every term the prefix matched
+// before the server's 256-term cap, so Matched > len(Suggestions) means it truncated.
+type Suggestions struct {
+	Suggestions []Suggestion `json:"suggestions"`
+	Matched     int          `json:"matched"`
+}
+
 // A TextSearchRequest is a BM25 full-text query. MinScore is a raw BM25 floor, not a
 // cosine one — BM25 scores are unbounded above and not comparable across queries, so a
 // floor that works for one query may drop everything for another.

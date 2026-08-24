@@ -13,7 +13,7 @@ mod highlight;
 mod schema;
 
 pub use analyzer::{Analyzer, Language};
-pub(crate) use analyzer::{analyze, analyze_with_prefix};
+pub(crate) use analyzer::{analyze, analyze_surface, analyze_with_prefix};
 pub(crate) use highlight::fragments;
 pub use schema::FtsField;
 pub(crate) use schema::validate;
@@ -46,6 +46,10 @@ pub(crate) struct FieldIndex {
     /// term → postings, appended in docnum order. Ordered (not a `HashMap`) so prefix
     /// expansion is a range scan rather than a full vocabulary sweep (D1).
     postings: BTreeMap<String, Vec<Posting>>,
+    /// folded surface form → its stem, for `suggest` alone. Ordered for the same reason
+    /// `postings` is; `postings` cannot serve it, since "nidus" stems to "nidu" and a
+    /// stem-keyed scan therefore goes empty exactly as the typist finishes the word.
+    surface: BTreeMap<String, String>,
     /// docnum → field length in terms (`0` once tombstoned).
     doc_len: Vec<u32>,
     /// docnum → owning doc id, or `None` for a tombstoned slot.
@@ -83,6 +87,13 @@ impl FieldIndex {
     /// stay but are skipped via hint-verify). O(terms in `text`).
     pub(crate) fn index(&mut self, id: &str, text: &str) {
         self.tombstone(id);
+
+        // Surface forms are vocabulary, not per-doc state: a tombstone leaves them behind
+        // exactly as it leaves postings keys, and `suggest` drops any whose stem has no
+        // live doc left.
+        for (surface, stemmed) in analyze_surface(text, self.cfg.analyzer) {
+            self.surface.insert(surface, stemmed);
+        }
 
         let terms = analyze(text, self.cfg.analyzer);
         let len = terms.len() as u32;
@@ -191,10 +202,7 @@ impl FieldIndex {
             .range(fragment.to_string()..)
             .take_while(|(t, _)| t.starts_with(fragment))
             .filter_map(|(t, postings)| {
-                let df = postings
-                    .iter()
-                    .filter(|p| self.docnum_to_id[p.docnum as usize].is_some())
-                    .count();
+                let df = self.live_df_of(postings);
                 (df > 0).then_some((t, df as f32))
             })
             .collect();
@@ -205,6 +213,41 @@ impl FieldIndex {
         matches.truncate(MAX_PREFIX_EXPANSION);
         (
             matches.into_iter().map(|(t, _)| t.clone()).collect(),
+            matched,
+        )
+    }
+
+    /// Postings whose owning doc is still live — the `df` every ranking here uses.
+    fn live_df_of(&self, postings: &[Posting]) -> usize {
+        postings
+            .iter()
+            .filter(|p| self.docnum_to_id[p.docnum as usize].is_some())
+            .count()
+    }
+
+    /// Surface forms carrying `fragment` as a prefix, each with the live `df` of the stem it
+    /// maps to, commonest first and truncated to the cap. Two spellings of one stem are two
+    /// completions sharing a `df`, which is what a dropdown wants.
+    pub(crate) fn suggest_scored(&self, fragment: &str) -> (Vec<(String, usize)>, usize) {
+        let mut matches: Vec<(&String, usize)> = self
+            .surface
+            .range(fragment.to_string()..)
+            .take_while(|(s, _)| s.starts_with(fragment))
+            .filter_map(|(s, stemmed)| {
+                let df = self
+                    .postings
+                    .get(stemmed)
+                    .map_or(0, |ps| self.live_df_of(ps));
+                (df > 0).then_some((s, df))
+            })
+            .collect();
+        let matched = matches.len();
+        // (df desc, term asc), the same tie-break `expand_prefix` needs and for the same
+        // reason: without it two equal-df completions truncate in arbitrary order.
+        matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        matches.truncate(MAX_PREFIX_EXPANSION);
+        (
+            matches.into_iter().map(|(s, df)| (s.clone(), df)).collect(),
             matched,
         )
     }
@@ -248,10 +291,10 @@ impl Fts {
     /// every field's name, BM25 `k1`/`b`, and analyzer — deterministically ordered. Any
     /// change flips it, so [`crate::index_cache`] rejects the stale cache and rebuilds.
     pub(crate) fn cache_key(&self) -> Vec<u8> {
-        /// Bump when the inverted-index layout or analyzer behaviour changes. `3` = postings
-        /// became a `BTreeMap` (changes the bincode encoding of `FieldIndex`); `2` = per-field
+        /// Bump when the inverted-index layout or analyzer behaviour changes. `4` = the
+        /// `surface` map `suggest` scans; `3` = postings became a `BTreeMap`; `2` = per-field
         /// BM25/analyzer params (`1` keyed the two store-wide constants separately).
-        const FTS_CACHE_VERSION: u8 = 3;
+        const FTS_CACHE_VERSION: u8 = 4;
         let mut key = vec![FTS_CACHE_VERSION];
         // BTreeMap iterates key-sorted, so the encoding is deterministic. Serializing a
         // BTreeMap of owned/Copy types is infallible; a silent drop here would weaken the
@@ -391,6 +434,23 @@ impl Fts {
             .get(&(collection.to_string(), field.to_string()))
         {
             Some(idx) => idx.expand_prefix(fragment),
+            None => (Vec::new(), 0),
+        }
+    }
+
+    /// Ranked completions for `fragment` in `collection`.`field` with their live `df` (see
+    /// [`FieldIndex::suggest_scored`]). `(vec![], 0)` when the field isn't indexed.
+    pub(crate) fn suggest(
+        &self,
+        collection: &str,
+        field: &str,
+        fragment: &str,
+    ) -> (Vec<(String, usize)>, usize) {
+        match self
+            .fields
+            .get(&(collection.to_string(), field.to_string()))
+        {
+            Some(idx) => idx.suggest_scored(fragment),
             None => (Vec::new(), 0),
         }
     }
@@ -650,6 +710,90 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    // ── suggest_scored (surface-form completions) ──────────────────────────────────
+
+    #[test]
+    fn suggest_returns_live_df_per_completion() {
+        let idx = idx_with(&[("d1", "cat"), ("d2", "cat"), ("d3", "cat car")]);
+        let (scored, matched) = idx.suggest_scored("ca");
+        assert_eq!(scored, vec![("cat".to_string(), 3), ("car".to_string(), 1)]);
+        assert_eq!(matched, 2);
+    }
+
+    #[test]
+    fn suggest_excludes_a_deleted_docs_only_term() {
+        let mut idx = idx_with(&[("d1", "car")]);
+        idx.tombstone("d1");
+        let (scored, matched) = idx.suggest_scored("ca");
+        assert!(scored.is_empty());
+        assert_eq!(matched, 0);
+    }
+
+    #[test]
+    fn suggest_df_falls_when_one_of_several_docs_is_deleted() {
+        let mut idx = idx_with(&[("d1", "car"), ("d2", "car"), ("d3", "car")]);
+        idx.tombstone("d1");
+        let (scored, _) = idx.suggest_scored("ca");
+        assert_eq!(scored, vec![("car".to_string(), 2)]);
+    }
+
+    #[test]
+    fn suggest_ties_break_on_term_ascending() {
+        let idx = idx_with(&[("d1", "cat"), ("d2", "car")]);
+        let (scored, _) = idx.suggest_scored("ca");
+        assert_eq!(scored, vec![("car".to_string(), 1), ("cat".to_string(), 1)]);
+    }
+
+    #[test]
+    fn suggest_truncates_at_the_cap_and_reports_matched() {
+        let idx = zz_corpus(MAX_PREFIX_EXPANSION + 1);
+        let (scored, matched) = idx.suggest_scored("zz");
+        assert_eq!(scored.len(), MAX_PREFIX_EXPANSION);
+        assert_eq!(matched, MAX_PREFIX_EXPANSION + 1);
+    }
+
+    /// The whole reason `surface` exists: "nidus" stems to "nidu", so the stem-keyed scan a
+    /// prefix *clause* uses goes empty on the full word while `suggest` still completes it.
+    #[test]
+    fn suggest_completes_a_full_word_where_the_stem_keyed_scan_cannot() {
+        let idx = idx_with(&[("d1", "nidus"), ("d2", "nidus")]);
+
+        let (scored, matched) = idx.suggest_scored("nidus");
+        assert_eq!(scored, vec![("nidus".to_string(), 2)], "{scored:?}");
+        assert_eq!(matched, 1);
+
+        // Unchanged, and the contrast is the point: the clause path keys on stems.
+        assert_eq!(idx.expand_prefix("nidus"), (vec![], 0));
+        assert_eq!(idx.expand_prefix("nidu"), (vec!["nidu".to_string()], 1));
+    }
+
+    /// Every keystroke answers, which the stem-keyed scan could not do past "nidu".
+    #[test]
+    fn suggest_answers_at_every_keystroke_of_a_stemmed_word() {
+        let idx = idx_with(&[("d1", "running")]);
+        for typed in ["r", "ru", "run", "runn", "runni", "runnin", "running"] {
+            let (scored, _) = idx.suggest_scored(typed);
+            assert_eq!(
+                scored,
+                vec![("running".to_string(), 1)],
+                "prefix {typed:?} must still complete to the word"
+            );
+        }
+    }
+
+    /// Two spellings of one stem are two completions, both carrying that stem's df.
+    #[test]
+    fn suggest_returns_each_surface_form_of_a_shared_stem() {
+        let idx = idx_with(&[("d1", "running"), ("d2", "runs")]);
+        let (scored, matched) = idx.suggest_scored("run");
+        assert_eq!(
+            scored,
+            vec![("running".to_string(), 2), ("runs".to_string(), 2)],
+            "{scored:?}"
+        );
+        assert_eq!(matched, 2);
+    }
+
     // ── cache invalidation ────────────────────────────────────────────────────────
 
     /// The cache key a store would carry with `fields` declared on one collection.
@@ -686,10 +830,10 @@ mod tests {
 
     #[test]
     fn cache_key_carries_the_bumped_version_for_btreemap_postings() {
-        // Guards the D1 bump: a store built under the old `HashMap` layout (version 2)
-        // must not be read back as valid by today's `FieldIndex` bincode shape.
+        // Guards each bump: a store built under an older `FieldIndex` bincode shape must
+        // not be read back as valid by today's.
         let key = key_for(&[FtsField::new("body")]);
-        assert_eq!(key[0], 3, "FTS_CACHE_VERSION must be 3, not the old 2");
+        assert_eq!(key[0], 4, "FTS_CACHE_VERSION must be 4, not the old 3");
     }
 
     #[test]

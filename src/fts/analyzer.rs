@@ -95,6 +95,22 @@ pub(crate) fn analyze_spans(text: &str, cfg: Analyzer) -> Vec<TermSpan> {
     }
 }
 
+/// Each surviving token as `(folded surface form, stem)`. `suggest` completes real words, so
+/// it needs the spelling the stem came from — `stem("nidus")` is `"nidu"`, which no one types.
+pub(crate) fn analyze_surface(text: &str, cfg: Analyzer) -> Vec<(String, String)> {
+    let tokens = tokenize(text, cfg.ascii_folding, cfg.max_token_len);
+    match cfg.language {
+        Language::English => tokens
+            .into_iter()
+            .filter(|t| !is_stopword(&t.term))
+            .filter_map(|t| {
+                let stemmed = stem(&t.term);
+                (!stemmed.is_empty()).then_some((t.term, stemmed))
+            })
+            .collect(),
+    }
+}
+
 /// Split `text` for a prefix clause: every term but the last analyzed normally, the last
 /// left fold-only (a fragment is not a word). The final **token** decides the fragment, not
 /// the final surviving term, so a trailing stopword still becomes it rather than being dropped.

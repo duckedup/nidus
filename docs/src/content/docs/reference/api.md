@@ -61,6 +61,7 @@ searchers plus one writer (see
 | `search` | `fn search<'a>(&self, scope: impl Into<Scope<'a>>, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>` | Ranked search over a scope using the store's distance metric; `SearchOpts`'s `offset`/`top_k` paginate. |
 | `search_similar` | `fn search_similar<'a>(&self, scope: impl Into<Scope<'a>>, collection: &str, id: &str, opts: &SearchOpts) -> Result<Vec<Hit>>` | "More like this": search using the vector already stored at `collection`/`id`, instead of a caller-supplied query. An omitted scope searches the source's own collection. The source record is always excluded from its own results, by id rather than by score, so a genuine duplicate still comes back. Errors if the record is text-only and has no vector to search with. |
 | `text_search` | `fn text_search<'a>(&self, scope: impl Into<Scope<'a>>, query: &FtsQuery, opts: &SearchOpts) -> Result<Vec<Hit>>` | [BM25 full-text search](/guides/search/#full-text-search-bm25) over one or more field clauses; `min_score` is a raw BM25 floor. |
+| `suggest` | `fn suggest(&self, collection: &str, field: &str, prefix: &str, limit: usize) -> Suggestions` | [Ranked term completions](/guides/search/#full-text-search-bm25) from `field`'s full-text vocabulary, ranked by document frequency (not idf). Infallible; an unindexed field or unknown collection returns an empty `Suggestions`. |
 | `hybrid_search` | `fn hybrid_search<'a>(&self, scope: impl Into<Scope<'a>>, vector: &[f32], text: &FtsQuery, opts: &HybridOpts) -> Result<Vec<Hit>>` | [Hybrid vector + BM25](/guides/search/#hybrid-search-rrf), fused with Reciprocal Rank Fusion. |
 | `aggregate` | `fn aggregate<'a>(&self, scope: impl Into<Scope<'a>>, opts: &AggregateOpts) -> Result<Aggregation>` | [Count and sum](/guides/search/#aggregation) over a filter, straight off the in-memory index; no record is materialized. |
 | `flush` | `fn flush(&mut self) -> Result<()>` | Force an fsync (relevant under `Fsync::OnFlush`). |
@@ -529,6 +530,30 @@ several, with `.combine(...)` and `.highlight(...)` builders. See
 `FtsClause::new(field, text).prefix()` sets the flag: only the clause's **final** term
 expands, to every indexed term carrying it as a prefix, capped at 256 expansions (past
 the cap, the commonest completions win rather than the query erroring). See
+[prefix matching for typeahead](/guides/search/#prefix-matching-search-as-you-type).
+
+## `Suggestion` & `Suggestions`
+
+[`Nidus::suggest`](#nidus)'s answer: ranked term completions from a full-text field's
+vocabulary, for an autocomplete dropdown.
+
+```rust
+pub struct Suggestion {
+    pub term: String,
+    pub df: usize,  // how many live documents contain this term
+}
+
+pub struct Suggestions {
+    pub suggestions: Vec<Suggestion>,  // df desc, then term asc
+    pub matched: usize,                // every term matched before the 256-term cap
+}
+```
+
+`matched > suggestions.len()` signals truncation. Ranking is by document frequency,
+not by the per-term idf a prefix clause scores documents with, so the common
+completion sorts first here even though the rare one would lift its document
+higher in a `text_search`. Completions are surface forms, not stems, so they are safe to
+show in a dropdown; two spellings of one stem are two completions sharing its `df`. See
 [prefix matching for typeahead](/guides/search/#prefix-matching-search-as-you-type).
 
 ## `FtsField` & `Analyzer`

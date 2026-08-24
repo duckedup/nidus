@@ -317,6 +317,10 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 			_, err := c.TextSearch(ctx, TextSearchRequest{Field: "body", Query: "fox"})
 			return err
 		}},
+		{"Suggest", `{"suggestions":[],"matched":0}`, http.MethodPost, "/collections/docs/suggest", func(c *Client) error {
+			_, err := c.Suggest(ctx, "docs", SuggestRequest{Field: "body", Prefix: "fo"})
+			return err
+		}},
 		{"HybridSearch", `[]`, http.MethodPost, "/hybrid-search", func(c *Client) error {
 			_, err := c.HybridSearch(ctx, HybridSearchRequest{
 				Vector: []float32{1, 0, 0}, Field: "body", Text: "fox",
@@ -2415,6 +2419,75 @@ func TestPrefixOmitsWhenUnset(t *testing.T) {
 	want = `{"vector":[1,0,0],"text":"ru","prefix":true}`
 	if body := fake.sentBody(t); body != want {
 		t.Errorf("body = %s, want %s", body, want)
+	}
+}
+
+// TestSuggestSendsCollectionInThePath — the collection is a path segment, not a body
+// field, so the body carries only the field/prefix/limit trio.
+func TestSuggestSendsCollectionInThePath(t *testing.T) {
+	fake := &capture{reply: `{"suggestions":[],"matched":0}`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.Suggest(ctx, "docs", SuggestRequest{Field: "body", Prefix: "nid", Limit: 5}); err != nil {
+		t.Fatalf("Suggest failed: %v", err)
+	}
+	snap := fake.snapshot()
+	if snap.path != "/collections/docs/suggest" {
+		t.Errorf("path = %s, want /collections/docs/suggest", snap.path)
+	}
+	want := `{"field":"body","prefix":"nid","limit":5}`
+	if body := string(snap.body); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+}
+
+// TestSuggestOmitsLimitWhenZero catches a client-side default forking from the
+// server's own default of 10: a zero Limit must not encode a "limit" key at all.
+func TestSuggestOmitsLimitWhenZero(t *testing.T) {
+	fake := &capture{reply: `{"suggestions":[],"matched":0}`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.Suggest(ctx, "docs", SuggestRequest{Field: "body", Prefix: "nid"}); err != nil {
+		t.Fatalf("Suggest failed: %v", err)
+	}
+	want := `{"field":"body","prefix":"nid"}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s (no limit key)", body, want)
+	}
+}
+
+// TestSuggestDecodesTheResponse checks every field of the decoded result, DF included.
+func TestSuggestDecodesTheResponse(t *testing.T) {
+	fake := &capture{reply: `{"suggestions":[{"term":"nidus","df":3}],"matched":1}`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	got, err := db.Suggest(ctx, "docs", SuggestRequest{Field: "body", Prefix: "nid"})
+	if err != nil {
+		t.Fatalf("Suggest failed: %v", err)
+	}
+	if got.Matched != 1 {
+		t.Errorf("Matched = %d, want 1", got.Matched)
+	}
+	if len(got.Suggestions) != 1 || got.Suggestions[0].Term != "nidus" || got.Suggestions[0].DF != 3 {
+		t.Errorf("Suggestions = %+v, want [{nidus 3}]", got.Suggestions)
+	}
+}
+
+// TestSuggestEscapesTheCollectionName — a collection name needing escaping must land
+// escaped in the path, exactly as every other collPath-routed method.
+func TestSuggestEscapesTheCollectionName(t *testing.T) {
+	fake := &capture{reply: `{"suggestions":[],"matched":0}`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.Suggest(ctx, "notes/2024", SuggestRequest{Field: "body", Prefix: "nid"}); err != nil {
+		t.Fatalf("Suggest failed: %v", err)
+	}
+	if got := fake.snapshot().path; got != "/collections/notes%2F2024/suggest" {
+		t.Errorf("path = %s, want /collections/notes%%2F2024/suggest", got)
 	}
 }
 

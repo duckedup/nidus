@@ -746,6 +746,41 @@ fn prefix_clause_survives_a_reopen() {
     assert_eq!(marked, vec!["carbon"]);
 }
 
+/// `Nidus::suggest` through the public API, surviving a reopen — proving the rebuilt fts
+/// cache still serves the postings `suggest` scans.
+#[test]
+#[cfg_attr(miri, ignore)] // fsync: File::sync_all is unimplemented under Miri
+fn suggest_survives_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    {
+        let mut db = Nidus::open(Config::new(&path, 3)).unwrap();
+        db.create_collection_with_fts("docs", &[FtsField::new("body")])
+            .unwrap();
+        let doc = |id: &str, body: &str| {
+            let mut attrs = BTreeMap::new();
+            attrs.insert("body".to_string(), Value::Str(body.to_string()));
+            Record::text_only(id, attrs)
+        };
+        db.upsert(
+            "docs",
+            &[
+                doc("a", "the carbon fiber panel"),
+                doc("b", "an unrelated document"),
+            ],
+        )
+        .unwrap();
+        db.flush().unwrap();
+    }
+
+    let db = Nidus::open(Config::new(&path, 3)).unwrap();
+    let got = db.suggest("docs", "body", "car", 10);
+    assert_eq!(got.matched, 1);
+    assert_eq!(got.suggestions.len(), 1);
+    assert_eq!(got.suggestions[0].term, "carbon");
+    assert_eq!(got.suggestions[0].df, 1);
+}
+
 /// The ranking-expression and aggregation surface through the public API, on a file-backed
 /// store reopened between writing and querying (nidus-m50.3, nidus-m50.6).
 #[test]

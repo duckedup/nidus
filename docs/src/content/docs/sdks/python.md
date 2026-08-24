@@ -220,6 +220,24 @@ at 256 expansions, past which the commonest completions win rather than the call
 `FtsClause` (the `clauses` spelling for several fields) carries the same key, so a
 multi-clause query can prefix-match one field while another stays exact.
 
+## Suggest (typeahead)
+
+`suggest` returns ranked term completions for a partial word, for an autocomplete
+dropdown, on both the sync and async clients:
+
+```python
+result = db.suggest("docs", field="title", prefix="nid", limit=5)
+for s in result.suggestions:
+    print(s.term, s.df)
+print(result.matched)  # > len(result.suggestions) means the 256-term cap truncated
+```
+
+Completions are ranked by document frequency, commonest first: the opposite of how a
+prefix clause ranks documents. Only the prefix's final token is completed. Unlike a
+prefix clause, which matches stems, `suggest` matches surface forms, so a corpus
+indexing "running" completes `running` at every keystroke. `limit` (default 10, a
+dropdown's size rather than a page's) truncates the already-256-capped list.
+
 ## Batch search and aggregation
 
 `batch_search` answers several vector queries in one round-trip (16 max), saving a hop

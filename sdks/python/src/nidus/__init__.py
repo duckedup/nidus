@@ -69,6 +69,8 @@ from .types import (
     Rollup,
     Stats,
     StoreVersions,
+    Suggestion,
+    Suggestions,
 )
 from .values import (
     AttrInput,
@@ -135,6 +137,8 @@ __all__ = [
     "Rollup",
     "Stats",
     "StoreVersions",
+    "Suggestion",
+    "Suggestions",
     "Transport",
     "Value",
     "__version__",

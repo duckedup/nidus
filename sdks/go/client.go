@@ -437,6 +437,20 @@ func (c *Client) TextSearch(ctx context.Context, req TextSearchRequest) ([]Hit, 
 	return c.hits(ctx, "/text-search", req)
 }
 
+// Suggest returns ranked term completions for a partial word from one field's indexed
+// vocabulary — what an autocomplete dropdown shows. Ranking is by document frequency,
+// commonest first, not the idf [Client.TextSearch] scores documents by.
+//
+// Completions are stems: the prefix is folded but not stemmed, so a corpus indexing
+// "running" as "run" completes "run" and never "running".
+func (c *Client) Suggest(ctx context.Context, collection string, req SuggestRequest) (Suggestions, error) {
+	var out Suggestions
+	if err := c.request(ctx, http.MethodPost, collPath(collection, "/suggest"), req, &out); err != nil {
+		return Suggestions{}, err
+	}
+	return out, nil
+}
+
 // HybridSearch fuses a vector query and a BM25 text query with reciprocal rank
 // fusion, so a document that ranks well on either leg surfaces. The returned score is
 // the fused RRF score — a rank-derived number, not a similarity, and not comparable

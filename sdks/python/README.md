@@ -263,6 +263,23 @@ Only the clause's last term expands; earlier terms still need an exact stem matc
 index holds stems, so `"runn"` will not prefix-match indexed `"run"` — the fragment itself
 is not stemmed, only fold-normalized (lowercased, accent-stripped).
 
+## Suggest (typeahead)
+
+`suggest` returns ranked term completions for a partial word, for an autocomplete
+dropdown:
+
+```python
+result = db.suggest("docs", field="title", prefix="nid", limit=5)
+for s in result.suggestions:
+    print(s.term, s.df)
+print(result.matched)  # > len(result.suggestions) means the 256-term cap truncated
+```
+
+Completions are ranked by document frequency, commonest first, the opposite of how a
+prefix clause ranks documents. Only the prefix's final token is completed. Unlike a
+prefix clause, which matches stems, `suggest` matches surface forms, so a corpus
+indexing "running" completes `running` at every keystroke.
+
 ## Query plans
 
 `search`, `search_similar`, and `hybrid_search` each have a `_with_plan` sibling that

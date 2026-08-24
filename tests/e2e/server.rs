@@ -685,6 +685,184 @@ fn prefix_clause_matches_a_truncated_query_over_http() {
     assert_eq!(hits[0]["id"], "a", "prefix on a clauses entry: {hits}");
 }
 
+/// "nidus" is in 3 documents, "nidification" in 1: the response ranks by document
+/// frequency, not idf, and hands back the words themselves rather than the Porter stems
+/// ("nidu", "nidif") that a dropdown could not display.
+#[test]
+fn suggest_returns_completions_ranked_by_document_frequency() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post("/collections/docs/fts-schema", &json!({"fields": ["body"]}))
+            .0,
+        200
+    );
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/upsert",
+                &json!({"records": [
+                    {"id": "a", "attrs": {"body": {"Str": "nidus"}}},
+                    {"id": "b", "attrs": {"body": {"Str": "nidus"}}},
+                    {"id": "c", "attrs": {"body": {"Str": "nidus"}}},
+                    {"id": "d", "attrs": {"body": {"Str": "nidification"}}}
+                ]}),
+            )
+            .0,
+        200
+    );
+
+    let (status, body) = server.post(
+        "/collections/docs/suggest",
+        &json!({"field": "body", "prefix": "nid"}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["suggestions"],
+        json!([
+            {"term": "nidus", "df": 3},
+            {"term": "nidification", "df": 1},
+        ]),
+        "commonest surface form first, not a stem: {body}"
+    );
+    assert_eq!(body["matched"], 2, "{body}");
+}
+
+/// A stem-keyed scan would go empty here, since "nidus" stems to "nidu": the surface-form
+/// map is what keeps the dropdown answering once the typist has finished the word.
+#[test]
+fn suggest_still_answers_on_the_whole_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post("/collections/docs/fts-schema", &json!({"fields": ["body"]}))
+            .0,
+        200
+    );
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/upsert",
+                &json!({"records": [{"id": "a", "attrs": {"body": {"Str": "nidus"}}}]}),
+            )
+            .0,
+        200
+    );
+
+    for typed in ["n", "nid", "nidu", "nidus"] {
+        let (status, body) = server.post(
+            "/collections/docs/suggest",
+            &json!({"field": "body", "prefix": typed}),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["suggestions"],
+            json!([{"term": "nidus", "df": 1}]),
+            "prefix {typed:?} must still complete: {body}"
+        );
+    }
+}
+
+/// `limit` truncates the returned list, but `matched` still reports the full match count so
+/// a caller can detect the truncation.
+#[test]
+fn suggest_limit_truncates_but_matched_reports_the_full_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post("/collections/docs/fts-schema", &json!({"fields": ["body"]}))
+            .0,
+        200
+    );
+    let records: Vec<Value> = (1..=5)
+        .map(|i| json!({"id": format!("d{i}"), "attrs": {"body": {"Str": format!("nid{i}")}}}))
+        .collect();
+    assert_eq!(
+        server
+            .post("/collections/docs/upsert", &json!({"records": records}))
+            .0,
+        200
+    );
+
+    let (status, body) = server.post(
+        "/collections/docs/suggest",
+        &json!({"field": "body", "prefix": "nid", "limit": 2}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["suggestions"].as_array().map(Vec::len),
+        Some(2),
+        "{body}"
+    );
+    assert_eq!(body["matched"], 5, "{body}");
+}
+
+/// Omitting `limit` defaults to 10, not the unrelated `top_k` default — the assertion that
+/// would catch a `default_top_k()` slip.
+#[test]
+fn suggest_defaults_the_limit_when_omitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post("/collections/docs/fts-schema", &json!({"fields": ["body"]}))
+            .0,
+        200
+    );
+    let records: Vec<Value> = (1..=15)
+        .map(|i| json!({"id": format!("d{i}"), "attrs": {"body": {"Str": format!("nid{i}")}}}))
+        .collect();
+    assert_eq!(
+        server
+            .post("/collections/docs/upsert", &json!({"records": records}))
+            .0,
+        200
+    );
+
+    let (status, body) = server.post(
+        "/collections/docs/suggest",
+        &json!({"field": "body", "prefix": "nid"}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["suggestions"].as_array().map(Vec::len),
+        Some(10),
+        "{body}"
+    );
+    assert_eq!(body["matched"], 15, "{body}");
+}
+
+/// A field with no full-text schema is a `200` carrying an empty list, not an error.
+#[test]
+fn suggest_of_an_unindexed_field_is_an_empty_200() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/upsert",
+                &json!({"records": [{"id": "a", "attrs": {"body": {"Str": "nidus"}}}]}),
+            )
+            .0,
+        200
+    );
+
+    let (status, body) = server.post(
+        "/collections/docs/suggest",
+        &json!({"field": "body", "prefix": "nid"}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, json!({"suggestions": [], "matched": 0}), "{body}");
+}
+
 /// A batch and a grouped aggregate over the REAL binary: both are new routes, and a route
 /// that is wired in-process can still be missing from the built router (nidus-m50.11,
 /// nidus-bmh).

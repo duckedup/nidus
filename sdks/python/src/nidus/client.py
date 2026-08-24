@@ -60,6 +60,7 @@ from .types import (
     Rollup,
     Stats,
     StoreVersions,
+    Suggestions,
 )
 from .values import AttrInput
 
@@ -469,6 +470,26 @@ class NidusClient:
                 rerank=rerank,
             ),
         )
+
+    def suggest(
+        self,
+        collection: str,
+        *,
+        field: str,
+        prefix: str,
+        limit: Optional[int] = None,
+    ) -> Suggestions:
+        """Ranked term completions for a partial word, for an autocomplete dropdown.
+
+        Ranked by document frequency (commonest first), the opposite of how a prefix clause
+        ranks documents. Only ``prefix``'s final token is completed. Completions are stems:
+        the prefix is folded, not stemmed, so a corpus indexing "running" as "run" completes
+        ``run`` and never ``running``.
+        """
+        payload = self._request(
+            "POST", _wire.suggest_path(collection), _wire.suggest_body(field, prefix, limit)
+        )
+        return _wire.decode_suggestions(payload)
 
     def hybrid_search(
         self,

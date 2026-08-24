@@ -222,6 +222,13 @@ ENDPOINTS: list[tuple[str, Callable[[AsyncNidusClient], Any], str, str, Any]] = 
         {"ok": True},
     ),
     ("recall", lambda db: db.recall("notes", "hello"), "POST", "/collections/notes/recall", []),
+    (
+        "suggest",
+        lambda db: db.suggest("docs", field="body", prefix="nid"),
+        "POST",
+        "/collections/docs/suggest",
+        {"suggestions": [], "matched": 0},
+    ),
     ("flush", lambda db: db.flush(), "POST", "/flush", {"ok": True}),
     ("compact", lambda db: db.compact(), "POST", "/compact", {"ok": True}),
     ("refresh", lambda db: db.refresh(), "POST", "/refresh", {"adopted": True}),
@@ -637,6 +644,29 @@ async def test_records_keeps_an_absent_vector_as_none() -> None:
         records = await db.records("docs")
     assert records[0].vector is None
     assert records[0].attrs == {"body": "text only"}
+
+
+async def test_suggest_posts_to_the_collection_path() -> None:
+    mock = MockServer({"suggestions": [], "matched": 0})
+    async with client(mock) as db:
+        await db.suggest("docs", field="body", prefix="nid", limit=5)
+    assert mock.last.method == "POST"
+    assert str(mock.last.url) == "http://x/collections/docs/suggest"
+    assert mock.json == {"field": "body", "prefix": "nid", "limit": 5}
+
+
+async def test_suggest_returns_the_decoded_result() -> None:
+    mock = MockServer(
+        {
+            "suggestions": [{"term": "nidus", "df": 3}, {"term": "nidification", "df": 1}],
+            "matched": 2,
+        }
+    )
+    async with client(mock) as db:
+        result = await db.suggest("docs", field="body", prefix="nid")
+    assert [s.term for s in result.suggestions] == ["nidus", "nidification"]
+    assert [s.df for s in result.suggestions] == [3, 1]
+    assert result.matched == 2
 
 
 @pytest.mark.parametrize("status", [200, 204, 299])

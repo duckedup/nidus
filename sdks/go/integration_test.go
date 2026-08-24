@@ -967,6 +967,46 @@ func TestSearchSimilarAgainstARealServer(t *testing.T) {
 	}
 }
 
+// TestSuggestAgainstARealServer checks the typeahead surface end to end: ranking is by
+// live document frequency, not the idf TextSearch uses, so "nidus" (in two documents)
+// must outrank "nidification" (in one) even though the rarer term has the higher idf.
+func TestSuggestAgainstARealServer(t *testing.T) {
+	db := startServer(t)
+	ctx := context.Background()
+
+	if err := db.CreateCollection(ctx, "docs"); err != nil {
+		t.Fatalf("CreateCollection failed: %v", err)
+	}
+	if err := db.SetFtsSchema(ctx, "docs", []string{"body"}); err != nil {
+		t.Fatalf("SetFtsSchema failed: %v", err)
+	}
+	_, err := db.Upsert(ctx, "docs", []Record{
+		{ID: "a", Attrs: Attrs{"body": Str("nidus is a vector store")}},
+		{ID: "b", Attrs: Attrs{"body": Str("the nidus fts index")}},
+		{ID: "c", Attrs: Attrs{"body": Str("nidification is a bird building its nest")}},
+	})
+	if err != nil {
+		t.Fatalf("Upsert failed: %v", err)
+	}
+
+	got, err := db.Suggest(ctx, "docs", SuggestRequest{Field: "body", Prefix: "nid"})
+	if err != nil {
+		t.Fatalf("Suggest failed: %v", err)
+	}
+	want := Suggestions{
+		Suggestions: []Suggestion{{Term: "nidus", DF: 2}, {Term: "nidification", DF: 1}},
+		Matched:     2,
+	}
+	if got.Matched != want.Matched || len(got.Suggestions) != len(want.Suggestions) {
+		t.Fatalf("Suggest = %+v, want %+v", got, want)
+	}
+	for i, s := range want.Suggestions {
+		if got.Suggestions[i] != s {
+			t.Errorf("Suggestions[%d] = %+v, want %+v", i, got.Suggestions[i], s)
+		}
+	}
+}
+
 // TestServerErrorsCarryTheirStatus checks the error surface against the real
 // classifier in src/server/mod.rs rather than a canned httptest reply. The status is
 // the part a caller acts on, so it has to be the status the server actually chose.

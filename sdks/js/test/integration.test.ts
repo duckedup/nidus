@@ -290,6 +290,24 @@ describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
     expect(clauseForm.map((h) => h.id)).toEqual(["a"]);
   });
 
+  // "run" and "runner" stem to themselves (Porter leaves both alone), so their df
+  // ordering is asserted exactly rather than hedged around stemming.
+  it("suggest ranks completions by document frequency", async () => {
+    await db.createCollection("m52");
+    await db.setFtsSchema("m52", ["body"]);
+    await db.upsert("m52", [
+      { id: "a", vector: [1, 0, 0], attrs: { body: "I run every morning" } },
+      { id: "b", vector: [0, 1, 0], attrs: { body: "run run run" } },
+      { id: "c", vector: [0, 0, 1], attrs: { body: "they run too" } },
+      { id: "d", vector: [1, 1, 0], attrs: { body: "a runner races" } },
+    ]);
+
+    const result = await db.suggest({ collection: "m52", field: "body", prefix: "run", limit: 10 });
+    expect(result.suggestions.map((s) => s.term)).toEqual(["run", "runner"]);
+    expect(result.suggestions.map((s) => s.df)).toEqual([3, 1]);
+    expect(result.matched).toBe(2);
+  });
+
   it("deletes and reflects the change in stats", async () => {
     expect(await db.delete("docs", { ids: ["b"] })).toBe(1);
     const remaining = await db.records("docs");

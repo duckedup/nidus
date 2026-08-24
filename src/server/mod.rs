@@ -30,7 +30,7 @@ use dto::{
     AggregateRequest, AggregationDto, AnnDto, BatchFuse, BatchSearchRequest, BatchSearchResponse,
     CompactRequest, DeleteRequest, FilterIndexRequest, FootprintDto, FtsSchemaRequest, HitDto,
     HybridSearchRequest, ListRequest, MAX_BATCH_QUERIES, MAX_TOP_K, SearchRequest, SearchResponse,
-    SimilarRequest, TextSearchRequest, UpsertRequest, VersionsDto,
+    SimilarRequest, SuggestRequest, SuggestionsDto, TextSearchRequest, UpsertRequest, VersionsDto,
 };
 
 // ── AI-ingest (memory) imports: only under the `memory` feature (pulled by the
@@ -457,6 +457,7 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/collections/{name}/records", get(records))
         .route("/collections/{name}/fts-schema", post(set_fts_schema))
         .route("/collections/{name}/filter-index", post(set_filter_index))
+        .route("/collections/{name}/suggest", post(suggest))
         .route("/search", post(search))
         .route("/search/batch", post(search_batch))
         .route("/search/similar", post(search_similar))
@@ -1164,6 +1165,21 @@ async fn set_filter_index(
     })
     .await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// `POST /collections/{name}/suggest` — ranked term completions for a prefix, for a
+/// typeahead dropdown. Ranked by document frequency, not by the idf `/text-search` uses.
+async fn suggest(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<SuggestRequest>,
+) -> Result<Json<SuggestionsDto>, ApiError> {
+    check_page(0, req.limit)?;
+    let out = run_read(st, move |db| {
+        Ok(db.suggest(&name, &req.field, &req.prefix, req.limit))
+    })
+    .await?;
+    Ok(Json(out.into()))
 }
 
 async fn text_search(

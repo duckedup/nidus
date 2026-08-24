@@ -1213,6 +1213,20 @@ enum Command {
         #[arg(long)]
         max_token_len: Option<usize>,
     },
+    /// Ranked term completions for a prefix, for an autocomplete dropdown.
+    Suggest {
+        #[command(flatten)]
+        store: StoreArgs,
+        /// The collection whose vocabulary to complete from.
+        collection: String,
+        /// The full-text-indexed field to complete from.
+        field: String,
+        /// The partial word being typed. Only its final token is completed.
+        prefix: String,
+        /// How many completions to return.
+        #[arg(long, short = 'n', default_value_t = 10)]
+        limit: usize,
+    },
     /// Full-text (BM25) search of fields declared via `set-fts-schema`.
     TextSearch {
         #[command(flatten)]
@@ -1882,6 +1896,16 @@ pub fn run(cli: Cli) -> Result<()> {
                 "collection": collection,
                 "fts_fields": reported,
             }))
+        }
+        Command::Suggest {
+            store,
+            collection,
+            field,
+            prefix,
+            limit,
+        } => {
+            let db = open(&store, false)?;
+            print_json(&db.suggest(&collection, &field, &prefix, limit))
         }
         Command::TextSearch {
             store,

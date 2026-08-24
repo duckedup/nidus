@@ -38,6 +38,8 @@ import type {
   SimilarSearchOptions,
   Stats,
   StoreVersions,
+  Suggestions,
+  SuggestOptions,
   TextSearchOptions,
   Value,
 } from "./types.js";
@@ -351,6 +353,19 @@ export class NidusClient {
       expand: encodeExpand(opts.expand),
       rerank: encodeRerank(opts.rerank),
     });
+  }
+
+  /**
+   * Ranked term completions for a partial word, for an autocomplete dropdown. Ranked by
+   * document frequency (commonest first), which is the opposite of how a prefix clause
+   * ranks documents. Completions are stems: the prefix is folded, not stemmed.
+   */
+  suggest(opts: SuggestOptions): Promise<Suggestions> {
+    return this.request<Suggestions>(
+      "POST",
+      `/collections/${enc(opts.collection)}/suggest`,
+      prune({ field: opts.field, prefix: opts.prefix, limit: opts.limit }),
+    );
   }
 
   /**

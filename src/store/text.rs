@@ -13,7 +13,9 @@ use crate::annotate::{Annotations, ClauseScore, Expansion, Highlight, HighlightO
 use crate::filter;
 use crate::fts::Analyzer;
 use crate::fuse::{FusionLeg, rrf_fuse};
-use crate::model::{FtsClause, FtsCombine, FtsQuery, Hit, HybridOpts, SearchOpts};
+use crate::model::{
+    FtsClause, FtsCombine, FtsQuery, Hit, HybridOpts, SearchOpts, Suggestion, Suggestions,
+};
 use crate::plan::QueryPlan;
 use crate::search::TopK;
 
@@ -155,6 +157,36 @@ impl Store {
         let mut hits = self.finish(self.hits_from_topk(topk, &opts.projection), opts);
         self.annotate(&mut hits, query, opts.explain.then_some(&mut breakdown));
         Ok(hits)
+    }
+
+    /// Ranked prefix completions from `field`'s vocabulary, `df` desc then term asc, the
+    /// opposite of the idf a prefix *clause* scores by, because a dropdown wants the common
+    /// completion first. Empty when the field isn't full-text indexed.
+    pub fn suggest(
+        &self,
+        collection: &str,
+        field: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> Suggestions {
+        let Some(cfg) = self.fts.field_analyzer(collection, field) else {
+            return Suggestions::default();
+        };
+        // The trailing token, folded exactly as a prefix clause folds it. Not stemmed:
+        // a half-typed word has no meaningful stem, and the scan it feeds keys on surface
+        // forms anyway (the postings' own keys are stems, which is why it cannot use them).
+        let (_, Some(fragment)) = crate::fts::analyze_with_prefix(prefix, cfg) else {
+            return Suggestions::default();
+        };
+        let (mut scored, matched) = self.fts.suggest(collection, field, &fragment);
+        scored.truncate(limit);
+        Suggestions {
+            suggestions: scored
+                .into_iter()
+                .map(|(term, df)| Suggestion { term, df })
+                .collect(),
+            matched,
+        }
     }
 
     /// Hybrid search: fuse a vector and a BM25 leg with Reciprocal Rank Fusion. Each leg runs
