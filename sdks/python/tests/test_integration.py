@@ -641,6 +641,7 @@ def test_suggest_is_fuzzy_by_default_and_exact_only_when_opted_out(server: str) 
         opted_out = db.suggest(field="title", prefix="runing", scope=["docs"], fuzzy=False)
         assert opted_out.suggestions == []
 
+
 def test_code_search_groups_a_known_file_by_symbol_and_line_span(server: str) -> None:
     """The load-bearing round trip: a known file in, symbol name and line span out.
 
