@@ -795,6 +795,23 @@ def test_suggest_body_carries_scope_and_filter() -> None:
     }
 
 
+def test_suggest_body_omits_fuzzy_when_unset() -> None:
+    """Unset means the server's own default (fuzzy on) applies, not a client-side one."""
+    body = _wire.suggest_body("body", "nid")
+    assert "fuzzy" not in body
+
+
+def test_suggest_body_carries_fuzzy_false() -> None:
+    """A literal ``False`` must survive ``prune`` — it is not falsy-None, it is an opt-out."""
+    assert _wire.suggest_body("body", "nid", fuzzy=False) == {
+        "scope": [],
+        "field": "body",
+        "prefix": "nid",
+        "filter": [],
+        "fuzzy": False,
+    }
+
+
 def test_decode_suggestions_decodes_terms_and_df() -> None:
     result = _wire.decode_suggestions({"suggestions": [{"term": "nidus", "df": 3}], "matched": 1})
     assert result.matched == 1

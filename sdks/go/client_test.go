@@ -2517,6 +2517,33 @@ func TestSuggestOmitsLimitWhenZero(t *testing.T) {
 	}
 }
 
+// TestSuggestFuzzyIsOmittedWhenNilAndSentWhenFalse is the omit-vs-zero test for a
+// tri-state *bool: nil must drop the "fuzzy" key entirely (the server default, on,
+// applies), and a pointer at false must still send "fuzzy":false. Checking only one
+// half would not tell omitempty on a pointer apart from the broken omitempty-on-bool
+// shape that can never ask for false.
+func TestSuggestFuzzyIsOmittedWhenNilAndSentWhenFalse(t *testing.T) {
+	fake := &capture{reply: `{"suggestions":[],"matched":0}`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.Suggest(ctx, SuggestRequest{Field: "body", Prefix: "nid"}); err != nil {
+		t.Fatalf("Suggest failed: %v", err)
+	}
+	if body := fake.sentBody(t); strings.Contains(body, "fuzzy") {
+		t.Errorf("body = %s, must omit fuzzy when Fuzzy is nil", body)
+	}
+
+	off := false
+	if _, err := db.Suggest(ctx, SuggestRequest{Field: "body", Prefix: "nid", Fuzzy: &off}); err != nil {
+		t.Fatalf("Suggest failed: %v", err)
+	}
+	want := `{"field":"body","prefix":"nid","fuzzy":false}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+}
+
 // TestSuggestDecodesTheResponse checks every field of the decoded result, DF included.
 func TestSuggestDecodesTheResponse(t *testing.T) {
 	fake := &capture{reply: `{"suggestions":[{"term":"nidus","df":3}],"matched":1}`}

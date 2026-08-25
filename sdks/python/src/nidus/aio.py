@@ -450,6 +450,7 @@ class AsyncNidusClient:
         scope: Optional[Sequence[str]] = None,
         limit: Optional[int] = None,
         filter: Optional[Filter] = None,  # noqa: A002
+        fuzzy: Optional[bool] = None,
     ) -> Suggestions:
         """Ranked term completions for a partial word, for an autocomplete dropdown.
 
@@ -461,9 +462,15 @@ class AsyncNidusClient:
         discarded: they narrow the completions to documents that also carry them, so pass
         the whole phrase typed so far. ``filter`` narrows each completion's ``df`` to the
         matching documents, so a completion no matching document carries is not offered.
+
+        When the exact-prefix scan finds nothing, the server falls back to a typo-tolerant
+        match against the field's vocabulary; this is on by default, so pass
+        ``fuzzy=False`` to require exact prefixes only.
         """
         payload = await self._request(
-            "POST", "/suggest", _wire.suggest_body(field, prefix, scope, limit, filter)
+            "POST",
+            "/suggest",
+            _wire.suggest_body(field, prefix, scope=scope, limit=limit, filter=filter, fuzzy=fuzzy),
         )
         return _wire.decode_suggestions(payload)
 

@@ -730,6 +730,77 @@ fn suggest_returns_completions_ranked_by_document_frequency() {
     assert_eq!(body["matched"], 2, "{body}");
 }
 
+#[test]
+fn suggest_completes_a_mistyped_prefix_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post("/collections/docs/fts-schema", &json!({"fields": ["body"]}))
+            .0,
+        200
+    );
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/upsert",
+                &json!({"records": [
+                    {"id": "a", "attrs": {"body": {"Str": "running"}}}
+                ]}),
+            )
+            .0,
+        200
+    );
+
+    // No "fuzzy" field at all: the default must be on, not a plain `bool`'s `false`.
+    let (status, body) = server.post(
+        "/suggest",
+        &json!({"scope": ["docs"], "field": "body", "prefix": "runing"}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["suggestions"],
+        json!([{"term": "running", "df": 1}]),
+        "fuzzy defaults to on, so a mistyped prefix should still complete: {body}"
+    );
+}
+
+#[test]
+fn suggest_fuzzy_false_leaves_a_typo_uncompleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post("/collections/docs/fts-schema", &json!({"fields": ["body"]}))
+            .0,
+        200
+    );
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/upsert",
+                &json!({"records": [
+                    {"id": "a", "attrs": {"body": {"Str": "running"}}}
+                ]}),
+            )
+            .0,
+        200
+    );
+
+    let (status, body) = server.post(
+        "/suggest",
+        &json!({"scope": ["docs"], "field": "body", "prefix": "runing", "fuzzy": false}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["suggestions"],
+        json!([]),
+        "fuzzy: false must opt out of the fallback leg: {body}"
+    );
+}
+
 /// A stem-keyed scan would go empty here, since "nidus" stems to "nidu": the surface-form
 /// map is what keeps the dropdown answering once the typist has finished the word.
 #[test]

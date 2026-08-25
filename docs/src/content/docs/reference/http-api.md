@@ -640,7 +640,7 @@ Ranked by document frequency (commonest first), which is the **opposite** of how
 *clause* in `/text-search` ranks documents. `scope` and `filter` are spelled exactly as
 `/text-search` spells them: an omitted or empty `scope` means every collection. `limit`
 defaults to 10 (a dropdown, not a page) and is bounded by the same `MAX_TOP_K` ceiling as the
-other read routes.
+other read routes. `fuzzy` is optional and defaults to **true**: send `false` to opt out.
 
 ```bash
 curl -s localhost:7700/suggest \
@@ -654,8 +654,10 @@ curl -s localhost:7700/suggest \
   "matched": 2 }
 ```
 
-`matched` counts every term the prefix matched before the 256-term cap; `matched` exceeding
-`suggestions.length` is the truncation signal. The prefix is folded (lowercased, optionally
+`matched` counts every term matched before the 256-term cap; `matched` exceeding
+`suggestions.length` is the truncation signal. When the fuzzy fallback below answers, `matched`
+counts what *it* matched, so `matched` of `0` means neither leg found anything, not that the
+exact prefix missed. The prefix is folded (lowercased, optionally
 ASCII-folded) the same way a prefix clause folds it, and matched against the field's surface
 forms, so completions are real words rather than stems: every keystroke of `running`
 completes to `running`. Two spellings of one stem are two completions sharing that stem's
@@ -676,6 +678,27 @@ Each `df` is a **conditioned** count, in two ways:
 
 A single-token prefix, or one whose earlier words are all stopwords (`"the br"`), has no head
 terms and so is unconditioned: it behaves exactly as `"br"` does.
+
+### Typo tolerance
+
+If the exact prefix matches **nothing at all**, `suggest` retries the final token against the
+field's vocabulary within a short edit budget and returns what it finds, ranked nearest first:
+
+```bash
+curl -s localhost:7700/suggest \
+  -H 'content-type: application/json' \
+  -d '{"scope": ["docs"], "field": "body", "prefix": "runing"}'
+```
+
+```json
+{ "suggestions": [ { "term": "running", "df": 12 } ], "matched": 1 }
+```
+
+The budget follows the fragment's length: none below 4 characters, 1 at 4 to 7, 2 at 8 or
+more, and none again past 64, since a fragment that long is not a word being typed. This is a
+fallback, not a widening: a prefix that already completes costs exactly what it did before.
+Both `df` conditions above apply to it unchanged, so a completion the `filter` excludes is
+absent here too. Send `"fuzzy": false` to turn it off.
 
 ```bash
 # only vocabulary from this tenant's documents, and only words that continue the phrase

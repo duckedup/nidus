@@ -1249,6 +1249,10 @@ enum Command {
         /// only matching documents, so a completion no match carries is not offered.
         #[arg(long = "where")]
         filter: Option<String>,
+        /// Turn off typo tolerance (on by default): a mistyped fragment then completes to
+        /// nothing.
+        #[arg(long)]
+        no_fuzzy: bool,
     },
     /// Full-text (BM25) search of fields declared via `set-fts-schema`.
     TextSearch {
@@ -1950,6 +1954,7 @@ pub fn run(cli: Cli) -> Result<()> {
             collections,
             limit,
             filter,
+            no_fuzzy,
         } => {
             let db = open(&store, false)?;
             let opts = SuggestOpts {
@@ -1958,6 +1963,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     Some(s) => serde_json::from_str(&s)?,
                     None => Filter::default(),
                 },
+                fuzzy: !no_fuzzy,
             };
             let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
             let out = if refs.is_empty() {

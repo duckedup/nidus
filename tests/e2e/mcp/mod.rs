@@ -513,6 +513,93 @@ fn suggest_tool_completes_a_prefix_ranked_by_document_frequency() {
     );
 }
 
+/// `suggest`'s `fuzzy` gate (nidus-972) defaults to **on**: a mistyped prefix that the exact
+/// scan cannot match still finds its term through the fallback edit-distance leg, with no
+/// `fuzzy` argument sent at all.
+#[test]
+fn suggest_tool_completes_a_mistyped_prefix_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+
+    assert_eq!(server.post("/collections/notes", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post(
+                "/collections/notes/fts-schema",
+                &json!({"fields": ["body"]})
+            )
+            .0,
+        200
+    );
+    let (status, _) = server.post(
+        "/collections/notes/upsert",
+        &json!({"records": [
+            {"id": "a", "vector": [1, 0, 0], "attrs": {"body": {"Str": "the banana bread"}}}
+        ]}),
+    );
+    assert_eq!(status, 200);
+
+    let (status, body) = mcp(
+        &server,
+        "tools/call",
+        Some("suggest"),
+        &call(
+            1,
+            "suggest",
+            json!({"collection": "notes", "field": "body", "prefix": "bannana"}),
+        ),
+    );
+    assert_eq!(status, 200, "suggest failed: {body}");
+    let out = text(&result(&body));
+    assert!(
+        out.contains("\"banana\""),
+        "a mistyped prefix must fall back to the fuzzy leg by default: {out}"
+    );
+}
+
+/// The same mistyped prefix with `fuzzy: false`: the fallback leg never runs, so the
+/// misspelled prefix finds nothing.
+#[test]
+fn suggest_tool_honours_fuzzy_false() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+
+    assert_eq!(server.post("/collections/notes", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post(
+                "/collections/notes/fts-schema",
+                &json!({"fields": ["body"]})
+            )
+            .0,
+        200
+    );
+    let (status, _) = server.post(
+        "/collections/notes/upsert",
+        &json!({"records": [
+            {"id": "a", "vector": [1, 0, 0], "attrs": {"body": {"Str": "the banana bread"}}}
+        ]}),
+    );
+    assert_eq!(status, 200);
+
+    let (status, body) = mcp(
+        &server,
+        "tools/call",
+        Some("suggest"),
+        &call(
+            1,
+            "suggest",
+            json!({"collection": "notes", "field": "body", "prefix": "bannana", "fuzzy": false}),
+        ),
+    );
+    assert_eq!(status, 200, "suggest failed: {body}");
+    let out = text(&result(&body));
+    assert!(
+        !out.contains("\"banana\""),
+        "fuzzy:false must not fall back to the edit-distance leg: {out}"
+    );
+}
+
 /// nidus-3j8 over MCP: `filter` narrows each completion's `df`, and a completion no matching
 /// entry carries is not offered at all. nidus-ucl comes with it, through `prefix` alone.
 #[test]

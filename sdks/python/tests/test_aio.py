@@ -691,6 +691,22 @@ async def test_suggest_posts_scope_and_filter_to_the_suggest_route() -> None:
     }
 
 
+async def test_suggest_omits_fuzzy_by_default_and_sends_it_false_to_opt_out() -> None:
+    mock = MockServer({"suggestions": [], "matched": 0})
+    async with client(mock) as db:
+        await db.suggest(field="body", prefix="nid")
+        assert "fuzzy" not in mock.json
+
+        await db.suggest(field="body", prefix="nid", fuzzy=False)
+    assert mock.json == {
+        "scope": [],
+        "field": "body",
+        "prefix": "nid",
+        "filter": [],
+        "fuzzy": False,
+    }
+
+
 async def test_suggest_returns_the_decoded_result() -> None:
     mock = MockServer(
         {

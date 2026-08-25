@@ -4505,6 +4505,7 @@ fn a_filtered_out_completions_only_docs_make_it_vanish_rather_than_leak_a_df() {
                     "tenant".into(),
                     Value::Str("acme".into()),
                 )]),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -4547,6 +4548,7 @@ fn a_filtered_df_counts_only_matching_live_docs() {
             &SuggestOpts {
                 limit: 10,
                 filter: Filter(vec![Predicate::Eq("keep".into(), Value::Bool(true))]),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -4793,8 +4795,122 @@ fn suggest_rejects_an_invalid_filter() {
     let bad = SuggestOpts {
         limit: 10,
         filter: Filter(vec![Predicate::Regex("body".into(), "([".into())]),
+        ..Default::default()
     };
     assert!(store.suggest(&["docs"], "body", "nid", &bad).is_err());
+}
+
+// ── suggest: fallback fuzzy leg (nidus-972) ──────────────────────────────────────
+
+/// The headline criterion: a mistyped fragment the exact-prefix scan cannot reach still
+/// completes, via the fallback leg.
+#[test]
+fn suggest_completes_a_mistyped_fragment() {
+    let store = fts_store(&[("a", "running")]);
+    assert_eq!(
+        sug_terms(&store, "docs", "runing"),
+        vec![("running".into(), 1)]
+    );
+}
+
+/// Asserts the trigger, not just the answer: "runt" prefix-matches "runtime", so the fuzzy leg
+/// must never run, and "rung" (one prefix-edit from "runt") must not leak in beside it.
+#[test]
+fn the_fuzzy_leg_does_not_fire_when_the_prefix_leg_answers() {
+    let store = fts_store(&[("a", "runtime"), ("b", "rung")]);
+    assert_eq!(
+        sug_terms(&store, "docs", "runt"),
+        vec![("runtime".into(), 1)],
+        "the prefix leg already answered; rung must not appear"
+    );
+}
+
+/// The nidus-3j8 leak guard at store level: a filter admitting no document empties even a
+/// fuzzy-reached completion, rather than reporting a whole-corpus count.
+#[test]
+fn fuzzy_completions_are_counted_through_the_filter() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    store
+        .upsert(
+            "docs",
+            &[doc_attr(
+                "a",
+                "running",
+                "tenant",
+                Value::Str("acme".into()),
+            )],
+        )
+        .unwrap();
+
+    let opts = SuggestOpts {
+        limit: 10,
+        filter: Filter(vec![Predicate::Eq(
+            "tenant".into(),
+            Value::Str("other".into()),
+        )]),
+        ..Default::default()
+    };
+    let got = store.suggest(&["docs"], "body", "runing", &opts).unwrap();
+    assert!(got.suggestions.is_empty(), "{got:?}");
+}
+
+/// nidus-ucl's head conditioning applies to the fuzzy leg too: "runting" shares no document
+/// with the head "quick", so it must not complete "quick runing" even though it is one prefix
+/// edit away, while "running" (which does share a document with "quick") still does.
+#[test]
+fn fuzzy_completions_are_conditioned_by_the_head_terms() {
+    let store = fts_store(&[("a", "quick running"), ("b", "brown runting")]);
+    assert_eq!(
+        sug_terms(&store, "docs", "quick runing"),
+        vec![("running".into(), 1)],
+        "runting shares no document with quick"
+    );
+}
+
+/// The budget floor: below four characters the fuzzy leg never sweeps, so a short typo the
+/// prefix leg cannot reach stays uncompleted.
+#[test]
+fn a_fragment_below_four_chars_does_not_complete_fuzzily() {
+    let store = fts_store(&[("a", "cat")]);
+    assert!(sug_terms(&store, "docs", "cta").is_empty());
+}
+
+/// Fails if the sort key is left as `(df desc, term asc)`: a distance-1 completion with a
+/// single document must still outrank a distance-2 completion with five.
+#[test]
+fn fuzzy_ranks_the_nearer_completion_first() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    let mut recs = vec![doc("close", "aaaaaaab")];
+    for i in 0..5 {
+        recs.push(doc(&format!("far{i}"), "aaaaaabb"));
+    }
+    store.upsert("docs", &recs).unwrap();
+
+    assert_eq!(
+        sug_terms(&store, "docs", "aaaaaaaa"),
+        vec![("aaaaaaab".into(), 1), ("aaaaaabb".into(), 5)],
+        "distance-1 must outrank distance-2 despite the lower df"
+    );
+}
+
+/// The opt-out actually opts out: with `fuzzy: false` a mistyped fragment stays uncompleted.
+#[test]
+fn suggest_with_fuzzy_off_leaves_a_typo_uncompleted() {
+    let store = fts_store(&[("a", "running")]);
+    let opts = SuggestOpts {
+        limit: 10,
+        fuzzy: false,
+        ..Default::default()
+    };
+    let got = store.suggest(&["docs"], "body", "runing", &opts).unwrap();
+    assert!(got.suggestions.is_empty(), "{got:?}");
+    assert_eq!(got.matched, 0);
 }
 
 // ── FTS schema: per-field BM25 / analyzer configuration (nidus-m50.13) ───────────

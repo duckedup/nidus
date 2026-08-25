@@ -2106,6 +2106,73 @@ fn cli_suggest_limit_truncates() {
     assert_eq!(out["matched"], 2, "unexpected match count: {out}");
 }
 
+/// Typo tolerance is on by default (nidus-972): a mistyped fragment still completes once the
+/// exact-prefix leg comes back empty.
+#[test]
+fn cli_suggest_completes_a_typo_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(
+        &["set-fts-schema", "--dir", dir, "docs", "--field", "body"],
+        "",
+    );
+    let seed = json!([
+        {"id": "d1", "vector": [1, 0, 0], "attrs": {"body": {"Str": "running"}}},
+    ])
+    .to_string();
+    ok(&["upsert", "--dir", dir, "docs"], &seed);
+
+    let out = ok(&["suggest", "--dir", dir, "body", "runing", "docs"], "");
+    let terms: Vec<&str> = out["suggestions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected an array, got {out}"))
+        .iter()
+        .map(|s| s["term"].as_str().unwrap())
+        .collect();
+    assert!(terms.contains(&"running"), "expected a fuzzy match: {out}");
+}
+
+/// `--no-fuzzy` turns the fallback leg off: the same typo then completes to nothing.
+#[test]
+fn cli_suggest_no_fuzzy_leaves_a_typo_uncompleted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(
+        &["set-fts-schema", "--dir", dir, "docs", "--field", "body"],
+        "",
+    );
+    let seed = json!([
+        {"id": "d1", "vector": [1, 0, 0], "attrs": {"body": {"Str": "running"}}},
+    ])
+    .to_string();
+    ok(&["upsert", "--dir", dir, "docs"], &seed);
+
+    let out = ok(
+        &[
+            "suggest",
+            "--dir",
+            dir,
+            "body",
+            "runing",
+            "docs",
+            "--no-fuzzy",
+        ],
+        "",
+    );
+    let terms: Vec<&str> = out["suggestions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected an array, got {out}"))
+        .iter()
+        .map(|s| s["term"].as_str().unwrap())
+        .collect();
+    assert!(
+        !terms.contains(&"running"),
+        "expected no fuzzy match with --no-fuzzy: {out}"
+    );
+}
+
 /// A field the collection never declared for FTS is silent-empty, not an error.
 /// `--where` narrows each completion's `df` through the real binary, and the words before the
 /// fragment narrow which completions are offered at all (nidus-3j8, nidus-ucl).

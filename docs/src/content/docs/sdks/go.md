@@ -238,6 +238,10 @@ for _, s := range sug.Suggestions {
 `Limit` is a plain `int`; leave it zero for the server's default of 10. `Suggest`
 matches the same stemmed, folded vocabulary `Prefix` does.
 
+`Fuzzy` is `*bool`, the same idiom as `Prefix`: `nil` (the zero value) leaves typo
+tolerance on, so a mistyped fragment (`"runing"`) still completes to `"running"` when the
+exact match finds nothing. Send `false` to opt out.
+
 ## Batch search and aggregation
 
 `BatchSearch` answers several vector queries in one round-trip (16 max), saving a hop

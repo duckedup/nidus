@@ -309,12 +309,16 @@ def suggest_body(
     scope: Optional[Sequence[str]] = None,
     limit: Optional[int] = None,
     filter: Optional[Filter] = None,  # noqa: A002
+    fuzzy: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /suggest``.
 
     ``scope`` and ``filter`` are spelled exactly as :func:`text_search_body` spells them: an
     empty list means every collection, unfiltered. ``limit`` is omitted when unset so the
-    server's default of 10 applies; sending it as ``None`` would be a 422.
+    server's default of 10 applies; sending it as ``None`` would be a 422. ``fuzzy`` is
+    likewise omitted when unset: the server falls back to a typo-tolerant match (edit-distance
+    against the field's vocabulary) only when the exact prefix scan finds nothing, and that
+    fallback is on by default, so pass ``fuzzy=False`` to opt out.
     """
     return prune(
         {
@@ -323,6 +327,7 @@ def suggest_body(
             "prefix": prefix,
             "limit": limit,
             "filter": list(filter) if filter is not None else [],
+            "fuzzy": fuzzy,
         }
     )
 

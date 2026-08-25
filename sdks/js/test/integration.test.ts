@@ -321,6 +321,26 @@ describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
     expect(filtered.suggestions).toEqual([]);
   });
 
+  it("fuzzy fallback completes a mistyped prefix by default, and fuzzy: false opts out", async () => {
+    await db.createCollection("m53");
+    await db.setFtsSchema("m53", ["body"]);
+    await db.upsert("m53", [
+      { id: "a", vector: [1, 0, 0], attrs: { body: "running quickly" } },
+    ]);
+
+    // "runing" has no exact-prefix match at all, so the fuzzy fallback fires by default.
+    const byDefault = await db.suggest({ scope: ["m53"], field: "body", prefix: "runing" });
+    expect(byDefault.suggestions.map((s) => s.term)).toEqual(["running"]);
+
+    const optedOut = await db.suggest({
+      scope: ["m53"],
+      field: "body",
+      prefix: "runing",
+      fuzzy: false,
+    });
+    expect(optedOut.suggestions).toEqual([]);
+  });
+
   it("sets an alias and searches through it to the concrete collection", async () => {
     await db.createCollection("docs_v2");
     await db.upsert("docs_v2", [{ id: "z", vector: [1, 0, 0], attrs: { lang: "rust-v2" } }]);

@@ -10,11 +10,13 @@ use crate::model::Value;
 
 mod analyzer;
 mod fold;
+mod fuzzy;
 mod highlight;
 mod schema;
 
 pub use analyzer::{Analyzer, Language};
 pub(crate) use analyzer::{analyze, analyze_surface, analyze_with_prefix};
+pub(crate) use fuzzy::budget_for as fuzzy_budget_for;
 pub(crate) use highlight::fragments;
 pub use schema::FtsField;
 pub(crate) use schema::validate;
@@ -321,6 +323,34 @@ impl FieldIndex {
             .collect()
     }
 
+    /// Surface forms within `max_edits` of `fragment` by prefix distance, each with the `df` of
+    /// the stem it maps to counted through `admit` — the fallback leg for a mistyped fragment
+    /// (nidus-972). Un-capped and unranked, exactly as `suggest_scored` is.
+    pub(crate) fn suggest_fuzzy(
+        &self,
+        fragment: &str,
+        max_edits: usize,
+        admit: Option<Admit<'_>>,
+    ) -> Vec<(String, usize, usize)> {
+        let mut out = Vec::new();
+        fuzzy::for_each_within(
+            &self.surface,
+            fragment,
+            max_edits,
+            |s, stemmed, distance| {
+                let df = self
+                    .postings
+                    .get(stemmed)
+                    .map_or(0, |ps| self.df_where(ps, admit));
+                // Same drop as `suggest_scored`: the nidus-3j8 leak guard, not an optimization.
+                if df > 0 {
+                    out.push((s.clone(), df, distance));
+                }
+            },
+        );
+        out
+    }
+
     /// Whether this index currently holds document `id` (live).
     #[cfg(test)]
     fn contains(&self, id: &str) -> bool {
@@ -528,6 +558,25 @@ impl Fts {
             .get(&(collection.to_string(), field.to_string()))
         {
             Some(idx) => idx.suggest_scored(fragment, admit),
+            None => Vec::new(),
+        }
+    }
+
+    /// Un-capped fuzzy completions for `fragment` in `collection`.`field` within `max_edits`
+    /// (see [`FieldIndex::suggest_fuzzy`]). Empty when the field isn't indexed.
+    pub(crate) fn suggest_fuzzy(
+        &self,
+        collection: &str,
+        field: &str,
+        fragment: &str,
+        max_edits: usize,
+        admit: Option<Admit<'_>>,
+    ) -> Vec<(String, usize, usize)> {
+        match self
+            .fields
+            .get(&(collection.to_string(), field.to_string()))
+        {
+            Some(idx) => idx.suggest_fuzzy(fragment, max_edits, admit),
             None => Vec::new(),
         }
     }
@@ -958,6 +1007,62 @@ mod tests {
             vec![("running".to_string(), 2), ("runs".to_string(), 2)],
             "{scored:?}"
         );
+    }
+
+    // ── suggest_fuzzy (fallback fuzzy leg, nidus-972) ──────────────────────────────
+
+    /// [`sug_fuzzy_admit`] with no admissibility predicate.
+    fn sug_fuzzy(
+        idx: &FieldIndex,
+        fragment: &str,
+        max_edits: usize,
+    ) -> Vec<(String, usize, usize)> {
+        sug_fuzzy_admit(idx, fragment, max_edits, None)
+    }
+
+    /// `suggest_fuzzy` sorted `(distance asc, df desc, term asc)`, the shape `Store::suggest`
+    /// ranks fuzzy completions in.
+    fn sug_fuzzy_admit(
+        idx: &FieldIndex,
+        fragment: &str,
+        max_edits: usize,
+        admit: Option<Admit<'_>>,
+    ) -> Vec<(String, usize, usize)> {
+        let mut v = idx.suggest_fuzzy(fragment, max_edits, admit);
+        v.sort_by(|a, b| {
+            a.2.cmp(&b.2)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        v
+    }
+
+    #[test]
+    fn suggest_fuzzy_reaches_a_mistyped_fragment() {
+        let idx = idx_with(&[("d1", "running")]);
+        assert_eq!(
+            sug_fuzzy(&idx, "runing", 1),
+            vec![("running".to_string(), 1, 1)]
+        );
+    }
+
+    /// The nidus-3j8 leak guard threaded onto the fuzzy leg: a term every admissible doc is
+    /// excluded from must not surface with a whole-corpus count.
+    #[test]
+    fn suggest_fuzzy_drops_a_term_no_admissible_doc_carries() {
+        let idx = idx_with(&[("d1", "running")]);
+        let none = |_: u32, _: &str| false;
+        assert!(sug_fuzzy_admit(&idx, "runing", 1, Some(&none)).is_empty());
+    }
+
+    /// The length prefilter is an optimization the DP would reach anyway (4 deletions exceeds a
+    /// budget of 1), so this pins the behaviour, not the shortcut: a far shorter word does not
+    /// complete a longer fragment.
+    #[test]
+    fn a_candidate_far_shorter_than_the_fragment_does_not_complete() {
+        let idx = idx_with(&[("d1", "running"), ("d2", "run")]);
+        let got = sug_fuzzy(&idx, "running", 1);
+        assert!(!got.iter().any(|(t, _, _)| t == "run"), "{got:?}");
     }
 
     // ── df_where / head_docs: the conditioned df (nidus-clv, nidus-3j8, nidus-ucl) ─

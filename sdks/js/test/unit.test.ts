@@ -370,6 +370,19 @@ describe("NidusClient request shaping", () => {
     expect("limit" in body).toBe(false);
   });
 
+  it("suggest omits fuzzy when unset and includes fuzzy: false when passed", async () => {
+    const { fn, calls } = mockFetch({ suggestions: [], matched: 0 });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    await db.suggest({ field: "body", prefix: "nid" });
+    const omitted = calls[0]!.json as Record<string, unknown>;
+    expect("fuzzy" in omitted).toBe(false);
+
+    await db.suggest({ field: "body", prefix: "nid", fuzzy: false });
+    const included = calls[1]!.json as Record<string, unknown>;
+    expect(included["fuzzy"]).toBe(false);
+  });
+
   it("suggest returns the parsed suggestions", async () => {
     const { fn } = mockFetch({ suggestions: [{ term: "nidus", df: 3 }], matched: 1 });
     const db = new NidusClient({ baseUrl: "http://x", fetch: fn });

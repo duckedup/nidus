@@ -60,6 +60,13 @@ fn clause_scores(
         .collect()
 }
 
+/// Which pass of `Store::suggest` a collection sweep answers for (nidus-972): the exact-prefix
+/// scan, or the fallback fuzzy scan that only runs when the prefix scan found nothing at all.
+enum Leg {
+    Prefix,
+    Fuzzy,
+}
+
 impl Store {
     /// Full-text (BM25) search over `collections`, reusing vector `search`'s
     /// `Hit`/`Filter`/top-k machinery. Every clause scores against its own field and folds by
@@ -160,9 +167,81 @@ impl Store {
         Ok(hits)
     }
 
-    /// Ranked prefix completions from `field`'s vocabulary across `collections`, `df` desc then
-    /// term asc, because a dropdown wants the common completion first. Each `df` counts only docs
-    /// passing `opts.filter` and carrying every head term the prefix spelled (SPEC §7).
+    /// One collection's completions for `leg` as `(term, df, distance)`, `distance` always `0`
+    /// for [`Leg::Prefix`]. Empty when the collection doesn't index `field`, the fragment folds
+    /// away to nothing, head conditioning excludes everything, or (fuzzy) the budget is `0`.
+    fn suggest_one(
+        &self,
+        col_name: &str,
+        field: &str,
+        prefix: &str,
+        opts: &SuggestOpts,
+        leg: &Leg,
+    ) -> Vec<(String, usize, usize)> {
+        let Some(cfg) = self.fts.field_analyzer(col_name, field) else {
+            return Vec::new();
+        };
+        let Some(col) = self.collections.get(col_name) else {
+            return Vec::new();
+        };
+        // Fold-only, exactly as a prefix clause folds its fragment. The heads ARE kept here,
+        // unlike before nidus-ucl; they condition the df rather than being scored.
+        let (heads, Some(fragment)) = crate::fts::analyze_with_prefix(prefix, cfg) else {
+            return Vec::new();
+        };
+        let head_docs = self.fts.head_docs(col_name, field, &heads);
+        // No heads means unconditioned; an empty head set means nothing continues the phrase,
+        // so every completion is dropped rather than falling back to the whole corpus.
+        if head_docs.as_ref().is_some_and(HashSet::is_empty) {
+            return Vec::new();
+        }
+        let filtered = !opts.filter.0.is_empty();
+        let admit = |docnum: u32, id: &str| {
+            if let Some(docs) = head_docs.as_ref()
+                && !docs.contains(&docnum)
+            {
+                return false;
+            }
+            if !filtered {
+                return true;
+            }
+            col.docs
+                .get(id)
+                .is_some_and(|entry| filter::matches(&opts.filter, &entry.attrs))
+        };
+        // Un-conditioned stays on the cheap path: no closure, so a tombstone-free index reads
+        // each posting list's length instead of walking it (nidus-clv stage 1).
+        let unconditioned = head_docs.is_none() && !filtered;
+        match leg {
+            Leg::Prefix => {
+                let scored = if unconditioned {
+                    self.fts.suggest(col_name, field, &fragment, None)
+                } else {
+                    self.fts.suggest(col_name, field, &fragment, Some(&admit))
+                };
+                scored.into_iter().map(|(term, df)| (term, df, 0)).collect()
+            }
+            Leg::Fuzzy => {
+                // Budget from this collection's own fragment: analyzers differ per field, so
+                // fragments (and their char counts) can differ collection to collection.
+                let max_edits = crate::fts::fuzzy_budget_for(&fragment);
+                if max_edits == 0 {
+                    return Vec::new();
+                }
+                if unconditioned {
+                    self.fts
+                        .suggest_fuzzy(col_name, field, &fragment, max_edits, None)
+                } else {
+                    self.fts
+                        .suggest_fuzzy(col_name, field, &fragment, max_edits, Some(&admit))
+                }
+            }
+        }
+    }
+
+    /// Ranked completions from `field`'s vocabulary across `collections` (SPEC §7). The exact-
+    /// prefix leg ranks `df` desc then term asc; if and only if it finds nothing at all does the
+    /// fallback fuzzy leg run (`opts.fuzzy`), ranked `distance` asc, `df` desc, term asc.
     pub fn suggest(
         &self,
         collections: &[&str],
@@ -172,62 +251,64 @@ impl Store {
     ) -> Result<Suggestions> {
         filter::validate(&opts.filter)?;
         // Merged by term across the scope: one dropdown, so a completion two collections share is
-        // one row whose `df` is the sum. `matched` is the distinct count before the cap.
-        let mut merged: BTreeMap<String, usize> = BTreeMap::new();
+        // one row whose `df` is the sum and whose distance is the best any collection found.
+        let mut merged: BTreeMap<String, (usize, usize)> = BTreeMap::new();
         for &col_name in collections {
-            let Some(cfg) = self.fts.field_analyzer(col_name, field) else {
-                continue;
-            };
-            let Some(col) = self.collections.get(col_name) else {
-                continue;
-            };
-            // Fold-only, exactly as a prefix clause folds its fragment. The heads ARE kept here,
-            // unlike before nidus-ucl; they condition the df rather than being scored.
-            let (heads, Some(fragment)) = crate::fts::analyze_with_prefix(prefix, cfg) else {
-                continue;
-            };
-            let head_docs = self.fts.head_docs(col_name, field, &heads);
-            // No heads means unconditioned; an empty head set means nothing continues the phrase,
-            // so every completion is dropped rather than falling back to the whole corpus.
-            if head_docs.as_ref().is_some_and(HashSet::is_empty) {
-                continue;
+            for (term, df, distance) in
+                self.suggest_one(col_name, field, prefix, opts, &Leg::Prefix)
+            {
+                merged
+                    .entry(term)
+                    .and_modify(|(d, existing)| {
+                        *d = (*d).min(distance);
+                        *existing += df;
+                    })
+                    .or_insert((distance, df));
             }
-            let filtered = !opts.filter.0.is_empty();
-            let admit = |docnum: u32, id: &str| {
-                if let Some(docs) = head_docs.as_ref()
-                    && !docs.contains(&docnum)
+        }
+        // Only when the prefix leg found nothing at all does the fuzzy leg sweep; a zero limit
+        // has nothing to fill, so it is skipped too (nidus-972).
+        let fuzzy = merged.is_empty() && opts.fuzzy && opts.limit > 0;
+        if fuzzy {
+            for &col_name in collections {
+                for (term, df, distance) in
+                    self.suggest_one(col_name, field, prefix, opts, &Leg::Fuzzy)
                 {
-                    return false;
+                    merged
+                        .entry(term)
+                        .and_modify(|(d, existing)| {
+                            *d = (*d).min(distance);
+                            *existing += df;
+                        })
+                        .or_insert((distance, df));
                 }
-                if !filtered {
-                    return true;
-                }
-                col.docs
-                    .get(id)
-                    .is_some_and(|entry| filter::matches(&opts.filter, &entry.attrs))
-            };
-            // Un-conditioned stays on the cheap path: no closure, so a tombstone-free index reads
-            // each posting list's length instead of walking it (nidus-clv stage 1).
-            let scored = if head_docs.is_none() && !filtered {
-                self.fts.suggest(col_name, field, &fragment, None)
-            } else {
-                self.fts.suggest(col_name, field, &fragment, Some(&admit))
-            };
-            for (term, df) in scored {
-                *merged.entry(term).or_insert(0) += df;
             }
         }
         let matched = merged.len();
-        // (df desc, term asc): the tie-break is load-bearing, or two equal-df completions
-        // truncate in whatever order the sort happened to leave them.
-        let mut scored: Vec<(String, usize)> = merged.into_iter().collect();
-        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut scored: Vec<(String, usize, usize)> = merged
+            .into_iter()
+            .map(|(term, (distance, df))| (term, df, distance))
+            .collect();
+        if fuzzy {
+            // (distance asc, df desc, term asc): a near-miss belongs above a common but distant
+            // word. The prefix ranking never mixes with this leg's, since it only fires when
+            // the prefix leg answered nothing.
+            scored.sort_by(|a, b| {
+                a.2.cmp(&b.2)
+                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+        } else {
+            // (df desc, term asc), unchanged: the tie-break is load-bearing, or two equal-df
+            // completions truncate in whatever order the sort happened to leave them.
+            scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        }
         scored.truncate(crate::fts::MAX_PREFIX_EXPANSION);
         scored.truncate(opts.limit);
         Ok(Suggestions {
             suggestions: scored
                 .into_iter()
-                .map(|(term, df)| Suggestion { term, df })
+                .map(|(term, df, _)| Suggestion { term, df })
                 .collect(),
             matched,
         })

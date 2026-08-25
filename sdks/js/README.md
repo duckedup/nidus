@@ -201,6 +201,9 @@ for (const { term, df } of suggestions) console.log(term, df);
 // matched > suggestions.length means the server's 256-term cap truncated the list.
 ```
 
+A prefix that matches nothing exactly falls back to typo-tolerant matching by default;
+pass `fuzzy: false` to require an exact prefix.
+
 ## Explaining and highlighting a hit
 
 `explain` reports what each leg and each matched clause contributed; `highlight` returns

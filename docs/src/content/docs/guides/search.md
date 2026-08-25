@@ -1093,6 +1093,33 @@ Pass the whole phrase typed so far and this happens on its own. A single-token p
 whose earlier words are all stopwords (`"the br"`), has no head terms and behaves exactly as
 `"br"` does.
 
+#### Typo tolerance
+
+If the exact prefix match finds nothing at all, `suggest` retries the fragment against a short
+edit-distance budget before giving up:
+
+```rust
+let opts = SuggestOpts { limit: 10, ..Default::default() };
+let got = db.suggest("docs", "body", "runing", &opts)?;
+// got.suggestions: [{ term: "running", df: 12 }, ...]
+```
+
+`"runing"` has no exact completion, so the fallback finds `"running"` one edit away and returns
+it. This only engages when the exact match is empty: a fragment that already completes costs
+nothing extra.
+
+How much tolerance a fragment earns depends on its length: none below four characters, one edit
+at four to seven, two at eight or more. Very short fragments get none deliberately, because at
+three characters most of the vocabulary is one edit away and the completions would be noise.
+
+It is on by default; turn it off with `fuzzy: false`:
+
+```rust
+let opts = SuggestOpts { limit: 10, fuzzy: false, ..Default::default() };
+let got = db.suggest("docs", "body", "runing", &opts)?;
+// got.suggestions: []
+```
+
 ### Tuning a field
 
 Each declared field is an `FtsField`, and every knob has a default that reproduces

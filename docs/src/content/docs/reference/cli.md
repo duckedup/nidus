@@ -335,6 +335,7 @@ unconditioned.
 | --- | --- | --- |
 | `-n, --limit <N>` | none | How many completions to return (default `10`). |
 | `--where <JSON>` | none | AND-filter (same form as `search --where`). Each completion's `df` counts only matching documents, so a completion no match carries is not offered. |
+| `--no-fuzzy` | none | Turn off typo tolerance. On by default: when the exact prefix matches nothing, `suggest` retries within a short edit budget that grows with the fragment's length (none below 4 characters, 1 at 4 to 7, 2 at 8 or more). |
 
 ```
 nidus suggest --dir ./store body nid docs --limit 5

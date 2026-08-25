@@ -66,6 +66,11 @@ pub struct SuggestRequest {
     /// vocabulary the caller can retrieve (nidus-3j8).
     #[serde(default)]
     pub filter: Filter,
+    /// Typo tolerance, defaulting to **on**. Absent means on (nidus-972); send `false` to opt
+    /// out. `Option` rather than a defaulted `bool`: a defaulted `bool` is `false`, which would
+    /// invert the intended default for every request that omits the field.
+    #[serde(default)]
+    pub fuzzy: Option<bool>,
 }
 
 /// A dropdown shows a handful of rows, so `top_k`'s default would be wrong here.
