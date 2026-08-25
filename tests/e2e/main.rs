@@ -6,6 +6,10 @@ mod harness;
 
 mod aliases;
 mod cluster;
+#[cfg(all(feature = "memory", feature = "code"))]
+mod code;
+#[cfg(all(feature = "memory", feature = "code"))]
+mod docs_index;
 mod env_flags;
 mod hardening;
 #[cfg(feature = "embed-ollama")]

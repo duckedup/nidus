@@ -312,17 +312,27 @@ export function miriIgnore(text, addedLines, file) {
 
 // ── 9. Feature gating: binary-only deps must not reach the library ─────────
 
-const BINARY_ONLY = /^\s*use\s+(clap|tokio|axum|tower|http_body|rmcp)\b/m
+const BINARY_ONLY = /^\s*use\s+(clap|tokio|axum|tower|http_body|rmcp|wdpkr_core|tree_sitter)\b/m
 const LIB_EXEMPT = /^src\/(cli|server|bin)\//
+// wdpkr_core/tree_sitter are gated behind `code` (D0014), not `cli`/`serve` (D0011), and
+// `src/code/` is the one directory their own doc comment says may use them — see
+// `src/code/mod.rs` and decisions/0014. Everywhere else in the library, incl. src/chunk/,
+// they are as ungated as any BINARY_ONLY crate.
+const CODE_ONLY = /^(wdpkr_core|tree_sitter)$/
+const CODE_EXEMPT = /^src\/code\//
 
 export function featureGating(file, text) {
   if (LIB_EXEMPT.test(file) || !file.startsWith('src/')) return []
   const m = text.match(BINARY_ONLY)
   if (!m) return []
+  if (CODE_ONLY.test(m[1]) && CODE_EXEMPT.test(file)) return []
   const line = text.slice(0, text.indexOf(m[0])).split('\n').length
+  const remediation = CODE_ONLY.test(m[1])
+    ? 'decisions/0014-nidus-depends-on-wdpkr-core-behind-code.md: those deps compile only under `code`, off by default, and `src/code/` is the only directory allowed to use them. Route through `src/code/` instead of importing them directly.'
+    : '.claude/rules/cli-feature.md (D0011): those deps compile only under `cli`/`serve`. Using them from a library module breaks the pure `cargo add nidus` install.'
   return [finding('feature-gating', 'error', file, line,
     `library module imports the binary-only crate \`${m[1]}\``,
-    '.claude/rules/cli-feature.md (D0011): those deps compile only under `cli`/`serve`. Using them from a library module breaks the pure `cargo add nidus` install.')]
+    remediation)]
 }
 
 export function modGating(libText) {

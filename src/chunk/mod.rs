@@ -14,6 +14,8 @@
 //! `src[c.char_start .. c.char_start + c.text.chars().count()] == c.text.chars()`.
 //! Trimming, where it happens, narrows the span — it never edits characters.
 
+#[cfg(feature = "code")]
+mod code;
 mod markdown;
 mod recursive;
 mod sentence;
@@ -27,6 +29,9 @@ pub enum ChunkStrategy {
     Recursive,
     Markdown,
     Sentence,
+    /// AST-aware: one chunk per symbol, from wdpkr-core's tree-sitter chunker.
+    #[cfg(feature = "code")]
+    Code,
 }
 
 /// Chunking parameters. `max_chars`/`overlap_chars` count `char`s, not bytes.
@@ -84,6 +89,8 @@ pub fn chunk_text(text: &str, opts: &ChunkOpts) -> Result<Vec<Chunk>> {
             (spans, Some(floors))
         }
         ChunkStrategy::Sentence => (sentence::split(&src, opts.max_chars), None),
+        #[cfg(feature = "code")]
+        ChunkStrategy::Code => (code::split(&src, opts.max_chars), None),
     };
     Ok(apply_overlap(
         &src,
@@ -149,11 +156,32 @@ fn apply_overlap(
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "code"))]
     const STRATEGIES: [ChunkStrategy; 3] = [
         ChunkStrategy::Recursive,
         ChunkStrategy::Markdown,
         ChunkStrategy::Sentence,
     ];
+    #[cfg(feature = "code")]
+    const STRATEGIES: [ChunkStrategy; 4] = [
+        ChunkStrategy::Recursive,
+        ChunkStrategy::Markdown,
+        ChunkStrategy::Sentence,
+        ChunkStrategy::Code,
+    ];
+
+    /// `Code` needs a real language grammar to find symbols, so the plain-prose fixtures
+    /// these length-sensitive tests share across strategies legitimately yield none from it.
+    fn is_code_strategy(_strategy: ChunkStrategy) -> bool {
+        #[cfg(feature = "code")]
+        {
+            _strategy == ChunkStrategy::Code
+        }
+        #[cfg(not(feature = "code"))]
+        {
+            false
+        }
+    }
 
     fn opts(strategy: ChunkStrategy, max_chars: usize, overlap_chars: usize) -> ChunkOpts {
         ChunkOpts {
@@ -239,6 +267,9 @@ mod tests {
     #[test]
     fn short_input_is_one_chunk_at_zero() {
         for strategy in STRATEGIES {
+            if is_code_strategy(strategy) {
+                continue;
+            }
             let o = opts(strategy, 1000, 100);
             let chunks = chunk_text("hello world", &o).unwrap();
             assert_eq!(chunks.len(), 1);
@@ -260,6 +291,9 @@ mod tests {
     #[test]
     fn single_char_input() {
         for strategy in STRATEGIES {
+            if is_code_strategy(strategy) {
+                continue;
+            }
             let o = opts(strategy, 100, 10);
             let chunks = chunk_text("x", &o).unwrap();
             assert_eq!(chunks.len(), 1);
@@ -286,6 +320,9 @@ mod tests {
     fn overlap_zero_is_contiguous_non_overlapping() {
         let text = "a".repeat(97);
         for strategy in STRATEGIES {
+            if is_code_strategy(strategy) {
+                continue;
+            }
             let o = opts(strategy, 25, 0);
             let chunks = chunk_text(&text, &o).unwrap();
             assert!(chunks.len() > 1);
@@ -300,6 +337,9 @@ mod tests {
     fn overlap_n_starts_n_chars_before_previous_end() {
         let text = "a".repeat(97);
         for strategy in STRATEGIES {
+            if is_code_strategy(strategy) {
+                continue;
+            }
             let o = opts(strategy, 25, 7);
             let chunks = chunk_text(&text, &o).unwrap();
             assert!(chunks.len() > 1);
@@ -322,5 +362,68 @@ mod tests {
                 assert!(c.text.chars().count() <= o.max_chars + o.overlap_chars);
             }
         }
+    }
+
+    // ── ChunkStrategy::Code, through the public entry point ────────────────────────────
+
+    #[cfg(feature = "code")]
+    #[test]
+    fn code_strategy_splits_rust_functions_by_symbol() {
+        let src = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n\
+                    fn sub(a: i32, b: i32) -> i32 {\n    a - b\n}\n";
+        let chunks = chunk_text(src, &opts(ChunkStrategy::Code, 1000, 0)).unwrap();
+        assert_eq!(chunks.len(), 2, "chunks: {chunks:?}");
+        assert!(
+            chunks[0].text.starts_with("fn add"),
+            "got {:?}",
+            chunks[0].text
+        );
+        assert!(
+            chunks[1].text.starts_with("fn sub"),
+            "got {:?}",
+            chunks[1].text
+        );
+        assert_char_slice_invariant(src, &chunks);
+        assert_dense_ascending(&chunks);
+    }
+
+    // wdpkr-core 0.2.0's `SymbolChunk::body` is the item's own text only; a preceding doc
+    // comment lands in the separate `doc_comment` field. Asserts the observed behavior:
+    // the chunk still slices exactly and starts at the item, not the comment (nidus-3gm).
+    #[cfg(feature = "code")]
+    #[test]
+    fn code_strategy_symbol_with_doc_comment_still_slices_exactly() {
+        let src = "/// Adds two numbers.\nfn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
+        let chunks = chunk_text(src, &opts(ChunkStrategy::Code, 1000, 0)).unwrap();
+        assert_eq!(chunks.len(), 1, "chunks: {chunks:?}");
+        assert!(
+            chunks[0].text.starts_with("fn add"),
+            "got {:?}",
+            chunks[0].text
+        );
+        assert_char_slice_invariant(src, &chunks);
+    }
+
+    #[cfg(feature = "code")]
+    #[test]
+    fn code_strategy_with_no_recognizable_grammar_yields_no_chunks() {
+        let src = "(define (add a b) (+ a b))\n(display (add 1 2))\n";
+        let chunks = chunk_text(src, &opts(ChunkStrategy::Code, 1000, 0)).unwrap();
+        assert!(chunks.is_empty(), "chunks: {chunks:?}");
+    }
+
+    #[cfg(feature = "code")]
+    #[test]
+    fn code_strategy_splits_an_oversized_symbol_but_keeps_exact_slices() {
+        let body_lines = "    let _ = 1 + 1;\n".repeat(2000);
+        let src = format!("fn big() {{\n{body_lines}}}\n");
+        let chunks = chunk_text(&src, &opts(ChunkStrategy::Code, 2000, 0)).unwrap();
+        assert!(
+            chunks.len() > 1,
+            "expected the oversized symbol to split: {} chunks",
+            chunks.len()
+        );
+        assert_char_slice_invariant(&src, &chunks);
+        assert_dense_ascending(&chunks);
     }
 }

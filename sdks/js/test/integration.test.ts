@@ -1,5 +1,5 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,6 +28,29 @@ try {
 
 const PORT = 7799;
 const baseUrl = `http://127.0.0.1:${PORT}`;
+
+// `just build-cli` (what NIDUS_BIN normally points at) builds `--features cli` only, so
+// `nidus code ingest` (needs `memory` + `code`) is absent and `/code-search` 404s.
+// Detected once up front — synchronously, so it can gate `describe.skipIf` below —
+// rather than letting the round-trip test read a missing feature as a client bug.
+let codeFeatureAvailable = false;
+if (binaryExists) {
+  try {
+    codeFeatureAvailable =
+      spawnSync(binary, ["code", "--help"], { stdio: "ignore" }).status === 0;
+  } catch {
+    codeFeatureAvailable = false;
+  }
+}
+if (binaryExists && !codeFeatureAvailable) {
+  console.warn(
+    `codeSearch integration test skipped: ${binary} has no \`code\` subcommand. ` +
+      "Build with `cargo build --release --features cli,memory,code` (or `serve`, which " +
+      "includes both) and point NIDUS_BIN at it to run this test.",
+  );
+}
+const CODE_PORT = 7798;
+const codeBaseUrl = `http://127.0.0.1:${CODE_PORT}`;
 
 // SIGTERM, then SIGKILL if it will not go — mirroring the Go suite's 5s escalation
 // and Python's `wait(timeout=10)`. Returns only once the child has actually exited.
@@ -392,5 +415,79 @@ describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
       )) as NidusError;
     expect(err).toBeInstanceOf(NidusError);
     expect([400, 404]).toContain(err.status);
+  });
+});
+
+// A known fixture: one `pub fn add`, so the AST chunker's start/end line span is
+// predictable (the doc comment sits outside the `function_item` node, so the span starts
+// at `pub fn`, not at `///`).
+const CODE_FIXTURE = `/// Adds two numbers.
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+`;
+
+describe.skipIf(!codeFeatureAvailable)("codeSearch over a code-featured nidus serve", () => {
+  let server: ChildProcess;
+  let sourceDir: string;
+  let storeDir: string;
+  const db = new NidusClient({ baseUrl: codeBaseUrl, timeoutMs: 5000 });
+
+  beforeAll(async () => {
+    sourceDir = mkdtempSync(join(tmpdir(), "nidus-sdk-code-src-"));
+    writeFileSync(join(sourceDir, "sample.rs"), CODE_FIXTURE);
+    storeDir = mkdtempSync(join(tmpdir(), "nidus-sdk-code-store-"));
+
+    // `nidus code ingest` opens the store itself (no embedder configured, so it ingests
+    // for BM25 only); it must finish, and close its handle, before `serve` opens the same
+    // directory below.
+    const ingested = spawnSync(
+      binary,
+      ["code", "ingest", sourceDir, "--dir", storeDir, "--collection", "code"],
+      { encoding: "utf8" },
+    );
+    if (ingested.status !== 0) {
+      throw new Error(`nidus code ingest failed (${ingested.status}): ${ingested.stderr}`);
+    }
+
+    server = spawn(binary, ["serve", "--dir", storeDir, "--addr", `127.0.0.1:${CODE_PORT}`], {
+      stdio: "ignore",
+    });
+    const deadline = Date.now() + 5000;
+    let last = "";
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetch(`${codeBaseUrl}/ready`);
+        if (res.status === 200) return;
+        last = `/ready answered ${res.status}`;
+      } catch (e) {
+        last = String(e);
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    throw new Error(`nidus serve did not become ready in time (${last})`);
+  });
+
+  afterAll(async () => {
+    if (server) await stopServer(server);
+    if (storeDir) rmSync(storeDir, { recursive: true, force: true });
+    if (sourceDir) rmSync(sourceDir, { recursive: true, force: true });
+  });
+
+  // The load-bearing assertion (#172): a 200 with an empty `files` array would also pass
+  // a shape check, so this proves the round trip through a real `code ingest` and a real
+  // `/code-search` by asserting the exact symbol name and line span.
+  it("finds the ingested symbol by name, with its file, language and line span", async () => {
+    const files = await db.codeSearch({ collection: "code", query: "add", vector: false });
+
+    const file = files.find((f) => f.path === "sample.rs");
+    expect(file).toBeDefined();
+    expect(file!.language).toBe("rust");
+
+    const symbol = file!.symbols.find((s) => s.symbol === "add");
+    expect(symbol).toBeDefined();
+    expect(symbol!.kind).toBe("function");
+    expect(symbol!.startLine).toBe(2);
+    expect(symbol!.endLine).toBe(4);
   });
 });

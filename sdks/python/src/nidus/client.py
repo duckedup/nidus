@@ -43,6 +43,7 @@ from .types import (
     Aggregation,
     Batch,
     ClusterStatus,
+    CodeSearchResult,
     Expand,
     FilterIndexField,
     FtsClause,
@@ -482,6 +483,31 @@ class NidusClient:
                 rerank=rerank,
             ),
         )
+
+    def code_search(
+        self,
+        *,
+        collection: str,
+        query: str,
+        limit: Optional[int] = None,
+        filter: Optional[Filter] = None,  # noqa: A002
+        vector: Optional[bool] = None,
+    ) -> CodeSearchResult:
+        """Search indexed code and docs, grouped by file with each hit's symbol, kind and
+        line span. Never returns the matched source; read the file itself for ground truth.
+
+        ``vector`` picks the ranking: ``True`` forces a vector search, ``False`` forces
+        BM25, and unset defers to the store — a dimension-0 (fts-only) store answers BM25
+        rather than erroring. The vector leg embeds ``query`` server-side with the same
+        embedder :meth:`recall` uses, and a build with the ``code`` feature but no
+        ``memory`` fails it visibly, naming the fix, rather than silently falling back.
+        """
+        payload = self._request(
+            "POST",
+            _wire.CODE_SEARCH,
+            _wire.code_search_body(collection, query, limit=limit, filter=filter, vector=vector),
+        )
+        return _wire.decode_code_search(payload)
 
     def suggest(
         self,

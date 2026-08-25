@@ -728,6 +728,50 @@ export interface RememberResult {
   deduped: boolean;
 }
 
+/**
+ * Options for {@link NidusClient.codeSearch} (the `code` feature): a text query over the
+ * metadata `nidus code ingest` stamps, grouped by file.
+ */
+export interface CodeSearchOptions {
+  /** Collection to search. */
+  collection: string;
+  /** The search text: a symbol name, phrase, or snippet, depending on `vector`. */
+  query: string;
+  /** How many hits to gather before grouping by file. The server defaults to 10. */
+  limit?: number;
+  filter?: Filter;
+  /**
+   * `true` forces a vector search, `false` forces BM25. Omit to defer to the store: a
+   * dimension-0 (fts-only) store answers BM25, any other store answers vector.
+   */
+  vector?: boolean;
+}
+
+/**
+ * One matched symbol within a file, from {@link NidusClient.codeSearch}: everything an
+ * agent needs to go read the real source, never the source body itself. `symbol`, `kind`,
+ * `startLine` and `endLine` are `null` for a hit whose file fell back to non-AST chunking.
+ */
+export interface CodeSymbolHit {
+  symbol: string | null;
+  kind: string | null;
+  /** 1-based first line of the symbol in its source file. */
+  startLine: number | null;
+  /** 1-based last line of the symbol in its source file. */
+  endLine: number | null;
+  score: number;
+}
+
+/**
+ * Every hit that landed in one file, from {@link NidusClient.codeSearch}: its language
+ * (present only when the file was AST-chunked) and its symbols, ranked by descending score.
+ */
+export interface CodeFileHit {
+  path: string;
+  language: string | null;
+  symbols: CodeSymbolHit[];
+}
+
 /** Options for {@link NidusClient.recall} (embed the query text, then vector-search). */
 export interface RecallOptions {
   topK?: number;

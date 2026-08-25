@@ -124,6 +124,7 @@ func (c *capture) sentBody(t *testing.T) string {
 func f32(v float32) *float32 { return &v }
 func iptr(v int) *int        { return &v }
 func i64(v int64) *int64     { return &v }
+func bptr(v bool) *bool      { return &v }
 
 // ── Batch search and grouped aggregation ────────────────────────────────────
 
@@ -211,6 +212,89 @@ func TestAggregateWithoutGroupByOmitsIt(t *testing.T) {
 	}
 	if body := cap.sentBody(t); strings.Contains(body, "group_by") {
 		t.Fatalf("an ungrouped request must not send group_by, got %s", body)
+	}
+}
+
+// ── Code search ─────────────────────────────────────────────────────────────
+
+// TestCodeSearchOmitsZeroKnobsAndSendsFilterAndVector pins the request shape: Limit and
+// Filter follow every other search request's omit-vs-zero rule, and Vector is a pointer
+// so &false reaches the wire distinctly from an unset (nil) choice, which defers to the
+// server.
+func TestCodeSearchOmitsZeroKnobsAndSendsFilterAndVector(t *testing.T) {
+	fake := &capture{reply: `{"files":[]}`}
+	db := serve(t, fake)
+	ctx := context.Background()
+
+	if _, err := db.CodeSearch(ctx, CodeSearchRequest{Collection: "code", Query: "fsync"}); err != nil {
+		t.Fatalf("CodeSearch failed: %v", err)
+	}
+	want := `{"collection":"code","query":"fsync"}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+
+	if _, err := db.CodeSearch(ctx, CodeSearchRequest{
+		Collection: "code",
+		Query:      "fsync",
+		Limit:      5,
+		Filter:     And(Eq("code.language", "rust")),
+		Vector:     bptr(false),
+	}); err != nil {
+		t.Fatalf("CodeSearch failed: %v", err)
+	}
+	want = `{"collection":"code","query":"fsync","limit":5,"filter":[{"Eq":["code.language",{"Str":"rust"}]}],"vector":false}`
+	if body := fake.sentBody(t); body != want {
+		t.Errorf("body = %s, want %s", body, want)
+	}
+}
+
+// TestCodeSearchDecodesFileGroupedHits pins the response shape: hits arrive nested
+// under "files", each file's symbols carry nullable fields for a chunk with no
+// symbol (prose chunked by heading rather than AST), and the source body never
+// appears at all — there is no field for it to decode into.
+func TestCodeSearchDecodesFileGroupedHits(t *testing.T) {
+	fake := &capture{reply: `{"files":[` +
+		`{"path":"src/commit.rs","language":"rust","symbols":[` +
+		`{"symbol":"commit_batch","kind":"function","start_line":10,"end_line":42,"score":1.5}]},` +
+		`{"path":"README.md","language":null,"symbols":[` +
+		`{"symbol":null,"kind":null,"start_line":null,"end_line":null,"score":0.5}]}` +
+		`]}`}
+	db := serve(t, fake)
+
+	out, err := db.CodeSearch(context.Background(), CodeSearchRequest{Collection: "code", Query: "commit"})
+	if err != nil {
+		t.Fatalf("CodeSearch failed: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("want 2 file groups, got %#v", out)
+	}
+
+	rs := out[0]
+	if rs.Path != "src/commit.rs" || rs.Language == nil || *rs.Language != "rust" {
+		t.Fatalf("rust file group decoded wrong: %#v", rs)
+	}
+	if len(rs.Symbols) != 1 {
+		t.Fatalf("want 1 symbol, got %#v", rs.Symbols)
+	}
+	sym := rs.Symbols[0]
+	if sym.Symbol == nil || *sym.Symbol != "commit_batch" {
+		t.Fatalf("want symbol commit_batch, got %#v", sym)
+	}
+	if sym.Kind == nil || *sym.Kind != "function" {
+		t.Fatalf("want kind function, got %#v", sym)
+	}
+	if sym.StartLine == nil || *sym.StartLine != 10 || sym.EndLine == nil || *sym.EndLine != 42 {
+		t.Fatalf("want line span 10-42, got %#v", sym)
+	}
+
+	md := out[1]
+	if md.Language != nil {
+		t.Fatalf("a file dispatch could not AST-chunk must decode Language nil, got %#v", md.Language)
+	}
+	mdSym := md.Symbols[0]
+	if mdSym.Symbol != nil || mdSym.Kind != nil || mdSym.StartLine != nil || mdSym.EndLine != nil {
+		t.Fatalf("a chunk with no symbol must decode every symbol field nil, got %#v", mdSym)
 	}
 }
 
@@ -325,6 +409,10 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 		}},
 		{"TextSearch", `[]`, http.MethodPost, "/text-search", func(c *Client) error {
 			_, err := c.TextSearch(ctx, TextSearchRequest{Field: "body", Query: "fox"})
+			return err
+		}},
+		{"CodeSearch", `{"files":[]}`, http.MethodPost, "/code-search", func(c *Client) error {
+			_, err := c.CodeSearch(ctx, CodeSearchRequest{Collection: "code", Query: "fox"})
 			return err
 		}},
 		{"Suggest", `{"suggestions":[],"matched":0}`, http.MethodPost, "/suggest", func(c *Client) error {

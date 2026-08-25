@@ -322,6 +322,38 @@ def test_text_search_body() -> None:
     }
 
 
+def test_code_search_body() -> None:
+    """``limit`` is omitted when unset, same rule as ``top_k``; ``filter`` is never pruned."""
+    assert _wire.code_search_body("code", "widget") == {
+        "collection": "code",
+        "query": "widget",
+        "filter": [],
+    }
+    full = _wire.code_search_body(
+        "code", "widget", limit=5, filter=[f.eq("lang", "rust")], vector=False
+    )
+    assert full == {
+        "collection": "code",
+        "query": "widget",
+        "limit": 5,
+        "filter": [{"Eq": ["lang", {"Str": "rust"}]}],
+        "vector": False,
+    }
+
+
+def test_code_search_body_sends_an_explicit_zero_limit() -> None:
+    """``limit=None`` is omitted; ``limit=0`` is sent as ``0``, same rule as ``top_k``."""
+    assert "limit" not in _wire.code_search_body("code", "widget")
+    assert _wire.code_search_body("code", "widget", limit=0)["limit"] == 0
+
+
+def test_code_search_body_vector_false_is_sent_not_pruned() -> None:
+    """``vector=False`` must reach the wire — it forces BM25, distinct from unset."""
+    assert "vector" not in _wire.code_search_body("code", "widget")
+    assert _wire.code_search_body("code", "widget", vector=False)["vector"] is False
+    assert _wire.code_search_body("code", "widget", vector=True)["vector"] is True
+
+
 def test_hybrid_search_body_has_no_min_score() -> None:
     """The score is a fused RRF rank, not a similarity, so the server offers no floor."""
     body = _wire.hybrid_search_body([1.0, 0.0, 0.0], "body", "fox")
@@ -818,6 +850,71 @@ def test_decode_suggestions_decodes_terms_and_df() -> None:
     assert len(result.suggestions) == 1
     assert result.suggestions[0].term == "nidus"
     assert result.suggestions[0].df == 3
+
+
+def test_decode_code_search_groups_symbols_by_file_ranked_by_score() -> None:
+    """The load-bearing shape: a file's symbols keep their own name, kind and line span."""
+    result = _wire.decode_code_search(
+        {
+            "files": [
+                {
+                    "path": "src/lib.rs",
+                    "language": "rust",
+                    "symbols": [
+                        {
+                            "symbol": "run",
+                            "kind": "function",
+                            "start_line": 10,
+                            "end_line": 12,
+                            "score": 1.5,
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    assert len(result.files) == 1
+    file = result.files[0]
+    assert file.path == "src/lib.rs"
+    assert file.language == "rust"
+    assert len(file.symbols) == 1
+    symbol = file.symbols[0]
+    assert symbol.symbol == "run"
+    assert symbol.kind == "function"
+    assert symbol.start_line == 10
+    assert symbol.end_line == 12
+    assert symbol.score == 1.5
+
+
+def test_decode_code_search_a_hit_with_no_symbol_decodes_to_none_fields() -> None:
+    """A generic (non-code-chunked) file's language and symbol fields are ``None``."""
+    result = _wire.decode_code_search(
+        {
+            "files": [
+                {
+                    "path": "README.md",
+                    "language": None,
+                    "symbols": [
+                        {
+                            "symbol": None,
+                            "kind": None,
+                            "start_line": None,
+                            "end_line": None,
+                            "score": 0.5,
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    file = result.files[0]
+    assert file.language is None
+    assert file.symbols[0].symbol is None
+    assert file.symbols[0].start_line is None
+
+
+def test_decode_code_search_empty_payload() -> None:
+    assert _wire.decode_code_search({"files": []}).files == []
 
 
 def test_filter_index_body() -> None:

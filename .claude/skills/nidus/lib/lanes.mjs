@@ -44,6 +44,11 @@ const RULES = [
     match: [/^src\/summarize\//],
   },
   {
+    recipe: 'just ci-code',
+    why: 'the code engine changed — cfg-gated behind `code`, off by default (D0014)',
+    match: [/^src\/code\//, /^src\/chunk\/code\.rs$/, /^src\/cli\/code\.rs$/, /^src\/server\/mcp\/code\.rs$/, /^tests\/e2e\/code\.rs$/],
+  },
+  {
     recipe: 'just ci-serve',
     why: 'the memory surface changed — remember/recall compile only under `serve`',
     match: [/^src\/memory\.rs$/],
@@ -149,6 +154,13 @@ const RULES = [
     manual: true,
     match: [/^charts\//],
   },
+  {
+    // `just docs-index` is the only thing that runs scripts/docs-index.sh end to end
+    // (nidus-3gm unit 11 makes it part of a shipped feature's story, not a loose file).
+    recipe: 'just docs-index',
+    why: 'the docs-index build script changed — this recipe is what runs it',
+    match: [/^scripts\/docs-index\.sh$/],
+  },
 ]
 
 // Which changed paths exercise each heavy CI job. The guard step in ci.yml /
@@ -166,6 +178,7 @@ export const CI_JOBS = {
   'miri': RUST,
   'miri-integration': RUST,
   'build-budget': RUST,
+  'build-budget-code': RUST,
   'bench-compiles': RUST,
   'build-thesis': RUST,
   'sdk-integration': [...RUST, /^sdks\//],

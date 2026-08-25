@@ -76,13 +76,12 @@ export function search(lines, words) {
 // Pure translation between a BM25 hit and a section ref, so `spec find` can promote a
 // ranked result without the fallback path knowing an index exists.
 
-/// The four corpora `just docs-index` builds, as `collection → repo-relative prefix`.
-/// `ingest` skips dot-entries, so `.claude/rules` is reachable only as its own root, and
-/// SPEC.md/CLAUDE.md are staged because `ingest` walks directories, not files.
+/// `just docs-index` (nidus-3gm unit 11) walks the whole repo root into one `code`
+/// collection, so a hit's `code.path` is already the repo-relative doc path -- no
+/// per-collection prefix left to reconstruct. Kept as a map (not a bare string) so an
+/// unrecognised collection still resolves to `undefined`, not a false match.
 export const CORPORA = {
-  root: '',
-  rules: '.claude/rules/',
-  decisions: 'decisions/',
+  code: '',
 }
 
 /// A hit's repo-relative doc path, or null when it names a collection we did not build.

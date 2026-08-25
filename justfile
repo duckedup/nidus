@@ -150,6 +150,21 @@ serve-memory DIR DIM *ARGS:
 # Pre-PR checks for the serve feature: format clean, no clippy warnings, tests green
 ci-serve: fmt-check lint-serve test-serve
 
+# ── AST-aware code search (the opt-in `code` feature, epic nidus-3gm) ────────
+# Off the core build path on purpose: `wdpkr-core` (tree-sitter over eight grammars)
+# is heavier than the rest of `serve`. Its own budget job, its own lane here.
+
+# Lint the code feature (dispatch, summarize wiring, presentation)
+lint-code:
+    cargo clippy --all-targets --features code -- -D warnings
+
+# Test the code feature
+test-code:
+    cargo test --features code
+
+# Pre-PR checks for the code feature: format clean, no clippy warnings, tests green
+ci-code: fmt-check lint-code test-code
+
 # ── wasm32 target (browser / edge) ──────────────────────────────────────────
 # The wasm-hostile deps (ureq/ring, tame-oauth, redis, rusty-s3, tame-gcs, url) are
 # target-cfg'd out, so no feature flag is needed: the target selects the tree.
@@ -465,8 +480,11 @@ bd-sync:
 spec *ARGS:
     @.claude/skills/nidus/bin/spec {{ARGS}}
 
-# The ranked tier under `spec find` (nidus-gmy.7), dogfooding `ingest --fts-only` on this
-# repo's own docs. Derived, gitignored, `cargo clean`-able, and never a prerequisite (D0013).
-# Build or refresh the docs index over SPEC.md, CLAUDE.md, .claude/rules and decisions
+# The ranked tier under `spec find` (nidus-gmy.7 / nidus-3gm unit 11), dogfooding
+# `code ingest` over the whole repo root: docs chunked by heading, source by AST, one
+# store. Derived, gitignored, `cargo clean`-able, and never a prerequisite (D0013). Needs
+# a nidus binary built with the `code` feature; the script itself says so and exits
+# nonzero rather than letting a missing `code ingest` subcommand surface as a clap error.
+# Build or refresh the docs+code index over the repo root
 docs-index:
     @./scripts/docs-index.sh

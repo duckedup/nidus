@@ -886,6 +886,64 @@ impl From<AnnConfig> for AnnDto {
     }
 }
 
+/// Body of `POST /code-search` (the `code` feature). `vector` picks the ranking:
+/// `Some(true)` forces a vector search, `Some(false)` forces BM25, `None` defers to the
+/// store — a dimension-0 (fts-only) store answers BM25 rather than erroring.
+#[cfg(feature = "code")]
+#[derive(Debug, Deserialize)]
+pub struct CodeSearchRequest {
+    pub collection: String,
+    pub query: String,
+    #[serde(default = "default_top_k")]
+    pub limit: usize,
+    #[serde(default)]
+    pub filter: Filter,
+    #[serde(default)]
+    pub vector: Option<bool>,
+}
+
+/// One matched symbol within a file: everything an agent needs to go read the real
+/// source, never the source itself. Mirrors [`crate::code::present::SymbolHit`].
+#[cfg(feature = "code")]
+#[derive(Debug, Serialize)]
+pub struct CodeSymbolHitDto {
+    pub symbol: Option<String>,
+    pub kind: Option<String>,
+    pub start_line: Option<i64>,
+    pub end_line: Option<i64>,
+    pub score: f32,
+}
+
+#[cfg(feature = "code")]
+impl From<crate::code::present::SymbolHit> for CodeSymbolHitDto {
+    fn from(s: crate::code::present::SymbolHit) -> Self {
+        Self {
+            symbol: s.symbol,
+            kind: s.kind,
+            start_line: s.start_line,
+            end_line: s.end_line,
+            score: s.score,
+        }
+    }
+}
+
+/// Every hit that landed in one file: its language (present only when the file was
+/// AST-chunked) and its symbols, ranked by descending score.
+#[cfg(feature = "code")]
+#[derive(Debug, Serialize)]
+pub struct CodeFileGroupDto {
+    pub path: String,
+    pub language: Option<String>,
+    pub symbols: Vec<CodeSymbolHitDto>,
+}
+
+/// `POST /code-search`'s response: hits grouped by file, never a vector or a source body.
+#[cfg(feature = "code")]
+#[derive(Debug, Serialize)]
+pub struct CodeSearchResponse {
+    pub files: Vec<CodeFileGroupDto>,
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

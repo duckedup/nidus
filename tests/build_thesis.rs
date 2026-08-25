@@ -7,7 +7,12 @@
 
 /// DEFAULT build: none of the AI-ingest features are enabled, so the async edge
 /// (reqwest/tokio/hyper) is not compiled. This test only exists on the pure lane.
-#[cfg(not(any(feature = "embed", feature = "summarize", feature = "rerank")))]
+#[cfg(not(any(
+    feature = "embed",
+    feature = "summarize",
+    feature = "rerank",
+    feature = "code"
+)))]
 #[test]
 fn default_build_is_pure() {
     // Base infra features — both gate `dep:reqwest` + `dep:tokio`.
@@ -17,6 +22,7 @@ fn default_build_is_pure() {
         "summarize must be off by default"
     );
     assert!(!cfg!(feature = "rerank"), "rerank must be off by default");
+    assert!(!cfg!(feature = "code"), "code must be off by default");
 
     // Headline memory surface + umbrellas.
     assert!(!cfg!(feature = "memory"), "memory must be off by default");

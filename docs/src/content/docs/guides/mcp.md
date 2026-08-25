@@ -99,6 +99,10 @@ client's writes rather than each client racing for its own.
 | `browse` | List a collection's contents, bounded and optionally filtered, without a query. |
 | `related` | Find entries like one you already have, using its own stored vector as the query. |
 | `suggest` | Complete a partial word from a field's indexed vocabulary, ranked commonest-first. Takes a `filter`, and the words before the final token narrow it. |
+| `code_search`* | Search a chunked code/docs corpus, grouped by file with each hit's matching symbols: name, kind, line span. Never returns source; read the file at the given lines instead. |
+
+\* Needs the off-by-default `code` feature on top of `mcp`. See the
+[code search guide](/guides/code/) for indexing a repo with `nidus code ingest` first.
 
 Every one of them takes **natural language, never vectors**. That is deliberate:
 a model cannot write a 1024-float array as a tool argument, so the raw

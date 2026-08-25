@@ -53,6 +53,12 @@ use crate::{Hit, QueryPlan};
 #[cfg(feature = "rerank")]
 use dto::RerankRequest;
 
+// ── Code search (nidus-3gm unit 5) imports: only under the `code` feature. `Hit` is used
+// fully-qualified (`crate::Hit`) below rather than imported here, so this block cannot
+// collide with the `rerank` block's own `use crate::Hit` when both features are on.
+#[cfg(feature = "code")]
+use dto::{CodeSearchRequest, CodeSearchResponse};
+
 /// How `nidus serve` is configured beyond the store itself.
 pub struct ServeConfig {
     /// Bind address.
@@ -484,6 +490,11 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
     // the whole middleware stack instead of growing its own copy of each layer.
     #[cfg(feature = "mcp")]
     let router = router.nest_service("/mcp", mcp::service(state.clone(), max_body_bytes));
+
+    // Code search (nidus-3gm unit 5), gated exactly like the memory routes above — present
+    // only when `code` is compiled in, so a plain build answers 404 rather than 500.
+    #[cfg(feature = "code")]
+    let router = router.route("/code-search", post(code_search));
 
     // `.layer()` applies outermost last, so inside-out this reads: body limit, backpressure,
     // auth (outside backpressure, so an unauthenticated request never consumes a permit), then
@@ -1796,6 +1807,131 @@ fn check_rerank_hybrid_depth(opts: &HybridOpts) -> Result<(), ApiError> {
         )));
     }
     Ok(())
+}
+
+// ── Code search handler (nidus-3gm unit 5, the `code` feature) ───────────────────────
+
+/// `POST /code-search` — a text query grouped by file, over metadata `src/code/mod.rs`
+/// stamps. `req.vector` picks vector-vs-BM25; `None` defers to the store (dim-0 answers
+/// BM25). Grouping runs in [`crate::code::present`], never a new `store::search` mode.
+#[cfg(feature = "code")]
+async fn code_search(
+    State(st): State<AppState>,
+    Json(req): Json<CodeSearchRequest>,
+) -> Result<Json<CodeSearchResponse>, ApiError> {
+    check_page(0, req.limit)?;
+    let CodeSearchRequest {
+        collection,
+        query,
+        limit,
+        filter,
+        vector,
+    } = req;
+
+    let use_vector = match vector {
+        Some(v) => v,
+        None => run_read(st.clone(), |db| Ok(db.dimension() > 0)).await?,
+    };
+
+    let hits = if use_vector {
+        code_search_vector(st, collection, query, limit, filter).await?
+    } else {
+        code_search_bm25(st, collection, query, limit, filter).await?
+    };
+    Ok(Json(code_search_response(&hits)))
+}
+
+/// The vector leg: embed `query` server-side (mirrors `/recall`), then search. Only
+/// compiled with `memory`, since embedding needs an [`AnyEmbedder`] — `code` alone
+/// (without `memory`) has no way to turn text into a vector.
+#[cfg(all(feature = "code", feature = "memory"))]
+async fn code_search_vector(
+    st: AppState,
+    collection: String,
+    query: String,
+    limit: usize,
+    filter: crate::Filter,
+) -> Result<Vec<crate::Hit>, ApiError> {
+    let embedder = st.embedder.clone().ok_or_else(missing_embedder_error)?;
+    let vector = embedder
+        .embed_query(&query)
+        .await
+        .map_err(anyhow::Error::new)?;
+    let opts = SearchOpts {
+        top_k: limit,
+        filter,
+        ..Default::default()
+    };
+    run_read(st, move |db| db.search(collection.as_str(), &vector, &opts)).await
+}
+
+/// A build with `code` but no `memory` cannot embed a query at all — a `400` naming the
+/// fix, never a silent BM25 fallback the caller did not ask for.
+#[cfg(all(feature = "code", not(feature = "memory")))]
+async fn code_search_vector(
+    _st: AppState,
+    _collection: String,
+    _query: String,
+    _limit: usize,
+    _filter: crate::Filter,
+) -> Result<Vec<crate::Hit>, ApiError> {
+    Err(ApiError::bad_request(anyhow::anyhow!(
+        "vector code search needs an embedder, and this build has no memory support; \
+         rebuild with --features serve, or pass \"vector\": false for BM25"
+    )))
+}
+
+/// The BM25 leg: matches `query` against the reserved chunk-text field every ingest path
+/// (code or prose) stamps, needing no embedder at all.
+#[cfg(feature = "code")]
+async fn code_search_bm25(
+    st: AppState,
+    collection: String,
+    query: String,
+    limit: usize,
+    filter: crate::Filter,
+) -> Result<Vec<crate::Hit>, ApiError> {
+    let opts = SearchOpts {
+        top_k: limit,
+        filter,
+        ..Default::default()
+    };
+    let q = FtsQuery {
+        clauses: vec![crate::FtsClause::new(crate::model::META_TEXT, query)],
+        combine: crate::FtsCombine::default(),
+        highlight: None,
+    };
+    run_read(st, move |db| db.text_search(collection.as_str(), &q, &opts)).await
+}
+
+/// Group `hits` by file via [`crate::code::present::group_by_file`] and attach each
+/// file's language from its own hits — `FileGroup` carries none, so it is read here
+/// rather than by touching `src/code/` (out of this unit's scope).
+#[cfg(feature = "code")]
+fn code_search_response(hits: &[crate::Hit]) -> CodeSearchResponse {
+    let mut language_by_path: std::collections::BTreeMap<&str, &str> =
+        std::collections::BTreeMap::new();
+    for h in hits {
+        if let (Some(crate::Value::Str(p)), Some(crate::Value::Str(l))) = (
+            h.attrs.get(crate::code::META_PATH),
+            h.attrs.get(crate::code::META_LANGUAGE),
+        ) {
+            language_by_path.entry(p.as_str()).or_insert(l.as_str());
+        }
+    }
+    let files = crate::code::present::group_by_file(hits)
+        .into_iter()
+        .map(|g| dto::CodeFileGroupDto {
+            language: language_by_path.get(g.path.as_str()).map(|s| s.to_string()),
+            path: g.path,
+            symbols: g
+                .symbols
+                .into_iter()
+                .map(dto::CodeSymbolHitDto::from)
+                .collect(),
+        })
+        .collect();
+    CodeSearchResponse { files }
 }
 
 /// Run a **read** operation on a blocking task under a shared lock — concurrent

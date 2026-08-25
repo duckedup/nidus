@@ -351,6 +351,42 @@ class RememberResult:
     deduped: bool
 
 
+@dataclass(frozen=True)
+class CodeSymbolHit:
+    """One matched symbol within a file, from :meth:`~nidus.NidusClient.code_search`.
+
+    ``symbol``/``kind``/line span are ``None`` when the hit came from a file the AST
+    chunker did not recognise (a generic, non-code chunk); mirrors the server's
+    ``CodeSymbolHitDto``. Never the source body — read the file itself for ground truth.
+    """
+
+    symbol: Optional[str]
+    kind: Optional[str]
+    start_line: Optional[int]
+    end_line: Optional[int]
+    score: float
+
+
+@dataclass(frozen=True)
+class CodeFileGroup:
+    """Every hit that landed in one file, its symbols ranked by descending score.
+
+    ``language`` is ``None`` for a file the AST chunker did not recognise.
+    """
+
+    path: str
+    language: Optional[str]
+    symbols: list[CodeSymbolHit] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CodeSearchResult:
+    """:meth:`~nidus.NidusClient.code_search`'s result: hits grouped by file, ranked by
+    each file's own best-scoring symbol. Never a vector or a source body."""
+
+    files: list[CodeFileGroup] = field(default_factory=list)
+
+
 class _RecordRequired(TypedDict):
     """The one field every record must carry (split out so the rest can be optional)."""
 

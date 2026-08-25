@@ -1665,6 +1665,18 @@ build until a real need exists.
   §13 for the browser storage backend this target makes possible, and §13.4 for why it
   needed no trait change.
 
+- **Code search (`nidus code`), behind the off-by-default `code` feature.** `nidus code
+  index` / `nidus code search` are front doors over the general ingest/search primitives:
+  `wdpkr-core`'s tree-sitter AST chunker and embed-summaries-not-code prompts run driven by
+  nidus's own walk-and-upsert pipeline (D0014), not `wdpkr-core`'s own indexer, so `code` gets
+  one walker, one idempotence scheme, and one corpus shared with docs rather than two that can
+  disagree. Every step is optional, never a prerequisite: no provider searches keyword-only
+  over the FTS path, an embed provider adds vectors, a summarize provider adds the
+  conceptual-query win that makes "where do we release commission payments" match code that
+  never says those words. Result grouping by file and symbol is a client/presentation concern,
+  not an engine one (commit c55d7e5). A plain `cargo add nidus` never sees `wdpkr-core`; see
+  D0014 for the build-budget measurements and the pinning policy.
+
 ### Still deferred (designed-for, not built)
 
 - **Pluggable storage & memory backends.** Generalize the §5 local directory along two

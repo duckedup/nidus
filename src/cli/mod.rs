@@ -39,6 +39,8 @@ use crate::rerank::{
 use crate::summarize::{AnySummarizer, SummarizeConfig, SummarizeProvider};
 
 mod backup;
+#[cfg(all(feature = "memory", feature = "code"))]
+mod code;
 #[cfg(feature = "memory")]
 mod ingest;
 #[cfg(feature = "memory")]
@@ -470,6 +472,11 @@ impl StoreArgs {
 #[cfg(feature = "memory")]
 #[derive(Args, Debug, Default)]
 struct IngestArgs {
+    /// Walk dot-entries too (`.github`, `.claude`, …). `.git` is always skipped, at any
+    /// depth, regardless of this flag. Off by default, so `nidus ingest .`'s output is
+    /// unchanged; `nidus code ingest` turns it on (nidus-0fw).
+    #[arg(long)]
+    include_hidden: bool,
     /// Embedding provider for `/remember` and `/recall`: voyage, openai, ollama,
     /// cohere, gemini, mistral, jina, or openai-compat. Omit to serve only the
     /// raw vector endpoints (the memory routes then answer 400).
@@ -780,6 +787,68 @@ impl From<ChunkStrategyArg> for crate::chunk::ChunkStrategy {
             ChunkStrategyArg::Sentence => crate::chunk::ChunkStrategy::Sentence,
         }
     }
+}
+
+/// `nidus code ingest` / `nidus code search` (epic nidus-3gm): the only nested subcommand
+/// in this file. Front doors over the `ingest`/`search` primitives, dispatching each file's
+/// chunk strategy through [`crate::code::dispatch`].
+#[cfg(all(feature = "memory", feature = "code"))]
+#[derive(Subcommand, Debug)]
+enum CodeCommand {
+    /// Walk a directory, chunk per [`crate::code::dispatch`], and upsert it. Dot-entries
+    /// are included by default; `.git` is always skipped. With no embedder configured,
+    /// ingests for BM25 only.
+    Ingest {
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(flatten)]
+        ingest: IngestArgs,
+        /// Directory to walk. Defaults to the current directory.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Collection to ingest into.
+        #[arg(long, default_value = "code")]
+        collection: String,
+        /// Chunk budget in characters for non-code files (docs, config). Code files are
+        /// chunked one symbol per chunk regardless of this budget.
+        #[arg(long, default_value_t = 1000)]
+        max_chars: usize,
+        /// Characters of backward overlap per non-code chunk. Must be below --max-chars.
+        #[arg(long, default_value_t = 100)]
+        overlap_chars: usize,
+        /// Delete previously-ingested records whose source file is gone.
+        #[arg(long)]
+        prune: bool,
+        /// Report what would happen without embedding or writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the content-hash embedding cache.
+        #[arg(long)]
+        no_cache: bool,
+        /// Cached vectors to keep before evicting the oldest.
+        #[arg(long, default_value_t = crate::embed::cache::DEFAULT_MAX_ENTRIES)]
+        cache_max_entries: usize,
+    },
+    /// Search indexed source and docs, grouped by file with symbol, kind and line span.
+    /// Never prints source; the agent reads the file for ground truth.
+    Search {
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(flatten)]
+        ingest: IngestArgs,
+        /// Query text.
+        query: String,
+        /// Collections to search; omit to search every collection.
+        #[arg(long = "in")]
+        collections: Vec<String>,
+        #[arg(long, short = 'k', default_value_t = 10)]
+        top_k: usize,
+        /// Force a vector-embedded query instead of the BM25 fallback. Refuses (naming the
+        /// reason) instead of silently falling back when no embedder is configured or the
+        /// store holds no vectors.
+        #[arg(long)]
+        vector: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -1525,6 +1594,13 @@ enum Command {
         /// no API key and makes no network call. Repeatable; `nidus.text` is the chunk text.
         #[arg(long = "fts-only", conflicts_with = "embed_provider")]
         fts_only: Vec<String>,
+    },
+    /// AST-aware source and docs search over one corpus (epic nidus-3gm): `code ingest`
+    /// and `code search` front-door the primitives above with per-file chunk dispatch.
+    #[cfg(all(feature = "memory", feature = "code"))]
+    Code {
+        #[command(subcommand)]
+        action: CodeCommand,
     },
     /// Remember a fact: embed `text` (optionally summarizing first) and store it.
     /// Needs an embedder — the same `--embed-*` flags (and `NIDUS_EMBED_*` envs) `serve` takes.
@@ -2290,6 +2366,49 @@ pub fn run(cli: Cli) -> Result<()> {
             cache_max_entries,
             fts_only,
         ),
+        #[cfg(all(feature = "memory", feature = "code"))]
+        Command::Code { action } => match action {
+            CodeCommand::Ingest {
+                store,
+                ingest,
+                path,
+                collection,
+                max_chars,
+                overlap_chars,
+                prune,
+                dry_run,
+                no_cache,
+                cache_max_entries,
+            } => code::ingest(
+                store,
+                ingest,
+                path,
+                collection,
+                max_chars,
+                overlap_chars,
+                prune,
+                dry_run,
+                no_cache,
+                cache_max_entries,
+            ),
+            CodeCommand::Search {
+                store,
+                ingest,
+                query,
+                collections,
+                top_k,
+                vector,
+            } => code::search(
+                store,
+                ingest,
+                code::SearchArgs {
+                    query,
+                    collections,
+                    top_k,
+                    vector,
+                },
+            ),
+        },
         #[cfg(feature = "memory")]
         Command::Remember {
             store,

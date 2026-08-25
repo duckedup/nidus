@@ -132,6 +132,12 @@ See [`examples/demo.rs`](examples/demo.rs) for an end-to-end run (`cargo run
   data in the browser's Origin Private File System (`opfs://`) from a dedicated
   worker, no server round trip. See the
   [browser guide](https://nidus.duckedup.org/guides/wasm/).
+- **Code search** *(opt-in)*: `nidus code ingest`/`nidus code search` chunk a
+  repository per file (AST-aware for source, heading-aware for docs) into one
+  corpus, and answer queries grouped by file and symbol, never a source body.
+  Off by default behind the `code` feature, so `cargo add nidus` still never sees
+  its tree-sitter dependency. See the
+  [code search guide](https://nidus.duckedup.org/guides/code/).
 
 ## Command line & server
 

@@ -459,6 +459,23 @@ func (c *Client) TextSearch(ctx context.Context, req TextSearchRequest) ([]Hit, 
 	return c.hits(ctx, "/text-search", req)
 }
 
+// CodeSearch queries an AST-chunked corpus and returns hits grouped by file rather
+// than as flat rows: every matched symbol in a file, ranked by score, under that
+// file's path and language. It never returns a vector or a source body — the caller
+// reads the file itself for ground truth.
+//
+// Needs a server built with the `code` feature; a plain build answers 404 on this
+// route rather than something that could be mistaken for an empty result.
+func (c *Client) CodeSearch(ctx context.Context, req CodeSearchRequest) ([]CodeFileHit, error) {
+	var out struct {
+		Files []CodeFileHit `json:"files"`
+	}
+	if err := c.request(ctx, http.MethodPost, "/code-search", req, &out); err != nil {
+		return nil, err
+	}
+	return out.Files, nil
+}
+
 // Suggest returns ranked term completions for a partial word from one field's indexed
 // vocabulary — what an autocomplete dropdown shows. Ranking is by document frequency,
 // commonest first, not the idf [Client.TextSearch] scores documents by.

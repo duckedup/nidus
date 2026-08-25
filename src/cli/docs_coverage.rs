@@ -59,9 +59,26 @@ fn long_flags(cmd: &Command) -> Vec<&str> {
         .collect()
 }
 
-/// The subcommands this build exposes, minus clap's built-in `help`.
-fn subcommands(cli: &Command) -> impl Iterator<Item = &Command> {
-    cli.get_subcommands().filter(|c| c.get_name() != "help")
+/// Every leaf subcommand this build exposes, minus clap's built-in `help`, keyed by its
+/// full space-joined name (`"code ingest"`, not `"code"`). A group like `code` — routing
+/// to nested subcommands rather than taking flags of its own — contributes no entry itself.
+fn subcommands(cli: &Command) -> Vec<(String, &Command)> {
+    fn walk<'a>(cmd: &'a Command, prefix: &str, out: &mut Vec<(String, &'a Command)>) {
+        for sub in cmd.get_subcommands().filter(|c| c.get_name() != "help") {
+            let name = match prefix {
+                "" => sub.get_name().to_string(),
+                p => format!("{p} {}", sub.get_name()),
+            };
+            if sub.get_subcommands().next().is_some() {
+                walk(sub, &name, out);
+            } else {
+                out.push((name, sub));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(cli, "", &mut out);
+    out
 }
 
 #[test]
@@ -70,9 +87,8 @@ fn every_long_flag_has_a_docs_row() {
     let cli = Cli::command();
     let mut missing = Vec::new();
 
-    for sub in subcommands(&cli) {
-        let name = sub.get_name();
-        let Some(own) = section(&secs, name) else {
+    for (name, sub) in subcommands(&cli) {
+        let Some(own) = section(&secs, &name) else {
             missing.push(format!(
                 "{name}: cli.md has no \"### {name}\" section at all"
             ));
@@ -80,7 +96,7 @@ fn every_long_flag_has_a_docs_row() {
         };
         let inherited = INHERITS
             .iter()
-            .find(|(from, _)| *from == name)
+            .find(|(from, _)| *from == name.as_str())
             .and_then(|(_, to)| section(&secs, to))
             .unwrap_or("");
 
@@ -128,8 +144,10 @@ fn subcommand_list_is_current() {
     );
 
     let cli = Cli::command();
-    let absent: Vec<&str> = subcommands(&cli)
-        .map(|c| c.get_name())
+    let names: Vec<String> = subcommands(&cli).into_iter().map(|(n, _)| n).collect();
+    let absent: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
         .filter(|n| !listed.contains(n))
         .collect();
     assert!(

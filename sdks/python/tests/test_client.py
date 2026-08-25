@@ -230,6 +230,13 @@ ENDPOINTS: list[tuple[str, Callable[[NidusClient], Any], str, str, Any]] = [
         "/hybrid-search",
         [],
     ),
+    (
+        "code_search",
+        lambda db: db.code_search(collection="code", query="widget"),
+        "POST",
+        "/code-search",
+        {"files": []},
+    ),
     ("list", lambda db: db.list(), "POST", "/list", []),
     ("aggregate", lambda db: db.aggregate(), "POST", "/aggregate", {"count": 0, "sums": {}}),
     (
@@ -473,6 +480,48 @@ def test_an_unknown_plan_path_decodes_without_raising() -> None:
     stub = StubTransport({"hits": [], "plan": {**PLAN_PAYLOAD, "path": "brand_new_path"}})
     _, plan = client(stub).search_with_plan(query=[1.0])
     assert plan.path == "brand_new_path"
+
+
+def test_code_search_sends_the_body_and_decodes_files_grouped_with_symbols() -> None:
+    """The load-bearing round trip: a known file in, symbol name and line span out."""
+    stub = StubTransport(
+        {
+            "files": [
+                {
+                    "path": "src/lib.rs",
+                    "language": "rust",
+                    "symbols": [
+                        {
+                            "symbol": "run",
+                            "kind": "function",
+                            "start_line": 10,
+                            "end_line": 12,
+                            "score": 1.5,
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    result = client(stub).code_search(
+        collection="code", query="widget", limit=5, vector=False, filter=[f.eq("lang", "rust")]
+    )
+    assert stub.last.json == {
+        "collection": "code",
+        "query": "widget",
+        "limit": 5,
+        "filter": [{"Eq": ["lang", {"Str": "rust"}]}],
+        "vector": False,
+    }
+    assert len(result.files) == 1
+    file = result.files[0]
+    assert file.path == "src/lib.rs"
+    assert file.language == "rust"
+    assert len(file.symbols) == 1
+    assert file.symbols[0].symbol == "run"
+    assert file.symbols[0].kind == "function"
+    assert file.symbols[0].start_line == 10
+    assert file.symbols[0].end_line == 12
 
 
 def test_a_multi_clause_text_search_reaches_the_wire_with_its_combine_rule() -> None:

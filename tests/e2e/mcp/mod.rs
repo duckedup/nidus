@@ -4,6 +4,7 @@
 
 mod aliases;
 mod attrs;
+mod code;
 mod dedupe;
 mod filters;
 mod hygiene;
@@ -187,26 +188,34 @@ fn tools_list_is_complete_ordered_and_cacheable() {
     assert_eq!(status, 200, "tools/list failed: {body}");
     let result = result(&body);
 
+    // `code_search` only exists with the `code` feature (off in the `just test-e2e` lane,
+    // present under `--features serve`), and it must append *after* every fixed tool below,
+    // never insert among them (SEP-2549).
+    #[cfg_attr(not(feature = "code"), allow(unused_mut))]
+    let mut want = vec![
+        "remember",
+        "recall",
+        "text_search",
+        "hybrid_search",
+        "list_collections",
+        "stats",
+        "forget",
+        "get",
+        "browse",
+        "related",
+        "suggest",
+        "list_aliases",
+        "set_alias",
+        "drop_alias",
+    ];
+    #[cfg(feature = "code")]
+    want.push("code_search");
     assert_eq!(
         tool_names(&result),
-        vec![
-            "remember",
-            "recall",
-            "text_search",
-            "hybrid_search",
-            "list_collections",
-            "stats",
-            "forget",
-            "get",
-            "browse",
-            "related",
-            "suggest",
-            "list_aliases",
-            "set_alias",
-            "drop_alias",
-        ],
+        want,
         "tool list changed — if this is deliberate, append rather than reorder. The alias \
-         tools must stay last so `related`'s position never shifts (SEP-2549)."
+         tools (and `code_search`, when the `code` feature is on) must stay last so \
+         `related`'s position never shifts (SEP-2549)."
     );
 
     // Required by SEP-2549 on every list result.

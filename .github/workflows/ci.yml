@@ -82,6 +82,43 @@ jobs:
             exit 1
           fi
 
+  # The build budget for the off-by-default `code` feature (D0014): `wdpkr-core` pulls in
+  # tree-sitter plus its own 167-crate graph, invisible to the default lane above. Same
+  # structure as `build-budget` — fetch first, no cache, offline — but its own bound: measured
+  # 122.1s CPU locally against 50.5s for the default lane (whose CI wall time is 25s), so 120s
+  # is the order-of-magnitude bound in the same spirit as the 60s one.
+  build-budget-code:
+    name: build-budget-code (clean-build timer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Lane guard — skip the work when no changed path exercises this job
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --quiet --depth=1 origin "$BASE_SHA"
+          files="$(git diff --name-only "$BASE_SHA" HEAD | paste -sd, -)"
+          if [ -n "$files" ] && [ "$(.claude/skills/nidus/bin/nidus-check ci-guard build-budget-code --paths "$files")" = "skip" ]; then
+            echo "SKIP_LANE=true" >> "$GITHUB_ENV"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+      - name: Fetch dependencies (network time is not compile time)
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: cargo fetch
+      - name: Time a clean offline build of the serve features
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: |
+          start=$(date +%s)
+          cargo build --offline --features serve
+          elapsed=$(( $(date +%s) - start ))
+          echo "clean build: ${elapsed}s (budget: 120s, D0014)"
+          if [ "$elapsed" -gt 120 ]; then
+            echo "::error::clean build took ${elapsed}s — over the 120s budget (D0014, measured 122.1s CPU locally against 50.5s for the default lane). A regression in wdpkr-core's dependency graph likely blew the code-feature build-and-ship thesis; this is a design change, not an implementation detail."
+            exit 1
+          fi
+
   # clippy, test, and the release build are separate compiles (check-mode vs
   # build-mode artifacts vs the release profile), so they stay parallel jobs with a
   # cache slot each. Within a job the feature sets share one `target`, which is why
@@ -133,6 +170,9 @@ jobs:
       - name: ingest
         if: ${{ !cancelled() && env.SKIP_LANE != 'true' }}
         run: cargo clippy --all-targets --features memory,embed-all,summarize-all,rerank-all -- -D warnings
+      - name: code
+        if: ${{ !cancelled() && env.SKIP_LANE != 'true' }}
+        run: cargo clippy --all-targets --features code -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -212,6 +252,9 @@ jobs:
       - name: ingest
         if: ${{ !cancelled() && env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: cargo test --features memory,embed-all,summarize-all,rerank-all
+      - name: code
+        if: ${{ !cancelled() && env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: cargo test --features code
 
   release:
     runs-on: ubuntu-latest

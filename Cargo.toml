@@ -103,6 +103,16 @@ rerank-voyage = ["rerank"]
 rerank-cohere = ["rerank"]
 rerank-all = ["rerank-voyage", "rerank-cohere"]
 
+# ── AST-aware code search (epic nidus-3gm) — OFF by default ──────────────────
+# wdpkr-core ships the engine nidus will not reimplement: tree-sitter AST
+# chunking over eight grammars, and the summarize-the-symbol prompts that make a
+# conceptual query work against source that never says those words. Measured
+# cost on the serve lane: 24.8s -> 26.3s wall, 96.3s -> 122.1s CPU on a clean
+# offline debug build (the eight grammars are only 9.3s CPU of that; generated
+# table-driven parsers are cheap at -O0). The DEFAULT lane is untouched and its
+# 60s build-budget job still guards it; `code` gets its own budget job. D0014.
+code = ["dep:wdpkr-core"]
+
 # The headline all-in-one memory surface (remember/recall). `memory` alone gives
 # the Raw ingest path (embed the text); add a `summarize-*` feature for the
 # summarize-then-embed mode.
@@ -124,7 +134,7 @@ mcp = ["cli", "memory", "dep:rmcp"]
 # CLI/server stack plus the full ingest layer, so the shipped binary and the JS
 # SDK's server-side memory work out of the box. `cli` alone still builds a lean
 # server with only the raw vector endpoints; the memory routes are `memory`-gated.
-serve = ["cli", "memory", "embed-all", "summarize-all", "rerank-all", "mcp"]
+serve = ["cli", "memory", "embed-all", "summarize-all", "rerank-all", "mcp", "code"]
 
 # The core is four small pure-Rust crates with no C and no FFI. The S3/GCS
 # persistence backends (below) add a few more — still all pure Rust except `ring`
@@ -243,6 +253,12 @@ rmcp = { version = "=3.1.1", default-features = false, features = [
 # OpenSSL — no new C tree); `json` gives typed request/response bodies.
 # Embeddings/summaries are single-shot request/response, so NO `stream` feature.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+
+# `code`-only dep: the AST-chunking + code-summarize-prompt engine (see the `code` feature
+# comment above). 0.2.0 ships ZERO cargo features, so the whole crate compiles even though only
+# chunk/ and summarize/ are called. Add `default-features = false` and a feature list the day
+# upstream grows them.
+wdpkr-core = { version = "0.2", optional = true }
 
 # Storage-backend + memory-tier deps that do not compile for wasm32 (network + threads):
 # `rusty-s3`/`tame-gcs`/`tame-oauth` (S3/GCS clients) run over `ureq`; `url` is their

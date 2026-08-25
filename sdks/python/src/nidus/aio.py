@@ -40,6 +40,7 @@ from .types import (
     Aggregation,
     Batch,
     ClusterStatus,
+    CodeSearchResult,
     Expand,
     FilterIndexField,
     FtsClause,
@@ -441,6 +442,25 @@ class AsyncNidusClient:
                 rerank=rerank,
             ),
         )
+
+    async def code_search(
+        self,
+        *,
+        collection: str,
+        query: str,
+        limit: Optional[int] = None,
+        filter: Optional[Filter] = None,  # noqa: A002
+        vector: Optional[bool] = None,
+    ) -> CodeSearchResult:
+        """Grouped by file with each hit's symbol, kind and line span. Same rules as
+        :meth:`nidus.client.NidusClient.code_search`, including ``vector``.
+        """
+        payload = await self._request(
+            "POST",
+            _wire.CODE_SEARCH,
+            _wire.code_search_body(collection, query, limit=limit, filter=filter, vector=vector),
+        )
+        return _wire.decode_code_search(payload)
 
     async def suggest(
         self,

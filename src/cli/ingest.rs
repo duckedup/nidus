@@ -22,32 +22,32 @@ use crate::{Filter, META_PARENT_ID, Nidus, Predicate, RememberMode, RememberOpts
 
 /// Attr holding the digest that makes a re-ingest a no-op. Doubles as the marker that a
 /// record came from `ingest`, which is what keeps `--prune` off hand-written memories.
-const META_SOURCE_HASH: &str = "nidus.source_hash";
+pub(super) const META_SOURCE_HASH: &str = "nidus.source_hash";
 /// Attr holding the source path relative to the ingest root, for callers filtering by file.
-const META_SOURCE_PATH: &str = "nidus.source_path";
+pub(super) const META_SOURCE_PATH: &str = "nidus.source_path";
 /// Attr holding how many chunks the file was split into. The skip check needs it: chunk 0
 /// carries the digest but is written *first*, so a write torn partway (nidus-lvo.5) would
 /// otherwise leave a half-ingested file looking complete for good.
-const META_SOURCE_CHUNKS: &str = "nidus.source_chunks";
+pub(super) const META_SOURCE_CHUNKS: &str = "nidus.source_chunks";
 
 /// One file the walk turned up: its forward-slashed path relative to the root, and where to
 /// read it from.
-struct Found {
-    rel: String,
-    abs: PathBuf,
+pub(super) struct Found {
+    pub(super) rel: String,
+    pub(super) abs: PathBuf,
 }
 
-/// Recursive `read_dir`, sorted so the order is reproducible. Dot-entries are skipped so
-/// `nidus ingest .` does not walk `.git`, and symlinks are never followed so a cycle cannot
-/// hang the walk.
-fn walk(root: &Path) -> Result<Vec<Found>> {
+/// Recursive `read_dir`, sorted so the order is reproducible. Symlinks are never followed so
+/// a cycle cannot hang the walk. `.git` is always skipped at any depth; every other
+/// dot-entry is skipped unless `include_hidden` is set (nidus-0fw).
+pub(super) fn walk(root: &Path, include_hidden: bool) -> Result<Vec<Found>> {
     let mut out = Vec::new();
-    visit(root, root, &mut out)?;
+    visit(root, root, include_hidden, &mut out)?;
     out.sort_by(|a, b| a.rel.cmp(&b.rel));
     Ok(out)
 }
 
-fn visit(root: &Path, dir: &Path, out: &mut Vec<Found>) -> Result<()> {
+fn visit(root: &Path, dir: &Path, include_hidden: bool, out: &mut Vec<Found>) -> Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .with_context(|| format!("reading {}", dir.display()))?
         .collect::<std::io::Result<Vec<_>>>()
@@ -56,7 +56,11 @@ fn visit(root: &Path, dir: &Path, out: &mut Vec<Found>) -> Result<()> {
 
     for entry in entries {
         let name = entry.file_name();
-        if name.to_string_lossy().starts_with('.') {
+        let name_str = name.to_string_lossy();
+        if name_str == ".git" {
+            continue;
+        }
+        if !include_hidden && name_str.starts_with('.') {
             continue;
         }
         let kind = entry
@@ -67,7 +71,7 @@ fn visit(root: &Path, dir: &Path, out: &mut Vec<Found>) -> Result<()> {
         }
         let path = entry.path();
         if kind.is_dir() {
-            visit(root, &path, out)?;
+            visit(root, &path, include_hidden, out)?;
         } else if kind.is_file() {
             let rel = path
                 .strip_prefix(root)
@@ -85,7 +89,7 @@ fn visit(root: &Path, dir: &Path, out: &mut Vec<Found>) -> Result<()> {
 /// nidus's `*` crosses `/` (SQL GLOB, SPEC §7.1), so `*.md` is already recursive. The
 /// ticket's own example is `**/*.md`, which under those semantics would miss root-level
 /// files, so a leading `**/` is treated as optional.
-fn matches(glob: &str, rel: &str) -> bool {
+pub(super) fn matches(glob: &str, rel: &str) -> bool {
     if crate::glob::glob_match(glob, rel) {
         return true;
     }
@@ -98,7 +102,12 @@ fn matches(glob: &str, rel: &str) -> bool {
 /// The digest a re-ingest compares. Covers the chunk options and the embedder as well as the
 /// text, so a `--max-chars` change or a model swap re-ingests instead of leaving vectors from
 /// one regime beside another. `DefaultHasher` is fixed-key, so it survives restarts.
-fn source_hash(text: &str, opts: &ChunkOpts, identity: &str, dimension: usize) -> String {
+pub(super) fn source_hash(
+    text: &str,
+    opts: &ChunkOpts,
+    identity: &str,
+    dimension: usize,
+) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);
     format!("{:?}", opts.strategy).hash(&mut h);
@@ -112,7 +121,10 @@ fn source_hash(text: &str, opts: &ChunkOpts, identity: &str, dimension: usize) -
 /// Whether `declared` needs replacing by `wanted`. Compared by field name only: the tuning
 /// knobs come from `FtsField::new`'s defaults on this path, so a name-set match means the
 /// declaration would be a no-op, and `set_fts_schema` reindexes every live doc.
-fn fts_schema_differs(declared: Option<&[crate::FtsField]>, wanted: &[crate::FtsField]) -> bool {
+pub(super) fn fts_schema_differs(
+    declared: Option<&[crate::FtsField]>,
+    wanted: &[crate::FtsField],
+) -> bool {
     let Some(declared) = declared else {
         return true;
     };
@@ -137,7 +149,7 @@ fn fts_identity(fields: &[String]) -> String {
 
 /// The `nidus.source_hash` already stored for this file, if any. Chunk 0 carries it, so this
 /// is one point lookup per file rather than a scan.
-fn stored_hash(db: &Nidus, collection: &str, rel: &str) -> Option<String> {
+pub(super) fn stored_hash(db: &Nidus, collection: &str, rel: &str) -> Option<String> {
     let record = db.get(collection, &format!("{rel}#0"))?;
     match record.attrs.get(META_SOURCE_HASH) {
         Some(Value::Str(s)) => Some(s.clone()),
@@ -183,7 +195,7 @@ pub(super) fn run(
     // Validate before the first billed call rather than letting chunk_text bail mid-run.
     crate::chunk::chunk_text("probe", &opts).context("invalid chunk options")?;
 
-    let found = walk(&path)?;
+    let found = walk(&path, ingest.include_hidden)?;
     let matched: Vec<Found> = found
         .into_iter()
         .filter(|f| matches(&glob, &f.rel))
@@ -362,7 +374,11 @@ pub(super) fn run(
 
 /// Delete records whose source file is gone. Only records carrying `nidus.source_hash` are
 /// considered, so a collection also holding hand-written `nidus remember` facts keeps them.
-fn prune_gone(db: &mut Nidus, collection: &str, seen: &HashSet<String>) -> Result<usize> {
+pub(super) fn prune_gone(
+    db: &mut Nidus,
+    collection: &str,
+    seen: &HashSet<String>,
+) -> Result<usize> {
     let mut gone: HashSet<String> = HashSet::new();
     for record in db.get_all(collection) {
         if !record.attrs.contains_key(META_SOURCE_HASH) {
@@ -458,13 +474,13 @@ mod tests {
         assert!(matches("*", "deep/nested/thing.rs"));
     }
 
-    /// `nidus ingest .` must not walk `.git`, and a symlink cycle must not hang the walk.
-    #[test]
-    fn walk_skips_dot_entries_and_symlinks_and_sorts() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
+    /// A tree with a dot-directory that has its own nested dot-directory, so the flag-on
+    /// half can assert `.claude/rules/x.md` is reached while `.git` stays skipped.
+    fn dotted_tree(root: &Path) {
         std::fs::create_dir(root.join(".git")).unwrap();
         std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        std::fs::create_dir_all(root.join(".claude/rules")).unwrap();
+        std::fs::write(root.join(".claude/rules/x.md"), "rule").unwrap();
         std::fs::write(root.join(".hidden"), "x").unwrap();
         std::fs::create_dir(root.join("sub")).unwrap();
         std::fs::write(root.join("sub/b.md"), "b").unwrap();
@@ -472,8 +488,17 @@ mod tests {
         std::fs::write(root.join("c.md"), "c").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(root, root.join("loop")).unwrap();
+    }
 
-        let found = walk(root).unwrap();
+    /// Without `--include-hidden`, `nidus ingest .` must not walk `.git` or any other
+    /// dot-entry, and a symlink cycle must not hang the walk. Unchanged since before nidus-0fw.
+    #[test]
+    fn walk_skips_dot_entries_and_symlinks_and_sorts_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        dotted_tree(root);
+
+        let found = walk(root, false).unwrap();
         let rels: Vec<&str> = found.iter().map(|f| f.rel.as_str()).collect();
         assert_eq!(
             rels,
@@ -482,10 +507,36 @@ mod tests {
         );
     }
 
+    /// With `--include-hidden`, the walk descends into dot-directories (`.claude/rules/x.md`
+    /// is reached) but `.git` stays skipped at any depth — the case that fails if the flag
+    /// were implemented as "drop the dot-check" instead of naming `.git` specifically.
+    #[test]
+    fn walk_with_include_hidden_reaches_dot_directories_but_never_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        dotted_tree(root);
+
+        let found = walk(root, true).unwrap();
+        let rels: Vec<&str> = found.iter().map(|f| f.rel.as_str()).collect();
+        assert!(
+            rels.contains(&".claude/rules/x.md"),
+            "a dot-directory must be walked: {rels:?}"
+        );
+        assert!(
+            rels.contains(&".hidden"),
+            "a dot-file must be walked: {rels:?}"
+        );
+        assert!(
+            !rels.iter().any(|r| r.starts_with(".git")),
+            ".git must stay skipped even with the flag on: {rels:?}"
+        );
+        assert!(!rels.contains(&"loop"), "the symlink is still skipped");
+    }
+
     /// A path with no matches is a report of zero, not an error.
     #[test]
     fn walk_of_an_empty_tree_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(walk(dir.path()).unwrap().is_empty());
+        assert!(walk(dir.path(), false).unwrap().is_empty());
     }
 }
