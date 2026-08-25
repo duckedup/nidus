@@ -574,10 +574,36 @@ and the [ingest flags](#ingest-flags-memory-feature) (it needs an embedder), plu
 | `--dry-run` | none | Report what would happen without embedding or writing anything. |
 | `--no-cache` | none | Skip the content-hash embedding cache. The per-file skip still applies. |
 | `--cache-max-entries <N>` | none | Cached vectors to keep before evicting the oldest (default `50000`). |
+| `--fts-only <FIELD>` | none | Ingest for BM25 only: store each chunk as a text-only record and declare these attrs as the collection's full-text schema, with no embedder at all. Repeatable. Conflicts with `--embed-provider`. |
 
 Dot-entries, symlinks, and files that are not valid UTF-8 are skipped; the last of
 these is counted as `skipped_non_utf8` rather than failing the run. See
 [Ingest a directory](/guides/ingest/) for the full behaviour.
+
+#### Keyword-only ingest, with no embedding provider
+
+`--fts-only` is the on-ramp for a corpus you want to search by keyword and nothing
+else. It needs no API key, makes no network call, and works offline and in CI:
+
+```bash
+nidus ingest --dir ./store --collection docs --glob '*.md' \
+  --strategy markdown --fts-only nidus.text ./docs
+nidus text-search --dir ./store nidus.text "crash safety"
+```
+
+Every chunk is stored as a **text-only record**: it carries the chunk text and its
+provenance attrs, occupies no vector row, and stays out of every vector scan. The
+chunk text lands under `nidus.text`, which is what the example indexes.
+
+Pointed at a directory with no store yet, this creates one with **dimension 0** -
+the store declares that it has no embedding space, and a vector query against it is
+refused with that reason rather than answered with an empty ranking. Pass `--dim` (or
+point `--fts-only` at a store that already exists) to keep room for vectors, and the
+text-only chunks sit alongside them.
+
+Re-running is a no-op on an unchanged tree, the same as an embedding ingest. Changing
+which fields you pass to `--fts-only` re-ingests, because the declared field set is
+folded into the per-file digest.
 
 ### `remember` (`memory` feature)
 

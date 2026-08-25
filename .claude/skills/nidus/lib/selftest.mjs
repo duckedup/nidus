@@ -1208,3 +1208,51 @@ export function selftest({ json = false } = {}) {
   }
   return failures.length ? 1 : 0
 }
+
+// ── The ranked docs tier (nidus-gmy.7) ───────────────────────────────────────────────
+
+test('docForHit: a rules hit becomes a repo-relative path', () => {
+  eq(spec.docForHit('rules', 'miri.md'), '.claude/rules/miri.md')
+})
+
+test('docForHit: the staged root corpus keeps its bare name', () => {
+  eq(spec.docForHit('root', 'SPEC.md'), 'SPEC.md')
+})
+
+test('docForHit: an unknown collection is not guessed at', () => {
+  eq(spec.docForHit('sdks', 'x.md'), null)
+})
+
+test('lineForOffset: an offset maps to the line it falls on', () => {
+  eq(spec.lineForOffset('a\nbb\nccc\n', 0), 1)
+  eq(spec.lineForOffset('a\nbb\nccc\n', 2), 2)
+  eq(spec.lineForOffset('a\nbb\nccc\n', 5), 3)
+})
+
+test('refForLine: the innermost containing section wins, as `spec <ref>` prints', () => {
+  const lines = ['## 7 Outer', 'x', '### 7.4 Inner', 'y', '## 8 Next'].join('\n').split('\n')
+  eq(spec.refForLine(lines, 4).num, '7.4')
+  eq(spec.refForLine(lines, 2).num, '7')
+})
+
+test('refForLine: a hit above the first heading has no ref rather than a wrong one', () => {
+  eq(spec.refForLine(['preamble', '## 1 First'], 1), null)
+})
+
+test('dedupeRanked: several chunks of one section collapse to its best score', () => {
+  const rows = spec.dedupeRanked([
+    { doc: 'SPEC.md', ref: '§7', score: 1 },
+    { doc: 'SPEC.md', ref: '§7', score: 5 },
+    { doc: 'CLAUDE.md', ref: '§7', score: 3 },
+  ])
+  eq(rows.length, 2)
+  eq(rows[0].score, 5)
+  eq(rows[0].doc, 'SPEC.md')
+})
+
+test('indexIsFresh: only an exact match is fresh', () => {
+  eq(spec.indexIsFresh('abc', 'abc'), true)
+  eq(spec.indexIsFresh('abc', 'def'), false)
+  eq(spec.indexIsFresh(null, 'abc'), false)
+  eq(spec.indexIsFresh('abc', null), false)
+})

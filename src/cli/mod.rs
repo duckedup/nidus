@@ -1516,6 +1516,11 @@ enum Command {
         /// Cached vectors to keep before evicting the oldest.
         #[arg(long, default_value_t = crate::embed::cache::DEFAULT_MAX_ENTRIES)]
         cache_max_entries: usize,
+        /// Ingest for BM25 only: store each chunk as a text-only record and declare these
+        /// attrs as the collection's full-text schema, with NO embedder (nidus-gmy.6). Needs
+        /// no API key and makes no network call. Repeatable; `nidus.text` is the chunk text.
+        #[arg(long = "fts-only", conflicts_with = "embed_provider")]
+        fts_only: Vec<String>,
     },
     /// Remember a fact: embed `text` (optionally summarizing first) and store it.
     /// Needs an embedder — the same `--embed-*` flags (and `NIDUS_EMBED_*` envs) `serve` takes.
@@ -2263,6 +2268,7 @@ pub fn run(cli: Cli) -> Result<()> {
             dry_run,
             no_cache,
             cache_max_entries,
+            fts_only,
         } => ingest::run(
             store,
             ingest,
@@ -2276,6 +2282,7 @@ pub fn run(cli: Cli) -> Result<()> {
             dry_run,
             no_cache,
             cache_max_entries,
+            fts_only,
         ),
         #[cfg(feature = "memory")]
         Command::Remember {

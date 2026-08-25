@@ -15,6 +15,7 @@ use super::{ScanOrder, Store, oom};
 use crate::ann::Walk;
 use crate::config::Config;
 use crate::filter;
+use crate::fts::FtsField;
 use crate::model::{
     AnnConfig, Distance, Filter, Footprint, Hit, HybridOpts, ListOpts, Projection, SearchOpts,
 };
@@ -183,6 +184,13 @@ impl Store {
     /// call rebuilds the field index from every live doc (`store/write.rs`).
     pub fn has_fts_schema(&self, collection: &str) -> bool {
         self.fts.schema_for(collection).is_some()
+    }
+
+    /// The FTS schema `collection` currently declares, if any. `has_fts_schema` answers
+    /// "is one set"; a caller re-declaring a field set needs to know *which* one, since
+    /// redeclaring the same fields would rebuild the index for no change (nidus-gmy.6).
+    pub fn fts_schema(&self, collection: &str) -> Option<&[FtsField]> {
+        self.fts.schema_for(collection)
     }
 
     /// Returns collection names sorted alphabetically.
@@ -504,9 +512,18 @@ impl Store {
 
     // ── Search ──────────────────────────────────────────────────────────────────
 
-    /// Reject a query vector whose length is not the store's pinned dimension (nidus-c5v).
+    /// Reject a query vector whose length is not the store's pinned dimension (nidus-c5v), and
+    /// any vector query against a dimension-0 store (nidus-gmy.6), where a zero-length query
+    /// would otherwise match and return an empty ranking reading as "nothing matched".
     pub(super) fn check_query_dim(&self, query: &[f32]) -> Result<()> {
         let dim = self.data.dimension();
+        if dim == 0 {
+            bail!(
+                "this store has dimension 0, so it holds no vectors and cannot answer a vector \
+                 query — it was created for full-text search only (`ingest --fts-only`); use \
+                 `text_search`, or create a store with an explicit dimension to store vectors"
+            );
+        }
         if query.len() != dim {
             bail!(
                 "query length {} does not match store dimension {}",

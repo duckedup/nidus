@@ -464,3 +464,9 @@ bd-sync:
 # Fetch one section of a repo doc: just spec toc | just spec 7.4 | just spec find rrf
 spec *ARGS:
     @.claude/skills/nidus/bin/spec {{ARGS}}
+
+# The ranked tier under `spec find` (nidus-gmy.7), dogfooding `ingest --fts-only` on this
+# repo's own docs. Derived, gitignored, `cargo clean`-able, and never a prerequisite (D0013).
+# Build or refresh the docs index over SPEC.md, CLAUDE.md, .claude/rules and decisions
+docs-index:
+    @./scripts/docs-index.sh

@@ -97,7 +97,7 @@ mod memory;
 #[cfg(feature = "memory")]
 pub use memory::{
     ChunkedRemembered, META_CREATED_AT, META_DIM, META_EMBEDDER, META_TEXT, META_UPDATED_AT,
-    Memory, RecallOpts, RememberMode, RememberOpts, Remembered, Rollup,
+    Memory, RecallOpts, RememberMode, RememberOpts, Remembered, Rollup, remember_chunked_text_only,
 };
 // The summarize-mode attr keys are only defined when summaries can be produced.
 #[cfg(all(feature = "memory", feature = "summarize"))]
@@ -327,6 +327,12 @@ impl Nidus {
     /// at most once per collection.
     pub fn has_fts_schema(&self, collection: &str) -> bool {
         self.store.has_fts_schema(collection)
+    }
+
+    /// The FTS schema `collection` declares, if any — the fields, not just their presence,
+    /// so a caller can tell a re-declaration that changes nothing from one that does.
+    pub fn fts_schema(&self, collection: &str) -> Option<&[FtsField]> {
+        self.store.fts_schema(collection)
     }
 
     pub fn collections(&self) -> Vec<String> {

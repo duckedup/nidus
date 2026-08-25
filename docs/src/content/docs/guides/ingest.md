@@ -9,6 +9,10 @@ file into chunks, embed the chunks with the provider you choose, and store them.
 Without it, everyone writes this script themselves, and most write it slightly
 wrong: no dedupe, no resume, and every run re-embeds the entire corpus.
 
+Want keyword search and nothing else? `--fts-only` runs the same pipeline with no
+embedding provider at all: no API key, no network call, works offline and in CI.
+Jump to [Keyword-only, with no provider](#keyword-only-with-no-provider).
+
 ## The one command
 
 ```bash
@@ -209,6 +213,40 @@ Corpora ingested before 0.75.0 have no stored chunk offsets, so their windows ar
 joined with a blank line and keep whatever overlap the chunker left. The per-file
 digest covers the chunk options, so changing any of them re-ingests the tree and
 picks the offsets up.
+
+## Keyword-only, with no provider
+
+Every embedding provider is a network provider, so an ordinary `ingest` needs an API
+key or a local ollama. When you only want BM25, `--fts-only` skips that entirely:
+
+```bash
+nidus ingest ./docs \
+  --collection docs \
+  --glob '**/*.md' \
+  --dir ./store \
+  --strategy markdown \
+  --fts-only nidus.text
+
+nidus text-search --dir ./store nidus.text "how does compaction work"
+```
+
+It walks, chunks, skips unchanged files and prunes exactly as above. The difference is
+what it writes: each chunk becomes a **text-only record**, carrying its text and
+provenance attrs, taking no vector row and staying out of every vector scan. No filler
+vectors, which would otherwise poison `search` and `hybrid-search` with meaningless
+cosine scores.
+
+Pass the flag once per attr you want indexed. The chunk text lands under `nidus.text`;
+`nidus.source_path` is useful when you want to find a chunk by its file name. Change
+the set later and the corpus re-ingests and the schema is redeclared, because the
+sorted field list is folded into the per-file digest.
+
+Pointed at a directory with no store, this creates one with **dimension 0**: it
+declares no embedding space, and a vector query against it is refused naming that
+reason (HTTP `400`) rather than answered with an empty ranking. Pass `--dim`, or point
+`--fts-only` at a store that already exists, to keep room for vectors alongside.
+
+`--fts-only` and `--embed-provider` are mutually exclusive, rejected at parse time.
 
 ## Scope
 

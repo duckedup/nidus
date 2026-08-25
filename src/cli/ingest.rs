@@ -109,6 +109,32 @@ fn source_hash(text: &str, opts: &ChunkOpts, identity: &str, dimension: usize) -
     format!("{:016x}", h.finish())
 }
 
+/// Whether `declared` needs replacing by `wanted`. Compared by field name only: the tuning
+/// knobs come from `FtsField::new`'s defaults on this path, so a name-set match means the
+/// declaration would be a no-op, and `set_fts_schema` reindexes every live doc.
+fn fts_schema_differs(declared: Option<&[crate::FtsField]>, wanted: &[crate::FtsField]) -> bool {
+    let Some(declared) = declared else {
+        return true;
+    };
+    let names = |f: &[crate::FtsField]| {
+        let mut v: Vec<&str> = f.iter().map(|x| x.field.as_str()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v.into_iter().map(str::to_owned).collect::<Vec<_>>()
+    };
+    names(declared) != names(wanted)
+}
+
+/// The embedder-identity stand-in an `--fts-only` run folds into [`source_hash`]. It names the
+/// declared field set, sorted, so changing which attrs are full-text indexed re-ingests instead
+/// of leaving chunks indexed under the old schema.
+fn fts_identity(fields: &[String]) -> String {
+    let mut sorted: Vec<&str> = fields.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    format!("fts-only:{}", sorted.join(","))
+}
+
 /// The `nidus.source_hash` already stored for this file, if any. Chunk 0 carries it, so this
 /// is one point lookup per file rather than a scan.
 fn stored_hash(db: &Nidus, collection: &str, rel: &str) -> Option<String> {
@@ -147,6 +173,7 @@ pub(super) fn run(
     dry_run: bool,
     no_cache: bool,
     cache_max_entries: usize,
+    fts_only: Vec<String>,
 ) -> Result<()> {
     let opts = ChunkOpts {
         strategy: strategy.into(),
@@ -162,12 +189,37 @@ pub(super) fn run(
         .filter(|f| matches(&glob, &f.rel))
         .collect();
 
+    let fts_fields = fts_only;
     let rt = super::memory::runtime()?;
     rt.block_on(async move {
-        let embedder = super::memory::require_embedder(&ingest).await?;
-        let identity = embedder_identity(&embedder);
-        let dimension = embedder.dimension();
-        let mut db = super::memory::open_with(store, &embedder, !dry_run)?;
+        // `--fts-only` is the whole no-provider path: no embedder is built, so no API key and
+        // no network call, and the identity below stands in for one in the re-ingest digest.
+        let embedder = match fts_fields.is_empty() {
+            true => Some(super::memory::require_embedder(&ingest).await?),
+            false => None,
+        };
+        let identity = match &embedder {
+            Some(e) => embedder_identity(e),
+            None => fts_identity(&fts_fields),
+        };
+        let dimension = embedder.as_ref().map_or(0, |e| e.dimension());
+        let mut db = match &embedder {
+            Some(e) => super::memory::open_with(store, e, !dry_run)?,
+            None => super::memory::open_fts_only(store, !dry_run)?,
+        };
+        // Declared before the first write so the chunks land already indexed. Resolved
+        // through an alias first, because `set_fts_schema` refuses one outright (nidus-klh),
+        // and re-declared only when the field set actually changed (a no-op reindexes).
+        if !fts_fields.is_empty() && !dry_run {
+            let resolved = db.resolve_alias(&collection);
+            let target = resolved.unwrap_or_else(|| collection.clone());
+            let fields: Vec<crate::FtsField> =
+                fts_fields.iter().map(crate::FtsField::new).collect();
+            if fts_schema_differs(db.fts_schema(&target), &fields) {
+                db.set_fts_schema(&target, &fields)
+                    .with_context(|| format!("declaring the fts schema on '{target}'"))?;
+            }
+        }
 
         let mut report = Report {
             matched: matched.len(),
@@ -175,13 +227,15 @@ pub(super) fn run(
         };
         let mut seen: HashSet<String> = HashSet::new();
         let cache_slot = db.persistence();
-        let cached = CachedEmbedder::open(
-            &embedder,
-            if no_cache { None } else { cache_slot },
-            &identity,
-            dimension,
-            if no_cache { 0 } else { cache_max_entries },
-        );
+        let cached = embedder.as_ref().map(|e| {
+            CachedEmbedder::open(
+                e,
+                if no_cache { None } else { cache_slot },
+                &identity,
+                dimension,
+                if no_cache { 0 } else { cache_max_entries },
+            )
+        });
 
         for file in &matched {
             seen.insert(file.rel.clone());
@@ -232,22 +286,34 @@ pub(super) fn run(
             attrs.insert(META_SOURCE_HASH.to_string(), Value::Str(hash));
             attrs.insert(META_SOURCE_PATH.to_string(), Value::Str(file.rel.clone()));
             attrs.insert(META_SOURCE_CHUNKS.to_string(), Value::Int(n as i64));
-            let written = crate::memory::remember_chunked_with(
-                &mut db,
-                &cached,
-                &collection,
-                &file.rel,
-                &text,
-                &opts,
-                RememberOpts {
-                    mode: RememberMode::Raw,
-                    attrs,
-                    ttl_seconds: None,
-                    dedupe_threshold: None,
-                },
-            )
-            .await
-            .with_context(|| format!("ingesting {}", file.rel))?;
+            let remember_opts = RememberOpts {
+                mode: RememberMode::Raw,
+                attrs,
+                ttl_seconds: None,
+                dedupe_threshold: None,
+            };
+            let written = match &cached {
+                Some(cached) => crate::memory::remember_chunked_with(
+                    &mut db,
+                    cached,
+                    &collection,
+                    &file.rel,
+                    &text,
+                    &opts,
+                    remember_opts,
+                )
+                .await
+                .with_context(|| format!("ingesting {}", file.rel))?,
+                None => crate::memory::remember_chunked_text_only(
+                    &mut db,
+                    &collection,
+                    &file.rel,
+                    &text,
+                    &opts,
+                    remember_opts,
+                )
+                .with_context(|| format!("ingesting {}", file.rel))?,
+            };
             report.ingested += 1;
             report.chunks += written.chunks.len();
             report.stale_tail_pruned += written.pruned;
@@ -264,11 +330,13 @@ pub(super) fn run(
             report.pruned = prune_gone(&mut db, &collection, &seen)?;
         }
         if !dry_run {
-            cached.save().context("saving the embedding cache")?;
+            if let Some(cached) = &cached {
+                cached.save().context("saving the embedding cache")?;
+            }
             db.flush()?;
         }
 
-        let stats = cached.stats();
+        let stats = cached.as_ref().map(|c| c.stats()).unwrap_or_default();
         super::print_json(&serde_json::json!({
             "collection": collection,
             "root": path.display().to_string(),
@@ -286,6 +354,7 @@ pub(super) fn run(
             "dry_run": dry_run,
             "embedder": identity,
             "dimension": dimension,
+            "fts_only": fts_fields,
             "cache": { "hits": stats.hits, "misses": stats.misses, "evicted": stats.evicted },
         }))
     })

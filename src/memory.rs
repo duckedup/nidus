@@ -557,6 +557,93 @@ pub(crate) async fn remember_chunked_with<E: Embedder>(
     })
 }
 
+/// [`Memory::remember_chunked`] with no embedder: same ids, provenance and stale-tail prune
+/// under one barrier, but every chunk is a text-only record, so no provider and no network.
+/// Pair with [`Nidus::set_fts_schema`] for BM25 — what `nidus ingest --fts-only` does.
+pub fn remember_chunked_text_only(
+    db: &mut Nidus,
+    collection: &str,
+    parent_id: &str,
+    text: &str,
+    chunk_opts: &crate::chunk::ChunkOpts,
+    opts: RememberOpts,
+) -> anyhow::Result<ChunkedRemembered> {
+    let RememberOpts {
+        mode,
+        attrs,
+        ttl_seconds,
+        dedupe_threshold,
+    } = opts;
+    match mode {
+        RememberMode::Raw => {}
+        #[cfg(feature = "summarize")]
+        RememberMode::Summarize => bail!(
+            "remember_chunked_text_only: summarizing needs a provider, and this path has none"
+        ),
+    }
+    if dedupe_threshold.is_some() {
+        bail!(
+            "remember_chunked_text_only: dedupe_threshold is incompatible with chunking, and a \
+             text-only write has no vector to find near-duplicates with"
+        );
+    }
+
+    let chunks = crate::chunk::chunk_text(text, chunk_opts)?;
+    if chunks.is_empty() {
+        return Ok(ChunkedRemembered {
+            parent_id: parent_id.to_string(),
+            chunks: Vec::new(),
+            pruned: 0,
+        });
+    }
+    let n = chunks.len();
+    let writes: Vec<(RememberWrite, Option<Vec<f32>>, i64, i64)> = chunks
+        .into_iter()
+        .map(|chunk| {
+            let index = chunk.index;
+            let write = RememberWrite {
+                id: format!("{parent_id}#{index}"),
+                text: chunk.text,
+                attrs: attrs.clone(),
+                ttl_seconds,
+                dedupe_threshold: None,
+            };
+            (write, None, index as i64, chunk.char_start as i64)
+        })
+        .collect();
+
+    let resolved = db.resolve_alias(collection);
+    let target = resolved.as_deref().unwrap_or(collection).to_string();
+
+    // Creating the collection INSIDE the deferred scope, so a first ingest takes one barrier
+    // rather than committing the empty collection separately from the chunks that fill it —
+    // the two-generation tear nidus-lvo.5 exists to prevent.
+    let (remembered, pruned) = db.deferred(|db| {
+        if !db.has_collection(&target) {
+            db.create_collection(&target)?;
+        }
+        let remembered = commit_chunks_inner(db, &target, parent_id, writes)?;
+        let pruned = db.delete_where(
+            &target,
+            &Filter(vec![Predicate::All(vec![
+                Predicate::Eq(
+                    META_PARENT_ID.to_string(),
+                    Value::Str(parent_id.to_string()),
+                ),
+                Predicate::Ge(META_CHUNK_INDEX.to_string(), Value::Int(n as i64)),
+            ])]),
+        )?;
+        db.commit()?;
+        Ok((remembered, pruned))
+    })?;
+
+    Ok(ChunkedRemembered {
+        parent_id: parent_id.to_string(),
+        chunks: remembered,
+        pruned,
+    })
+}
+
 /// The store half of a `remember`, shared by the Rust, HTTP, and MCP surfaces so the
 /// stamping, dedup, and recency rules cannot drift between them.
 ///
@@ -585,6 +672,22 @@ pub(crate) fn commit_remember_chunks<E: Embedder>(
     chunks: Vec<(RememberWrite, Vec<f32>, i64, i64)>,
 ) -> anyhow::Result<Vec<Remembered>> {
     ensure_collection_and_pin(db, embedder, collection)?;
+    let chunks = chunks
+        .into_iter()
+        .map(|(w, v, i, c)| (w, Some(v), i, c))
+        .collect();
+    commit_chunks_inner(db, collection, parent_id, chunks)
+}
+
+/// The embedder-free half of [`commit_remember_chunks`]: stamping, provenance and the one
+/// all-or-nothing `upsert`. Split out so the text-only ingest path (nidus-gmy.6) reuses the
+/// exact write semantics without an embedder to pin the collection with.
+fn commit_chunks_inner(
+    db: &mut Nidus,
+    collection: &str,
+    parent_id: &str,
+    chunks: Vec<(RememberWrite, Option<Vec<f32>>, i64, i64)>,
+) -> anyhow::Result<Vec<Remembered>> {
     let mut records = Vec::with_capacity(chunks.len());
     let mut out = Vec::with_capacity(chunks.len());
     for (write, vector, index, char_start) in chunks {
@@ -598,7 +701,7 @@ pub(crate) fn commit_remember_chunks<E: Embedder>(
             vector,
             Some((parent_id, index, char_start)),
         )?;
-        records.push(Record::new(p.id.clone(), p.vector, p.attrs));
+        records.push(record_from(&p));
         out.push((p.id, p.deduped));
     }
     // One all-or-nothing batch (SPEC §6.1): every fallible step rolls `data` and `log` back
@@ -623,17 +726,12 @@ fn commit_remember_inner<E: Embedder>(
     chunk: Option<(&str, i64, i64)>,
 ) -> anyhow::Result<Remembered> {
     ensure_collection_and_pin(db, embedder, collection)?;
-    let prepared = prepare_remember(db, collection, write, vector, chunk)?;
-    let Prepared {
-        id,
-        attrs,
-        vector,
-        deduped,
-    } = prepared;
-    let upserted = db.upsert(collection, &[Record::new(id.clone(), vector, attrs)])?;
+    let prepared = prepare_remember(db, collection, write, Some(vector), chunk)?;
+    let record = record_from(&prepared);
+    let upserted = db.upsert(collection, &[record])?;
     Ok(Remembered {
-        id,
-        deduped,
+        id: prepared.id,
+        deduped: prepared.deduped,
         upserted,
     })
 }
@@ -643,8 +741,19 @@ fn commit_remember_inner<E: Embedder>(
 struct Prepared {
     id: String,
     attrs: BTreeMap<String, Value>,
-    vector: Vec<f32>,
+    /// `None` for a text-only write (nidus-gmy.6): the record carries text and attrs, takes
+    /// no data row, and stays out of every vector scan.
+    vector: Option<Vec<f32>>,
     deduped: bool,
+}
+
+/// The one place a [`Prepared`] becomes a [`Record`], so the vector-bearing and text-only
+/// shapes cannot drift apart between the single-write and whole-document paths.
+fn record_from(p: &Prepared) -> Record {
+    match &p.vector {
+        Some(v) => Record::new(p.id.clone(), v.clone(), p.attrs.clone()),
+        None => Record::text_only(p.id.clone(), p.attrs.clone()),
+    }
 }
 
 /// The single chokepoint for reserved-attr stamping and dedup resolution. Reads the store
@@ -654,7 +763,7 @@ fn prepare_remember(
     db: &Nidus,
     collection: &str,
     write: RememberWrite,
-    vector: Vec<f32>,
+    vector: Option<Vec<f32>>,
     chunk: Option<(&str, i64, i64)>,
 ) -> anyhow::Result<Prepared> {
     let RememberWrite {
@@ -681,7 +790,16 @@ fn prepare_remember(
 
     let mut target_id = id;
     let mut deduped = false;
-    if let Some(threshold) = dedupe_threshold {
+    // Dedup is a similarity search, so a text-only write has nothing to search with. Bailing
+    // rather than silently ignoring the threshold: a caller that asked to merge near-duplicates
+    // and got none would read the result as "nothing matched".
+    if dedupe_threshold.is_some() && vector.is_none() {
+        bail!(
+            "dedupe_threshold needs a vector to search with, but this write is text-only \
+             (no embedding)"
+        );
+    }
+    if let (Some(threshold), Some(vector)) = (dedupe_threshold, vector.as_ref()) {
         // An expired entry is dead to every read path, so it must not be a dedup candidate
         // either: merging onto one inherits its already-past `expires_at`, landing a write
         // that reports success and is never visible.
@@ -691,7 +809,7 @@ fn prepare_remember(
             filter: Filter(vec![not_expired_predicate(now_ms())]),
             ..Default::default()
         };
-        if let Some(hit) = db.search(collection, &vector, &opts)?.into_iter().next() {
+        if let Some(hit) = db.search(collection, vector, &opts)?.into_iter().next() {
             target_id = hit.id;
             deduped = true;
         }

@@ -141,6 +141,7 @@ just build         # debug                just release  # optimized
 just doc           # build + open API docs
 just deps          # dependency tree (cargo tree -p nidus)
 just spec toc      # SPEC.md section index — see below
+just docs-index    # optional ranked tier under `spec find` (derived, never required)
 ```
 
 Rust 1.96+ (pinned via `rust-toolchain.toml`). Edition 2024. `just --list` has the rest,
@@ -149,6 +150,11 @@ including the `cli`, `serve`, and wasm lanes.
 **Do not read `SPEC.md` whole — it is 2577 lines.** `just spec toc` is the index,
 `just spec find <words>` says which section covers a topic, `just spec <ref>` prints one
 section. It works on any tracked doc: `just spec --file CLAUDE.md find miri`.
+
+`just docs-index` adds a ranked BM25 tier under an unqualified `find`, spanning SPEC.md,
+CLAUDE.md, `.claude/rules/` and `decisions/` — so a query whose words the doc spells
+differently still lands. Optional: without it `find` uses its own text search and says so
+once on stderr. Nothing requires it (D0013).
 
 ## Laws that apply before you touch a file
 

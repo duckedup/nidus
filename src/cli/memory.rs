@@ -53,6 +53,16 @@ pub(super) fn open_with(
     super::open(&store, mutating)
 }
 
+/// Open the store for an `--fts-only` ingest, which has no embedder to take a dimension from.
+/// An existing store keeps its own; a fresh one gets dimension 0, declaring no embedding space
+/// rather than pinning an arbitrary one a later embedder would clash with (nidus-gmy.6).
+pub(super) fn open_fts_only(mut store: StoreArgs, mutating: bool) -> Result<Nidus> {
+    if store.dim.is_none() && store.peek()?.is_none() {
+        store.dim = Some(0);
+    }
+    super::open(&store, mutating)
+}
+
 /// Parse `--attrs` into the typed attr map, defaulting to empty.
 fn parse_attrs(attrs: Option<String>) -> Result<BTreeMap<String, Value>> {
     match attrs {
