@@ -37,6 +37,9 @@ const CODE_FTS_FIELDS: [&str; 4] = [META_TEXT, CODE_META_PATH, META_SYMBOL, META
 /// on, so without this a run reads all of `target/`. `nidus ingest` passes `&[]` and keeps
 /// its own default (skip every dot-entry) untouched.
 const BUILD_DIRS: &[&str] = &[
+    // Peer-session checkouts: each is a FULL copy of this repo, so walking them multiplies
+    // the corpus by the number of live worktrees and buries the real hits under duplicates.
+    ".claude/worktrees",
     "target",
     "node_modules",
     ".venv",

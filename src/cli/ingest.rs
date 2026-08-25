@@ -52,7 +52,9 @@ pub(super) struct WalkSkips {
 }
 
 /// Recursive `read_dir`, sorted, never following symlinks. `.git` is always skipped, other
-/// dot-entries unless `include_hidden`, and anything named in `skip_dirs` (nidus-0fw).
+/// dot-entries unless `include_hidden`, and anything in `skip_dirs` (nidus-0fw). A
+/// `skip_dirs` entry matches a bare name at any depth, or a root-relative path if it has a
+/// `/`.
 pub(super) fn walk(
     root: &Path,
     include_hidden: bool,
@@ -90,7 +92,17 @@ fn visit(
             skips.hidden += 1;
             continue;
         }
-        if skip_dirs.contains(&name_str.as_ref()) {
+        let rel_of = |p: &Path| -> Option<String> {
+            p.strip_prefix(root).ok().map(|r| {
+                r.components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+        };
+        if skip_dirs.contains(&name_str.as_ref())
+            || rel_of(&entry.path()).is_some_and(|rel| skip_dirs.contains(&rel.as_str()))
+        {
             skips.build_dirs += 1;
             continue;
         }
