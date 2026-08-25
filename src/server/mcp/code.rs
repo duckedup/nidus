@@ -9,6 +9,8 @@ use rmcp::{
 };
 use serde_json::{Map, Value as JsonValue, json};
 
+use crate::embed::Embedder;
+
 use super::NidusMcp;
 use super::args::{api_error, optional_usize, required_str, tool};
 use super::search::{filter_defs, filter_schema, parse_filter};
@@ -84,11 +86,9 @@ impl NidusMcp {
 
         let use_vector = match want_semantic {
             Some(v) => v,
-            None => {
-                crate::server::run_read(self.state.clone(), |db| Ok(db.dimension() > 0))
-                    .await
-                    .map_err(api_error)?
-            }
+            None => crate::server::run_read(self.state.clone(), |db| Ok(db.dimension() > 0))
+                .await
+                .map_err(api_error)?,
         };
 
         let hits = if use_vector {

@@ -518,7 +518,10 @@ fn the_walk_with_include_hidden_reaches_dot_directories_but_never_git() {
     let mock = Recorder::start();
 
     let out = ingest(&store, &corpus, &mock.url, &["--include-hidden"]);
-    assert_eq!(out["matched"], 2, "the visible file and the hidden one: {out}");
+    assert_eq!(
+        out["matched"], 2,
+        "the visible file and the hidden one: {out}"
+    );
     assert_eq!(
         ids(&store),
         vec![".claude/rules/x.md#0".to_string(), "a.md#0".to_string()],

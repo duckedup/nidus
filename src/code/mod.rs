@@ -269,7 +269,10 @@ mod wire_tests {
 
         let req = rx.recv().unwrap();
         // wdpkr's code-summarizer system prompt reached the wire...
-        assert!(req.body.contains("code summarizer for a semantic search index"));
+        assert!(
+            req.body
+                .contains("code summarizer for a semantic search index")
+        );
         // ...never nidus's own generic default, which someone "simplifying" this back
         // to `SummarizeOpts::default()` would send instead.
         assert!(!req.body.contains("Preserve the key names"));

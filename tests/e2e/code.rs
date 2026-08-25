@@ -87,7 +87,10 @@ fn code_ingest_dispatches_each_file_and_reaches_dot_directories() {
     corpus(&root);
 
     let report = code_ingest(&store, &root);
-    assert_eq!(report["matched"], 3, "all three files, dot-dir included: {report}");
+    assert_eq!(
+        report["matched"], 3,
+        "all three files, dot-dir included: {report}"
+    );
     assert_eq!(report["ingested"], 3, "{report}");
 
     let rust_hits = code_search(&store, "zorbatronic", &[]);
@@ -139,7 +142,13 @@ fn code_search_never_prints_source() {
     corpus(&root);
     code_ingest(&store, &root);
 
-    let out = run(&["code", "search", "zorbatronic", "--dir", &store.to_string_lossy()]);
+    let out = run(&[
+        "code",
+        "search",
+        "zorbatronic",
+        "--dir",
+        &store.to_string_lossy(),
+    ]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -165,7 +174,10 @@ fn code_search_vector_with_no_embedder_is_refused() {
         &store.to_string_lossy(),
         "--vector",
     ]);
-    assert!(!out.status.success(), "a forced vector query with no embedder must fail");
+    assert!(
+        !out.status.success(),
+        "a forced vector query with no embedder must fail"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("--vector") && stderr.contains("embedder"),

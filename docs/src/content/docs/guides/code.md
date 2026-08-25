@@ -1,6 +1,6 @@
 ---
 title: Code search
-description: Index a codebase and its docs together, chunked for what each file actually is, and search it grouped by file and symbol. Off by default: enable it with the code feature.
+description: Index a codebase and its docs together, chunked for what each file actually is, and search it grouped by file and symbol. Off by default, enabled with the code feature.
 ---
 
 `nidus code` indexes source and documentation in one corpus, each chunked for what it

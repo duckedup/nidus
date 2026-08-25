@@ -314,12 +314,13 @@ export function miriIgnore(text, addedLines, file) {
 
 const BINARY_ONLY = /^\s*use\s+(clap|tokio|axum|tower|http_body|rmcp|wdpkr_core|tree_sitter)\b/m
 const LIB_EXEMPT = /^src\/(cli|server|bin)\//
-// wdpkr_core/tree_sitter are gated behind `code` (D0014), not `cli`/`serve` (D0011), and
-// `src/code/` is the one directory their own doc comment says may use them — see
-// `src/code/mod.rs` and decisions/0014. Everywhere else in the library, incl. src/chunk/,
-// they are as ungated as any BINARY_ONLY crate.
+// wdpkr_core/tree_sitter are gated behind `code` (D0014), not `cli`/`serve` (D0011). Two
+// places may use them: `src/code/`, the engine module, and `src/chunk/code.rs`, the AST
+// adapter — a file that only exists behind `#[cfg(feature = "code")] mod code;`, which
+// modGating below proves is guarded. Everywhere else in the library, src/chunk/mod.rs
+// included, they are as ungated as any BINARY_ONLY crate.
 const CODE_ONLY = /^(wdpkr_core|tree_sitter)$/
-const CODE_EXEMPT = /^src\/code\//
+const CODE_EXEMPT = /^src\/(code\/|chunk\/code\.rs$)/
 
 export function featureGating(file, text) {
   if (LIB_EXEMPT.test(file) || !file.startsWith('src/')) return []

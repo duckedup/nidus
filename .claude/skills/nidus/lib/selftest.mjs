@@ -307,9 +307,11 @@ test('gating: src/cli may import wdpkr_core', () => {
 
 // src/code/ is the one directory its own doc comment (src/code/mod.rs) says may use
 // wdpkr_core — everywhere else, including src/chunk/, stays flagged (D0014).
-test('gating: src/code may import wdpkr_core, src/chunk may not', () => {
+test('gating: src/code and the cfg-gated src/chunk/code.rs may import wdpkr_core, src/chunk/mod.rs may not', () => {
   eq(ids(laws.featureGating('src/code/mod.rs', 'use wdpkr_core::chunk::detect_language;\n')), [], 'findings')
-  eq(ids(laws.featureGating('src/chunk/code.rs', 'use wdpkr_core::chunk::Chunker;\n')), ['feature-gating'], 'findings')
+  eq(ids(laws.featureGating('src/chunk/code.rs', 'use wdpkr_core::chunk::Chunker;\n')), [], 'findings')
+  eq(ids(laws.featureGating('src/chunk/mod.rs', 'use wdpkr_core::chunk::Chunker;\n')), ['feature-gating'], 'findings')
+  eq(ids(laws.featureGating('src/chunk/markdown.rs', 'use tree_sitter::Parser;\n')), ['feature-gating'], 'findings')
 })
 
 test('gating: ungated mod declaration flagged', () => {

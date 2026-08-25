@@ -2,15 +2,15 @@
 //! gated on the `code` feature (off in the default `just test-e2e` lane); the negative one
 //! runs exactly there, proving a binary built without `code` answers 404, not 500.
 
-use serde_json::json;
 #[cfg(feature = "code")]
 use serde_json::Value;
+use serde_json::json;
 
-use crate::harness::Server;
-#[cfg(feature = "code")]
-use crate::harness::RunningServer;
 #[cfg(feature = "code")]
 use super::{call, mcp, result, text};
+#[cfg(feature = "code")]
+use crate::harness::RunningServer;
+use crate::harness::Server;
 
 /// Create `collection`, declare `nidus.text` as full-text, and seed it with `records` —
 /// hand-crafted attrs mirroring what a real `code` ingest would stamp (`src/code/mod.rs`'s
@@ -18,7 +18,9 @@ use super::{call, mcp, result, text};
 #[cfg(feature = "code")]
 fn seed_code(server: &RunningServer, collection: &str, records: Value) {
     assert_eq!(
-        server.post(&format!("/collections/{collection}"), &json!({})).0,
+        server
+            .post(&format!("/collections/{collection}"), &json!({}))
+            .0,
         200
     );
     assert_eq!(

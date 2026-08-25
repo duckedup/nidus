@@ -158,9 +158,7 @@ pub(super) fn ingest(
                     )
                     .await?
                 }
-                None => {
-                    ingest_chunks_text_only(&mut db, &collection, &file.rel, chunks, &hash, n)?
-                }
+                None => ingest_chunks_text_only(&mut db, &collection, &file.rel, chunks, &hash, n)?,
             };
             report.ingested += 1;
             report.chunks += written;
@@ -294,7 +292,10 @@ fn ingest_chunks_text_only(
             attrs.insert(META_TEXT.to_string(), Value::Str(chunk.text));
             attrs.insert(META_PARENT_ID.to_string(), Value::Str(rel.to_string()));
             attrs.insert(META_CHUNK_INDEX.to_string(), Value::Int(i as i64));
-            attrs.insert(META_CHAR_START.to_string(), Value::Int(chunk.char_start as i64));
+            attrs.insert(
+                META_CHAR_START.to_string(),
+                Value::Int(chunk.char_start as i64),
+            );
             if i == 0 {
                 attrs.insert(META_SOURCE_HASH.to_string(), Value::Str(hash.to_string()));
                 attrs.insert(META_SOURCE_PATH.to_string(), Value::Str(rel.to_string()));
@@ -370,7 +371,7 @@ pub(super) fn search(store: StoreArgs, ingest: IngestArgs, args: SearchArgs) -> 
     })
 }
 
-fn scope(refs: &[&str]) -> crate::Scope<'_> {
+fn scope<'a>(refs: &'a [&'a str]) -> crate::Scope<'a> {
     if refs.is_empty() {
         crate::Scope::All
     } else {
