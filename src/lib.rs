@@ -103,6 +103,14 @@ pub use memory::{
 #[cfg(all(feature = "memory", feature = "summarize"))]
 pub use memory::{META_SOURCE, META_SUMMARY};
 
+/// Volume for the sweep-style tests: `scale(native, under_miri)`, the crate-internal twin of
+/// the helper `tests/filter_index.rs` has carried since nidus-2r7. Prefer it to a `miri` ignore
+/// when a test is slow because it repeats — an ignore gives up the paths too (nidus-d1c).
+#[cfg(test)]
+pub(crate) const fn scale(native: usize, under_miri: usize) -> usize {
+    if cfg!(miri) { under_miri } else { native }
+}
+
 pub use annotate::{
     Annotations, ClauseScore, Expansion, Fragment, Highlight, HighlightOpts, LegScore,
 };

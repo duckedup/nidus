@@ -138,7 +138,10 @@ mod tests {
             "hello", "a", "b", "ab", "abc", "abcxyz", "term0 x", "xterm0 y", "v12x", "vx",
             "readme", "README", "abd", "acd", "zzz", "",
         ];
-        for p in patterns {
+        // `required_literals` is the code under test and is cheap; the oracle below is the
+        // `regex` crate, and compiling one pattern costs seconds under Miri. Trimming the
+        // pattern list there keeps a real cross-check without paying for thirteen of them.
+        for &p in &patterns[..crate::scale(patterns.len(), 3)] {
             let lits = required_literals(p);
             if lits.is_empty() {
                 continue;

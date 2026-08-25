@@ -625,12 +625,20 @@ jobs:
   # The Miri lane is two REQUIRED jobs run in parallel (nidus-0bs); one serial job was
   # every PR's longest pole at ~15 minutes. The split is a name filter, not a target
   # list, so a new tests/*.rs file is covered automatically: `Miri` runs store:: (the
-  # lib's biggest module, 132s locally) plus doctests; `Miri (integration)` runs
+  # lib's biggest module, ~145s locally) plus doctests; `Miri (integration)` runs
   # `--tests --skip store::` — which INCLUDES the lib target (cargo's --tests does),
-  # so it is the exact complement (~260s locally, verified disjoint and total).
+  # so it is the exact complement (~230s locally, verified disjoint and total).
+  #
+  # Both carry a `timeout-minutes` because these numbers rot silently and expensively: the
+  # figures above read 132s/260s while the real jobs had drifted to 33m and 13m, and nothing
+  # failed to say so. A single 80-vector HNSW build was 385s of it, alone (nidus-d1c).
+  # The bound is order-of-magnitude on purpose — it never flakes, and it turns the next drift
+  # into a red check instead of a PR that just feels slow. `crate::scale` is the fix when a
+  # test is slow because it repeats; `#[cfg_attr(miri, ignore)]` is for syscalls Miri lacks.
   miri:
     name: Miri
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v6
 
@@ -681,6 +689,7 @@ jobs:
   miri-integration:
     name: Miri (integration)
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v6
 
