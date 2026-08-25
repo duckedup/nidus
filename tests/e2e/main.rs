@@ -10,6 +10,8 @@ mod env_flags;
 mod hardening;
 #[cfg(feature = "embed-ollama")]
 mod ingest;
+#[cfg(feature = "memory")]
+mod ingest_fts;
 #[cfg(feature = "mcp")]
 mod mcp;
 #[cfg(feature = "mcp")]

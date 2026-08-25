@@ -412,7 +412,7 @@ curl -s localhost:7700/search \
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `query` | – (required) | query vector; length must equal the store dimension |
+| `query` | – (required) | query vector; length must equal the store dimension. A store with dimension `0` holds no vectors (see [keyword-only ingest](/reference/cli/#keyword-only-ingest-with-no-embedding-provider)) and answers `400` here, naming that as the reason. |
 | `scope` | all collections | collection names to search |
 | `top_k` | `10` | maximum hits to return |
 | `offset` | `0` | top-ranked hits to skip, for pagination |
@@ -1222,7 +1222,7 @@ mistake from a server fault:
 
 | Status | When |
 | --- | --- |
-| `400 Bad Request` | malformed JSON, or a query/vector whose length ≠ store dimension |
+| `400 Bad Request` | malformed JSON; a query/vector whose length ≠ store dimension; or any vector query against a dimension-0 store, which holds no vectors ([keyword-only ingest](/reference/cli/#keyword-only-ingest-with-no-embedding-provider)) |
 | `401 Unauthorized` | missing or wrong bearer token (when a token is configured) |
 | `403 Forbidden` | a write against a `--read-only` server |
 | `409 Conflict` | the store's writer lock is held by another process |

@@ -2,9 +2,13 @@
 // so an agent fetches §7.4 instead of reading all 177KB of SPEC.md.
 
 import { readFileSync, existsSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { resolve, dirname } from 'node:path'
 
-import { headings, label, title, locate, section, search } from './specdoc.mjs'
+import {
+  headings, label, title, locate, section, search,
+  docForHit, lineForOffset, refForLine, dedupeRanked, indexIsFresh,
+} from './specdoc.mjs'
 
 const REPO = resolve(dirname(new URL(import.meta.url).pathname), '../../../..')
 
@@ -83,6 +87,72 @@ function runFind(lines, words) {
   return 0
 }
 
+const INDEX = resolve(REPO, 'target/docs-index')
+
+/// The prebuilt binary, or null. Deliberately not `cargo run`: `find` is called constantly,
+/// and a build check per invocation would cost more than the ranking saves.
+function nidusBin() {
+  for (const p of ['target/debug/nidus', 'target/release/nidus']) {
+    const abs = resolve(REPO, p)
+    if (existsSync(abs)) return abs
+  }
+  return null
+}
+
+function currentDigest() {
+  try {
+    return execFileSync(resolve(REPO, 'scripts/docs-index.sh'), ['--digest'], {
+      cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+  } catch { return null }
+}
+
+/// The digest the index recorded, read back out of the store itself (the `meta` sentinel
+/// record `just docs-index` writes). Any failure — no store, no record, no binary — is a
+/// missing digest, which reads as stale.
+function recordedDigest() {
+  try {
+    const out = execFileSync(nidusBin(), ['get', 'meta', '--dir', INDEX], {
+      cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    const rec = JSON.parse(out).find(r => r.id === 'docs-index.digest')
+    return rec?.attrs?.digest?.Str ?? null
+  } catch { return null }
+}
+
+/// Why the ranked tier is unavailable, or null when it is usable. Never throws and never
+/// prompts: a missing index is the normal state of a fresh clone (D0013).
+function rankedUnavailable() {
+  if (!existsSync(INDEX)) return 'no docs index yet'
+  if (!nidusBin()) return 'the nidus binary is not built'
+  if (!indexIsFresh(recordedDigest(), currentDigest())) return 'the docs index is stale'
+
+  return null
+}
+
+/// BM25 hits → ranked section refs. Each hit names a doc and a char offset; the section is
+/// whatever `spec <ref>` would print for that line, so the ref is directly fetchable.
+function rankedFind(words) {
+  const out = execFileSync(nidusBin(), [
+    'text-search', '--dir', INDEX, 'nidus.text', words.join(' '), '--top-k', '30',
+  ], { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+  const rows = []
+  for (const hit of JSON.parse(out)) {
+    const attrs = hit.attrs || {}
+    const doc = docForHit(hit.collection, attrs['nidus.source_path']?.Str)
+    if (!doc || !existsSync(resolve(REPO, doc))) continue
+    const text = readFileSync(resolve(REPO, doc), 'utf8')
+    const lines = text.split('\n')
+    const h = refForLine(lines, lineForOffset(text, attrs['nidus.char_start']?.Int ?? 0))
+    // No enclosing `##`+ heading — a doc titled with a bare `#`, or a preamble. Dropping the
+    // hit made whole files invisible and the query answer "nothing found"; name the file.
+    rows.push(h
+      ? { doc, ref: label(h), title: title(h), score: hit.score, line: h.line, end: h.end }
+      : { doc, ref: null, title: '(whole file)', score: hit.score, line: 1, end: lines.length })
+  }
+  return dedupeRanked(rows)
+}
+
 const USAGE = `spec — fetch one section of a repo doc instead of reading the whole file.
 
   spec toc                    the heading index, with line counts
@@ -92,8 +162,45 @@ const USAGE = `spec — fetch one section of a repo doc instead of reading the w
 
   --json                      machine-readable output for toc and find`
 
+/// Ranked output. One row per section, across every corpus, so the answer names the doc
+/// as well as the ref — `spec find` over SPEC.md alone cannot point at a rule or an ADR.
+function runRanked(rows, words) {
+  if (asJson) {
+    console.log(JSON.stringify(rows, null, 2))
+    return rows.length ? 0 : 1
+  }
+  for (const r of rows.slice(0, 10)) {
+    const file = r.doc === 'SPEC.md' ? '' : ` --file ${r.doc}`
+    const fetch = r.ref ? `spec${file} ${r.ref.replace(/^[§#]/, '')}` : `spec${file} toc`
+    const ref = r.ref || '—'
+    console.log(`${r.doc}  ${ref}  ${r.title}  (${r.end - r.line + 1} lines) — fetch: ${fetch}`)
+  }
+  if (rows.length > 10) console.log(`\n… ${rows.length - 10} more. Add a word to narrow.`)
+  return 0
+}
+
 const cmd = rest[0]
 if (!cmd || cmd === '--help' || cmd === '-h') { console.log(USAGE); process.exit(0) }
+
+// The ranked tier applies to an unqualified `find` only: `--file` names one doc on purpose,
+// and the index spans all four. Any reason it is unavailable is one stderr line, never an
+// error and never a prompt — the text search below is the floor and always works.
+if ((cmd === 'find' || cmd === 'grep') && docFlag === null && rest.length > 1) {
+  const why = rankedUnavailable()
+  if (why) {
+    console.error(`spec: ${why}; using text search. \`just docs-index\` builds the ranked one.`)
+  } else {
+    try {
+      const rows = rankedFind(rest.slice(1))
+      // Empty is not an answer: the ranked tier must never be worse than the floor it
+      // replaces, so fall through to the text search rather than reporting nothing.
+      if (rows.length) process.exit(runRanked(rows, rest.slice(1)))
+    } catch (e) {
+      console.error(`spec: the docs index could not be queried (${e.message}); using text search.`)
+    }
+  }
+}
+
 const lines = load()
 if (cmd === 'toc') process.exit(runToc(lines))
 else if (cmd === 'find' || cmd === 'grep') process.exit(runFind(lines, rest.slice(1)))

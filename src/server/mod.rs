@@ -1925,6 +1925,7 @@ fn classify(err: &anyhow::Error) -> StatusCode {
     if msg.contains("store is not open yet") {
         StatusCode::SERVICE_UNAVAILABLE
     } else if msg.contains("does not match store dimension")
+        || msg.contains("holds no vectors")
         || msg.contains("fts field")
         || msg.contains("filter index")
         || msg.contains("full-text query")
@@ -4042,6 +4043,14 @@ mod tests {
         let cases = [
             (
                 "vector length 4 does not match store dimension 8",
+                StatusCode::BAD_REQUEST,
+            ),
+            // A vector query against a dimension-0, fts-only store (nidus-gmy.6). Its own
+            // substring, because the message deliberately says why rather than reusing the
+            // length-mismatch wording — and without a mapping it fell through to a 500.
+            (
+                "this store has dimension 0, so it holds no vectors and cannot answer a \
+                 vector query",
                 StatusCode::BAD_REQUEST,
             ),
             // The read-path counterpart (nidus-c5v). Same substring on purpose, so the

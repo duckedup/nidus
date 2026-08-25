@@ -71,3 +71,58 @@ export function search(lines, words) {
   // already covered by a matching child is noise, and §7 is 669 lines of it.
   return found.filter(h => !found.some(o => o !== h && o.line > h.line && o.end <= h.end))
 }
+
+// ── The ranked tier (nidus-gmy.7) ────────────────────────────────────────────────────
+// Pure translation between a BM25 hit and a section ref, so `spec find` can promote a
+// ranked result without the fallback path knowing an index exists.
+
+/// The four corpora `just docs-index` builds, as `collection → repo-relative prefix`.
+/// `ingest` skips dot-entries, so `.claude/rules` is reachable only as its own root, and
+/// SPEC.md/CLAUDE.md are staged because `ingest` walks directories, not files.
+export const CORPORA = {
+  root: '',
+  rules: '.claude/rules/',
+  decisions: 'decisions/',
+}
+
+/// A hit's repo-relative doc path, or null when it names a collection we did not build.
+export function docForHit(collection, sourcePath) {
+  const prefix = CORPORA[collection]
+  if (prefix === undefined || !sourcePath) return null
+  return `${prefix}${sourcePath}`
+}
+
+/// The 1-based line a character offset falls on. `ingest` stamps `nidus.char_start` per
+/// chunk, which is the only thing tying a BM25 hit back to a place in the file.
+export function lineForOffset(text, charStart) {
+  const upto = [...text].slice(0, Math.max(0, charStart)).join('')
+  return upto.split('\n').length
+}
+
+/// The innermost section containing `line`, matching what `spec <ref>` would print. Falls
+/// back to the whole doc when the hit lands above the first heading (a preamble).
+export function refForLine(lines, line) {
+  const hs = headings(lines)
+  const containing = hs.filter(h => h.line <= line && line <= h.end)
+  if (!containing.length) return null
+  return containing[containing.length - 1]
+}
+
+/// Collapse ranked chunk hits into one row per (doc, section), keeping the best score and
+/// the order BM25 put them in. Several chunks of one section is one answer, not three.
+export function dedupeRanked(rows) {
+  const seen = new Map()
+  for (const r of rows) {
+    const key = `${r.doc}\u0000${r.ref}`
+    const prior = seen.get(key)
+    if (!prior || r.score > prior.score) seen.set(key, { ...r, score: Math.max(r.score, prior?.score ?? r.score) })
+  }
+  return [...seen.values()].sort((a, b) => b.score - a.score)
+}
+
+/// Whether a built index still describes the working tree. The digest is whatever the
+/// caller can compute cheaply over the corpus (git blob ids); equality is the whole rule,
+/// so a missing or unreadable digest is stale rather than an error.
+export function indexIsFresh(recorded, current) {
+  return Boolean(recorded) && Boolean(current) && recorded === current
+}
