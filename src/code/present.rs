@@ -9,7 +9,7 @@
 
 use crate::{Hit, Value};
 
-use super::{META_END_LINE, META_KIND, META_PATH, META_START_LINE, META_SYMBOL};
+use super::{META_END_LINE, META_KIND, META_LANGUAGE, META_PATH, META_START_LINE, META_SYMBOL};
 
 /// One matched symbol within a file: everything an agent needs to go read the real source,
 /// never the source itself.
@@ -26,6 +26,10 @@ pub struct SymbolHit {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileGroup {
     pub path: String,
+    /// The `code.language` its hits carried, when the file was AST-chunked. Lives here so
+    /// the CLI, `POST /code-search` and the MCP tool all report the same field from the same
+    /// place rather than each deriving it.
+    pub language: Option<String>,
     pub symbols: Vec<SymbolHit>,
 }
 
@@ -33,7 +37,7 @@ pub struct FileGroup {
 /// ranked by their own best-scoring symbol. A hit carrying no `code.path` did not come from
 /// `code` ingest and is skipped; this module has nothing to say about it.
 pub fn group_by_file(hits: &[Hit]) -> Vec<FileGroup> {
-    let mut by_path: Vec<(String, Vec<SymbolHit>)> = Vec::new();
+    let mut by_path: Vec<(String, Option<String>, Vec<SymbolHit>)> = Vec::new();
     for hit in hits {
         let Some(path) = str_attr(hit, META_PATH) else {
             continue;
@@ -45,17 +49,27 @@ pub fn group_by_file(hits: &[Hit]) -> Vec<FileGroup> {
             end_line: int_attr(hit, META_END_LINE),
             score: hit.score,
         };
-        match by_path.iter_mut().find(|(p, _)| p == path) {
-            Some((_, syms)) => syms.push(symbol),
-            None => by_path.push((path.to_string(), vec![symbol])),
+        let lang = str_attr(hit, META_LANGUAGE).map(str::to_string);
+        match by_path.iter_mut().find(|(p, _, _)| p == path) {
+            Some((_, existing, syms)) => {
+                if existing.is_none() {
+                    *existing = lang;
+                }
+                syms.push(symbol);
+            }
+            None => by_path.push((path.to_string(), lang, vec![symbol])),
         }
     }
 
     let mut groups: Vec<FileGroup> = by_path
         .into_iter()
-        .map(|(path, mut symbols)| {
+        .map(|(path, language, mut symbols)| {
             symbols.sort_by(|a, b| b.score.total_cmp(&a.score));
-            FileGroup { path, symbols }
+            FileGroup {
+                path,
+                language,
+                symbols,
+            }
         })
         .collect();
     groups.sort_by(|a, b| best_score(b).total_cmp(&best_score(a)));

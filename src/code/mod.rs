@@ -31,6 +31,11 @@ pub const META_START_LINE: &str = "code.start_line";
 pub const META_END_LINE: &str = "code.end_line";
 /// The language [`wdpkr_core::chunk::detect_language`] reported for this file.
 pub const META_LANGUAGE: &str = "code.language";
+/// The symbol's doc comment, marker-stripped. Separate from `text` because wdpkr cleans it
+/// (`/// x` -> `x`), so it is not a source slice and cannot join a [`crate::chunk::Chunk`]
+/// without breaking the exact-char-slice invariant. Indexed for BM25: a doc comment is
+/// often the only prose naming what a symbol is for.
+pub const META_DOC: &str = "code.doc";
 
 /// One chunked span plus the metadata `code search` presents without re-parsing the file
 /// (see the `META_*` constants above; units 4, 5 and the SDKs consume these key names).
@@ -51,6 +56,7 @@ pub fn chunk_file(path: &str, text: &str, opts: &ChunkOpts) -> Result<Vec<CodeCh
             path,
             text,
             detect_language(path).unwrap_or_default(),
+            opts,
         )),
         strategy => prose_chunks(path, text, strategy, opts),
     }
@@ -83,47 +89,54 @@ fn prose_chunks(
         .collect())
 }
 
-/// One [`CodeChunk`] per symbol wdpkr's tree-sitter chunker finds in `text` for `lang`, in
-/// source order, each carrying its own name/kind/line-span. A parse failure yields no
-/// chunks; a symbol whose body cannot be relocated in `text` is skipped, not guessed.
-fn code_chunks(path: &str, text: &str, lang: &str) -> Vec<CodeChunk> {
-    let mut symbols = match TreeSitterChunker::new().chunk(path, text, lang) {
+/// One [`CodeChunk`] per symbol, in source order, each carrying its own name, kind,
+/// line span and (marker-stripped) doc comment.
+///
+/// The span arithmetic and the container/oversize rules live in [`crate::chunk::code`], so
+/// `ChunkStrategy::Code` and this metadata-carrying path cannot disagree about what a symbol
+/// is. An earlier version relocated each body with a forward-only `find`, which silently
+/// dropped every method inside a class: wdpkr emits the class as a symbol too, and the class
+/// body consumed the bytes its methods needed.
+fn code_chunks(path: &str, text: &str, lang: &str, opts: &ChunkOpts) -> Vec<CodeChunk> {
+    let symbols = match TreeSitterChunker::new().chunk(path, text, lang) {
         Ok(f) => f.symbols,
         Err(_) => return Vec::new(),
     };
-    symbols.sort_by_key(|s| s.start_line);
-
-    let mut out = Vec::with_capacity(symbols.len());
-    let mut from_byte = 0usize;
-    for sym in &symbols {
-        let Some(rel) = text[from_byte..].find(sym.body.as_str()) else {
-            continue;
-        };
-        let byte_start = from_byte + rel;
-        let char_start = text[..byte_start].chars().count();
-        from_byte = byte_start + sym.body.len();
-
-        let mut attrs = BTreeMap::new();
-        attrs.insert(META_PATH.to_string(), Value::Str(path.to_string()));
-        attrs.insert(META_LANGUAGE.to_string(), Value::Str(lang.to_string()));
-        attrs.insert(META_SYMBOL.to_string(), Value::Str(sym.name.clone()));
-        attrs.insert(META_KIND.to_string(), Value::Str(sym.kind.clone()));
-        attrs.insert(
-            META_START_LINE.to_string(),
-            Value::Int(i64::from(sym.start_line)),
-        );
-        attrs.insert(
-            META_END_LINE.to_string(),
-            Value::Int(i64::from(sym.end_line)),
-        );
-        out.push(CodeChunk {
-            text: sym.body.clone(),
-            index: out.len(),
-            char_start,
-            attrs,
-        });
-    }
-    out
+    let src: Vec<char> = text.chars().collect();
+    crate::chunk::code::locate_symbols(&src, symbols, opts.max_chars)
+        .into_iter()
+        .enumerate()
+        .map(|(index, located)| {
+            let sym = &located.sym;
+            let mut attrs = BTreeMap::new();
+            attrs.insert(META_PATH.to_string(), Value::Str(path.to_string()));
+            attrs.insert(META_LANGUAGE.to_string(), Value::Str(lang.to_string()));
+            attrs.insert(META_SYMBOL.to_string(), Value::Str(sym.name.clone()));
+            attrs.insert(META_KIND.to_string(), Value::Str(sym.kind.clone()));
+            attrs.insert(
+                META_START_LINE.to_string(),
+                Value::Int(i64::from(sym.start_line)),
+            );
+            attrs.insert(
+                META_END_LINE.to_string(),
+                Value::Int(i64::from(sym.end_line)),
+            );
+            if let Some(doc) = sym
+                .doc_comment
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+            {
+                attrs.insert(META_DOC.to_string(), Value::Str(doc.to_string()));
+            }
+            CodeChunk {
+                text: src[located.start..located.end].iter().collect(),
+                index,
+                char_start: located.start,
+                attrs,
+            }
+        })
+        .collect()
 }
 
 /// [`crate::summarize::SummarizeOpts`] carrying wdpkr-core's file prompt (re-exported here,
@@ -236,6 +249,40 @@ mod tests {
         assert!(instructions.contains("src/lib.rs"));
         // The real content is never duplicated into the instructions lead-in.
         assert!(!instructions.contains("pub fn f() {}"));
+    }
+    /// The bug the review caught: wdpkr emits a Python class BOTH as its own symbol and as
+    /// each method inside it. The earlier forward-only `find` let the class body consume the
+    /// bytes its methods needed, so every method vanished and the file became one
+    /// class-sized chunk. Five of the eight grammars (Python, TS, JS, Java, C#) have that
+    /// shape, so this is the common case, not an edge one.
+    #[test]
+    fn a_class_yields_its_methods_not_the_container() {
+        let src = "class Foo:\n    def one(self):\n        return 1\n\n    def two(self):\n        return 2\n";
+        let chunks = chunk_file("foo.py", src, &opts()).unwrap();
+        let names: Vec<&str> = chunks
+            .iter()
+            .filter_map(|c| match c.attrs.get(META_SYMBOL) {
+                Some(Value::Str(n)) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["one", "two"], "chunks: {chunks:?}");
+        for c in &chunks {
+            assert!(
+                src[c.char_start..].starts_with(&c.text),
+                "chunk is not an exact source slice: {c:?}"
+            );
+        }
+    }
+
+    /// A file whose extension `detect_language` knows but whose grammar wdpkr does not ship
+    /// must still be chunked. Routing it to the AST chunker yields zero symbols, which would
+    /// drop the file from the corpus silently.
+    #[test]
+    fn a_recognised_language_with_no_grammar_still_chunks() {
+        let chunks = chunk_file("app.svelte", "<script>let a = 1;</script>\n", &opts()).unwrap();
+        assert!(!chunks.is_empty(), "svelte must not vanish from the corpus");
+        assert!(!chunks[0].attrs.contains_key(META_SYMBOL));
     }
 }
 

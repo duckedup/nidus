@@ -15,7 +15,7 @@
 //! Trimming, where it happens, narrows the span — it never edits characters.
 
 #[cfg(feature = "code")]
-mod code;
+pub(crate) mod code;
 mod markdown;
 mod recursive;
 mod sentence;

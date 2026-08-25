@@ -11,6 +11,15 @@ use wdpkr_core::chunk::{Chunker, SymbolChunk};
 
 use super::recursive;
 
+/// One located symbol: its exact char range in the source, plus the wdpkr symbol it came
+/// from. `sym` is shared by every piece an oversized symbol was split into, so a split
+/// symbol still reports one name.
+pub(crate) struct Located {
+    pub start: usize,
+    pub end: usize,
+    pub sym: SymbolChunk,
+}
+
 /// Keep an oversized symbol as one chunk up to this many chars; a generated match arm or a
 /// minified blob beyond it falls back to `recursive::split` so no chunk balloons unbounded.
 const OVERSIZED_SYMBOL_CAP: usize = 20_000;
@@ -29,37 +38,83 @@ const LANGUAGES: &[&str] = &[
     "csharp",
 ];
 
+/// Whether wdpkr-core ships a grammar config for `lang`. `detect_language` recognises more
+/// extensions than `languages::get_config` has grammars for (svelte, for one), and asking it
+/// to chunk one of those yields no symbols at all — so callers route those elsewhere.
+pub(crate) fn has_grammar(lang: &str) -> bool {
+    LANGUAGES.contains(&lang) || lang == "c"
+}
+
 /// Splits `src` into per-symbol char ranges. `vec![]` when no grammar recognises the
 /// content — an unrecognised language and a parse failure look the same from here.
 pub(super) fn split(src: &[char], max_chars: usize) -> Vec<(usize, usize)> {
     let content: String = src.iter().collect();
     let chunker = TreeSitterChunker::new();
 
-    let mut symbols = LANGUAGES
+    let symbols = LANGUAGES
         .iter()
         .filter_map(|&lang| chunker.chunk("", &content, lang).ok())
         .max_by_key(|fc| fc.symbols.len())
         .map(|fc| fc.symbols)
         .unwrap_or_default();
+    locate_symbols(src, symbols, max_chars)
+        .into_iter()
+        .map(|l| (l.start, l.end))
+        .collect()
+}
+
+/// Locates every symbol's exact char range, drops the containers, and caps the oversized.
+///
+/// **Containers are dropped, not kept beside their contents.** wdpkr emits a class both as
+/// its own symbol and again as each method inside it (Python/TS/JS/Java/C#/C++ all list the
+/// class node as a symbol AND a container), so keeping both would index the same bytes twice
+/// and inflate every BM25 score for the file. The finer-grained symbol wins, which is what
+/// `docs/guides/code.md` promises: one chunk per function.
+pub(crate) fn locate_symbols(
+    src: &[char],
+    mut symbols: Vec<SymbolChunk>,
+    max_chars: usize,
+) -> Vec<Located> {
     if symbols.is_empty() {
         return Vec::new();
     }
     symbols.sort_by_key(|s| s.start_line);
 
     let line_starts = line_start_table(src);
-    let mut spans = Vec::with_capacity(symbols.len());
-    for sym in &symbols {
-        let Some(start) = locate_symbol(src, &line_starts, sym) else {
+    let mut placed: Vec<(usize, usize, SymbolChunk)> = Vec::with_capacity(symbols.len());
+    for sym in symbols {
+        let Some(start) = locate_symbol(src, &line_starts, &sym) else {
             continue;
         };
         let end = start + sym.body.chars().count();
+        placed.push((start, end, sym));
+    }
+
+    let ranges: Vec<(usize, usize)> = placed.iter().map(|(s, e, _)| (*s, *e)).collect();
+    let mut out = Vec::with_capacity(placed.len());
+    for (i, (start, end, sym)) in placed.into_iter().enumerate() {
+        let contains_another = ranges
+            .iter()
+            .enumerate()
+            .any(|(j, &(s, e))| j != i && start <= s && e <= end && (e - s) < (end - start));
+        if contains_another {
+            continue;
+        }
         if end - start <= OVERSIZED_SYMBOL_CAP {
-            spans.push((start, end));
+            out.push(Located { start, end, sym });
         } else {
-            spans.extend(recursive::split(src, start, end, max_chars));
+            out.extend(
+                recursive::split(src, start, end, max_chars)
+                    .into_iter()
+                    .map(|(s, e)| Located {
+                        start: s,
+                        end: e,
+                        sym: sym.clone(),
+                    }),
+            );
         }
     }
-    spans
+    out
 }
 
 /// `line_starts[i]` is the char offset where 1-based source line `i + 1` begins.

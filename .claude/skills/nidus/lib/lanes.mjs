@@ -46,7 +46,7 @@ const RULES = [
   {
     recipe: 'just ci-code',
     why: 'the code engine changed — cfg-gated behind `code`, off by default (D0014)',
-    match: [/^src\/code\//, /^src\/chunk\/code\.rs$/, /^src\/cli\/code\.rs$/, /^src\/server\/mcp\/code\.rs$/, /^tests\/e2e\/code\.rs$/],
+    match: [/^src\/code\//, /^src\/chunk\/code\.rs$/, /^src\/cli\/code\.rs$/, /^src\/server\/mcp\/code\.rs$/, /^tests\/e2e\/code\.rs$/, /^tests\/e2e\/mcp\/code\.rs$/, /^tests\/e2e\/docs_index\.rs$/],
   },
   {
     recipe: 'just ci-serve',

@@ -5,11 +5,15 @@
 
 use crate::chunk::ChunkStrategy;
 
-/// A language [`wdpkr_core::chunk::detect_language`] recognises gets AST-aware chunking;
+/// A language wdpkr-core both recognises AND ships a grammar for gets AST-aware chunking;
 /// `.md`/`.mdx`/`.markdown` gets the markdown splitter; everything else falls back to the
 /// generic recursive splitter. Path-only: UTF-8 validity of `path`'s content is upstream.
+///
+/// `detect_language` recognises more extensions than `languages::get_config` has grammars
+/// for (`.svelte`, for one). Routing one of those to the AST chunker yields ZERO chunks, so
+/// the file would vanish from the corpus; `has_grammar` keeps it on the recursive splitter.
 pub fn strategy_for(path: &str) -> ChunkStrategy {
-    if wdpkr_core::chunk::detect_language(path).is_some() {
+    if wdpkr_core::chunk::detect_language(path).is_some_and(crate::chunk::code::has_grammar) {
         return ChunkStrategy::Code;
     }
     match path.rsplit('.').next() {

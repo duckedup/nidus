@@ -473,10 +473,11 @@ impl StoreArgs {
 #[derive(Args, Debug, Default)]
 struct IngestArgs {
     /// Walk dot-entries too (`.github`, `.claude`, …). `.git` is always skipped, at any
-    /// depth, regardless of this flag. Off by default, so `nidus ingest .`'s output is
-    /// unchanged; `nidus code ingest` turns it on (nidus-0fw).
-    #[arg(long)]
-    include_hidden: bool,
+    /// depth, regardless of this flag. Defaults to off for `nidus ingest`, so its output is
+    /// unchanged, and to ON for `nidus code ingest`, which exists to read a repo; pass
+    /// `--include-hidden false` there to turn it back off (nidus-0fw).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    include_hidden: Option<bool>,
     /// Embedding provider for `/remember` and `/recall`: voyage, openai, ollama,
     /// cohere, gemini, mistral, jina, or openai-compat. Omit to serve only the
     /// raw vector endpoints (the memory routes then answer 400).

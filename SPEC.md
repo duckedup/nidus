@@ -1666,7 +1666,7 @@ build until a real need exists.
   needed no trait change.
 
 - **Code search (`nidus code`), behind the off-by-default `code` feature.** `nidus code
-  index` / `nidus code search` are front doors over the general ingest/search primitives:
+  ingest` / `nidus code search` are front doors over the general ingest/search primitives:
   `wdpkr-core`'s tree-sitter AST chunker and embed-summaries-not-code prompts run driven by
   nidus's own walk-and-upsert pipeline (D0014), not `wdpkr-core`'s own indexer, so `code` gets
   one walker, one idempotence scheme, and one corpus shared with docs rather than two that can

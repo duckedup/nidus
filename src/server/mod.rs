@@ -1904,25 +1904,15 @@ async fn code_search_bm25(
     run_read(st, move |db| db.text_search(collection.as_str(), &q, &opts)).await
 }
 
-/// Group `hits` by file via [`crate::code::present::group_by_file`] and attach each
-/// file's language from its own hits — `FileGroup` carries none, so it is read here
-/// rather than by touching `src/code/` (out of this unit's scope).
+/// Group `hits` by file via [`crate::code::present::group_by_file`], which carries each
+/// file's language itself, so the CLI, this route and the MCP tool all report one field
+/// derived in one place.
 #[cfg(feature = "code")]
 fn code_search_response(hits: &[crate::Hit]) -> CodeSearchResponse {
-    let mut language_by_path: std::collections::BTreeMap<&str, &str> =
-        std::collections::BTreeMap::new();
-    for h in hits {
-        if let (Some(crate::Value::Str(p)), Some(crate::Value::Str(l))) = (
-            h.attrs.get(crate::code::META_PATH),
-            h.attrs.get(crate::code::META_LANGUAGE),
-        ) {
-            language_by_path.entry(p.as_str()).or_insert(l.as_str());
-        }
-    }
     let files = crate::code::present::group_by_file(hits)
         .into_iter()
         .map(|g| dto::CodeFileGroupDto {
-            language: language_by_path.get(g.path.as_str()).map(|s| s.to_string()),
+            language: g.language,
             path: g.path,
             symbols: g
                 .symbols

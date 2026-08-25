@@ -15,7 +15,7 @@ use super::ingest::{
 use super::{IngestArgs, StoreArgs};
 use crate::chunk::{ChunkOpts, ChunkStrategy};
 use crate::code::present::{FileGroup, group_by_file};
-use crate::code::{META_PATH as CODE_META_PATH, META_SYMBOL, chunk_file};
+use crate::code::{META_DOC, META_PATH as CODE_META_PATH, META_SYMBOL, chunk_file};
 use crate::embed::cache::CachedEmbedder;
 use crate::embed::{Embedder, embedder_identity};
 use crate::memory::{META_TEXT, RememberWrite, commit_remember_chunks, stamp_recency};
@@ -31,7 +31,23 @@ const WDPKR_CORE_VERSION: &str = "0.2.0";
 
 /// What `code search`'s BM25 fallback is declared over: the chunk body, plus the two fields
 /// a caller is most likely to name directly.
-const CODE_FTS_FIELDS: [&str; 3] = [META_TEXT, CODE_META_PATH, META_SYMBOL];
+const CODE_FTS_FIELDS: [&str; 4] = [META_TEXT, CODE_META_PATH, META_SYMBOL, META_DOC];
+
+/// Directories `code ingest` never walks into. It defaults to the repo root with dot-entries
+/// ON, so without this a single run reads all of `target/` and `node_modules/` — minutes of
+/// IO and a corpus of build output. `nidus ingest`'s own default is untouched: it passes
+/// `&[]` and keeps skipping every dot-entry instead.
+const BUILD_DIRS: &[&str] = &[
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".beads",
+    ".next",
+    "__pycache__",
+];
 
 /// `code search`'s query knobs, bundled so the entry point stays under clippy's argument cap.
 pub(super) struct SearchArgs {
@@ -67,7 +83,7 @@ pub(super) fn ingest(
 
     // A repo scan that cannot reach `.github`/`.claude` is the bug nidus-0fw fixes; `.git`
     // stays skipped regardless.
-    let found = walk(&path, true)?;
+    let (found, skips) = walk(&path, ingest.include_hidden.unwrap_or(true), BUILD_DIRS)?;
 
     let rt = super::memory::runtime()?;
     rt.block_on(async move {
@@ -183,6 +199,10 @@ pub(super) fn ingest(
             "unchanged": report.unchanged,
             "skipped_non_utf8": report.skipped_non_utf8,
             "skipped_empty": report.skipped_empty,
+            "skipped_hidden": skips.hidden,
+            "skipped_git": skips.git,
+            "skipped_build_dirs": skips.build_dirs,
+            "skipped_symlinks": skips.symlinks,
             "chunks": report.chunks,
             "pruned": report.pruned,
             "would_ingest": report.would_ingest,
@@ -379,8 +399,19 @@ fn scope<'a>(refs: &'a [&'a str]) -> crate::Scope<'a> {
     }
 }
 
+/// One clause per declared field, `Max`-combined: a query word may live in the body, the
+/// path, the symbol name or the doc comment, and a doc comment is often the only prose
+/// naming what a symbol is for. `Max` rather than `Sum` so a long body cannot out-accumulate
+/// an exact symbol-name match.
 fn text_search(db: &Nidus, refs: &[&str], query: &str, top_k: usize) -> Result<Vec<crate::Hit>> {
-    let q = FtsQuery::new(META_TEXT, query.to_string());
+    let q = FtsQuery {
+        combine: crate::FtsCombine::Max,
+        ..FtsQuery::multi(
+            CODE_FTS_FIELDS
+                .into_iter()
+                .map(|f| crate::FtsClause::new(f, query.to_string())),
+        )
+    };
     let opts = SearchOpts {
         top_k,
         ..Default::default()
@@ -408,7 +439,11 @@ fn groups_to_json(groups: &[FileGroup]) -> serde_json::Value {
                         })
                     })
                     .collect();
-                serde_json::json!({ "path": g.path, "symbols": symbols })
+                serde_json::json!({
+                    "path": g.path,
+                    "language": g.language,
+                    "symbols": symbols,
+                })
             })
             .collect(),
     )

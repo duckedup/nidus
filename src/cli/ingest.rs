@@ -37,17 +37,46 @@ pub(super) struct Found {
     pub(super) abs: PathBuf,
 }
 
-/// Recursive `read_dir`, sorted so the order is reproducible. Symlinks are never followed so
-/// a cycle cannot hang the walk. `.git` is always skipped at any depth; every other
-/// dot-entry is skipped unless `include_hidden` is set (nidus-0fw).
-pub(super) fn walk(root: &Path, include_hidden: bool) -> Result<Vec<Found>> {
-    let mut out = Vec::new();
-    visit(root, root, include_hidden, &mut out)?;
-    out.sort_by(|a, b| a.rel.cmp(&b.rel));
-    Ok(out)
+/// What the walk declined to enter, so the report can say it out loud instead of leaving a
+/// silent omission (nidus-0fw: "a user pointing `nidus ingest` at any repo silently gets no
+/// .github, no .claude, and nothing says so").
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct WalkSkips {
+    /// Dot-entries passed over because `--include-hidden` was off.
+    pub(super) hidden: usize,
+    /// `.git`, always, at any depth.
+    pub(super) git: usize,
+    /// Build and dependency directories named in `skip_dirs`.
+    pub(super) build_dirs: usize,
+    /// Symlinks, never followed, so a cycle cannot hang the walk.
+    pub(super) symlinks: usize,
 }
 
-fn visit(root: &Path, dir: &Path, include_hidden: bool, out: &mut Vec<Found>) -> Result<()> {
+/// Recursive `read_dir`, sorted so the order is reproducible. Symlinks are never followed so
+/// a cycle cannot hang the walk. `.git` is always skipped at any depth; every other
+/// dot-entry is skipped unless `include_hidden` is set (nidus-0fw); any directory named in
+/// `skip_dirs` is skipped at any depth (`nidus code ingest` passes the build-output list, so
+/// pointing it at a repo root does not read all of `target/`).
+pub(super) fn walk(
+    root: &Path,
+    include_hidden: bool,
+    skip_dirs: &[&str],
+) -> Result<(Vec<Found>, WalkSkips)> {
+    let mut out = Vec::new();
+    let mut skips = WalkSkips::default();
+    visit(root, root, include_hidden, skip_dirs, &mut out, &mut skips)?;
+    out.sort_by(|a, b| a.rel.cmp(&b.rel));
+    Ok((out, skips))
+}
+
+fn visit(
+    root: &Path,
+    dir: &Path,
+    include_hidden: bool,
+    skip_dirs: &[&str],
+    out: &mut Vec<Found>,
+    skips: &mut WalkSkips,
+) -> Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .with_context(|| format!("reading {}", dir.display()))?
         .collect::<std::io::Result<Vec<_>>>()
@@ -58,20 +87,27 @@ fn visit(root: &Path, dir: &Path, include_hidden: bool, out: &mut Vec<Found>) ->
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         if name_str == ".git" {
+            skips.git += 1;
             continue;
         }
         if !include_hidden && name_str.starts_with('.') {
+            skips.hidden += 1;
+            continue;
+        }
+        if skip_dirs.contains(&name_str.as_ref()) {
+            skips.build_dirs += 1;
             continue;
         }
         let kind = entry
             .file_type()
             .with_context(|| format!("stat {}", entry.path().display()))?;
         if kind.is_symlink() {
+            skips.symlinks += 1;
             continue;
         }
         let path = entry.path();
         if kind.is_dir() {
-            visit(root, &path, include_hidden, out)?;
+            visit(root, &path, include_hidden, skip_dirs, out, skips)?;
         } else if kind.is_file() {
             let rel = path
                 .strip_prefix(root)
@@ -195,7 +231,7 @@ pub(super) fn run(
     // Validate before the first billed call rather than letting chunk_text bail mid-run.
     crate::chunk::chunk_text("probe", &opts).context("invalid chunk options")?;
 
-    let found = walk(&path, ingest.include_hidden)?;
+    let (found, skips) = walk(&path, ingest.include_hidden.unwrap_or(false), &[])?;
     let matched: Vec<Found> = found
         .into_iter()
         .filter(|f| matches(&glob, &f.rel))
@@ -359,6 +395,10 @@ pub(super) fn run(
             "unchanged": report.unchanged,
             "skipped_non_utf8": report.skipped_non_utf8,
             "skipped_empty": report.skipped_empty,
+            "skipped_hidden": skips.hidden,
+            "skipped_git": skips.git,
+            "skipped_build_dirs": skips.build_dirs,
+            "skipped_symlinks": skips.symlinks,
             "chunks": report.chunks,
             "stale_tail_pruned": report.stale_tail_pruned,
             "pruned": report.pruned,
@@ -498,13 +538,43 @@ mod tests {
         let root = dir.path();
         dotted_tree(root);
 
-        let found = walk(root, false).unwrap();
+        let (found, skips) = walk(root, false, &[]).unwrap();
         let rels: Vec<&str> = found.iter().map(|f| f.rel.as_str()).collect();
         assert_eq!(
             rels,
             vec!["a.md", "c.md", "sub/b.md"],
             "sorted, no dots, no symlink"
         );
+        // What the report prints, so the omission stops being silent (nidus-0fw): two
+        // dot-entries passed over (`.claude`, `.hidden`), `.git` named separately, and the
+        // symlink cycle guard counted rather than hidden.
+        assert_eq!(skips.hidden, 2, "{skips:?}");
+        assert_eq!(skips.git, 1, "{skips:?}");
+        assert_eq!(skips.build_dirs, 0, "{skips:?}");
+        assert_eq!(skips.symlinks, 1, "{skips:?}");
+    }
+
+    /// `nidus code ingest` walks a repo root with dot-entries on, so it passes a build-output
+    /// denylist. Without it a single run reads all of `target/`; with it the directory is not
+    /// entered at all and the report says how many it declined.
+    #[test]
+    fn walk_skips_named_build_directories_and_counts_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::write(root.join("target/debug/huge.rs"), "fn generated() {}").unwrap();
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("node_modules/dep.js"), "module.exports = 1;").unwrap();
+        std::fs::write(root.join("keep.rs"), "fn kept() {}").unwrap();
+
+        let (found, skips) = walk(root, true, &["target", "node_modules"]).unwrap();
+        let rels: Vec<&str> = found.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(rels, vec!["keep.rs"], "build output must not be walked");
+        assert_eq!(skips.build_dirs, 2, "{skips:?}");
+
+        // The counterfactual: with no denylist the same tree yields the build output too.
+        let (all, _) = walk(root, true, &[]).unwrap();
+        assert_eq!(all.len(), 3, "denylist is what excludes them, nothing else");
     }
 
     /// With `--include-hidden`, the walk descends into dot-directories (`.claude/rules/x.md`
@@ -516,7 +586,12 @@ mod tests {
         let root = dir.path();
         dotted_tree(root);
 
-        let found = walk(root, true).unwrap();
+        let (found, skips) = walk(root, true, &[]).unwrap();
+        assert_eq!(skips.hidden, 0, "nothing hidden was declined: {skips:?}");
+        assert_eq!(
+            skips.git, 1,
+            ".git is still declined, and counted: {skips:?}"
+        );
         let rels: Vec<&str> = found.iter().map(|f| f.rel.as_str()).collect();
         assert!(
             rels.contains(&".claude/rules/x.md"),
@@ -537,6 +612,6 @@ mod tests {
     #[test]
     fn walk_of_an_empty_tree_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(walk(dir.path(), false).unwrap().is_empty());
+        assert!(walk(dir.path(), false, &[]).unwrap().0.is_empty());
     }
 }
