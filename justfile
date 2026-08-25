@@ -75,7 +75,7 @@ test-cli:
 # The embed/summarize features gate suites driven by hand-rolled TCP mocks — no real
 # services — so leaving them off would silently compile those suites away (#111).
 test-e2e *FILTER:
-    cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e {{ FILTER }}
+    cargo test --features cli,mcp,code,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e {{ FILTER }}
 
 # Start the services the cluster e2e tests need (real S3 + real Redis-family tier).
 # The container definitions live in scripts/e2e-services.sh — one source of truth,
@@ -110,6 +110,12 @@ test-e2e-cluster *FILTER:
 # Release build of the `nidus` binary
 build-cli:
     cargo build --release --features cli
+
+# The binary the SDK integration suites drive. `serve` (not `cli`) because the memory and
+# `code` routes only exist there: a suite driving a `cli`-only binary sees 404s and skips,
+# and a skip reads as a pass (nidus-3gm).
+build-serve-bin:
+    cargo build --release --features serve
 
 # Install the `nidus` binary from this checkout — with the memory endpoints, so
 # the installed `nidus serve` matches the shipped (binstall/Docker) binary.
@@ -149,6 +155,21 @@ serve-memory DIR DIM *ARGS:
 
 # Pre-PR checks for the serve feature: format clean, no clippy warnings, tests green
 ci-serve: fmt-check lint-serve test-serve
+
+# ── AST-aware code search (the opt-in `code` feature, epic nidus-3gm) ────────
+# Off the core build path on purpose: `wdpkr-core` (tree-sitter over eight grammars)
+# is heavier than the rest of `serve`. Its own budget job, its own lane here.
+
+# Lint the code feature (dispatch, summarize wiring, presentation)
+lint-code:
+    cargo clippy --all-targets --features code -- -D warnings
+
+# Test the code feature
+test-code:
+    cargo test --features code
+
+# Pre-PR checks for the code feature: format clean, no clippy warnings, tests green
+ci-code: fmt-check lint-code test-code
 
 # ── wasm32 target (browser / edge) ──────────────────────────────────────────
 # The wasm-hostile deps (ureq/ring, tame-oauth, redis, rusty-s3, tame-gcs, url) are
@@ -293,7 +314,7 @@ sdk-js-test:
 
 # JS/TS SDK: full test incl. integration against a real `nidus serve`.
 # Builds the binary first and points the suite at it via NIDUS_BIN.
-sdk-js-test-all: build-cli
+sdk-js-test-all: build-serve-bin
     cd sdks/js && npm install && npm run typecheck && \
       NIDUS_BIN={{justfile_directory()}}/target/release/nidus npm test
 
@@ -315,7 +336,7 @@ sdk-go-lint:
 # Go SDK: full test incl. integration against a real `nidus serve`.
 # Builds the binary first and points the suite at it via NIDUS_BIN. The integration
 # tests are behind a build tag, so they are invisible to `sdk-go-test` above.
-sdk-go-test-all: build-cli
+sdk-go-test-all: build-serve-bin
     cd sdks/go && NIDUS_BIN={{justfile_directory()}}/target/release/nidus \
       go test -tags integration ./...
 
@@ -346,7 +367,7 @@ sdk-py-test: sdk-py-venv
 
 # Python SDK: full test incl. integration against a real `nidus serve`.
 # Builds the binary first and points the suite at it via NIDUS_BIN.
-sdk-py-test-all: build-cli sdk-py-venv
+sdk-py-test-all: build-serve-bin sdk-py-venv
     cd sdks/python && ./.venv/bin/mypy src && \
       NIDUS_BIN={{justfile_directory()}}/target/release/nidus ./.venv/bin/pytest
 
@@ -465,8 +486,11 @@ bd-sync:
 spec *ARGS:
     @.claude/skills/nidus/bin/spec {{ARGS}}
 
-# The ranked tier under `spec find` (nidus-gmy.7), dogfooding `ingest --fts-only` on this
-# repo's own docs. Derived, gitignored, `cargo clean`-able, and never a prerequisite (D0013).
-# Build or refresh the docs index over SPEC.md, CLAUDE.md, .claude/rules and decisions
+# The ranked tier under `spec find` (nidus-gmy.7 / nidus-3gm unit 11), dogfooding
+# `code ingest` over the whole repo root: docs chunked by heading, source by AST, one
+# store. Derived, gitignored, `cargo clean`-able, and never a prerequisite (D0013). Needs
+# a nidus binary built with the `code` feature; the script itself says so and exits
+# nonzero rather than letting a missing `code ingest` subcommand surface as a clap error.
+# Build or refresh the docs+code index over the repo root
 docs-index:
     @./scripts/docs-index.sh

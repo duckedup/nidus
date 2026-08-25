@@ -642,6 +642,54 @@ def test_suggest_is_fuzzy_by_default_and_exact_only_when_opted_out(server: str) 
         assert opted_out.suggestions == []
 
 
+def test_code_search_groups_a_known_file_by_symbol_and_line_span(server: str) -> None:
+    """The load-bearing round trip: a known file in, symbol name and line span out.
+
+    Attrs mirror exactly what ``nidus code ingest`` stamps on a real AST-chunked symbol
+    (``src/code/mod.rs``'s ``META_*`` keys), so this proves ``/code-search``'s own
+    grouping and decoding rather than the ingest pipeline (a sibling epic's concern).
+    A 404 fails rather than skips: the lane that runs this builds ``--features serve``,
+    which includes ``code``, so an absent route means the contract is broken, not that the
+    environment is thin. A skipped contract test reads as a pass.
+    """
+    with NidusClient(server, timeout=10.0) as db:
+        db.set_fts_schema("code", ["nidus.text"])
+        db.upsert(
+            "code",
+            [
+                {
+                    "id": "src/lib.rs#run",
+                    "attrs": {
+                        "nidus.text": v.str("the quick brown fox"),
+                        "code.path": v.str("src/lib.rs"),
+                        "code.language": v.str("rust"),
+                        "code.symbol": v.str("run"),
+                        "code.kind": v.str("function"),
+                        "code.start_line": 10,
+                        "code.end_line": 12,
+                    },
+                }
+            ],
+        )
+        try:
+            result = db.code_search(collection="code", query="fox", vector=False)
+        except NidusError as caught:
+            if caught.status == 404:
+                raise AssertionError(
+                    "/code-search is absent: the binary under test was built without the "
+                    "`code` feature. The lane that runs this builds --features serve "
+                    "(just build-serve-bin); a skip here would read as a pass."
+                ) from caught
+            raise
+        assert [g.path for g in result.files] == ["src/lib.rs"]
+        file = result.files[0]
+        assert file.language == "rust"
+        assert [s.symbol for s in file.symbols] == ["run"]
+        assert file.symbols[0].kind == "function"
+        assert file.symbols[0].start_line == 10
+        assert file.symbols[0].end_line == 12
+
+
 def test_ready_cluster_and_refresh_against_a_real_server(server: str) -> None:
     """Shape, not specific values: a standalone server is ready, decodes, and adopts nothing."""
     with NidusClient(server, timeout=10.0) as db:

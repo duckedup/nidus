@@ -207,6 +207,13 @@ ENDPOINTS: list[tuple[str, Callable[[AsyncNidusClient], Any], str, str, Any]] = 
         [],
     ),
     (
+        "code_search",
+        lambda db: db.code_search(collection="code", query="widget"),
+        "POST",
+        "/code-search",
+        {"files": []},
+    ),
+    (
         "search_with_plan",
         lambda db: db.search_with_plan(query=[1.0, 0.0, 0.0]),
         "POST",
@@ -446,6 +453,49 @@ async def test_an_unknown_plan_path_decodes_without_raising_on_the_async_path_to
     async with client(mock) as db:
         _, plan = await db.search_with_plan(query=[1.0])
     assert plan.path == "brand_new_path"
+
+
+async def test_code_search_sends_the_body_and_decodes_files_grouped_with_symbols() -> None:
+    """The same round trip as the sync client's: a known file in, symbol and line span out."""
+    mock = MockServer(
+        {
+            "files": [
+                {
+                    "path": "src/lib.rs",
+                    "language": "rust",
+                    "symbols": [
+                        {
+                            "symbol": "run",
+                            "kind": "function",
+                            "start_line": 10,
+                            "end_line": 12,
+                            "score": 1.5,
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    async with client(mock) as db:
+        result = await db.code_search(
+            collection="code", query="widget", limit=5, vector=False, filter=[f.eq("lang", "rust")]
+        )
+    assert mock.json == {
+        "collection": "code",
+        "query": "widget",
+        "limit": 5,
+        "filter": [{"Eq": ["lang", {"Str": "rust"}]}],
+        "vector": False,
+    }
+    assert len(result.files) == 1
+    file = result.files[0]
+    assert file.path == "src/lib.rs"
+    assert file.language == "rust"
+    assert len(file.symbols) == 1
+    assert file.symbols[0].symbol == "run"
+    assert file.symbols[0].kind == "function"
+    assert file.symbols[0].start_line == 10
+    assert file.symbols[0].end_line == 12
 
 
 async def test_the_multi_clause_and_ranking_knobs_reach_the_same_wire() -> None:

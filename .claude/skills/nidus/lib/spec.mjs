@@ -139,7 +139,10 @@ function rankedFind(words) {
   const rows = []
   for (const hit of JSON.parse(out)) {
     const attrs = hit.attrs || {}
-    const doc = docForHit(hit.collection, attrs['nidus.source_path']?.Str)
+    // `code.path` (crate::code::META_PATH), not `nidus.source_path`: `code ingest`
+    // stamps the latter only on each file's first chunk, but every chunk carries its
+    // own `code.path` (nidus-3gm unit 11).
+    const doc = docForHit(hit.collection, attrs['code.path']?.Str)
     if (!doc || !existsSync(resolve(REPO, doc))) continue
     const text = readFileSync(resolve(REPO, doc), 'utf8')
     const lines = text.split('\n')

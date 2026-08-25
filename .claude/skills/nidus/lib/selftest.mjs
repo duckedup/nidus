@@ -295,6 +295,25 @@ test('gating: src/server may import axum', () => {
   eq(ids(laws.featureGating('src/server/mod.rs', 'use axum::Router;\n')), [], 'findings')
 })
 
+// nidus-3gm: wdpkr_core/tree_sitter are gated behind `code`, not `cli`/`serve` — same
+// BINARY_ONLY table, same LIB_EXEMPT paths, so an ungated src/ file is still flagged.
+test('gating: a library module importing wdpkr_core is an error', () => {
+  eq(ids(laws.featureGating('src/store/read.rs', 'use wdpkr_core::chunk;\n')), ['feature-gating'], 'findings')
+})
+
+test('gating: src/cli may import wdpkr_core', () => {
+  eq(ids(laws.featureGating('src/cli/code.rs', 'use wdpkr_core::chunk;\n')), [], 'findings')
+})
+
+// src/code/ is the one directory its own doc comment (src/code/mod.rs) says may use
+// wdpkr_core — everywhere else, including src/chunk/, stays flagged (D0014).
+test('gating: src/code and the cfg-gated src/chunk/code.rs may import wdpkr_core, src/chunk/mod.rs may not', () => {
+  eq(ids(laws.featureGating('src/code/mod.rs', 'use wdpkr_core::chunk::detect_language;\n')), [], 'findings')
+  eq(ids(laws.featureGating('src/chunk/code.rs', 'use wdpkr_core::chunk::Chunker;\n')), [], 'findings')
+  eq(ids(laws.featureGating('src/chunk/mod.rs', 'use wdpkr_core::chunk::Chunker;\n')), ['feature-gating'], 'findings')
+  eq(ids(laws.featureGating('src/chunk/markdown.rs', 'use tree_sitter::Parser;\n')), ['feature-gating'], 'findings')
+})
+
 test('gating: ungated mod declaration flagged', () => {
   eq(ids(laws.modGating('mod store;\npub mod cli;\n')), ['mod-gating'], 'findings')
   eq(ids(laws.modGating('mod store;\n#[cfg(feature = "cli")]\npub mod cli;\n')), [], 'findings')
@@ -454,14 +473,37 @@ test('lanes: each SDK lane runs every step its CI job runs (#172)', () => {
   }
 })
 
+// nidus-3gm: the code engine (D0014) is cfg-gated behind `code`, mirroring ci-embed/
+// ci-summarize, across every layer it touches — core, chunker, CLI, MCP, e2e.
+test('lanes: the code engine changed runs just ci-code', () => {
+  for (const f of ['src/code/mod.rs', 'src/chunk/code.rs', 'src/cli/code.rs', 'src/server/mcp/code.rs', 'tests/e2e/code.rs']) {
+    eq(lanes([f]).run.map(l => l.recipe).includes('just ci-code'), true, `ci-code runs for ${f}`)
+  }
+})
+
+// nidus-3gm unit 6b: scripts/docs-index.sh used to fall through every rule and land
+// in `unmatched` — the tell that a path nobody's table knows about.
+test('lanes: the docs-index script is no longer unmapped', () => {
+  const r = lanes(['scripts/docs-index.sh'])
+  eq(r.unmatched, [], 'unmatched')
+  eq(r.run.map(l => l.recipe), ['just docs-index'], 'recipes')
+})
+
 // ── ci-guard: the per-job skip oracle (nidus-0bs) ───────────────────────────
 // A wrong `skip` silently unguards a required check's work, so the failure modes
 // are pinned: docs-only skips, src runs, empty runs, unknown job throws.
 
 test('ci-guard: a docs/skill-only change skips the Rust jobs', () => {
-  for (const job of ['test', 'test-extended', 'miri', 'miri-integration', 'release', 'build-budget']) {
+  for (const job of ['test', 'test-extended', 'miri', 'miri-integration', 'release', 'build-budget', 'build-budget-code']) {
     eq(ciGuard(job, ['docs/src/content/docs/api.md', '.claude/skills/nidus/SKILL.md', 'README.md']).run, false, `${job} skips`)
   }
+})
+
+// nidus-3gm: without this key, unit 6a's guard step throws `unknown job` on the first
+// PR that does not touch Rust — CI_JOBS must carry it, not just the justfile recipe.
+test('ci-guard: build-budget-code skips docs-only and runs for Rust', () => {
+  eq(ciGuard('build-budget-code', ['docs/x.md', 'README.md']).run, false, 'docs-only skips')
+  eq(ciGuard('build-budget-code', ['src/code/mod.rs']).run, true, 'Rust path runs')
 })
 
 test('ci-guard: any src or manifest change runs every Rust job', () => {
@@ -1211,12 +1253,10 @@ export function selftest({ json = false } = {}) {
 
 // ── The ranked docs tier (nidus-gmy.7) ───────────────────────────────────────────────
 
-test('docForHit: a rules hit becomes a repo-relative path', () => {
-  eq(spec.docForHit('rules', 'miri.md'), '.claude/rules/miri.md')
-})
-
-test('docForHit: the staged root corpus keeps its bare name', () => {
-  eq(spec.docForHit('root', 'SPEC.md'), 'SPEC.md')
+test('docForHit: the code collection keeps its code.path bare, already repo-relative', () => {
+  eq(spec.docForHit('code', 'SPEC.md'), 'SPEC.md')
+  eq(spec.docForHit('code', '.claude/rules/miri.md'), '.claude/rules/miri.md')
+  eq(spec.docForHit('code', 'src/chunk/mod.rs'), 'src/chunk/mod.rs')
 })
 
 test('docForHit: an unknown collection is not guessed at', () => {

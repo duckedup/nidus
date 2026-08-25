@@ -729,6 +729,46 @@ type BatchFuse struct {
 	TopK    int       `json:"top_k,omitempty"`
 }
 
+// ── Code search ─────────────────────────────────────────────────────────────
+
+// A CodeSearchRequest queries an AST-chunked corpus (`nidus code ingest`) and gets
+// hits back grouped by file — see [Client.CodeSearch].
+//
+// Vector picks the ranking: nil defers to the store (a dimension-0, fts-only store
+// answers BM25 rather than erroring), &true forces a vector search, and &false forces
+// BM25 — a pointer for the usual reason in this package: false and "unset" are
+// different requests.
+type CodeSearchRequest struct {
+	Collection string `json:"collection"`
+	Query      string `json:"query"`
+	Limit      int    `json:"limit,omitempty"`
+	Filter     Filter `json:"filter,omitempty"`
+	Vector     *bool  `json:"vector,omitempty"`
+}
+
+// A CodeFileHit is every matched symbol within one file, ranked by descending score.
+// Language is nil when dispatch could not AST-chunk the file (chunked by heading or
+// paragraph instead) — never for a real source file.
+type CodeFileHit struct {
+	Path     string      `json:"path"`
+	Language *string     `json:"language"`
+	Symbols  []SymbolHit `json:"symbols"`
+}
+
+// A SymbolHit is one matched chunk within a [CodeFileHit]: everything an agent needs
+// to go read the real source, never the source body itself.
+//
+// Symbol, Kind, StartLine and EndLine are nil for a chunk that carries no symbol —
+// prose chunked by heading rather than AST, for instance — never for a real
+// function, method, type, or the like.
+type SymbolHit struct {
+	Symbol    *string `json:"symbol"`
+	Kind      *string `json:"kind"`
+	StartLine *int64  `json:"start_line"`
+	EndLine   *int64  `json:"end_line"`
+	Score     float32 `json:"score"`
+}
+
 // RememberOptions tunes a text-native ingest: the server embeds the text and upserts
 // it, so the client only ever sends strings.
 //

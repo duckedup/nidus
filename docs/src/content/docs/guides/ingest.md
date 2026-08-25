@@ -131,7 +131,9 @@ uses SQL GLOB semantics, where `*` crosses `/`, so `*.md` is already recursive:
 Three things are skipped without being asked:
 
 - **Entries whose name starts with a dot**, so `nidus ingest .` does not walk
-  `.git` or `.venv`.
+  `.git` or `.venv`. Pass `--include-hidden` to walk dot-entries too (`.github`,
+  `.claude`, …), for a repo scan that wants to reach its own config and docs.
+  `.git` is always skipped, at any depth, regardless of this flag.
 - **Symlinks**, so a link pointing back up the tree cannot make the walk loop
   forever.
 - **Files that are not valid UTF-8.** A stray binary file in the tree is counted
@@ -213,6 +215,22 @@ Corpora ingested before 0.75.0 have no stored chunk offsets, so their windows ar
 joined with a blank line and keep whatever overlap the chunker left. The per-file
 digest covers the chunk options, so changing any of them re-ingests the tree and
 picks the offsets up.
+
+## Code and docs in one corpus: per-file strategy dispatch
+
+`nidus ingest` applies one `--strategy` to every file it walks, which is right for a
+tree of one kind of content. A repository is not: source files want AST-aware
+chunking (one chunk per function, struct, trait, …) while its `README.md` wants
+heading-aware chunking, and neither wants the other's splitter.
+
+`nidus code ingest` (behind the off-by-default `code` feature) is the front door for
+that case: same walk, digest-skip, embed step and prune as `nidus ingest`, but the
+chunk strategy is picked **per file** instead of once for the whole walk. A
+recognised language gets one chunk per symbol, tagged with its name, kind and line
+span; `.md`/`.mdx`/`.markdown` gets the markdown splitter; everything else falls back
+to the same generic splitter `nidus ingest` uses. One corpus, each file chunked for
+what it actually is. See the [code search guide](/guides/code/) for indexing and
+searching a repo end to end.
 
 ## Keyword-only, with no provider
 

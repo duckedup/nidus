@@ -89,6 +89,11 @@ pub mod summarize;
 // `store::rerank`; only the async provider call sits behind this feature.
 #[cfg(feature = "rerank")]
 pub mod rerank;
+// AST-aware code search (epic nidus-3gm): per-file chunk-strategy dispatch, the summarize
+// wiring onto wdpkr-core's prompts, and file-grouped presentation. The only directory allowed
+// to `use wdpkr_core` — see `src/code/mod.rs`.
+#[cfg(feature = "code")]
+pub mod code;
 // Text-native memory API: `remember(text)` / `recall(query_text)`. Gated on the
 // `memory` feature (= `embed`) so building a bare provider (e.g. `embed-voyage`)
 // does not require this module to exist.

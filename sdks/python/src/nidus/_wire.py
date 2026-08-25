@@ -56,6 +56,9 @@ from .types import (
     Batch,
     ClauseScore,
     ClusterStatus,
+    CodeFileGroup,
+    CodeSearchResult,
+    CodeSymbolHit,
     Expand,
     Expansion,
     FilterIndexField,
@@ -106,6 +109,7 @@ SEARCH_BATCH = "/search/batch"
 SIMILAR = "/search/similar"
 TEXT_SEARCH = "/text-search"
 HYBRID_SEARCH = "/hybrid-search"
+CODE_SEARCH = "/code-search"
 LIST = "/list"
 AGGREGATE = "/aggregate"
 FLUSH = "/flush"
@@ -468,6 +472,32 @@ def text_search_body(
             "diversity": diversity,
             "expand": _expand(expand),
             "rerank": _rerank(rerank),
+        }
+    )
+
+
+def code_search_body(
+    collection: str,
+    query: str,
+    *,
+    limit: Optional[int] = None,
+    filter: Optional[Filter] = None,  # noqa: A002
+    vector: Optional[bool] = None,
+) -> dict[str, Any]:
+    """Body for ``POST /code-search`` (the ``code`` feature). Field order mirrors the
+    server's ``CodeSearchRequest``.
+
+    ``vector`` picks the ranking: ``True`` forces a vector search, ``False`` forces BM25,
+    unset defers to the store — a dimension-0 (fts-only) store answers BM25 rather than
+    erroring, the same default the server applies.
+    """
+    return prune(
+        {
+            "collection": collection,
+            "query": query,
+            "limit": limit,
+            "filter": list(filter) if filter is not None else [],
+            "vector": vector,
         }
     )
 
@@ -987,6 +1017,33 @@ def decode_suggestions(payload: Any) -> Suggestions:
 
 def _suggestion_of(payload: Mapping[str, Any]) -> Suggestion:
     return Suggestion(term=str(payload["term"]), df=int(payload["df"]))
+
+
+def decode_code_search(payload: Any) -> CodeSearchResult:
+    """Decode ``POST /code-search``: hits grouped by file, each file's symbols ranked by
+    descending score, and files ranked by their own best-scoring symbol.
+    """
+    if not isinstance(payload, Mapping):
+        raise NidusError(f"code_search returned no JSON object (got {payload!r})", 0)
+    return CodeSearchResult(files=[_code_file_group_of(g) for g in payload.get("files") or ()])
+
+
+def _code_file_group_of(payload: Mapping[str, Any]) -> CodeFileGroup:
+    return CodeFileGroup(
+        path=str(payload["path"]),
+        language=payload.get("language"),
+        symbols=[_code_symbol_hit_of(s) for s in payload.get("symbols") or ()],
+    )
+
+
+def _code_symbol_hit_of(payload: Mapping[str, Any]) -> CodeSymbolHit:
+    return CodeSymbolHit(
+        symbol=payload.get("symbol"),
+        kind=payload.get("kind"),
+        start_line=payload.get("start_line"),
+        end_line=payload.get("end_line"),
+        score=float(payload["score"]),
+    )
 
 
 def decode_remember(payload: Any, requested_id: str) -> RememberResult:

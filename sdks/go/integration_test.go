@@ -1105,6 +1105,99 @@ func TestSuggestAgainstARealServer(t *testing.T) {
 	}
 }
 
+// TestCodeSearchAgainstARealServer proves the /code-search contract end to end.
+//
+// It seeds records shaped exactly as `nidus code ingest` would stamp them
+// (src/code/mod.rs's `code.*` attrs plus the reserved `nidus.text` chunk field) rather
+// than driving the CLI ingest itself — that ingest wiring is a different unit, the same
+// scoping tests/e2e/mcp/code.rs uses for the MCP tool's own contract test. The
+// load-bearing claim is the shape of what comes back: a symbol name and a real line
+// span, grouped under its file — "a 200 came back" proves nothing.
+//
+// The route exists only on a binary built with the `code` feature, and the lane that runs
+// this (`just sdk-go-test-all`, and CI's sdk-integration job) builds `--features serve`,
+// which includes it. So a 404 is a FAILURE, not a skip: a skipped contract test reads as a
+// pass, which is how a broken route ships (nidus-3gm).
+func TestCodeSearchAgainstARealServer(t *testing.T) {
+	db := startServer(t)
+	ctx := context.Background()
+	const collection = "code"
+
+	if err := db.CreateCollection(ctx, collection); err != nil {
+		t.Fatalf("CreateCollection failed: %v", err)
+	}
+	if err := db.SetFtsSchema(ctx, collection, []string{"nidus.text"}); err != nil {
+		t.Fatalf("SetFtsSchema failed: %v", err)
+	}
+	_, err := db.Upsert(ctx, collection, []Record{
+		{
+			ID: "src/commit.rs#0",
+			Attrs: Attrs{
+				"code.path":       Str("src/commit.rs"),
+				"code.symbol":     Str("commit_batch"),
+				"code.kind":       Str("function"),
+				"code.language":   Str("rust"),
+				"code.start_line": Int(10),
+				"code.end_line":   Int(42),
+				"nidus.text":      Str("commit_batch fsyncs the active segment before appending log records"),
+			},
+		},
+		{
+			ID: "src/other.rs#0",
+			Attrs: Attrs{
+				"code.path":       Str("src/other.rs"),
+				"code.symbol":     Str("unrelated_thing"),
+				"code.kind":       Str("function"),
+				"code.language":   Str("rust"),
+				"code.start_line": Int(1),
+				"code.end_line":   Int(5),
+				"nidus.text":      Str("nothing to do with the query at all"),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Upsert failed: %v", err)
+	}
+
+	hits, err := db.CodeSearch(ctx, CodeSearchRequest{
+		Collection: collection,
+		Query:      "fsyncs",
+		Vector:     bptr(false), // BM25 — this harness's binary has no embedder
+	})
+	if err != nil {
+		var nerr *Error
+		if errors.As(err, &nerr) && nerr.Status == 404 {
+			t.Fatalf("/code-search is absent: the binary under test was built without the " +
+				"`code` feature. Build it with `--features serve` (just build-serve-bin).")
+		}
+		t.Fatalf("CodeSearch failed: %v", err)
+	}
+
+	if len(hits) != 1 {
+		t.Fatalf("want 1 file group, got %#v", hits)
+	}
+	file := hits[0]
+	if file.Path != "src/commit.rs" {
+		t.Errorf("Path = %q, want src/commit.rs", file.Path)
+	}
+	if file.Language == nil || *file.Language != "rust" {
+		t.Errorf("Language = %v, want rust", file.Language)
+	}
+	if len(file.Symbols) != 1 {
+		t.Fatalf("want 1 symbol, got %#v", file.Symbols)
+	}
+	sym := file.Symbols[0]
+	if sym.Symbol == nil || *sym.Symbol != "commit_batch" {
+		t.Errorf("Symbol = %v, want commit_batch", sym.Symbol)
+	}
+	if sym.StartLine == nil || *sym.StartLine != 10 {
+		t.Errorf("StartLine = %v, want 10", sym.StartLine)
+	}
+	if sym.EndLine == nil || *sym.EndLine != 42 {
+		t.Errorf("EndLine = %v, want 42", sym.EndLine)
+	}
+}
+
 // TestServerErrorsCarryTheirStatus checks the error surface against the real
 // classifier in src/server/mod.rs rather than a canned httptest reply. The status is
 // the part a caller acts on, so it has to be the status the server actually chose.

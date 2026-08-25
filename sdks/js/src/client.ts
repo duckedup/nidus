@@ -12,6 +12,8 @@ import type {
   Aggregation,
   BatchSearchOptions,
   ClusterStatus,
+  CodeFileHit,
+  CodeSearchOptions,
   DecodedRecord,
   Expand,
   Filter,
@@ -368,6 +370,37 @@ export class NidusClient {
       expand: encodeExpand(opts.expand),
       rerank: encodeRerank(opts.rerank),
     });
+  }
+
+  /**
+   * AST-aware source and docs search over one corpus (the `code` feature, `POST
+   * /code-search`): a text query grouped by file, each with the symbols it matched.
+   * `vector` picks vector-vs-BM25; omitted, it defers to the store the same way
+   * {@link NidusClient.textSearch} never has to (that route is BM25-only).
+   */
+  async codeSearch(opts: CodeSearchOptions): Promise<CodeFileHit[]> {
+    const res = await this.request<RawCodeSearchResponse>(
+      "POST",
+      "/code-search",
+      prune({
+        collection: opts.collection,
+        query: opts.query,
+        limit: opts.limit,
+        filter: opts.filter ?? [],
+        vector: opts.vector,
+      }),
+    );
+    return res.files.map((f) => ({
+      path: f.path,
+      language: f.language,
+      symbols: f.symbols.map((s) => ({
+        symbol: s.symbol,
+        kind: s.kind,
+        startLine: s.start_line,
+        endLine: s.end_line,
+        score: s.score,
+      })),
+    }));
   }
 
   /**
@@ -799,6 +832,21 @@ interface RawAggregation {
 interface RawBatchSearch {
   results?: RawHit[][];
   fused?: RawHit[];
+}
+
+/** A `/code-search` response as it arrives on the wire (snake_case), before camelCasing. */
+interface RawCodeSearchResponse {
+  files: {
+    path: string;
+    language: string | null;
+    symbols: {
+      symbol: string | null;
+      kind: string | null;
+      start_line: number | null;
+      end_line: number | null;
+      score: number;
+    }[];
+  }[];
 }
 
 /** Encode `rankBy` to its externally-tagged wire form, dropping the knobs left unset. */

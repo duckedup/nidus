@@ -63,8 +63,9 @@ fn initialize_reports_protocol_and_server_info() {
     );
 }
 
-/// The fourteen tools, in the same order HTTP reports them — the split must not have forked
-/// the list by transport.
+/// Every tool, in the same order HTTP reports them: the split must not have forked the list
+/// by transport. `code_search` is feature-gated, so it is appended here exactly as
+/// `mcp::tools()` appends it (SEP-2549: a gated tool goes last, shifting nothing).
 #[test]
 fn tools_list_matches_http_order() {
     let dir = tempfile::tempdir().unwrap();
@@ -73,24 +74,28 @@ fn tools_list_matches_http_order() {
 
     let resp = server.request(&request(2, "tools/list", json!({})));
     let listed = result(&resp);
+    let mut expected = vec![
+        "remember",
+        "recall",
+        "text_search",
+        "hybrid_search",
+        "list_collections",
+        "stats",
+        "forget",
+        "get",
+        "browse",
+        "related",
+        "suggest",
+        "list_aliases",
+        "set_alias",
+        "drop_alias",
+    ];
+    if cfg!(feature = "code") {
+        expected.push("code_search");
+    }
     assert_eq!(
         tool_names(&listed),
-        vec![
-            "remember",
-            "recall",
-            "text_search",
-            "hybrid_search",
-            "list_collections",
-            "stats",
-            "forget",
-            "get",
-            "browse",
-            "related",
-            "suggest",
-            "list_aliases",
-            "set_alias",
-            "drop_alias",
-        ],
+        expected,
         "stdio's tool list/order must match HTTP's: {listed}"
     );
 }

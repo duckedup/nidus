@@ -39,6 +39,7 @@ so the same id appears in your logs and the server's.
 | `POST /search/batch` | several queries in one round-trip, optionally RRF-fused | – |
 | `POST /text-search` | BM25 full-text search | `text_search` |
 | `POST /hybrid-search` | fused vector + BM25 (RRF) | `hybrid_search` |
+| `POST /code-search`*** | search a chunked code/docs corpus, grouped by file and symbol | `search` / `text_search` |
 | `POST /list` | metadata-only query (no vector) | `list` |
 | `POST /aggregate` | count + sum over a filter, no records materialized | `aggregate` |
 | `POST /flush` | flush buffered writes to disk | `flush` |
@@ -55,6 +56,8 @@ so the same id appears in your logs and the server's.
 \* Present only in a `memory`-featured build (the `serve` umbrella; absent from a plain
 `--features cli` build). See [Memory](#memory-remember--recall) below.
 \*\* Needs the `mcp` feature on top of `memory`. See [`/mcp`](#mcp) below.
+\*\*\* Needs the off-by-default `code` feature on top of `memory`. See
+[`POST /code-search`](#post-code-search) below and the [code search guide](/guides/code/).
 
 ## Health & introspection
 
@@ -633,6 +636,53 @@ no branch worth a `plan`. [Query plans](#query-plans-how-a-query-ran) below cove
 `/search`, `/search/similar`, and `/hybrid-search`. A prefix clause's expansion cap is
 reported through `explain` instead, as `expansion` on that clause's score.
 
+### `POST /code-search`
+
+Search a corpus ingested with [`nidus code ingest`](/guides/code/), grouped by file
+with each hit's matching symbols. Needs the off-by-default `code` feature on top of
+`memory`; a build without it answers `404` here, not `400`. Never returns a raw
+vector or the source body: read the file at the given lines for ground truth.
+
+```bash
+curl -s localhost:7700/code-search \
+  -H 'content-type: application/json' \
+  -d '{"collection": "code", "query": "where do we release commission payments", "limit": 10}'
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `collection` | – (required) | collection to search |
+| `query` | – (required) | the search text: a natural-language description for a vector search, or exact keywords for BM25 |
+| `limit` | `10` | maximum files to return, ranked by their best-matching symbol |
+| `filter` | none | AND of predicates applied before scoring |
+| `vector` | none | `true` forces a vector search, `false` forces BM25; omit to let the store decide (a dimension-0 store, ingested with no embedder, answers BM25) |
+
+```json
+{
+  "files": [
+    {
+      "path": "internal/finance/commission/release.go",
+      "language": "go",
+      "symbols": [
+        { "symbol": "ReleaseCommission", "kind": "function",
+          "start_line": 42, "end_line": 78, "score": 8.31 }
+      ]
+    }
+  ]
+}
+```
+
+`language` is present only for a file that was AST-chunked (a language
+[`wdpkr-core`](https://crates.io/crates/wdpkr-core) recognises); a markdown or
+generically-chunked file carries `language: null` and its symbols carry `symbol: null`
+and `kind: null`, since a heading or a generic split is not a symbol. Files are
+ordered by their best-matching symbol's score; symbols within a file keep that same
+descending order.
+
+`vector: true` against a build with `code` but no `memory` embedder configured (a
+plain `--features code` build, with no `--embed-provider` at serve time) is a `400`
+naming the fix, rather than a silent BM25 fallback the caller did not ask for.
+
 ### `POST /suggest`
 
 Ranked term completions from a field's full-text vocabulary, for an autocomplete dropdown.
@@ -1159,10 +1209,11 @@ than reimplementing any of them: a token required elsewhere on this server is re
 `/mcp` too.
 
 Eleven tools, all text-native: `remember`, `recall`, `text_search`, `hybrid_search`,
-`list_collections`, `stats`, `forget`, `get`, `browse`, `related`, `suggest`. **No tool
-takes a raw vector**:
-every argument is natural language, which is deliberate, since a model cannot emit a raw
-float array as a tool call, and `tests/e2e/mcp/` asserts the surface stays that way.
+`list_collections`, `stats`, `forget`, `get`, `browse`, `related`, `suggest`, plus a
+twelfth, `code_search`, behind the off-by-default `code` feature. **No tool takes a
+raw vector**: every argument is natural language, which is deliberate, since a model
+cannot emit a raw float array as a tool call, and `tests/e2e/mcp/` asserts the surface
+stays that way.
 
 This page does not restate the tool schemas, the transport details, or protocol
 negotiation; see the [MCP guide](/guides/mcp/) for those, including the stdio transport

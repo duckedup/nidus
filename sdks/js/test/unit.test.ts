@@ -1448,3 +1448,89 @@ describe("ops surface (ready/cluster/refresh)", () => {
   });
 });
 
+describe("codeSearch", () => {
+  it("posts collection, query and a default (empty) filter, with the rest pruned", async () => {
+    const { fn, calls } = mockFetch({ files: [] });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    await db.codeSearch({ collection: "code", query: "add" });
+    expect(calls[0]!.url).toBe("http://x/code-search");
+    expect(calls[0]!.init.method).toBe("POST");
+    expect(calls[0]!.json).toEqual({
+      collection: "code",
+      query: "add",
+      filter: [],
+    });
+    expect(calls[0]!.json).not.toHaveProperty("limit");
+    expect(calls[0]!.json).not.toHaveProperty("vector");
+  });
+
+  it("carries limit, filter and an explicit vector-vs-BM25 choice", async () => {
+    const { fn, calls } = mockFetch({ files: [] });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    await db.codeSearch({
+      collection: "code",
+      query: "add",
+      limit: 5,
+      filter: f.and(f.eq("code.language", "rust")),
+      vector: false,
+    });
+    expect(calls[0]!.json).toEqual({
+      collection: "code",
+      query: "add",
+      limit: 5,
+      filter: [{ Eq: ["code.language", { Str: "rust" }] }],
+      vector: false,
+    });
+
+    await db.codeSearch({ collection: "code", query: "add", vector: true });
+    expect(calls[1]!.json).toMatchObject({ vector: true });
+  });
+
+  it("decodes files grouped with their symbols, snake_case to camelCase", async () => {
+    const { fn } = mockFetch({
+      files: [
+        {
+          path: "sample.rs",
+          language: "rust",
+          symbols: [
+            { symbol: "add", kind: "function", start_line: 1, end_line: 3, score: 1.5 },
+          ],
+        },
+        {
+          path: "README.md",
+          language: null,
+          symbols: [
+            { symbol: null, kind: null, start_line: null, end_line: null, score: 0.4 },
+          ],
+        },
+      ],
+    });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    const files = await db.codeSearch({ collection: "code", query: "add" });
+    expect(files).toEqual([
+      {
+        path: "sample.rs",
+        language: "rust",
+        symbols: [{ symbol: "add", kind: "function", startLine: 1, endLine: 3, score: 1.5 }],
+      },
+      {
+        path: "README.md",
+        language: null,
+        symbols: [{ symbol: null, kind: null, startLine: null, endLine: null, score: 0.4 }],
+      },
+    ]);
+  });
+
+  it("throws NidusError with the 404 status when the server has no `code` feature", async () => {
+    const { fn } = mockFetch({ error: "not found" }, 404);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await expect(db.codeSearch({ collection: "code", query: "add" })).rejects.toMatchObject({
+      name: "NidusError",
+      status: 404,
+    });
+  });
+});
+

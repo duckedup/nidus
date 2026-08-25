@@ -25,6 +25,8 @@ use super::{AppState, dto::HitDto};
 
 mod admin;
 mod args;
+#[cfg(feature = "code")]
+mod code;
 mod hygiene;
 mod prompts;
 mod remember;
@@ -123,6 +125,10 @@ fn tools() -> Vec<Tool> {
     // The alias lifecycle tools: appended last for the same reason, so a future edit to
     // `admin::tools()` never shifts them or anything that predates them.
     v.extend(admin::alias_tools());
+    // `code_search` (nidus-3gm unit 5): present only with the `code` feature, so it must
+    // append last too — nothing may ever be inserted after a feature-gated tail (SEP-2549).
+    #[cfg(feature = "code")]
+    v.extend(code::tools());
     v
 }
 
@@ -217,6 +223,8 @@ impl ServerHandler for NidusMcp {
             "list_aliases" => self.list_aliases().await,
             "set_alias" => self.set_alias(&args).await,
             "drop_alias" => self.drop_alias(&args).await,
+            #[cfg(feature = "code")]
+            "code_search" => self.code_search(&args).await,
             other => Err(McpError::invalid_params(
                 format!("unknown tool `{other}`"),
                 None,

@@ -28,3 +28,4 @@ Fetch one with `just spec --file decisions/<file> toc`, or just read it.
 | D0011 | [The binary is gated behind the non-default `cli` feature](0011-the-cli-feature-keeps-cargo-add-fast.md) |
 | D0012 | [A feature ships whole, in one PR](0012-a-feature-ships-whole.md) |
 | D0013 | [Docs retrieval is derived, and never committed](0013-the-docs-index-is-derived-and-never-tracked.md) |
+| D0014 | [nidus depends on `wdpkr-core`, behind the off-by-default `code` feature](0014-nidus-depends-on-wdpkr-core-behind-code.md) |

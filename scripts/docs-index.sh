@@ -1,45 +1,43 @@
 #!/usr/bin/env bash
-# Build the ranked docs index (nidus-gmy.7). Everything it writes lives in target/:
-# gitignored, per-worktree, and `cargo clean`-able (D0013). Never a prerequisite for
-# anything — `bin/spec` falls back to its own text search when this has not been run.
+# Build the ranked docs+code index (nidus-3gm unit 11). Everything it writes lives in
+# target/: gitignored, per-worktree, and `cargo clean`-able (D0013). Never a prerequisite
+# for anything -- `bin/spec` falls back to its own text search when this has not been run.
 set -euo pipefail
 
 repo=$(git rev-parse --show-toplevel)
 cd "$repo"
 store="target/docs-index"
-staged="target/docs-index-src/root"
+features="cli,memory,code"
 
-# The digest that tells `spec find` whether the index still describes the tree. `git ls-files`
-# names the tracked corpus; the content hash comes from the WORKING TREE, because `-s` would
-# report the staged blob and an unstaged doc edit would leave the index silently stale.
-digest=$(git ls-files -z SPEC.md CLAUDE.md .claude/rules decisions \
-  | xargs -0 shasum 2>/dev/null | shasum | cut -d' ' -f1)
+# The digest that tells `spec find` whether the index still describes the tree. `git
+# ls-files` names the whole tracked corpus the ingest below walks; the content hash comes
+# from the WORKING TREE, because `-s` would report the staged blob and an unstaged edit
+# would leave the index silently stale.
+digest=$(git ls-files -z | xargs -0 shasum 2>/dev/null | shasum | cut -d' ' -f1)
 
 if [ "${1:-}" = "--digest" ]; then echo "$digest"; exit 0; fi
 
-echo "building the docs index → $store"
-rm -rf "$store" "$staged"
-mkdir -p "$staged"
-# `ingest` walks directories, not files, so the two root docs are staged into one.
-cp SPEC.md CLAUDE.md "$staged/"
+# Same feature set the ingest call below needs, checked here so a missing `code` feature
+# fails with this message instead of `code ingest` surfacing as a clap "unrecognized
+# subcommand" error further down.
+if ! cargo run --quiet --features "$features" --bin nidus -- --version >/dev/null 2>&1; then
+  echo "docs-index: cannot build a nidus binary with --features $features (needs the" \
+    "'code' feature: cargo build --features $features)" >&2
+  exit 1
+fi
 
-bin=$(cargo run --quiet --features cli,memory --bin nidus -- --version >/dev/null 2>&1 && echo ok || echo no)
-[ "$bin" = "ok" ] || { echo "docs-index: cannot build the nidus binary" >&2; exit 1; }
+echo "building the docs+code index → $store"
+rm -rf "$store"
 
-ingest() { # <root> <collection>
-  cargo run --quiet --features cli,memory --bin nidus -- ingest "$1" \
-    --collection "$2" --dir "$store" --glob '*.md' --strategy markdown \
-    --max-chars 1200 --overlap-chars 100 \
-    --fts-only nidus.text --fts-only nidus.source_path >/dev/null
-}
-
-ingest "$staged" root
-ingest .claude/rules rules
-ingest decisions decisions
+# ONE walk, dot-entries included so it reaches .claude/rules and decisions/ from the repo
+# root; .git is always skipped regardless. Per-file dispatch chunks markdown by heading and
+# source by AST -- what the old three-ingest-plus-staging-copy dance was faking by hand.
+cargo run --quiet --features "$features" --bin nidus -- code ingest . \
+  --dir "$store" --include-hidden --max-chars 1200 --overlap-chars 100 >/dev/null
 
 # In the store, as a sentinel record: it survives a copy of the directory and is visible to
 # every nidus query surface, which a sidecar file beside `manifest` would not be.
 printf '[{"id":"docs-index.digest","attrs":{"digest":{"Str":"%s"}}}]' "$digest" \
-  | cargo run --quiet --features cli,memory --bin nidus -- upsert --dir "$store" meta >/dev/null
+  | cargo run --quiet --features "$features" --bin nidus -- upsert --dir "$store" meta >/dev/null
 
 echo "docs-index: ready. \`spec find <words>\` now ranks; \`just docs-index\` to refresh."

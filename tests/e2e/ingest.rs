@@ -484,10 +484,11 @@ fn dry_run_embeds_nothing_and_writes_nothing() {
     assert!(ids(&store).is_empty(), "nor write: {:?}", ids(&store));
 }
 
-/// Dot-entries are skipped so `nidus ingest .` does not walk `.git`; symlinks are skipped so
-/// a cycle cannot hang the walk. Both are behaviours of the real walk over a real tree.
+/// By default, dot-entries are skipped so `nidus ingest .` does not walk `.git`; symlinks are
+/// skipped so a cycle cannot hang the walk. Both are behaviours of the real walk over a real
+/// tree, unchanged since before nidus-0fw.
 #[test]
-fn the_walk_skips_dot_entries_and_symlinks() {
+fn the_walk_skips_dot_entries_and_symlinks_by_default() {
     let dir = tempfile::tempdir().unwrap();
     let (corpus, store) = (dir.path().join("corpus"), dir.path().join("store"));
     write(&corpus.join("a.md"), "alpha one two three");
@@ -500,6 +501,32 @@ fn the_walk_skips_dot_entries_and_symlinks() {
     let out = ingest(&store, &corpus, &mock.url, &[]);
     assert_eq!(out["matched"], 1, "only the visible file: {out}");
     assert_eq!(ids(&store), vec!["a.md#0".to_string()]);
+}
+
+/// With `--include-hidden`, a dot-directory is walked, but `.git` stays skipped at any
+/// depth and the symlink is still skipped (nidus-0fw). The case that fails if the flag
+/// were implemented as "drop the dot-check" instead of naming `.git` specifically.
+#[test]
+fn the_walk_with_include_hidden_reaches_dot_directories_but_never_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let (corpus, store) = (dir.path().join("corpus"), dir.path().join("store"));
+    write(&corpus.join("a.md"), "alpha one two three");
+    write(&corpus.join(".git/HEAD.md"), "ref: refs/heads/main");
+    write(&corpus.join(".claude/rules/x.md"), "a hidden rule file");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&corpus, corpus.join("loop")).unwrap();
+    let mock = Recorder::start();
+
+    let out = ingest(&store, &corpus, &mock.url, &["--include-hidden"]);
+    assert_eq!(
+        out["matched"], 2,
+        "the visible file and the hidden one: {out}"
+    );
+    assert_eq!(
+        ids(&store),
+        vec![".claude/rules/x.md#0".to_string(), "a.md#0".to_string()],
+        ".git must never be walked, flag or no flag"
+    );
 }
 
 /// A model swap into a collection that already has vectors is refused outright — the store

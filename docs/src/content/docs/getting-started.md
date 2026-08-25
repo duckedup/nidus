@@ -30,7 +30,7 @@ the HTTP alternative.
 ```toml
 # Cargo.toml
 [dependencies]
-nidus = "0.92"
+nidus = "0.93"
 anyhow = "1"     # nidus returns anyhow::Result
 ```
 
