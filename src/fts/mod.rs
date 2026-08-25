@@ -331,7 +331,14 @@ impl FieldIndex {
 /// The most terms one prefix clause may **score**. Ranking by df means every matching term
 /// is still df-scanned first, so this bounds the BM25 disjunction, not the range scan.
 /// Truncates rather than erroring: typeahead's first keystroke must still answer.
+#[cfg(not(miri))]
 pub(crate) const MAX_PREFIX_EXPANSION: usize = 256;
+
+/// Smaller under Miri: the six tests that pin the cap must build a corpus that *exceeds* it,
+/// and at 256 they cost ~145s of that lane. A cap is a comparison, not a branch, so the paths
+/// are identical — see `crate::scale`, and nidus-d1c for the measurements.
+#[cfg(miri)]
+pub(crate) const MAX_PREFIX_EXPANSION: usize = 12;
 
 /// All FTS state for a store: the per-`(collection, field)` indexes plus the declared schema
 /// (`collection → [FtsField]`). The schema is the source of truth for which attrs are

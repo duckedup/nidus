@@ -88,8 +88,8 @@ fn predicates() -> Vec<Predicate> {
 /// predicate actually matches. A subset here is a silently wrong query result.
 #[test]
 fn candidates_are_always_a_superset_of_the_true_matches() {
-    for seed in [1u64, 2, 3, 7, 11, 42] {
-        let docs = corpus(seed, 40);
+    for &seed in &[1u64, 2, 3, 7, 11, 42][..crate::scale(6, 1)] {
+        let docs = corpus(seed, crate::scale(40, 12));
         let idx = build(&docs);
         for pred in predicates() {
             let truth: Vec<&str> = docs

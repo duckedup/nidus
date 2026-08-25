@@ -4726,7 +4726,9 @@ fn conditioning_runs_before_the_cap_not_after_it() {
     store
         .set_fts_schema("docs", &[FtsField::new("body")])
         .unwrap();
-    let decoys = crate::fts::MAX_PREFIX_EXPANSION + 44;
+    // The margin over the cap only has to be comfortable, so it shrinks with the cap: the
+    // fixed +44 was what still cost 10s under Miri once MAX_PREFIX_EXPANSION itself shrank.
+    let decoys = crate::fts::MAX_PREFIX_EXPANSION + crate::scale(44, 4);
     let mut recs: Vec<Record> = Vec::new();
     for i in 0..decoys {
         // Two documents each, so every decoy out-ranks the target on raw df.
@@ -9929,7 +9931,9 @@ fn plan_reports_quantized_path_with_rows_scanned() {
 
 #[test]
 fn plan_reports_ann_path_with_no_rows_scanned() {
-    let data = random_unit_vectors(50, 4, 3);
+    // Which path the planner reports does not depend on the corpus size, and the HNSW build
+    // does: under Miri it is the build, not the search, that costs (see `crate::scale`).
+    let data = random_unit_vectors(crate::scale(50, 16), 4, 3);
     let store = ann_store(4, AnnConfig::hnsw(), &data);
     let q = random_unit_vectors(1, 4, 4).pop().unwrap();
     let (hits, plan) = store
@@ -9943,7 +9947,9 @@ fn plan_reports_ann_path_with_no_rows_scanned() {
 
 #[test]
 fn plan_reports_ann_prefilter_fallback_on_a_selective_filter() {
-    let data = random_unit_vectors(50, 4, 5);
+    // Smaller under Miri for the HNSW build cost; the one tagged doc below is what makes the
+    // filter selective enough to force the fallback, and that is independent of the corpus.
+    let data = random_unit_vectors(crate::scale(50, 16), 4, 5);
     let mut store = ann_store(4, AnnConfig::hnsw(), &data);
     let mut attrs = BTreeMap::new();
     attrs.insert("tag".to_string(), Value::Int(1));
@@ -9997,7 +10003,9 @@ fn plan_reports_segmented_path() {
 
 #[test]
 fn plan_candidates_survived_and_dropped_sum_to_surfaced() {
-    let data = random_unit_vectors(80, 4, 7);
+    // The identity below holds at any corpus size, and the HNSW build does not: 80 vectors
+    // cost 385s under Miri, which was most of that lane's wall clock on its own.
+    let data = random_unit_vectors(crate::scale(80, 16), 4, 7);
     let store = ann_store(4, AnnConfig::hnsw(), &data);
     let q = random_unit_vectors(1, 4, 8).pop().unwrap();
     let (_, plan) = store
