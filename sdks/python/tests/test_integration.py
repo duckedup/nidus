@@ -647,9 +647,9 @@ def test_code_search_groups_a_known_file_by_symbol_and_line_span(server: str) ->
     Attrs mirror exactly what ``nidus code ingest`` stamps on a real AST-chunked symbol
     (``src/code/mod.rs``'s ``META_*`` keys), so this proves ``/code-search``'s own
     grouping and decoding rather than the ingest pipeline (a sibling epic's concern).
-    Skips when the binary lacks the ``code`` feature (``/code-search`` then 404s) — an
-    environment gap, not an SDK bug, same bargain ``test_remember_with_ttl_and_dedupe_
-    fails_visibly_without_an_embedder`` strikes for ``memory``.
+    A 404 fails rather than skips: the lane that runs this builds ``--features serve``,
+    which includes ``code``, so an absent route means the contract is broken, not that the
+    environment is thin. A skipped contract test reads as a pass.
     """
     with NidusClient(server, timeout=10.0) as db:
         db.set_fts_schema("code", ["nidus.text"])
@@ -674,7 +674,11 @@ def test_code_search_groups_a_known_file_by_symbol_and_line_span(server: str) ->
             result = db.code_search(collection="code", query="fox", vector=False)
         except NidusError as caught:
             if caught.status == 404:
-                pytest.skip("server lacks the `code` feature (build with --features code)")
+                raise AssertionError(
+                    "/code-search is absent: the binary under test was built without the "
+                    "`code` feature. The lane that runs this builds --features serve "
+                    "(just build-serve-bin); a skip here would read as a pass."
+                ) from caught
             raise
         assert [g.path for g in result.files] == ["src/lib.rs"]
         file = result.files[0]

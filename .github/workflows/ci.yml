@@ -623,7 +623,9 @@ jobs:
 
       - name: Build the binary the suites drive
         if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
-        run: cargo build --release --features cli
+        # `serve`, not `cli`: the memory and `code` routes exist only there, and a suite
+        # that 404s and skips reads as a pass (nidus-3gm).
+        run: cargo build --release --features serve
 
       - name: Refuse to proceed without the binary (a skip must never read as a pass)
         if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}

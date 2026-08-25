@@ -111,6 +111,12 @@ test-e2e-cluster *FILTER:
 build-cli:
     cargo build --release --features cli
 
+# The binary the SDK integration suites drive. `serve` (not `cli`) because the memory and
+# `code` routes only exist there: a suite driving a `cli`-only binary sees 404s and skips,
+# and a skip reads as a pass (nidus-3gm).
+build-serve-bin:
+    cargo build --release --features serve
+
 # Install the `nidus` binary from this checkout — with the memory endpoints, so
 # the installed `nidus serve` matches the shipped (binstall/Docker) binary.
 install:
@@ -308,7 +314,7 @@ sdk-js-test:
 
 # JS/TS SDK: full test incl. integration against a real `nidus serve`.
 # Builds the binary first and points the suite at it via NIDUS_BIN.
-sdk-js-test-all: build-cli
+sdk-js-test-all: build-serve-bin
     cd sdks/js && npm install && npm run typecheck && \
       NIDUS_BIN={{justfile_directory()}}/target/release/nidus npm test
 
@@ -330,7 +336,7 @@ sdk-go-lint:
 # Go SDK: full test incl. integration against a real `nidus serve`.
 # Builds the binary first and points the suite at it via NIDUS_BIN. The integration
 # tests are behind a build tag, so they are invisible to `sdk-go-test` above.
-sdk-go-test-all: build-cli
+sdk-go-test-all: build-serve-bin
     cd sdks/go && NIDUS_BIN={{justfile_directory()}}/target/release/nidus \
       go test -tags integration ./...
 
@@ -361,7 +367,7 @@ sdk-py-test: sdk-py-venv
 
 # Python SDK: full test incl. integration against a real `nidus serve`.
 # Builds the binary first and points the suite at it via NIDUS_BIN.
-sdk-py-test-all: build-cli sdk-py-venv
+sdk-py-test-all: build-serve-bin sdk-py-venv
     cd sdks/python && ./.venv/bin/mypy src && \
       NIDUS_BIN={{justfile_directory()}}/target/release/nidus ./.venv/bin/pytest
 

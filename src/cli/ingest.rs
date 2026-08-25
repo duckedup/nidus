@@ -37,9 +37,8 @@ pub(super) struct Found {
     pub(super) abs: PathBuf,
 }
 
-/// What the walk declined to enter, so the report can say it out loud instead of leaving a
-/// silent omission (nidus-0fw: "a user pointing `nidus ingest` at any repo silently gets no
-/// .github, no .claude, and nothing says so").
+/// What the walk declined to enter, so the report says it out loud rather than leaving a
+/// silent omission (nidus-0fw).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct WalkSkips {
     /// Dot-entries passed over because `--include-hidden` was off.

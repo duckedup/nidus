@@ -64,12 +64,8 @@ pub(super) fn split(src: &[char], max_chars: usize) -> Vec<(usize, usize)> {
 }
 
 /// Locates every symbol's exact char range, drops the containers, and caps the oversized.
-///
-/// **Containers are dropped, not kept beside their contents.** wdpkr emits a class both as
-/// its own symbol and again as each method inside it (Python/TS/JS/Java/C#/C++ all list the
-/// class node as a symbol AND a container), so keeping both would index the same bytes twice
-/// and inflate every BM25 score for the file. The finer-grained symbol wins, which is what
-/// `docs/guides/code.md` promises: one chunk per function.
+/// A container is dropped rather than kept beside its contents: wdpkr emits a class as a
+/// symbol AND each method inside it, so keeping both indexes the same bytes twice.
 pub(crate) fn locate_symbols(
     src: &[char],
     mut symbols: Vec<SymbolChunk>,

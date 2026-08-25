@@ -184,3 +184,234 @@ fn code_search_vector_with_no_embedder_is_refused() {
         "the error must name the flag and the missing embedder: {stderr}"
     );
 }
+
+/// Two mock providers on loopback: an embedder that records exactly which texts it was asked
+/// to embed, and a summarizer that records its prompts and answers with a fixed sentence.
+/// Both are the `ingest.rs::Recorder` pattern; what they buy here is the only proof that
+/// matters for summarize-then-embed — WHICH text reached the embedder.
+mod summarize_mocks {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    pub struct Mock {
+        pub url: String,
+        pub bodies: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn read_body(stream: &mut std::net::TcpStream) -> String {
+        let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+        let mut len = 0usize;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            let lower = line.to_ascii_lowercase();
+            if let Some(v) = lower.strip_prefix("content-length:") {
+                len = v.trim().parse().unwrap_or(0);
+            }
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+        }
+        let mut body = vec![0u8; len];
+        reader.read_exact(&mut body).ok();
+        String::from_utf8_lossy(&body).to_string()
+    }
+
+    fn respond(mut stream: std::net::TcpStream, json: &str) {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            json.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(json.as_bytes());
+        let _ = stream.flush();
+    }
+
+    /// `response` is a closure so the embedder can echo a deterministic vector and the
+    /// summarizer can answer with prose.
+    pub fn start(response: impl Fn(&str) -> String + Send + 'static) -> Mock {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&bodies);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let body = read_body(&mut stream);
+                sink.lock().expect("sink").push(body.clone());
+                respond(stream, &response(&body));
+            }
+        });
+        Mock {
+            url: format!("http://{addr}"),
+            bodies,
+        }
+    }
+
+    impl Mock {
+        pub fn bodies(&self) -> Vec<String> {
+            self.bodies.lock().expect("sink").clone()
+        }
+    }
+}
+
+/// `--summarize` embeds the SUMMARY, not the body. The load-bearing assertion is what the
+/// embedder was asked to embed: with the flag, the summary sentence; without it, the source.
+/// A test that only checked "the command exited 0" would pass with the summarize step
+/// deleted, which is exactly how this shipped unwired the first time.
+#[test]
+fn summarize_embeds_the_summary_and_stores_it_beside_the_body() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, root) = (tmp.path().join("store"), tmp.path().join("repo"));
+    write(
+        &root.join("src/lib.rs"),
+        "/// Adds one.\npub fn alpha(x: i32) -> i32 {\n    x + 1\n}\n",
+    );
+
+    const SUMMARY: &str = "This function increments an integer by one.";
+    let summarizer = summarize_mocks::start(|_| {
+        serde_json::json!({
+            "choices": [{ "message": { "role": "assistant", "content": SUMMARY } }]
+        })
+        .to_string()
+    });
+    let embedder = summarize_mocks::start(|_| {
+        serde_json::json!({ "embeddings": [[0.1f64, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]] })
+            .to_string()
+    });
+
+    let out = run(&[
+        "code",
+        "ingest",
+        root.to_str().expect("root"),
+        "--dir",
+        store.to_str().expect("store"),
+        "--dim",
+        "8",
+        "--embed-provider",
+        "ollama",
+        "--embed-base-url",
+        &embedder.url,
+        "--summarize",
+        "--summarize-provider",
+        "openai",
+        "--summarize-api-key",
+        "test-key",
+        "--summarize-base-url",
+        &summarizer.url,
+    ]);
+    assert!(
+        out.status.success(),
+        "ingest failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).expect("ingest report is json");
+    assert_eq!(report["summarize"]["files_summarized"], 1, "{report}");
+    // One file summary plus one symbol summary: wdpkr's symbol prompt takes the file
+    // summary as context, so the file call is not optional.
+    assert_eq!(report["summarize"]["model_calls"], 2, "{report}");
+
+    // wdpkr's code-summarizer prompt reached the provider, not nidus's generic default.
+    let prompts = summarizer.bodies();
+    assert!(
+        prompts
+            .iter()
+            .any(|b| b.contains("code summarizer for a semantic search index")),
+        "wdpkr's system prompt must reach the wire: {prompts:?}"
+    );
+
+    // THE claim: the embedder saw the summary, never the function body.
+    let embedded = embedder.bodies();
+    assert!(
+        embedded.iter().any(|b| b.contains("increments an integer")),
+        "the summary must be what gets embedded: {embedded:?}"
+    );
+    assert!(
+        !embedded.iter().any(|b| b.contains("x + 1")),
+        "the body must NOT be what gets embedded under --summarize: {embedded:?}"
+    );
+
+    // The body is still stored and still BM25-searchable; the summary sits beside it.
+    let listed = ok_json(&[
+        "list",
+        "--dir",
+        store.to_str().expect("store"),
+        "--limit",
+        "5",
+    ]);
+    let text = listed.to_string();
+    assert!(text.contains("nidus.summary"), "{listed}");
+    assert!(text.contains("x + 1"), "the body is still stored: {listed}");
+}
+
+/// The spend guard: a budget too small for a file's `1 + symbols` calls embeds that file raw
+/// and says so, rather than half-summarizing it and leaving two kinds of vector in one
+/// corpus with nothing recording which is which.
+#[test]
+fn a_file_the_summarize_budget_cannot_cover_is_embedded_raw_and_reported() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, root) = (tmp.path().join("store"), tmp.path().join("repo"));
+    write(
+        &root.join("src/lib.rs"),
+        "pub fn a() -> i32 {\n    1\n}\n\npub fn b() -> i32 {\n    2\n}\n",
+    );
+
+    let summarizer = summarize_mocks::start(|_| {
+        serde_json::json!({
+            "choices": [{ "message": { "role": "assistant", "content": "summary" } }]
+        })
+        .to_string()
+    });
+    let embedder = summarize_mocks::start(|_| {
+        serde_json::json!({ "embeddings": [[0.1f64, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]] })
+            .to_string()
+    });
+
+    let out = run(&[
+        "code",
+        "ingest",
+        root.to_str().expect("root"),
+        "--dir",
+        store.to_str().expect("store"),
+        "--dim",
+        "8",
+        "--embed-provider",
+        "ollama",
+        "--embed-base-url",
+        &embedder.url,
+        "--summarize",
+        "--summarize-provider",
+        "openai",
+        "--summarize-api-key",
+        "test-key",
+        "--summarize-base-url",
+        &summarizer.url,
+        // The file needs three calls (one file plus two symbols); two is not enough.
+        "--summarize-budget",
+        "2",
+    ]);
+    assert!(
+        out.status.success(),
+        "ingest failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).expect("ingest report is json");
+    assert_eq!(report["summarize"]["files_over_budget"], 1, "{report}");
+    assert_eq!(report["summarize"]["files_summarized"], 0, "{report}");
+    assert_eq!(
+        report["summarize"]["model_calls"], 0,
+        "not one call may be spent on a file it cannot finish: {report}"
+    );
+    assert!(
+        summarizer.bodies().is_empty(),
+        "the provider must not be called at all for a file over budget"
+    );
+    // The bodies were embedded instead, so the file is still searchable.
+    assert!(
+        embedder.bodies().iter().any(|b| b.contains("1")),
+        "the raw bodies must still be embedded: {:?}",
+        embedder.bodies()
+    );
+}

@@ -87,10 +87,33 @@ silently falling back, when no embedder is available or the store holds no vecto
 The code engine carries `wdpkr-core`'s own code-summarization prompts (one for a
 whole file, one per symbol), built for embedding what code *means* rather than its
 literal tokens, which is what closes a conceptual query like "where do we release
-commission payments" onto a function that never spells any of those words. They are
-exposed as library-level `SummarizeOpts` builders (`feature = "summarize"`) for a
-custom ingest pipeline built on `Nidus` directly, alongside the same
-[summarize provider](/guides/remember-and-recall/) setup `nidus remember` uses.
+commission payments" onto a function that never spells any of those words. Pass `--summarize` with a summarize provider and `code ingest` embeds each symbol's
+summary instead of its body. The body is still stored and still BM25-searchable; the
+summary sits beside it under `nidus.summary`.
+
+```bash
+nidus code ingest . --dir ./index \
+  --embed-provider voyage --embed-api-key "$VOYAGE_API_KEY" \
+  --summarize --summarize-provider anthropic --summarize-api-key "$ANTHROPIC_API_KEY" \
+  --summarize-budget 500
+```
+
+It costs one model call per file plus one per symbol, so a whole repo is thousands of
+calls. `--summarize-budget` is the ceiling (500 by default). A file whose remaining
+budget cannot cover it is embedded raw rather than half-summarized, and the report
+counts those under `summarize.files_over_budget`, so a truncated run says so instead of
+leaving two kinds of vector in one corpus with nothing recording which is which.
+
+The prompts are also exposed as library-level `SummarizeOpts` builders
+(`feature = "summarize"`) for a custom ingest pipeline built on `Nidus` directly.
+
+## Known limitation: exported TypeScript classes
+
+An exported class (`export class Foo { ... }`) currently chunks as one chunk for the
+whole export rather than one per method. A plain `class Foo { ... }` chunks per method,
+as do Python, Java and C# classes. The cause is upstream, in how `wdpkr-core` walks an
+export statement ([wdpkr-core#7](https://github.com/duckedup/wdpkr-core/issues/7)), so it
+is fixed there rather than worked around here.
 
 ## Why off by default
 

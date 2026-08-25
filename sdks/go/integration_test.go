@@ -1114,9 +1114,10 @@ func TestSuggestAgainstARealServer(t *testing.T) {
 // load-bearing claim is the shape of what comes back: a symbol name and a real line
 // span, grouped under its file — "a 200 came back" proves nothing.
 //
-// The route exists only on a binary built with the `code` feature, which
-// `just build-cli` does not set, so a 404 here is skipped rather than failed: it says
-// this harness's binary lacks the feature, not that the SDK is wrong.
+// The route exists only on a binary built with the `code` feature, and the lane that runs
+// this (`just sdk-go-test-all`, and CI's sdk-integration job) builds `--features serve`,
+// which includes it. So a 404 is a FAILURE, not a skip: a skipped contract test reads as a
+// pass, which is how a broken route ships (nidus-3gm).
 func TestCodeSearchAgainstARealServer(t *testing.T) {
 	db := startServer(t)
 	ctx := context.Background()
@@ -1166,7 +1167,8 @@ func TestCodeSearchAgainstARealServer(t *testing.T) {
 	if err != nil {
 		var nerr *Error
 		if errors.As(err, &nerr) && nerr.Status == 404 {
-			t.Skip("server has no /code-search route — built without the `code` feature")
+			t.Fatalf("/code-search is absent: the binary under test was built without the " +
+				"`code` feature. Build it with `--features serve` (just build-serve-bin).")
 		}
 		t.Fatalf("CodeSearch failed: %v", err)
 	}

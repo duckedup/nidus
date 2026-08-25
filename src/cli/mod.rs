@@ -472,10 +472,9 @@ impl StoreArgs {
 #[cfg(feature = "memory")]
 #[derive(Args, Debug, Default)]
 struct IngestArgs {
-    /// Walk dot-entries too (`.github`, `.claude`, …). `.git` is always skipped, at any
-    /// depth, regardless of this flag. Defaults to off for `nidus ingest`, so its output is
-    /// unchanged, and to ON for `nidus code ingest`, which exists to read a repo; pass
-    /// `--include-hidden false` there to turn it back off (nidus-0fw).
+    /// Walk dot-entries too (`.github`, `.claude`, …); `.git` is always skipped regardless.
+    /// Off by default for `ingest`, on for `code ingest`, which exists to read a repo: pass
+    /// `--include-hidden false` there to turn it off (nidus-0fw).
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     include_hidden: Option<bool>,
     /// Embedding provider for `/remember` and `/recall`: voyage, openai, ollama,
@@ -829,6 +828,20 @@ enum CodeCommand {
         /// Cached vectors to keep before evicting the oldest.
         #[arg(long, default_value_t = crate::embed::cache::DEFAULT_MAX_ENTRIES)]
         cache_max_entries: usize,
+        /// Summarize each symbol before embedding it, using wdpkr's code-summarization
+        /// prompts, and embed the summary instead of the body. This is what makes a
+        /// conceptual query match source that never says those words. Needs both an
+        /// embedder and --summarize-provider. Off by default: it is one model call per
+        /// symbol plus one per file, so a whole repo is thousands of calls.
+        #[cfg(all(feature = "memory", feature = "summarize"))]
+        #[arg(long)]
+        summarize: bool,
+        /// Ceiling on model calls for --summarize, counting one per file plus one per
+        /// symbol. A file whose remaining budget cannot cover it is embedded raw rather
+        /// than half-summarized, and the report says how many were left out.
+        #[cfg(all(feature = "memory", feature = "summarize"))]
+        #[arg(long, default_value_t = 500)]
+        summarize_budget: usize,
     },
     /// Search indexed source and docs, grouped by file with symbol, kind and line span.
     /// Never prints source; the agent reads the file for ground truth.
@@ -2380,6 +2393,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 dry_run,
                 no_cache,
                 cache_max_entries,
+                #[cfg(feature = "summarize")]
+                summarize,
+                #[cfg(feature = "summarize")]
+                summarize_budget,
             } => code::ingest(
                 store,
                 ingest,
@@ -2391,6 +2408,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 dry_run,
                 no_cache,
                 cache_max_entries,
+                #[cfg(feature = "summarize")]
+                summarize,
+                #[cfg(feature = "summarize")]
+                summarize_budget,
             ),
             CodeCommand::Search {
                 store,

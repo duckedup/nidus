@@ -29,10 +29,10 @@ try {
 const PORT = 7799;
 const baseUrl = `http://127.0.0.1:${PORT}`;
 
-// `just build-cli` (what NIDUS_BIN normally points at) builds `--features cli` only, so
-// `nidus code ingest` (needs `memory` + `code`) is absent and `/code-search` 404s.
-// Detected once up front — synchronously, so it can gate `describe.skipIf` below —
-// rather than letting the round-trip test read a missing feature as a client bug.
+// The lane that runs this (`just sdk-js-test-all`, CI's sdk-integration job) builds
+// `--features serve`, which includes `code`, so the subcommand must be there. Detected once
+// up front — synchronously, so it can fail loudly below rather than silently skipping: a
+// skipped contract test reads as a pass, which is how a broken route ships (nidus-3gm).
 let codeFeatureAvailable = false;
 if (binaryExists) {
   try {
@@ -43,10 +43,10 @@ if (binaryExists) {
   }
 }
 if (binaryExists && !codeFeatureAvailable) {
-  console.warn(
-    `codeSearch integration test skipped: ${binary} has no \`code\` subcommand. ` +
-      "Build with `cargo build --release --features cli,memory,code` (or `serve`, which " +
-      "includes both) and point NIDUS_BIN at it to run this test.",
+  throw new Error(
+    `${binary} has no \`code\` subcommand, so the codeSearch contract cannot be tested. ` +
+      "Build it with `--features serve` (just build-serve-bin) and point NIDUS_BIN at it. " +
+      "This throws rather than skipping: a skipped contract test reads as a pass.",
   );
 }
 const CODE_PORT = 7798;

@@ -32,8 +32,7 @@ pub const META_END_LINE: &str = "code.end_line";
 /// The language [`wdpkr_core::chunk::detect_language`] reported for this file.
 pub const META_LANGUAGE: &str = "code.language";
 /// The symbol's doc comment, marker-stripped. Separate from `text` because wdpkr cleans it
-/// (`/// x` -> `x`), so it is not a source slice and cannot join a [`crate::chunk::Chunk`]
-/// without breaking the exact-char-slice invariant. Indexed for BM25: a doc comment is
+/// (`/// x` -> `x`), so it is no longer a source slice. Indexed for BM25: a doc comment is
 /// often the only prose naming what a symbol is for.
 pub const META_DOC: &str = "code.doc";
 
@@ -89,14 +88,9 @@ fn prose_chunks(
         .collect())
 }
 
-/// One [`CodeChunk`] per symbol, in source order, each carrying its own name, kind,
-/// line span and (marker-stripped) doc comment.
-///
-/// The span arithmetic and the container/oversize rules live in [`crate::chunk::code`], so
-/// `ChunkStrategy::Code` and this metadata-carrying path cannot disagree about what a symbol
-/// is. An earlier version relocated each body with a forward-only `find`, which silently
-/// dropped every method inside a class: wdpkr emits the class as a symbol too, and the class
-/// body consumed the bytes its methods needed.
+/// One [`CodeChunk`] per symbol, in source order, with its name, kind, line span and doc
+/// comment. Span arithmetic and the container/oversize rules live in [`crate::chunk::code`],
+/// so this path and `ChunkStrategy::Code` cannot disagree about what a symbol is.
 fn code_chunks(path: &str, text: &str, lang: &str, opts: &ChunkOpts) -> Vec<CodeChunk> {
     let symbols = match TreeSitterChunker::new().chunk(path, text, lang) {
         Ok(f) => f.symbols,
@@ -250,11 +244,9 @@ mod tests {
         // The real content is never duplicated into the instructions lead-in.
         assert!(!instructions.contains("pub fn f() {}"));
     }
-    /// The bug the review caught: wdpkr emits a Python class BOTH as its own symbol and as
-    /// each method inside it. The earlier forward-only `find` let the class body consume the
-    /// bytes its methods needed, so every method vanished and the file became one
-    /// class-sized chunk. Five of the eight grammars (Python, TS, JS, Java, C#) have that
-    /// shape, so this is the common case, not an edge one.
+    /// wdpkr emits a Python class BOTH as its own symbol and as each method inside it, and
+    /// a forward-only `find` let the class consume the bytes its methods needed. Five of the
+    /// eight grammars have that shape, so it is the common case, not an edge one.
     #[test]
     fn a_class_yields_its_methods_not_the_container() {
         let src = "class Foo:\n    def one(self):\n        return 1\n\n    def two(self):\n        return 2\n";

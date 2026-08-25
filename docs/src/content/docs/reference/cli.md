@@ -104,7 +104,7 @@ the binary was built with the `memory` feature (the `serve` umbrella). With no
 
 | Flag | Env | Description |
 | --- | --- | --- |
-| `--include-hidden` | n/a | Walk dot-entries too (`.github`, `.claude`, …). `.git` is always skipped, at any depth, regardless of this flag. Off by default; `code ingest` turns it on. |
+| `--include-hidden [BOOL]` | n/a | Walk dot-entries too (`.github`, `.claude`, …). `.git` is always skipped, at any depth, regardless of this flag. Defaults to off for `ingest` and on for `code ingest`, which exists to read a repo; pass `--include-hidden false` there to turn it back off. |
 | `--embed-provider <NAME>` | `NIDUS_EMBED_PROVIDER` | Embedding provider: `voyage`, `openai`, `ollama`, `cohere`, `gemini`, `mistral`, `jina`, or `openai-compat`. |
 | `--embed-model <MODEL>` | `NIDUS_EMBED_MODEL` | Embedding model. Defaults to the provider's default (`openai-compat` has none). |
 | `--embed-api-key <KEY>` | `NIDUS_EMBED_API_KEY` | API key for the embedding provider (some, e.g. Ollama, need none). |
@@ -627,11 +627,17 @@ configured, this ingests for BM25 only, same as `ingest --fts-only`), plus:
 | `--dry-run` | none | Report what would happen without embedding or writing anything. |
 | `--no-cache` | none | Skip the content-hash embedding cache. |
 | `--cache-max-entries <N>` | none | Cached vectors to keep before evicting the oldest (default `50000`). |
+| `--summarize` | none | Summarize each symbol with wdpkr's code-summarization prompts and embed the summary instead of the body, so a conceptual query matches source that never says those words. Needs both an embedder and `--summarize-provider`. Off by default: it costs one model call per file plus one per symbol. |
+| `--summarize-budget <N>` | none | Ceiling on model calls for `--summarize`, counting one per file plus one per symbol (default `500`). A file whose remaining budget cannot cover it is embedded raw rather than half-summarized, and the report counts it under `summarize.files_over_budget`. |
 
-`PATH` defaults to the current directory. Dot-entries are always walked (`.github`,
-`.claude`, …), so a repo scan reaches its own config and docs; `.git` is always skipped,
-at any depth, regardless. Symlinks are skipped and files that are not valid UTF-8 are
-skipped, same as `ingest`.
+`PATH` defaults to the current directory. Dot-entries are walked by default here (`.github`,
+`.claude`, …), so a repo scan reaches its own config and docs; pass
+`--include-hidden false` to turn that off. `.git` is always skipped, at any depth,
+regardless. Build and dependency directories are never walked (`target`, `node_modules`,
+`.venv`, `venv`, `dist`, `build`, `.beads`, `.next`, `__pycache__`), because this command
+defaults to a whole repo. Symlinks are skipped and files that are not valid UTF-8 are
+skipped, same as `ingest`. The report says how many entries the walk declined and why:
+`skipped_hidden`, `skipped_git`, `skipped_build_dirs`, `skipped_symlinks`.
 
 ### `code search` (`memory`, `code` features)
 

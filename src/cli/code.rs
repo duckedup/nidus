@@ -33,10 +33,9 @@ const WDPKR_CORE_VERSION: &str = "0.2.0";
 /// a caller is most likely to name directly.
 const CODE_FTS_FIELDS: [&str; 4] = [META_TEXT, CODE_META_PATH, META_SYMBOL, META_DOC];
 
-/// Directories `code ingest` never walks into. It defaults to the repo root with dot-entries
-/// ON, so without this a single run reads all of `target/` and `node_modules/` — minutes of
-/// IO and a corpus of build output. `nidus ingest`'s own default is untouched: it passes
-/// `&[]` and keeps skipping every dot-entry instead.
+/// Directories `code ingest` never walks into: it defaults to a whole repo with dot-entries
+/// on, so without this a run reads all of `target/`. `nidus ingest` passes `&[]` and keeps
+/// its own default (skip every dot-entry) untouched.
 const BUILD_DIRS: &[&str] = &[
     "target",
     "node_modules",
@@ -72,6 +71,8 @@ pub(super) fn ingest(
     dry_run: bool,
     no_cache: bool,
     cache_max_entries: usize,
+    #[cfg(feature = "summarize")] summarize: bool,
+    #[cfg(feature = "summarize")] summarize_budget: usize,
 ) -> Result<()> {
     let opts = ChunkOpts {
         strategy: ChunkStrategy::Recursive,
@@ -92,7 +93,38 @@ pub(super) fn ingest(
             Some(e) => embedder_identity(e),
             None => "fts-only:code".to_string(),
         };
+        #[cfg(feature = "summarize")]
+        let summarizer = match summarize {
+            true => match ingest.build_summarizer().await? {
+                Some(s) => Some(s),
+                None => anyhow::bail!(
+                    "--summarize needs a summarizer: pass --summarize-provider (anthropic or openai)"
+                ),
+            },
+            false => None,
+        };
+        #[cfg(feature = "summarize")]
+        if summarizer.is_some() && embedder.is_none() {
+            anyhow::bail!(
+                "--summarize embeds the summary, so it needs an embedder too: pass \
+                 --embed-provider, or drop --summarize for the BM25-only path"
+            );
+        }
+        // The digest folds the summarize identity, so turning --summarize on or off
+        // re-ingests instead of leaving two regimes of vectors side by side.
+        #[cfg(feature = "summarize")]
+        let base_identity = {
+            use crate::summarize::Summarizer as _;
+            match &summarizer {
+                Some(s) => {
+                    format!("{base_identity}+sum:{}/{}", s.provider_name(), s.model_name())
+                }
+                None => base_identity,
+            }
+        };
         let identity = format!("{base_identity}+wdpkr-{WDPKR_CORE_VERSION}");
+        #[cfg(feature = "summarize")]
+        let mut summarize_budget = summarize_budget;
         let dimension = embedder.as_ref().map_or(0, |e| e.dimension());
         let mut db = match &embedder {
             Some(e) => super::memory::open_with(store, e, !dry_run)?,
@@ -161,6 +193,31 @@ pub(super) fn ingest(
                 continue;
             }
 
+            #[cfg_attr(not(feature = "summarize"), allow(unused_mut))]
+            let mut chunks = chunks;
+            #[cfg_attr(not(feature = "summarize"), allow(unused_mut))]
+            let mut embed_texts: Vec<String> =
+                chunks.iter().map(|c| c.text.clone()).collect();
+            #[cfg(feature = "summarize")]
+            if let Some(summarizer) = &summarizer {
+                match summarize_file(
+                    summarizer,
+                    &file.rel,
+                    &text,
+                    &mut chunks,
+                    &mut summarize_budget,
+                    &mut report.summarize_calls,
+                )
+                .await?
+                {
+                    Some(texts) => {
+                        embed_texts = texts;
+                        report.files_summarized += 1;
+                    }
+                    None => report.files_over_summarize_budget += 1,
+                }
+            }
+
             let written = match &cached {
                 Some(cached) => {
                     ingest_chunks_embedded(
@@ -169,6 +226,7 @@ pub(super) fn ingest(
                         &collection,
                         &file.rel,
                         chunks,
+                        &embed_texts,
                         &hash,
                         n,
                     )
@@ -204,6 +262,7 @@ pub(super) fn ingest(
             "skipped_build_dirs": skips.build_dirs,
             "skipped_symlinks": skips.symlinks,
             "chunks": report.chunks,
+            "summarize": summarize_report(&report),
             "pruned": report.pruned,
             "would_ingest": report.would_ingest,
             "dry_run": dry_run,
@@ -225,21 +284,147 @@ struct Report {
     chunks: usize,
     pruned: usize,
     would_ingest: usize,
+    /// Files whose symbols were summarized before embedding (`--summarize`).
+    #[cfg(feature = "summarize")]
+    files_summarized: usize,
+    /// Files embedded raw because the remaining `--summarize-budget` could not cover them.
+    /// Counted and reported rather than silently half-summarized.
+    #[cfg(feature = "summarize")]
+    files_over_summarize_budget: usize,
+    /// Model calls spent on summaries.
+    #[cfg(feature = "summarize")]
+    summarize_calls: usize,
+}
+
+/// The summarize half of the report: `null` when nothing was summarized, so a run without
+/// `--summarize` reads exactly as it did before, and a run with it says how many files were
+/// summarized, how many calls that cost, and how many files the budget could not cover.
+fn summarize_report(report: &Report) -> serde_json::Value {
+    #[cfg(feature = "summarize")]
+    if report.files_summarized > 0 || report.files_over_summarize_budget > 0 {
+        return serde_json::json!({
+            "files_summarized": report.files_summarized,
+            "files_over_budget": report.files_over_summarize_budget,
+            "model_calls": report.summarize_calls,
+        });
+    }
+    let _ = report;
+    serde_json::Value::Null
+}
+
+/// Summarize one file and its symbols with wdpkr's prompts, driven through nidus's own
+/// [`crate::summarize::AnySummarizer`], and return the text to embed per chunk.
+///
+/// Returns `None` — embed the bodies raw, count it, say so — when the remaining budget
+/// cannot cover this whole file. A half-summarized file would mean two kinds of vector in
+/// one corpus with nothing recording which is which.
+///
+/// wdpkr's symbol prompt takes the FILE summary as context, which is what stops per-symbol
+/// summaries reading generically, so the file summary is the first call and the symbols
+/// follow it: `1 + symbols` calls per file.
+#[cfg(feature = "summarize")]
+async fn summarize_file(
+    summarizer: &crate::summarize::AnySummarizer,
+    rel: &str,
+    text: &str,
+    chunks: &mut [crate::code::CodeChunk],
+    budget: &mut usize,
+    calls: &mut usize,
+) -> Result<Option<Vec<String>>> {
+    use crate::summarize::Summarizer;
+
+    let symbol_count = chunks
+        .iter()
+        .filter(|c| c.attrs.contains_key(META_SYMBOL))
+        .count();
+    if symbol_count == 0 {
+        return Ok(None);
+    }
+    let needed = symbol_count + 1;
+    if *budget < needed {
+        return Ok(None);
+    }
+
+    let language = chunks
+        .iter()
+        .find_map(|c| match c.attrs.get(crate::code::META_LANGUAGE) {
+            Some(Value::Str(l)) => Some(l.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    // `imports` stays empty: `chunk_file` returns chunks, not wdpkr's `FileChunks`, so the
+    // import list is not threaded through. The prompt treats it as optional context.
+    let file_input = wdpkr_core::summarize::FileSummaryInput {
+        file_path: rel.to_string(),
+        content: text.to_string(),
+        imports: Vec::new(),
+        language: language.clone(),
+    };
+    let file_summary = summarizer
+        .summarize(text, &crate::code::file_summarize_opts(&file_input))
+        .await
+        .with_context(|| format!("summarizing {rel}"))?;
+    *budget -= 1;
+    *calls += 1;
+
+    let mut embed_texts = Vec::with_capacity(chunks.len());
+    for chunk in chunks.iter_mut() {
+        let (Some(Value::Str(name)), Some(Value::Str(kind))) = (
+            chunk.attrs.get(META_SYMBOL),
+            chunk.attrs.get(crate::code::META_KIND),
+        ) else {
+            // A prose chunk (markdown, config): embed it as written. wdpkr's prompts are
+            // about symbols, and a heading section is not one.
+            embed_texts.push(chunk.text.clone());
+            continue;
+        };
+        let doc = match chunk.attrs.get(crate::code::META_DOC) {
+            Some(Value::Str(d)) => Some(d.clone()),
+            _ => None,
+        };
+        let input = wdpkr_core::summarize::SymbolSummaryInput {
+            symbol_name: name.clone(),
+            symbol_kind: kind.clone(),
+            body: chunk.text.clone(),
+            signature: None,
+            doc_comment: doc,
+            file_path: rel.to_string(),
+            file_summary: file_summary.clone(),
+        };
+        let summary = summarizer
+            .summarize(&chunk.text, &crate::code::symbol_summarize_opts(&input))
+            .await
+            .with_context(|| format!("summarizing {rel}::{name}"))?;
+        *budget -= 1;
+        *calls += 1;
+        chunk.attrs.insert(
+            crate::memory::META_SUMMARY.to_string(),
+            Value::Str(summary.clone()),
+        );
+        embed_texts.push(summary);
+    }
+    Ok(Some(embed_texts))
 }
 
 /// One file's chunks, embedded and committed as one group under a single barrier (mirrors
 /// [`crate::memory::remember_chunked_with`]), each keeping its own per-symbol attrs rather
 /// than the one shared `attrs` map a plain `remember` write uses.
+#[allow(clippy::too_many_arguments)]
 async fn ingest_chunks_embedded<E: Embedder>(
     db: &mut Nidus,
     embedder: &E,
     collection: &str,
     rel: &str,
     chunks: Vec<crate::code::CodeChunk>,
+    embed_texts: &[String],
     hash: &str,
     n: usize,
 ) -> Result<usize> {
-    let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+    // The embedded text is NOT always the chunk body: with --summarize it is the symbol's
+    // summary, which is the whole point of summarize-then-embed. The body is still what is
+    // stored and what BM25 indexes.
+    let texts: Vec<&str> = embed_texts.iter().map(String::as_str).collect();
     let vectors = embedder
         .embed_batch(&texts)
         .await
