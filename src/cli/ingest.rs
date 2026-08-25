@@ -51,11 +51,8 @@ pub(super) struct WalkSkips {
     pub(super) symlinks: usize,
 }
 
-/// Recursive `read_dir`, sorted so the order is reproducible. Symlinks are never followed so
-/// a cycle cannot hang the walk. `.git` is always skipped at any depth; every other
-/// dot-entry is skipped unless `include_hidden` is set (nidus-0fw); any directory named in
-/// `skip_dirs` is skipped at any depth (`nidus code ingest` passes the build-output list, so
-/// pointing it at a repo root does not read all of `target/`).
+/// Recursive `read_dir`, sorted, never following symlinks. `.git` is always skipped, other
+/// dot-entries unless `include_hidden`, and anything named in `skip_dirs` (nidus-0fw).
 pub(super) fn walk(
     root: &Path,
     include_hidden: bool,

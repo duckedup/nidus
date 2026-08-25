@@ -828,11 +828,9 @@ enum CodeCommand {
         /// Cached vectors to keep before evicting the oldest.
         #[arg(long, default_value_t = crate::embed::cache::DEFAULT_MAX_ENTRIES)]
         cache_max_entries: usize,
-        /// Summarize each symbol before embedding it, using wdpkr's code-summarization
-        /// prompts, and embed the summary instead of the body. This is what makes a
-        /// conceptual query match source that never says those words. Needs both an
-        /// embedder and --summarize-provider. Off by default: it is one model call per
-        /// symbol plus one per file, so a whole repo is thousands of calls.
+        /// Summarize each symbol with wdpkr's prompts and embed the summary, not the body,
+        /// so a conceptual query matches source that never says those words. Needs an
+        /// embedder and --summarize-provider; costs one call per symbol plus one per file.
         #[cfg(all(feature = "memory", feature = "summarize"))]
         #[arg(long)]
         summarize: bool,

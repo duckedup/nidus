@@ -185,10 +185,9 @@ fn code_search_vector_with_no_embedder_is_refused() {
     );
 }
 
-/// Two mock providers on loopback: an embedder that records exactly which texts it was asked
-/// to embed, and a summarizer that records its prompts and answers with a fixed sentence.
-/// Both are the `ingest.rs::Recorder` pattern; what they buy here is the only proof that
-/// matters for summarize-then-embed — WHICH text reached the embedder.
+/// Two mock providers on loopback (the `ingest.rs::Recorder` pattern): an embedder and a
+/// summarizer, both recording their request bodies. That recording is the only proof that
+/// matters for summarize-then-embed: WHICH text reached the embedder.
 mod summarize_mocks {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
@@ -258,8 +257,7 @@ mod summarize_mocks {
 }
 
 /// `--summarize` embeds the SUMMARY, not the body. The load-bearing assertion is what the
-/// embedder was asked to embed: with the flag, the summary sentence; without it, the source.
-/// A test that only checked "the command exited 0" would pass with the summarize step
+/// embedder was asked to embed: a test checking only "exit 0" passes with the summarize step
 /// deleted, which is exactly how this shipped unwired the first time.
 #[test]
 fn summarize_embeds_the_summary_and_stores_it_beside_the_body() {

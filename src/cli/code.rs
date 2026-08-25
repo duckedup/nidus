@@ -312,16 +312,9 @@ fn summarize_report(report: &Report) -> serde_json::Value {
     serde_json::Value::Null
 }
 
-/// Summarize one file and its symbols with wdpkr's prompts, driven through nidus's own
-/// [`crate::summarize::AnySummarizer`], and return the text to embed per chunk.
-///
-/// Returns `None` — embed the bodies raw, count it, say so — when the remaining budget
-/// cannot cover this whole file. A half-summarized file would mean two kinds of vector in
-/// one corpus with nothing recording which is which.
-///
-/// wdpkr's symbol prompt takes the FILE summary as context, which is what stops per-symbol
-/// summaries reading generically, so the file summary is the first call and the symbols
-/// follow it: `1 + symbols` calls per file.
+/// Summarize one file and its symbols with wdpkr's prompts, returning the text to embed per
+/// chunk, or `None` when the remaining budget cannot cover the whole file. wdpkr's symbol
+/// prompt takes the file summary as context, so a file costs `1 + symbols` calls.
 #[cfg(feature = "summarize")]
 async fn summarize_file(
     summarizer: &crate::summarize::AnySummarizer,
@@ -584,10 +577,9 @@ fn scope<'a>(refs: &'a [&'a str]) -> crate::Scope<'a> {
     }
 }
 
-/// One clause per declared field, `Max`-combined: a query word may live in the body, the
-/// path, the symbol name or the doc comment, and a doc comment is often the only prose
-/// naming what a symbol is for. `Max` rather than `Sum` so a long body cannot out-accumulate
-/// an exact symbol-name match.
+/// One clause per declared field: a query word may live in the body, the path, the symbol
+/// name or the doc comment. `Max` rather than `Sum`, so a long body cannot out-accumulate an
+/// exact symbol-name match.
 fn text_search(db: &Nidus, refs: &[&str], query: &str, top_k: usize) -> Result<Vec<crate::Hit>> {
     let q = FtsQuery {
         combine: crate::FtsCombine::Max,
