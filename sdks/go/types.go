@@ -558,6 +558,10 @@ type SuggestRequest struct {
 	Prefix string   `json:"prefix"`
 	Limit  int      `json:"limit,omitempty"`
 	Filter Filter   `json:"filter,omitempty"`
+	// Fuzzy enables typo tolerance. Nil means the server default, which is on; set it
+	// to false explicitly to opt out. A plain bool would send false for every caller
+	// that ignores the field, inverting the default.
+	Fuzzy *bool `json:"fuzzy,omitempty"`
 }
 
 // Suggestion is one completion: an indexed term and how many live documents contain it.

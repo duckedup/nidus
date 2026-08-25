@@ -553,6 +553,7 @@ field's vocabulary, for an autocomplete dropdown.
 pub struct SuggestOpts {
     pub limit: usize,    // 0 answers nothing, exactly as SearchOpts::top_k does
     pub filter: Filter,  // each df counts only matching documents
+    pub fuzzy: bool,     // typo tolerance, on by default (see Default below)
 }
 
 pub struct Suggestion {

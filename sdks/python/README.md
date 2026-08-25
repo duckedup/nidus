@@ -280,6 +280,11 @@ prefix clause ranks documents. Only the prefix's final token is completed. Unlik
 prefix clause, which matches stems, `suggest` matches surface forms, so a corpus
 indexing "running" completes `running` at every keystroke.
 
+If the exact prefix matches nothing at all, `suggest` retries within a short edit budget
+that grows with the fragment's length, so `"runing"` still completes to `"running"`. It is
+on by default and costs nothing when the exact prefix answers. Pass `fuzzy=False` to
+turn it off.
+
 ## Query plans
 
 `search`, `search_similar`, and `hybrid_search` each have a `_with_plan` sibling that

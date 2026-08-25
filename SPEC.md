@@ -756,6 +756,69 @@ reliable guard there is to refuse work *before* allocating:
   - **HTTP is `POST /suggest`** with `scope` in the body, mirroring `/text-search`;
     `POST /collections/{name}/suggest` is retired, since one capability gets one route. MCP's
     `suggest` tool stays single-`collection`, as every MCP tool is, but gains `filter`.
+- **`suggest` falls back to a fuzzy leg when the exact-prefix scan finds nothing at all**
+  (nidus-972). This is a fallback, not a widening: a fragment the prefix leg answers costs
+  exactly what it costs today, and the fuzzy leg engages only when the prefix leg's merged
+  result, across the whole scope, is empty.
+  - **Prefix edit distance, not whole-string.** The fragment is matched against any *prefix* of
+    a candidate surface form, so `runn` reaches `running` at distance 0 rather than the three
+    edits separating the whole strings. This is a different primitive from the filter layer's
+    whole-string `Predicate::Fuzzy` (`filter::levenshtein_ascii_ci`, §7.4), and is written new
+    rather than shared with it.
+  - **The budget is length-derived**: 0 below 4 characters, 1 at 4-7, 2 at 8+. `MAX_FUZZY_EDITS`
+    (8, §7.4) is not reused: that is the filter layer's whole-string budget for an already-typed
+    complete term, while a completion's tolerance has to follow what was typed so far, not what
+    a filter predicate permits. A budget of 2 on a 3-character fragment would rank noise above
+    the completion the typist meant, so short fragments get none.
+  - **Narrowed by the surface map's own ordering, not by a second index.** `surface` is a
+    `BTreeMap`, so it is already an implicit trie: the DP runs down shared prefixes, and a
+    subtree is skipped whole once its row minimum exceeds the budget (row minima never fall as
+    the candidate grows). A subtree is skippable only when **no ancestor has already matched**:
+    prefix semantics mean that once some prefix is within budget, every longer key carrying it
+    is a completion of it, so such a subtree is settled at that distance rather than pruned.
+    Getting that backwards drops completions the walk had already found, which is why
+    `fuzzy::for_each_within` returns its DP-row count and a test asserts the narrowing.
+  - **The cost, measured.** Release build, per fallback, over a field vocabulary of *N* distinct
+    surface forms; `b1`/`b2` are the 1-edit and 2-edit budgets:
+
+    | *N* | 5,000 | 10,000 | 25,000 | 50,000 |
+    |---|---|---|---|---|
+    | b1 | 0.36 ms | 0.40 ms | 0.87 ms | 1.72 ms |
+    | b2 | 0.36 ms | 0.48 ms | 1.08 ms | 2.00 ms |
+
+    Sub-millisecond to roughly 25,000 surface forms and sublinear beyond it (ten times the
+    vocabulary costs about five times the time). A deliberately adversarial vocabulary, where
+    every term shares a prefix and an infix so pruning rarely fires, costs 3.4 ms at 50,000. When
+    the leg does *not* engage, which is every keystroke the prefix scan answers and every
+    fragment under four characters, the measured cost is 0.4 us.
+
+    It is not trigram-bounded: `findex::trigram::fuzzy_threshold` requires
+    `|distinct_trigrams(needle)| > 3*d`, non-vacuous only at 6+ characters for one edit and 9+
+    for two, so a trigram gate would leave the leg silent exactly where typeahead typos are
+    commonest, since most fragments complete before six characters. A deletion-neighbourhood
+    (SymSpell-style) index would instead answer in microseconds independent of *N*, but
+    completion needs every prefix length indexed, not just whole words, which measured 48 MB per
+    field at one edit and 108 MB at two over a 50,000-term vocabulary: roughly 250 times the
+    text it indexes. That trade is tracked separately (nidus-4s7) rather than taken here. This
+    bullet records a cost knowingly accepted, not a settled one: re-open it if the walk stops
+    being cheap enough for the corpora `suggest` actually serves.
+  - **Ranking** is `(distance asc, df desc, term asc)`, unlike the prefix leg's `(df desc, term
+    asc)`. The two never mix in one response, since the leg only fires when the prefix leg
+    found nothing.
+  - **Conditioning is identical.** Heads and `opts.filter` condition the fuzzy leg exactly as
+    they condition the prefix leg (nidus-3j8), so a completion no admissible document carries
+    is absent on both legs, not returned with a corpus-wide count.
+  - **The fragment is capped at 64 characters** (`fuzzy::MAX_FUZZY_FRAGMENT`), above which the
+    budget is `0` and the leg does not run. `Analyzer::max_token_len` defaults to `None`, so the
+    final token of an untrusted `prefix` is never truncated, and the DP is sized to the needle
+    before the vocabulary is consulted: without this cap one request chooses that size, which is
+    the resource exhaustion the Stable commitment (§1) forbids. The guard counts at most
+    `MAX_FUZZY_FRAGMENT + 1` characters, because counting them all is itself the cost refused.
+  - **`matched` counts the leg that answered.** When the fuzzy leg fires it reports *its* match
+    count, not the prefix leg's zero, so `matched == 0` means neither leg found anything rather
+    than "the exact prefix missed". The 256-term cap and its truncation signal are unchanged.
+  - **On by default**, opt out with `SuggestOpts::fuzzy: false`. No on-disk or cache-format
+    change: `FTS_CACHE_VERSION` stays at **4**.
 - **A tombstone-free field index reads a `df` instead of walking for it** (nidus-clv stage 1).
   `FieldIndex::tombstones` is exact: at zero, every posting is live, so `live_df == postings.len()`
   and the walk is skipped entirely. This is exact rather than approximate, costs no RAM, needs no

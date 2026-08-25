@@ -61,8 +61,17 @@ pub(super) fn optional_top_k(args: &Map<String, JsonValue>) -> Result<usize, Mcp
 
 /// An optional boolean argument, defaulting to `false` when absent.
 pub(super) fn optional_bool(args: &Map<String, JsonValue>, key: &str) -> Result<bool, McpError> {
+    optional_bool_or(args, key, false)
+}
+
+/// An optional boolean argument with a caller-chosen default, for gates that are on by default.
+pub(super) fn optional_bool_or(
+    args: &Map<String, JsonValue>,
+    key: &str,
+    default: bool,
+) -> Result<bool, McpError> {
     match args.get(key) {
-        None | Some(JsonValue::Null) => Ok(false),
+        None | Some(JsonValue::Null) => Ok(default),
         Some(JsonValue::Bool(b)) => Ok(*b),
         Some(_) => Err(McpError::invalid_params(
             format!("`{key}` must be a boolean"),

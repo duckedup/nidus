@@ -285,6 +285,9 @@ Unlike `Prefix` above, which matches stems, `Suggest` matches surface forms, so
 completions are real words. Leave `Limit` zero for the server's default of 10; the Go
 spelling cannot ask for zero completions, which would return an empty list anyway.
 
+When the exact prefix match finds nothing, typo-tolerant matching kicks in by default;
+set `Fuzzy` to a pointer to `false` to require an exact prefix instead.
+
 ## Reshaping the ranking
 
 ```go

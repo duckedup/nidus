@@ -389,6 +389,7 @@ export class NidusClient {
         prefix: opts.prefix,
         limit: opts.limit,
         filter: opts.filter ?? [],
+        fuzzy: opts.fuzzy,
       }),
     );
   }

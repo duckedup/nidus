@@ -916,6 +916,21 @@ def test_suggest_sends_a_filter_verbatim() -> None:
     }
 
 
+def test_suggest_omits_fuzzy_by_default_and_sends_it_false_to_opt_out() -> None:
+    stub = StubTransport({"suggestions": [], "matched": 0})
+    client(stub).suggest(field="body", prefix="nid")
+    assert "fuzzy" not in stub.last.json
+
+    client(stub).suggest(field="body", prefix="nid", fuzzy=False)
+    assert stub.last.json == {
+        "scope": [],
+        "field": "body",
+        "prefix": "nid",
+        "filter": [],
+        "fuzzy": False,
+    }
+
+
 def test_suggest_returns_the_decoded_result() -> None:
     stub = StubTransport(
         {

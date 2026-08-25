@@ -466,6 +466,10 @@ func (c *Client) TextSearch(ctx context.Context, req TextSearchRequest) ([]Hit, 
 // Completions are real spellings, not stems: a corpus indexing "running" as "run"
 // completes "running". See [SuggestRequest] for how Scope, Filter and the words before
 // the final token narrow the result.
+//
+// When the exact prefix match finds nothing, the server falls back to typo-tolerant
+// matching within a short edit budget; this is on by default, so a mistyped fragment
+// still completes. Set [SuggestRequest.Fuzzy] to false to require an exact prefix.
 func (c *Client) Suggest(ctx context.Context, req SuggestRequest) (Suggestions, error) {
 	var out Suggestions
 	if err := c.request(ctx, http.MethodPost, "/suggest", req, &out); err != nil {

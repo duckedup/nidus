@@ -17,7 +17,8 @@ use crate::{Filter, HybridOpts, SearchOpts};
 
 use super::NidusMcp;
 use super::args::{
-    api_error, optional_bool, optional_f32, optional_top_k, optional_usize, required_str, tool,
+    api_error, optional_bool, optional_bool_or, optional_f32, optional_top_k, optional_usize,
+    required_str, tool,
 };
 use super::{HitDto, hits_content, hits_with_plan_content};
 
@@ -522,6 +523,10 @@ pub(super) fn suggest_tool() -> Tool {
                     "description": "How many completions to return. Defaults to 10.",
                     "minimum": 1
                 },
+                "fuzzy": {
+                    "type": "boolean",
+                    "description": "Typo tolerance: when the exact-prefix scan finds nothing, retry within a short edit budget. Defaults to true."
+                },
                 "filter": filter_schema()
             },
             "required": ["collection", "field", "prefix"],
@@ -836,6 +841,7 @@ impl NidusMcp {
             ));
         }
         let filter = parse_filter(args)?;
+        let fuzzy = optional_bool_or(args, "fuzzy", true)?;
 
         let out = crate::server::run_read(self.state.clone(), move |db| {
             db.suggest(
@@ -845,6 +851,7 @@ impl NidusMcp {
                 &crate::SuggestOpts {
                     limit,
                     filter: filter.unwrap_or_default(),
+                    fuzzy,
                 },
             )
         })

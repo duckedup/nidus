@@ -258,6 +258,10 @@ result = db.suggest(
 A single-token prefix, or one whose earlier words are all stopwords, has no head terms and
 behaves exactly as the bare fragment does.
 
+If the exact match finds nothing at all, `suggest` retries with a short edit-distance budget
+before giving up, so a mistyped fragment like `"runing"` still completes to `"running"`. This
+is on by default (`fuzzy=None`); pass `fuzzy=False` to opt out.
+
 ## Batch search and aggregation
 
 `batch_search` answers several vector queries in one round-trip (16 max), saving a hop

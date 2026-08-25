@@ -1081,6 +1081,28 @@ func TestSuggestAgainstARealServer(t *testing.T) {
 	if len(filtered.Suggestions) != 0 {
 		t.Errorf("filtered Suggest = %+v, want none (id is not an attr)", filtered.Suggestions)
 	}
+
+	// A mistyped prefix finds no exact match, so the fuzzy fallback (on by default)
+	// completes it within a short edit budget.
+	typo, err := db.Suggest(ctx, SuggestRequest{Scope: []string{"docs"}, Field: "body", Prefix: "nudus"})
+	if err != nil {
+		t.Fatalf("Suggest failed: %v", err)
+	}
+	if len(typo.Suggestions) != 1 || typo.Suggestions[0].Term != "nidus" {
+		t.Errorf("fuzzy Suggest = %+v, want only nidus", typo.Suggestions)
+	}
+
+	// The same mistyped prefix with Fuzzy explicitly false disables the fallback.
+	off := false
+	exact, err := db.Suggest(ctx, SuggestRequest{
+		Scope: []string{"docs"}, Field: "body", Prefix: "nudus", Fuzzy: &off,
+	})
+	if err != nil {
+		t.Fatalf("Suggest failed: %v", err)
+	}
+	if len(exact.Suggestions) != 0 {
+		t.Errorf("Fuzzy:false Suggest = %+v, want none", exact.Suggestions)
+	}
 }
 
 // TestServerErrorsCarryTheirStatus checks the error surface against the real

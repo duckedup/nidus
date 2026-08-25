@@ -629,6 +629,19 @@ def test_suggest_ranks_by_document_frequency_against_a_real_server(server: str) 
         assert result.matched == 2
 
 
+def test_suggest_is_fuzzy_by_default_and_exact_only_when_opted_out(server: str) -> None:
+    """A mistyped prefix completes by default; ``fuzzy=False`` requires an exact prefix."""
+    with NidusClient(server, timeout=10.0) as db:
+        db.set_fts_schema("docs", ["title"])
+        db.upsert("docs", [{"id": "a", "attrs": {"title": v.str("running quickly")}}])
+
+        exact = db.suggest(field="title", prefix="runing", scope=["docs"])
+        assert [s.term for s in exact.suggestions] == ["running"]
+
+        opted_out = db.suggest(field="title", prefix="runing", scope=["docs"], fuzzy=False)
+        assert opted_out.suggestions == []
+
+
 def test_ready_cluster_and_refresh_against_a_real_server(server: str) -> None:
     """Shape, not specific values: a standalone server is ready, decodes, and adopts nothing."""
     with NidusClient(server, timeout=10.0) as db:

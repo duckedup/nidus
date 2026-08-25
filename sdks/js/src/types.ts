@@ -528,6 +528,8 @@ export interface SuggestOptions {
    * matching document carries is not offered at all.
    */
   filter?: Filter;
+  /** Typo tolerance. Omitted means the server default, which is on; pass `false` to opt out. */
+  fuzzy?: boolean;
 }
 
 /** One completion: an indexed term and how many live documents contain it. */

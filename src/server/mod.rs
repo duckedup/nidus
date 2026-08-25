@@ -1214,6 +1214,7 @@ async fn suggest(
         let opts = SuggestOpts {
             limit: req.limit,
             filter: req.filter,
+            fuzzy: req.fuzzy.unwrap_or(true),
         };
         scoped(&req.scope, |scope| {
             db.suggest(scope, &req.field, &req.prefix, &opts)

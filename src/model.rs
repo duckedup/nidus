@@ -422,19 +422,35 @@ pub struct Suggestion {
     pub df: usize,
 }
 
-/// Query parameters for [`crate::Nidus::suggest`]. Derives `Default` like [`SearchOpts`], so
-/// `limit` defaults to `0` and answers nothing, exactly as `top_k == 0` does.
-#[derive(Clone, Debug, Default)]
+/// Query parameters for [`crate::Nidus::suggest`]. `limit` defaults to `0` and answers nothing,
+/// exactly as `top_k == 0` does; `fuzzy` defaults to **on**, so a mistyped fragment completes
+/// for every existing caller without a code change (nidus-972).
+#[derive(Clone, Debug)]
 pub struct SuggestOpts {
     /// Maximum number of completions.
     pub limit: usize,
     /// Metadata filter each completion's `df` is counted through (nidus-3j8): a completion no
     /// matching document carries is dropped, not returned with a whole-corpus count.
     pub filter: Filter,
+    /// Typo tolerance. When the exact-prefix scan finds nothing, retry within a short
+    /// length-derived edit budget. Opt **out** by setting `false`; costs nothing whenever the
+    /// prefix scan answers.
+    pub fuzzy: bool,
 }
 
-/// [`crate::Nidus::suggest`]'s answer. `matched` counts every term the prefix matched before
-/// the 256-term cap, so `matched > suggestions.len()` is the truncation signal.
+impl Default for SuggestOpts {
+    fn default() -> Self {
+        Self {
+            limit: 0,
+            filter: Filter::default(),
+            fuzzy: true,
+        }
+    }
+}
+
+/// [`crate::Nidus::suggest`]'s answer. `matched` counts every term matched before the 256-term
+/// cap, so `matched > suggestions.len()` is the truncation signal. When the fuzzy leg answers
+/// (nidus-972) it counts that leg's matches, so `0` means neither leg found anything.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Suggestions {
     pub suggestions: Vec<Suggestion>,
