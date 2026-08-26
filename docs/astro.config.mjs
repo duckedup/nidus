@@ -33,6 +33,9 @@ export default defineConfig({
         PageSidebar: "./src/components/PageSidebar.astro",
         // Adds Astro view transitions for flash-free navigation.
         Head: "./src/components/Head.astro",
+        // Persists the header (and with it Starlight's search) across those
+        // transitions. See src/components/Header.astro.
+        Header: "./src/components/Header.astro",
       },
       // Code blocks wear Everforest — a warm, woodland palette that matches the
       // nest. Dark theme first, light second; Starlight switches with the page.

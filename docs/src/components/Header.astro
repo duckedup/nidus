@@ -1,0 +1,46 @@
+---
+/**
+ * nidus — header override, kept alive across view transitions.
+ *
+ * Head.astro turns on Astro's <ClientRouter />, but Starlight ships no
+ * view-transition support: its <site-search> mounts PagefindUI from a
+ * `DOMContentLoaded` listener registered in the element constructor, and
+ * reveals the ⌘K badge from a run-once inline script. Neither fires again
+ * after a client-side swap, so a rebuilt header means a dead search box, a
+ * missing badge, and one leaked keydown listener per navigation, each bound
+ * to the previous page's detached <dialog>.
+ *
+ * The header is page-independent (title, search, socials, theme, language),
+ * so persisting the DOM node is the whole fix: the search element is never
+ * reconstructed, and its Pagefind instance and listeners simply stay valid.
+ * The wrapper carries the attribute because Starlight's own Header does not
+ * spread props onto its root, and `display: contents` keeps it out of the
+ * layout so the header grid still resolves against PageFrame's <header>.
+ */
+import Default from "@astrojs/starlight/components/Header.astro";
+---
+
+<div class="nd-header-persist" transition:persist="nd-site-header">
+  <Default><slot /></Default>
+</div>
+
+<style>
+  .nd-header-persist {
+    display: contents;
+  }
+</style>
+
+<script>
+  // Astro's swap drops the incoming <body> into the live document *before* it
+  // restores persisted nodes, so the header that is about to be discarded
+  // still upgrades its custom elements first: Starlight's <site-search> binds
+  // a window keydown listener to a dialog that is detached a tick later, and
+  // ⌘K then throws from one more dead handler after every navigation. Empty
+  // the incoming header while the new document is still inert — Astro only
+  // needs that node as a position marker for the one we keep.
+  document.addEventListener("astro:before-swap", (event) => {
+    event.newDocument
+      .querySelector('[data-astro-transition-persist="nd-site-header"]')
+      ?.replaceChildren();
+  });
+</script>
