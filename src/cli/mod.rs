@@ -129,7 +129,8 @@ fn typed(matches: &ArgMatches, id: &str) -> bool {
 #[derive(Args, Debug, Default)]
 struct StoreArgs {
     /// Store directory (created on first write). Unused — but still required — when
-    /// `--persistence` names an object store, where the durable bytes live remotely.
+    /// `--persistence` names an object store or a local path, where the durable bytes
+    /// actually live (nidus-kjt).
     #[arg(long, short = 'd', env = "NIDUS_DIR")]
     dir: PathBuf,
     /// Embedding dimension. Inferred from an existing store; required to create one.
@@ -300,8 +301,8 @@ impl StoreArgs {
     }
 
     /// The `(dimension, distance)` an existing store already committed to, if any. An
-    /// object-store location has no local `data` file to stat, so it is peeked through the
-    /// backend — one GET of the `data` header, the route `backup::check` takes (nidus-hzi).
+    /// object-store location is peeked through the backend (one GET of the `data` header);
+    /// a local `--persistence` path is statted directly, the same file `Store::open` uses.
     fn peek(&self) -> Result<Option<(usize, Distance)>> {
         if self.is_object_store() {
             let location = self.store_location();
@@ -319,15 +320,22 @@ impl StoreArgs {
                 .with_context(|| format!("{location} has no readable nidus header"))
                 .map(Some);
         }
+        if let Some(local) = self
+            .persistence
+            .as_deref()
+            .and_then(crate::backend::local_persistence_path)
+        {
+            return crate::data::peek_header(&std::path::Path::new(local).join("data"));
+        }
         crate::data::peek_header(&self.dir.join("data"))
     }
 
     /// What [`peek`](Self::peek) actually probed, so an error names where we looked: the
-    /// object-store URL, else `--dir`. A *local* `--persistence` path is deliberately not
-    /// named — `peek` still reads `--dir/data` for it (nidus-hzi).
+    /// object-store URL, else a local `--persistence` path, else `--dir` (nidus-kjt).
     fn store_location(&self) -> String {
         match self.persistence.as_deref() {
             Some(p) if self.is_object_store() => p.to_string(),
+            Some(p) if crate::backend::local_persistence_path(p).is_some() => p.to_string(),
             _ => self.dir.display().to_string(),
         }
     }
@@ -4717,6 +4725,84 @@ mod tests {
         };
         let err = args.resolve().unwrap_err().to_string();
         assert!(err.contains("--dim"), "unexpected error: {err}");
+    }
+
+    /// Build a store at `--persistence P --dim 3`, seed a decoy of a different dimension at
+    /// `--dir B`, then resolve `StoreArgs { dir: B, persistence: Some(location) }` — mirrors
+    /// `cold_read_of_an_existing_object_store_needs_no_dim` (tests/e2e/cluster.rs:988-1000).
+    fn cold_reopen_dim_through_local_persistence(
+        location_from_path: impl Fn(&std::path::Path) -> String,
+    ) -> usize {
+        let persistence_dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let cfg = Config::new(store_dir.path().to_path_buf(), 3)
+            .persistence(persistence_dir.path().to_string_lossy().to_string());
+        Nidus::open(cfg).unwrap();
+
+        // Without the decoy, a wrong-path peek would return `None` and the test would fail
+        // for the right reason only by luck; with it, reading the wrong location fails loudly.
+        let reader_dir = tempfile::tempdir().unwrap();
+        Nidus::open(Config::new(reader_dir.path().to_path_buf(), 9)).unwrap();
+
+        let args = StoreArgs {
+            dir: reader_dir.path().to_path_buf(),
+            persistence: Some(location_from_path(persistence_dir.path())),
+            ..Default::default()
+        };
+        args.resolve().unwrap().0
+    }
+
+    #[test]
+    fn resolve_infers_dim_through_a_local_persistence_cold() {
+        assert_eq!(
+            cold_reopen_dim_through_local_persistence(|p| p.to_string_lossy().to_string()),
+            3
+        );
+    }
+
+    #[test]
+    fn resolve_infers_dim_through_a_file_url_persistence_cold() {
+        assert_eq!(
+            cold_reopen_dim_through_local_persistence(|p| format!("file://{}", p.display())),
+            3
+        );
+    }
+
+    #[test]
+    fn resolve_errors_on_missing_local_persistence_without_creating_it() {
+        let scratch = tempfile::tempdir().unwrap();
+        let missing = scratch.path().join("nope");
+        let args = StoreArgs {
+            dir: PathBuf::from("/should-not-be-named"),
+            persistence: Some(missing.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let err = args.resolve().unwrap_err().to_string();
+        assert!(
+            err.contains(&*missing.to_string_lossy()),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains("should-not-be-named"),
+            "unexpected error: {err}"
+        );
+        assert!(!missing.exists());
+    }
+
+    /// An empty `--persistence` (or `NIDUS_PERSISTENCE=""`) means "no override, use `--dir`" —
+    /// `Store::open`'s own rule. Reading it as a local path would probe a relative `./data`
+    /// against the process cwd and name a blank location in the error (nidus-kjt).
+    #[test]
+    fn an_empty_persistence_still_resolves_from_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        Nidus::open(Config::new(dir.path().to_path_buf(), 7)).unwrap();
+
+        let args = StoreArgs {
+            dir: dir.path().to_path_buf(),
+            persistence: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(args.resolve().unwrap().0, 7);
     }
 
     // `peek_ignores_local_data_under_object_store_persistence` asserted the contract nidus-hzi

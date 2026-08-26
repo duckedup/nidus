@@ -105,7 +105,7 @@ pub fn backup(source: &str, out_location: &str) -> Result<BackupReport> {
     // Read order gives the lock-free snapshot (§6.2): the store `manifest` (the segment
     // set's commit point) first, then the segments it names (sealed ones are immutable),
     // then `log` last, so replay ignores anything newer than the data we captured.
-    let src = crate::open_persistence(source)?;
+    let src = crate::backend::open_existing_persistence(source)?;
     let store_manifest = src.get(crate::manifest::MANIFEST_KEY)?;
     let sealed: Vec<String> = match &store_manifest {
         Some(bytes) => crate::manifest::Manifest::decode(bytes)
@@ -438,7 +438,7 @@ pub struct CheckReport {
 /// naming the segment and erring on the first mismatch. Opens segments directly and
 /// read-only, without a writer lock — safe alongside a running `nidus serve` (SPEC §6.2).
 pub fn check(source: &str) -> Result<CheckReport> {
-    let p = crate::open_persistence(source)?;
+    let p = crate::backend::open_existing_persistence(source)?;
     let manifest_bytes = p.get(crate::manifest::MANIFEST_KEY)?;
     let data = p
         .get("data")?

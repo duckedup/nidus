@@ -541,6 +541,43 @@ fn open_persistence_file_scheme_and_bare_path() {
     }
 }
 
+#[test]
+fn local_persistence_path_local_vs_remote() {
+    assert_eq!(local_persistence_path("relative/dir"), Some("relative/dir"));
+    assert_eq!(local_persistence_path("file:///abs/dir"), Some("/abs/dir"));
+    assert_eq!(local_persistence_path("FILE:///abs/dir"), Some("/abs/dir"));
+    assert_eq!(local_persistence_path("s3://bucket/p"), None);
+    assert_eq!(local_persistence_path("gs://bucket/p"), None);
+    assert_eq!(local_persistence_path("gcs://bucket/p"), None);
+    assert_eq!(local_persistence_path("opfs://name"), None);
+    // "" is `Store::open`'s "no override, use --dir", not a path (nidus-kjt).
+    assert_eq!(local_persistence_path(""), None);
+}
+
+#[cfg(feature = "cli")]
+#[test]
+fn open_existing_persistence_rejects_missing_local_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("does-not-exist");
+    let loc = missing.display().to_string();
+
+    let err = open_existing_persistence(&loc).map(|_| ()).unwrap_err();
+    assert!(err.to_string().contains(&loc));
+    assert!(!missing.exists());
+}
+
+#[cfg_attr(miri, ignore)]
+#[cfg(feature = "cli")]
+#[test]
+fn open_existing_persistence_opens_present_local_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let loc = dir.path().display().to_string();
+
+    let p = open_existing_persistence(&loc).unwrap();
+    p.put("k", b"v").unwrap();
+    assert_eq!(p.get("k").unwrap().as_deref(), Some(b"v".as_slice()));
+}
+
 // ── FileAppender parity with the data/log discipline (Miri-ignored) ─────────────
 
 #[cfg_attr(miri, ignore)]

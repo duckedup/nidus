@@ -244,6 +244,34 @@ pub(crate) fn validate_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// The filesystem path a **local** persistence `location` names — `file://<path>` or a bare
+/// path. `None` for a remote/virtual backend, and for `""`, which means "use `--dir`"
+/// (`Store::open`'s rule). Single owner: `open_persistence` and the CLI peek both read it.
+pub(crate) fn local_persistence_path(location: &str) -> Option<&str> {
+    if location.is_empty()
+        || strip_scheme(location, "s3").is_some()
+        || strip_scheme(location, "gs").is_some()
+        || strip_scheme(location, "gcs").is_some()
+        || strip_scheme(location, "opfs").is_some()
+    {
+        return None;
+    }
+    Some(strip_scheme(location, "file").unwrap_or(location))
+}
+
+/// Open `location` only if it already exists: a read-only probe must not create the store it
+/// is probing ([`LocalFs::new`] does, for a local path). Non-existent local paths error;
+/// everything else delegates to [`open_persistence`] unchanged (nidus-kjt).
+#[cfg(feature = "cli")]
+pub(crate) fn open_existing_persistence(location: &str) -> Result<Box<dyn Persistence>> {
+    if let Some(path) = local_persistence_path(location)
+        && !std::path::Path::new(path).exists()
+    {
+        bail!("no nidus store at {location}");
+    }
+    open_persistence(location)
+}
+
 /// Open a **persistence** backend from a URL/location string (SPEC §13.4):
 pub fn open_persistence(location: &str) -> Result<Box<dyn Persistence>> {
     if let Some(rest) = strip_scheme(location, "s3") {
@@ -275,8 +303,8 @@ pub fn open_persistence(location: &str) -> Result<Box<dyn Persistence>> {
             bail!("opfs:// persistence backend {location:?} is only available in wasm32 builds");
         }
     }
-    // `file://<path>` or a bare path → local files.
-    let path = strip_scheme(location, "file").unwrap_or(location);
+    // `file://<path>` or a bare path → local files, per `local_persistence_path`.
+    let path = local_persistence_path(location).unwrap_or(location);
     Ok(Box::new(LocalFs::new(path)?))
 }
 
