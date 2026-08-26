@@ -81,6 +81,9 @@ pub(super) fn ingest(
         strategy: ChunkStrategy::Recursive,
         max_chars,
         overlap_chars,
+        // Per-file dispatch resolves the language from the path (`code::chunk_file`), so the
+        // fallback options carry none.
+        ..Default::default()
     };
     // Validates the non-code fallback's options; dispatch decides the strategy per file.
     crate::chunk::chunk_text("probe", &opts).context("invalid chunk options")?;

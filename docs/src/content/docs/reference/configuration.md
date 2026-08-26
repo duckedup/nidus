@@ -192,8 +192,10 @@ is not. See [larger-than-RAM stores](/guides/storage/#larger-than-ram-memory-map
 [`path`](#path)). An [`open_persistence`](/guides/storage-backends/) location: a path / `file://`,
 or `s3://<bucket>[/<prefix>]` / `gs://<bucket>[/<prefix>]` for a **live object-store-backed
 store** (each segment is rewritten as one whole object on flush; `O(object)`, suited to
-low write rates, under an advisory writer lock). With an object store, pass `dimension`
-explicitly: the remote header is not peeked. See [Storage backends](/guides/storage-backends/).
+low write rates, under an advisory writer lock). `Config` always takes a `dimension`, and it
+must match the one the remote store already committed to. The CLI peeks that header for you,
+so `nidus … --persistence s3://…` needs `--dim` only when creating a store. See
+[Storage backends](/guides/storage-backends/).
 
 ### `memory`
 

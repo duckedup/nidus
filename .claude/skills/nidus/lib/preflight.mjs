@@ -32,6 +32,11 @@ export function preflight(facts = {}) {
   const {
     fetched, branch, onMain, dirty, behind = 0, mainAhead = 0,
     issue, issueBranches = [], me = [],
+    // Several tickets share one branch, one blueprint and one PR, so preflight has to
+    // clear every one of them: a bundle is only as sound as its stalest premise. Each
+    // entry is `{ issue, issueBranches }`; `issue`/`issueBranches` above stay the
+    // single-ticket spelling.
+    issues = null,
   } = facts
   const findings = []
   const here = branch || 'HEAD'
@@ -60,7 +65,12 @@ export function preflight(facts = {}) {
       'Decide before touching them: stash and branch, commit here first, or stop. Do not fold someone else\'s work-in-progress into this ticket.'))
   }
 
-  findings.push(...ticketFindings(issue, issueBranches, me, branch))
+  const tickets = issues && issues.length
+    ? issues
+    : [{ issue, issueBranches }]
+  for (const t of tickets) {
+    findings.push(...ticketFindings(t.issue, t.issueBranches || [], me, branch))
+  }
   return findings
 }
 

@@ -13,8 +13,7 @@ string. Nothing else about how you use nidus changes.
 nidus search --dir ./store docs -k 5 < query.json
 
 # The same store, kept in Amazon S3 instead
-nidus search --dir ./meta --dim 768 \
-  --persistence s3://my-bucket/store docs -k 5 < query.json
+nidus search --dir ./meta --persistence s3://my-bucket/store docs -k 5 < query.json
 ```
 
 From the Rust library it is one builder call:
@@ -69,13 +68,14 @@ export AWS_REGION=us-east-1
 # export AWS_ENDPOINT_URL=https://<accountid>.r2.cloudflarestorage.com
 
 nidus upsert --dir ./meta --dim 768 --persistence s3://my-bucket/store docs < recs.json
-nidus search --dir ./meta --dim 768 \
-  --persistence s3://my-bucket/store docs -k 5 < query.json
+# No --dim on the read: the store exists, so its dimension comes from the remote header.
+nidus search --dir ./meta --persistence s3://my-bucket/store docs -k 5 < query.json
 ```
 
-`AWS_SESSION_TOKEN` is used if set. Pass `--dim` when the store lives in the cloud: nidus
-reads the local folder's header to learn the dimension, and there isn't one for a remote
-store.
+`AWS_SESSION_TOKEN` is used if set. `--dim` is needed only to **create** a store. Against
+one that already exists, nidus reads the dimension from the remote header, so any `--dir`
+opens it cold. That is what lets CI build an index once and everyone search the same one
+with no server: `--persistence` is a runtime switch, not a rebuild.
 
 **Keyless credentials.** When `AWS_ACCESS_KEY_ID` is unset, nidus follows the standard AWS
 chain and fetches temporary credentials automatically, refreshing them before they expire:

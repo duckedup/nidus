@@ -2059,6 +2059,7 @@ mod tests {
             strategy: crate::chunk::ChunkStrategy::Recursive,
             max_chars: 10,
             overlap_chars: 0,
+            ..Default::default()
         }
     }
 

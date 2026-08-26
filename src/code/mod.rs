@@ -71,6 +71,10 @@ fn prose_chunks(
 ) -> Result<Vec<CodeChunk>> {
     let opts = ChunkOpts {
         strategy,
+        // A prose strategy must not inherit a code language: `chunk_file` resolves one per
+        // file, and carrying it onto the markdown/recursive path would describe this text as
+        // something it is not, for any future reader of the field.
+        language: None,
         ..opts.clone()
     };
     Ok(chunk_text(text, &opts)?
@@ -184,6 +188,7 @@ mod tests {
             strategy: ChunkStrategy::Recursive,
             max_chars: 1000,
             overlap_chars: 100,
+            ..Default::default()
         }
     }
 
