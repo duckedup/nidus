@@ -13,7 +13,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{Persistence, open_object_location};
+use crate::backend::{Persistence, open_existing_object_location, open_object_location};
 use crate::{Config, Nidus, OpenMode};
 
 /// Embedded report entry name (informational; restore tolerates its absence).
@@ -220,14 +220,10 @@ pub fn restore(
     target_location: &str,
     assume_yes: bool,
 ) -> Result<RestoreReport> {
-    // Extract the source-of-truth objects into the target store's backend. `put`
-    // validates each key (rejecting any path separators / `..`), so a hand-crafted
-    // traversal entry can never escape the store.
-    let target = crate::open_persistence(target_location)?;
-
     // Fully validate the archive before touching the target: a corrupt one must not
-    // leave a half-restored store behind, and must never pass silently (#152).
-    let (src, key) = open_object_location(in_location)?;
+    // leave a half-restored store behind, and must never pass silently (#152). That
+    // includes *creating* the target, which opening it does (nidus-h83).
+    let (src, key) = open_existing_object_location(in_location)?;
     let archive = src
         .get(&key)?
         .with_context(|| format!("backup archive not found: {in_location}"))?;
@@ -236,6 +232,11 @@ pub fn restore(
     if !objects.iter().any(|(name, _)| name == "data") {
         bail!("backup archive contained no `data` object — not a nidus backup");
     }
+
+    // Extract the source-of-truth objects into the target store's backend. `put`
+    // validates each key (rejecting any path separators / `..`), so a hand-crafted
+    // traversal entry can never escape the store.
+    let target = crate::open_persistence(target_location)?;
 
     if store_present(target.as_ref()) && !assume_yes && !confirm_overwrite(target_location)? {
         bail!("aborted: {target_location} already contains a store (pass -y/--yes to overwrite)");
@@ -376,7 +377,7 @@ fn put_objects(target: &dyn Persistence, objects: &[Object]) -> Result<()> {
 /// baseline CRC (if the archive carries one), and open the extracted store read-only.
 /// Never touches a real store — extraction lands in a `TempDir` cleaned up on every path.
 pub fn verify(in_location: &str) -> Result<VerifyReport> {
-    let (src, key) = open_object_location(in_location)?;
+    let (src, key) = open_existing_object_location(in_location)?;
     let archive = src
         .get(&key)?
         .with_context(|| format!("backup archive not found: {in_location}"))?;
@@ -664,6 +665,34 @@ mod tests {
         let archive = empty.path().join("snap.tar.gz");
         let err = backup(&empty.path().to_string_lossy(), &archive.to_string_lossy()).unwrap_err();
         assert!(err.to_string().contains("no nidus store"));
+    }
+
+    /// A mistyped archive location must not be created by the read that fails on it. The
+    /// assertion is `!exists()`, not the error: both commands already erred before the fix,
+    /// they just left a directory behind first (nidus-h83).
+    #[test]
+    fn reading_a_missing_archive_creates_nothing() {
+        let scratch = tempfile::tempdir().unwrap();
+
+        let tpyo = scratch.path().join("tpyo");
+        let missing = tpyo.join("snap.tar.gz");
+        let err = verify(&missing.to_string_lossy()).unwrap_err();
+        assert!(!tpyo.exists(), "verify created {}", tpyo.display());
+        assert!(err.to_string().contains("no nidus store"), "{err}");
+
+        // restore also opened its *target* before validating the archive, so a bad --in
+        // left an empty store directory behind as well.
+        let tpyo2 = scratch.path().join("tpyo2");
+        let target = scratch.path().join("rtarget");
+        let err = restore(
+            &tpyo2.join("snap.tar.gz").to_string_lossy(),
+            &target.to_string_lossy(),
+            true,
+        )
+        .unwrap_err();
+        assert!(!tpyo2.exists(), "restore created {}", tpyo2.display());
+        assert!(!target.exists(), "restore created {}", target.display());
+        assert!(err.to_string().contains("no nidus store"), "{err}");
     }
 
     /// Write enough rows through a small `segment_max_rows` that the store seals

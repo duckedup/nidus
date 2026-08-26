@@ -344,6 +344,17 @@ pub fn open_object_location(location: &str) -> Result<(Box<dyn Persistence>, Str
     Ok((open_persistence(root)?, key.to_string()))
 }
 
+/// [`open_object_location`] for a **read**: the archive's directory must already exist, so a
+/// mistyped `--in` errors instead of leaving one behind (nidus-h83). Writers keep
+/// `open_object_location` — creating the destination of a `backup --out` is intended.
+#[cfg(feature = "cli")]
+pub(crate) fn open_existing_object_location(
+    location: &str,
+) -> Result<(Box<dyn Persistence>, String)> {
+    let (root, key) = split_object_location(location)?;
+    Ok((open_existing_persistence(root)?, key.to_string()))
+}
+
 /// Split a location into `(root_location, object_key)` at the last `/`. Pure string
 /// logic (no IO), so it is unit-tested directly.
 fn split_object_location(location: &str) -> Result<(&str, &str)> {
