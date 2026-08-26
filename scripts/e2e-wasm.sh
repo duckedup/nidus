@@ -151,6 +151,10 @@ s.close()')"
     done
 
     bun docs/e2e/terminal.mjs "http://127.0.0.1:${port}"
+    # Search survives a client-side navigation (nidus-5os). Same server, same
+    # driver: the bug only ever appeared after the view transition, so a fresh
+    # page load proves nothing.
+    bun docs/e2e/navigation.mjs "http://127.0.0.1:${port}"
 }
 
 case "${1:-}" in
