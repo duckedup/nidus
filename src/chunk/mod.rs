@@ -40,6 +40,10 @@ pub struct ChunkOpts {
     pub strategy: ChunkStrategy,
     pub max_chars: usize,
     pub overlap_chars: usize,
+    /// The language [`ChunkStrategy::Code`] parses `text` as: a `detect_language` name such
+    /// as `"rust"`. `None` tries every grammar and keeps the best guess, at one parse per
+    /// language (nidus-61d). Other strategies ignore it.
+    pub language: Option<&'static str>,
 }
 
 impl Default for ChunkOpts {
@@ -48,6 +52,7 @@ impl Default for ChunkOpts {
             strategy: ChunkStrategy::Recursive,
             max_chars: 1000,
             overlap_chars: 100,
+            language: None,
         }
     }
 }
@@ -90,7 +95,7 @@ pub fn chunk_text(text: &str, opts: &ChunkOpts) -> Result<Vec<Chunk>> {
         }
         ChunkStrategy::Sentence => (sentence::split(&src, opts.max_chars), None),
         #[cfg(feature = "code")]
-        ChunkStrategy::Code => (code::split(&src, opts.max_chars), None),
+        ChunkStrategy::Code => (code::split(&src, opts.max_chars, opts.language), None),
     };
     Ok(apply_overlap(
         &src,
@@ -188,6 +193,7 @@ mod tests {
             strategy,
             max_chars,
             overlap_chars,
+            ..Default::default()
         }
     }
 
@@ -225,6 +231,7 @@ mod tests {
             strategy: ChunkStrategy::Markdown,
             max_chars: 1000,
             overlap_chars: 100,
+            ..Default::default()
         };
         let chunks = chunk_text(&doc, &opts).unwrap();
         assert!(
@@ -402,6 +409,98 @@ mod tests {
             chunks[0].text
         );
         assert_char_slice_invariant(src, &chunks);
+    }
+
+    /// nidus-61d: a caller that already knows the language hands it over instead of paying
+    /// one parse per grammar. Same input, same chunks — the field is a shortcut, not a
+    /// different splitter.
+    #[cfg(feature = "code")]
+    #[test]
+    fn code_strategy_with_a_supplied_language_matches_the_guess() {
+        let src = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n\
+                    fn sub(a: i32, b: i32) -> i32 {\n    a - b\n}\n";
+        let guessed = chunk_text(src, &opts(ChunkStrategy::Code, 1000, 0)).unwrap();
+        let told = chunk_text(
+            src,
+            &ChunkOpts {
+                language: Some("rust"),
+                ..opts(ChunkStrategy::Code, 1000, 0)
+            },
+        )
+        .unwrap();
+        assert_eq!(told, guessed, "told: {told:?}");
+        assert_eq!(told.len(), 2, "told: {told:?}");
+    }
+
+    /// The assertion that would fail if `split` accepted `language` and then guessed anyway:
+    /// Rust source parsed as Python finds no symbols. Without it, every test above would pass
+    /// against an implementation that ignored the field entirely.
+    #[cfg(feature = "code")]
+    #[test]
+    fn code_strategy_uses_the_supplied_language_rather_than_the_best_guess() {
+        let src = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n\
+                    fn sub(a: i32, b: i32) -> i32 {\n    a - b\n}\n";
+        assert_eq!(
+            chunk_text(src, &opts(ChunkStrategy::Code, 1000, 0))
+                .unwrap()
+                .len(),
+            2,
+            "precondition: guessing finds this Rust"
+        );
+        let chunks = chunk_text(
+            src,
+            &ChunkOpts {
+                language: Some("python"),
+                ..opts(ChunkStrategy::Code, 1000, 0)
+            },
+        )
+        .unwrap();
+        assert!(
+            chunks.is_empty(),
+            "a supplied language must be used, not overridden by a better guess: {chunks:?}"
+        );
+    }
+
+    /// `detect_language` recognises extensions wdpkr ships no grammar for (svelte, for one).
+    /// Naming one yields nothing rather than silently falling back to the guess, which would
+    /// chunk a Svelte file as whichever language scored highest.
+    #[cfg(feature = "code")]
+    #[test]
+    fn code_strategy_with_a_language_that_has_no_grammar_yields_no_chunks() {
+        let src = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
+        let chunks = chunk_text(
+            src,
+            &ChunkOpts {
+                language: Some("svelte"),
+                ..opts(ChunkStrategy::Code, 1000, 0)
+            },
+        )
+        .unwrap();
+        assert!(chunks.is_empty(), "chunks: {chunks:?}");
+    }
+
+    /// `language` is meaningless outside `ChunkStrategy::Code`, and must stay inert there
+    /// rather than quietly changing how prose splits.
+    #[cfg(feature = "code")]
+    #[test]
+    fn a_supplied_language_is_ignored_by_the_prose_strategies() {
+        let doc = "First sentence here. Second sentence here. Third one too.";
+        for strategy in [
+            ChunkStrategy::Recursive,
+            ChunkStrategy::Markdown,
+            ChunkStrategy::Sentence,
+        ] {
+            let plain = chunk_text(doc, &opts(strategy, 30, 0)).unwrap();
+            let with_lang = chunk_text(
+                doc,
+                &ChunkOpts {
+                    language: Some("rust"),
+                    ..opts(strategy, 30, 0)
+                },
+            )
+            .unwrap();
+            assert_eq!(plain, with_lang, "{strategy:?} must ignore `language`");
+        }
     }
 
     #[cfg(feature = "code")]

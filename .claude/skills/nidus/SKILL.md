@@ -41,13 +41,20 @@ open `lanes/<name>.md` and follow it.
 | anything else | **Full pipeline**: `lanes/spec.md` → scope gate → plan gate → `lanes/implement.md` → `lanes/review.md` → offer `lanes/ship.md` |
 
 Paths are relative to `.claude/skills/nidus/`. The rest of `$ARGUMENTS` is the target: an
-issue number (`#42`), a PR number (review only), a path, or a freeform description. With no
-arguments at all, run `lanes/review.md` against the working tree — that is the cheapest
-useful thing.
+issue number (`#42`), **several issue numbers**, a PR number (review only), a path, or a
+freeform description. With no arguments at all, run `lanes/review.md` against the working
+tree — that is the cheapest useful thing.
+
+**Several tickets are one job, not N jobs**: one branch, one blueprint, one version bump, one
+PR closing all of them. Do not open a branch per ticket unless the user asks or one is
+blocked. `lanes/spec.md` step 3 has the reasoning and the naming.
 
 ## Preflight (every subcommand, `review` and `fit` included)
 
-1. **`nidus-check preflight --issue <id>` — first, before anything else.** It fetches
+1. **`nidus-check preflight --issue <id>` — first, before anything else.** `--issue` takes a
+   comma-separated list (`--issue nidus-hzi,nidus-61d`); pass every ticket in the bundle, since
+   a bundle is only as sound as its stalest premise and one already-shipped ticket among three
+   blocks the lot. It fetches
    `origin`, then blocks on every premise that would otherwise be silently stale: HEAD
    behind `origin/main`, on `main`, the ticket already closed, already carried by a merged
    or open PR, already claimed by a remote branch or another assignee. It also prints the
@@ -66,7 +73,8 @@ useful thing.
    `review` and `fit` need this as much as the rest: `review` compares against
    `origin/main` (a stale base examines a range nobody meant, nidus-qko), and `fit` step 1
    asks whether an idea is already decided, which is a question about issue state.
-2. Resolve the target. If it matches `#?\d+` or `nidus-\d+`, `bd show nidus-<n>`; read the
+2. Resolve the target — **every** id in it, not just the first. If it matches `#?\d+` or
+   `nidus-\d+`, `bd show nidus-<n>`; read the
    title, description, labels, and comments (`bd comments nidus-<n>`). Issues kept their
    GitHub numbers, so `#186` and `nidus-186` are the same ticket. If `bd show` cannot find
    it, say so and ask whether to proceed from the description alone — do not invent the

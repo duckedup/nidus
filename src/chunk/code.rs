@@ -1,10 +1,11 @@
 //! Adapter from wdpkr-core's AST-aware symbol chunker to nidus's [`Chunk`] shape. Gated
 //! behind the `code` feature; nothing here is reachable, or built, in the default lane.
 //!
-//! `chunk_text`'s public entry carries only `src` and `max_chars`, no file path, so no
-//! [`wdpkr_core::chunk::detect_language`] input reaches this module. `split` tries every
-//! grammar wdpkr-core ships and keeps whichever finds the most symbols: real source
-//! reliably matches exactly one grammar, and plain prose matches none.
+//! A caller that already resolved a language passes it through [`super::ChunkOpts::language`]
+//! and `split` makes exactly one parse. A caller that has not — `chunk_text` carries no file
+//! path, so no [`wdpkr_core::chunk::detect_language`] input need reach this module — falls back
+//! to trying every grammar wdpkr-core ships and keeping whichever finds the most symbols: real
+//! source reliably matches exactly one grammar, and plain prose matches none.
 
 use wdpkr_core::chunk::tree_sitter::TreeSitterChunker;
 use wdpkr_core::chunk::{Chunker, SymbolChunk};
@@ -47,16 +48,30 @@ pub(crate) fn has_grammar(lang: &str) -> bool {
 
 /// Splits `src` into per-symbol char ranges. `vec![]` when no grammar recognises the
 /// content — an unrecognised language and a parse failure look the same from here.
-pub(super) fn split(src: &[char], max_chars: usize) -> Vec<(usize, usize)> {
+/// `language` is one parse; `None` tries every grammar and keeps the best (nidus-61d).
+pub(super) fn split(src: &[char], max_chars: usize, language: Option<&str>) -> Vec<(usize, usize)> {
     let content: String = src.iter().collect();
     let chunker = TreeSitterChunker::new();
 
-    let symbols = LANGUAGES
-        .iter()
-        .filter_map(|&lang| chunker.chunk("", &content, lang).ok())
-        .max_by_key(|fc| fc.symbols.len())
-        .map(|fc| fc.symbols)
-        .unwrap_or_default();
+    let symbols = match language {
+        // Guessing here would let a caller that *told* us the language get another's parse.
+        Some(lang) => {
+            if has_grammar(lang) {
+                chunker
+                    .chunk("", &content, lang)
+                    .map(|fc| fc.symbols)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        None => LANGUAGES
+            .iter()
+            .filter_map(|&lang| chunker.chunk("", &content, lang).ok())
+            .max_by_key(|fc| fc.symbols.len())
+            .map(|fc| fc.symbols)
+            .unwrap_or_default(),
+    };
     locate_symbols(src, symbols, max_chars)
         .into_iter()
         .map(|l| (l.start, l.end))
@@ -161,7 +176,7 @@ mod tests {
     #[test]
     fn no_grammar_recognises_the_content_yields_no_spans() {
         let src: Vec<char> = "(define (add a b) (+ a b))\n".chars().collect();
-        assert!(split(&src, 1000).is_empty());
+        assert!(split(&src, 1000, None).is_empty());
     }
 
     #[test]
@@ -169,7 +184,7 @@ mod tests {
         let text = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n\
                      fn sub(a: i32, b: i32) -> i32 {\n    a - b\n}\n";
         let src: Vec<char> = text.chars().collect();
-        let spans = split(&src, 1000);
+        let spans = split(&src, 1000, None);
         assert_eq!(spans.len(), 2, "spans: {spans:?}");
         for &(s, e) in &spans {
             let slice: String = src[s..e].iter().collect();
@@ -182,7 +197,7 @@ mod tests {
         let body_lines = "    let _ = 1 + 1;\n".repeat(2000);
         let text = format!("fn big() {{\n{body_lines}}}\n");
         let src: Vec<char> = text.chars().collect();
-        let spans = split(&src, 2000);
+        let spans = split(&src, 2000, None);
         assert!(
             spans.len() > 1,
             "expected the oversized symbol to split: {} pieces",

@@ -21,6 +21,19 @@
    unambiguous, say so in one line and go to step 3 — an invented question is its own noise.
 3. **You** write the blueprints from the research and the answers — do not delegate this. The
    gate the user approves must be yours.
+
+   **Several tickets are ONE blueprint set and ONE PR, never one per ticket.** When the target
+   names more than one issue, they share a branch, a root blueprint, a version bump and a PR
+   whose body carries a `Closes` line each. Splitting them is the expensive default: N branches
+   racing for one `Cargo.toml` version (of which the second to merge releases nothing, silently),
+   N review cycles over one tree, and N chances to leave a bead open. `<id>` is then the tickets
+   joined by `-` (`BLUEPRINT-nidus-hzi-61d.md`). One root blueprint covers all of them: one
+   summary, one file list, one lane set, and a per-ticket section for its own root cause,
+   acceptance criteria and tests. Split into separate PRs only when the user asks, or when one
+   ticket is blocked and the rest should not wait for it — say which and why.
+
+   A ticket that turns out to need **no code** still gets its section, recording what was
+   measured and why it closes; it just contributes no files.
    - `BLUEPRINT-<id>.md` in **each directory** that will change.
    - `BLUEPRINT-<id>.md` at the **repo root**: summary, the table of sub-blueprints, complete
      file create/modify/remove list, group ordering and why, and the global verification lanes

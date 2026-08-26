@@ -234,6 +234,7 @@ pub(super) fn run(
         strategy: strategy.into(),
         max_chars,
         overlap_chars,
+        ..Default::default()
     };
     // Validate before the first billed call rather than letting chunk_text bail mid-run.
     crate::chunk::chunk_text("probe", &opts).context("invalid chunk options")?;
@@ -460,6 +461,7 @@ mod tests {
             strategy: ChunkStrategy::Recursive,
             max_chars: 1000,
             overlap_chars: 100,
+            ..Default::default()
         }
     }
 

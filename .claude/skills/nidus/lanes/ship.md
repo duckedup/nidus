@@ -11,7 +11,9 @@
    If `major.minor` changed, update the `nidus = "M.m"` snippet in `README.md` and
    `docs/src/content/docs/getting-started.md`. Never touch `charts/nidus/Chart.yaml` or the
    SDK version files — CI stamps those and commits them back.
-3. **State the close, then perform it.** Put `Closes nidus-<n>` in the PR body — but that
+3. **State the close, then perform it.** A bundled PR carries one `Closes` line **per
+   ticket**, each audited separately: it is normal for a bundle to close two tickets and only
+   `Refs` a third. Put `Closes nidus-<n>` in the PR body — but that
    line no longer *does* anything, because GitHub cannot close a bead. Re-read every such
    line against the diff and downgrade it to `Refs nidus-<n>` if this change does not
    finish the issue. Then, once the PR merges, actually close it:

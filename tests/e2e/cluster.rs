@@ -912,3 +912,153 @@ fn gcs_persistence_round_trip_via_emulator() {
     assert_eq!(doc_count(&second), 2);
     assert_eq!(ids(&second), vec!["a", "b"]);
 }
+
+/// Run the `nidus` binary against minio with the credentials the container expects.
+/// CLI-driven, not `Server`-driven: nidus-hzi is in `StoreArgs`' dimension resolution, which
+/// every one-shot subcommand runs and `serve` runs once at startup.
+fn nidus_s3(args: &[&str]) -> std::process::Output {
+    require_services();
+    std::process::Command::new(env!("CARGO_BIN_EXE_nidus"))
+        .args(args)
+        .env(
+            "AWS_ENDPOINT_URL",
+            service("NIDUS_E2E_S3_ENDPOINT", "http://127.0.0.1:9100"),
+        )
+        .env(
+            "AWS_ACCESS_KEY_ID",
+            service("NIDUS_E2E_S3_KEY", "minioadmin"),
+        )
+        .env(
+            "AWS_SECRET_ACCESS_KEY",
+            service("NIDUS_E2E_S3_SECRET", "minioadmin"),
+        )
+        .env("AWS_REGION", service("NIDUS_E2E_S3_REGION", "us-east-1"))
+        .output()
+        .expect("run nidus")
+}
+
+/// nidus-hzi: a read against an **existing** `s3://` store must not demand `--dim`. The
+/// assertion is the **row**, from a `--dir` that has never seen this store: asserting "exit 0"
+/// alone would pass against a freshly-created empty one.
+#[test]
+#[ignore = "needs real minio (just e2e-services-up)"]
+fn cold_read_of_an_existing_object_store_needs_no_dim() {
+    let bucket = service("NIDUS_E2E_S3_BUCKET", "nidus-test");
+    let prefix = unique_prefix("cold-open");
+    let location = format!("s3://{bucket}/{prefix}");
+
+    // Write from one --dir, with --dim, because *creating* a store legitimately needs one.
+    let writer = tempfile::tempdir().expect("temp dir");
+    let writer_dir = writer.path().to_string_lossy().into_owned();
+    let created = nidus_s3(&[
+        "create",
+        "--dir",
+        &writer_dir,
+        "--persistence",
+        &location,
+        "--dim",
+        "3",
+        "docs",
+    ]);
+    assert!(
+        created.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let records = writer.path().join("records.json");
+    std::fs::write(&records, r#"[{"id":"a","vector":[1,0,0],"attrs":{}}]"#).expect("write records");
+    let upserted = nidus_s3(&[
+        "upsert",
+        "--dir",
+        &writer_dir,
+        "--persistence",
+        &location,
+        "--dim",
+        "3",
+        "--file",
+        &records.to_string_lossy(),
+        "docs",
+    ]);
+    assert!(
+        upserted.status.success(),
+        "upsert failed: {}",
+        String::from_utf8_lossy(&upserted.stderr)
+    );
+
+    // Seed the reader's --dir with a LOCAL store of a different dimension first. If `peek`
+    // ever read that local header instead of the remote one, the open below would fail with
+    // "store dimension mismatch: manifest has 3, requested 5" rather than returning the row.
+    let reader = tempfile::tempdir().expect("temp dir");
+    let decoy = nidus_s3(&[
+        "create",
+        "--dir",
+        &reader.path().to_string_lossy(),
+        "--dim",
+        "5",
+        "decoy",
+    ]);
+    assert!(
+        decoy.status.success(),
+        "seeding the local decoy store failed: {}",
+        String::from_utf8_lossy(&decoy.stderr)
+    );
+
+    // Now read with NO --dim: the dimension must come from the remote header. This is the
+    // command that failed outright before the fix.
+    let query = reader.path().join("query.json");
+    std::fs::write(&query, "[1,0,0]").expect("write query");
+    let out = nidus_s3(&[
+        "search",
+        "--dir",
+        &reader.path().to_string_lossy(),
+        "--persistence",
+        &location,
+        "--query-file",
+        &query.to_string_lossy(),
+        "docs",
+    ]);
+    assert!(
+        out.status.success(),
+        "a cold read of an existing {location} must not need --dim; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits: Value =
+        serde_json::from_slice(&out.stdout).expect("search must print a JSON array of hits");
+    let ids: Vec<&str> = hits
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .filter_map(|h| h["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["a"],
+        "the row written through s3:// must come back from a --dir that never saw it"
+    );
+
+    // The absent-store case still errors, and names the location that actually matters: the
+    // persistence URL, not the local --dir, which holds nothing.
+    let empty = tempfile::tempdir().expect("temp dir");
+    let missing = format!("s3://{bucket}/{}", unique_prefix("cold-open-absent"));
+    let absent_query = empty.path().join("query.json");
+    std::fs::write(&absent_query, "[1,0,0]").expect("write query");
+    let out = nidus_s3(&[
+        "search",
+        "--dir",
+        &empty.path().to_string_lossy(),
+        "--persistence",
+        &missing,
+        "--query-file",
+        &absent_query.to_string_lossy(),
+        "docs",
+    ]);
+    assert!(
+        !out.status.success(),
+        "no store at {missing} must still err"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&missing),
+        "the error must name the persistence location, got: {stderr}"
+    );
+}

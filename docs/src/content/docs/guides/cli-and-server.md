@@ -223,9 +223,10 @@ store-opening command, including `serve`:
 
 ```bash
 # --persistence: where the durable data/log live. A live object-store-backed store
-# (whole-object rewrite on flush). Pass --dim: the remote header is not peeked.
+# (whole-object rewrite on flush). --dim only to create one; an existing store's
+# dimension is read from its remote header, so any --dir opens it cold.
 nidus upsert --dir ./meta --dim 768 --persistence s3://my-bucket/store docs < recs.json
-nidus search --dir ./meta --dim 768 --persistence s3://my-bucket/store docs -k 5 < q.json
+nidus search --dir ./meta --persistence s3://my-bucket/store docs -k 5 < q.json
 
 # --memory: share the in-RAM working set across processes via Redis/Valkey/KeyDB.
 # Each worker publishes on flush and adopts on open, skipping the log replay.

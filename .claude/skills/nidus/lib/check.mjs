@@ -193,15 +193,21 @@ function runPreflight() {
   const behind = git.behindMain()
   const mainAhead = git.refDrift('main').ahead
   const raw = flag('issue')
-  const id = typeof raw === 'string' ? raw.replace(new RegExp(`^(?:#|${git.BEAD_PREFIX}-)`), '') : null
+  // A comma-separated list, because several tickets land as one branch and one PR: each
+  // still needs its own closed/claimed/already-shipped check, and running preflight once
+  // per ticket means N fetches and N chances to skip the last one.
+  const ids = typeof raw === 'string'
+    ? raw.split(',').map(s => s.trim()).filter(Boolean)
+        .map(s => s.replace(new RegExp(`^(?:#|${git.BEAD_PREFIX}-)`), ''))
+    : []
 
-  let issue = null
-  let issueBranches = []
-  if (id) {
-    const facts = git.issueFacts([id])
-    issue = facts[String(id)] || { number: id, unknown: true }
-    issueBranches = git.branchesForIssue(id)
-  }
+  const facts = ids.length ? git.issueFacts(ids) : {}
+  const tickets = ids.map(id => ({
+    issue: facts[String(id)] || { number: id, unknown: true },
+    issueBranches: git.branchesForIssue(id),
+  }))
+  const issue = tickets.length ? tickets[0].issue : null
+  const issueBranches = tickets.length ? tickets[0].issueBranches : []
 
   const mainVersion = mainVersion_()
   const claimed = git.inflightVersions()
@@ -211,11 +217,12 @@ function runPreflight() {
   const findings = pre.preflight({
     fetched, branch: self.branch, onMain: self.branch === 'main',
     dirty: self.dirty, behind, mainAhead, issue, issueBranches,
+    issues: tickets,
     me: git.identities(),
   })
   const info = { branch: self.branch, behind, mainAhead, mainVersion, nextVersion, fetched }
 
-  if (asJson) console.log(JSON.stringify({ info, claimed, issue, issueBranches, findings }, null, 2))
+  if (asJson) console.log(JSON.stringify({ info, claimed, issue, issueBranches, tickets, findings }, null, 2))
   else console.log(pre.formatPreflight(findings, info))
   return findings.some(f => f.severity === 'error') || (argv.includes('--strict') && findings.length) ? 1 : 0
 }
@@ -246,7 +253,7 @@ const USAGE = `nidus-check — deterministic checks for this repo's laws and ver
       run. --status prints just that derived state. The plan is
       {"peers":[{"name":…,"dir":…,"self":true?,"queue":[…],"surface":{"<n>":["path"]}}]}.
 
-  nidus-check preflight [--issue <id>] [--no-fetch] [--json] [--strict]
+  nidus-check preflight [--issue <id>[,<id>…]] [--no-fetch] [--json] [--strict]
       Run this FIRST, before evaluating anything. Fetches origin, then reports
       whether this tree is fit to reason from: behind origin/main, on main,
       dirty, and — with --issue — whether the ticket is already closed, already

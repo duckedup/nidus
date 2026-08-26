@@ -170,8 +170,8 @@ struct StoreArgs {
     #[arg(long, env = "NIDUS_ANN_SEED")]
     ann_seed: Option<u64>,
     /// Where the durable bytes live (SPEC §13.2). Omit for local files under `--dir`; `s3://…` or
-    /// `gs://…` for a live object-backed store. Pass `--dim` with an object store, since the remote
-    /// header is not peeked; credentials come from the standard environment.
+    /// `gs://…` for a live object-backed store. `--dim` only to *create* one: an existing store's
+    /// dimension comes from its remote header. Credentials come from the standard environment.
     #[arg(long, env = "NIDUS_PERSISTENCE")]
     persistence: Option<String>,
     /// Share the in-RAM working set across processes (SPEC §13.3): a `redis://…` (or
@@ -275,13 +275,20 @@ impl StoreArgs {
     /// against the header on open; otherwise the value comes from an existing store's header. With
     /// neither — no store and no `--dim` — creation cannot proceed.
     fn resolve(&self) -> Result<(usize, Distance)> {
-        let peeked = self.peek()?;
+        // An object-store peek is a network round trip: skip it when `--dim` already answers
+        // the only question it settles, so a `--dim` command keeps working uncredentialed.
+        // Distance keeps its pre-existing default on that path.
+        let peeked = if self.dim.is_some() && self.is_object_store() {
+            None
+        } else {
+            self.peek()?
+        };
         let dimension = match (self.dim, peeked) {
             (Some(d), _) => d,
             (None, Some((d, _))) => d,
             (None, None) => bail!(
                 "no store at {} yet — pass --dim to create one",
-                self.dir.display()
+                self.store_location()
             ),
         };
         let distance = match (self.distance, peeked) {
@@ -292,13 +299,37 @@ impl StoreArgs {
         Ok((dimension, distance))
     }
 
-    /// The `(dimension, distance)` an existing local store already committed to, if any.
-    /// An object-store location has no peekable local `data`, so it reads as absent.
+    /// The `(dimension, distance)` an existing store already committed to, if any. An
+    /// object-store location has no local `data` file to stat, so it is peeked through the
+    /// backend — one GET of the `data` header, the route `backup::check` takes (nidus-hzi).
     fn peek(&self) -> Result<Option<(usize, Distance)>> {
         if self.is_object_store() {
-            return Ok(None);
+            let location = self.store_location();
+            let persistence = crate::open_persistence(&location)
+                .with_context(|| format!("opening persistence backend at {location}"))?;
+            // A backend error propagates rather than degrading to `Ok(None)`: a missing
+            // credential must not read back as "no store yet", inviting a second store.
+            let Some(bytes) = persistence
+                .get("data")
+                .with_context(|| format!("reading the `data` object at {location}"))?
+            else {
+                return Ok(None);
+            };
+            return crate::data::header_from_bytes(&bytes)
+                .with_context(|| format!("{location} has no readable nidus header"))
+                .map(Some);
         }
         crate::data::peek_header(&self.dir.join("data"))
+    }
+
+    /// What [`peek`](Self::peek) actually probed, so an error names where we looked: the
+    /// object-store URL, else `--dir`. A *local* `--persistence` path is deliberately not
+    /// named — `peek` still reads `--dir/data` for it (nidus-hzi).
+    fn store_location(&self) -> String {
+        match self.persistence.as_deref() {
+            Some(p) if self.is_object_store() => p.to_string(),
+            _ => self.dir.display().to_string(),
+        }
     }
 
     /// Whether `--persistence` names a (non-local) object store.
@@ -4688,25 +4719,25 @@ mod tests {
         assert!(err.contains("--dim"), "unexpected error: {err}");
     }
 
-    /// `peek()` must defer to `is_object_store()` before ever touching the local
-    /// filesystem, even when a stray local `data` file happens to exist.
+    // `peek_ignores_local_data_under_object_store_persistence` asserted the contract nidus-hzi
+    // reverses. Its claim moved to `cluster::cold_read_of_an_existing_object_store_needs_no_dim`
+    // (a local decoy store): testing it here would mean an outbound IMDS call in the unit lane.
+
+    /// nidus-hzi's own regression guard: `--dim` supplied must resolve from the flag without
+    /// a network round trip. Without the skip in `resolve`, this errors out on an unreachable
+    /// backend even though nothing about the answer needed the backend.
     #[test]
-    fn peek_ignores_local_data_under_object_store_persistence() {
+    fn resolve_with_an_explicit_dim_never_reaches_an_object_store() {
         let dir = tempfile::tempdir().unwrap();
-        {
-            let cfg = Config::new(dir.path().to_path_buf(), 5);
-            Nidus::open(cfg).unwrap();
-        }
-        assert!(
-            dir.path().join("data").exists(),
-            "local store must have written a data file"
-        );
         let args = StoreArgs {
             dir: dir.path().to_path_buf(),
             persistence: Some("s3://bucket/store".to_string()),
+            dim: Some(7),
             ..Default::default()
         };
-        assert_eq!(args.peek().unwrap(), None);
+        let (dim, distance) = args.resolve().expect("an explicit --dim needs no backend");
+        assert_eq!(dim, 7);
+        assert_eq!(distance, Distance::default());
     }
 
     #[test]

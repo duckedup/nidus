@@ -1014,6 +1014,33 @@ test('preflight: assigned to me is not taken; assigned to someone else is', () =
   eq(ids(pre.preflight({ ...clean, issue: mine, me: ['someone-else'] })), ['preflight-ticket-taken'], 'theirs')
 })
 
+test('preflight: every ticket in a bundle is checked, not just the first', () => {
+  // The failure this prevents: three tickets share one branch and one PR, the first is
+  // clean, and the third shipped last week. Checking only the head of the list clears
+  // the bundle on the strength of its healthiest member.
+  const ok = { number: '1', state: 'OPEN', assignees: [], linkedPrs: [] }
+  const shipped = { number: '3', state: 'CLOSED', assignees: [], linkedPrs: [{ number: 9, state: 'MERGED' }] }
+  const found = pre.preflight({
+    ...clean,
+    issues: [{ issue: ok }, { issue: ok }, { issue: shipped }],
+  })
+  eq(ids(found), ['preflight-ticket-closed', 'preflight-ticket-shipped'], 'the third ticket blocks')
+})
+
+test('preflight: a bundle also catches a foreign branch on a non-first ticket', () => {
+  const issue = { number: '7', state: 'OPEN', assignees: [], linkedPrs: [] }
+  const found = pre.preflight({
+    ...clean,
+    issues: [{ issue }, { issue, issueBranches: ['origin/someone/7-thing'] }],
+  })
+  eq(ids(found), ['preflight-branch-exists'], 'findings')
+})
+
+test('preflight: an empty issues list falls back to the single-ticket fields', () => {
+  const issue = { number: '7', state: 'CLOSED', assignees: [], linkedPrs: [] }
+  eq(ids(pre.preflight({ ...clean, issue, issues: [] })), ['preflight-ticket-closed'], 'findings')
+})
+
 test('preflight: a ticket bd cannot resolve warns rather than being invented', () => {
   eq(ids(pre.preflight({ ...clean, issue: { number: 'zzz', unknown: true } })), ['preflight-ticket-unknown'], 'findings')
 })
