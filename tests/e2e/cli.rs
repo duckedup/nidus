@@ -2336,3 +2336,104 @@ fn orthogonal_unit_vec(u: &[f32]) -> Vec<f32> {
     }
     unit_vec(e)
 }
+
+/// A row written through `--persistence P` (never `--dir`) must be readable cold, with no
+/// `--dim`, from a `--dir` that never saw it. Local persistence needs no services, unlike
+/// its `s3://` twin at `cluster.rs:943` (nidus-kjt, split off nidus-hzi).
+#[test]
+fn cold_read_of_a_local_persistence_store_needs_no_dim() {
+    let root = tempfile::tempdir().unwrap();
+    let writer = root.path().join("A");
+    let writer = writer.to_str().expect("utf-8 temp path");
+    let reader = root.path().join("B");
+    let reader = reader.to_str().expect("utf-8 temp path");
+    let persist = root.path().join("P");
+    let persist = persist.to_str().expect("utf-8 temp path");
+
+    // Write from --dir A, --persistence P, --dim 3: the durable bytes land at P, not A.
+    let out = ok(
+        &[
+            "create",
+            "--dir",
+            writer,
+            "--persistence",
+            persist,
+            "--dim",
+            "3",
+            "docs",
+        ],
+        "",
+    );
+    assert_eq!(out["created"], "docs");
+    let out = ok(
+        &["upsert", "--dir", writer, "--persistence", persist, "docs"],
+        &json!([{"id": "a", "vector": [1, 0, 0], "attrs": {}}]).to_string(),
+    );
+    assert_eq!(out["upserted"], 1, "{out}");
+
+    // Seed the reader's --dir B with a LOCAL store of a different dimension. If `peek` ever
+    // read B/data instead of P/data, the search below would fail on a dimension mismatch
+    // rather than passing quietly.
+    let decoy = ok(&["create", "--dir", reader, "--dim", "5", "decoy"], "");
+    assert_eq!(decoy["created"], "decoy");
+
+    // Cold read, no --dim: the command that fails outright before the fix.
+    let hits = ok(
+        &["search", "--dir", reader, "--persistence", persist, "docs"],
+        "[1,0,0]",
+    );
+    assert_eq!(
+        ids(&hits),
+        ["a"],
+        "the row written through --persistence P must come back from a --dir that never saw it: {hits}"
+    );
+
+    // Same, through file://P: covers the scheme-stripping path.
+    let file_url = format!("file://{persist}");
+    let hits = ok(
+        &[
+            "search",
+            "--dir",
+            reader,
+            "--persistence",
+            &file_url,
+            "docs",
+        ],
+        "[1,0,0]",
+    );
+    assert_eq!(ids(&hits), ["a"], "file://-prefixed persistence: {hits}");
+
+    // A typo'd --persistence still errs, names the persistence path (not --dir), and — the
+    // whole reason this ticket exists — creates nothing at that path.
+    let tpyo = root.path().join("tpyo");
+    let tpyo_str = tpyo.to_str().expect("utf-8 temp path");
+    let err = fails(
+        &["search", "--dir", reader, "--persistence", tpyo_str, "docs"],
+        "[1,0,0]",
+    );
+    assert!(
+        err.contains(tpyo_str),
+        "must name the persistence path, got: {err}"
+    );
+    assert!(
+        !err.contains(reader),
+        "must not name --dir instead, got: {err}"
+    );
+    assert!(
+        !tpyo.exists(),
+        "a read-only probe of a typo'd path must not create it: {err}"
+    );
+
+    // `check` takes the same no-mkdir-on-read path.
+    let tpyo2 = root.path().join("tpyo2");
+    let tpyo2_str = tpyo2.to_str().expect("utf-8 temp path");
+    let err = fails(&["check", "--dir", reader, "--persistence", tpyo2_str], "");
+    assert!(
+        err.contains(tpyo2_str),
+        "must name the persistence path, got: {err}"
+    );
+    assert!(
+        !tpyo2.exists(),
+        "check on a typo'd path must not create it: {err}"
+    );
+}
