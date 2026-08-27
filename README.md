@@ -6,8 +6,8 @@ first) with the provider of your choice, or bring your own vectors. At its core
 it's a vector store for development and small-scale use: exact-by-default
 nearest-neighbour search (cosine, dot, or Euclidean) over a single append-only
 directory, approximate (HNSW/IVF) when you opt in, with typed metadata filters and
-many logical collections sharing one embedding space. No SQL, no query engine, and
-a build measured in seconds, not minutes.
+many logical collections sharing one embedding space. No SQL, no query engine, no
+bundled C++ tree.
 
 > _nidus_ (Latin, "nest"): a small place where things are kept safe.
 
@@ -22,27 +22,29 @@ obvious off-the-shelf options fail the **build-and-ship** test, not the
 functionality test:
 
 - **DuckDB** (via `libduckdb-sys`) bundles a large C++ source tree and compiles it
-  from scratch: multi-minute cold builds, a required C++ toolchain, a bloated
-  binary, and FFI that can't run under Miri. A vector workload uses ~1% of it.
-- **LanceDB** is "written in Rust" yet still takes ~10 minutes to compile, because
-  it drags in Arrow + DataFusion (a full SQL engine) + a columnar format: hundreds
-  of crates to do `ORDER BY distance LIMIT k`.
+  from scratch: a required C++ toolchain, a bloated binary, and FFI that can't run
+  under Miri. A vector workload uses ~1% of it.
+- **LanceDB** is "written in Rust" yet drags in Arrow + DataFusion (a full SQL
+  engine) + a columnar format: hundreds of crates to do `ORDER BY distance LIMIT k`.
 
-The workload is a *vector store, not a database*. nidus is that store (with an
-opt-in memory layer over it, off by default), so it **compiles in seconds** and
-embeds as a normal Rust dependency.
+The workload is a *vector store, not a database*. nidus is that store, plus a
+memory layer built on top; `--no-default-features` gives the storage-and-search
+core alone, and either way it embeds as a normal Rust dependency.
 
 ### The constraints are the product
 
 The bar is **build-and-ship speed**, not zero-C absolutism. The enemy is the
-*multi-minute* C/C++ tree (DuckDB) or hundred-crate graph (LanceDB), not a small,
+sprawling C/C++ tree (DuckDB) or hundred-crate graph (LanceDB), not a small,
 fast dependency.
 
-- **Builds in seconds**: the whole crate, with every backend (local files, S3, GCS, and
-  the Redis/Valkey memory tier), compiles in seconds (CI asserts well under a minute). The
-  only native code is `ring` (the TLS used by the S3/GCS backends and `rediss://`, a small
-  C+asm compile); never a bundled C++ tree, vendored OpenSSL, or `aws-lc`. The Redis client
-  is sync/pure-Rust (no tokio).
+- **No bundled C++ tree**: no bundled C++ source tree, no vendored OpenSSL, no
+  `aws-lc`, no SQL engine, pure-Rust core. `--no-default-features` gives the
+  storage-and-search core alone (four crates plus the backends), with `ring` (the
+  TLS used by the S3/GCS backends and `rediss://`, a small C+asm compile) as the
+  only native code; the Redis client itself is sync/pure-Rust (no tokio). The
+  default build adds the CLI, server, MCP, memory, every embed/summarize/rerank
+  provider, and `code`; the `code` feature's tree-sitter parsers are the only
+  other native code either lane touches.
 - **Near-zero `unsafe` in our code** (`#![deny(unsafe_code)]`). The one exception is the
   opt-in [`Config::mmap`](https://nidus.duckedup.org/reference/configuration/#mmap) path:
   a single scoped `mmap` call for serving large stores from disk; every other `unsafe` is a
@@ -50,14 +52,15 @@ fast dependency.
 - **Pure-Rust core**: the local store and search path are pure Rust with no native
   library; the cloud backends are sans-IO clients (`rusty-s3`/`tame-gcs`) over a small
   blocking HTTP client.
-- **Miri-checkable**: all of nidus's own logic, including the local file IO, runs
-  under Miri (only the network TLS paths are excluded).
+- **Miri-checkable**: the lean library build (`--no-default-features`) runs all of
+  nidus's own logic, including the local file IO, under Miri (only the network TLS
+  paths are excluded).
 
 ## Quick start
 
 ```toml
 [dependencies]
-nidus = "0.95"
+nidus = "0.96"
 ```
 
 ```rust
@@ -96,12 +99,13 @@ See [`examples/demo.rs`](examples/demo.rs) for an end-to-end run (`cargo run
 
 ## What it does
 
-- **Remember text, recall the relevant bits** *(opt-in)*: hand nidus natural
+- **Remember text, recall the relevant bits**: hand nidus natural
   language and it embeds it for you, optionally summarizing first, with a provider of
   your choice (Voyage, OpenAI, Ollama, Cohere, Gemini, Mistral, Jina, or any
   OpenAI-compatible endpoint), then answers queries by similarity. The raw `Vec<f32>`
-  API is untouched: bring your own vectors and skip it entirely. Off by default, so
-  `cargo add nidus` stays a lean synchronous store. See the
+  API is untouched: bring your own vectors and skip it entirely.
+  `--no-default-features` gives the storage-and-search core alone, without this
+  layer. See the
   [remember & recall guide](https://nidus.duckedup.org/guides/remember-and-recall/).
 - **Exact or approximate search**: exact by default (100% recall, fast at the target
   scale of ≤ a few million vectors, comfortably in RAM). Score by cosine, dot, or
@@ -132,25 +136,26 @@ See [`examples/demo.rs`](examples/demo.rs) for an end-to-end run (`cargo run
   data in the browser's Origin Private File System (`opfs://`) from a dedicated
   worker, no server round trip. See the
   [browser guide](https://nidus.duckedup.org/guides/wasm/).
-- **Code search** *(opt-in)*: `nidus code ingest`/`nidus code search` chunk a
+- **Code search**: `nidus code ingest`/`nidus code search` chunk a
   repository per file (AST-aware for source, heading-aware for docs) into one
   corpus, and answer queries grouped by file and symbol, never a source body.
-  Off by default behind the `code` feature, so `cargo add nidus` still never sees
-  its tree-sitter dependency. See the
+  Part of the default build (the `code` feature); `--no-default-features` gives
+  the storage-and-search core alone, without tree-sitter. See the
   [code search guide](https://nidus.duckedup.org/guides/code/).
 
 ## Command line & server
 
-The same crate ships an optional `nidus` binary: a CLI for working with a store
+The same crate ships a `nidus` binary: a CLI for working with a store
 directly, and `nidus serve`, an HTTP server exposing the full store (create,
-upsert, search, inspect, maintain) over JSON. The binary is built behind a `cli`
-feature, so `cargo add nidus` stays pure: the library never pulls the binary's
-dependencies.
+upsert, search, inspect, maintain) over JSON. It is part of the default build, so
+`cargo install nidus` produces the whole binary; a library dependency that wants
+the storage-and-search core alone (no binary, no async stack) adds `nidus` with
+`--no-default-features`.
 
 ```bash
 # Install: no Rust toolchain needed (prebuilt binary for your platform)
 curl -fsSL https://raw.githubusercontent.com/duckedup/nidus/main/install.sh | sh
-# …or, with cargo: `cargo binstall nidus` / `cargo install nidus --features cli`
+# …or, with cargo: `cargo binstall nidus` / `cargo install nidus`
 
 # Use it on a store directory (records/queries are JSON). --dim is pinned at
 # creation, then inferred from the store, so later commands don't repeat it.
@@ -202,7 +207,7 @@ better.
 | dim=768 | 100 | **8.57 ms** | 53.16 ms | 64.99 ms | 100% |
 
 All three are exact (recall 100%); nidus is the fastest in every cell while being the
-one that compiles in seconds. The kernel is plain safe Rust: an
+one with no bundled C++ tree. The kernel is plain safe Rust: an
 8-lane chunked dot the optimizer can vectorize, an allocation-free top-k scan, and a
 storage-order (prefetcher-friendly) sweep of the matrix. Reproduce with
 `just bench all` (see [`benchmarks/`](benchmarks/); the heavy DuckDB/LanceDB deps are
@@ -242,21 +247,26 @@ defaults, env vars, or hidden directories.
 ## Development
 
 ```bash
-just test    # all tests (pure library)
-just ci       # fmt-check + clippy (-D warnings) + test (pure library)
-just miri     # undefined-behavior check (nightly; all of nidus's own logic runs)
+just test     # all tests, lean library build
+just ci       # fmt-check + clippy (-D warnings) + test, lean library build
+just miri     # undefined-behavior check (nightly; the lean library build's own logic)
 just demo     # the end-to-end example
-just deps     # the dependency tree (stays short)
+just deps     # the dependency tree, default build (`just deps-lean` for the lean one)
 
-just ci-cli   # the same gate for the opt-in `cli` feature (binary + server)
+just ci-cli   # the same gate, isolated to the `cli` feature (binary + server)
 just serve ./store 768   # run `nidus serve` from the checkout
 ```
 
-The core recipes keep the seconds-long build path intact; the `cli` feature (which
-pulls clap + the tokio/axum stack) has its own opt-in recipes. Miri runs all of
-nidus's own logic, including the local file IO and the in-RAM object-store/memory-tier
-paths; only the network paths (S3/GCS TLS, the Redis socket) and the opt-in `mmap`
-syscall are outside its reach.
+`just test`/`just ci` run the lean library build (`--no-default-features`): the
+storage-and-search core alone, which keeps the inner loop fast. The default build,
+which is what `cargo install nidus` ships, adds CLI, server, MCP, memory, every
+embed/summarize/rerank provider, and `code`; `just ci-serve` is the gate for it.
+Lanes that isolate one slice, like
+`just ci-cli`, pair `--no-default-features` with that slice's feature so a failure
+there points at one crate, not the whole tree. Miri runs against the lean library
+build: all of nidus's own logic, including the local file IO and the in-RAM
+object-store/memory-tier paths; only the network paths (S3/GCS TLS, the Redis
+socket) and the opt-in `mmap` syscall are outside its reach.
 
 Rust 1.96+ (pinned via `rust-toolchain.toml`), edition 2024.
 

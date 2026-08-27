@@ -53,10 +53,10 @@ so the same id appears in your logs and the server's.
 | `POST /collections/{name}/recall`* | text in, embed, and search with TTL filtering | `search` |
 | `/mcp`** | the Model Context Protocol surface, nested inside this router | – |
 
-\* Present only in a `memory`-featured build (the `serve` umbrella; absent from a plain
-`--features cli` build). See [Memory](#memory-remember--recall) below.
+\* Present only in a `memory`-featured build (the default build; absent from a
+`--no-default-features --features cli` build). See [Memory](#memory-remember--recall) below.
 \*\* Needs the `mcp` feature on top of `memory`. See [`/mcp`](#mcp) below.
-\*\*\* Needs the off-by-default `code` feature on top of `memory`. See
+\*\*\* Needs the `code` feature on top of `memory`. See
 [`POST /code-search`](#post-code-search) below and the [code search guide](/guides/code/).
 
 ## Health & introspection
@@ -432,7 +432,7 @@ curl -s localhost:7700/search \
 | `plan` | `false` | report how the query ran alongside the hits; see [Query plans](#query-plans-how-a-query-ran) |
 
 Omitting `rerank` leaves the response byte-identical to a nidus without the feature.
-`rerank` is only compiled in under the `rerank` feature (part of the `serve` umbrella);
+`rerank` is compiled in under the `rerank` feature, part of the default build;
 requesting it against a build without a `--rerank-provider` configured is a `400` naming
 the flag, never a silent pass-through of the un-reranked order.
 
@@ -639,8 +639,9 @@ reported through `explain` instead, as `expansion` on that clause's score.
 ### `POST /code-search`
 
 Search a corpus ingested with [`nidus code ingest`](/guides/code/), grouped by file
-with each hit's matching symbols. Needs the off-by-default `code` feature on top of
-`memory`; a build without it answers `404` here, not `400`. Never returns a raw
+with each hit's matching symbols. Needs the `code` feature on top of `memory`,
+both part of the default build; a build without it (`--no-default-features`)
+answers `404` here, not `400`. Never returns a raw
 vector or the source body: read the file at the given lines for ground truth.
 
 ```bash
@@ -680,8 +681,9 @@ ordered by their best-matching symbol's score; symbols within a file keep that s
 descending order.
 
 `vector: true` against a build with `code` but no `memory` embedder configured (a
-plain `--features code` build, with no `--embed-provider` at serve time) is a `400`
-naming the fix, rather than a silent BM25 fallback the caller did not ask for.
+`--no-default-features --features code` build, or the default build with no
+`--embed-provider` at serve time) is a `400` naming the fix, rather than a silent
+BM25 fallback the caller did not ask for.
 
 ### `POST /suggest`
 
@@ -1105,9 +1107,9 @@ error** rather than quietly matching nothing. See
 
 Two text-native routes over the same store: send text, not vectors, and the server embeds
 (and optionally summarizes) it for you. Both are compiled in only under the `memory`
-feature, which is part of the `serve` umbrella and therefore present in the prebuilt
-`cargo binstall` binary. A `cargo install nidus --features cli` build has **neither** route;
-hitting them there is a `404`, not a `400`. See the
+feature, which is part of the default build and therefore present in `cargo install
+nidus` and the prebuilt `cargo binstall` binary. A `--no-default-features --features cli`
+build has **neither** route; hitting them there is a `404`, not a `400`. See the
 [remember & recall guide](/guides/remember-and-recall/) for setup (an embedder, optionally a
 summarizer) and [parity across the surfaces](/guides/remember-and-recall/#parity-across-the-surfaces)
 for how these two routes compare to the Rust API, the CLI, and the MCP tools below.
@@ -1210,7 +1212,8 @@ than reimplementing any of them: a token required elsewhere on this server is re
 
 Eleven tools, all text-native: `remember`, `recall`, `text_search`, `hybrid_search`,
 `list_collections`, `stats`, `forget`, `get`, `browse`, `related`, `suggest`, plus a
-twelfth, `code_search`, behind the off-by-default `code` feature. **No tool takes a
+twelfth, `code_search`, behind the `code` feature (part of the default build).
+**No tool takes a
 raw vector**: every argument is natural language, which is deliberate, since a model
 cannot emit a raw float array as a tool call, and `tests/e2e/mcp/` asserts the surface
 stays that way.

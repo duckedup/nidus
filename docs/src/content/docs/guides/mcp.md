@@ -43,11 +43,11 @@ fail, since they write.
 
 ## Over HTTP (`nidus serve`)
 
-The endpoint ships in the `mcp` feature, which is part of the `serve` umbrella,
-so a binary built for the memory layer already has it:
+The endpoint ships in the `mcp` feature, part of the default build, so a
+binary built for the memory layer already has it:
 
 ```bash
-cargo install nidus --features serve
+cargo install nidus
 ```
 
 It needs an embedder, because the useful tools take **text** and embed it for
@@ -101,7 +101,7 @@ client's writes rather than each client racing for its own.
 | `suggest` | Complete a partial word from a field's indexed vocabulary, ranked commonest-first. Takes a `filter`, and the words before the final token narrow it. |
 | `code_search`* | Search a chunked code/docs corpus, grouped by file with each hit's matching symbols: name, kind, line span. Never returns source; read the file at the given lines instead. |
 
-\* Needs the off-by-default `code` feature on top of `mcp`. See the
+\* Needs the `code` feature on top of `mcp`, part of the default build. See the
 [code search guide](/guides/code/) for indexing a repo with `nidus code ingest` first.
 
 Every one of them takes **natural language, never vectors**. That is deliberate:

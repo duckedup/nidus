@@ -1,6 +1,7 @@
 # D0014 — nidus depends on `wdpkr-core`, behind the off-by-default `code` feature
 
 **Status:** accepted
+**Superseded in part by [D0015](0015-the-default-build-ships-the-whole-binary.md):** `code` is part of the default `serve` set now, so three claims below are stale. The budget table's "default features" row now names the *lean* `--no-default-features` lane, not the default one. The Miri paragraph reasons from "the CI Miri jobs never pass `--features`" meaning Miri never saw `code`; post-flip that same fact means the opposite, so the jobs now pass `--no-default-features` to preserve this record's own stated invariant. And the Evidence line citing D0011 for "the binary … is gated behind non-default features" is stale in the same way D0011 itself now is. Everything else — the cycle argument, the measurement methodology, the 167-crate cost, the exit plan — still holds.
 **Rule:** nidus may depend on `wdpkr-core` behind the off-by-default `code` feature. The cargo-cycle argument that forbade this is dead, the build-budget argument is satisfied by measurement plus a dedicated CI job, and the default `cargo add nidus` graph is unchanged.
 
 ## Why

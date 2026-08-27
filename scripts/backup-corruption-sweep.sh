@@ -15,7 +15,7 @@ set -euo pipefail
 STRIDE="${1:-41}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/target/debug/nidus"
-[ -x "$BIN" ] || { echo "build first: cargo build --features cli" >&2; exit 1; }
+[ -x "$BIN" ] || { echo "build first: cargo build" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

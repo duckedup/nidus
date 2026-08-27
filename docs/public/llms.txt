@@ -1,10 +1,10 @@
 # nidus
 
-> A small, pure-Rust embeddable vector store for development and small-scale use. It holds dense vectors plus typed metadata in a single on-disk directory and answers nearest-neighbour queries — exact brute-force by default, or an opt-in approximate index (HNSW / IVF) — over cosine, dot-product, or Euclidean distance. No FFI, no C, no SQL, no query engine, no background threads; `#![forbid(unsafe_code)]` and pure-Rust dependencies only, so `cargo add nidus` compiles in seconds.
+> A small, pure-Rust vector store for development and small-scale use. It holds dense vectors plus typed metadata in a single on-disk directory and answers nearest-neighbour queries: exact brute-force by default, or an opt-in approximate index (HNSW / IVF), over cosine, dot-product, or Euclidean distance. No SQL, no query engine, no background threads; `#![deny(unsafe_code)]` and pure-Rust dependencies throughout.
 
 Key facts for answering questions about nidus:
 
-- It is a library (`cargo add nidus`), with an optional `cli` feature that adds a `nidus` binary and an HTTP server (`nidus serve`). The library is synchronous; async callers wrap it in `Arc<Mutex<Nidus>>` + `spawn_blocking`.
+- It is a library (`cargo add nidus`), by default with a `cli` feature that adds a `nidus` binary and an HTTP server (`nidus serve`); `--no-default-features` gives the storage-and-search core alone. The library is synchronous; async callers wrap it in `Arc<Mutex<Nidus>>` + `spawn_blocking`.
 - One store is a directory of append-only files (`data`, `log`, `lock`). One embedding dimension is pinned per store; many collections share it.
 - Durability is per-batch fsync; cross-process readers are lock-free and see a consistent, possibly-stale snapshot.
 - Search is exact brute-force cosine by default. Opt-in `Config::quantization` (int8 / binary) speeds the scan with a two-pass quantized-then-rerank search. Opt-in `Config::ann` (HNSW or IVF) walks an approximate index. The two can be combined: a quantized index walk plus an exact f32 rerank.
@@ -16,18 +16,18 @@ Key facts for answering questions about nidus:
 - [How it works](https://nidus.duckedup.org/guides/how-it-works/): the storage model and search path end to end, from upsert to ranked hits.
 - [Search & filters](https://nidus.duckedup.org/guides/search/): scoped search over three distance metrics; exact or approximate (HNSW/IVF) indexing; int8/binary quantization; metadata-only queries; equality / glob / set / range filter predicates.
 - [Storage & durability](https://nidus.duckedup.org/guides/storage/): the on-disk format, per-batch fsync contract, crash recovery, compaction, and lock-free cross-process readers.
-- [Storage backends](https://nidus.duckedup.org/guides/storage-backends/): keep durable data on local disk (default), Amazon S3 (or R2 / MinIO), or Google Cloud Storage — chosen with one location string.
+- [Storage backends](https://nidus.duckedup.org/guides/storage-backends/): keep durable data on local disk (default), Amazon S3 (or R2 / MinIO), or Google Cloud Storage, chosen with one location string.
 - [Memory stores](https://nidus.duckedup.org/guides/memory-stores/): share the in-RAM working set across processes via Redis (or Valkey / KeyDB / DragonflyDB), or keep it in local memory (default).
 - [Embedding in a host app](https://nidus.duckedup.org/guides/integrating/): map a host document type onto a nidus `Record` and bridge the synchronous API into an async runtime.
 
 ## Reference
 
-- [API reference](https://nidus.duckedup.org/reference/api/): the full public surface — `Nidus`, `Config`, `Record`, `Value`, `Filter`, `Predicate`, `Scope`, `SearchOpts`, `Hit`, `Footprint`, `AnnConfig`, `Quantization`.
-- [Configuration](https://nidus.duckedup.org/reference/configuration/): every `Config` knob — distance metric, fsync policy, open mode, auto-compaction, lock TTL, `max_vector_bytes`, quantization, and ANN.
-- [Performance](https://nidus.duckedup.org/reference/performance/): exact brute-force cosine KNN benchmarked against DuckDB and LanceDB — fastest in every cell at 100% recall, compiling in seconds.
+- [API reference](https://nidus.duckedup.org/reference/api/): the full public surface: `Nidus`, `Config`, `Record`, `Value`, `Filter`, `Predicate`, `Scope`, `SearchOpts`, `Hit`, `Footprint`, `AnnConfig`, `Quantization`.
+- [Configuration](https://nidus.duckedup.org/reference/configuration/): every `Config` knob: distance metric, fsync policy, open mode, auto-compaction, lock TTL, `max_vector_bytes`, quantization, and ANN.
+- [Performance](https://nidus.duckedup.org/reference/performance/): exact brute-force cosine KNN benchmarked against DuckDB and LanceDB, fastest in every cell at 100% recall.
 
 ## Optional
 
 - [Command line](https://nidus.duckedup.org/guides/cli-and-server/): drive a store directory from the terminal with the `nidus` binary (create, upsert, search, inspect, back up, restore).
 - [HTTP server](https://nidus.duckedup.org/guides/http-server/): run `nidus serve` and drive the store over JSON, with no Rust toolchain on the client.
-- [HTTP API](https://nidus.duckedup.org/reference/http-api/): the route-by-route endpoint reference for a running server — JSON body and curl example for each, plus error codes.
+- [HTTP API](https://nidus.duckedup.org/reference/http-api/): the route-by-route endpoint reference for a running server, JSON body and curl example for each, plus error codes.

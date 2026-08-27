@@ -20,18 +20,21 @@ binary was built:
 
 | Install | Command | Surface |
 | --- | --- | --- |
-| `cargo binstall nidus` (prebuilt), or the install script | n/a | Everything below: all 33 subcommands, every `--embed-*`/`--summarize-*` flag, `mcp`, `ingest`, `code ingest`, `code search`, `remember`, `recall` |
-| `cargo install nidus --features cli` | build from source | No `mcp`, `ingest`, `code ingest`, `code search`, `remember`, or `recall` subcommand, and `serve` has **no** `--embed-*`/`--summarize-*` flags |
+| `cargo install nidus`, `cargo binstall nidus`, the install script, or the release tarballs | n/a | Everything below: all 33 subcommands, every `--embed-*`/`--summarize-*` flag, `mcp`, `ingest`, `code ingest`, `code search`, `remember`, `recall` |
+| `cargo install nidus --no-default-features --features cli` | build from source | No `mcp`, `ingest`, `code ingest`, `code search`, `remember`, or `recall` subcommand, and `serve` has **no** `--embed-*`/`--summarize-*` flags |
 
-The prebuilt binaries (`cargo binstall`, the install script, and the release
-tarballs) are all built with `--features serve`, which is the umbrella feature
-`cli + memory + embed-all + summarize-all + mcp`. A plain `--features cli`
-source build gets the store-operation subcommands and `serve` for the raw vector
-routes, but none of the AI-ingest layer: `mcp`, `remember`, and `recall` do not
-exist as subcommands at all, and `serve`'s embedder/summarizer flags are absent
-rather than merely inert. A reference that listed them anyway would be wrong for
-that install, so every flag below tagged **memory** or **mcp** is only present
-when the binary was built with that feature (`serve` pulls in both).
+`cargo install nidus` builds with `default = ["serve"]`, the umbrella feature
+`cli + memory + embed-all + summarize-all + rerank-all + mcp + code`. One surface, no flags
+to remember: the prebuilt binaries (`cargo binstall`, the install script, and
+the release tarballs) ship the same thing. Someone who wants the narrower
+store-and-server build without the providers or `code` opts out explicitly
+with `--no-default-features --features cli`: that build gets the
+store-operation subcommands and `serve` for the raw vector routes, but none of
+the AI-ingest layer. `mcp`, `remember`, and `recall` do not exist as
+subcommands at all, and `serve`'s embedder/summarizer flags are absent rather
+than merely inert. A reference that listed them anyway would be wrong for that
+install, so every flag below tagged **memory** or **mcp** is only present when
+the binary was built with that feature (the default build pulls in both).
 
 See [Install](/guides/cli-and-server/#install) for the two paths, and
 [Remember & recall](/guides/remember-and-recall/#turn-it-on) for the Cargo

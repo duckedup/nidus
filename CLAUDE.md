@@ -22,8 +22,9 @@ skipped — brevity is not a licence to omit bad news.
 Three commitments every change is judged against (SPEC §1 — trading one away is a
 design change, not an implementation detail):
 
-1. **Speed** — the clean build stays in seconds and CI asserts it; dependencies are
-   judged by build-and-ship cost (D0005). Never trade this away silently.
+1. **Speed** — the lean library build (`--no-default-features`) stays under a minute and
+   the default build under two minutes, both CI-asserted (D0014, D0015); dependencies
+   are judged by build-and-ship cost (D0005). Never trade this away silently.
 2. **Testing** — verify against the real artifact, never assume (SPEC §11). Every
    behaviour claim is backed by a test that runs in CI: surfaces only a real binary
    can prove get e2e tests (`tests/e2e/`), and the SDK↔server contract runs against a
@@ -133,8 +134,8 @@ Work is NOT complete until `git push` succeeds. Do not stop before pushing, and 
 ## Build & Test
 
 ```bash
-just test          # all tests (pure library — no cli feature)
-just ci            # fmt-check + clippy (-D warnings) + test (pure library)
+just test          # all tests (lean library build, --no-default-features)
+just ci            # fmt-check + clippy (-D warnings) + test (lean library build)
 just lint          # clippy only          just fmt      # format
 just miri          # UB check via Miri (nightly)
 just build         # debug                just release  # optimized

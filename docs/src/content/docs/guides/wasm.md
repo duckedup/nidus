@@ -13,6 +13,9 @@ No `Cargo.toml` feature flag is involved. The `wasm32` target itself selects whi
 of the tree compile: the core store, search, and the local/RAM/OPFS backends build and run
 there, while the S3, GCS, and Redis-family backends are simply absent (their client crates
 depend on native TLS and certificate stores that do not target `wasm32-unknown-unknown`).
+If you depend on `nidus` directly from your own crate targeting `wasm32`, set
+`default-features = false` on that dependency: the default build pulls in `cli`,
+`serve`, and the provider crates, none of which target `wasm32-unknown-unknown`.
 
 ## Installing
 
@@ -43,8 +46,9 @@ Most consumers only need `npm install @duckedup/nidus` above. Build straight fro
 repo instead when you are working on the binding itself:
 
 ```bash
-# Build the library for the target (no --features needed)
-cargo build --target wasm32-unknown-unknown --lib
+# Build the library for the target. `--no-default-features` is required: the default
+# build pulls the server stack (tokio, axum, reqwest), none of which targets wasm32.
+cargo build --no-default-features --target wasm32-unknown-unknown --lib
 
 # Build the JS binding (bindings/wasm)
 just build-wasm-binding

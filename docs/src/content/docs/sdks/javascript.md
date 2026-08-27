@@ -205,7 +205,7 @@ const { suggestions } = await db.suggest({
   prefix: "quick br",
   filter: [{ Eq: ["tenant", { Str: "acme" }] }],
 });
-// suggestions: [{ term: "bracket", df: 1 }]   — "brown" is not offered
+// suggestions: [{ term: "bracket", df: 1 }] ("brown" is not offered)
 ```
 
 A single-token prefix, or one whose earlier words are all stopwords, has no head terms and

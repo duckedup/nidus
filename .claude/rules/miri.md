@@ -6,11 +6,13 @@ paths:
 
 # Miri discipline
 
-`just miri` runs the suite under Miri. **All of nidus's own logic** runs under it — codecs,
-search kernels, filters, local file IO. Only the network paths in the S3/GCS backends are out
-of reach, and even there the unit tests (presigned-URL and request construction) are pure and
-DO run; only the localhost-mock round-trips are ignored. Miri runs with
-`-Zmiri-disable-isolation` so file-backed tests can touch a temp dir.
+`just miri` runs the suite under Miri, against `--no-default-features` (D0015). Miri cannot
+instrument foreign code, and `code` (default since D0015) pulls tree-sitter's C via
+`wdpkr-core`; the lean lane is the only one Miri can run at all. **All of nidus's own logic**
+runs under it — codecs, search kernels, filters, local file IO. Only the network paths in the
+S3/GCS backends are out of reach, and even there the unit tests (presigned-URL and request
+construction) are pure and DO run; only the localhost-mock round-trips are ignored. Miri runs
+with `-Zmiri-disable-isolation` so file-backed tests can touch a temp dir.
 
 **Do NOT ignore** pure-logic tests: cosine math, glob matching, filter evaluation, op-log and
 value codec round-trips. Prefer testing a codec against `Vec<u8>` rather than a real file so

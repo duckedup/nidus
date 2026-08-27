@@ -7,6 +7,12 @@ paths:
 
 # Test placement
 
+**`--features X` is additive to the default set, never a replacement (D0015).** The default
+build now ships everything (`serve`), so a lane meant to isolate one feature slice — `cli`,
+`code`, `embed-all`, whatever — must pass `--no-default-features --features X` explicitly. Omit
+`--no-default-features` and the lane silently re-tests the full default build instead: it keeps
+passing and its name keeps promising isolation it no longer provides.
+
 - **Pure-logic unit tests** live inline per module.
 - **File-backed behaviour** goes in `tests/` against temp dirs, with
   `#[cfg_attr(miri, ignore)]` where they fsync (name the reason — `.claude/rules/miri.md`).

@@ -329,8 +329,8 @@ export function featureGating(file, text) {
   if (CODE_ONLY.test(m[1]) && CODE_EXEMPT.test(file)) return []
   const line = text.slice(0, text.indexOf(m[0])).split('\n').length
   const remediation = CODE_ONLY.test(m[1])
-    ? 'decisions/0014-nidus-depends-on-wdpkr-core-behind-code.md: those deps compile only under `code`, off by default, and `src/code/` is the only directory allowed to use them. Route through `src/code/` instead of importing them directly.'
-    : '.claude/rules/cli-feature.md (D0011): those deps compile only under `cli`/`serve`. Using them from a library module breaks the pure `cargo add nidus` install.'
+    ? 'decisions/0014-nidus-depends-on-wdpkr-core-behind-code.md: those deps compile only under `code` (part of the default build since D0015, excluded by --no-default-features), and `src/code/` is the only directory allowed to use them. Route through `src/code/` instead of importing them directly.'
+    : '.claude/rules/cli-feature.md (D0011, D0015): those deps compile only under `cli`/`serve`. Using them from a library module breaks the lean `--no-default-features` install.'
   return [finding('feature-gating', 'error', file, line,
     `library module imports the binary-only crate \`${m[1]}\``,
     remediation)]

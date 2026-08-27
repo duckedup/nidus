@@ -1,6 +1,7 @@
 # D0011 — The binary is gated behind the non-default `cli` feature
 
 **Status:** accepted
+**Superseded in part by [D0015](0015-the-default-build-ships-the-whole-binary.md):** the `cli`/`serve` deps are now in the default set. Everything else here still holds: the gates stay, the lean library build is still `--no-default-features`, and library modules still must not import binary-only crates.
 **Rule:** Gate anything in `src/cli/`, `src/server/`, or `src/bin/` on the `cli` feature and verify with `just ci-cli`. Never move those deps into the default set, and never use them from a library module.
 
 ## Why

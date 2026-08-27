@@ -70,11 +70,11 @@ jobs:
       - name: Fetch dependencies (network time is not compile time)
         if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: cargo fetch
-      - name: Time a clean offline build of the default features
+      - name: Time a clean offline build of the lean library build
         if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: |
           start=$(date +%s)
-          cargo build --offline
+          cargo build --offline --no-default-features
           elapsed=$(( $(date +%s) - start ))
           echo "clean build: ${elapsed}s (budget: 60s, SPEC §1)"
           if [ "$elapsed" -gt 60 ]; then
@@ -82,13 +82,13 @@ jobs:
             exit 1
           fi
 
-  # The build budget for the off-by-default `code` feature (D0014): `wdpkr-core` pulls in
-  # tree-sitter plus its own 167-crate graph, invisible to the default lane above. Same
-  # structure as `build-budget` — fetch first, no cache, offline — but its own bound: measured
-  # 122.1s CPU locally against 50.5s for the default lane (whose CI wall time is 25s), so 120s
-  # is the order-of-magnitude bound in the same spirit as the 60s one.
-  build-budget-code:
-    name: build-budget-code (clean-build timer)
+  # The build budget for the default build (D0014, D0015): `default = ["serve"]` pulls in
+  # the whole ingest layer plus `code`'s tree-sitter and its own 167-crate graph, invisible
+  # to the lean lane above. Same structure as `build-budget` — fetch first, no cache, offline —
+  # but its own bound: measured 122.1s CPU locally against 50.5s for the lean lane (whose CI
+  # wall time is 25s), so 120s is the order-of-magnitude bound in the same spirit as the 60s one.
+  build-budget-default:
+    name: build-budget-default (clean-build timer)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -99,7 +99,7 @@ jobs:
         run: |
           git fetch --quiet --depth=1 origin "$BASE_SHA"
           files="$(git diff --name-only "$BASE_SHA" HEAD | paste -sd, -)"
-          if [ -n "$files" ] && [ "$(.claude/skills/nidus/bin/nidus-check ci-guard build-budget-code --paths "$files")" = "skip" ]; then
+          if [ -n "$files" ] && [ "$(.claude/skills/nidus/bin/nidus-check ci-guard build-budget-default --paths "$files")" = "skip" ]; then
             echo "SKIP_LANE=true" >> "$GITHUB_ENV"
           fi
       - uses: dtolnay/rust-toolchain@stable
@@ -107,15 +107,15 @@ jobs:
       - name: Fetch dependencies (network time is not compile time)
         if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: cargo fetch
-      - name: Time a clean offline build of the serve features
+      - name: Time a clean offline build of the default build
         if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: |
           start=$(date +%s)
-          cargo build --offline --features serve
+          cargo build --offline
           elapsed=$(( $(date +%s) - start ))
-          echo "clean build: ${elapsed}s (budget: 120s, D0014)"
+          echo "clean build: ${elapsed}s (budget: 120s, D0014, D0015)"
           if [ "$elapsed" -gt 120 ]; then
-            echo "::error::clean build took ${elapsed}s — over the 120s budget (D0014, measured 122.1s CPU locally against 50.5s for the default lane). A regression in wdpkr-core's dependency graph likely blew the code-feature build-and-ship thesis; this is a design change, not an implementation detail."
+            echo "::error::clean build took ${elapsed}s — over the 120s budget (D0014, D0015, measured 122.1s CPU locally against 50.5s for the lean lane). A regression in the default build's dependency graph likely blew the build-and-ship thesis; this is a design change, not an implementation detail."
             exit 1
           fi
 
@@ -159,20 +159,20 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-clippy-
 
-      - name: pure library (default features)
-        run: cargo clippy --all-targets -- -D warnings
+      - name: lean library build (--no-default-features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
       - name: cli
         if: ${{ !cancelled() && env.SKIP_LANE != 'true' }}
-        run: cargo clippy --all-targets --features cli -- -D warnings
+        run: cargo clippy --all-targets --no-default-features --features cli -- -D warnings
       - name: serve
         if: ${{ !cancelled() && env.SKIP_LANE != 'true' }}
         run: cargo clippy --all-targets --features serve -- -D warnings
       - name: ingest
         if: ${{ !cancelled() && env.SKIP_LANE != 'true' }}
-        run: cargo clippy --all-targets --features memory,embed-all,summarize-all,rerank-all -- -D warnings
+        run: cargo clippy --all-targets --no-default-features --features memory,embed-all,summarize-all,rerank-all -- -D warnings
       - name: code
         if: ${{ !cancelled() && env.SKIP_LANE != 'true' }}
-        run: cargo clippy --all-targets --features code -- -D warnings
+        run: cargo clippy --all-targets --no-default-features --features code -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -205,12 +205,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-test-
 
-      - name: pure library (default features)
+      - name: lean library build (--no-default-features)
         if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
-        run: cargo test
+        run: cargo test --no-default-features
       - name: cli
         if: ${{ !cancelled() && env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
-        run: cargo test --features cli
+        run: cargo test --no-default-features --features cli
 
   # The other half of the test lane (see the comment above `clippy`): the serve and
   # ingest feature sets, in parallel with `test`. Required in main's ruleset, exactly
@@ -251,10 +251,10 @@ jobs:
         run: cargo test --features serve
       - name: ingest
         if: ${{ !cancelled() && env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
-        run: cargo test --features memory,embed-all,summarize-all,rerank-all
+        run: cargo test --no-default-features --features memory,embed-all,summarize-all,rerank-all
       - name: code
         if: ${{ !cancelled() && env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
-        run: cargo test --features code
+        run: cargo test --no-default-features --features code
 
   release:
     runs-on: ubuntu-latest
@@ -287,18 +287,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-release-
 
-      - name: pure library (default features)
+      - name: lean library build (--no-default-features)
         if: ${{ env.SKIP_LANE != 'true' }}
-        run: cargo build --release
+        run: cargo build --release --no-default-features
       - name: cli
         if: ${{ !cancelled() && env.SKIP_LANE != 'true' }}
-        run: cargo build --release --features cli
+        run: cargo build --release --no-default-features --features cli
       - name: serve
         if: ${{ !cancelled() && env.SKIP_LANE != 'true' }}
         run: cargo build --release --features serve
       - name: ingest
         if: ${{ !cancelled() && env.SKIP_LANE != 'true' }}
-        run: cargo build --release --features memory,embed-all,summarize-all,rerank-all
+        run: cargo build --release --no-default-features --features memory,embed-all,summarize-all,rerank-all
 
   # Bit-rot guard for the benchmark crate. `default-members = ["."]` means neither
   # `cargo test` nor any lane above ever compiles `nidus-bench` — which is right (it
@@ -346,16 +346,20 @@ jobs:
       - if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: cargo clippy -p nidus-bench --all-targets --features server -- -D warnings
 
-  # Build-thesis guard (epic nidus-54l): the off-by-default AI ingest layer must
-  # not regress nidus's identity. This job asserts EMPIRICALLY, via the resolved
-  # dependency graph, that:
-  #   1. the DEFAULT build pulls NONE of reqwest / tokio / hyper (the async edge),
-  #      so `cargo add nidus` stays the pure, seconds-fast, dep-lean sync store; and
+  # Build-thesis guard (epic nidus-54l, D0015): `--no-default-features` gives the lean
+  # library build, and `default = ["serve"]` ships the whole AI ingest layer plus the
+  # binary. This job asserts EMPIRICALLY, via the resolved dependency graph, that:
+  #   1. the LEAN library build pulls NONE of reqwest / tokio / hyper (the async edge),
+  #      so `cargo add nidus --no-default-features` stays the pure, seconds-fast,
+  #      dep-lean sync store; and
+  #   1b. the DEFAULT build DOES pull the server stack, so a silent revert of
+  #      `default = ["serve"]` is caught rather than shipping `cargo install nidus`
+  #      with nothing to install; and
   #   2. the ingest build's TLS is rustls + `ring` — the SAME small C+asm compile
   #      already present for ureq/redis — with NO aws-lc-sys and NO OpenSSL (the
   #      multi-minute C trees nidus exists to avoid).
   # It complements the compile-time `cfg` invariant in tests/build_thesis.rs
-  # (built by the `test` job's default-features and ingest steps above). `-e no-dev` excludes
+  # (built by the `test` job's lean-lane and ingest steps above). `-e no-dev` excludes
   # dev-dependencies so a test-only crate can never mask a real regression.
   build-thesis:
     name: build-thesis (dep-absence guard)
@@ -375,22 +379,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
 
-      - name: DEFAULT build pulls no async ingest edge
+      - name: The lean library build pulls no async ingest edge
         if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: |
-          echo "::group::default dep tree (reqwest/tokio/hyper must be absent)"
-          if cargo tree -e no-dev | grep -iE '(^|[^-])(reqwest|tokio|hyper)( |$|v)'; then
-            echo "::error::default build pulled an AI-ingest async-edge crate (reqwest/tokio/hyper)"
+          echo "::group::lean dep tree (reqwest/tokio/hyper must be absent)"
+          if cargo tree -e no-dev --no-default-features | grep -iE '(^|[^-])(reqwest|tokio|hyper)( |$|v)'; then
+            echo "::error::--no-default-features pulled an async-edge crate (reqwest/tokio/hyper). The lean library build is the invariant D0015 keeps; a feature edge leaked into it."
             exit 1
           fi
-          echo "default build is pure: no reqwest / tokio / hyper"
+          echo "lean library build is pure: no reqwest / tokio / hyper"
+          echo "::endgroup::"
+
+      - name: The default build DOES ship the server stack
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: |
+          echo "::group::default dep tree (reqwest/tokio/axum must be present)"
+          if ! cargo tree -e no-dev | grep -qiE '(^|[^-])(reqwest|tokio|axum)( |$|v)'; then
+            echo "::error::the default build is missing the server stack. default = [\"serve\"] was probably reverted; cargo install nidus would ship nothing (D0015)."
+            exit 1
+          fi
+          echo "default build ships the server stack: reqwest / tokio / axum present"
           echo "::endgroup::"
 
       - name: ingest build uses rustls/ring, never aws-lc/OpenSSL
         if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: |
           echo "::group::ingest dep tree (must show rustls + ring, must NOT show aws-lc/openssl-sys)"
-          tree="$(cargo tree -e no-dev --features memory,embed-all,summarize-all,rerank-all)"
+          tree="$(cargo tree -e no-dev --no-default-features --features memory,embed-all,summarize-all,rerank-all)"
           echo "$tree" | grep -iE 'reqwest|rustls|ring' | sort -u
           # Forbid the multi-minute C trees: aws-lc-sys, the OpenSSL C bindings
           # (openssl-sys / vendored openssl), and native-tls (which pulls openssl-sys
@@ -717,19 +732,21 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-miri-
 
-      # nidus is pure safe Rust with zero FFI, so the whole suite runs under Miri
-      # (no feature to gate out). File-backed tests that hit fsync/syscalls Miri
-      # lacks carry `#[cfg_attr(miri, ignore)]`; everything else is checked.
+      # Miri covers the lean library build (--no-default-features): pure safe Rust,
+      # zero FFI. `code`'s tree-sitter is bundled C, permanently outside Miri's reach
+      # (D0014, restated by D0015 now that reaching the lean lane needs an explicit
+      # flag). File-backed tests that hit fsync/syscalls Miri lacks carry
+      # `#[cfg_attr(miri, ignore)]`; everything else in the lean lane is checked.
       - name: "Test with Miri (store:: unit tests)"
         if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks"
-        run: "cargo miri test --lib store::"
+        run: "cargo miri test --no-default-features --lib store::"
       - name: Doc-tests with Miri
         if: ${{ !cancelled() && env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks"
-        run: cargo miri test --doc
+        run: cargo miri test --no-default-features --doc
 
   miri-integration:
     name: Miri (integration)
@@ -774,7 +791,7 @@ jobs:
         if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks"
-        run: "cargo miri test --tests -- --skip store::"
+        run: "cargo miri test --no-default-features --tests -- --skip store::"
 
   # The checker that decides which lanes a change needs and which repo laws it breaks
   # was never run by CI (#183), so every law and every selftest case was advisory. Two

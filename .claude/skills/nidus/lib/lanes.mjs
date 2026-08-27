@@ -15,7 +15,7 @@ const RULES = [
   },
   {
     recipe: 'just deps',
-    why: 'Cargo.toml changed — assert the dependency tree stayed minimal',
+    why: 'Cargo.toml changed — assert the default and lean (--no-default-features) trees are both what they claim (D0015)',
     match: [/^Cargo\.toml$/],
   },
   {
@@ -35,17 +35,17 @@ const RULES = [
   },
   {
     recipe: 'just ci-embed',
-    why: 'embedder adapters changed — cfg-gated out of the default build',
+    why: 'embedder adapters changed — cfg-gated behind `embed-all`, part of the default build; verify with --no-default-features --features embed-all',
     match: [/^src\/embed\//, /^src\/providers\.rs$/],
   },
   {
     recipe: 'just ci-summarize',
-    why: 'summarizer adapters changed — cfg-gated out of the default build',
+    why: 'summarizer adapters changed — cfg-gated behind `summarize-all`, part of the default build; verify with --no-default-features --features summarize-all',
     match: [/^src\/summarize\//],
   },
   {
     recipe: 'just ci-code',
-    why: 'the code engine changed — cfg-gated behind `code`, off by default (D0014)',
+    why: 'the code engine changed — cfg-gated behind `code`, part of the default build since D0015; verify with --no-default-features --features code',
     match: [/^src\/code\//, /^src\/chunk\/code\.rs$/, /^src\/cli\/code\.rs$/, /^src\/server\/mcp\/code\.rs$/, /^tests\/e2e\/code\.rs$/, /^tests\/e2e\/mcp\/code\.rs$/, /^tests\/e2e\/docs_index\.rs$/],
   },
   {
@@ -178,7 +178,7 @@ export const CI_JOBS = {
   'miri': RUST,
   'miri-integration': RUST,
   'build-budget': RUST,
-  'build-budget-code': RUST,
+  'build-budget-default': RUST,
   'bench-compiles': RUST,
   'build-thesis': RUST,
   'sdk-integration': [...RUST, /^sdks\//],

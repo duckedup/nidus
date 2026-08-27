@@ -1,6 +1,6 @@
 ---
 title: Performance
-description: Exact brute-force cosine KNN benchmarked against DuckDB and LanceDB. nidus is the fastest in every cell, at 100% recall, while compiling in seconds.
+description: Exact brute-force cosine KNN benchmarked against DuckDB and LanceDB. nidus is the fastest in every cell, at 100% recall.
 ---
 
 Every vector store ships a benchmark proving it's the fastest, on synthetic data
@@ -24,7 +24,7 @@ query p50; lower is better.
 | dim=768  |   100 | **8.57 ms** | 53.16 ms | 64.99 ms |  100%  |
 
 All three are exact (recall 100%); nidus is the fastest in every cell while being
-the one that compiles in seconds with zero FFI.
+the one with a pure-Rust core and no bundled C++ tree.
 
 ### Text search, hybrid, and rank_by
 
@@ -152,6 +152,6 @@ cargo bench -p nidus-bench --bench nidus_regression -- 'text_search|hybrid|rank_
 ```
 
 The heavy DuckDB/LanceDB dependencies are **quarantined off nidus's own build
-path** (in `benchmarks/`), so they never touch the seconds-long build of nidus
-itself. Synthetic data on an Apple Silicon laptop: useless, like all
-benchmarks, but there it is.
+path** (in `benchmarks/`), so they never touch the build of nidus itself.
+Synthetic data on an Apple Silicon laptop: useless, like all benchmarks, but
+there it is.

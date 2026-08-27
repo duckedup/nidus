@@ -8,9 +8,9 @@ working with a store directly. It operates on an ordinary store directory, the
 very same format the library reads and writes. The same binary also runs an HTTP
 server; that has its own [HTTP server](/guides/http-server/) page.
 
-The binary is optional. The library has no dependency on it: `cargo add nidus`
-pulls in only the pure-Rust core. The binary is built behind a `cli` feature, so
-its extra dependencies are compiled only when you ask for them.
+The binary is optional. The library has no dependency on it: `cargo add nidus
+--no-default-features` gives you the storage-and-search core alone. The binary
+is built behind a `cli` feature, part of the default build.
 
 This page is a tour, with worked examples. For every subcommand and flag, its
 `NIDUS_*` environment variable, and which Cargo feature unlocks it, see the
@@ -36,7 +36,7 @@ If you already have a Rust toolchain, either of these works too:
 
 ```bash
 cargo binstall nidus                 # prebuilt binary, via cargo
-cargo install nidus --features cli   # build from source
+cargo install nidus                  # build from source
 ```
 
 Every route installs the same single `nidus` executable.

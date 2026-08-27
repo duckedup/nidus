@@ -1,6 +1,6 @@
 ---
 title: nidus
-description: A small, pure-Rust all-in-one memory. Remember text, recall the relevant bits. Built-in embedding (and optional summarization) over an exact-or-approximate vector store, or bring your own vectors. No FFI, no C, no SQL, no query engine.
+description: A small, pure-Rust all-in-one memory. Remember text, recall the relevant bits. Built-in embedding (and optional summarization) over an exact-or-approximate vector store, or bring your own vectors. No SQL, no query engine.
 template: splash
 hero:
   tagline: Remember text, recall the relevant bits. A small, pure-Rust memory that embeds for you (or takes the vectors you already have) and answers by similarity from a single directory.
@@ -51,7 +51,7 @@ let hits = memory.recall("notes", "how do users sign in?", &RecallOpts {
   <article class="feature" data-reveal>
     <span class="twig" aria-hidden="true">❧</span>
     <h3>Remember text, recall the relevant bits</h3>
-    <p>Hand nidus natural language and it embeds it for you (optionally summarizing first) with the provider you choose: Voyage, OpenAI, Ollama, Cohere, Gemini, Mistral, Jina, or any OpenAI-compatible endpoint. Already have vectors? The raw API is untouched: bring your own. The memory layer is opt-in and off by default, so the core stays lean.</p>
+    <p>Hand nidus natural language and it embeds it for you (optionally summarizing first) with the provider you choose: Voyage, OpenAI, Ollama, Cohere, Gemini, Mistral, Jina, or any OpenAI-compatible endpoint. Already have vectors? The raw API is untouched: bring your own. `--no-default-features` gives you the storage-and-search core alone, without the memory layer.</p>
   </article>
   <article class="feature" data-reveal style="--reveal-delay:0.04s">
     <span class="twig" aria-hidden="true">❧</span>

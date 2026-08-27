@@ -65,7 +65,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-$TARGE
     # hold the triple's hyphens, so underscore both.
     export CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER="$cc"; \
     export CC_$(echo "$target" | tr '-' '_')="$cc"; \
-    cargo build --release --features cli --target "$target"; \
+    cargo build --release --features serve --target "$target"; \
     # Copy out of the cache mount (which won't persist past this RUN).
     cp "target/$target/release/nidus" /usr/local/bin/nidus
 

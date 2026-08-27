@@ -16,10 +16,12 @@ really just waiting (D0003).
 job skipped outright is exactly the check that never reports. Only `fmt`, `clippy` and
 `release` do real work in the queue; everything else still triggers and still reports.
 
-The `build-budget` job times a clean, uncached, offline build of the default features on every
-PR and fails past 60s (measured ~7s — the bound is order-of-magnitude on purpose so it never
-flakes and still catches a bundled-C tree). Adding a dependency that blows it, or any
-bundled-C / native-linking crate, is a design change: file an issue first (D0005).
+Two jobs time a clean, uncached, offline build on every PR. `build-budget` now measures the
+**lean library build** (`--no-default-features`) and fails past 60s (measured ~7s — the bound
+is order-of-magnitude on purpose so it never flakes and still catches a bundled-C tree).
+`build-budget-default` measures the **default build** (`serve`, D0015) against a 120s bound.
+Adding a dependency that blows either, or any bundled-C / native-linking crate, is a design
+change: file an issue first (D0005).
 
 `release.yml` invokes the SDK and chart publish workflows via `workflow_call` rather than
 letting a tag trigger them: a tag pushed with `GITHUB_TOKEN` cannot trigger another workflow,

@@ -46,9 +46,9 @@ Now the model has `remember`/`recall` as tools, and your hooks have
 same store, the same embedder, and the same lock.
 
 :::note
-The server needs the `memory` routes, which ship in the `serve` umbrella:
-`cargo install nidus --features serve`. Without them `/remember` and `/recall` are
-absent and only the raw vector endpoints answer.
+The server needs the `memory` routes, which ship in the default build:
+`cargo install nidus`. Without them (`--no-default-features`) `/remember` and
+`/recall` are absent and only the raw vector endpoints answer.
 :::
 
 ## You do not have to create anything

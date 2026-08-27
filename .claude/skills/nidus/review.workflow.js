@@ -75,9 +75,10 @@ DO report, because these are the defects that survive review here:
 const HOUSE_RULES = `nidus's laws (CLAUDE.md, .claude/rules/, and decisions/ for the why), for context —
 a deterministic checker already covers the
 mechanical ones, so do not re-report those; use them to judge intent:
-- Pure-library build stays fast and FFI-light. src/cli, src/server, src/bin and the
-  embed/summarize/memory layers are feature-gated and must never be reachable from the
-  default build. \`just ci\` does NOT compile them.
+- The lean library build (\`--no-default-features\`) stays fast and FFI-light. src/cli,
+  src/server, src/bin and the embed/summarize/memory layers are feature-gated and must never be
+  reachable without those features, even though they ship in the default build (D0015).
+  \`just ci\` does NOT compile them.
 - #![deny(unsafe_code)]; src/data/mmap.rs is the single sanctioned exception.
 - Durability: append vectors → fsync data → append committing log records → fsync log.
   A crash may lose the in-flight batch and nothing else. Appends are atomic and roll back
@@ -130,11 +131,13 @@ assumption that two processes cannot interleave. Describe the actual interleavin
   },
   {
     key: 'build-thesis',
-    prompt: `Review this change against nidus's BUILD-AND-SHIP THESIS: does anything reachable from
-the DEFAULT build pull a binary-only or async-edge dependency (clap, tokio, axum, tower,
-reqwest, rmcp)? Are new modules correctly #[cfg(feature = …)]-gated in src/lib.rs? Would a
-plain \`cargo add nidus\` still compile in seconds with no FFI? Check tests/build_thesis.rs
-still asserts what it claims to.`,
+    prompt: `Review this change against nidus's BUILD-AND-SHIP THESIS (D0015): does every lane naming
+a narrower feature slice than the default (\`cli\`, \`code\`, \`embed-all\`, …) pass
+\`--no-default-features\` explicitly, given that \`--features X\` is additive and silently
+re-tests the full default \`serve\` build otherwise? Does \`--no-default-features\` still yield
+the lean storage-and-search core alone, with no reqwest/tokio/hyper? Are new modules correctly
+#[cfg(feature = …)]-gated in src/lib.rs? Check tests/build_thesis.rs still asserts both
+directions.`,
   },
   {
     key: 'api-contract',
