@@ -100,7 +100,7 @@ test_cmd() {
     log="$STATE_DIR/test.log"
     set +e
     CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
-        cargo test --target wasm32-unknown-unknown --test wasm_opfs 2>&1 | tee "$log"
+        cargo test --no-default-features --target wasm32-unknown-unknown --test wasm_opfs 2>&1 | tee "$log"
     status="${PIPESTATUS[0]}"
     set -e
 

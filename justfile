@@ -27,17 +27,19 @@ lint:
 test:
     cargo test --no-default-features
 
-# Run tests within a single module/path (e.g. `just test-mod log`)
+# Run tests within a single module/path (e.g. `just test-mod log`). Lean lane, to match
+# `just test`: without the flag this would compile the whole default (serve) stack.
 test-mod MOD:
-    cargo test {{ MOD }}
+    cargo test --no-default-features {{ MOD }}
 
 # Generate and open the API docs
 doc:
     cargo doc --no-deps --open
 
-# Run the end-to-end demo (open → index → search → reopen)
+# Run the end-to-end demo (open → index → search → reopen). A pure-library example, so
+# it runs on the lean lane and does not drag in the server stack.
 demo:
-    cargo run --example demo
+    cargo run --no-default-features --example demo
 
 # Run Miri to check for undefined behavior (requires nightly).
 # The lean library build is pure safe Rust with zero FFI, so Miri can compile and

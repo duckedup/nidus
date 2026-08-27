@@ -46,8 +46,9 @@ Most consumers only need `npm install @duckedup/nidus` above. Build straight fro
 repo instead when you are working on the binding itself:
 
 ```bash
-# Build the library for the target (no --features needed)
-cargo build --target wasm32-unknown-unknown --lib
+# Build the library for the target. `--no-default-features` is required: the default
+# build pulls the server stack (tokio, axum, reqwest), none of which targets wasm32.
+cargo build --no-default-features --target wasm32-unknown-unknown --lib
 
 # Build the JS binding (bindings/wasm)
 just build-wasm-binding
