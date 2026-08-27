@@ -223,7 +223,7 @@ tree of one kind of content. A repository is not: source files want AST-aware
 chunking (one chunk per function, struct, trait, …) while its `README.md` wants
 heading-aware chunking, and neither wants the other's splitter.
 
-`nidus code ingest` (behind the off-by-default `code` feature) is the front door for
+`nidus code ingest` (behind the `code` feature, part of the default build) is the front door for
 that case: same walk, digest-skip, embed step and prune as `nidus ingest`, but the
 chunk strategy is picked **per file** instead of once for the whole walk. A
 recognised language gets one chunk per symbol, tagged with its name, kind and line

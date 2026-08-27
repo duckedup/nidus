@@ -19,13 +19,13 @@ fmt:
 fmt-check:
     cargo fmt --all -- --check
 
-# Lint with clippy, deny all warnings (pure library — no cli feature)
+# Lint with clippy, deny all warnings (the lean library build — no default features)
 lint:
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --all-targets --no-default-features -- -D warnings
 
-# Run all tests (pure library — no cli feature)
+# Run all tests (the lean library build — no default features)
 test:
-    cargo test
+    cargo test --no-default-features
 
 # Run tests within a single module/path (e.g. `just test-mod log`)
 test-mod MOD:
@@ -40,34 +40,42 @@ demo:
     cargo run --example demo
 
 # Run Miri to check for undefined behavior (requires nightly).
-# nidus is pure safe Rust with zero FFI, so — unlike a C-backed store — the
-# WHOLE crate compiles and runs under Miri. Isolation is disabled so the
-# file-backed integration tests can touch a temp dir; pure-logic tests
+# The lean library build is pure safe Rust with zero FFI, so Miri can compile and
+# run it whole; the default build pulls tree-sitter's C, which Miri cannot
+# instrument, so this is scoped to --no-default-features. Isolation is disabled
+# so the file-backed integration tests can touch a temp dir; pure-logic tests
 # (cosine, glob, filter, codec) need no special flags.
 miri:
-    MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks" cargo +nightly miri test
+    MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks" cargo +nightly miri test --no-default-features
 
-# Show nidus's dependency tree — it must stay minimal and pure Rust. Scoped to
-# `-p nidus` so the heavy, opt-in benchmark crate (nidus-bench) never shows up here.
+# Show nidus's dependency tree for the default build (CLI, HTTP server, MCP,
+# memory, every embed/summarize/rerank provider, and `code`). Scoped to `-p nidus`
+# so the heavy, opt-in benchmark crate (nidus-bench) never shows up here.
 deps:
     cargo tree -p nidus
 
+# The lean library tree — what `cargo add nidus --no-default-features` pulls. This is the
+# one that must stay minimal; CI's build-budget job holds it to its bound.
+deps-lean:
+    cargo tree -p nidus --no-default-features
+
 # Pre-commit / pre-PR checks: format clean, no clippy warnings, tests green.
-# Pure library only — the opt-in `cli` feature has its own gate (`just ci-cli`),
-# kept separate so the core stays a seconds-long, FFI-free build path.
+# The lean library build only — the default build has its own gates
+# (`just ci-cli`, `just ci-serve`, …), kept separate so this stays a
+# pure-Rust, FFI-free build path.
 ci: fmt-check lint test
 
-# ── CLI / server binary (the opt-in `cli` feature) ──────────────────────────
-# Off the core build path on purpose: these pull the binary-only deps (clap +
-# the tokio/axum stack). All pure Rust, but heavier than the library alone.
+# ── CLI / server binary (the `cli` feature, isolated from the default build) ─
+# `--no-default-features --features cli` narrows to just the binary-only deps
+# (clap + the tokio/axum stack), without pulling the rest of the default set.
 
 # Lint the cli feature (binary + server)
 lint-cli:
-    cargo clippy --all-targets --features cli -- -D warnings
+    cargo clippy --all-targets --no-default-features --features cli -- -D warnings
 
 # Test the cli feature (binary + server)
 test-cli:
-    cargo test --features cli
+    cargo test --no-default-features --features cli
 
 # End-to-end tests only: spawn the real `nidus serve` binary and drive it over HTTP.
 # Included in `test-cli` (they need no services and run in seconds); this recipe is
@@ -75,7 +83,7 @@ test-cli:
 # The embed/summarize features gate suites driven by hand-rolled TCP mocks — no real
 # services — so leaving them off would silently compile those suites away (#111).
 test-e2e *FILTER:
-    cargo test --features cli,mcp,code,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e {{ FILTER }}
+    cargo test --no-default-features --features cli,mcp,code,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e {{ FILTER }}
 
 # Start the services the cluster e2e tests need (real S3 + real Redis-family tier).
 # The container definitions live in scripts/e2e-services.sh — one source of truth,
@@ -97,7 +105,7 @@ test-e2e-valkey-cluster *FILTER:
     ./scripts/e2e-services.sh up-cluster
     trap './scripts/e2e-services.sh down-cluster' EXIT
     NIDUS_E2E_REDIS_URL="$(./scripts/e2e-services.sh cluster-url)" \
-        cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e cluster::{{ FILTER }} -- --ignored --test-threads=2
+        cargo test --no-default-features --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e cluster::{{ FILTER }} -- --ignored --test-threads=2
 
 # Cluster e2e: several real `nidus serve` processes over a shared object store and
 # memory tier. #[ignore]d by default (they need the services above), so run them
@@ -105,11 +113,11 @@ test-e2e-valkey-cluster *FILTER:
 # Override the endpoints with NIDUS_E2E_S3_ENDPOINT / NIDUS_E2E_S3_BUCKET /
 # NIDUS_E2E_S3_KEY / NIDUS_E2E_S3_SECRET / NIDUS_E2E_REDIS_URL.
 test-e2e-cluster *FILTER:
-    cargo test --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e cluster::{{ FILTER }} -- --ignored --test-threads=2
+    cargo test --no-default-features --features cli,mcp,embed-ollama,embed-openai-compat,summarize-openai,rerank-cohere --test e2e cluster::{{ FILTER }} -- --ignored --test-threads=2
 
 # Release build of the `nidus` binary
 build-cli:
-    cargo build --release --features cli
+    cargo build --release --no-default-features --features cli
 
 # The binary the SDK integration suites drive. `serve` (not `cli`) because the memory and
 # `code` routes only exist there: a suite driving a `cli`-only binary sees 404s and skips,
@@ -124,17 +132,19 @@ install:
 
 # Run `nidus serve` against a store (e.g. `just serve /tmp/store 384`)
 serve DIR DIM *ARGS:
-    cargo run --features cli -- serve --dir {{ DIR }} --dim {{ DIM }} {{ ARGS }}
+    cargo run --no-default-features --features cli -- serve --dir {{ DIR }} --dim {{ DIM }} {{ ARGS }}
 
 # Pre-PR checks for the cli feature: format clean, no clippy warnings, tests green
 ci-cli: fmt-check lint-cli test-cli
 
-# ── `nidus serve` WITH memory endpoints (the `serve` umbrella feature) ───────
+# ── `nidus serve` WITH memory endpoints (the `serve` feature, which is also the
+# default build) ─────────────────────────────────────────────────────────────
 # `serve` = `cli` + the full AI-ingest layer (memory + every embedder +
 # summarizer). This is the binary that ships via `cargo binstall` / Docker: the
 # `/remember` + `/recall` routes are compiled in, so the SDKs can send TEXT and
-# the server embeds/summarizes. Its own lane so a `cli`-only change never waits
-# on the heavier async-edge compile.
+# the server embeds/summarizes. The `--features serve` flags below are
+# redundant with the default build but stay as explicit intent. Its own lane
+# so a `cli`-only change never waits on the heavier async-edge compile.
 
 # Lint the serve feature (server + memory routes + every provider adapter)
 lint-serve:
@@ -156,29 +166,33 @@ serve-memory DIR DIM *ARGS:
 # Pre-PR checks for the serve feature: format clean, no clippy warnings, tests green
 ci-serve: fmt-check lint-serve test-serve
 
-# ── AST-aware code search (the opt-in `code` feature, epic nidus-3gm) ────────
-# Off the core build path on purpose: `wdpkr-core` (tree-sitter over eight grammars)
-# is heavier than the rest of `serve`. Its own budget job, its own lane here.
+# ── AST-aware code search (the `code` feature, epic nidus-3gm) ──────────────
+# Ships in the default build via `serve` (D0015), but keeps its own lane here:
+# `wdpkr-core` (tree-sitter over eight grammars) is heavier than the rest of
+# `serve`, and tree-sitter's C is why the Miri lanes run `--no-default-features`.
 
 # Lint the code feature (dispatch, summarize wiring, presentation)
 lint-code:
-    cargo clippy --all-targets --features code -- -D warnings
+    cargo clippy --all-targets --no-default-features --features code -- -D warnings
 
 # Test the code feature
 test-code:
-    cargo test --features code
+    cargo test --no-default-features --features code
 
 # Pre-PR checks for the code feature: format clean, no clippy warnings, tests green
 ci-code: fmt-check lint-code test-code
 
 # ── wasm32 target (browser / edge) ──────────────────────────────────────────
-# The wasm-hostile deps (ureq/ring, tame-oauth, redis, rusty-s3, tame-gcs, url) are
-# target-cfg'd out, so no feature flag is needed: the target selects the tree.
+# `--no-default-features` is LOAD-BEARING here (D0015). The storage-backend deps
+# (ureq/ring, tame-oauth, redis, rusty-s3, tame-gcs, url) are target-cfg'd out, so the
+# target selects those. But the default set is `serve`, and tokio/axum/reqwest/wdpkr-core
+# are FEATURE-gated, not target-gated: without the flag this pulls tokio and dies compiling
+# `mio` for wasm32. Same reason `bindings/wasm/Cargo.toml` pins `default-features = false`.
 build-wasm:
-    cargo build --target wasm32-unknown-unknown --lib
+    cargo build --no-default-features --target wasm32-unknown-unknown --lib
 
 lint-wasm:
-    cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
+    cargo clippy --no-default-features --target wasm32-unknown-unknown --all-targets -- -D warnings
 
 ci-wasm: build-wasm lint-wasm
 
@@ -189,9 +203,9 @@ test-wasm:
     # s3://+redis:// are hard errors on wasm32) live in the lib and would otherwise
     # compile without ever running.
     CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
-        cargo test --target wasm32-unknown-unknown --lib
+        cargo test --no-default-features --target wasm32-unknown-unknown --lib
     CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
-        cargo test --target wasm32-unknown-unknown --test wasm
+        cargo test --no-default-features --target wasm32-unknown-unknown --test wasm
 
 # Executes in a REAL headless browser (the `wasm_opfs` target). Brought up by the same
 # script CI uses, because a browser driver is the part that differs per machine.
@@ -241,54 +255,55 @@ verify-wasm-subpath: build-wasm-binding
     fi
     echo "npm pack ships the whole ./wasm subpath (5 files asserted)"
 
-# ── AI ingest layer (the opt-in embed/summarize/memory features) ────────────
-# The off-by-default async network edge (reqwest → hyper → rustls/ring; NO new C
-# tree, NO aws-lc/OpenSSL) that turns nidus into an all-in-one "memory". Like
-# `cli`/`serve`, it lives OFF the core build path on purpose: the DEFAULT build
-# (`just ci`) pulls NONE of reqwest/tokio/hyper, so `cargo add nidus` stays the
-# pure, seconds-fast, sync vector store. The `build-thesis` guard (CI + the
-# integration test `tests/build_thesis.rs`) asserts that invariant. Being an
-# async-edge feature set, this layer is skipped by the Miri lanes — the same as
-# the cli/server stack.
+# ── AI ingest layer (the embed/summarize/memory features) ───────────────────
+# The async network edge (reqwest → hyper → rustls/ring; NO new C tree, NO
+# aws-lc/OpenSSL) that turns nidus into an all-in-one "memory". It ships in the
+# DEFAULT build via `serve` (D0015). The LEAN library build
+# (`--no-default-features`, what `just ci` runs) pulls none of
+# reqwest/tokio/hyper, and the `build-thesis` guard (CI + the integration test
+# `tests/build_thesis.rs`) asserts that in both directions. The recipes below pair
+# `--no-default-features` with one slice so they isolate it rather than re-testing
+# the whole default set. Being an async-edge feature set, this layer is skipped by
+# the Miri lanes — the same as the cli/server stack.
 
 # Lint the embed feature set (base infra + every provider adapter)
 lint-embed:
-    cargo clippy --all-targets --features embed-all -- -D warnings
+    cargo clippy --all-targets --no-default-features --features embed-all -- -D warnings
 
 # Test the embed feature set (base infra + every provider adapter)
 test-embed:
-    cargo test --features embed-all
+    cargo test --no-default-features --features embed-all
 
 # Pre-PR checks for the embed features: format clean, no clippy warnings, tests green
 ci-embed: fmt-check lint-embed test-embed
 
 # Lint the summarize feature set (base infra + every provider adapter)
 lint-summarize:
-    cargo clippy --all-targets --features summarize-all -- -D warnings
+    cargo clippy --all-targets --no-default-features --features summarize-all -- -D warnings
 
 # Test the summarize feature set (base infra + every provider adapter)
 test-summarize:
-    cargo test --features summarize-all
+    cargo test --no-default-features --features summarize-all
 
 # Pre-PR checks for the summarize features: format clean, no clippy warnings, tests green
 ci-summarize: fmt-check lint-summarize test-summarize
 
 # Lint the rerank feature set (base infra + every provider adapter)
 lint-rerank:
-    cargo clippy --all-targets --features rerank-all -- -D warnings
+    cargo clippy --all-targets --no-default-features --features rerank-all -- -D warnings
 
 # Test the rerank feature set (base infra + every provider adapter)
 test-rerank:
-    cargo test --features rerank-all
+    cargo test --no-default-features --features rerank-all
 
 # Pre-PR checks for the rerank features: format clean, no clippy warnings, tests green
 ci-rerank: fmt-check lint-rerank test-rerank
 
 # Pre-PR checks for the FULL ingest layer (memory + every embedder + summarizer): build, lint, test
 ci-ingest: fmt-check
-    cargo clippy --all-targets --features memory,embed-all,summarize-all,rerank-all -- -D warnings
-    cargo test --features memory,embed-all,summarize-all,rerank-all
-    cargo build --release --features memory,embed-all,summarize-all,rerank-all
+    cargo clippy --all-targets --no-default-features --features memory,embed-all,summarize-all,rerank-all -- -D warnings
+    cargo test --no-default-features --features memory,embed-all,summarize-all,rerank-all
+    cargo build --release --no-default-features --features memory,embed-all,summarize-all,rerank-all
 
 # ── Docs site (Astro + Starlight, in docs/) ─────────────────────────────────
 
@@ -414,7 +429,7 @@ bench ENGINES="nidus" *ARGS:
 bench-server *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build --release --features cli
+    cargo build --release --no-default-features --features cli
     NIDUS_BIN="$PWD/target/release/nidus" \
         cargo run -p nidus-bench --release --features server -- {{ARGS}}
 
@@ -444,7 +459,7 @@ bench-ann *ARGS:
 bench-write *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build --release --features cli
+    cargo build --release --no-default-features --features cli
     # Passed through so a recorded baseline names the nidus it measured — the bench
     # crate's own CARGO_PKG_VERSION would say 0.1.0, which is the wrong crate.
     NIDUS_VERSION="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')" \

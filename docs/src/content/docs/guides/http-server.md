@@ -121,12 +121,12 @@ default endpoint to fall back to.
 
 `--embed-*` and `--summarize-*` exist only in a build compiled with the `memory`
 feature, which the `serve` feature umbrella pulls in along with every provider:
-`serve = ["cli", "memory", "embed-all", "summarize-all", "mcp"]`. A plain
-`cargo install nidus --features cli` binary has no `--embed-provider` flag at
-all: clap rejects it as unrecognised. `cargo binstall nidus` and the binaries
-`release.yml` publishes are both built with `--features serve`, so the shipped
-binary always has every provider; building your own with `--features cli` alone
-does not.
+`serve = ["cli", "memory", "embed-all", "summarize-all", "rerank-all", "mcp",
+"code"]`, and `default = ["serve"]`. `cargo install nidus`, `cargo binstall
+nidus`, and the binaries `release.yml` publishes all build with `serve`, so the
+shipped binary always has every provider. Only a `--no-default-features
+--features cli` build opts out: it has no `--embed-provider` flag at all, and
+clap rejects it as unrecognised.
 
 ### Failure modes
 

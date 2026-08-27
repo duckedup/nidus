@@ -494,16 +494,18 @@ test('lanes: the docs-index script is no longer unmapped', () => {
 // are pinned: docs-only skips, src runs, empty runs, unknown job throws.
 
 test('ci-guard: a docs/skill-only change skips the Rust jobs', () => {
-  for (const job of ['test', 'test-extended', 'miri', 'miri-integration', 'release', 'build-budget', 'build-budget-code']) {
+  for (const job of ['test', 'test-extended', 'miri', 'miri-integration', 'release', 'build-budget', 'build-budget-default']) {
     eq(ciGuard(job, ['docs/src/content/docs/api.md', '.claude/skills/nidus/SKILL.md', 'README.md']).run, false, `${job} skips`)
   }
 })
 
 // nidus-3gm: without this key, unit 6a's guard step throws `unknown job` on the first
 // PR that does not touch Rust — CI_JOBS must carry it, not just the justfile recipe.
-test('ci-guard: build-budget-code skips docs-only and runs for Rust', () => {
-  eq(ciGuard('build-budget-code', ['docs/x.md', 'README.md']).run, false, 'docs-only skips')
-  eq(ciGuard('build-budget-code', ['src/code/mod.rs']).run, true, 'Rust path runs')
+// Renamed build-budget-code -> build-budget-default in nidus-rwz (D0015): the job now
+// measures the default (serve) lane, not an off-by-default `code` slice.
+test('ci-guard: build-budget-default skips docs-only and runs for Rust', () => {
+  eq(ciGuard('build-budget-default', ['docs/x.md', 'README.md']).run, false, 'docs-only skips')
+  eq(ciGuard('build-budget-default', ['src/code/mod.rs']).run, true, 'Rust path runs')
 })
 
 test('ci-guard: any src or manifest change runs every Rust job', () => {

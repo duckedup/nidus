@@ -1,12 +1,16 @@
-//! Build-thesis guard for the AI ingest layer (epic nidus-54l).
+//! Build-thesis guard for the AI ingest layer (epic nidus-54l, D0015). The file itself
+//! always compiles; the tests inside are individually `cfg`-gated. `default_build_is_pure`
+//! exists only on the LEAN lane (`--no-default-features`) and asserts the async edge is
+//! absent there, while `chunker_ships_in_default_build` is ungated and
+//! `ingest_lane_enables_the_async_edge` runs whenever the ingest features are on.
 
 // Every assertion here is a deliberate compile-time `cfg!` guard, so its operand is a constant on
 // purpose — pinning the feature graph at build time. `clippy::assertions_on_constants` would flag
 // each one, hence the crate-wide allow in this guard file.
 #![allow(clippy::assertions_on_constants)]
 
-/// DEFAULT build: none of the AI-ingest features are enabled, so the async edge
-/// (reqwest/tokio/hyper) is not compiled. This test only exists on the pure lane.
+/// LEAN library build: none of the AI-ingest features are enabled, so the async edge
+/// (reqwest/tokio/hyper) is not compiled. This test only exists on the lean lane.
 #[cfg(not(any(
     feature = "embed",
     feature = "summarize",

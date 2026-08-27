@@ -149,8 +149,9 @@ jobs:
           path: nidus-${{ matrix.target }}.*
 
   # The library is published to crates.io; the binaries above ride the GitHub
-  # release. `cargo publish` verifies with default features, so it never compiles
-  # the optional cli stack.
+  # release. `cargo publish` verifies with default features, which is now `serve`
+  # (D0015), so it compiles the full CLI/server/ingest/code stack, not just the
+  # lean library.
   publish-crate:
     name: Publish to crates.io
     needs: check-version
@@ -241,7 +242,7 @@ jobs:
 
           \`\`\`sh
           cargo binstall nidus              # prebuilt binary (incl. memory endpoints)
-          cargo install nidus --features serve   # from source (server + memory)
+          cargo install nidus   # from source
           \`\`\`
 
           ### Changes

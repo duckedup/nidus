@@ -252,7 +252,7 @@ result = db.suggest(
     scope=["docs"],
     filter=[{"Eq": ["tenant", {"Str": "acme"}]}],
 )
-# result.suggestions: [Suggestion(term="bracket", df=1)]  — "brown" is not offered
+# result.suggestions: [Suggestion(term="bracket", df=1)] ("brown" is not offered)
 ```
 
 A single-token prefix, or one whose earlier words are all stopwords, has no head terms and

@@ -59,12 +59,12 @@ detect_target() {
     case "$os" in
         Linux)  os_part="unknown-linux-gnu" ;;
         Darwin) os_part="apple-darwin" ;;
-        *)      err "unsupported OS '$os' — build from source: cargo install nidus --features cli" ;;
+        *)      err "unsupported OS '$os' — build from source: cargo install nidus" ;;
     esac
     case "$arch" in
         x86_64|amd64)  arch_part="x86_64" ;;
         arm64|aarch64) arch_part="aarch64" ;;
-        *)             err "unsupported arch '$arch' — build from source: cargo install nidus --features cli" ;;
+        *)             err "unsupported arch '$arch' — build from source: cargo install nidus" ;;
     esac
     printf '%s-%s' "$arch_part" "$os_part"
 }

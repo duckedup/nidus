@@ -29,3 +29,4 @@ Fetch one with `just spec --file decisions/<file> toc`, or just read it.
 | D0012 | [A feature ships whole, in one PR](0012-a-feature-ships-whole.md) |
 | D0013 | [Docs retrieval is derived, and never committed](0013-the-docs-index-is-derived-and-never-tracked.md) |
 | D0014 | [nidus depends on `wdpkr-core`, behind the off-by-default `code` feature](0014-nidus-depends-on-wdpkr-core-behind-code.md) |
+| D0015 | [The default build ships the whole binary](0015-the-default-build-ships-the-whole-binary.md) |

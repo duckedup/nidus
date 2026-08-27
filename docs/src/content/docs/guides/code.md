@@ -1,6 +1,6 @@
 ---
 title: Code search
-description: Index a codebase and its docs together, chunked for what each file actually is, and search it grouped by file and symbol. Off by default, enabled with the code feature.
+description: Index a codebase and its docs together, chunked for what each file actually is, and search it grouped by file and symbol.
 ---
 
 `nidus code` indexes source and documentation in one corpus, each chunked for what it
@@ -9,24 +9,19 @@ markdown, and nidus's own generic splitter for everything else. Search comes bac
 grouped by file, each hit carrying a symbol name, kind and line span, never the source
 body itself: read the file at that line span for ground truth.
 
-It ships behind the off-by-default `code` feature, so `cargo add nidus` is unaffected
-whether or not you ever touch this page. See [why it is off by default](#why-off-by-default)
-before turning it on.
+It ships behind the `code` feature, part of the default build, so `cargo install
+nidus` has it out of the box. `--no-default-features` excludes it along with the
+rest of the ingest layer; see [AST-aware code search is in the default
+build](#ast-aware-code-search-is-in-the-default-build) below.
 
-## Install with the feature on
-
-```bash
-cargo binstall nidus --features code
-# …or: cargo install nidus --features code
-```
-
-`code` needs `memory` underneath it (the walk/digest/embed pipeline `code ingest` and
-`code search` are front doors over), so either enable both or reach for the `serve`
-umbrella, which already includes `memory`:
+## Install
 
 ```bash
-cargo install nidus --features serve,code
+cargo install nidus
 ```
+
+`code` needs `memory` underneath it (the walk/digest/embed pipeline `code ingest`
+and `code search` are front doors over); the default build already includes both.
 
 ## Index a repo, no provider
 
@@ -115,28 +110,15 @@ as do Python, Java and C# classes. The cause is upstream, in how `wdpkr-core` wa
 export statement ([wdpkr-core#7](https://github.com/duckedup/wdpkr-core/issues/7)), so it
 is fixed there rather than worked around here.
 
-## Why off by default
+## AST-aware code search is in the default build
 
 `nidus code` depends on [`wdpkr-core`](https://crates.io/crates/wdpkr-core) for its
-tree-sitter AST chunking across eight languages. That dependency sits entirely behind
-the `code` feature, so a plain `cargo add nidus` never sees it: `cargo add` stays the
-few-hundred-millisecond build it always was.
+tree-sitter AST chunking across eight languages. That dependency sits behind the
+`code` feature, which `cargo install nidus` pulls in along with the rest of the
+default build. `--no-default-features` gives you the storage-and-search core
+alone, without `code` or the rest of the ingest layer, and stays a pure-Rust
+build with no bundled C or C++ tree.
 
-The reason it is a feature and not the default is measured, not a guess (see
+The cost of pulling `wdpkr-core` in is measured, not a guess: see
 [D0014](https://github.com/duckedup/nidus/blob/main/decisions/0014-nidus-depends-on-wdpkr-core-behind-code.md)
-for the full record). Clean, offline, debug builds, one machine:
-
-| lane | wall | CPU |
-| --- | ---: | ---: |
-| default features | 13.4s | 50.5s |
-| `serve,embed-all,summarize-all,memory,mcp` | 24.8s | 96.3s |
-| the same, plus `wdpkr-core` | 26.3s | 122.1s |
-| tree-sitter plus the eight grammars alone | 2.6s | 9.3s |
-| `wdpkr-core` alone | 13.1s | 68.9s |
-
-The eight grammars are not the expensive part: 2.48M lines of generated, table-driven
-C that costs 9.3s CPU at `-O0`. What costs is `wdpkr-core`'s own Rust dependency
-graph, which arrives whole (it ships no cargo features of its own) the moment
-anything pulls it in. A dedicated `build-budget-code` CI job holds the `code` lane to
-its own 60s-class bound, the same way the default lane is held to its 60s bound,
-without moving either bound onto the other.
+and the decision record for the default-features change (D0015) for the full record.

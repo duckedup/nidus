@@ -8,25 +8,31 @@ paths:
 # The `cli` / `serve` / `mcp` feature gates
 
 The binary (CLI plus `nidus serve`, an axum/tokio HTTP wrapper, SPEC §9) is gated behind the
-**non-default `cli` feature**, so the core recipes (`just test`, `ci`, `lint`, Miri) build ONLY
-the pure library and `cargo add nidus` keeps its seconds-long build (D0011).
+`cli` feature, part of `default = ["serve"]` (D0015): a bare `cargo install nidus` ships the
+whole binary. `--no-default-features` remains the supported lean library build, and the core
+recipes (`just test`, `ci`, `lint`, Miri) build ONLY that lean library, still reached only via
+`--no-default-features` (D0011, superseded in part by D0015).
 
 ```bash
-just ci-cli        # fmt-check + clippy + test, all with --features cli
-just test-cli      # cargo test --features cli
-just build-cli     # release build of the nidus binary
-just serve DIR DIM # cargo run --features cli -- serve --dir DIR --dim DIM
-just install       # cargo install --path . --features cli
+just ci-cli        # fmt-check + clippy + test, --no-default-features --features cli
+just test-cli      # cargo test --no-default-features --features cli
+just build-cli     # release build of the nidus binary, cli slice only
+just serve DIR DIM # cargo run --no-default-features --features cli -- serve --dir DIR --dim DIM
+just install       # cargo install --path . --features serve (redundant now, kept as intent)
 ```
 
 **When you touch these directories, gate it on the feature and verify with `just ci-cli`** —
-the core `just ci` does not compile them. Do NOT move these deps into the default feature set
-or use them from a library module: that breaks the pure `cargo add nidus` install, and
-`nidus-check laws` checks for it.
+the core `just ci` does not compile them. The gates themselves are unchanged and still matter:
+do NOT use these deps from a library module, because `--no-default-features` must still yield
+the lean tree, and `nidus-check laws` checks for it. **Any lane that means a narrower slice
+than the default must pass `--no-default-features` explicitly** — `--features X` alone is
+additive to the default set, not a replacement, so a flag meant to isolate `cli` (or `code`,
+`embed-all`, …) silently re-tests the full default build instead if it omits that flag.
 
 The binary's deps (`clap`, `tokio`, `axum`, `tower`, `serde_json`, `tar`, `flate2` — all pure
-Rust, zero FFI) compile only under `--features cli`. The AI ingest layer
-(`embed`/`summarize`/`memory`/`mcp`, which add `reqwest` + `rmcp`) is likewise off by default.
+Rust, zero FFI) sit behind `feature = "cli"`, part of the default build. The AI ingest layer
+(`embed`/`summarize`/`memory`/`mcp`, which add `reqwest` + `rmcp`) is gated the same way, also
+in by default; `--no-default-features` is what excludes all of it.
 
 **The binary adapts to the library, never the reverse.** Wire DTOs mirror `Hit` and `Footprint`
 in `src/server/dto.rs`.

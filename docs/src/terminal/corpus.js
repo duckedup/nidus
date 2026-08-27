@@ -208,7 +208,7 @@ export const SEEDS = [
   },
   {
     id: "build-cost",
-    text: "Pure Rust with no bundled C or C++ tree, so a clean build finishes in seconds and CI fails the pull request if it ever creeps past a minute.",
+    text: "Pure Rust core with no bundled C++ tree: the default build adds tree-sitter's small C parser for code search, and `--no-default-features` gives the storage-and-search core alone.",
     attrs: { topic: "build" },
   },
   {

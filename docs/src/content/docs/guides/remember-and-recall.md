@@ -37,23 +37,24 @@ reasoning is recorded in `SPEC.md` §9.1.
 
 ## Turn it on
 
-The memory layer and its provider adapters are **off by default**: the plain
-`cargo add nidus` stays a pure, dependency-lean sync vector store. Opt in with
-Cargo features: `memory` for the `remember`/`recall` surface, one `embed-<name>`
-feature per embedding provider you want, and (optionally) a `summarize-<name>`
-feature for the summarize-then-embed mode.
+`cargo add nidus` gives you the memory layer and every provider adapter out of
+the box: `memory` for the `remember`/`recall` surface, every `embed-<name>`
+feature, and every `summarize-<name>` feature. `--no-default-features` gives
+you the storage-and-search core alone. If you want to pick individual
+providers rather than the full set, name them explicitly instead:
 
 ```toml
-# Cargo.toml: the all-in-one memory with OpenAI embeddings and
-# Anthropic summarization:
+# Cargo.toml: only the memory layer, OpenAI embeddings, and
+# Anthropic summarization, nothing else:
 [dependencies]
-nidus = { version = "0.55", features = ["memory", "embed-openai", "summarize-anthropic"] }
+nidus = { version = "0.96", default-features = false, features = ["memory", "embed-openai", "summarize-anthropic"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-Enable only the providers you use: each `embed-<name>` compiles just that one
-adapter. The umbrella features `embed-all` and `summarize-all` pull in every
-shipped adapter at once.
+Naming providers this way keeps the build to just the adapters you use: each
+`embed-<name>` compiles only that one. The umbrella features `embed-all` and
+`summarize-all`, both in the default build, pull in every shipped adapter at
+once.
 
 :::note
 Enabling `embed`/`summarize` adds `reqwest` (with rustls TLS, reusing the `ring`

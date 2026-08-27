@@ -1086,7 +1086,7 @@ documents that also carry them.
 ```rust
 // "brown" is the commonest br* in the corpus, but no document says both "quick" and "brown"
 let got = db.suggest("docs", "body", "quick br", &opts)?;
-// got.suggestions: [{ term: "bracket", df: 1 }]   — "brown" is not offered at all
+// got.suggestions: [{ term: "bracket", df: 1 }] ("brown" is not offered at all)
 ```
 
 Pass the whole phrase typed so far and this happens on its own. A single-token prefix, or one

@@ -38,8 +38,8 @@ not the functionality test, the **build-and-ship** test:
 
 At its core the workload is a **vector store, not a database**: no joins, no SQL, no
 analytics, no larger-than-RAM scans (at the target scale). nidus is that store —
-plus an opt-in memory layer (embedding, optionally summarization) over it that stays
-off the default build — and nothing more.
+plus a memory layer (embedding, optionally summarization) built on top — and nothing
+more; `--no-default-features` gives the storage-and-search core alone.
 
 ### Thesis (the product *is* the constraints)
 
@@ -47,7 +47,7 @@ off the default build — and nothing more.
 commitments, and every change is judged against them; trading one away is a change to
 *what nidus is*, not an implementation detail:
 
-- **Speed** — builds in seconds, installs with a bare `cargo add`, answers queries at
+- **Speed** — installs with a bare `cargo add`, answers queries at
   brute-force-fast latencies. The bar is empirical and CI-asserted, never aspirational.
 - **Testing** — behaviour is *verified against the real artifact, never assumed* (§11).
   Every surface has a load-bearing test in CI — end-to-end where only end-to-end can
@@ -58,8 +58,9 @@ commitments, and every change is judged against them; trading one away is a chan
 
 The hard bar on dependencies is **build-and-ship speed, not zero-C absolutism.** What
 disqualified DuckDB and LanceDB was a *multi-minute* build (a large C/C++ tree, a whole
-SQL engine) — not the mere presence of any C. nidus's bar is concrete and testable: **a
-clean build stays under a minute** (it is ~seconds today).
+SQL engine) — not the mere presence of any C. nidus's bar is concrete and testable: **the
+lean library build (`--no-default-features`) stays under a minute**; the default build
+carries its own budget, under two minutes (D0014, D0015).
 
 1. **Pure-Rust-first, fast to build.** Prefer well-established pure-Rust crates
    (`anyhow`, `serde`/`bincode`, `crc32fast`, `regex`, …). A C-compiling/native-linking dep is
@@ -1385,16 +1386,18 @@ build until a real need exists.
   signs), so incremental upsert is plain append — no scale, no refit. Parallelizes harder
   than int8 (32× less first-pass traffic). The first pass overscans more (`rescore`
   defaults to 16 vs int8's 4) to offset the coarser proxy.
-- **Lightweight server.** `nidus serve` (behind the opt-in `cli` feature) wraps a
+- **Lightweight server.** `nidus serve` (behind the `cli` feature, part of the default
+  build) wraps a
   long-lived `Nidus` in a thin axum/tokio HTTP layer — exactly the separate-wrapper
   shape this seam called for, not a change to nidus core. The enabling pieces were
   already here: the cross-process lock + lock-free read snapshots (§6.2) and
   `OpenMode::ReadOnly` (§4.1) let a writer process and one-or-more search servers share
   one store. The core API stayed operation-centric, with no process-wide assumptions.
   Its deps (`clap`, `tokio`, `axum`, `tower`, `serde_json` — all pure Rust, zero FFI)
-  compile only under `--features cli`, so `cargo add nidus` stays lean.
-- **MCP surface, two transports.** Behind the opt-in `mcp` feature (folds `cli` +
-  `memory`), one `NidusMcp` adapter (`src/server/mcp/`) speaks MCP 2026-07-28 both
+  compile under the `cli` feature, part of the default build; `--no-default-features`
+  gives the storage-and-search core alone, without them.
+- **MCP surface, two transports.** Behind the `mcp` feature (folds `cli` + `memory`, and
+  part of the default build via `serve`), one `NidusMcp` adapter (`src/server/mcp/`) speaks MCP 2026-07-28 both
   nested inside `nidus serve`'s HTTP stack at `/mcp` (inheriting its auth, body
   limits, backpressure, and metrics) and standalone over stdio via `nidus mcp
   --dir …`, for a client that spawns its own server process (e.g. `claude mcp add
@@ -1789,8 +1792,10 @@ collides with the §1/§13.6 build-cost bar. It does not. That bar rules out an
 *inference engine* — ONNX Runtime is exactly the multi-minute native-toolchain
 dependency nidus exists to avoid. But a **static** embedder (model2vec-style) is not
 an inference engine: it is a token→vector lookup table plus mean-pooling, which is
-tens of lines of pure Rust and costs nothing to compile. Measured for reference: the
-clean default build is ~16s against a "well under a minute" budget.
+tens of lines of pure Rust and costs nothing to compile. Measured for reference at the
+time: adding it kept the clean build (then the whole default, now what
+`--no-default-features` gives: the lean library build) comfortably inside a "well
+under a minute" budget.
 
 The real cost is **weight distribution**, a constraint the build bar does not speak to:
 
@@ -2528,8 +2533,9 @@ a segment is the natural object boundary for a batch).
 
 - **Exact-by-default, zero-config locally.** No tuning knob (`ef`/`nprobe`/…) is ever a
   precondition to getting answers; any index is automatic-by-size or opt-in, never required.
-- **Near-zero `unsafe` in our code; clean build well under a minute; no heavy/native deps**
-  (§1, §13.6). mmap is the one conscious FFI opt-in (§9) — `#![deny(unsafe_code)]` plus the
+- **Near-zero `unsafe` in our code; the lean library build (`--no-default-features`) stays
+  well under a minute; no heavy/native deps in that lane** (§1, §13.6). mmap is the one
+  conscious FFI opt-in (§9) — `#![deny(unsafe_code)]` plus the
   single scoped `Mmap::map` site — now built and applied per segment (phase 3, opt-in, off by
   default). No other `unsafe` is permitted.
 - **One embedding space per store; the §4 public API is unchanged.** This is an internal

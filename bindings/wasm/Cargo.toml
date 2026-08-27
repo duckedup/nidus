@@ -12,9 +12,10 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Path dependency on the crate itself, default features only (no `cli`/`embed`/etc — none
-# of those compile for wasm32 anyway). The binding depends on nidus; never the reverse.
-nidus = { path = "../.." }
+# Path dependency on the crate itself. `default-features = false` is load-bearing now
+# that nidus's default set is `serve`: without it a wasm32 build pulls tokio/axum/reqwest
+# and fails to compile. The binding depends on nidus; never the reverse.
+nidus = { path = "../..", default-features = false }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 # Marshals Rust <-> JsValue through the same serde model the request/response DTOs already

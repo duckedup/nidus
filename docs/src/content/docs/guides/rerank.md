@@ -19,13 +19,15 @@ volume, the plain vector or hybrid ranking is usually the better trade.
 
 ## Turning it on
 
-Reranking is **off by default**, exactly like the embedders: `cargo add nidus` stays a
-pure, dependency-lean sync vector store until you opt in. Enable the `rerank` feature plus
-one `rerank-<name>` feature per provider you want (or `rerank-all` for both):
+`cargo add nidus` gives you reranking out of the box, exactly like the embedders:
+the `rerank` feature and both `rerank-<name>` provider features (`rerank-all`)
+ship in the default build. `--no-default-features` gives you the
+storage-and-search core alone. To pick a single provider explicitly instead of
+the full set, name it directly:
 
 ```toml
 [dependencies]
-nidus = { version = "0.67", features = ["rerank-voyage"] }
+nidus = { version = "0.67", default-features = false, features = ["rerank-voyage"] }
 ```
 
 | Provider | Feature | Enum | Default model |

@@ -13,6 +13,9 @@ No `Cargo.toml` feature flag is involved. The `wasm32` target itself selects whi
 of the tree compile: the core store, search, and the local/RAM/OPFS backends build and run
 there, while the S3, GCS, and Redis-family backends are simply absent (their client crates
 depend on native TLS and certificate stores that do not target `wasm32-unknown-unknown`).
+If you depend on `nidus` directly from your own crate targeting `wasm32`, set
+`default-features = false` on that dependency: the default build pulls in `cli`,
+`serve`, and the provider crates, none of which target `wasm32-unknown-unknown`.
 
 ## Installing
 

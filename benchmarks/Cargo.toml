@@ -38,7 +38,9 @@ name = "nidus-bench-write"
 path = "src/write.rs"
 
 [dependencies]
-nidus = { path = ".." }
+# `default-features = false`: this crate quarantines heavy deps (DuckDB, LanceDB)
+# behind explicit opt-in features, so it must not inherit nidus's full `serve` tree.
+nidus = { path = "..", default-features = false }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
