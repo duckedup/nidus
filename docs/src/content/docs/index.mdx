@@ -1,96 +1,166 @@
 ---
 title: nidus
-description: A small, pure-Rust all-in-one memory. Remember text, recall the relevant bits. Built-in embedding (and optional summarization) over an exact-or-approximate vector store, or bring your own vectors. No SQL, no query engine.
+description: Install one binary and point it at a folder. nidus is a command-line vector store with semantic and keyword search, an HTTP server, AST-aware code search, and agent memory over MCP, all over a single store directory. A Rust library too, when you want the store in your own process.
 template: splash
 hero:
-  tagline: Remember text, recall the relevant bits. A small, pure-Rust memory that embeds for you (or takes the vectors you already have) and answers by similarity from a single directory.
+  tagline: Install one binary and point it at a folder. Semantic and keyword search, an HTTP server, AST-aware code search, and agent memory over MCP, all over a single store directory.
   actions:
-    - text: Get started
-      link: /getting-started/
+    - text: Install the CLI
+      link: /guides/cli-and-server/#install
       variant: primary
-    - text: View on GitHub
-      link: https://github.com/duckedup/nidus
+    - text: Use the Rust library
+      link: /getting-started/
       variant: minimal
 ---
 
 import { Code } from '@astrojs/starlight/components';
 import Terminal from '../../components/Terminal.astro';
 
-<p class="lede not-content">
-  <strong>nidus (Latin, "nest") is two things in one small, pure-Rust package.</strong>
-  It's a <strong>vector store</strong> (the storage-and-search core you build
-  semantic search, code indexing, RAG, and agent memory on) and an <strong>all-in-one
-  memory</strong> layered on top that embeds text for you, so you can remember natural
-  language and recall the relevant bits. Bring your own vectors, or let nidus make
-  them. Reach either from outside a Rust process too: run it as an
-  <a href="/guides/http-server/">HTTP server</a>, point any MCP client at it as
-  <a href="/guides/mcp/">agent memory</a>, or connect with the
-  <a href="/sdks/javascript/">JavaScript</a>, <a href="/sdks/go/">Go</a>, or
-  <a href="/sdks/python/">Python</a> SDK. Not a database, no SQL, no query engine;
-  sized for development and small-scale use.
+<p class="section-kicker not-content">From nothing to ranked results</p>
+
+<Code code={`# 1. Install. No Rust toolchain needed.
+curl -fsSL https://raw.githubusercontent.com/duckedup/nidus/main/install.sh | sh
+
+# 2. Index this repo. AST-aware, and with no API key it answers from BM25.
+nidus code ingest . --dir ./store
+
+# 3. Ask it a question.
+nidus code search "where do we fsync the write-ahead log" --dir ./store`} lang="bash" />
+
+<p class="io-label not-content">what comes back</p>
+
+<Code code={`[
+  { "path": "store/write.rs", "language": "rust",
+    "symbols": [
+      { "symbol": "commit", "kind": "function",
+        "start_line": 136, "end_line": 148, "score": 10.09 }
+    ] }
+]`} lang="json" />
+
+<p class="aside-note not-content">
+  No source body in that response, on purpose. A code hit is a pointer: open the file
+  at those lines and you get the current text, never a stale copy.
 </p>
 
-<Code code={`// Text in: nidus embeds it for you.
-memory.remember(
-    "notes", "login",
-    "Users sign in with a bearer token.",
-    attrs, RememberMode::Raw,
-).await?;
-
-// Relevant text out, ranked by similarity.
-let hits = memory.recall("notes", "how do users sign in?", &RecallOpts {
-    top_k: 5,
-    ..Default::default()
-}).await?;`} lang="rust" />
+<p class="section-kicker not-content">Try it right here</p>
 
 <Terminal />
+
+<p class="section-kicker not-content">Four ways in, one store directory</p>
+
+<div class="lane-grid not-content">
+  <article class="lane" data-reveal>
+    <span class="lane-kicker">nidus ingest</span>
+    <h3>Index a folder, search it</h3>
+    <p>
+      One command walks the tree, chunks every file, embeds it and stores it. Re-run it
+      and nothing unchanged is touched. Bring an embedding provider to search by
+      meaning, or skip it entirely and get BM25 with no API key.
+    </p>
+    <a class="lane-link" href="/guides/ingest/">Ingest a directory</a>
+  </article>
+
+  <article class="lane" data-reveal style="--reveal-delay:0.04s">
+    <span class="lane-kicker">nidus code</span>
+    <h3>Search a codebase</h3>
+    <p>
+      Chunked by symbol, not by byte count. Every hit names a function, its kind and
+      its line span, so you land on the right lines instead of a paragraph near them.
+    </p>
+    <a class="lane-link" href="/guides/code/">Code search</a>
+  </article>
+
+  <article class="lane" data-reveal style="--reveal-delay:0.08s">
+    <span class="lane-kicker">nidus serve</span>
+    <h3>Serve it over HTTP</h3>
+    <p>
+      The same store on a port, in JSON. Every library operation has a route, so any
+      language can drive it. The JavaScript, Go and Python SDKs speak to exactly this.
+    </p>
+    <a class="lane-link" href="/guides/http-server/">HTTP server</a>
+  </article>
+
+  <article class="lane" data-reveal style="--reveal-delay:0.12s">
+    <span class="lane-kicker">nidus mcp</span>
+    <h3>Give an agent memory</h3>
+    <p>
+      One line registers the store with any MCP client, over stdio or at
+      <code>/mcp</code>. Your agent remembers what is worth keeping and recalls it by
+      meaning, with no glue code.
+    </p>
+    <a class="lane-link" href="/guides/mcp/">MCP (agent memory)</a>
+  </article>
+</div>
 
 <p class="section-kicker not-content">Why it exists</p>
 
 <div class="feature-grid not-content">
   <article class="feature" data-reveal>
     <span class="twig" aria-hidden="true">❧</span>
-    <h3>Remember text, recall the relevant bits</h3>
-    <p>Hand nidus natural language and it embeds it for you (optionally summarizing first) with the provider you choose: Voyage, OpenAI, Ollama, Cohere, Gemini, Mistral, Jina, or any OpenAI-compatible endpoint. Already have vectors? The raw API is untouched: bring your own. `--no-default-features` gives you the storage-and-search core alone, without the memory layer.</p>
+    <h3>One binary, every door</h3>
+    <p>
+      <code>cargo install nidus</code> ships all 33 subcommands, the server, the MCP
+      endpoint and every embedding provider. No feature flags to remember, and the
+      prebuilt binaries are the same thing. Want only the store?
+      <code>--no-default-features</code> is four crates and nothing else.
+    </p>
   </article>
   <article class="feature" data-reveal style="--reveal-delay:0.04s">
     <span class="twig" aria-hidden="true">❧</span>
-    <h3>Search by similarity, filter as you go</h3>
-    <p>Hand nidus a query and get the closest records back, ranked with scores: exact by default (100% recall at the scale it targets) by cosine, dot, or Euclidean, or an approximate index (HNSW/IVF) and int8/binary quantization when you want more speed. Store typed metadata beside every vector and narrow results before they score: equality, ranges, globs, sets, list containment, fuzzy and regex text matching, and boolean composition over all of them.</p>
+    <h3>Search by meaning, by keyword, or both</h3>
+    <p>
+      Vector search by cosine, dot or Euclidean distance, exact by default and
+      HNSW/IVF when you want more speed. BM25 over the same records, hybrid queries
+      that fuse the two, and typed metadata filters that narrow results before they
+      score.
+    </p>
   </article>
   <article class="feature" data-reveal style="--reveal-delay:0.08s">
     <span class="twig" aria-hidden="true">❧</span>
     <h3>One directory, crash-safe</h3>
-    <p>A whole store is a single append-only directory, fsync'd per batch and CRC-checked. A crash loses at most the in-flight write, and a torn tail repairs itself the moment you reopen; nothing to back up but a folder.</p>
+    <p>
+      A whole store is a single append-only directory, fsync'd per batch and
+      CRC-checked. A crash loses at most the in-flight write, and a torn tail repairs
+      itself the moment you reopen; nothing to back up but a folder.
+    </p>
   </article>
   <article class="feature" data-reveal style="--reveal-delay:0.12s">
     <span class="twig" aria-hidden="true">❧</span>
     <h3>From a folder to the cloud</h3>
-    <p>Start against a local directory, then move the same store to S3 or GCS by changing one URL, and add a shared Redis/Valkey memory tier when instances need a warm working set: no migration, no rewrite. Begin on a laptop and grow into the cloud when you need to.</p>
+    <p>
+      Start against a local directory, then move the same store to S3 or GCS by
+      changing one URL, and add a shared Redis/Valkey memory tier when instances need a
+      warm working set: no migration, no rewrite. Begin on a laptop and grow into the
+      cloud when you need to.
+    </p>
   </article>
 </div>
 
 <p class="section-kicker not-content">Where to next</p>
 
 <div class="next-grid not-content">
-  <a class="next-card" href="/getting-started/" data-reveal>
-    <span class="next-title">Getting started</span>
+  <a class="next-card" href="/guides/cli-and-server/" data-reveal>
+    <span class="next-title">Command line</span>
+    <p>Install the binary, then create, upsert, search, inspect and back up a store.</p>
+  </a>
+  <a class="next-card" href="/guides/http-server/" data-reveal style="--reveal-delay:0.06s">
+    <span class="next-title">HTTP server</span>
+    <p>Run <code>nidus serve</code>, authenticate it, and drive a store over JSON.</p>
+  </a>
+  <a class="next-card" href="/guides/code/" data-reveal style="--reveal-delay:0.06s">
+    <span class="next-title">Code search</span>
+    <p>Index a repo chunked by symbol, and search it grouped by file.</p>
+  </a>
+  <a class="next-card" href="/guides/mcp/" data-reveal style="--reveal-delay:0.06s">
+    <span class="next-title">MCP (agent memory)</span>
+    <p>Register a store as agent memory over stdio or at <code>/mcp</code>.</p>
+  </a>
+  <a class="next-card" href="/getting-started/" data-reveal style="--reveal-delay:0.12s">
+    <span class="next-title">Rust library</span>
     <p>Add the dependency, open a store, index records, run your first search.</p>
   </a>
-  <a class="next-card" href="/guides/remember-and-recall/" data-reveal style="--reveal-delay:0.06s">
-    <span class="next-title">Remember &amp; recall</span>
-    <p>Let nidus embed text for you: pick a provider, remember, recall.</p>
-  </a>
-  <a class="next-card" href="/guides/how-it-works/" data-reveal style="--reveal-delay:0.06s">
+  <a class="next-card" href="/guides/how-it-works/" data-reveal style="--reveal-delay:0.12s">
     <span class="next-title">How it works</span>
     <p>The storage model and the search path, end to end.</p>
-  </a>
-  <a class="next-card" href="/guides/storage/" data-reveal style="--reveal-delay:0.06s">
-    <span class="next-title">Storage &amp; durability</span>
-    <p>The on-disk format, the fsync contract, and lock-free readers.</p>
-  </a>
-  <a class="next-card" href="/reference/api/" data-reveal style="--reveal-delay:0.12s">
-    <span class="next-title">API reference</span>
-    <p>Every public type and method, with signatures.</p>
   </a>
 </div>
