@@ -17,7 +17,7 @@ export default defineConfig({
     starlight({
       title: "nidus",
       description:
-        "Install one binary and point it at a folder. A command-line vector store with semantic and keyword search, an HTTP server, AST-aware code search, and agent memory over MCP, all over a single store directory. Pure Rust: no FFI, no C, no SQL, no query engine.",
+        "One binary, one directory. A vector store you search from your shell, over HTTP, or as memory for an agent: semantic and keyword search, AST-aware code search, and MCP. Pure Rust: no FFI, no C, no SQL, no query engine.",
       logo: {
         // The nest mark — full-colour illustration, reads on light and dark.
         src: "./src/assets/nidus.svg",
