@@ -546,11 +546,17 @@ body:has(.nd-hero) .main-pane::before {
   z-index: 1;
 }
 
+/* The landing page is a two-column hero and a set of card grids, not a reading
+   column, so it gets a wider measure than a doc page's 50rem. */
+body:has(.nd-hero) .main-pane {
+  --sl-content-width: 72rem;
+}
+
 /* ── Hero ──────────────────────────────────────────────────────────────── */
 
 .nd-hero {
   display: grid;
-  grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
   align-items: center;
   gap: clamp(1.5rem, 1rem + 3vw, 4rem);
   padding-block: clamp(1.5rem, 1rem + 3vw, 3.5rem) clamp(2rem, 1rem + 3vw, 4rem);
@@ -584,11 +590,11 @@ body:has(.nd-hero) .main-pane::before {
   font-optical-sizing: auto;
   font-weight: 580;
   font-variation-settings: "SOFT" 30, "WONK" 0;
-  font-size: clamp(2.7rem, 1.7rem + 4.4vw, 4.8rem);
-  line-height: 0.98;
+  font-size: clamp(2.5rem, 1.6rem + 3vw, 4rem);
+  line-height: 1;
   letter-spacing: -0.02em;
   color: var(--sl-color-white);
-  margin: 0 0 1.1rem;
+  margin: 0 0 1rem;
   text-wrap: balance;
 }
 .nd-flourish {
@@ -624,9 +630,9 @@ body:has(.nd-hero) .main-pane::before {
   font-family: var(--sl-font);
   color: var(--sl-color-gray-2);
   font-size: clamp(1.05rem, 1rem + 0.55vw, 1.28rem);
-  line-height: 1.6;
-  max-width: 40ch;
-  margin: 0 0 1.9rem;
+  line-height: 1.55;
+  max-width: 46ch;
+  margin: 0 0 1.6rem;
 }
 @media (max-width: 50rem) {
   .nd-tagline {
@@ -639,7 +645,7 @@ body:has(.nd-hero) .main-pane::before {
   display: flex;
   flex-wrap: wrap;
   gap: 0.75rem;
-  margin-bottom: 1.9rem;
+  margin-bottom: 0;
 }
 @media (max-width: 50rem) {
   .nd-actions {
@@ -686,36 +692,6 @@ body:has(.nd-hero) .main-pane::before {
 .nd-btn--secondary:hover {
   border-color: color-mix(in srgb, var(--nd-teal) 55%, transparent);
   transform: translateY(-2px);
-}
-
-/* Proof line — the receipt under the buttons */
-.nd-proof {
-  font-family: var(--sl-font-mono);
-  font-size: 0.82rem;
-  color: var(--sl-color-gray-3);
-  display: flex;
-  align-items: center;
-  gap: 0.55rem;
-  margin: 0;
-}
-@media (max-width: 50rem) {
-  .nd-proof {
-    justify-content: center;
-  }
-}
-.nd-proof code {
-  color: var(--sl-color-gray-1);
-  background: none;
-  padding: 0;
-}
-.nd-proof__prompt {
-  color: var(--nd-teal);
-}
-.nd-proof__sep {
-  color: var(--sl-color-gray-4);
-}
-.nd-proof__note {
-  color: var(--nd-gold);
 }
 
 /* ── Hero art: nest + nearest-neighbour weave ──────────────────────────── */
@@ -849,9 +825,6 @@ body:has(.nd-hero) .main-pane::before {
 .nd-actions {
   animation-delay: 0.32s;
 }
-.nd-proof {
-  animation-delay: 0.42s;
-}
 @keyframes nd-rise {
   from {
     opacity: 0;
@@ -863,19 +836,7 @@ body:has(.nd-hero) .main-pane::before {
   }
 }
 
-/* ── Lede + section kickers ───────────────────────────────────────────── */
-
-.lede {
-  font-size: 1.2rem;
-  line-height: 1.62;
-  color: var(--sl-color-gray-2);
-  max-width: 62ch;
-  margin: 0.5rem 0 3rem;
-}
-.lede strong {
-  color: var(--sl-color-white);
-  font-weight: 600;
-}
+/* ── Section kickers ──────────────────────────────────────────────────── */
 
 .section-kicker {
   font-family: var(--sl-font-mono);
@@ -897,6 +858,139 @@ body:has(.nd-hero) .main-pane::before {
     var(--sl-color-hairline),
     transparent
   );
+}
+
+/* ── Command/output pair ───────────────────────────────────────────────── */
+
+/* The bash block and the JSON block below it are one exchange: what you type,
+   then what comes back. Close the gap and label the second half. */
+.io-label {
+  font-family: var(--sl-font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--sl-color-gray-3);
+  margin: 1.1rem 0 0.5rem;
+}
+.io-label::before {
+  content: "↳";
+  color: var(--nd-teal);
+  margin-right: 0.5rem;
+}
+
+/* ── Aside note — the sentence that follows a code block ───────────────── */
+
+.aside-note {
+  font-size: 0.95rem;
+  line-height: 1.6;
+  color: var(--sl-color-gray-3);
+  max-width: 66ch;
+  margin: 0.9rem 0 0;
+  padding-left: 0.9rem;
+  border-left: 2px solid color-mix(in srgb, var(--nd-gold) 45%, transparent);
+}
+
+/* ── Lane cards — the four front doors into one store directory ────────── */
+
+.lane-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1rem;
+}
+@media (max-width: 50rem) {
+  .lane-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.lane {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 0.85rem;
+  background: color-mix(in srgb, var(--nd-surface-raised) 70%, transparent);
+  box-shadow: var(--nd-card-shadow);
+  padding: 1.4rem 1.5rem 1.3rem;
+  overflow: hidden;
+  transition: border-color 0.25s var(--nd-ease), transform 0.25s var(--nd-ease),
+    box-shadow 0.25s var(--nd-ease);
+}
+/* Gold hairline along the top edge, to distinguish a lane from a feature. */
+.lane::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 2px;
+  background: linear-gradient(
+    to right,
+    transparent,
+    var(--nd-gold),
+    transparent
+  );
+  opacity: 0;
+  transition: opacity 0.25s ease;
+}
+.lane:hover {
+  border-color: color-mix(in srgb, var(--nd-gold) 50%, transparent);
+  transform: translateY(-3px);
+  box-shadow: var(--nd-card-shadow),
+    0 22px 40px -28px color-mix(in srgb, var(--nd-gold) 55%, black);
+}
+.lane:hover::before {
+  opacity: 0.9;
+}
+
+/* The subcommand itself, set in mono: what you actually type. */
+.lane-kicker {
+  display: inline-block;
+  align-self: flex-start;
+  font-family: var(--sl-font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  color: var(--nd-teal);
+  background: color-mix(in srgb, var(--nd-teal) 12%, transparent);
+  border-radius: 0.35rem;
+  padding: 0.22rem 0.5rem;
+  margin-bottom: 0.7rem;
+}
+.lane h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1.3rem;
+  line-height: 1.18;
+  color: var(--sl-color-white);
+}
+.lane > p {
+  margin: 0 0 1rem;
+  color: var(--sl-color-gray-3);
+  line-height: 1.6;
+  font-size: 0.96rem;
+}
+.lane > p code {
+  color: var(--sl-color-gray-1);
+}
+
+.lane-link {
+  font-family: var(--sl-font-mono);
+  font-size: 0.8rem;
+  color: var(--nd-teal-deep);
+  text-decoration: none;
+  align-self: flex-start;
+}
+:root[data-theme="dark"] .lane-link {
+  color: var(--nd-teal);
+}
+.lane-link::after {
+  content: "→";
+  display: inline-block;
+  margin-left: 0.4rem;
+  transition: transform 0.2s var(--nd-ease);
+}
+.lane-link:hover {
+  color: var(--nd-teal-bright);
+}
+.lane-link:hover::after {
+  transform: translateX(3px);
 }
 
 /* ── Feature cards ────────────────────────────────────────────────────── */
