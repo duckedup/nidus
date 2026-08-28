@@ -9,3 +9,5 @@ src/generated/
 # environment
 .env
 .env.production
+# install.sh copied in from the repo root by scripts/copy-install-script.mjs
+public/install.sh

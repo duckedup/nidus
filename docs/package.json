@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "predev": "node ./scripts/copy-wasm.mjs",
+    "predev": "node ./scripts/copy-wasm.mjs && node ./scripts/copy-install-script.mjs",
     "dev": "astro dev",
     "start": "astro dev",
-    "prebuild": "node ./scripts/copy-wasm.mjs",
+    "prebuild": "node ./scripts/copy-wasm.mjs && node ./scripts/copy-install-script.mjs",
     "build": "astro build",
     "preview": "astro preview",
     "astro": "astro"

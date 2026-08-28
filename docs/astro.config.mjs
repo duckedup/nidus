@@ -17,16 +17,13 @@ export default defineConfig({
     starlight({
       title: "nidus",
       description:
-        "Install one binary and point it at a folder. A command-line vector store with semantic and keyword search, an HTTP server, AST-aware code search, and agent memory over MCP, all over a single store directory. Pure Rust: no FFI, no C, no SQL, no query engine.",
+        "One binary, one directory. A vector store you search from your shell, over HTTP, or as memory for an agent: semantic and keyword search, AST-aware code search, and MCP. Pure Rust: no FFI, no C, no SQL, no query engine.",
       logo: {
         // The nest mark — full-colour illustration, reads on light and dark.
         src: "./src/assets/nidus.svg",
         alt: "nidus",
       },
       components: {
-        // Custom splash hero: the nest in an ember glow, overlaid with a live
-        // nearest-neighbour weave. See src/components/Hero.astro.
-        Hero: "./src/components/Hero.astro",
         // One sidebar only: a custom left nav with icon-led, collapsible
         // sections. PageSidebar is emptied to drop the right-hand TOC.
         Sidebar: "./src/components/Sidebar.astro",
@@ -59,12 +56,16 @@ export default defineConfig({
         "@fontsource/jetbrains-mono/400.css",
         "@fontsource/jetbrains-mono/500.css",
         "./src/styles/nest.css",
+        // Shared with the landing page (src/pages/index.astro), which runs
+        // outside Starlight and so cannot pull styles from nest.css.
+        "./src/styles/terminal.css",
       ],
       sidebar: [
         {
           label: "Start here",
           items: [
-            { label: "Introduction", link: "/" },
+            // "/" is the landing page (src/pages/index.astro), not a docs page.
+            { label: "Home", link: "/" },
             { label: "Getting started", link: "/getting-started/" },
           ],
         },

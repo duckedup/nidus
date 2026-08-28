@@ -1,0 +1,1009 @@
+/* ────────────────────────────────────────────────────────────────────────
+   nidus — landing page
+
+   Not a docs page. The product is a binary you type at, so the page is built
+   out of terminal panels: those are the only filled surfaces here, and
+   everything else sits bare on the ground, separated by hairlines. Each
+   section is named by the command it teaches, so scrolling the page reads as
+   a table of contents made of real commands.
+
+   Palette is the docs palette, unchanged (see nest.css): bark and parchment,
+   one teal accent, gold as the single flourish. Tokens are redeclared here
+   because Starlight's stylesheet does not load on this route.
+   ──────────────────────────────────────────────────────────────────────── */
+
+:root {
+  --sl-font: "Hanken Grotesk Variable", ui-sans-serif, system-ui, sans-serif;
+  --sl-font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --nd-display: "Fraunces Variable", Georgia, "Times New Roman", serif;
+
+  --nd-teal: #4f9d97;
+  --nd-teal-bright: #5fbab2;
+  --nd-teal-deep: #2f807a;
+  --nd-gold: #e0a93f;
+  --nd-gold-bright: #f0bc55;
+
+  --nd-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --nd-measure: 74rem;
+  --nd-gutter: clamp(1.25rem, 5vw, 4rem);
+}
+
+/* ── Dark (default) ─────────────────────────────────────────────────────── */
+:root,
+:root[data-theme="dark"] {
+  --sl-color-white: #f7f0e4;
+  --sl-color-gray-1: #efe7da;
+  --sl-color-gray-2: #e4d8c8;
+  --sl-color-gray-3: #b6a48f;
+  --sl-color-gray-4: #6b5240;
+  --sl-color-gray-5: #4a3526;
+  --sl-color-gray-6: #33231a;
+  --sl-color-black: #241710;
+
+  --sl-color-hairline: #3c2a1d;
+  --sl-color-hairline-light: #4a3526;
+  --nd-surface: #33231a;
+  --nd-surface-raised: #3c2a1d;
+
+  --nd-ember: radial-gradient(
+    62rem 42rem at 82% -12%,
+    color-mix(in srgb, var(--nd-gold) 15%, transparent),
+    transparent 62%
+  );
+  --nd-ember-2: radial-gradient(
+    46rem 38rem at 2% 2%,
+    color-mix(in srgb, var(--nd-teal) 12%, transparent),
+    transparent 60%
+  );
+  --nd-grain-opacity: 0.05;
+
+  /* Shell tokens */
+  --t-comment: #8a7259;
+  --t-cmd: #f7f0e4;
+  --t-sub: #9ed6d0;
+  --t-flag: #b09a83;
+  --t-str: var(--nd-gold);
+  --t-op: #7f6650;
+  --t-arg: #d9cbb9;
+  --t-key: #7fc2bb;
+  --t-num: var(--nd-gold-bright);
+  --t-lit: #d98c7d;
+}
+
+/* ── Light ──────────────────────────────────────────────────────────────── */
+:root[data-theme="light"] {
+  --sl-color-white: #2e1d12;
+  --sl-color-gray-1: #3d2a1c;
+  --sl-color-gray-2: #4f3826;
+  --sl-color-gray-3: #6e5a48;
+  --sl-color-gray-4: #8a7563;
+  --sl-color-gray-5: #d3c2ad;
+  --sl-color-gray-6: #e9ddca;
+  --sl-color-black: #faf5ea;
+
+  --sl-color-hairline: #e3d6c1;
+  --sl-color-hairline-light: #ebe0cf;
+  --nd-surface: #fffdf8;
+  --nd-surface-raised: #fffefb;
+
+  --nd-ember: radial-gradient(
+    62rem 42rem at 82% -12%,
+    color-mix(in srgb, var(--nd-gold) 22%, transparent),
+    transparent 60%
+  );
+  --nd-ember-2: radial-gradient(
+    46rem 38rem at 2% 2%,
+    color-mix(in srgb, var(--nd-teal) 13%, transparent),
+    transparent 58%
+  );
+  --nd-grain-opacity: 0.035;
+
+  --t-comment: #97806a;
+  --t-cmd: #2e1d12;
+  --t-sub: #216a65;
+  --t-flag: #7a6350;
+  --t-str: #a06a13;
+  --t-op: #a08a74;
+  --t-arg: #4f3826;
+  --t-key: #226f69;
+  --t-num: #a06a13;
+  --t-lit: #b05a48;
+}
+
+/* ── Ground ─────────────────────────────────────────────────────────────── */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+body {
+  margin: 0;
+  background: var(--sl-color-black);
+  color: var(--sl-color-gray-2);
+  font-family: var(--sl-font);
+  font-size: 1rem;
+  line-height: 1.72;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Ember glow, then the woven paper tooth over everything. Both fixed, so they
+   read as the surface of the page rather than layers that scroll past it. */
+body::before,
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+body::before {
+  z-index: -2;
+  background: var(--nd-ember), var(--nd-ember-2);
+}
+body::after {
+  z-index: -1;
+  opacity: var(--nd-grain-opacity);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+a {
+  color: var(--nd-teal);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.22em;
+}
+
+:focus-visible {
+  outline: 2px solid var(--nd-teal-bright);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+
+.wrap {
+  max-width: var(--nd-measure);
+  margin-inline: auto;
+  padding-inline: var(--nd-gutter);
+}
+
+.skip {
+  position: absolute;
+  left: -9999px;
+}
+.skip:focus {
+  left: 1rem;
+  top: 1rem;
+  z-index: 50;
+  background: var(--nd-surface-raised);
+  color: var(--sl-color-white);
+  padding: 0.6rem 1rem;
+  border-radius: 0.5rem;
+}
+
+/* ── Header ─────────────────────────────────────────────────────────────── */
+
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  border-bottom: 1px solid var(--sl-color-hairline);
+  background: color-mix(in srgb, var(--sl-color-black) 72%, transparent);
+  backdrop-filter: blur(12px) saturate(140%);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
+}
+.nav__in {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  height: 4.25rem;
+}
+.nav__brand {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-right: auto;
+  color: var(--sl-color-white);
+  text-decoration: none;
+  font-family: var(--nd-display);
+  font-size: 1.3rem;
+  font-weight: 560;
+  font-variation-settings: "SOFT" 28, "WONK" 0;
+  letter-spacing: -0.01em;
+}
+.nav__brand img {
+  width: 1.9rem;
+  height: 1.9rem;
+}
+.nav__links {
+  display: flex;
+  align-items: center;
+  gap: 1.35rem;
+}
+.nav__links a {
+  color: var(--sl-color-gray-3);
+  text-decoration: none;
+  font-size: 0.92rem;
+  transition: color 0.16s ease;
+}
+.nav__links a:hover {
+  color: var(--sl-color-white);
+}
+.nav__icon {
+  display: grid;
+  place-items: center;
+  width: 2.1rem;
+  height: 2.1rem;
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 0.5rem;
+  background: none;
+  color: var(--sl-color-gray-3);
+  cursor: pointer;
+  transition: color 0.16s ease, border-color 0.16s ease;
+}
+.nav__icon:hover {
+  color: var(--sl-color-white);
+  border-color: var(--sl-color-hairline-light);
+}
+.nav__icon svg {
+  width: 1.05rem;
+  height: 1.05rem;
+}
+.nav__icon .icon-sun {
+  display: none;
+}
+:root[data-theme="light"] .nav__icon .icon-sun {
+  display: block;
+}
+:root[data-theme="light"] .nav__icon .icon-moon {
+  display: none;
+}
+
+@media (max-width: 44rem) {
+  .nav__links a[data-optional] {
+    display: none;
+  }
+}
+
+/* ── Display type ───────────────────────────────────────────────────────── */
+
+h1,
+h2,
+h3 {
+  font-family: var(--nd-display);
+  font-optical-sizing: auto;
+  color: var(--sl-color-white);
+  margin: 0;
+}
+
+/* The headline is the one place Fraunces is allowed to be strange: WONK on,
+   SOFT off, so the leg of the R and the ear of the g splay. Used nowhere else. */
+.hero__title {
+  font-size: clamp(2.5rem, 5.3vw, 4.05rem);
+  line-height: 1.02;
+  font-weight: 420;
+  font-variation-settings: "SOFT" 0, "WONK" 1;
+  letter-spacing: -0.028em;
+  text-wrap: balance;
+}
+/* The second sentence always starts its own line: it is the turn in the
+   headline, not a phrase that should wrap wherever the measure happens to end. */
+.hero__title em {
+  display: block;
+  font-style: italic;
+  color: var(--nd-teal-bright);
+  font-variation-settings: "SOFT" 0, "WONK" 1;
+}
+
+h2 {
+  font-size: clamp(1.7rem, 3.1vw, 2.35rem);
+  line-height: 1.14;
+  font-weight: 500;
+  font-variation-settings: "SOFT" 24, "WONK" 0;
+  letter-spacing: -0.017em;
+  text-wrap: balance;
+}
+
+/* ── Eyebrows and chips: mono, because they name real things ────────────── */
+
+.eyebrow {
+  margin: 0;
+  font-family: var(--sl-font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.19em;
+  text-transform: uppercase;
+  color: var(--sl-color-gray-3);
+}
+.eyebrow em {
+  font-style: italic;
+  color: var(--nd-teal);
+  text-transform: none;
+  letter-spacing: 0.08em;
+}
+
+/* ── Hero ───────────────────────────────────────────────────────────────── */
+
+.hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.95fr);
+  gap: clamp(2rem, 5vw, 4.5rem);
+  align-items: center;
+  padding-block: clamp(2.75rem, 6vw, 5rem) clamp(2.5rem, 5vw, 4rem);
+}
+@media (max-width: 60rem) {
+  .hero {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2.75rem;
+  }
+}
+
+.hero__copy > * + * {
+  margin-top: 1.5rem;
+}
+.hero__copy .hero__title {
+  margin-top: 1.1rem;
+}
+/* Fraunces italic descends a long way; the lede needs clearance from it. */
+.hero__copy .hero__lede {
+  margin-top: 1.9rem;
+}
+.hero__lede {
+  margin: 0;
+  max-width: 33rem;
+  font-size: clamp(1rem, 1.2vw, 1.09rem);
+  line-height: 1.62;
+  color: var(--sl-color-gray-3);
+}
+.hero__lede strong {
+  color: var(--sl-color-gray-1);
+  font-weight: 500;
+}
+
+/* Install block: the command is the call to action, so it gets the emphasis a
+   button would normally take. */
+.install {
+  max-width: 36rem;
+}
+.install__tabs {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-bottom: 0.55rem;
+}
+/* The copy control sits above the command so the command line itself stays
+   full width and wraps the way a terminal would. */
+.install__tabs .install__copy {
+  margin-left: auto;
+}
+.install__tab {
+  font-family: var(--sl-font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  padding: 0.25rem 0.6rem;
+  border-radius: 0.4rem;
+  border: 1px solid transparent;
+  background: none;
+  color: var(--sl-color-gray-4);
+  cursor: pointer;
+  transition: color 0.16s ease, border-color 0.16s ease;
+}
+.install__tab:hover {
+  color: var(--sl-color-gray-2);
+}
+.install__tab[aria-pressed="true"] {
+  color: var(--nd-teal-bright);
+  border-color: color-mix(in srgb, var(--nd-teal) 40%, transparent);
+  background: color-mix(in srgb, var(--nd-teal) 9%, transparent);
+}
+
+.install__row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.8rem 1rem;
+  border: 1px solid color-mix(in srgb, var(--nd-teal) 34%, var(--sl-color-hairline));
+  border-radius: 0.7rem;
+  background: color-mix(in srgb, var(--nd-surface) 66%, transparent);
+}
+.install__prompt {
+  color: var(--nd-teal);
+  font-family: var(--sl-font-mono);
+  font-size: 0.7rem;
+  line-height: 1.7;
+  user-select: none;
+}
+.install__cmd {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--sl-font-mono);
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+  font-size: 0.7rem;
+  line-height: 1.7;
+  color: var(--sl-color-white);
+  /* Wrap at shell words, never mid-URL. */
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+.install__copy {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-family: var(--sl-font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.05em;
+  padding: 0.35rem 0.6rem;
+  border: none;
+  border-radius: 0.45rem;
+  background: var(--nd-teal-deep);
+  color: #fbf7ee;
+  cursor: pointer;
+  transition: background-color 0.16s ease;
+}
+.install__copy:hover {
+  background: var(--nd-teal);
+}
+.install__copy[data-copied="1"] {
+  background: var(--nd-gold);
+  color: #241710;
+}
+
+.hero__alt {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--sl-color-gray-4);
+}
+.hero__alt a {
+  color: var(--sl-color-gray-2);
+}
+
+/* The live wasm terminal is the hero's thesis: a real nidus, in this tab. */
+.hero__demo .nd-term {
+  margin: 0;
+}
+/* The hero's demo column is narrower than a section's, so its transcript is set
+   a size down to keep every command on one line. */
+.hero__demo .term pre {
+  font-size: 0.735rem;
+}
+.hero__demo .nd-term__disclosure {
+  font-size: 0.775rem;
+  line-height: 1.55;
+  color: var(--sl-color-gray-4);
+  max-width: 34rem;
+}
+.hero__demo .nd-term__frame {
+  background: color-mix(in srgb, var(--nd-surface-raised) 72%, transparent);
+  box-shadow: 0 30px 70px -40px rgba(0, 0, 0, 0.85);
+}
+:root[data-theme="light"] .hero__demo .nd-term__frame {
+  box-shadow: 0 24px 56px -34px rgba(83, 45, 23, 0.35);
+}
+
+/* ── Spec strip: the facts you would read off the underside of the box ──── */
+
+.spec {
+  border-block: 1px solid var(--sl-color-hairline);
+}
+.spec__in {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem 1.4rem;
+  padding-block: 1.05rem;
+  font-family: var(--sl-font-mono);
+  font-size: 0.76rem;
+  letter-spacing: 0.05em;
+  color: var(--sl-color-gray-3);
+}
+.spec__in span::before {
+  content: "·";
+  color: var(--nd-teal);
+  margin-right: 1.4rem;
+}
+.spec__in span:first-child::before {
+  content: none;
+  margin: 0;
+}
+
+/* ── Sections ───────────────────────────────────────────────────────────── */
+
+.sec {
+  padding-block: clamp(3.5rem, 8vw, 6.5rem);
+  border-bottom: 1px solid var(--sl-color-hairline);
+}
+
+/* The chip carries the literal subcommand, and the rule runs from it to the
+   edge: the section is labelled by the thing you would actually type. */
+.sec__label {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1.4rem;
+}
+.sec__chip {
+  flex: none;
+  font-family: var(--sl-font-mono);
+  font-size: 0.76rem;
+  letter-spacing: 0.02em;
+  color: var(--nd-teal-bright);
+  padding: 0.28rem 0.65rem;
+  border: 1px solid color-mix(in srgb, var(--nd-teal) 32%, transparent);
+  border-radius: 0.4rem;
+  background: color-mix(in srgb, var(--nd-teal) 8%, transparent);
+  white-space: nowrap;
+}
+.sec__rule {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(
+    to right,
+    var(--sl-color-hairline-light),
+    transparent
+  );
+}
+
+.sec__body--single {
+  grid-template-columns: minmax(0, 1fr) !important;
+}
+.sec__body--single .sec__prose {
+  max-width: 46rem;
+  position: static;
+}
+
+.sec__body {
+  display: grid;
+  grid-template-columns: minmax(0, 0.82fr) minmax(0, 1.18fr);
+  gap: clamp(1.75rem, 4vw, 3.5rem);
+  align-items: start;
+}
+@media (max-width: 62rem) {
+  .sec__body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.sec__prose h2 {
+  margin-bottom: 1rem;
+}
+/* The claim stays beside the commands that prove it, rather than scrolling off
+   and leaving a column of nothing. */
+@media (min-width: 62rem) {
+  .sec__prose {
+    position: sticky;
+    top: 6rem;
+  }
+}
+.sec__prose p {
+  margin: 0 0 1rem;
+  color: var(--sl-color-gray-3);
+}
+.sec__prose p strong {
+  color: var(--sl-color-gray-1);
+  font-weight: 500;
+}
+.sec__prose code {
+  font-family: var(--sl-font-mono);
+  font-size: 0.86em;
+  color: var(--nd-teal-bright);
+}
+
+.sec__links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.25rem;
+  margin-top: 1.4rem;
+  padding: 0;
+  list-style: none;
+}
+.sec__links a {
+  font-size: 0.9rem;
+  text-decoration: none;
+  border-bottom: 1px solid color-mix(in srgb, var(--nd-teal) 35%, transparent);
+  transition: border-color 0.16s ease, color 0.16s ease;
+}
+.sec__links a::after {
+  content: " →";
+  color: var(--sl-color-gray-4);
+}
+.sec__links a:hover {
+  color: var(--nd-teal-bright);
+  border-color: var(--nd-teal-bright);
+}
+
+.sec__demo > * + * {
+  margin-top: 1rem;
+}
+
+/* ── Terminal panel (Term.astro) ────────────────────────────────────────── */
+
+.term {
+  margin: 0;
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 0.8rem;
+  background: color-mix(in srgb, var(--nd-surface) 62%, transparent);
+  overflow: hidden;
+}
+
+.term__bar {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.6rem 0.95rem;
+  border-bottom: 1px solid var(--sl-color-hairline);
+  background: color-mix(in srgb, var(--nd-teal) 5%, transparent);
+}
+.term__lamp {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: var(--nd-teal);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--nd-teal) 18%, transparent);
+}
+.term__title {
+  font-family: var(--sl-font-mono);
+  font-size: 0.74rem;
+  letter-spacing: 0.04em;
+  color: var(--sl-color-gray-3);
+}
+
+.term pre {
+  margin: 0;
+  overflow-x: auto;
+  font-family: var(--sl-font-mono);
+  /* No ligatures: `--dir` must not render as a long dash in CLI copy. */
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+  font-size: 0.8rem;
+  line-height: 1.72;
+  tab-size: 2;
+}
+.term__cmd {
+  padding: 0.95rem 1.05rem;
+}
+/* The `$` gutter: one prompt per command line, never on a continuation. */
+.t-prompt {
+  color: var(--nd-teal);
+  user-select: none;
+}
+
+.term__out {
+  position: relative;
+  border-top: 1px dashed var(--sl-color-hairline);
+  background: color-mix(in srgb, var(--sl-color-black) 30%, transparent);
+  padding: 0.95rem 1.05rem 1rem;
+}
+.term__out-label {
+  display: block;
+  margin-bottom: 0.5rem;
+  font-family: var(--sl-font-mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--sl-color-gray-4);
+}
+.term__out pre {
+  max-height: 21rem;
+  overflow-y: auto;
+}
+.term__note {
+  margin: 0;
+  padding: 0.7rem 1.05rem;
+  border-top: 1px solid var(--sl-color-hairline);
+  font-size: 0.82rem;
+  color: var(--sl-color-gray-4);
+}
+
+.t-comment {
+  color: var(--t-comment);
+  font-style: italic;
+}
+.t-cmd {
+  color: var(--t-cmd);
+  font-weight: 500;
+}
+.t-sub {
+  color: var(--t-sub);
+}
+.t-flag {
+  color: var(--t-flag);
+}
+.t-str {
+  color: var(--t-str);
+}
+.t-op {
+  color: var(--t-op);
+}
+.t-arg {
+  color: var(--t-arg);
+}
+.t-key {
+  color: var(--t-key);
+}
+.t-num {
+  color: var(--t-num);
+  font-variant-numeric: tabular-nums;
+}
+.t-lit {
+  color: var(--t-lit);
+}
+
+/* ── The rest of the binary: a hairline table, not a deck of cards ──────── */
+
+.more {
+  display: grid;
+  grid-template-columns: 1fr;
+  border-top: 1px solid var(--sl-color-hairline);
+}
+.more__item {
+  display: block;
+  padding: 1.5rem 0 1.6rem;
+  border-bottom: 1px solid var(--sl-color-hairline);
+  text-decoration: none;
+  color: inherit;
+  transition: background-color 0.18s ease;
+}
+.more__item:hover {
+  background: color-mix(in srgb, var(--nd-teal) 5%, transparent);
+}
+.more__cmd {
+  display: block;
+  font-family: var(--sl-font-mono);
+  font-size: 0.76rem;
+  letter-spacing: 0.02em;
+  color: var(--nd-teal);
+  margin-bottom: 0.5rem;
+}
+.more__title {
+  display: block;
+  font-size: 1.02rem;
+  font-weight: 500;
+  color: var(--sl-color-white);
+  margin-bottom: 0.3rem;
+}
+.more__item p {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--sl-color-gray-3);
+}
+
+/* Two rows of three: six cells, no ragged last row, and the hairlines between
+   columns make it read as one table rather than six cards. */
+@media (min-width: 46rem) {
+  .more {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .more__item {
+    padding: 1.5rem;
+  }
+  .more__item:nth-child(2n + 1) {
+    padding-left: 0;
+  }
+  .more__item:not(:nth-child(2n + 1)) {
+    border-left: 1px solid var(--sl-color-hairline);
+  }
+}
+@media (min-width: 68rem) {
+  .more {
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .more__item:nth-child(2n + 1) {
+    padding-left: 1.5rem;
+  }
+  .more__item:not(:nth-child(2n + 1)) {
+    border-left: none;
+  }
+  .more__item:nth-child(3n + 1) {
+    padding-left: 0;
+  }
+  .more__item:not(:nth-child(3n + 1)) {
+    border-left: 1px solid var(--sl-color-hairline);
+  }
+}
+
+/* ── Closing ────────────────────────────────────────────────────────────── */
+
+.end {
+  padding-block: clamp(3.5rem, 8vw, 6rem) clamp(3rem, 6vw, 4.5rem);
+  text-align: center;
+}
+.end__mark {
+  width: 4.5rem;
+  height: 4.5rem;
+  margin: 0 auto 1.5rem;
+  display: block;
+}
+.end h2 {
+  font-size: clamp(2rem, 4.4vw, 3.1rem);
+  font-variation-settings: "SOFT" 0, "WONK" 1;
+  font-weight: 420;
+  letter-spacing: -0.024em;
+  margin-bottom: 1rem;
+}
+.end p {
+  max-width: 34rem;
+  margin: 0 auto 2rem;
+  color: var(--sl-color-gray-3);
+}
+.end .install {
+  margin-inline: auto;
+  max-width: 46rem;
+  text-align: left;
+}
+.end__links {
+  margin-top: 1.6rem;
+  font-size: 0.92rem;
+  color: var(--sl-color-gray-4);
+}
+.end__links a {
+  margin-inline: 0.5rem;
+}
+
+.foot {
+  border-top: 1px solid var(--sl-color-hairline);
+}
+.foot__in {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1.5rem;
+  align-items: center;
+  padding-block: 1.6rem 2.4rem;
+  font-size: 0.85rem;
+  color: var(--sl-color-gray-4);
+}
+.foot__in a {
+  color: var(--sl-color-gray-3);
+  text-decoration: none;
+}
+.foot__in a:hover {
+  color: var(--sl-color-white);
+}
+.foot__spacer {
+  margin-left: auto;
+}
+
+/* ── Motion: one load sequence in the hero, one reveal per section ──────── */
+
+@media (prefers-reduced-motion: no-preference) {
+  [data-lift] {
+    opacity: 0;
+    transform: translateY(14px);
+    animation: lift 0.75s var(--nd-ease) forwards;
+    animation-delay: var(--lift-delay, 0s);
+  }
+  [data-reveal] {
+    opacity: 0;
+    transform: translateY(18px);
+    transition: opacity 0.7s var(--nd-ease), transform 0.7s var(--nd-ease);
+  }
+  [data-reveal].is-visible {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes lift {
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.foot__mark {
+  font-family: var(--nd-display);
+  font-size: 1.05rem;
+  font-weight: 560;
+  font-variation-settings: "SOFT" 28, "WONK" 0;
+  color: var(--sl-color-gray-3);
+}
+
+/* ── "Try it before you install it" ─────────────────────────────────────── */
+
+.try {
+  display: grid;
+  grid-template-columns: minmax(0, 0.82fr) minmax(0, 1.18fr);
+  gap: clamp(1.75rem, 4vw, 3.5rem);
+  align-items: start;
+}
+@media (max-width: 62rem) {
+  .try {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.try__copy h2 {
+  margin-bottom: 1rem;
+}
+.try__copy p {
+  margin: 0 0 1rem;
+  color: var(--sl-color-gray-3);
+}
+.try__copy code {
+  font-family: var(--sl-font-mono);
+  font-size: 0.86em;
+  color: var(--nd-teal-bright);
+}
+/* The caveat is set apart rather than buried: it is a footnote, not a retraction. */
+.try__caveat {
+  font-size: 0.88rem;
+  padding-left: 1rem;
+  border-left: 1px solid var(--sl-color-hairline-light);
+  color: var(--sl-color-gray-4) !important;
+}
+.try__demo .nd-term {
+  margin: 0;
+}
+.try__demo .nd-term__disclosure {
+  display: none;
+}
+
+/* ── "Where it fits": the two columns are the whole point ───────────────── */
+
+.fits__title {
+  max-width: 34rem;
+  margin-bottom: 1.6rem;
+}
+
+.fits {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr));
+  gap: 0;
+  border-top: 1px solid var(--sl-color-hairline);
+}
+.fits__col {
+  padding: 1.6rem 0 0;
+}
+@media (min-width: 46rem) {
+  .fits__col + .fits__col {
+    padding-left: 2.5rem;
+    margin-left: 2.5rem;
+    border-left: 1px solid var(--sl-color-hairline);
+  }
+}
+.fits__head {
+  font-family: var(--sl-font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.19em;
+  text-transform: uppercase;
+  color: var(--sl-color-gray-3);
+  margin-bottom: 1rem;
+}
+.fits__col:first-child .fits__head {
+  color: var(--nd-teal-bright);
+}
+.fits ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.fits li {
+  position: relative;
+  padding-left: 1.4rem;
+  margin-bottom: 0.7rem;
+  color: var(--sl-color-gray-3);
+  font-size: 0.95rem;
+}
+.fits li::before {
+  position: absolute;
+  left: 0;
+  top: 0;
+  font-family: var(--sl-font-mono);
+  font-size: 0.85rem;
+}
+.fits__col:first-child li::before {
+  content: "+";
+  color: var(--nd-teal);
+}
+.fits__col + .fits__col li::before {
+  content: "\2013";
+  color: var(--sl-color-gray-4);
+}

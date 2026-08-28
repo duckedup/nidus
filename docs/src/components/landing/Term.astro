@@ -1,0 +1,123 @@
+---
+/**
+ * A terminal panel for the landing page: a shell command, and what the real
+ * binary printed back. Every `out` on this page was captured from
+ * `nidus 0.96.0`, not written by hand.
+ *
+ * Tokenising is done here rather than with expressive-code so the colours come
+ * from the nest palette (teal for the binary, gold for literals, bark for
+ * everything structural) and the landing page ships no highlighter.
+ */
+interface Props {
+  /** Label in the panel's top bar. Lowercase, describes what the command does. */
+  title: string;
+  /** One or more bash lines. Blank lines and `#` comments are kept. */
+  cmd: string;
+  /** What the command printed. Omitted when the command is the whole point. */
+  out?: string;
+  /** How to colour `out`. */
+  outLang?: "json" | "text";
+  /** Caption under the output, e.g. a timing. */
+  note?: string;
+}
+
+const { title, cmd, out, outLang = "json", note } = Astro.props;
+
+const esc = (s: string) =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+const wrap = (cls: string, s: string) => `<span class="t-${cls}">${esc(s)}</span>`;
+
+/**
+ * Colour a bash block. The `$` is emitted as a real token, not a CSS prefix, so
+ * a line the shell never prompted for (a `\` continuation, or the right side of
+ * a pipe) correctly gets none.
+ */
+function bashHtml(src: string): string {
+  let continuation = false;
+
+  return src
+    .split("\n")
+    .map((line) => {
+      if (line.trim() === "") {
+        continuation = false;
+        return "";
+      }
+      if (line.trim().startsWith("#")) {
+        continuation = false;
+        return wrap("comment", line);
+      }
+
+      const isContinuation = continuation;
+      continuation = line.trimEnd().endsWith("\\");
+
+      // Split on whitespace but keep single- and double-quoted runs whole.
+      const parts = line.match(/'[^']*'|"[^"]*"|\S+|\s+/g) ?? [];
+      // A continuation line carries the previous line's command, so nothing on
+      // it may claim the command slot.
+      let seenCommand = isContinuation;
+      let sawBinary = false;
+
+      const body = parts
+        .map((tok) => {
+          if (/^\s+$/.test(tok)) return esc(tok);
+          if (/^['"]/.test(tok)) return wrap("str", tok);
+          if (tok === "|" || tok === "\\" || tok === ">" || tok === "<") {
+            if (tok === "|") seenCommand = false;
+            return wrap("op", tok);
+          }
+          if (tok.startsWith("-")) return wrap("flag", tok);
+          if (!seenCommand) {
+            seenCommand = true;
+            sawBinary = tok === "nidus";
+            return wrap("cmd", tok);
+          }
+          // The word right after `nidus` is its subcommand, worth its own colour.
+          if (sawBinary) {
+            sawBinary = false;
+            return wrap("sub", tok);
+          }
+          return wrap("arg", tok);
+        })
+        .join("");
+
+      return isContinuation ? `  ${body}` : `${wrap("prompt", "$")} ${body}`;
+    })
+    .join("\n");
+}
+
+/** Colour JSON: keys teal, strings parchment, numbers gold. */
+function jsonHtml(src: string): string {
+  return esc(src).replace(
+    /("(?:[^"\\]|\\.)*")(\s*:)?|\b(-?\d+(?:\.\d+)?)\b|\b(true|false|null)\b/g,
+    (m, str, colon, num, lit) => {
+      if (str) return colon ? `<span class="t-key">${str}</span>${colon}` : `<span class="t-str">${str}</span>`;
+      if (num) return `<span class="t-num">${num}</span>`;
+      return `<span class="t-lit">${lit}</span>`;
+    },
+  );
+}
+
+const cmdHtml = bashHtml(cmd.trimEnd());
+const outHtml = out ? (outLang === "json" ? jsonHtml(out.trimEnd()) : esc(out.trimEnd())) : null;
+---
+
+<figure class="term">
+  <figcaption class="term__bar">
+    <span class="term__lamp" aria-hidden="true"></span>
+    <span class="term__title">{title}</span>
+  </figcaption>
+
+  <pre class="term__cmd"><code set:html={cmdHtml} /></pre>
+
+  {
+    outHtml && (
+      <div class="term__out">
+        <span class="term__out-label">output</span>
+        <pre><code set:html={outHtml} /></pre>
+      </div>
+    )
+  }
+
+  {note && <p class="term__note">{note}</p>}
+</figure>

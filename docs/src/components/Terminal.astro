@@ -50,11 +50,10 @@ import { EXAMPLE_QUERY, EXAMPLE_OUTPUT } from "../terminal/corpus.js";
   </div>
 
   <p class="nd-term__disclosure">
-    There is no embedding model in your browser, so text is turned into a vector by
-    character trigrams plus a small hand-written concept map. The store, the ranking
-    and the scores are real nidus; the vectors are a stand-in, and the concept map
-    only knows the words someone wrote down. Data persists in
-    <a href="/guides/wasm/">OPFS</a>, private to this origin.
+    A real nidus, compiled to wasm and running in this tab. No browser ships an
+    embedding model, so text becomes a vector by character trigrams plus a small
+    concept map; the store, the ranking and the scores are the real thing. Data
+    persists in <a href="/guides/wasm/">OPFS</a>, private to this origin.
   </p>
 </div>
 
@@ -231,5 +230,13 @@ import { EXAMPLE_QUERY, EXAMPLE_OUTPUT } from "../terminal/corpus.js";
     });
   }
 
+  // `astro:page-load` covers the docs, which navigate with view transitions.
+  // The landing page (src/pages/index.astro) is outside that router, so wire on
+  // DOM ready too; initTerminal is idempotent via `data-wired`.
   document.addEventListener("astro:page-load", initTerminal);
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initTerminal);
+  } else {
+    initTerminal();
+  }
 </script>
