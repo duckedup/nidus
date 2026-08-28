@@ -1,7 +1,7 @@
 ---
 name: nidus
-description: Carry work from a thought to a shipped PR — assess whether it belongs, research and blueprint it, implement it with parallel agents, review it, ship it, or coordinate a fleet of peer sessions doing all of that. Use when the user invokes /nidus with a subcommand (fit, spec, implement, review, ship, fleet) or with an issue number (beads, e.g. nidus-186 or #186) or description.
-argument-hint: "[fit|spec|implement|review|ship|fleet] <issue number | description | PR number | who does what>"
+description: Carry work from a thought to a shipped PR — assess whether it belongs, research and blueprint it, implement it with parallel agents, simplify or speed up code that already ships, review it, ship it, or coordinate a fleet of peer sessions doing all of that. Use when the user invokes /nidus with a subcommand (fit, spec, implement, simplify, optimize, review, ship, fleet) or with an issue number (beads, e.g. nidus-186 or #186) or description.
+argument-hint: "[fit|spec|implement|simplify|optimize|review|ship|fleet] <issue number | description | PR number | path | who does what>"
 model: opus
 allowed-tools: [Read, Write, Edit, Bash, Grep, Glob, Agent, Workflow, AskUserQuestion, ReportFindings, TodoWrite, ListAgents, SendMessage, EnterWorktree, ExitWorktree]
 ---
@@ -35,6 +35,8 @@ open `lanes/<name>.md` and follow it.
 | `fit` | `lanes/fit.md` |
 | `spec` | `lanes/spec.md` |
 | `implement` | `lanes/implement.md` |
+| `simplify` | `lanes/simplify.md` |
+| `optimize` | `lanes/optimize.md` |
 | `review` | `lanes/review.md` |
 | `ship` | `lanes/ship.md` |
 | `fleet` | `lanes/fleet.md` |
@@ -44,6 +46,14 @@ Paths are relative to `.claude/skills/nidus/`. The rest of `$ARGUMENTS` is the t
 issue number (`#42`), **several issue numbers**, a PR number (review only), a path, or a
 freeform description. With no arguments at all, run `lanes/review.md` against the working
 tree — that is the cheapest useful thing.
+
+`simplify` and `optimize` are the two lanes that start from the **code that already ships**
+rather than from a ticket, so their target is a scope (a path, a subsystem in words, or
+nothing for the whole repo) and they file the issue themselves. Both reuse the rest of the
+pipeline unchanged: a sweep in place of `spec`'s research, then the same blueprint format, the
+same `implement.workflow.js`, the same `review.workflow.js`, the same **Ship**. Neither may
+change what nidus does — that is the line that separates them from feature work, and each lane
+file says how it is enforced.
 
 **Several tickets are one job, not N jobs**: one branch, one blueprint, one version bump, one
 PR closing all of them. Do not open a branch per ticket unless the user asks or one is
@@ -95,7 +105,9 @@ blocked. `lanes/spec.md` step 3 has the reasoning and the naming.
   durable knowledge goes in the issue that owns it, or in `SPEC.md`. Issue state is not in
   the repo: `bd dolt push` publishes it, `bd bootstrap` sets up a fresh clone.
 - Implementation agents are sonnet in worktrees; merging, verifying, and reviewing stay on
-  the main thread so one context has seen the whole change.
+  the main thread so one context has seen the whole change. The two sweep lanes invert only
+  the first half: their scanners are opus, because judging what is genuinely duplicated or
+  genuinely hot is the hard part and implementing the answer is not.
 - `nidus-check` is the source of truth for lanes, laws and dispatch safety. If it is wrong, fix
   the checker and its selftest — do not work around it in prose.
 - **Assert the behaviour, not that the machinery ran.** The rule below is reactive: it catches a
