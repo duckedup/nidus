@@ -24,9 +24,6 @@ export default defineConfig({
         alt: "nidus",
       },
       components: {
-        // Custom splash hero: the nest in an ember glow, overlaid with a live
-        // nearest-neighbour weave. See src/components/Hero.astro.
-        Hero: "./src/components/Hero.astro",
         // One sidebar only: a custom left nav with icon-led, collapsible
         // sections. PageSidebar is emptied to drop the right-hand TOC.
         Sidebar: "./src/components/Sidebar.astro",
@@ -59,12 +56,16 @@ export default defineConfig({
         "@fontsource/jetbrains-mono/400.css",
         "@fontsource/jetbrains-mono/500.css",
         "./src/styles/nest.css",
+        // Shared with the landing page (src/pages/index.astro), which runs
+        // outside Starlight and so cannot pull styles from nest.css.
+        "./src/styles/terminal.css",
       ],
       sidebar: [
         {
           label: "Start here",
           items: [
-            { label: "Introduction", link: "/" },
+            // "/" is the landing page (src/pages/index.astro), not a docs page.
+            { label: "Home", link: "/" },
             { label: "Getting started", link: "/getting-started/" },
           ],
         },

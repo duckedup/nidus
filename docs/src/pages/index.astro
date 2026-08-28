@@ -1,0 +1,655 @@
+---
+/**
+ * nidus — landing page.
+ *
+ * A standalone Astro route, deliberately outside Starlight: the docs shell is a
+ * reading surface, and this page is a pitch. It keeps the docs palette and
+ * typefaces so the two feel like one site.
+ *
+ * Copy rule for this page: plain words first, jargon second and only once, in
+ * parentheses, for the reader who is searching for that term. A front-end
+ * developer who has never touched a vector store should read the whole page
+ * without stopping.
+ *
+ * Every command and every block of output here was captured from `nidus 0.96.0`
+ * against a real store. Nothing is illustrative.
+ */
+import { Image } from "astro:assets";
+import nest from "../assets/nidus.svg";
+import Terminal from "../components/Terminal.astro";
+import Term from "../components/landing/Term.astro";
+
+import "@fontsource-variable/fraunces";
+import "@fontsource-variable/hanken-grotesk";
+import "@fontsource/jetbrains-mono/400.css";
+import "@fontsource/jetbrains-mono/500.css";
+import "../styles/landing.css";
+import "../styles/terminal.css";
+
+const title = "nidus: point it at your files, ask it anything";
+const description =
+  "A search engine for your own data that is itself a single file. Documents, notes, a support archive or a codebase: it finds the passages that answer a question, by meaning or by exact words. The retrieval half of a RAG app, the memory behind an agent, and a plain search box, out of one folder.";
+
+// public/install.sh is copied from the repo root at build time by
+// scripts/copy-install-script.mjs, which is what keeps this one line short.
+const CURL = "curl -fsSL https://nidus.duckedup.org/install.sh | sh";
+const CARGO = "cargo install nidus";
+
+const more = [
+  {
+    cmd: "nidus serve",
+    title: "Run it as a server",
+    body: "Start it on a port and talk to it with fetch. Everything the library does has a URL, and there are JavaScript, Go and Python clients that wrap them.",
+    href: "/guides/http-server/",
+  },
+  {
+    cmd: "nidus mcp",
+    title: "Plug it into your editor",
+    body: "One line registers it with Claude Code, Cursor, or anything else that speaks MCP. Several editors can share one running copy.",
+    href: "/guides/mcp/",
+  },
+  {
+    cmd: "--persistence s3://…",
+    title: "Start local, move it later",
+    body: "The same index works from a folder, from S3, or from Google Cloud Storage. Changing where it lives means changing one URL, not running a migration.",
+    href: "/guides/storage-backends/",
+  },
+  {
+    cmd: "nidus backup",
+    title: "Hard to break",
+    body: "Kill it mid-write and it comes back clean: it loses at most the write that was in flight, and repairs itself when you reopen it. Backing up is copying a folder.",
+    href: "/guides/storage/",
+  },
+  {
+    cmd: "--rerank",
+    title: "Squeeze the top of the list",
+    body: "Cast a wider net, then have a reranker read the query and each candidate together and reorder them. Better answers without scanning more.",
+    href: "/guides/rerank/",
+  },
+  {
+    cmd: "wasm32",
+    title: "Runs in a browser tab",
+    body: "The whole thing compiles to WebAssembly and saves to browser storage. That is what the demo further up this page is running.",
+    href: "/guides/wasm/",
+  },
+];
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="canonical" href="https://nidus.duckedup.org/" />
+    {/* Pick up the theme Starlight stored, before first paint. */}
+    <script is:inline>
+      (() => {
+        const stored = (() => {
+          try {
+            return localStorage.getItem("starlight-theme");
+          } catch {
+            return null;
+          }
+        })();
+        const theme =
+          stored === "light" || stored === "dark"
+            ? stored
+            : window.matchMedia("(prefers-color-scheme: light)").matches
+              ? "light"
+              : "dark";
+        document.documentElement.dataset.theme = theme;
+      })();
+    </script>
+  </head>
+
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+
+    <header class="nav">
+      <div class="wrap nav__in">
+        <a class="nav__brand" href="/">
+          <Image src={nest} alt="" width={38} height={38} loading="eager" />
+          <span>nidus</span>
+        </a>
+        <nav class="nav__links" aria-label="Site">
+          <a href="/getting-started/">Get started</a>
+          <a href="/guides/how-it-works/" data-optional>How it works</a>
+          <a href="/reference/cli/" data-optional>Reference</a>
+          <a href="https://github.com/duckedup/nidus">GitHub</a>
+          <button class="nav__icon" id="theme-toggle" type="button" aria-label="Switch theme">
+            <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+              <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z" />
+            </svg>
+            <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+              <circle cx="12" cy="12" r="4" />
+              <path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4" />
+            </svg>
+          </button>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <!-- ── Hero ─────────────────────────────────────────────────────── -->
+      <div class="wrap">
+        <section class="hero">
+          <div class="hero__copy">
+            <p class="eyebrow" data-lift style="--lift-delay:0.05s">
+              Latin <span aria-hidden="true">·</span> <em>nidus</em>, a nest
+            </p>
+
+            <h1 class="hero__title" data-lift style="--lift-delay:0.12s">
+              Point it at your files. <em>Ask it anything.</em>
+            </h1>
+
+            <p class="hero__lede" data-lift style="--lift-delay:0.2s">
+              nidus is a search engine you run as a single file. Give it documents, notes,
+              a support archive or a codebase, and it finds the passages that answer a
+              question, by meaning or by exact words. <strong>It is the retrieval half of a
+              RAG app, the memory behind an agent, and a plain search box, all out of one
+              folder.</strong>
+            </p>
+
+            <div class="install" data-lift style="--lift-delay:0.28s">
+              <div class="install__tabs">
+                <button class="install__tab" type="button" aria-pressed="true" data-cmd={CURL}>
+                  install script
+                </button>
+                <button class="install__tab" type="button" aria-pressed="false" data-cmd={CARGO}>
+                  cargo
+                </button>
+                <button class="install__copy" type="button">copy</button>
+              </div>
+              <div class="install__row">
+                <span class="install__prompt" aria-hidden="true">$</span>
+                <code class="install__cmd" id="install-cmd">{CURL}</code>
+              </div>
+            </div>
+
+            <p class="hero__alt" data-lift style="--lift-delay:0.34s">
+              No Rust toolchain needed. It also works
+              <a href="/getting-started/">as a Rust library</a>, if you would rather keep
+              the index inside your own program.
+            </p>
+          </div>
+
+          <div class="hero__demo" data-lift style="--lift-delay:0.42s">
+            <Term
+              title="the whole thing, start to finish"
+              cmd={`# read a folder. no key, no model, no network call.
+nidus ingest ./docs --collection docs --dir ./store \\
+  --strategy markdown --fts-only nidus.text
+
+# ask it something the way you would ask a colleague.
+nidus text-search --dir ./store nidus.text -k 3 \\
+  "how do we avoid losing data when the process crashes"`}
+              out={`[
+  { "id": "guides/storage.md#3",
+    "score": 11.747257,
+    "attrs": { "nidus.source_path":
+      { "Str": "guides/storage.md" } } },
+  { "id": "guides/storage.md#0",
+    "score": 11.720629, "attrs": { … } },
+  { "id": "guides/cli-and-server.md#19",
+    "score": 9.665971, "attrs": { … } }
+]`}
+              note="27 markdown files became 758 searchable passages in 0.4 seconds, and the question landed on the durability guide."
+            />
+          </div>
+        </section>
+      </div>
+
+      <!-- ── Spec strip ───────────────────────────────────────────────── -->
+      <div class="spec">
+        <div class="wrap spec__in">
+          <span>nothing running in the background</span>
+          <span>no database to set up</span>
+          <span>no API key to start</span>
+          <span>one folder to back up</span>
+        </div>
+      </div>
+
+      <div class="wrap">
+        <!-- ── 1. RAG: grounding a model in your own data ─────────────── -->
+        <section class="sec" data-reveal>
+          <div class="sec__label">
+            <span class="sec__chip">nidus recall</span>
+            <span class="sec__rule"></span>
+          </div>
+          <div class="sec__body">
+            <div class="sec__prose">
+              <h2>Stop your model guessing. Hand it your data.</h2>
+              <p>
+                A model knows what it was trained on and whatever you paste in. Ask it about
+                your product, your runbooks, or last quarter's tickets and it will invent
+                something that reads perfectly and is wrong.
+              </p>
+              <p>
+                The fix is to look the answer up first and hand the model what you found.
+                That lookup is <strong>the hard half</strong>, and it is the half nidus is:
+                index your content once, ask in plain English, get back the few passages
+                that actually answer it, each with the file it came from.
+              </p>
+              <p>
+                It works with any model and any framework, because what comes back is JSON
+                from a command or an HTTP call. It also remembers: save something worth
+                keeping, find it again weeks later by meaning rather than by filename.
+              </p>
+              <ul class="sec__links">
+                <li><a href="/guides/remember-and-recall/">Saving and recalling</a></li>
+                <li><a href="/guides/ingest/">Indexing a folder</a></li>
+                <li><a href="/guides/http-server/">Over HTTP</a></li>
+              </ul>
+            </div>
+
+            <div class="sec__demo">
+              <Term
+                title="index anything you have"
+                cmd={`nidus ingest ./handbook --collection docs --dir ./store \\
+  --embed-provider voyage`}
+                note="Markdown, PDFs exported to text, notes, transcripts, a support archive. Run it again and it skips every file you have not touched."
+              />
+              <Term
+                title="ask, and get passages back"
+                cmd={`nidus recall docs "what is our refund window" \\
+  --dir ./store --rollup 1 --neighbours 1`}
+                note="--rollup keeps the best passage per document and stitches its neighbours back on, so the model gets something readable instead of three overlapping fragments."
+              />
+              <Term
+                title="or let it be your app's search endpoint"
+                cmd={`nidus serve --dir ./store --embed-provider voyage
+
+curl localhost:8080/collections/docs/recall \\
+  -d '{"query": "what is our refund window"}'`}
+                note="These three need an embedding provider (Voyage, OpenAI, Ollama and others). The run at the top of this page needed none."
+              />
+            </div>
+          </div>
+        </section>
+
+        <!-- ── 2. Code, read as code ──────────────────────────────────── -->
+        <section class="sec" data-reveal>
+          <div class="sec__label">
+            <span class="sec__chip">nidus code ingest</span>
+            <span class="sec__rule"></span>
+          </div>
+          <div class="sec__body">
+            <div class="sec__prose">
+              <h2>And it reads code as code, not as text.</h2>
+              <p>
+                Point it at a repository and it splits by function, struct and trait rather
+                than by character count. Every result is a whole symbol with the lines it
+                lives on, so you land on the thing instead of somewhere near it.
+              </p>
+              <p>
+                That makes it a good lookup table for a coding assistant, which has a hard
+                limit on how much it can hold and blows past it on any real codebase. It
+                asks in plain English, gets back <strong>a file and a line range</strong>,
+                then opens that file for the real text. It can never quote a stale copy,
+                because it was never handed a copy.
+              </p>
+              <p>
+                One line connects it to Claude Code, Cursor, or anything else that speaks
+                MCP (the standard those tools use for plugging in extra abilities).
+              </p>
+              <ul class="sec__links">
+                <li><a href="/guides/code/">Searching a codebase</a></li>
+                <li><a href="/guides/mcp/">Connecting an assistant</a></li>
+              </ul>
+            </div>
+
+            <div class="sec__demo">
+              <Term
+                title="read the repo, then ask it something"
+                cmd={`nidus code ingest . --dir ./store
+
+nidus code search "where do we fsync the write ahead log" \\
+  --dir ./store`}
+                out={`[
+  { "path": "store/write.rs", "language": "rust",
+    "symbols": [
+      { "symbol": "commit", "kind": "function",
+        "start_line": 136, "end_line": 148, "score": 10.09 },
+      { "symbol": "maybe_sync", "kind": "function",
+        "start_line": 109, "end_line": 119, "score": 7.75 }
+    ] }
+]`}
+                note="138 files became 3,403 symbols in 1.7 seconds, with no API key, and it found the two functions that do the work."
+              />
+              <Term
+                title="hand it to your assistant"
+                cmd={`claude mcp add nidus -- nidus mcp --dir ~/.nidus \\
+  --embed-provider voyage --embed-model voyage-4`}
+                note="That is the entire integration. No SDK to install, no glue code to write."
+              />
+            </div>
+          </div>
+        </section>
+
+        <!-- ── 2. Exact words ─────────────────────────────────────────── -->
+        <section class="sec" data-reveal>
+          <div class="sec__label">
+            <span class="sec__chip">nidus text-search</span>
+            <span class="sec__rule"></span>
+          </div>
+          <div class="sec__body">
+            <div class="sec__prose">
+              <h2>Sometimes you know the exact words.</h2>
+              <p>
+                An error code. A ticket number. A function name someone said in standup.
+                Searching by meaning is bad at those, because there is no meaning to match,
+                only a string.
+              </p>
+              <p>
+                So nidus does ordinary keyword search too, ranked the way a good search box
+                ranks things (BM25, the same scoring Elasticsearch uses). Same data, same
+                command, <strong>no model and no API key anywhere near it</strong>. Ask it
+                which words matched and it hands back the fragment with them marked.
+              </p>
+              <ul class="sec__links">
+                <li><a href="/guides/search/">Search and filters</a></li>
+                <li><a href="/guides/ingest/">Indexing a folder</a></li>
+              </ul>
+            </div>
+
+            <div class="sec__demo">
+              <Term
+                title="say which fields are searchable, then search them"
+                cmd={`nidus set-fts-schema --dir ./store docs --field body --field title
+
+nidus text-search --dir ./store body "crash fsync" \\
+  -k 3 --include-attr title`}
+                out={`[
+  {
+    "id": "wal-commit",
+    "score": 1.876369,
+    "attrs": { "title": { "Str": "Write-ahead log" } }
+  }
+]`}
+              />
+              <Term
+                title="show me what matched"
+                cmd={`nidus text-search --dir ./store body "crash" \\
+  --highlight --fragment-chars 60`}
+                out={`"fragments": [
+  { "text": "before commit returns, so a crash loses at most the in",
+    "spans": [[28, 33]] }
+]`}
+                note="Character positions, so you can wrap the match in a <mark> without guessing."
+              />
+            </div>
+          </div>
+        </section>
+
+        <!-- ── 3. Meaning ─────────────────────────────────────────────── -->
+        <section class="sec" data-reveal>
+          <div class="sec__label">
+            <span class="sec__chip">nidus search</span>
+            <span class="sec__rule"></span>
+          </div>
+          <div class="sec__body">
+            <div class="sec__prose">
+              <h2>And sometimes you only know what you meant.</h2>
+              <p>
+                Ask "how do we keep data safe if the process dies" and the right file comes
+                back, even though it uses none of those words. That is the other half of
+                nidus: it compares <strong>meaning rather than spelling</strong> (this is
+                the vector search part, if that is the phrase you came here for).
+              </p>
+              <p>
+                It checks everything by default, which is quick at the size of a project on
+                your laptop and always exactly right. When you outgrow that, one flag
+                switches to a faster index that gives up a sliver of accuracy for a lot of
+                speed, and another scans a compressed copy first and then double-checks the
+                winners at full precision.
+              </p>
+              <p>
+                Filters run <strong>before</strong> anything is ranked, so narrowing a
+                search makes it cheaper rather than more expensive. And one command runs
+                both halves at once and merges the two rankings into a single list.
+              </p>
+              <ul class="sec__links">
+                <li><a href="/guides/how-it-works/">How it works</a></li>
+                <li><a href="/reference/performance/">Speed and memory</a></li>
+              </ul>
+            </div>
+
+            <div class="sec__demo">
+              <Term
+                title="closest matches first"
+                cmd={`echo '[0.9,0.1,0.0]' | nidus search --dir ./store docs \\
+  -k 3 --include-attr title`}
+                out={`[
+  { "id": "wal-commit", "score": 1.0,
+    "attrs": { "title": { "Str": "Write-ahead log" } } },
+  { "id": "compaction", "score": 0.32151973,
+    "attrs": { "title": { "Str": "Compaction" } } },
+  { "id": "hnsw",       "score": 0.13098952,
+    "attrs": { "title": { "Str": "HNSW index" } } }
+]`}
+              />
+              <Term
+                title="faster, smaller, or narrower: one flag each"
+                cmd={`# trade a little accuracy for a lot of speed
+echo '[0.9,0.1,0.0]' | nidus search --dir ./store docs --ann hnsw -k 5
+
+# scan a compressed copy, then check the winners exactly
+echo '[0.9,0.1,0.0]' | nidus search --dir ./store docs \\
+  --quantization int8
+
+# narrow it down before anything is ranked
+echo '[0.9,0.1,0.0]' | nidus search --dir ./store docs \\
+  --where '[{"Eq":["lang",{"Str":"rust"}]}]'`}
+              />
+              <Term
+                title="or run both halves and merge the results"
+                cmd={`echo '[0.9,0.1,0.0]' | nidus hybrid-search --dir ./store \\
+  body "write ahead log" --text-weight 3 -k 5`}
+              />
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- ── 4. Try it here ───────────────────────────────────────────── -->
+      <div class="wrap">
+        <section class="sec" data-reveal>
+          <div class="sec__label">
+            <span class="sec__chip">no install required</span>
+            <span class="sec__rule"></span>
+          </div>
+          <div class="try">
+            <div class="try__copy">
+              <h2>Try it before you install it.</h2>
+              <p>
+                The terminal beside this is nidus itself, compiled to WebAssembly and
+                running in this tab. Type <code>search</code> and a question, or
+                <code>help</code> to see what else it takes.
+              </p>
+              <p class="try__caveat">
+                One honest caveat: no browser ships a language model, so in here the words
+                are turned into numbers by a crude stand-in rather than a real one. The
+                index, the ranking and the scores are the actual thing.
+              </p>
+            </div>
+            <div class="try__demo">
+              <Terminal />
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- ── 5. Where it fits ─────────────────────────────────────────── -->
+      <div class="wrap">
+        <section class="sec" data-reveal>
+          <div class="sec__label">
+            <span class="sec__chip">before you commit to it</span>
+            <span class="sec__rule"></span>
+          </div>
+          <h2 class="fits__title">Where it fits, and where it doesn’t.</h2>
+          <div class="fits">
+            <div class="fits__col">
+              <h3 class="fits__head">Good fit</h3>
+              <ul>
+                <li>A repo, a docs folder, or a pile of notes on your own machine.</li>
+                <li>Giving a coding assistant a way to look through your code.</li>
+                <li>A side project or an internal tool that needs real search.</li>
+                <li>One service that owns its own index and does not want a second thing to operate.</li>
+              </ul>
+            </div>
+            <div class="fits__col">
+              <h3 class="fits__head">Look elsewhere</h3>
+              <ul>
+                <li>Billions of records spread across a cluster.</li>
+                <li>A managed service with somebody else carrying the pager.</li>
+                <li>Anything that should be your primary database. This sits beside one.</li>
+              </ul>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- ── 6. Still one binary ──────────────────────────────────────── -->
+      <div class="wrap">
+        <section class="sec" data-reveal>
+          <div class="sec__label">
+            <span class="sec__chip">nidus --help</span>
+            <span class="sec__rule"></span>
+          </div>
+          <div class="sec__body sec__body--single">
+            <div class="sec__prose">
+              <h2>It is still one binary.</h2>
+              <p>
+                Everything on this page is in the same download. There are no editions, no
+                paid tier and no build flags to get right: the install script, the prebuilt
+                binaries and <code>cargo install nidus</code> all hand you the same file.
+                It is written in Rust with no C libraries underneath, which is why
+                installing it is a download rather than an afternoon.
+              </p>
+            </div>
+          </div>
+
+          <div class="more">
+            {
+              more.map((m) => (
+                <a class="more__item" href={m.href}>
+                  <span class="more__cmd">{m.cmd}</span>
+                  <span class="more__title">{m.title}</span>
+                  <p>{m.body}</p>
+                </a>
+              ))
+            }
+          </div>
+        </section>
+      </div>
+
+      <!-- ── Close ─────────────────────────────────────────────────────── -->
+      <div class="wrap">
+        <section class="end" data-reveal>
+          <Image class="end__mark" src={nest} alt="" width={144} height={144} />
+          <h2>One command, and you’re searching.</h2>
+          <p>
+            No account, nothing to sign up for, nothing left running afterwards. Install
+            it, point it at a folder, ask it something.
+          </p>
+          <div class="install">
+            <div class="install__row">
+              <span class="install__prompt" aria-hidden="true">$</span>
+              <code class="install__cmd">{CURL}</code>
+              <button class="install__copy" data-copy={CURL} type="button">copy</button>
+            </div>
+          </div>
+          <p class="end__links">
+            <a href="/guides/cli-and-server/">Command line tour</a>
+            <a href="/getting-started/">Rust library</a>
+            <a href="https://github.com/duckedup/nidus">Source</a>
+          </p>
+        </section>
+      </div>
+    </main>
+
+    <footer class="foot">
+      <div class="wrap foot__in">
+        <span class="foot__mark">nidus</span>
+        <span class="foot__spacer"></span>
+        <a href="/reference/cli/">CLI reference</a>
+        <a href="/reference/http-api/">HTTP API</a>
+        <a href="https://github.com/duckedup/nidus/blob/main/LICENSE">License</a>
+      </div>
+    </footer>
+
+    <script>
+      // Theme toggle, writing the key Starlight reads so the choice survives the
+      // hop into the docs.
+      const root = document.documentElement;
+      document.getElementById("theme-toggle")?.addEventListener("click", () => {
+        const next = root.dataset.theme === "light" ? "dark" : "light";
+        root.dataset.theme = next;
+        try {
+          localStorage.setItem("starlight-theme", next);
+        } catch {
+          /* private mode: the choice just does not persist */
+        }
+      });
+
+      // Install command: switch between the script and cargo, and copy either.
+      // Plain buttons with aria-pressed, not a tablist: there is no panel to own.
+      const cmdEl = document.getElementById("install-cmd");
+      for (const tab of document.querySelectorAll<HTMLButtonElement>(".install__tab")) {
+        tab.addEventListener("click", () => {
+          for (const t of document.querySelectorAll(".install__tab")) {
+            t.setAttribute("aria-pressed", String(t === tab));
+          }
+          if (cmdEl) cmdEl.textContent = tab.dataset.cmd ?? "";
+        });
+      }
+
+      for (const btn of document.querySelectorAll<HTMLButtonElement>(".install__copy")) {
+        btn.addEventListener("click", async () => {
+          const text =
+            btn.dataset.copy ??
+            btn.closest(".install")?.querySelector(".install__cmd")?.textContent ??
+            "";
+          try {
+            await navigator.clipboard.writeText(text.trim());
+            btn.textContent = "copied";
+            btn.dataset.copied = "1";
+            setTimeout(() => {
+              btn.textContent = "copy";
+              delete btn.dataset.copied;
+            }, 1600);
+          } catch {
+            btn.textContent = "select it";
+            setTimeout(() => (btn.textContent = "copy"), 1600);
+          }
+        });
+      }
+
+      // Reveal sections on scroll. Progressive enhancement: with JS off or
+      // motion reduced, the CSS leaves everything visible.
+      const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const targets = document.querySelectorAll("[data-reveal]");
+      if (reduce || !("IntersectionObserver" in window)) {
+        targets.forEach((el) => el.classList.add("is-visible"));
+      } else {
+        const io = new IntersectionObserver(
+          (entries, obs) => {
+            for (const entry of entries) {
+              if (entry.isIntersecting) {
+                entry.target.classList.add("is-visible");
+                obs.unobserve(entry.target);
+              }
+            }
+          },
+          { rootMargin: "0px 0px -12% 0px", threshold: 0.05 },
+        );
+        targets.forEach((el) => io.observe(el));
+      }
+    </script>
+  </body>
+</html>
