@@ -169,6 +169,15 @@ a {
   border-radius: 3px;
 }
 
+/* Anything scrolled to by an anchor or by scrollIntoView clears the sticky
+   header rather than landing underneath it. */
+:target,
+.sec,
+.term,
+.nd-term {
+  scroll-margin-top: 5.5rem;
+}
+
 .wrap {
   max-width: var(--nd-measure);
   margin-inline: auto;

@@ -115,31 +115,37 @@ async function main() {
     // the badge check would pass for the wrong reason.
     await session.setWindowSize(1280, 900);
 
-    // Start on a docs page, so the first navigation is the one users reported:
-    // a click on the home icon in the header.
-    await session.navigate(`${root}/getting-started/`);
+    // Start on a guides page, and hop to another one in the same sidebar group,
+    // which is expanded there. The navigation under test has to stay *inside*
+    // Starlight: "/" is a standalone landing page outside the router (nidus-e4k),
+    // so the home icon is now an ordinary full page load and cannot reproduce
+    // anything. A sidebar link is the client-side swap the bug lived in.
+    await session.navigate(`${root}/guides/how-it-works/`);
     await waitFor(() => session.findElement("site-search").catch(() => null), {
       timeoutMs: 15000,
       label: "the header search element on first load",
     });
     await session.execute(INSTALL_ERROR_TRAP);
 
-    step("clicking the home icon");
-    await clickUntilAt(session, "header a.site-title", "/", "the site logo");
+    step("clicking a sidebar link");
+    await clickUntilAt(
+      session,
+      'a.nd-link[href="/guides/search/"]',
+      "/guides/search/",
+      "the sidebar link",
+    );
     await waitFor(() => session.execute(SEARCH_BUTTON_READY), {
       timeoutMs: 10000,
-      label: "the header to settle on the home page",
+      label: "the header to settle after the sidebar navigation",
     });
 
-    // And back into the docs, so the assertions below cover a round trip rather
-    // than only the splash page. Back is a client-side navigation too (Astro
-    // handles popstate), and unlike a link in the page body it cannot be
-    // knocked out of reach by the splash layout.
-    step("navigating back into the docs");
+    // And back, so the assertions below cover a round trip rather than a single
+    // hop. Back is a client-side navigation too (Astro handles popstate).
+    step("navigating back");
     await session.back();
     await waitFor(
-      async () => new URL(await session.currentUrl()).pathname === "/getting-started/",
-      { timeoutMs: 10000, label: "the getting-started page after navigating back" },
+      async () => new URL(await session.currentUrl()).pathname === "/guides/how-it-works/",
+      { timeoutMs: 10000, label: "the how-it-works page after navigating back" },
     );
     await waitFor(() => session.execute(SEARCH_BUTTON_READY), {
       timeoutMs: 10000,
