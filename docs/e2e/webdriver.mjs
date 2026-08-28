@@ -183,6 +183,29 @@ class Session {
     return this.call("POST", `${this.base}/element/${el}/click`, {});
   }
 
+  /**
+   * Click an element after centring what `selector` matches in the viewport.
+   *
+   * The driver's own click scrolls the element only just into view, which on a
+   * page with a `position: sticky` header parks it underneath that header and
+   * gets the click intercepted ("Element is not clickable at point"). Centring
+   * first is what a person does without thinking about it, and the click itself
+   * stays a real driver click rather than a dispatched event.
+   *
+   * Scrolling by selector rather than by element handle keeps the script's only
+   * argument a string, so there is no element-reference encoding to get wrong on
+   * one driver and right on another. `behavior: "instant"` is load-bearing: the
+   * page sets `scroll-behavior: smooth`, and the driver would otherwise click
+   * where the element was before the animation started.
+   */
+  async clickInView(el, selector) {
+    await this.execute(
+      "document.querySelector(arguments[0])?.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }); return true;",
+      [selector],
+    );
+    return this.click(el);
+  }
+
   sendKeys(el, text) {
     return this.call("POST", `${this.base}/element/${el}/value`, { text });
   }

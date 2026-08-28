@@ -43,7 +43,7 @@ async function main() {
       timeoutMs: 15000,
       label: "#nd-term-run to appear",
     });
-    await session.click(runBtn);
+    await session.clickInView(runBtn, "#nd-term-run");
 
     // The wasm module is ~485 KB plus compile; give it a generous budget on a shared runner.
     const modeEl = await waitFor(() => session.findElement("#nd-term-mode"), {
@@ -58,7 +58,7 @@ async function main() {
       timeoutMs: 5000,
       label: "#nd-term-input to appear after boot",
     });
-    await session.click(inputEl);
+    await session.clickInView(inputEl, "#nd-term-input");
     const enterKey = String.fromCharCode(0xe007); // WebDriver's normalized "Enter" key value
     await session.sendKeys(inputEl, `search ${QUERY}${enterKey}`);
 
@@ -103,7 +103,7 @@ async function main() {
 
     // `similar <id>` searches by a stored record's own vector, and must never return
     // that record: an off-by-one in the exclusion would silently make it hit #1.
-    await session.click(inputEl);
+    await session.clickInView(inputEl, "#nd-term-input");
     await session.sendKeys(inputEl, `similar ${EXPECTED_TOP}${enterKey}`);
     const simRows = await waitFor(
       async () => {
@@ -128,7 +128,7 @@ async function main() {
         timeoutMs: 15000,
         label: "#nd-term-run after reload",
       });
-      await session.click(runAgain);
+      await session.clickInView(runAgain, "#nd-term-run");
       const restoredEl = await waitFor(
         () => session.findElement(".nd-term__restored").catch(() => null),
         { timeoutMs: 35000, label: ".nd-term__restored after reload (persistence)" },
