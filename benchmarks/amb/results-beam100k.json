@@ -1,0 +1,36 @@
+[
+  {
+    "dataset": "beam",
+    "split": "100k",
+    "provider": "bm25",
+    "k": 10,
+    "queries": 100,
+    "documents": 30,
+    "corpus_tokens": 576120,
+    "ingest_s": 0.25,
+    "ingest_docs_per_s": 118.4,
+    "hit_at_k": 0.0,
+    "recall_at_k": 0.0,
+    "mrr": 0.0,
+    "retrieve_p50_ms": 8.4,
+    "retrieve_p95_ms": 9.0,
+    "avg_context_tokens": 5109.0
+  },
+  {
+    "dataset": "beam",
+    "split": "100k",
+    "provider": "nidus-fts",
+    "k": 10,
+    "queries": 100,
+    "documents": 30,
+    "corpus_tokens": 576120,
+    "ingest_s": 0.29,
+    "ingest_docs_per_s": 104.0,
+    "hit_at_k": 0.0,
+    "recall_at_k": 0.0,
+    "mrr": 0.0,
+    "retrieve_p50_ms": 0.4,
+    "retrieve_p95_ms": 0.5,
+    "avg_context_tokens": 5101.0
+  }
+]

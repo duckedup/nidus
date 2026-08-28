@@ -1,0 +1,36 @@
+[
+  {
+    "dataset": "longmemeval",
+    "split": "s",
+    "provider": "bm25",
+    "k": 10,
+    "queries": 479,
+    "documents": 23867,
+    "corpus_tokens": 56624220,
+    "ingest_s": 15.34,
+    "ingest_docs_per_s": 1555.9,
+    "hit_at_k": 0.9228,
+    "recall_at_k": 0.8618,
+    "mrr": 0.8058,
+    "retrieve_p50_ms": 12.4,
+    "retrieve_p95_ms": 13.2,
+    "avg_context_tokens": 4943.0
+  },
+  {
+    "dataset": "longmemeval",
+    "split": "s",
+    "provider": "nidus-fts",
+    "k": 10,
+    "queries": 479,
+    "documents": 23867,
+    "corpus_tokens": 56624220,
+    "ingest_s": 27.34,
+    "ingest_docs_per_s": 872.9,
+    "hit_at_k": 0.9791,
+    "recall_at_k": 0.9504,
+    "mrr": 0.9073,
+    "retrieve_p50_ms": 13.8,
+    "retrieve_p95_ms": 29.4,
+    "avg_context_tokens": 4887.0
+  }
+]

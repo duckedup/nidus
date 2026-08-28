@@ -1,0 +1,36 @@
+[
+  {
+    "dataset": "locomo",
+    "split": "locomo10",
+    "provider": "bm25",
+    "k": 10,
+    "queries": 197,
+    "documents": 272,
+    "corpus_tokens": 379721,
+    "ingest_s": 0.13,
+    "ingest_docs_per_s": 2063.9,
+    "hit_at_k": 0.8731,
+    "recall_at_k": 0.814,
+    "mrr": 0.5496,
+    "retrieve_p50_ms": 2.0,
+    "retrieve_p95_ms": 2.1,
+    "avg_context_tokens": 4854.0
+  },
+  {
+    "dataset": "locomo",
+    "split": "locomo10",
+    "provider": "nidus-fts",
+    "k": 10,
+    "queries": 197,
+    "documents": 272,
+    "corpus_tokens": 379721,
+    "ingest_s": 0.15,
+    "ingest_docs_per_s": 1792.8,
+    "hit_at_k": 0.9848,
+    "recall_at_k": 0.9447,
+    "mrr": 0.8223,
+    "retrieve_p50_ms": 0.3,
+    "retrieve_p95_ms": 0.4,
+    "avg_context_tokens": 4680.0
+  }
+]

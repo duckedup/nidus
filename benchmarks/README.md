@@ -144,3 +144,12 @@ take roughly a minute and a half.
 The shape to watch: `on_flush` is flat across batch size (no per-call barrier since
 `nidus-4h2`), while `per_batch` scales with the number of calls. Group commit should pull
 `per_batch` toward `on_flush`.
+
+## Also here: the Agent Memory Benchmark
+
+`amb/` is a separate, Python-side harness that runs nidus against
+[AMB](https://github.com/vectorize-io/agent-memory-benchmark), the agent-memory leaderboard
+(personamem, locomo, longmemeval, lifebench, beam, sdebench). It ships three AMB memory
+providers driving a real `nidus serve`, plus a retrieval-only scorer that measures recall@k
+against AMB's gold document ids with no LLM and no API spend. See `amb/README.md`; the work
+is tracked under epic `nidus-7d5`.
