@@ -4518,7 +4518,7 @@ mod memory_tests {
     pub(super) const DIM: usize = 3;
 
     /// A multi-connection HTTP/1.1 mock: accepts forever on a background thread, drains each
-    /// request, and replies with `EMBED_BODY`. Unlike the one-shot `embed::testutil` mock, it
+    /// request, and replies with `EMBED_BODY`. Unlike the one-shot `http::mock`, it
     /// survives the several calls a remember→recall flow makes; `pub(super)` for `rerank_tests`.
     pub(super) fn spawn_embed_mock() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
@@ -4882,7 +4882,7 @@ mod memory_tests {
 #[cfg(all(test, feature = "rerank-voyage"))]
 mod rerank_tests {
     use super::*;
-    use crate::rerank::testutil::mock_once;
+    use crate::http::mock::mock_once;
     use crate::rerank::{AnyReranker, RerankConfig, RerankProvider};
     use axum::body::{Body, to_bytes};
     use axum::http::Request;

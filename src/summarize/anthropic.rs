@@ -119,7 +119,7 @@ fn extract_text(resp: &MessagesResponse) -> Result<String, SummarizeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::summarize::test_server::serve_once;
+    use crate::http::mock::mock_once;
 
     // ── Response parsing ──────────────────────────────────────────────
 
@@ -189,10 +189,11 @@ mod tests {
 
     #[tokio::test]
     async fn summarize_sends_correct_request_and_parses_response() {
-        let (base, rx) = serve_once(
+        let server = mock_once(
             200,
             r#"{"content":[{"type":"text","text":"a dense summary"}]}"#,
         );
+        let base = server.base_url.clone();
         let s = AnthropicSummarizer::new(
             SummarizeConfig::new("claude-haiku-4-5-20251001")
                 .api_key("secret-key")
@@ -212,7 +213,7 @@ mod tests {
             .unwrap();
         assert_eq!(out, "a dense summary");
 
-        let req = rx.recv().unwrap();
+        let req = server.captured();
         assert!(req.head.starts_with("POST /v1/messages"));
         assert!(
             req.head
@@ -234,7 +235,8 @@ mod tests {
     #[tokio::test]
     async fn non_success_status_maps_to_api_error() {
         // 400 is non-retryable, so this returns immediately (no backoff wait).
-        let (base, _rx) = serve_once(400, r#"{"error":{"message":"bad request"}}"#);
+        let server = mock_once(400, r#"{"error":{"message":"bad request"}}"#);
+        let base = server.base_url.clone();
         let s =
             AnthropicSummarizer::new(SummarizeConfig::new("claude").api_key("k").base_url(base))
                 .unwrap();

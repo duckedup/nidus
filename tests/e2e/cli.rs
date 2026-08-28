@@ -4,66 +4,13 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
 
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde_json::{Value, json};
 
-/// Run the binary with `args`, feeding `stdin` and capturing both streams. `NIDUS_*` is
-/// stripped for the same reason the HTTP harness strips it: an inherited env var is a
-/// flag default here, so it would silently override the flag under test.
-fn run(args: &[&str], stdin: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nidus"))
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear()
-        .envs(std::env::vars().filter(|(k, _)| !k.starts_with("NIDUS_")))
-        .spawn()
-        .unwrap_or_else(|e| panic!("spawn nidus {args:?}: {e}"));
-    child
-        .stdin
-        .take()
-        .expect("stdin piped")
-        .write_all(stdin.as_bytes())
-        .unwrap_or_else(|e| panic!("write stdin for {args:?}: {e}"));
-    child
-        .wait_with_output()
-        .unwrap_or_else(|e| panic!("wait for nidus {args:?}: {e}"))
-}
-
-/// Run a command that must succeed, returning its stdout parsed as JSON. Parsing rather
-/// than substring-matching is the point: it fails on a malformed document, not just a
-/// changed one.
-fn ok(args: &[&str], stdin: &str) -> Value {
-    let out = run(args, stdin);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "nidus {args:?} exited {:?}\n--- stderr ---\n{stderr}",
-        out.status.code()
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(&stdout).unwrap_or_else(|e| {
-        panic!("nidus {args:?} printed non-JSON: {e}\n--- stdout ---\n{stdout}")
-    })
-}
-
-/// Run a command that must fail, returning its stderr. Also asserts nothing was printed
-/// to stdout — a failing command that emits half a JSON document would poison a pipeline.
-fn fails(args: &[&str], stdin: &str) -> String {
-    let out = run(args, stdin);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        !out.status.success(),
-        "nidus {args:?} unexpectedly succeeded\n--- stdout ---\n{stdout}"
-    );
-    assert!(stdout.trim().is_empty(), "wrote to stdout: {stdout}");
-    String::from_utf8_lossy(&out.stderr).into_owned()
-}
+use crate::harness::{fails, ok, run};
 
 /// Flip one byte of `path` at `offset`, in place. Used to corrupt an archive at a
 /// chosen position rather than a random one, so a failing assertion reproduces.

@@ -6,37 +6,10 @@
 #![cfg(feature = "memory")]
 
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
 
-/// The binary with a cleared environment: no `NIDUS_EMBED_PROVIDER`, no key, nothing a
-/// developer's shell might be exporting. A test that inherited those would pass here and
-/// fail in CI, proving nothing about the no-provider path.
-fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_nidus"))
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear()
-        .envs(std::env::vars().filter(|(k, _)| !k.starts_with("NIDUS_")))
-        .output()
-        .unwrap_or_else(|e| panic!("spawn nidus {args:?}: {e}"))
-}
-
-fn ok_json(args: &[&str]) -> Value {
-    let out = run(args);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "nidus {args:?} exited {:?}\n--- stderr ---\n{stderr}",
-        out.status.code()
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("nidus {args:?} stdout is not JSON ({e}):\n{stdout}"))
-}
+use crate::harness::{ok_json, run_no_stdin};
 
 /// One `--fts-only` ingest over `corpus` into `store`. No `--dim` and no `--embed-*`: the
 /// store is created by this call, and the flags it is *not* given are the point.
@@ -182,7 +155,7 @@ fn a_vector_query_against_an_fts_only_store_is_refused_with_the_reason() {
     // JSON parsing before the store is ever consulted — passing the test for the wrong reason.
     let query = tmp.path().join("query.json");
     write(&query, "[0.1, 0.2, 0.3]");
-    let out = run(&[
+    let out = run_no_stdin(&[
         "search",
         "--dir",
         &store.to_string_lossy(),
@@ -311,7 +284,7 @@ fn fts_only_and_an_embed_provider_conflict_at_parse_time() {
     let (store, docs) = (tmp.path().join("store"), tmp.path().join("docs"));
     corpus(&docs);
 
-    let out = run(&[
+    let out = run_no_stdin(&[
         "ingest",
         &docs.to_string_lossy(),
         "--collection",

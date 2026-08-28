@@ -4,12 +4,11 @@
 
 #![cfg(feature = "embed-ollama")]
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 
 use serde_json::{Value, json};
 
-use crate::harness::Server;
+use crate::harness::{Server, respond_once};
 
 use super::{call, mcp, result, text};
 
@@ -21,8 +20,7 @@ fn fixed_vector() -> Vec<f32> {
 }
 
 /// A persistent mock answering every request with [`fixed_vector`] in Ollama's wire shape
-/// (`{"embeddings": [[...]]}`) — needs no API key. Duplicated from `stdio::round_trip`
-/// rather than shared: that is a sibling test module, not something the harness exposes.
+/// (`{"embeddings": [[...]]}`) — needs no API key.
 fn mock_embedder() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock embedder");
     let addr = listener.local_addr().expect("mock embedder addr");
@@ -50,45 +48,6 @@ fn mock_summarizer(summary: &'static str) -> String {
         }
     });
     format!("http://{addr}")
-}
-
-/// Drain one HTTP/1.1 request (headers + `Content-Length` body) and answer it with `body` —
-/// enough of the protocol for `reqwest` to round-trip, nothing more.
-fn respond_once(mut stream: TcpStream, body: &str) {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 1024];
-    let header_end = loop {
-        let n = stream.read(&mut tmp).unwrap_or(0);
-        if n == 0 {
-            return;
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
-        }
-    };
-    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-    let content_length: usize = head
-        .lines()
-        .find_map(|l| {
-            let l = l.to_ascii_lowercase();
-            l.strip_prefix("content-length:")
-                .map(|v| v.trim().parse().unwrap_or(0))
-        })
-        .unwrap_or(0);
-    while buf.len() < header_end + content_length {
-        let n = stream.read(&mut tmp).unwrap_or(0);
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&tmp[..n]);
-    }
-    let response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = stream.write_all(response.as_bytes());
 }
 
 /// A server with a working (mock) embedder, over a fresh store directory.

@@ -5,13 +5,14 @@
 
 #![cfg(feature = "embed-ollama")]
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
+
+use crate::harness::{ok_json, read_request_body, run_no_stdin};
 
 const DIM: usize = 8;
 /// The ollama adapter embeds this literal once per process to learn its own dimension
@@ -72,38 +73,6 @@ fn vector_for(text: &str) -> Vec<f32> {
     v
 }
 
-fn read_request_body(stream: &mut TcpStream) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 1024];
-    let header_end = loop {
-        let n = stream.read(&mut tmp).unwrap_or(0);
-        if n == 0 {
-            return Vec::new();
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
-        }
-    };
-    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-    let content_length: usize = head
-        .lines()
-        .find_map(|l| {
-            let l = l.to_ascii_lowercase();
-            l.strip_prefix("content-length:")
-                .map(|v| v.trim().parse().unwrap_or(0))
-        })
-        .unwrap_or(0);
-    while buf.len() < header_end + content_length {
-        let n = stream.read(&mut tmp).unwrap_or(0);
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&tmp[..n]);
-    }
-    buf[header_end..].to_vec()
-}
-
 fn write_json_response(mut stream: TcpStream, body: &str) {
     let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -119,33 +88,6 @@ fn requested_text(body: &[u8]) -> String {
         .ok()
         .and_then(|v| v["input"].as_str().map(str::to_string))
         .unwrap_or_default()
-}
-
-/// `NIDUS_*` is stripped for the reason the other suites strip it: an inherited env var is a
-/// flag default here, so it would silently override the flag under test.
-fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_nidus"))
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear()
-        .envs(std::env::vars().filter(|(k, _)| !k.starts_with("NIDUS_")))
-        .output()
-        .unwrap_or_else(|e| panic!("spawn nidus {args:?}: {e}"))
-}
-
-fn ok_json(args: &[&str]) -> Value {
-    let out = run(args);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "nidus {args:?} exited {:?}\n--- stderr ---\n{stderr}",
-        out.status.code()
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("nidus {args:?} stdout is not JSON ({e}):\n{stdout}"))
 }
 
 /// One ingest invocation over `corpus` into `store`, plus whatever extra flags a test needs.
@@ -542,7 +484,7 @@ fn a_model_swap_into_an_existing_collection_is_refused() {
     let before = ids(&store);
 
     let (store_s, corpus_s) = (store.to_string_lossy(), corpus.to_string_lossy());
-    let out = run(&[
+    let out = run_no_stdin(&[
         "ingest",
         &corpus_s,
         "--collection",

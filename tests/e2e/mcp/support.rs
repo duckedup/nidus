@@ -4,12 +4,12 @@
 
 #![cfg(feature = "embed-ollama")]
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 
 use serde_json::{Value, json};
 
-use crate::harness::Server;
+use crate::harness::{Server, read_request_body};
 
 /// The dimension the mcp e2e suites use (shared with `memory_http.rs`).
 pub(crate) const DIM: usize = 3;
@@ -28,39 +28,6 @@ pub(crate) fn vector_for(text: &str, dim: usize) -> Vec<f32> {
 /// reproduced here so a test can opt into the collide-everything behaviour on purpose.
 pub(super) fn fixed_vector(dim: usize) -> Vec<f32> {
     (0..dim).map(|i| (i + 1) as f32 * 0.1).collect()
-}
-
-/// Drain one HTTP/1.1 request (headers + `Content-Length` body) and return the body bytes.
-fn read_request_body(stream: &mut TcpStream) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 1024];
-    let header_end = loop {
-        let n = stream.read(&mut tmp).unwrap_or(0);
-        if n == 0 {
-            return Vec::new();
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
-        }
-    };
-    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-    let content_length: usize = head
-        .lines()
-        .find_map(|l| {
-            let l = l.to_ascii_lowercase();
-            l.strip_prefix("content-length:")
-                .map(|v| v.trim().parse().unwrap_or(0))
-        })
-        .unwrap_or(0);
-    while buf.len() < header_end + content_length {
-        let n = stream.read(&mut tmp).unwrap_or(0);
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&tmp[..n]);
-    }
-    buf[header_end..].to_vec()
 }
 
 /// Answer one request with `body` as a `200 application/json` response.

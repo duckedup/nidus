@@ -108,8 +108,8 @@ struct EmbedResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::super::testutil::mock_once;
     use super::*;
+    use crate::http::mock::mock_once;
 
     #[test]
     fn response_parsing() {

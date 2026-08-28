@@ -4,33 +4,7 @@
 
 use serde_json::{Value, json};
 
-use crate::harness::{RunningServer, Server};
-
-/// `PUT` and `DELETE` against a running server. The harness wraps GET and POST; these two
-/// verbs reach only the collection admin routes, so they live beside their tests.
-fn send(server: &RunningServer, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
-    let agent = ureq::Agent::new_with_config(
-        ureq::config::Config::builder()
-            .http_status_as_error(false)
-            .build(),
-    );
-    let url = format!("{}{path}", server.base_url());
-    let res = match (method, body) {
-        ("PUT", Some(b)) => agent
-            .put(&url)
-            .header("content-type", "application/json")
-            .send(&serde_json::to_vec(b).expect("serialise body")),
-        ("DELETE", None) => agent.delete(&url).call(),
-        _ => panic!("unsupported {method} {path}"),
-    }
-    .unwrap_or_else(|e| panic!("{method} {path}: {e}\n--- stderr ---\n{}", server.stderr()));
-    let status = res.status().as_u16();
-    let bytes = res.into_body().read_to_vec().expect("read body");
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
-}
+use crate::harness::{Server, send};
 
 /// Two orthogonal unit vectors plus attrs, the shape the other suites reuse.
 fn records() -> Value {

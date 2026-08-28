@@ -115,8 +115,8 @@ impl Embedder for OpenAiCompatEmbedder {
 
 #[cfg(test)]
 mod tests {
-    use super::super::testutil::mock_once;
     use super::*;
+    use crate::http::mock::mock_once;
 
     #[tokio::test]
     async fn requires_base_url() {

@@ -1051,7 +1051,7 @@ mod tests {
     #[tokio::test]
     async fn recall_with_rerank_changes_the_order() {
         use crate::embed::{AnyEmbedder, EmbedConfig, EmbedProvider};
-        use crate::rerank::testutil::mock_once;
+        use crate::http::mock::mock_once;
         use crate::rerank::{AnyReranker, RerankConfig, RerankProvider};
 
         const INVERTING_SCORES: &str = r#"{"data":[{"index":0,"relevance_score":0.1},
@@ -1131,7 +1131,7 @@ mod tests {
     #[tokio::test]
     async fn a_reranked_recall_still_reinforces() {
         use crate::embed::{AnyEmbedder, EmbedConfig, EmbedProvider};
-        use crate::rerank::testutil::mock_once;
+        use crate::http::mock::mock_once;
         use crate::rerank::{AnyReranker, RerankConfig, RerankProvider};
 
         const SCORES: &str = r#"{"data":[{"index":0,"relevance_score":0.9},

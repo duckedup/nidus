@@ -122,8 +122,8 @@ fn validate_output_dimension(model: &str, d: usize) -> Result<usize, EmbedError>
 
 #[cfg(test)]
 mod tests {
-    use super::super::testutil::mock_once;
     use super::*;
+    use crate::http::mock::mock_once;
 
     #[test]
     fn dimension_lookup() {
