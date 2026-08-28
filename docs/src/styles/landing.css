@@ -629,8 +629,14 @@ h2 {
   border-color: var(--nd-teal-bright);
 }
 
-.sec__demo > * + * {
-  margin-top: 1rem;
+/* `gap`, not sibling margins: `.term` below resets `margin: 0` at the same
+   specificity and later in the file, so a margin-top here loses the tie. */
+.sec__demo {
+  display: grid;
+  /* minmax(0, …) so a long unwrapped command shrinks the track instead of
+     widening it, the same reason every other grid on this page spells it out. */
+  grid-template-columns: minmax(0, 1fr);
+  gap: 1rem;
 }
 
 /* ── Terminal panel (Term.astro) ────────────────────────────────────────── */
