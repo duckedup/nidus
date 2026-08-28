@@ -165,3 +165,122 @@ mod tests {
         assert!((srv.retryable)(500));
     }
 }
+
+// ── Test-only in-process mock HTTP server, shared by adapter wire tests ──────
+
+#[cfg(all(
+    test,
+    any(
+        feature = "embed-voyage",
+        feature = "embed-openai",
+        feature = "embed-ollama",
+        feature = "embed-cohere",
+        feature = "embed-gemini",
+        feature = "embed-mistral",
+        feature = "embed-jina",
+        feature = "embed-openai-compat",
+        feature = "rerank-voyage",
+        feature = "rerank-cohere",
+        feature = "summarize-anthropic",
+        feature = "summarize-openai",
+    )
+))]
+pub(crate) mod mock {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
+    /// What the mock captured about the single request it served.
+    #[allow(dead_code)]
+    pub struct Captured {
+        pub method: String,
+        pub path: String,
+        pub head: String,
+        pub body: String,
+    }
+
+    /// A one-shot HTTP/1.1 server: accepts exactly one connection, replies with
+    /// `status`/`resp_body`, and lets the test read back the request it saw.
+    pub struct MockServer {
+        pub base_url: String,
+        rx: mpsc::Receiver<Captured>,
+    }
+
+    impl MockServer {
+        /// Block until the request has been served and return what it captured.
+        pub fn captured(self) -> Captured {
+            self.rx.recv().expect("mock server captured a request")
+        }
+    }
+
+    /// Spin a one-shot mock returning `status` with JSON `resp_body`.
+    pub fn mock_once(status: u16, resp_body: &str) -> MockServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server addr");
+        let base_url = format!("http://{addr}");
+        let (tx, rx) = mpsc::channel();
+        let resp_body = resp_body.to_string();
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock connection");
+
+            // Read headers, then the Content-Length body.
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            let header_end = loop {
+                let n = stream.read(&mut tmp).expect("read request");
+                if n == 0 {
+                    break buf.len();
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..header_end.min(buf.len())]).to_string();
+            let content_length = head
+                .lines()
+                .find_map(|l| {
+                    let l = l.to_ascii_lowercase();
+                    l.strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            while buf.len() < header_end + content_length {
+                let n = stream.read(&mut tmp).expect("read body");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+
+            let mut lines = head.lines();
+            let request_line = lines.next().unwrap_or("");
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or("").to_string();
+            let path = parts.next().unwrap_or("").to_string();
+            let body = String::from_utf8_lossy(&buf[header_end.min(buf.len())..]).to_string();
+
+            let response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = tx.send(Captured {
+                method,
+                path,
+                head,
+                body,
+            });
+        });
+
+        MockServer { base_url, rx }
+    }
+
+    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+}

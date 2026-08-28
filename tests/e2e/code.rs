@@ -6,37 +6,10 @@
 #![cfg(all(feature = "memory", feature = "code"))]
 
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
 
-/// The binary with a cleared environment, same rationale as `ingest_fts.rs`: a leaked
-/// `NIDUS_EMBED_PROVIDER` from a developer's shell would silently switch the code path
-/// this file exists to prove (no provider, no network).
-fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_nidus"))
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear()
-        .envs(std::env::vars().filter(|(k, _)| !k.starts_with("NIDUS_")))
-        .output()
-        .unwrap_or_else(|e| panic!("spawn nidus {args:?}: {e}"))
-}
-
-fn ok_json(args: &[&str]) -> Value {
-    let out = run(args);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "nidus {args:?} exited {:?}\n--- stderr ---\n{stderr}",
-        out.status.code()
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("nidus {args:?} stdout is not JSON ({e}):\n{stdout}"))
-}
+use crate::harness::{ok_json, run_no_stdin};
 
 fn code_ingest(store: &Path, root: &Path) -> Value {
     let (store, root) = (store.to_string_lossy(), root.to_string_lossy());
@@ -142,7 +115,7 @@ fn code_search_never_prints_source() {
     corpus(&root);
     code_ingest(&store, &root);
 
-    let out = run(&[
+    let out = run_no_stdin(&[
         "code",
         "search",
         "zorbatronic",
@@ -166,7 +139,7 @@ fn code_search_vector_with_no_embedder_is_refused() {
     corpus(&root);
     code_ingest(&store, &root);
 
-    let out = run(&[
+    let out = run_no_stdin(&[
         "code",
         "search",
         "zorbatronic",
@@ -280,7 +253,7 @@ fn summarize_embeds_the_summary_and_stores_it_beside_the_body() {
             .to_string()
     });
 
-    let out = run(&[
+    let out = run_no_stdin(&[
         "code",
         "ingest",
         root.to_str().expect("root"),
@@ -367,7 +340,7 @@ fn a_file_the_summarize_budget_cannot_cover_is_embedded_raw_and_reported() {
             .to_string()
     });
 
-    let out = run(&[
+    let out = run_no_stdin(&[
         "code",
         "ingest",
         root.to_str().expect("root"),

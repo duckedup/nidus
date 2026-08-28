@@ -2,60 +2,9 @@
 //! reasoned-about correctness anchor (IVF with `n_probe == n_lists` visits every row) rather
 //! than "the command exited 0 and printed JSON" (nidus-sk9).
 
-use std::io::Write;
-use std::process::{Command, Output, Stdio};
-
 use serde_json::{Value, json};
 
-/// Mirrors `cli.rs`'s helper (copied, not shared — each e2e suite stands alone). Strips
-/// `NIDUS_*` so an inherited env var can't silently override the flag under test.
-fn run(args: &[&str], stdin: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nidus"))
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear()
-        .envs(std::env::vars().filter(|(k, _)| !k.starts_with("NIDUS_")))
-        .spawn()
-        .unwrap_or_else(|e| panic!("spawn nidus {args:?}: {e}"));
-    child
-        .stdin
-        .take()
-        .expect("stdin piped")
-        .write_all(stdin.as_bytes())
-        .unwrap_or_else(|e| panic!("write stdin for {args:?}: {e}"));
-    child
-        .wait_with_output()
-        .unwrap_or_else(|e| panic!("wait for nidus {args:?}: {e}"))
-}
-
-/// Run a command that must succeed, returning its stdout parsed as JSON.
-fn ok(args: &[&str], stdin: &str) -> Value {
-    let out = run(args, stdin);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "nidus {args:?} exited {:?}\n--- stderr ---\n{stderr}",
-        out.status.code()
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(&stdout).unwrap_or_else(|e| {
-        panic!("nidus {args:?} printed non-JSON: {e}\n--- stdout ---\n{stdout}")
-    })
-}
-
-/// Run a command that must fail, returning its stderr.
-fn fails(args: &[&str], stdin: &str) -> String {
-    let out = run(args, stdin);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        !out.status.success(),
-        "nidus {args:?} unexpectedly succeeded\n--- stdout ---\n{stdout}"
-    );
-    assert!(stdout.trim().is_empty(), "wrote to stdout: {stdout}");
-    String::from_utf8_lossy(&out.stderr).into_owned()
-}
+use crate::harness::{fails, ok};
 
 /// Deterministic vectors without a PRNG dependency: SplitMix64, same approach as
 /// `scale.rs`'s `Rng` (kept local — e2e suites don't reach into the library's internals).

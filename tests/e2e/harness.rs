@@ -1,10 +1,9 @@
 //! Spawn a real `nidus serve` and talk to it over HTTP, or a real `nidus mcp` and talk to
 //! it over stdio.
 
-#[cfg(feature = "mcp")]
-use std::io::Write;
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::process::{Child, Command, Output, Stdio};
 #[cfg(feature = "mcp")]
 use std::process::{ChildStdin, ChildStdout};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
@@ -416,6 +415,204 @@ fn read(res: ureq::http::Response<ureq::Body>, path: &str, stderr: &str) -> (u16
         .read_to_vec()
         .unwrap_or_else(|e| panic!("read body of {path}: {e}\n--- server stderr ---\n{stderr}"));
     (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+// ── CLI runner (`nidus <args>`) ──────────────────────────────────────────────
+
+/// Run the binary with `args`, feeding `stdin` and capturing both streams. `NIDUS_*` is
+/// stripped for the same reason the HTTP harness strips it: an inherited env var is a
+/// flag default here, so it would silently override the flag under test.
+pub fn run(args: &[&str], stdin: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nidus"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_clear()
+        .envs(std::env::vars().filter(|(k, _)| !k.starts_with("NIDUS_")))
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn nidus {args:?}: {e}"));
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(stdin.as_bytes())
+        .unwrap_or_else(|e| panic!("write stdin for {args:?}: {e}"));
+    child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait for nidus {args:?}: {e}"))
+}
+
+/// Run a command that must succeed, returning its stdout parsed as JSON. Parsing rather
+/// than substring-matching is the point: it fails on a malformed document, not just a
+/// changed one.
+pub fn ok(args: &[&str], stdin: &str) -> Value {
+    let out = run(args, stdin);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "nidus {args:?} exited {:?}\n--- stderr ---\n{stderr}",
+        out.status.code()
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("nidus {args:?} printed non-JSON: {e}\n--- stdout ---\n{stdout}")
+    })
+}
+
+/// Run a command that must fail, returning its stderr. Also asserts nothing was printed
+/// to stdout — a failing command that emits half a JSON document would poison a pipeline.
+pub fn fails(args: &[&str], stdin: &str) -> String {
+    let out = run(args, stdin);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "nidus {args:?} unexpectedly succeeded\n--- stdout ---\n{stdout}"
+    );
+    assert!(stdout.trim().is_empty(), "wrote to stdout: {stdout}");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// The stdin-less counterpart of [`run`]: `Stdio::null()` rather than piping and writing
+/// an empty string. Kept as its own shape rather than folded into `run` — unreferenced
+/// under a feature set with no stdin-less caller.
+#[allow(dead_code)]
+pub fn run_no_stdin(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_nidus"))
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_clear()
+        .envs(std::env::vars().filter(|(k, _)| !k.starts_with("NIDUS_")))
+        .output()
+        .unwrap_or_else(|e| panic!("spawn nidus {args:?}: {e}"))
+}
+
+/// [`run_no_stdin`]'s success case, parsed as JSON — unreferenced under a feature set
+/// with no stdin-less caller.
+#[allow(dead_code)]
+pub fn ok_json(args: &[&str]) -> Value {
+    let out = run_no_stdin(args);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "nidus {args:?} exited {:?}\n--- stderr ---\n{stderr}",
+        out.status.code()
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("nidus {args:?} stdout is not JSON ({e}):\n{stdout}"))
+}
+
+// ── HTTP admin verbs beyond GET/POST ─────────────────────────────────────────
+
+/// `PUT`/`DELETE` against a running server — the collection-admin and alias routes that
+/// [`RunningServer::get`]/[`RunningServer::post`] above don't cover.
+pub fn send(
+    server: &RunningServer,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let url = format!("{}{path}", server.base_url());
+    let res = match (method, body) {
+        ("PUT", Some(b)) => agent
+            .put(&url)
+            .header("content-type", "application/json")
+            .send(&serde_json::to_vec(b).expect("serialise body")),
+        ("DELETE", None) => agent.delete(&url).call(),
+        _ => panic!("unsupported {method} {path}"),
+    }
+    .unwrap_or_else(|e| panic!("{method} {path}: {e}\n--- stderr ---\n{}", server.stderr()));
+    let status = res.status().as_u16();
+    let bytes = res.into_body().read_to_vec().expect("read body");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+// ── Tiny mock HTTP servers (embedder/summarizer/reranker stand-ins) ──────────
+
+/// Drain one HTTP/1.1 request (headers + `Content-Length` body) and return the body
+/// bytes — unreferenced under a feature set with no embedder-mock caller.
+#[allow(dead_code)]
+pub fn read_request_body(stream: &mut TcpStream) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    let header_end = loop {
+        let n = stream.read(&mut tmp).unwrap_or(0);
+        if n == 0 {
+            return Vec::new();
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let content_length: usize = head
+        .lines()
+        .find_map(|l| {
+            let l = l.to_ascii_lowercase();
+            l.strip_prefix("content-length:")
+                .map(|v| v.trim().parse().unwrap_or(0))
+        })
+        .unwrap_or(0);
+    while buf.len() < header_end + content_length {
+        let n = stream.read(&mut tmp).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    buf[header_end..].to_vec()
+}
+
+/// Drain one HTTP/1.1 request and answer it with `body` — enough of the protocol for
+/// `reqwest` to round-trip. Unreferenced under a feature set with no embedder-mock caller.
+#[allow(dead_code)]
+pub fn respond_once(mut stream: TcpStream, body: &str) {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    let header_end = loop {
+        let n = stream.read(&mut tmp).unwrap_or(0);
+        if n == 0 {
+            return;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let content_length: usize = head
+        .lines()
+        .find_map(|l| {
+            let l = l.to_ascii_lowercase();
+            l.strip_prefix("content-length:")
+                .map(|v| v.trim().parse().unwrap_or(0))
+        })
+        .unwrap_or(0);
+    while buf.len() < header_end + content_length {
+        let n = stream.read(&mut tmp).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
 }
 
 // ── `nidus mcp` over stdio ──────────────────────────────────────────────────

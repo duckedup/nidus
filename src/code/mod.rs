@@ -286,13 +286,13 @@ mod tests {
 #[cfg(all(test, feature = "summarize-anthropic"))]
 mod wire_tests {
     use super::*;
-    use crate::summarize::{
-        AnySummarizer, SummarizeConfig, SummarizeProvider, Summarizer, test_server::serve_once,
-    };
+    use crate::http::mock::mock_once;
+    use crate::summarize::{AnySummarizer, SummarizeConfig, SummarizeProvider, Summarizer};
 
     #[tokio::test]
     async fn wdpkrs_prompt_is_what_reaches_the_adapter() {
-        let (base, rx) = serve_once(200, r#"{"content":[{"type":"text","text":"ok"}]}"#);
+        let server = mock_once(200, r#"{"content":[{"type":"text","text":"ok"}]}"#);
+        let base = server.base_url.clone();
         let summarizer = AnySummarizer::build(
             SummarizeProvider::Anthropic,
             SummarizeConfig::new("claude-haiku-4-5-20251001")
@@ -311,7 +311,7 @@ mod wire_tests {
         let opts = file_summarize_opts(&input);
         summarizer.summarize(&input.content, &opts).await.unwrap();
 
-        let req = rx.recv().unwrap();
+        let req = server.captured();
         // wdpkr's code-summarizer system prompt reached the wire...
         assert!(
             req.body

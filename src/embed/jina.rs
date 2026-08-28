@@ -93,8 +93,8 @@ impl Embedder for JinaEmbedder {
 
 #[cfg(test)]
 mod tests {
-    use super::super::testutil::mock_once;
     use super::*;
+    use crate::http::mock::mock_once;
 
     #[test]
     fn constructor_requires_key() {

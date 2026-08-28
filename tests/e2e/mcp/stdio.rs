@@ -172,12 +172,11 @@ fn read_only_opens_without_taking_the_writer_lock() {
 /// `embed-ollama` is present — e.g. under `just ci-serve`.
 #[cfg(feature = "embed-ollama")]
 mod round_trip {
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::TcpListener;
 
     use serde_json::json;
 
-    use crate::harness::StdioServer;
+    use crate::harness::{StdioServer, respond_once};
 
     use super::super::{result, text};
     use super::{call, handshake};
@@ -234,45 +233,6 @@ mod round_trip {
             }
         });
         format!("http://{addr}")
-    }
-
-    /// Drain one HTTP/1.1 request (headers + `Content-Length` body) and answer it with
-    /// `body` — enough of the protocol for `reqwest` to round-trip, nothing more.
-    fn respond_once(mut stream: TcpStream, body: &str) {
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 1024];
-        let header_end = loop {
-            let n = stream.read(&mut tmp).unwrap_or(0);
-            if n == 0 {
-                return;
-            }
-            buf.extend_from_slice(&tmp[..n]);
-            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                break pos + 4;
-            }
-        };
-        let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-        let content_length: usize = head
-            .lines()
-            .find_map(|l| {
-                let l = l.to_ascii_lowercase();
-                l.strip_prefix("content-length:")
-                    .map(|v| v.trim().parse().unwrap_or(0))
-            })
-            .unwrap_or(0);
-        while buf.len() < header_end + content_length {
-            let n = stream.read(&mut tmp).unwrap_or(0);
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&tmp[..n]);
-        }
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let _ = stream.write_all(response.as_bytes());
     }
 }
 
