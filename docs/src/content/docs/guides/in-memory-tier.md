@@ -1,5 +1,5 @@
 ---
-title: Memory stores
+title: In-memory tier
 description: Share a store's in-RAM working set across processes with Redis (or Valkey, KeyDB, DragonflyDB) so each worker loads it instead of rebuilding, or keep it in local memory, the default.
 ---
 

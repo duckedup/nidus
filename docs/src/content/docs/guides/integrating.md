@@ -14,7 +14,7 @@ A `Record` is an `id`, an **optional** `vector`, and an open `attrs` map. Every 
 your document either *is* one of those or fits an attr. Pick a stable `id` (it is the
 upsert key), embed the content into `vector`, and project the rest into typed
 attrs (a document with no embedding is `Record::text_only(id, attrs)`, found by
-[full-text search](/guides/search/#full-text-search-bm25) and never by vector `search`):
+[full-text search](/guides/full-text-search/) and never by vector `search`):
 
 ```rust
 use std::collections::BTreeMap;
@@ -42,7 +42,7 @@ fn to_record(c: Chunk) -> Record {
 }
 ```
 
-The [`Null`-vs-absent](/guides/search/#typed-metadata) distinction preserves
+The [`Null`-vs-absent](/guides/filters/#typed-metadata) distinction preserves
 "computed-empty" versus "un-indexed" semantics. Don't collapse them.
 
 ## Many collections, one dimension

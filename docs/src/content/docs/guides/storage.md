@@ -10,7 +10,7 @@ reclaimed, and how a second process reads a store another is writing.
 This page is about a store on **local disk**. To keep the durable data somewhere
 else (Amazon S3 or Google Cloud Storage), see [Storage backends](/guides/storage-backends/);
 to share the in-memory index across processes via Redis, see
-[Memory stores](/guides/memory-stores/).
+[Memory stores](/guides/in-memory-tier/).
 
 ## On-disk format
 
@@ -233,7 +233,7 @@ It also stays cheap *when* there is new state. If only the active segment grew (
 appends, with no seal or compaction changing the segment list), `refresh` re-reads just that
 one segment object and reuses every immutable segment, instead of re-fetching the whole
 set; a seal/compaction takes the full re-open. And when a shared
-[memory tier](/guides/memory-stores/) holds a snapshot matching the new state, the reader
+[memory tier](/guides/in-memory-tier/) holds a snapshot matching the new state, the reader
 adopts it and skips the log replay entirely.
 
 ## Point-in-time reads

@@ -254,7 +254,7 @@ curl -s -X PUT localhost:7700/collections/docs/meta \
 
 Declare which attribute fields of a collection are full-text indexed for BM25. Run it
 once before (or after) upserting; see
-[Full-text search](/guides/search/#full-text-search-bm25) for the ranking model.
+[Full-text search](/guides/full-text-search/) for the ranking model.
 
 ```bash
 curl -s -X POST localhost:7700/collections/docs/fts-schema \
@@ -266,7 +266,7 @@ curl -s -X POST localhost:7700/collections/docs/fts-schema \
 A field entry may also be an object, tuning BM25 and the analyzer for that field alone.
 Every key but `field` is optional and defaults to what the bare-name form gets: `k1`
 1.2, `b` 0.75, `language` `"english"`, no ASCII folding, no token-length cap
-([details](/guides/search/#tuning-a-field)):
+([details](/guides/full-text-search/#tuning-a-field)):
 
 ```bash
 curl -s -X POST localhost:7700/collections/docs/fts-schema \
@@ -280,7 +280,7 @@ curl -s -X POST localhost:7700/collections/docs/fts-schema \
 Declare which attribute fields are indexed for the text predicates (`Fuzzy`,
 `ContainsAllTokens`, `ContainsAnyToken`, `ContainsTokenSequence`, `Regex`). Documents
 already written are indexed as part of the declaration; see
-[Indexing the text predicates](/guides/search/#indexing-the-text-predicates).
+[Indexing the text predicates](/guides/filters/#indexing-the-text-predicates).
 
 This changes how fast those predicates run, never what they return.
 
@@ -621,7 +621,7 @@ curl -s localhost:7700/text-search \
 The expansion is capped at 256 terms; past the cap the match keeps the commonest
 completions rather than erroring. With `explain: true`, a hit's clause score carries
 `"expansion": {"matched": N, "scored": M}`, `matched > scored` meaning the cap
-truncated it. See [prefix matching for typeahead](/guides/search/#prefix-matching-search-as-you-type).
+truncated it. See [prefix matching for typeahead](/guides/full-text-search/#prefix-matching-search-as-you-type).
 
 `/text-search` also takes the same `rerank` field as `/search` (`overscan` default `10`,
 `text_attr` default `"nidus.text"`). `query` is optional when the query is named as one
@@ -916,7 +916,7 @@ why each candidate did not survive: `surfaced`, `survived`, and `dropped_out_of_
 `dropped_stale` / `dropped_filtered` / `dropped_min_score`; it is absent on paths that never
 surface an index candidate set (`exact`, `quantized`).
 
-`narrowing` reports whether the opt-in [filter index](/guides/search/#indexing-the-text-predicates)
+`narrowing` reports whether the opt-in [filter index](/guides/filters/#indexing-the-text-predicates)
 narrowed the scan before it ran, one of three states:
 
 | `state` | Meaning |
@@ -1101,7 +1101,7 @@ the outer AND. `Not` and `Ne` differ on a **missing** attribute: `Ne` requires t
 present, `Not` is a true complement. A filter is validated once per query, before any row
 is scanned, so an unparseable `Regex` or a `Fuzzy` budget above 8 is **refused with an
 error** rather than quietly matching nothing. See
-[Search & filters](/guides/search/#filters) for the full semantics.
+[Search & filters](/guides/filters/#filters) for the full semantics.
 
 ## Memory (remember & recall)
 

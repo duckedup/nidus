@@ -204,7 +204,7 @@ process heap; nothing shared). A Redis-family URL (`redis://` / `rediss://` /
 `valkey://` / `valkeys://` / `keydb://` / `dragonfly://`, optionally `?prefix=<ns>`)
 publishes the serialized working set on `flush` and adopts it on `open`, so other workers
 skip the log replay. A rebuildable cache: an unreachable or evicted tier is never fatal.
-See [Memory stores](/guides/memory-stores/).
+See [Memory stores](/guides/in-memory-tier/).
 
 ### `cluster`
 

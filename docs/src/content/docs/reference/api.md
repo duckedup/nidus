@@ -40,9 +40,9 @@ searchers plus one writer (see
 | `collections` | `fn collections(&self) -> Vec<String>` | All collection names. |
 | `get_meta` | `fn get_meta(&self, collection: &str) -> BTreeMap<String, String>` | Per-collection metadata. |
 | `set_meta` | `fn set_meta(&mut self, collection: &str, meta: BTreeMap<String, String>) -> Result<()>` | |
-| `create_collection_with_fts` | `fn create_collection_with_fts(&mut self, name: &str, fields: &[FtsField]) -> Result<()>` | Create + declare [full-text fields](/guides/search/#full-text-search-bm25) up front (incremental from the first upsert). |
-| `set_fts_schema` | `fn set_fts_schema(&mut self, collection: &str, fields: &[FtsField]) -> Result<()>` | Declare/redeclare full-text fields any time; indexes existing docs once. Each [`FtsField`](/guides/search/#tuning-a-field) carries its own `k1`, `b`, and `Analyzer`. |
-| `set_filter_index` | `fn set_filter_index(&mut self, collection: &str, fields: &[FilterIndexField]) -> Result<()>` | Declare/redeclare [filter-indexed fields](/guides/search/#indexing-the-text-predicates) any time; indexes existing docs once. Speeds up the text predicates, changes no results. Empty list drops it. |
+| `create_collection_with_fts` | `fn create_collection_with_fts(&mut self, name: &str, fields: &[FtsField]) -> Result<()>` | Create + declare [full-text fields](/guides/full-text-search/) up front (incremental from the first upsert). |
+| `set_fts_schema` | `fn set_fts_schema(&mut self, collection: &str, fields: &[FtsField]) -> Result<()>` | Declare/redeclare full-text fields any time; indexes existing docs once. Each [`FtsField`](/guides/full-text-search/#tuning-a-field) carries its own `k1`, `b`, and `Analyzer`. |
+| `set_filter_index` | `fn set_filter_index(&mut self, collection: &str, fields: &[FilterIndexField]) -> Result<()>` | Declare/redeclare [filter-indexed fields](/guides/filters/#indexing-the-text-predicates) any time; indexes existing docs once. Speeds up the text predicates, changes no results. Empty list drops it. |
 
 ### Aliases
 
@@ -72,10 +72,10 @@ An indirect name resolving to one concrete collection, one hop only; see the
 | `list` | `fn list<'a>(&self, scope: impl Into<Scope<'a>>, opts: &ListOpts) -> Result<Vec<Hit>>` | Metadata-only query: no vector, returns filter-matched records in insertion order (or by [`ListOpts::order_by`](#orderby)); `offset`/`limit` paginate. |
 | `search` | `fn search<'a>(&self, scope: impl Into<Scope<'a>>, query: &[f32], opts: &SearchOpts) -> Result<Vec<Hit>>` | Ranked search over a scope using the store's distance metric; `SearchOpts`'s `offset`/`top_k` paginate. |
 | `search_similar` | `fn search_similar<'a>(&self, scope: impl Into<Scope<'a>>, collection: &str, id: &str, opts: &SearchOpts) -> Result<Vec<Hit>>` | "More like this": search using the vector already stored at `collection`/`id`, instead of a caller-supplied query. An omitted scope searches the source's own collection. The source record is always excluded from its own results, by id rather than by score, so a genuine duplicate still comes back. Errors if the record is text-only and has no vector to search with. |
-| `text_search` | `fn text_search<'a>(&self, scope: impl Into<Scope<'a>>, query: &FtsQuery, opts: &SearchOpts) -> Result<Vec<Hit>>` | [BM25 full-text search](/guides/search/#full-text-search-bm25) over one or more field clauses; `min_score` is a raw BM25 floor. |
-| `suggest` | `fn suggest<'a>(&self, scope: impl Into<Scope<'a>>, field: &str, prefix: &str, opts: &SuggestOpts) -> Result<Suggestions>` | [Ranked term completions](/guides/search/#full-text-search-bm25) from `field`'s full-text vocabulary across a scope, ranked by document frequency (not idf). Each `df` counts only documents passing `opts.filter` and carrying every word before the final token. An unindexed field or unknown collection contributes nothing rather than erroring. |
-| `hybrid_search` | `fn hybrid_search<'a>(&self, scope: impl Into<Scope<'a>>, vector: &[f32], text: &FtsQuery, opts: &HybridOpts) -> Result<Vec<Hit>>` | [Hybrid vector + BM25](/guides/search/#hybrid-search-rrf), fused with Reciprocal Rank Fusion. |
-| `aggregate` | `fn aggregate<'a>(&self, scope: impl Into<Scope<'a>>, opts: &AggregateOpts) -> Result<Aggregation>` | [Count and sum](/guides/search/#aggregation) over a filter, straight off the in-memory index; no record is materialized. |
+| `text_search` | `fn text_search<'a>(&self, scope: impl Into<Scope<'a>>, query: &FtsQuery, opts: &SearchOpts) -> Result<Vec<Hit>>` | [BM25 full-text search](/guides/full-text-search/) over one or more field clauses; `min_score` is a raw BM25 floor. |
+| `suggest` | `fn suggest<'a>(&self, scope: impl Into<Scope<'a>>, field: &str, prefix: &str, opts: &SuggestOpts) -> Result<Suggestions>` | [Ranked term completions](/guides/full-text-search/) from `field`'s full-text vocabulary across a scope, ranked by document frequency (not idf). Each `df` counts only documents passing `opts.filter` and carrying every word before the final token. An unindexed field or unknown collection contributes nothing rather than erroring. |
+| `hybrid_search` | `fn hybrid_search<'a>(&self, scope: impl Into<Scope<'a>>, vector: &[f32], text: &FtsQuery, opts: &HybridOpts) -> Result<Vec<Hit>>` | [Hybrid vector + BM25](/guides/hybrid-search/), fused with Reciprocal Rank Fusion. |
+| `aggregate` | `fn aggregate<'a>(&self, scope: impl Into<Scope<'a>>, opts: &AggregateOpts) -> Result<Aggregation>` | [Count and sum](/guides/filters/#aggregation) over a filter, straight off the in-memory index; no record is materialized. |
 | `flush` | `fn flush(&mut self) -> Result<()>` | Force an fsync (relevant under `Fsync::OnFlush`). |
 | `deferred` | `fn deferred<T>(&mut self, f: impl FnOnce(&mut Nidus) -> Result<T>) -> Result<T>` | Run `f`'s mutations with their durable barrier deferred, so several can share one; see [group commit](/guides/how-it-works/#group-commit). **Report nothing successful until `commit` returns `Ok`**: until then the bytes are appended but not durable. |
 | `commit` | `fn commit(&mut self) -> Result<()>` | Take one barrier covering everything appended by `deferred` (fsync `data`, then `log`). A no-op when no barrier is owed, so the ordinary path pays nothing. Narrower than `flush`: no segment seal, no working-set publish. |
@@ -191,13 +191,13 @@ pub struct Record {
 
 Construct with `Record::new(id, vector, attrs)` for a vector-bearing document, or
 `Record::text_only(id, attrs)` for a document with no embedding (indexed purely by
-[full-text search](/guides/search/#full-text-search-bm25)). Over the wire / in backups
+[full-text search](/guides/full-text-search/)). Over the wire / in backups
 the `vector` field may be omitted, which deserializes to `None`.
 
 ## `Value`
 
 A typed metadata value. `Null` is **distinct from an absent key**; see
-[typed metadata](/guides/search/#typed-metadata).
+[typed metadata](/guides/filters/#typed-metadata).
 
 ```rust
 pub enum Value {
@@ -269,7 +269,7 @@ without `Filter` itself changing. Note `Not` differs from `Ne` on a **missing**
 attribute: `Ne(k, v)` is false (it requires `k` present), while `Not(Eq(k, v))` is
 true. Use `Ne`/`NotIn`/`NotContains` to require presence, `Not` for set complement.
 
-The [text predicates](/guides/search/#text-predicates) read any text the attribute
+The [text predicates](/guides/filters/#text-predicates) read any text the attribute
 carries: a `Str` directly, a `List` element by element, matching when any *single*
 element does. `Fuzzy` counts characters, not bytes, over the plain three-operation
 Levenshtein distance (so a transposition costs 2) with both sides ASCII-case-folded; a
@@ -460,7 +460,7 @@ attribute) sort into one trailing bucket, which stays trailing when reversed.
 
 ## `AggregateOpts` & `Aggregation`
 
-[Count and sum](/guides/search/#aggregation) over a filter, answered from the in-memory
+[Count and sum](/guides/filters/#aggregation) over a filter, answered from the in-memory
 index without materializing a record.
 
 ```rust
@@ -514,7 +514,7 @@ surface answers `400` for the wire form that sends both.
 
 ## `FtsQuery`, `FtsClause`, `FtsCombine` & `Language`
 
-A [full-text query](/guides/search/#full-text-search-bm25): one or more clauses, each
+A [full-text query](/guides/full-text-search/): one or more clauses, each
 naming an indexed field *and its own* raw query text (analyzed at query time the same way
 documents were at index time).
 
@@ -537,12 +537,12 @@ pub enum Language { English }     // the analyzer; extensible (US English today)
 
 `FtsQuery::new(field, text)` is the one-clause shorthand; `FtsQuery::multi([...])` takes
 several, with `.combine(...)` and `.highlight(...)` builders. See
-[searching several fields at once](/guides/search/#searching-several-fields-at-once).
+[searching several fields at once](/guides/full-text-search/#searching-several-fields-at-once).
 
 `FtsClause::new(field, text).prefix()` sets the flag: only the clause's **final** term
 expands, to every indexed term carrying it as a prefix, capped at 256 expansions (past
 the cap, the commonest completions win rather than the query erroring). See
-[prefix matching for typeahead](/guides/search/#prefix-matching-search-as-you-type).
+[prefix matching for typeahead](/guides/full-text-search/#prefix-matching-search-as-you-type).
 
 ## `SuggestOpts`, `Suggestion` & `Suggestions`
 
@@ -581,13 +581,13 @@ only documents carrying all the earlier words, so `"quick br"` completes against
 that also say "quick". A single-token prefix, or one whose earlier words are all stopwords, has
 no head terms and is unconditioned. Across a multi-collection scope, a completion two
 collections share is one row whose `df` is the sum. See
-[prefix matching for typeahead](/guides/search/#prefix-matching-search-as-you-type).
+[prefix matching for typeahead](/guides/full-text-search/#prefix-matching-search-as-you-type).
 
 ## `FtsField` & `Analyzer`
 
 The declared shape of one full-text-indexed field: BM25 tuning plus its analyzer.
 Passed to [`create_collection_with_fts` / `set_fts_schema`](#collections); see
-[tuning a field](/guides/search/#tuning-a-field).
+[tuning a field](/guides/full-text-search/#tuning-a-field).
 
 ```rust
 pub struct FtsField {
@@ -659,7 +659,7 @@ independently; only `hybrid_search` produces them.
 
 ## `HybridOpts`
 
-Options for [hybrid search](/guides/search/#hybrid-search-rrf) (vector + BM25, fused
+Options for [hybrid search](/guides/hybrid-search/) (vector + BM25, fused
 with Reciprocal Rank Fusion).
 
 ```rust
@@ -679,7 +679,7 @@ Implements `Default` (`top_k: 10`, `offset: 0`, `explain: false`, both weights `
 `offset` pages the **fused** ranking, never a leg. There is no `min_score`: a fused RRF
 score has no absolute scale. Both weights at `1.0` reproduce the unweighted fusion exactly;
 a non-finite or negative weight is refused. See
-[weighting the legs](/guides/search/#weighting-the-legs).
+[weighting the legs](/guides/hybrid-search/#weighting-the-legs).
 
 ## `ListOpts`
 
@@ -1004,7 +1004,7 @@ input returns `Ok(vec![])`, never a single empty chunk.
 The pluggable storage and shared-memory-tier seam (SPEC §13): implement one of these
 traits to plug in a backend nidus doesn't ship. See
 [writing your own storage backend](/guides/storage-backends/#writing-your-own-backend)
-and [writing your own memory store](/guides/memory-stores/#writing-your-own-memory-store).
+and [writing your own memory store](/guides/in-memory-tier/#writing-your-own-memory-store).
 
 ```rust
 pub trait Persistence: Send + Sync {

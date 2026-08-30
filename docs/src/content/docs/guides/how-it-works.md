@@ -104,7 +104,7 @@ walks an approximate index for a candidate set and applies the same scope/filter
 to those. The exact path is:
 
 1. Resolve the scope to a set of candidate rows.
-2. Apply the metadata [`Filter`](/guides/search/#filters) (before any dot
+2. Apply the metadata [`Filter`](/guides/filters/#filters) (before any dot
    product: cheap rows are discarded first).
 3. Score each surviving row against the query with a dot product. Because
    vectors are **unit-normalized on insert**, `score = dot(v, q)` *is* cosine

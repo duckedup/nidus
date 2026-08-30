@@ -166,7 +166,7 @@ Prefer **existing Secrets** (`credentials.existingSecrets`, `auth.existingSecret
 SealedSecrets, the External Secrets Operator, and similar. Inline values
 (`credentials.inline`, `auth.token`) are written to a chart-managed Secret and are
 handy for a quick start. The library guides cover the same credentials for the
-[object stores](/guides/storage-backends/) and the [memory tier](/guides/memory-stores/).
+[object stores](/guides/storage-backends/) and the [memory tier](/guides/in-memory-tier/).
 
 ## Ingress and TLS
 

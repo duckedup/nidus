@@ -397,7 +397,7 @@ Full-text (BM25) search of fields declared via `set-fts-schema`. Usage:
 A prefix match expands only the clause's final term, capped at 256 expansions (past the
 cap, the commonest completions win rather than the command erroring). With `--explain`,
 each hit's clause score reports `expansion: {matched, scored}` when the clause was a
-prefix match. See [prefix matching for typeahead](/guides/search/#prefix-matching-search-as-you-type).
+prefix match. See [prefix matching for typeahead](/guides/full-text-search/#prefix-matching-search-as-you-type).
 
 ### `hybrid-search`
 
