@@ -1,28 +1,29 @@
 ---
 title: Getting started
-description: Add nidus to a Rust project, open a store, index records, and run your first search.
+description: Add nidus to a Rust project, open a store, index records, and run your first vector, full-text, or hybrid search.
 ---
 
-nidus is built for development and small-scale use. You add it as a dependency,
-open a store in a directory of your choosing, and call methods. There is nothing
-to install, no daemon to run, and no network.
+nidus is a vector store and full-text search engine for development and small-scale
+use. You add it as a dependency, open a store in a directory of your choosing, and
+call methods. There is nothing to install, no daemon to run, and no network.
 
-There are two ways in. This page takes the **vector-store** path: you bring the
-embeddings and nidus stores and searches them. If you'd rather hand nidus plain
-text and let it embed for you (remember natural language, recall the relevant
-bits), see [Remember & recall](/guides/remember-and-recall/); it's the same store
-with an embedding step wrapped around it.
+A store holds records: a vector, an id, and an open map of typed metadata. You can
+search it three ways, and they share one set of results, filters, and scoping:
 
-:::tip[Just want local search, no Rust?]
-If you'd rather not write Rust, install the `nidus` command-line tool (no
-toolchain required) and stand up a working local store in four commands. See
+- **[Full-text search](/guides/full-text-search/)** ranks by keyword with BM25. No
+  embedder, no model, no API key.
+- **[Vector search](/guides/search/)** ranks by meaning, over embeddings you supply.
+- **[Hybrid search](/guides/hybrid-search/)** runs both legs and fuses them into one
+  ranking.
+
+This page takes the vector path, because it exercises the most of the store. If you
+only want keyword search, [full-text search](/guides/full-text-search/) stands alone
+and needs no embeddings at all.
+
+:::tip[Prefer not to write Rust?]
+Install the `nidus` command-line tool (no toolchain required) and stand up a working
+local store in four commands. See
 [Quickstart: local search in four commands](/guides/cli-and-server/#quickstart-local-search-in-four-commands).
-:::
-
-:::tip[Want it as agent memory instead?]
-`claude mcp add nidus -- nidus mcp --dir ~/.nidus` registers a store as an MCP
-server over stdio in one line. See [MCP](/guides/mcp/) for the tool surface and
-the HTTP alternative.
 :::
 
 ## Add the dependency
@@ -90,7 +91,7 @@ db.upsert("code", &[Record::new("a", vec![/* 768 f32s */], attrs)])?;
 
 Pass a slice to upsert a whole batch in one durable, all-or-nothing call. A record
 may also carry no embedding (`Record::text_only(id, attrs)`) for a document indexed
-purely by [full-text search](/guides/search/#full-text-search-bm25).
+purely by [full-text search](/guides/full-text-search/).
 
 ## Search
 

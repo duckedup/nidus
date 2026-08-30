@@ -70,26 +70,49 @@ export default defineConfig({
           ],
         },
         {
-          label: "Guides",
+          label: "Core",
           items: [
             { label: "How it works", link: "/guides/how-it-works/" },
             { label: "Storage & durability", link: "/guides/storage/" },
-            { label: "Storage backends", link: "/guides/storage-backends/" },
-            { label: "Blue/green reindexing", link: "/guides/blue-green-reindex/" },
-            { label: "Running in the browser", link: "/guides/wasm/" },
-            { label: "Memory stores", link: "/guides/memory-stores/" },
-            { label: "Search & filters", link: "/guides/search/" },
+            { label: "Vector search", link: "/guides/search/" },
+            { label: "Full-text search (BM25)", link: "/guides/full-text-search/" },
+            { label: "Hybrid search (RRF)", link: "/guides/hybrid-search/" },
+            { label: "Filters & metadata", link: "/guides/filters/" },
             { label: "Reranking", link: "/guides/rerank/" },
             { label: "Remember & recall", link: "/guides/remember-and-recall/" },
+          ],
+        },
+        {
+          label: "Loading data",
+          items: [
             { label: "Ingest a directory", link: "/guides/ingest/" },
-            { label: "Code search", link: "/guides/code/" },
-            { label: "MCP (agent memory)", link: "/guides/mcp/" },
-            { label: "Automatic memory", link: "/guides/automatic-memory/" },
-            { label: "Embedding in a host app", link: "/guides/integrating/" },
+          ],
+        },
+        {
+          label: "Operating",
+          items: [
             { label: "Command line", link: "/guides/cli-and-server/" },
             { label: "HTTP server", link: "/guides/http-server/" },
+            { label: "Storage backends", link: "/guides/storage-backends/" },
+            { label: "In-memory tier", link: "/guides/in-memory-tier/" },
+            { label: "Blue/green reindexing", link: "/guides/blue-green-reindex/" },
             { label: "Running across a few boxes", link: "/guides/multi-box/" },
             { label: "Kubernetes (Helm)", link: "/guides/kubernetes/" },
+          ],
+        },
+        {
+          label: "Embedding nidus",
+          items: [
+            { label: "In a host app", link: "/guides/integrating/" },
+            { label: "In the browser (wasm)", link: "/guides/wasm/" },
+          ],
+        },
+        {
+          label: "Also built in",
+          items: [
+            { label: "MCP", link: "/guides/mcp/" },
+            { label: "Code search", link: "/guides/code/" },
+            { label: "Automatic memory", link: "/guides/automatic-memory/" },
           ],
         },
         {

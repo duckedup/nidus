@@ -1,6 +1,6 @@
 ---
-title: MCP (agent memory)
-description: "nidus speaks the Model Context Protocol over stdio or at nidus serve's /mcp, so any MCP client can use a store as long-term memory: remember text, recall it by meaning, with no glue code."
+title: MCP
+description: "nidus speaks the Model Context Protocol over stdio or at nidus serve's /mcp, so any MCP client can search a store directly: full-text, vector, and hybrid queries plus text-native remember and recall, with no glue code."
 ---
 
 nidus speaks the [Model Context Protocol](https://modelcontextprotocol.io) over

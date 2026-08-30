@@ -218,7 +218,7 @@ configuration.
 
 By default a store is a local directory and its working set is the process heap. Two
 optional flags point each axis elsewhere. See [Storage backends](/guides/storage-backends/)
-and [Memory stores](/guides/memory-stores/) for the full model; both work on every
+and [Memory stores](/guides/in-memory-tier/) for the full model; both work on every
 store-opening command, including `serve`:
 
 ```bash

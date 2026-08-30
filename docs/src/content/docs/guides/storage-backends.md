@@ -162,7 +162,7 @@ by copying the whole directory (or bucket prefix) instead.
 ## Cooperating instances (cluster)
 
 When the durable bytes live on a **shared** object store and the working set is shared
-through a [memory tier](/guides/memory-stores/), several nidus processes can cooperate over
+through a [memory tier](/guides/in-memory-tier/), several nidus processes can cooperate over
 the *same* store: one writer and any number of read-only searchers. Turn it on with
 [`Config::cluster(true)`](/reference/configuration/#cluster):
 
