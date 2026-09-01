@@ -31,7 +31,7 @@ local store in four commands. See
 ```toml
 # Cargo.toml
 [dependencies]
-nidus = "0.96"
+nidus = "0.97"
 anyhow = "1"     # nidus returns anyhow::Result
 ```
 
