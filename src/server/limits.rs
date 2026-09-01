@@ -201,6 +201,9 @@ fn timed_out(after: Duration) -> Response {
 /// Read the request body to completion under the idle timeout and the size cap, holding a
 /// body slot rather than a store permit. The collected bytes come back alongside the rebuilt
 /// request so the deadline can be classified from them (nidus-a34).
+// The `Err` is the response to send, and the sole caller returns it as-is. Boxing it would
+// not shrink this `Result` anyway: the `Ok` variant is 272 bytes against the error's 128.
+#[allow(clippy::result_large_err)]
 async fn receive_body(limits: &Limits, req: Request) -> Result<(Request, Option<Bytes>), Response> {
     let declared = req
         .headers()

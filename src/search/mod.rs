@@ -30,11 +30,11 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "dot: slice lengths must be equal");
 
     let mut acc = [0.0f32; DOT_LANES];
-    let mut a_chunks = a.chunks_exact(DOT_LANES);
-    let mut b_chunks = b.chunks_exact(DOT_LANES);
+    let (a_chunks, a_tail) = a.as_chunks::<DOT_LANES>();
+    let (b_chunks, b_tail) = b.as_chunks::<DOT_LANES>();
 
     // Bulk of the work: full LANES-wide chunks, each lane an independent FMA chain.
-    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+    for (ca, cb) in a_chunks.iter().zip(b_chunks) {
         for lane in 0..DOT_LANES {
             acc[lane] += ca[lane] * cb[lane];
         }
@@ -49,7 +49,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
         half /= 2;
     }
     let mut sum = acc[0];
-    for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+    for (x, y) in a_tail.iter().zip(b_tail) {
         sum += x * y;
     }
     sum
@@ -66,10 +66,10 @@ pub fn euclidean_neg_sq(a: &[f32], b: &[f32]) -> f32 {
     );
 
     let mut acc = [0.0f32; DOT_LANES];
-    let mut a_chunks = a.chunks_exact(DOT_LANES);
-    let mut b_chunks = b.chunks_exact(DOT_LANES);
+    let (a_chunks, a_tail) = a.as_chunks::<DOT_LANES>();
+    let (b_chunks, b_tail) = b.as_chunks::<DOT_LANES>();
 
-    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+    for (ca, cb) in a_chunks.iter().zip(b_chunks) {
         for lane in 0..DOT_LANES {
             let d = ca[lane] - cb[lane];
             acc[lane] += d * d;
@@ -84,7 +84,7 @@ pub fn euclidean_neg_sq(a: &[f32], b: &[f32]) -> f32 {
         half /= 2;
     }
     let mut sum = acc[0];
-    for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+    for (x, y) in a_tail.iter().zip(b_tail) {
         let d = x - y;
         sum += d * d;
     }
@@ -136,10 +136,10 @@ impl QuantParams {
 pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
     debug_assert_eq!(a.len(), b.len());
     let mut acc = [0i32; DOT_LANES];
-    let mut a_chunks = a.chunks_exact(DOT_LANES);
-    let mut b_chunks = b.chunks_exact(DOT_LANES);
+    let (a_chunks, a_tail) = a.as_chunks::<DOT_LANES>();
+    let (b_chunks, b_tail) = b.as_chunks::<DOT_LANES>();
 
-    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+    for (ca, cb) in a_chunks.iter().zip(b_chunks) {
         for lane in 0..DOT_LANES {
             acc[lane] += ca[lane] as i32 * cb[lane] as i32;
         }
@@ -153,7 +153,7 @@ pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
         half /= 2;
     }
     let mut sum = acc[0];
-    for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+    for (x, y) in a_tail.iter().zip(b_tail) {
         sum += *x as i32 * *y as i32;
     }
     sum
@@ -164,10 +164,10 @@ pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
 pub fn euclidean_neg_sq_i8(a: &[i8], b: &[i8]) -> i32 {
     debug_assert_eq!(a.len(), b.len());
     let mut acc = [0i32; DOT_LANES];
-    let mut a_chunks = a.chunks_exact(DOT_LANES);
-    let mut b_chunks = b.chunks_exact(DOT_LANES);
+    let (a_chunks, a_tail) = a.as_chunks::<DOT_LANES>();
+    let (b_chunks, b_tail) = b.as_chunks::<DOT_LANES>();
 
-    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+    for (ca, cb) in a_chunks.iter().zip(b_chunks) {
         for lane in 0..DOT_LANES {
             let d = ca[lane] as i32 - cb[lane] as i32;
             acc[lane] += d * d;
@@ -182,7 +182,7 @@ pub fn euclidean_neg_sq_i8(a: &[i8], b: &[i8]) -> i32 {
         half /= 2;
     }
     let mut sum = acc[0];
-    for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+    for (x, y) in a_tail.iter().zip(b_tail) {
         let d = *x as i32 - *y as i32;
         sum += d * d;
     }
@@ -219,17 +219,17 @@ pub fn hamming(a: &[u64], b: &[u64]) -> u32 {
     debug_assert_eq!(a.len(), b.len(), "hamming: word lengths must be equal");
 
     let mut acc = [0u32; DOT_LANES];
-    let mut a_chunks = a.chunks_exact(DOT_LANES);
-    let mut b_chunks = b.chunks_exact(DOT_LANES);
+    let (a_chunks, a_tail) = a.as_chunks::<DOT_LANES>();
+    let (b_chunks, b_tail) = b.as_chunks::<DOT_LANES>();
 
-    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+    for (ca, cb) in a_chunks.iter().zip(b_chunks) {
         for lane in 0..DOT_LANES {
             acc[lane] += (ca[lane] ^ cb[lane]).count_ones();
         }
     }
 
     let mut sum: u32 = acc.iter().sum();
-    for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+    for (x, y) in a_tail.iter().zip(b_tail) {
         sum += (x ^ y).count_ones();
     }
     sum

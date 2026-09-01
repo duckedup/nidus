@@ -191,7 +191,7 @@ jobs:
         with:
           bun-version: latest
 
-      # NOT the action's `targets:` input. `rust-toolchain.toml` pins 1.96.0, so every
+      # NOT the action's `targets:` input. `rust-toolchain.toml` pins 1.98.0, so every
       # cargo call resolves there while `targets:` would add wasm32 to `stable` instead,
       # and the build would fail with "can't find crate for `core`". `rustup target add`
       # honours the toolchain-file override, so it lands on whatever cargo actually uses.

@@ -268,7 +268,7 @@ build: all of nidus's own logic, including the local file IO and the in-RAM
 object-store/memory-tier paths; only the network paths (S3/GCS TLS, the Redis
 socket) and the opt-in `mmap` syscall are outside its reach.
 
-Rust 1.96+ (pinned via `rust-toolchain.toml`), edition 2024.
+Rust 1.98+ (pinned via `rust-toolchain.toml`), edition 2024.
 
 ## Design
 
