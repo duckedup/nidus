@@ -145,7 +145,7 @@ just spec toc      # SPEC.md section index — see below
 just docs-index    # optional ranked tier under `spec find` (derived, never required)
 ```
 
-Rust 1.96+ (pinned via `rust-toolchain.toml`). Edition 2024. `just --list` has the rest,
+Rust 1.98+ (pinned via `rust-toolchain.toml`). Edition 2024. `just --list` has the rest,
 including the `cli`, `serve`, and wasm lanes.
 
 **Do not read `SPEC.md` whole — it is 2577 lines.** `just spec toc` is the index,

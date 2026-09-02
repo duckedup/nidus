@@ -190,8 +190,8 @@ fn bytes_to_floats(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
         );
     }
     let mut out = Vec::with_capacity(n);
-    for chunk in bytes.chunks_exact(4) {
-        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in bytes.as_chunks::<4>().0 {
+        out.push(f32::from_le_bytes(*chunk));
     }
     Ok(out)
 }
@@ -292,8 +292,8 @@ impl DataSegment {
                     appender
                         .read_exact_at(offset, &mut buf[..take])
                         .context("failed to read data file rows")?;
-                    for chunk in buf[..take].chunks_exact(4) {
-                        v.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                    for chunk in buf[..take].as_chunks::<4>().0 {
+                        v.push(f32::from_le_bytes(*chunk));
                     }
                     offset += take as u64;
                     remaining -= take;

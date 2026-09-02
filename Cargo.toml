@@ -9,9 +9,9 @@ default-members = ["."]
 
 [package]
 name = "nidus"
-version = "0.96.1"
+version = "0.97.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.98"
 description = "A small, pure-Rust embeddable vector store: brute-force or ANN cosine search over a single append-only directory, with pluggable persistence (local files, S3, GCS). No SQL, no query engine."
 repository = "https://github.com/duckedup/nidus"
 license = "MIT"

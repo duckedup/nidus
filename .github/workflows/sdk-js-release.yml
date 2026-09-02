@@ -107,7 +107,7 @@ jobs:
         run: npm run test:unit
 
       # Same pinned toolchain subtlety as ci.yml:390-395 — `targets:` would add wasm32
-      # to `stable` rather than the 1.96.0 `rust-toolchain.toml` pin, so `rustup target
+      # to `stable` rather than the 1.98.0 `rust-toolchain.toml` pin, so `rustup target
       # add` is used instead. wasm-bindgen version MUST match ci.yml and
       # scripts/e2e-wasm.sh: it is keyed to Cargo.lock's `wasm-bindgen`.
       - uses: dtolnay/rust-toolchain@stable

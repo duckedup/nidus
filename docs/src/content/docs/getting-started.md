@@ -31,11 +31,11 @@ local store in four commands. See
 ```toml
 # Cargo.toml
 [dependencies]
-nidus = "0.96"
+nidus = "0.97"
 anyhow = "1"     # nidus returns anyhow::Result
 ```
 
-nidus requires **Rust 1.96+** (edition 2024). It pulls in only popular, mostly
+nidus requires **Rust 1.98+** (edition 2024). It pulls in only popular, mostly
 pure-Rust crates: the local store and search path are pure Rust, and the bundled
 S3/GCS backends add only a small TLS compile (`ring`), never a bundled C++ tree.
 
