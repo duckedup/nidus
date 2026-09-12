@@ -203,7 +203,8 @@ fn slow_query_threshold_logs_a_stderr_line_with_a_path() {
     assert_eq!(status, 200, "{hits}");
 
     let stderr = server.stderr_until(Duration::from_secs(2), |s| {
-        s.lines().any(|l| l.contains("msg=") && l.contains("slow query"))
+        s.lines()
+            .any(|l| l.contains("msg=") && l.contains("slow query"))
     });
     let slow_line = stderr
         .lines()

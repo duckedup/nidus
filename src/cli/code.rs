@@ -20,8 +20,8 @@ use crate::embed::cache::CachedEmbedder;
 use crate::embed::{Embedder, embedder_identity};
 use crate::memory::{META_TEXT, RememberWrite, commit_remember_chunks, stamp_recency};
 use crate::{
-    Filter, FtsField, META_CHAR_START, META_CHUNK_INDEX, META_PARENT_ID, Nidus, Predicate,
-    Record, SearchOpts, Value,
+    Filter, FtsField, META_CHAR_START, META_CHUNK_INDEX, META_PARENT_ID, Nidus, Predicate, Record,
+    SearchOpts, Value,
 };
 
 /// wdpkr-core's pinned minor version (`Cargo.toml`'s `wdpkr-core = "0.2"`), folded into the
