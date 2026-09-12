@@ -712,6 +712,9 @@ impl Store {
         if fts_on {
             self.fts_dirty = true;
         }
+        if findex_on {
+            self.findex_dirty = true;
+        }
 
         // Quantize only the rows this batch appended (O(batch)); refits lazily.
         self.extend_quant(data_mark);
