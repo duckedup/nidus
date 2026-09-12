@@ -4145,6 +4145,30 @@ fn findex_cache_persists_after_upsert_only() {
         path.join("findex").exists(),
         "findex cache file written after upsert-only persist"
     );
+    drop(store);
+
+    // Reopening must ADOPT that cache, not rebuild from the replayed docs. `findex_dirty`
+    // is the tell: `load_or_build_findex` clears it on adoption, `rebuild_findex` sets it.
+    let reopened = Store::open(Config::new(&path, 2)).unwrap();
+    assert!(
+        !reopened.findex_dirty,
+        "the reopened store rebuilt the filter index instead of adopting the cache"
+    );
+    let hits = reopened
+        .list(
+            &["docs"],
+            &ListOpts {
+                filter: Filter(vec![Predicate::ContainsAllTokens(
+                    "body".into(),
+                    "beta".into(),
+                )]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["a", "b"], "adopted index answers the filter");
 }
 
 #[test]

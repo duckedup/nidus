@@ -14,8 +14,11 @@ use super::ingest::{
 };
 use super::{IngestArgs, StoreArgs};
 use crate::chunk::{ChunkOpts, ChunkStrategy};
+use crate::code::chunk_file;
 use crate::code::present::{FileGroup, group_by_file};
-use crate::code::{META_SYMBOL, chunk_file};
+// Only `summarize_file` still names it; the BM25 field list moved to `code::search` (nidus-hij).
+#[cfg(feature = "summarize")]
+use crate::code::META_SYMBOL;
 use crate::embed::cache::CachedEmbedder;
 use crate::embed::{Embedder, embedder_identity};
 use crate::memory::{META_TEXT, RememberWrite, commit_remember_chunks, stamp_recency};
