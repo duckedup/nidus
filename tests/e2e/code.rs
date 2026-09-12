@@ -130,6 +130,48 @@ fn code_search_never_prints_source() {
     );
 }
 
+/// Pull each file group's `path`, in order, from either the CLI's bare array or the HTTP
+/// response's `files` array — both shapes carry the same field names.
+fn ordered_paths(groups: &[Value]) -> Vec<String> {
+    groups
+        .iter()
+        .map(|g| g["path"].as_str().expect("group has a path").to_string())
+        .collect()
+}
+
+/// CLI-versus-HTTP ORDERED parity (nidus-hij): a set comparison would miss a ranking
+/// divergence. `code ingest` runs through the CLI and EXITS, dropping the writer lock,
+/// before `harness::Server` opens the same `--dir` as the writer in turn.
+#[test]
+fn code_search_ranks_identically_over_cli_and_http() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, root) = (tmp.path().join("store"), tmp.path().join("repo"));
+    corpus(&root);
+    code_ingest(&store, &root);
+
+    let cli_hits = code_search(&store, "one", &[]);
+    let cli_paths = ordered_paths(cli_hits.as_array().expect("cli hits are an array"));
+    assert!(
+        cli_paths.len() >= 2,
+        "the corpus should match more than one file for this term, or ordering proves \
+         nothing: {cli_hits:?}"
+    );
+
+    let server = crate::harness::Server::new(store.as_path(), 0).start();
+    let (status, body) = server.post(
+        "/code-search",
+        &serde_json::json!({"collection": "code", "query": "one", "limit": 10}),
+    );
+    assert_eq!(status, 200, "code-search over HTTP failed: {body}");
+    let http_paths = ordered_paths(body["files"].as_array().expect("files is an array"));
+
+    assert_eq!(
+        cli_paths, http_paths,
+        "CLI and HTTP must rank the same files in the same order: cli={cli_paths:?} \
+         http={http_paths:?}"
+    );
+}
+
 /// `--vector` with no embedder configured is refused up front, naming the flag it needs,
 /// instead of silently answering from BM25.
 #[test]

@@ -653,7 +653,7 @@ curl -s localhost:7700/code-search \
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `collection` | – (required) | collection to search |
-| `query` | – (required) | the search text: a natural-language description for a vector search, or exact keywords for BM25 |
+| `query` | – (required) | the search text: a natural-language description for a vector search, or exact keywords for BM25, which matches the chunk body, the file path, the symbol name, and the doc comment (so a path or a symbol name works on its own) |
 | `limit` | `10` | maximum files to return, ranked by their best-matching symbol |
 | `filter` | none | AND of predicates applied before scoring |
 | `vector` | none | `true` forces a vector search, `false` forces BM25; omit to let the store decide (a dimension-0 store, ingested with no embedder, answers BM25) |

@@ -15,23 +15,19 @@ use super::ingest::{
 use super::{IngestArgs, StoreArgs};
 use crate::chunk::{ChunkOpts, ChunkStrategy};
 use crate::code::present::{FileGroup, group_by_file};
-use crate::code::{META_DOC, META_PATH as CODE_META_PATH, META_SYMBOL, chunk_file};
+use crate::code::{META_SYMBOL, chunk_file};
 use crate::embed::cache::CachedEmbedder;
 use crate::embed::{Embedder, embedder_identity};
 use crate::memory::{META_TEXT, RememberWrite, commit_remember_chunks, stamp_recency};
 use crate::{
-    Filter, FtsField, FtsQuery, META_CHAR_START, META_CHUNK_INDEX, META_PARENT_ID, Nidus,
-    Predicate, Record, SearchOpts, Value,
+    Filter, FtsField, META_CHAR_START, META_CHUNK_INDEX, META_PARENT_ID, Nidus, Predicate,
+    Record, SearchOpts, Value,
 };
 
 /// wdpkr-core's pinned minor version (`Cargo.toml`'s `wdpkr-core = "0.2"`), folded into the
 /// re-ingest digest (via the `identity` [`source_hash`] hashes) so a grammar/query bump that
 /// moves symbol boundaries re-ingests instead of leaving two chunking regimes in one store.
 const WDPKR_CORE_VERSION: &str = "0.2.0";
-
-/// What `code search`'s BM25 fallback is declared over: the chunk body, plus the two fields
-/// a caller is most likely to name directly.
-const CODE_FTS_FIELDS: [&str; 4] = [META_TEXT, CODE_META_PATH, META_SYMBOL, META_DOC];
 
 /// Directories `code ingest` never walks into: it defaults to a whole repo with dot-entries
 /// on, so without this a run reads all of `target/`. `nidus ingest` passes `&[]` and keeps
@@ -140,7 +136,10 @@ pub(super) fn ingest(
         if embedder.is_none() && !dry_run {
             let resolved = db.resolve_alias(&collection);
             let target = resolved.unwrap_or_else(|| collection.clone());
-            let fields: Vec<FtsField> = CODE_FTS_FIELDS.into_iter().map(FtsField::new).collect();
+            let fields: Vec<FtsField> = crate::code::search::CODE_FTS_FIELDS
+                .into_iter()
+                .map(FtsField::new)
+                .collect();
             if fts_schema_differs(db.fts_schema(&target), &fields) {
                 db.set_fts_schema(&target, &fields)
                     .with_context(|| format!("declaring the fts schema on '{target}'"))?;
@@ -583,18 +582,10 @@ fn scope<'a>(refs: &'a [&'a str]) -> crate::Scope<'a> {
     }
 }
 
-/// One clause per declared field: a query word may live in the body, the path, the symbol
-/// name or the doc comment. `Max` rather than `Sum`, so a long body cannot out-accumulate an
-/// exact symbol-name match.
+/// The query leg is the shared builder; this holds only what stays CLI-specific: scope and
+/// `top_k`.
 fn text_search(db: &Nidus, refs: &[&str], query: &str, top_k: usize) -> Result<Vec<crate::Hit>> {
-    let q = FtsQuery {
-        combine: crate::FtsCombine::Max,
-        ..FtsQuery::multi(
-            CODE_FTS_FIELDS
-                .into_iter()
-                .map(|f| crate::FtsClause::new(f, query.to_string())),
-        )
-    };
+    let q = crate::code::search::fts_query(query);
     let opts = SearchOpts {
         top_k,
         ..Default::default()

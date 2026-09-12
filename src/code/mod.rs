@@ -10,6 +10,7 @@
 
 pub mod dispatch;
 pub mod present;
+pub mod search;
 
 use std::collections::BTreeMap;
 

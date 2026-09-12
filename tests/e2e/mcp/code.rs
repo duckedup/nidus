@@ -12,11 +12,11 @@ use super::{call, mcp, result, text};
 use crate::harness::RunningServer;
 use crate::harness::Server;
 
-/// Create `collection`, declare `nidus.text` as full-text, and seed it with `records` —
+/// Create `collection`, declare `fts_fields` as full-text, and seed it with `records` —
 /// hand-crafted attrs mirroring what a real `code` ingest would stamp (`src/code/mod.rs`'s
 /// `META_*` keys), since that ingest wiring is a different unit.
 #[cfg(feature = "code")]
-fn seed_code(server: &RunningServer, collection: &str, records: Value) {
+fn seed_code(server: &RunningServer, collection: &str, fts_fields: &[&str], records: Value) {
     assert_eq!(
         server
             .post(&format!("/collections/{collection}"), &json!({}))
@@ -27,7 +27,7 @@ fn seed_code(server: &RunningServer, collection: &str, records: Value) {
         server
             .post(
                 &format!("/collections/{collection}/fts-schema"),
-                &json!({"fields": ["nidus.text"]})
+                &json!({"fields": fts_fields})
             )
             .0,
         200
@@ -50,6 +50,7 @@ fn code_search_finds_a_symbol_by_path_kind_and_line_span_never_a_vector_or_sourc
     seed_code(
         &server,
         "code",
+        &["nidus.text"],
         json!([
             {
                 "id": "src/commit.rs#0",
@@ -127,6 +128,71 @@ fn code_search_finds_a_symbol_by_path_kind_and_line_span_never_a_vector_or_sourc
     );
 }
 
+/// The load-bearing regression test (nidus-hij): with all four fields declared, a query term
+/// that appears only in `code.symbol` (nowhere in `nidus.text`) must still find its file. A
+/// BM25 leg built over `nidus.text` alone cannot see this match at all.
+#[cfg(feature = "code")]
+#[test]
+fn code_search_over_mcp_matches_a_term_found_only_in_the_symbol_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    seed_code(
+        &server,
+        "code",
+        &["nidus.text", "code.path", "code.symbol", "code.doc"],
+        json!([
+            {
+                "id": "src/quibble.rs#0",
+                "vector": [1, 0, 0],
+                "attrs": {
+                    "code.path": {"Str": "src/quibble.rs"},
+                    "code.symbol": {"Str": "quibble_step"},
+                    "code.kind": {"Str": "function"},
+                    "code.language": {"Str": "rust"},
+                    "code.start_line": {"Int": 1},
+                    "code.end_line": {"Int": 4},
+                    "nidus.text": {"Str": "adjusts internal state and returns a result"}
+                }
+            },
+            {
+                "id": "src/other.rs#0",
+                "vector": [0, 1, 0],
+                "attrs": {
+                    "code.path": {"Str": "src/other.rs"},
+                    "code.symbol": {"Str": "unrelated_thing"},
+                    "code.kind": {"Str": "function"},
+                    "code.language": {"Str": "rust"},
+                    "code.start_line": {"Int": 1},
+                    "code.end_line": {"Int": 5},
+                    "nidus.text": {"Str": "nothing to do with the query at all"}
+                }
+            }
+        ]),
+    );
+
+    let (status, body) = mcp(
+        &server,
+        "tools/call",
+        Some("code_search"),
+        &call(
+            1,
+            "code_search",
+            json!({"collection": "code", "query": "quibble", "semantic": false}),
+        ),
+    );
+    assert_eq!(status, 200, "code_search failed: {body}");
+    let rendered = text(&result(&body));
+
+    assert!(
+        rendered.contains("\"path\": \"src/quibble.rs\""),
+        "a query matching only the symbol name should still find its file: {rendered}"
+    );
+    assert!(
+        !rendered.contains("src/other.rs"),
+        "the non-matching file must not appear: {rendered}"
+    );
+}
+
 /// `POST /code-search` directly, against a store pinned at dimension 0 (no embedding space
 /// at all): it must answer with BM25 results, not the "does not match store dimension"
 /// error a vector query would get.
@@ -138,6 +204,7 @@ fn code_search_on_a_dimension_zero_store_answers_bm25_not_a_dimension_error() {
     seed_code(
         &server,
         "code",
+        &["nidus.text"],
         json!([{
             "id": "src/widen.rs#0",
             "vector": [],

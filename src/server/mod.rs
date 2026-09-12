@@ -1881,8 +1881,8 @@ async fn code_search_vector(
     )))
 }
 
-/// The BM25 leg: matches `query` against the reserved chunk-text field every ingest path
-/// (code or prose) stamps, needing no embedder at all.
+/// The BM25 leg: matches `query` against the four fields [`crate::code::search::fts_query`]
+/// declares (chunk body, path, symbol, doc), needing no embedder at all.
 #[cfg(feature = "code")]
 async fn code_search_bm25(
     st: AppState,
@@ -1896,11 +1896,7 @@ async fn code_search_bm25(
         filter,
         ..Default::default()
     };
-    let q = FtsQuery {
-        clauses: vec![crate::FtsClause::new(crate::model::META_TEXT, query)],
-        combine: crate::FtsCombine::default(),
-        highlight: None,
-    };
+    let q = crate::code::search::fts_query(&query);
     run_read(st, move |db| db.text_search(collection.as_str(), &q, &opts)).await
 }
 
