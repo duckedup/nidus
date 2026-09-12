@@ -113,11 +113,7 @@ impl NidusMcp {
                 filter,
                 ..Default::default()
             };
-            let q = crate::FtsQuery {
-                clauses: vec![crate::FtsClause::new(crate::model::META_TEXT, query)],
-                combine: crate::FtsCombine::default(),
-                highlight: None,
-            };
+            let q = crate::code::search::fts_query(&query);
             crate::server::run_read(self.state.clone(), move |db| {
                 db.text_search(collection.as_str(), &q, &opts)
             })

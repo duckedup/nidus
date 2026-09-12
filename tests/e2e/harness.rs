@@ -211,6 +211,20 @@ impl RunningServer {
         self.stderr.lock().expect("stderr log").join("\n")
     }
 
+    /// Poll stderr until `pred` accepts it, or `limit` elapses. Returns the final snapshot
+    /// either way, so a timeout fails the caller's own assertion (with the full log in the
+    /// panic) instead of soft-passing (nidus-1jd).
+    pub fn stderr_until(&self, limit: Duration, pred: impl Fn(&str) -> bool) -> String {
+        let started = Instant::now();
+        loop {
+            let snapshot = self.stderr();
+            if pred(&snapshot) || started.elapsed() >= limit {
+                return snapshot;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     /// `GET path`, as `(status, body)`. The body is `Value::Null` when not JSON (an
     /// error page, say), so status-only assertions don't have to care.
     pub fn get(&self, path: &str) -> (u16, Value) {

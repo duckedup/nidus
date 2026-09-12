@@ -57,7 +57,7 @@ file says how it is enforced.
 
 **Several tickets are one job, not N jobs**: one branch, one blueprint, one version bump, one
 PR closing all of them. Do not open a branch per ticket unless the user asks or one is
-blocked. `lanes/spec.md` step 3 has the reasoning and the naming.
+blocked. `lanes/spec.md` step 4 has the reasoning and the naming.
 
 ## Preflight (every subcommand, `review` and `fit` included)
 
@@ -125,6 +125,15 @@ blocked. `lanes/spec.md` step 3 has the reasoning and the naming.
   signal that only ever appeared by accident, and a `git log -6` sample that could not have
   disconfirmed the convention it was sampling. A green result from a check that had no failing
   mode is indistinguishable from no check. For a regression test, go and watch it go red.
+- **An acceptance criterion you inherit is a check too, and it can arrive already unfalsifiable.**
+  The rule above assumes you wrote the check; this one does not. nidus-g4h shipped with
+  "assert the reopened store returns the upserted rows through a filtered query" — true with
+  and without the fix, because a watermark guard rebuilds the index anyway. Nobody could have
+  read that off the ticket: it took tracing every reader of the flag. A bad criterion is worse
+  than a bad test, because it propagates — into the blueprint, then into every agent that
+  reads it, each of which is being graded against it. So construct the counterfactual for each
+  criterion *before* the scope gate, and when one has no failing mode say so, fix the ticket,
+  and ship the criterion that does.
 - **A green lane run is evidence only about a tree nobody was writing to.** Anything sharing
   the checkout while the lanes run — an agent, another session, you — can turn a lane red for
   a reason that is nowhere in the diff and gone before you look. When a lane fails on

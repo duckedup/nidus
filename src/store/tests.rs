@@ -4120,6 +4120,57 @@ fn hybrid_search_is_deterministic() {
     assert_eq!(ids_a, ids_b);
 }
 
+/// Mirrors `fts_cache_persists_and_reloads` for the filter index, upsert-only (nidus-g4h).
+/// `set_filter_index` sets `findex_dirty` itself, so the setup persists once to clear
+/// that and deletes the file: only the upsert below can recreate it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn findex_cache_persists_after_upsert_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut store = Store::open(Config::new(&path, 2)).unwrap();
+    store
+        .set_filter_index("docs", &[FilterIndexField::new("body")])
+        .unwrap();
+    // Clear the dirty flag `set_filter_index` set on its own, then remove the file it
+    // wrote so only the upsert below can recreate it.
+    store.persist_index().unwrap();
+    std::fs::remove_file(path.join("findex")).unwrap();
+
+    store
+        .upsert("docs", &[doc("a", "alpha beta"), doc("b", "beta gamma")])
+        .unwrap();
+    store.persist_index().unwrap();
+    assert!(
+        path.join("findex").exists(),
+        "findex cache file written after upsert-only persist"
+    );
+    drop(store);
+
+    // Reopening must ADOPT that cache, not rebuild from the replayed docs. `findex_dirty`
+    // is the tell: `load_or_build_findex` clears it on adoption, `rebuild_findex` sets it.
+    let reopened = Store::open(Config::new(&path, 2)).unwrap();
+    assert!(
+        !reopened.findex_dirty,
+        "the reopened store rebuilt the filter index instead of adopting the cache"
+    );
+    let hits = reopened
+        .list(
+            &["docs"],
+            &ListOpts {
+                filter: Filter(vec![Predicate::ContainsAllTokens(
+                    "body".into(),
+                    "beta".into(),
+                )]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["a", "b"], "adopted index answers the filter");
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn fts_cache_persists_and_reloads() {
