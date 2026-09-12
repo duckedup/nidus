@@ -6,6 +6,8 @@
 //! string, array-vs-object shape, a stderr line — never just "200 with some hits", which
 //! would still pass if the whole feature were reverted.
 
+use std::time::Duration;
+
 use serde_json::{Value, json};
 
 use crate::harness::Server;
@@ -200,7 +202,9 @@ fn slow_query_threshold_logs_a_stderr_line_with_a_path() {
     let (status, hits) = server.post("/search", &json!({"query": query, "top_k": 5}));
     assert_eq!(status, 200, "{hits}");
 
-    let stderr = server.stderr();
+    let stderr = server.stderr_until(Duration::from_secs(2), |s| {
+        s.lines().any(|l| l.contains("msg=") && l.contains("slow query"))
+    });
     let slow_line = stderr
         .lines()
         .find(|l| l.contains("msg=") && l.contains("slow query"))

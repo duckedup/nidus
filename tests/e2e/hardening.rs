@@ -292,13 +292,9 @@ fn request_ids_round_trip_into_the_access_log() {
         Some("e2e-correlation-1")
     );
 
-    // The access line is emitted after the response is produced, so give the child a
-    // moment to flush it before reading its stderr.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && !server.stderr().contains("e2e-correlation-1") {
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    let log = server.stderr();
+    // The access line is emitted after the response is produced, so wait for it rather than
+    // racing the harness's stderr reader thread (nidus-1jd).
+    let log = server.stderr_until(Duration::from_secs(5), |s| s.contains("e2e-correlation-1"));
     assert!(
         log.contains("id=e2e-correlation-1"),
         "the access log should carry the caller's id:\n{log}"
