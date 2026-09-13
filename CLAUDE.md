@@ -169,8 +169,9 @@ once on stderr. Nothing requires it (D0013).
   non-additive on-disk format change, or weakening a Core Foundation commitment.
 - **No em dashes in user-facing prose** (docs site, README, SDK READMEs). Reword with a
   period, comma, colon, or parentheses. En dashes in numeric ranges are fine.
-- **Positioning:** nidus is a vector store for development and small-scale use. Describe what
-  it does today; do not pin it to "an embeddable library" and do not promise future modes.
+- **Positioning:** nidus is a vector store with full-text search that runs anywhere Rust runs
+  (D0016). Describe what it does today; do not pin it to "an embeddable library" and do not
+  promise future modes.
 - Commit style: emoji prefix + short description (e.g. `🪺 op-log codec`).
 - One branch per issue or bundled epic; push for PR review.
 

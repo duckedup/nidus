@@ -159,8 +159,8 @@ pub fn backup(source: &str, out_location: &str) -> Result<BackupReport> {
     }
     objects.push(object_sum("log", &log));
 
-    // Build the whole gzip-tar archive in memory, then PUT it as one object. A
-    // snapshot of a dev/small-scale store fits in RAM comfortably (SPEC §13.7).
+    // Build the whole gzip-tar archive in memory, then PUT it as one object: this
+    // path buffers the whole archive in RAM, so it is bounded by store size (SPEC §13.7).
     let mut archive: Vec<u8> = Vec::new();
     {
         let gz = GzEncoder::new(&mut archive, Compression::default());

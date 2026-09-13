@@ -112,10 +112,10 @@ and staleness contract.
 
 ## The target regime
 
-nidus is tuned for **exact** search at the scale where a full scan wins: up to a
-few million vectors, comfortably in RAM. At that size, 100% recall with no index
-to build or tune beats an approximate index, and exact search is the default, so
-you never pay for an index you don't need.
+nidus is tuned for **exact** search at the scale where a full scan wins. Scan cost scales
+with the rows scanned, so where a full sweep is cheap, 100% recall with no index to build
+or tune beats an approximate index. Exact search is the default, so you never pay for an
+index you don't need.
 
 Past that scale, an [approximate index](/guides/search/#approximate-search-ann)
 (HNSW or IVF, via `Config::ann`) is available as an opt-in: it trades some recall

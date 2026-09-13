@@ -1,11 +1,12 @@
 # nidus
 
-A small, pure-Rust **all-in-one memory**: remember text, recall the relevant bits.
-Hand it natural language and nidus embeds the text for you (optionally summarizing
-first) with the provider of your choice, or bring your own vectors. At its core
-it's a vector store for development and small-scale use: exact-by-default
-nearest-neighbour search (cosine, dot, or Euclidean) over a single append-only
-directory, approximate (HNSW/IVF) when you opt in, with typed metadata filters and
+nidus is a pure-Rust vector store with full-text search that runs anywhere Rust runs:
+in process as a library, behind `nidus serve` over HTTP, as an MCP server, or in a
+browser on wasm. Its bytes live on local disk or in object storage (S3, GCS), with an
+optional shared memory tier (Redis, Valkey). Hand it natural language and nidus embeds
+the text for you (optionally summarizing first) with the provider of your choice, or
+bring your own vectors: exact-by-default nearest-neighbour search (cosine, dot, or
+Euclidean), approximate (HNSW/IVF) when you opt in, with typed metadata filters and
 many logical collections sharing one embedding space. No SQL, no query engine, no
 bundled C++ tree.
 
@@ -107,11 +108,11 @@ See [`examples/demo.rs`](examples/demo.rs) for an end-to-end run (`cargo run
   `--no-default-features` gives the storage-and-search core alone, without this
   layer. See the
   [remember & recall guide](https://nidus.duckedup.org/guides/remember-and-recall/).
-- **Exact or approximate search**: exact by default (100% recall, fast at the target
-  scale of ≤ a few million vectors, comfortably in RAM). Score by cosine, dot, or
-  Euclidean (cosine the default; cosine vectors are unit-normalized on insert, so a
-  score is plain similarity in `[-1, 1]`). Opt into an approximate index (HNSW or IVF)
-  or int8 quantization to trade some recall for speed at larger scale.
+- **Exact or approximate search**: exact by default (100% recall; scan cost scales with
+  the rows scanned). Score by cosine, dot, or Euclidean (cosine the default; cosine
+  vectors are unit-normalized on insert, so a score is plain similarity in `[-1, 1]`).
+  Opt into an approximate index (HNSW or IVF) or int8 quantization to trade some recall
+  for speed at larger scale.
 - **Scoped search**: query one collection, a subset, or the **whole store** in one
   call, merged into a single ranking. Sound because every collection shares one
   embedding space (one pinned dimension).

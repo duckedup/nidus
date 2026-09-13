@@ -37,9 +37,15 @@ not the functionality test, the **build-and-ship** test:
   top-k. Same disease as DuckDB, transitively-Rust instead of FFI.
 
 At its core the workload is a **vector store, not a database**: no joins, no SQL, no
-analytics, no larger-than-RAM scans (at the target scale). nidus is that store —
-plus a memory layer (embedding, optionally summarization) built on top — and nothing
-more; `--no-default-features` gives the storage-and-search core alone.
+analytics; the scan cost is what it is, and mmap, ANN, quantization and segments are the
+opt-ins that change it. nidus is that store — plus a memory layer (embedding, optionally
+summarization) built on top — and nothing more; `--no-default-features` gives the
+storage-and-search core alone.
+
+nidus is a pure-Rust vector store with full-text search that runs anywhere Rust runs: in
+process as a library, behind `nidus serve` over HTTP, as an MCP server, or in a browser on
+wasm. Its bytes live on local disk or in object storage (S3, GCS), with an optional shared
+memory tier (Redis, Valkey).
 
 ### Thesis (the product *is* the constraints)
 
@@ -91,9 +97,10 @@ Compiling a *large* C tree, or adding a *second* `unsafe` site to *our* code, is
 ## 2. Goals & non-goals
 
 **Goals**
-- Embeddable, in-process, single-store-per-directory.
-- Exact (100% recall) brute-force cosine search, fast at the target scale
-  (≤ a few million vectors, comfortably in RAM).
+- Runs anywhere Rust runs: in process as a library, behind `nidus serve` over HTTP, as an
+  MCP server, or in a browser on wasm; single-store-per-directory.
+- Exact (100% recall) brute-force cosine search, whose scan cost scales with rows scanned;
+  mmap, ANN, and quantization are the opt-ins that change that.
 - Many logical collections (namespaces) in one store, sharing one dimension.
 - **Scoped search**: query one collection, a chosen subset, or the entire store in
   a single call, with results merged into one ranking. The API must not lock callers
@@ -2245,8 +2252,8 @@ minute — CI asserts it (§9, the build-time gate).**
   segment is an in-RAM buffer rewritten as one whole object on sync (`ObjectAppender`,
   `O(object)` per flush) under a race-free object lock — atomic create-if-absent (S3
   `If-None-Match: *`, GCS `ifGenerationMatch=0`, nidus-a7c), falling back to an advisory
-  get-then-put on a backend lacking the primitive. Best for low-write-rate / dev /
-  small-scale, single-writer use (nidus's positioning).
+  get-then-put on a backend lacking the primitive. Best for low-write-rate, single-writer
+  use, since each segment flush rewrites a whole object.
 - **Snapshot / backup (built).** PUT/GET the whole store as one archive (the `cli`-feature
   `tar.gz`). This is *exactly* object-granular, so every persistence backend does it
   trivially. `nidus backup --out <loc>` reads the source store's `data`/`log` objects via

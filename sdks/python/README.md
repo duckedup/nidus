@@ -1,16 +1,16 @@
 # nidus (Python)
 
-The Python client for [nidus](https://nidus.duckedup.org) — a small, fast vector store.
-This package drives a running `nidus serve` instance over HTTP, whether it is on your
-laptop or a remote host.
+The Python client for [nidus](https://nidus.duckedup.org), a pure-Rust vector store with
+full-text search that runs anywhere Rust runs. This package drives a running `nidus serve`
+instance over HTTP, whether it is on your laptop or a remote host.
 
 ```bash
-pip install nidus            # the sync client — pulls ZERO dependencies
+pip install nidus            # the sync client: pulls ZERO dependencies
 pip install 'nidus[async]'   # adds AsyncNidusClient (httpx)
 ```
 
 `NidusClient` is built on `urllib.request`, so installing this package brings nothing
-else with it — the same zero-dependency posture the JS SDK gets from the platform
+else with it, the same zero-dependency posture the JS SDK gets from the platform
 `fetch`. Only the async client needs a third-party HTTP stack, and it is quarantined
 behind the `async` extra. Python 3.9+.
 
@@ -20,7 +20,7 @@ identically-numbered nidus release. Match the two and the wire contract lines up
 
 ## Connecting
 
-"Local vs remote" is just the base URL — point the client at a local `nidus serve` or
+"Local vs remote" is just the base URL: point the client at a local `nidus serve` or
 any reachable host.
 
 ```python
@@ -41,7 +41,7 @@ db = NidusClient(
 
 Both clients work as context managers. Nothing is opened until the first request, and the
 default `urllib` transport is connectionless, so `close()` matters only once a pooled
-transport (below) or the async client is in play — using `with` means you never have to
+transport (below) or the async client is in play, using `with` means you never have to
 remember which case you are in:
 
 ```python
@@ -57,7 +57,7 @@ with an `ImportError` that names that fix. Either spelling works:
 
 ```python
 from nidus.aio import AsyncNidusClient   # explicit
-import nidus; nidus.AsyncNidusClient     # lazy — resolved on first attribute access
+import nidus; nidus.AsyncNidusClient     # lazy: resolved on first attribute access
 ```
 
 `import nidus` itself never touches `httpx`, which is what keeps the dependency
@@ -79,7 +79,7 @@ asyncio.run(main())
 
 ## Upserting and searching
 
-`attrs` accept plain Python values — `str`, `int`, `bool`, lists of `str`, and `None` —
+`attrs` accept plain Python values (`str`, `int`, `bool`, lists of `str`, and `None`)
 and are normalized to nidus's typed values for you. Results come back with `attrs`
 decoded to plain Python values.
 
@@ -89,7 +89,7 @@ db.create_collection("docs")
 db.upsert("docs", [
     {"id": "a", "vector": [0.1, 0.2, 0.3], "attrs": {"lang": "rust", "year": 2024}},
     {"id": "b", "vector": [0.4, 0.5, 0.6], "attrs": {"lang": "go", "year": 2023}},
-    # a text-only doc — omit the vector
+    # a text-only doc: omit the vector
     {"id": "c", "attrs": {"body": "vector stores are neat"}},
 ])
 
@@ -99,16 +99,16 @@ for hit in db.search(query=[0.1, 0.2, 0.3], top_k=5):
 
 `upsert` and `delete` return a count; the search family returns a list of `Hit`
 dataclasses (`collection`, `id`, `score`, `attrs`). `attrs` is a plain `dict`, so reach
-for `.get` unless every record in scope is known to carry the key — a search spans
+for `.get` unless every record in scope is known to carry the key: a search spans
 whatever the scope holds, and attrs are per-record, not a schema.
 
 The Python type of an attribute decides its nidus type, and the pair that matters is
 `Int` vs `Float`: `2` is an `Int`, `2.0` is a `Float`. They are separate types on the
 server and comparisons are same-type only, so a `Float` attribute filtered with an `int`
-operand matches nothing — keep a numeric field's Python type uniform across records.
+operand matches nothing, so keep a numeric field's Python type uniform across records.
 `nan` and `inf` are refused (`ValueError`): JSON cannot spell them.
 
-A `datetime` becomes a `DateTime` — a UTC instant carried as epoch **milliseconds**, so
+A `datetime` becomes a `DateTime` (a UTC instant carried as epoch **milliseconds**), so
 sub-millisecond precision is truncated and the timezone is not stored. It must be
 **aware**; a naive `datetime` raises `ValueError` rather than being assumed to be UTC,
 because the wrong guess is off by hours in valid-looking JSON. Reading one back gives an
@@ -130,13 +130,13 @@ db.upsert("docs", [{"id": "d", "attrs": {
 }}])
 ```
 
-`v.nil()` is the explicit `Null` value — "set, and empty" — which is a different fact
+`v.nil()` is the explicit `Null` value ("set, and empty"), which is a different fact
 from an absent key ("not set / not indexed"). The SDK keeps them apart.
 
 ## Filtering
 
 Build an AND-filter with the `f.*` helpers. Each predicate is a positive assertion about
-a **present** attribute, so an absent key matches nothing — including the negative
+a **present** attribute, so an absent key matches nothing, including the negative
 predicates (`ne`, `not_in`) and the ranges.
 
 ```python
@@ -157,7 +157,7 @@ hits = db.search(
 Predicates: `eq`, `ne`, `glob`, `iglob`, `in_`, `not_in`, `lt`, `le`, `gt`, `ge`,
 `contains`, `not_contains`, `contains_any`; the text ones `fuzzy`, `contains_all_tokens`,
 `contains_any_token`, `contains_token_sequence`, `regex`; and the groups `all_`, `any_`,
-`not_`, plus `and_`. The trailing underscores are not style — `in`, `and` and `not` are
+`not_`, plus `and_`. The trailing underscores are not style: `in`, `and` and `not` are
 reserved words in Python and `all`/`any` shadow builtins, so `f.in_`, `f.not_in`, `f.and_`,
 `f.all_`, `f.any_` and `f.not_` are the JS SDK's `f.in`, `f.notIn`, `f.and`, `f.all`,
 `f.any` and `f.not`. Nothing else deviates.
@@ -174,11 +174,11 @@ punctuation do not count, and each of them matches a list attribute when any sin
 element does.
 
 A `Filter` is just a `list` of predicates, AND-combined, so `f.and_(...)` is sugar for
-building that list — `filter=[f.eq("lang", "rust")]` is equally valid.
+building that list: `filter=[f.eq("lang", "rust")]` is equally valid.
 
 Comparisons are same-type only (int↔int numeric, float↔float by IEEE, str↔str lexical,
 bool↔bool, datetime↔datetime as instants). A range predicate against a mismatched type
-matches nothing, which is the usual reason a filter mysteriously returns no rows — and
+matches nothing, which is the usual reason a filter mysteriously returns no rows, and
 `f.gt("score", 2)` against a `Float` attribute is exactly that mismatch.
 
 ## Indexing the text predicates
@@ -228,7 +228,7 @@ document matched:
 ```python
 hits = db.text_search(
     clauses=[{"field": "title", "query": "rust"}, {"field": "body", "query": "async runtime"}],
-    combine="Sum",      # or "Max" — Sum rewards matching in two fields, Max takes the best
+    combine="Sum",      # or "Max": Sum rewards matching in two fields, Max takes the best
     explain=True,       # each matched clause's own BM25 score
     highlight=True,     # or {"max_fragments": 2, "fragment_chars": 80}
 )
@@ -244,7 +244,7 @@ for hit in hits:
 
 `field`+`query` and `clauses` are mutually exclusive, and an empty clause list is refused
 at the call site rather than answered as "no matches". `hit.annotations` is `None` unless
-`explain` or `highlight` asked for it — on a hybrid search it also carries each leg's own
+`explain` or `highlight` asked for it. On a hybrid search it also carries each leg's own
 `rank` and `score`, which is the only way to see a leg's rank, since the returned score is
 the fused one.
 
@@ -252,7 +252,7 @@ the fused one.
 match, for typeahead:
 
 ```python
-# Matches "running", "runtime", … — every indexed term "run" is a prefix of.
+# Matches "running", "runtime", …: every indexed term "run" is a prefix of.
 db.text_search(field="title", query="run", prefix=True)
 
 # On the clauses spelling it is set per clause, not on the call as a whole.
@@ -260,7 +260,7 @@ db.text_search(clauses=[{"field": "title", "query": "run", "prefix": True}])
 ```
 
 Only the clause's last term expands; earlier terms still need an exact stem match. The
-index holds stems, so `"runn"` will not prefix-match indexed `"run"` — the fragment itself
+index holds stems, so `"runn"` will not prefix-match indexed `"run"`. The fragment itself
 is not stemmed, only fold-normalized (lowercased, accent-stripped).
 
 ## Suggest (typeahead)
@@ -307,7 +307,7 @@ when that phase did not run, except `total_us`, which always does. `text_search`
 ## Remembering and recalling (text-native)
 
 When the server is started with an embedder (`nidus serve --embed-provider …`) you can
-send **text** and let the server embed it — no need to compute vectors client-side.
+send **text** and let the server embed it, no need to compute vectors client-side.
 `remember` embeds and upserts; `recall` embeds the query and vector-searches.
 
 ```python
@@ -331,7 +331,7 @@ hits = db.recall("notes", "quick fox", top_k=5, min_score=0.2, filter=[f.eq("tag
 db.recall("notes", "quick fox", reinforce=True, extend_ttl_seconds=3600)
 ```
 
-`remember` returns a `RememberResult` — `id`, `upserted`, `deduped`. Read `id` from it
+`remember` returns a `RememberResult` (`id`, `upserted`, `deduped`). Read `id` from it
 rather than assuming the one you passed: a `dedupe_threshold` match redirects the write
 onto the entry it matched, and that entry's id is the one that changed. An already-expired
 entry is never a dedupe candidate, so a TTL that has run out cannot be revived by a later
@@ -339,7 +339,7 @@ near-duplicate.
 
 Both raise `NidusError` with status `400` against a server that has **no embedder
 configured** (the message names `--embed-provider`), and `mode="summarize"` without a
-summarizer is likewise a `400`. Dedupe needs that same embedder — it is a vector search
+summarizer is likewise a `400`. Dedupe needs that same embedder: it is a vector search
 under the hood. The client only ever sends text; the embedding always happens server-side.
 
 ## Everything else
@@ -368,7 +368,7 @@ rather than a number: `top_k=0` is a legitimate request for zero results, so `0`
 double as "unset".
 
 `stats().ann` is `None` when the store does exact brute-force search, rather than an
-`AnnInfo` full of defaults. Likewise `Record.vector` is `None` — never `[]` — for a
+`AnnInfo` full of defaults. Likewise `Record.vector` is `None` (never `[]`) for a
 text-only document. `aggregate` is answered from the in-RAM index alone (no record is
 built, no vector is read), and its sums keep the server's type: a run of `Int`s is an
 `int`, a run that met one `Float` is a `float`.
@@ -428,11 +428,11 @@ Python's type system cannot express two mistakes that produce a **well-formed** 
 server accepts and answers wrongly, so the SDK refuses them at the call site instead:
 
 ```python
-db.delete("docs", "a")          # TypeError: a str IS a Sequence[str] — this asked to
+db.delete("docs", "a")          # TypeError: a str IS a Sequence[str], so this asked to
                                 # delete the ids "a"... one character at a time
-db.search(query=vec, scope="docs")   # TypeError — same slip, five collections that
+db.search(query=vec, scope="docs")   # TypeError: same slip, five collections that
                                      # do not exist, an empty result and a 200
-f.in_("lang", "rust")           # TypeError — one predicate value per character
+f.in_("lang", "rust")           # TypeError: one predicate value per character
 db.delete_where("docs", [])     # ValueError: an empty filter matches EVERYTHING, so this
                                 # deleted the whole collection; use drop_collection
 ```
@@ -450,7 +450,7 @@ The honest cost of a standard-library-only client: `urllib.request` opens a **fr
 connection per request**. For interactive use that is invisible; for a long run of
 sequential upserts the handshakes are measurable overhead.
 
-The escape hatch is `transport=` — a callable
+The escape hatch is `transport=`, a callable
 `(method, url, headers, body, timeout) -> (status, text)`. Hand in one backed by `httpx`
 or `requests` and you get pooling, keep-alive, retries, or instrumentation without the
 SDK taking on a dependency for everyone:
@@ -482,7 +482,7 @@ with NidusClient("http://127.0.0.1:7700", transport=PooledTransport()) as db:
 ```
 
 The same seam is what lets the SDK's own unit tests exercise every endpoint with no
-server and no socket. `AsyncNidusClient` takes the natural equivalent for its own stack —
+server and no socket. `AsyncNidusClient` takes the natural equivalent for its own stack:
 `transport=` there is an `httpx.AsyncBaseTransport` (a pre-tuned pool, or an
 `httpx.MockTransport` for tests); it pools by default, so nothing extra is needed for
 bulk ingest.
@@ -498,17 +498,17 @@ from nidus import NidusError
 try:
     db.upsert("docs", records)
 except NidusError as err:
-    if err.is_bad_request:      # 400 — e.g. a vector dimension mismatch
+    if err.is_bad_request:      # 400: e.g. a vector dimension mismatch
         ...
-    if err.is_locked:           # 409 — the writer lock is held by another process
+    if err.is_locked:           # 409: the writer lock is held by another process
         ...
     print(err.status, err.message)
 ```
 
-Also available: `is_read_only` (403), `is_out_of_capacity` (507 — `max_vector_bytes`
+Also available: `is_read_only` (403), `is_out_of_capacity` (507, `max_vector_bytes`
 exceeded, or OOM), and `is_transport_error`.
 
-A status of `0` is the sentinel for **no response at all** — connection refused, DNS
+A status of `0` is the sentinel for **no response at all**: connection refused, DNS
 failure, or the request exceeded `timeout`. Every nidus SDK uses the same sentinel, so
 "was this even reachable?" is answered identically in all of them.
 

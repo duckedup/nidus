@@ -15,8 +15,8 @@ description, or an issue number to resolve with `bd show`).
    capability.
 3. **Right fit.** Judge against SPEC §1 (the core foundation and thesis) and §2
    (goals/non-goals): does it belong in nidus core, or in the host application, an SDK,
-   the docs, or a separate tool? Does the public positioning (development and small-scale
-   use, nothing promised beyond what ships) survive it?
+   the docs, or a separate tool? Does the public positioning (the shipped modes, D0016,
+   nothing promised beyond what ships) survive it?
 4. **Does it make sense — the cost side.**
    - On-disk or wire format change? SPEC §9's rule applies: a format change needs a
      **named caller**; query-path features are judged on their own merits.

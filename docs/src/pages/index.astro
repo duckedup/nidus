@@ -152,7 +152,10 @@ const more = [
               a support archive or a codebase, and it finds the passages that answer a
               question, by meaning or by exact words. <strong>It is the retrieval half of a
               RAG app, the memory behind an agent, and a plain search box, all out of one
-              folder.</strong>
+              folder.</strong> It is a pure-Rust vector store with full-text search that
+              runs anywhere Rust runs: in process as a library, behind
+              <code>nidus serve</code> over HTTP, as an MCP server, or in a browser on
+              wasm.
             </p>
 
             <div class="install" data-lift style="--lift-delay:0.28s">
