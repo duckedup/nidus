@@ -393,6 +393,25 @@ test('lanes: the CI-covered section is printed, not silently dropped', () => {
   eq(/just miri/.test(out), true, 'names the recipe')
 })
 
+test('lanes: every top-level integration test maps to `just ci` (nidus-q7q0)', () => {
+  // `just test` is `cargo test --no-default-features`, which builds every target directly
+  // under tests/. The rule used to allowlist two filenames, so tests/filter_index.rs — which
+  // already shipped — reported as unmapped, and so would every new integration test.
+  for (const f of ['tests/integration.rs', 'tests/build_thesis.rs', 'tests/filter_index.rs', 'tests/namespaces.rs']) {
+    const r = lanes([f])
+    eq(r.unmatched, [], `${f} must not be unmapped`)
+    eq(r.run.map(l => l.recipe).includes('just ci'), true, `${f} runs just ci`)
+  }
+})
+
+test('lanes: widening tests/ did not swallow the subdirectory suites (nidus-q7q0)', () => {
+  // The counterfactual for the rule above: these must still NOT pull `just ci`, because the
+  // lean build cannot exercise them. tests/e2e/ is #![cfg(feature = "cli")]; wasm needs a browser.
+  for (const f of ['tests/e2e/cluster.rs', 'tests/e2e/aliases.rs', 'tests/wasm_opfs/main.rs']) {
+    eq(lanes([f]).run.map(l => l.recipe).includes('just ci'), false, `${f} must not run just ci`)
+  }
+})
+
 test('lanes: cluster tests are manual, not automatic', () => {
   const r = lanes(['tests/e2e/cluster.rs'])
   eq(r.run.map(l => l.recipe), [], 'nothing automatic')
