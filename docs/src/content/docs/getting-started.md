@@ -3,9 +3,14 @@ title: Getting started
 description: Add nidus to a Rust project, open a store, index records, and run your first vector, full-text, or hybrid search.
 ---
 
-nidus is a vector store and full-text search engine for development and small-scale
-use. You add it as a dependency, open a store in a directory of your choosing, and
-call methods. There is nothing to install, no daemon to run, and no network.
+nidus is a pure-Rust vector store with full-text search that runs anywhere Rust runs: in
+process as a library, behind `nidus serve` over HTTP, as an MCP server, or in a browser on
+wasm. Its bytes live on local disk or in object storage (S3, GCS), with an optional shared
+memory tier (Redis, Valkey).
+
+This guide takes the in-process library path: add nidus as a dependency, open a store in a
+directory of your choosing, and call methods directly. There is nothing to install, no
+daemon to run, and no network for this path.
 
 A store holds records: a vector, an id, and an open map of typed metadata. You can
 search it three ways, and they share one set of results, filters, and scoping:
@@ -31,7 +36,7 @@ local store in four commands. See
 ```toml
 # Cargo.toml
 [dependencies]
-nidus = "0.98"
+nidus = "0.99"
 anyhow = "1"     # nidus returns anyhow::Result
 ```
 

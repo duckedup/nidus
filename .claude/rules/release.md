@@ -44,6 +44,9 @@ silently absent (D0012).
 - **NO em dashes in user-facing prose** (docs site, README, SDK READMEs). Reword with a period,
   comma, colon, or parentheses. A sweep removed them all; do not reintroduce them. En dashes in
   numeric ranges are fine.
-- **Positioning:** nidus is a vector store **for development and small-scale use**. Keep the
-  framing open — do NOT pin it to "an embeddable library" (or "a library, not a server") and do
-  NOT promise future modes ("server planned / on the roadmap"). Describe what it does today.
+- **Positioning:** nidus is a vector store with full-text search that runs anywhere Rust runs
+  (D0016): in process as a library, behind `nidus serve` over HTTP, as an MCP server, or in a
+  browser on wasm, with its bytes on local disk or in object storage and an optional shared
+  memory tier. Keep the framing open: do NOT pin it to "an embeddable library" (or "a library,
+  not a server") and do NOT promise future modes ("server planned / on the roadmap"). Describe
+  what it does today.

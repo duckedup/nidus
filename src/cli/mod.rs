@@ -54,7 +54,7 @@ mod docs_coverage;
 #[command(
     name = "nidus",
     version,
-    about = "A small, pure-Rust vector store — CLI and HTTP server"
+    about = "A pure-Rust vector store with full-text search: CLI and HTTP server"
 )]
 pub struct Cli {
     #[command(subcommand)]

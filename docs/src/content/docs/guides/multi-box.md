@@ -166,7 +166,7 @@ is not wrong exactly, but every query for its documents will go somewhere else.
 
 This recipe is entirely yours to operate. nidus contributes no code to it, and the following
 are explicitly out of scope: not "not yet", but **not planned**, because building them is
-how a small embeddable store turns into the managed cluster it exists as an alternative to:
+how a store you run yourself turns into the managed cluster it exists as an alternative to:
 
 - **No coordinator or service discovery.** The list of boxes is a constant in your client.
 - **No replication.** One copy of each shard. A dead box takes its slice offline until it is

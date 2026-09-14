@@ -1,8 +1,9 @@
 # @duckedup/nidus
 
-The JavaScript/TypeScript client for [nidus](https://nidus.duckedup.org), a small,
-fast vector store. This package connects to a running `nidus serve` instance over
-HTTP, whether it's on your laptop or a remote host.
+The JavaScript/TypeScript client for [nidus](https://nidus.duckedup.org), a pure-Rust
+vector store with full-text search that runs anywhere Rust runs. This package connects
+to a running `nidus serve` instance over HTTP, whether it's on your laptop or a remote
+host.
 
 It is a **remote client**: zero runtime dependencies, built on the platform-global
 `fetch`, so it runs unchanged on Node 18+, Deno, Bun, Cloudflare Workers, and in the

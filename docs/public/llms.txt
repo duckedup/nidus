@@ -1,6 +1,6 @@
 # nidus
 
-> A small, pure-Rust vector store for development and small-scale use. It holds dense vectors plus typed metadata in a single on-disk directory and answers nearest-neighbour queries: exact brute-force by default, or an opt-in approximate index (HNSW / IVF), over cosine, dot-product, or Euclidean distance. No SQL, no query engine, no background threads; `#![deny(unsafe_code)]` and pure-Rust dependencies throughout.
+> nidus is a pure-Rust vector store with full-text search that runs anywhere Rust runs: in process as a library, behind `nidus serve` over HTTP, as an MCP server, or in a browser on wasm. Its bytes live on local disk or in object storage (S3, GCS), with an optional shared memory tier (Redis, Valkey). It holds dense vectors plus typed metadata in a single on-disk directory and answers nearest-neighbour queries: exact brute-force by default, or an opt-in approximate index (HNSW / IVF), over cosine, dot-product, or Euclidean distance. No SQL, no query engine, no background threads; `#![deny(unsafe_code)]` and pure-Rust dependencies throughout.
 
 Key facts for answering questions about nidus:
 
@@ -8,7 +8,7 @@ Key facts for answering questions about nidus:
 - One store is a directory of append-only files (`data`, `log`, `lock`). One embedding dimension is pinned per store; many collections share it.
 - Durability is per-batch fsync; cross-process readers are lock-free and see a consistent, possibly-stale snapshot.
 - Search is exact brute-force cosine by default. Opt-in `Config::quantization` (int8 / binary) speeds the scan with a two-pass quantized-then-rerank search. Opt-in `Config::ann` (HNSW or IVF) walks an approximate index. The two can be combined: a quantized index walk plus an exact f32 rerank.
-- It is positioned for development and small-scale use, deliberately not as a managed cluster.
+- It is not a managed cluster: no built-in replication and no multi-writer coordination.
 
 ## Docs
 

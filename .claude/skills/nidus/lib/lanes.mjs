@@ -161,6 +161,11 @@ const RULES = [
     why: 'the docs-index build script changed — this recipe is what runs it',
     match: [/^scripts\/docs-index\.sh$/],
   },
+  {
+    recipe: 'just ceilings',
+    why: 'the lean ceilings or their committed bounds changed — the script is the gate',
+    match: [/^scripts\/ceilings\.(sh|env)$/],
+  },
 ]
 
 // Which changed paths exercise each heavy CI job. The guard step in ci.yml /
@@ -179,6 +184,8 @@ export const CI_JOBS = {
   'miri-integration': RUST,
   'build-budget': RUST,
   'build-budget-default': RUST,
+  // Plus the bounds file itself: a ceiling bump must re-run the job that enforces it.
+  'ceilings': [...RUST, /^scripts\/ceilings\.(sh|env)$/],
   'bench-compiles': RUST,
   'build-thesis': RUST,
   'sdk-integration': [...RUST, /^sdks\//],

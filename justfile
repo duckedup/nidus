@@ -61,6 +61,12 @@ deps:
 deps-lean:
     cargo tree -p nidus --no-default-features
 
+# Bound the lean dependency count and the shipped binary size (scripts/ceilings.sh,
+# scripts/ceilings.env). A bump is a design change (D0005) and lands in the PR that
+# needs it, not here.
+ceilings:
+    ./scripts/ceilings.sh
+
 # Pre-commit / pre-PR checks: format clean, no clippy warnings, tests green.
 # The lean library build only — the default build has its own gates
 # (`just ci-cli`, `just ci-serve`, …), kept separate so this stays a

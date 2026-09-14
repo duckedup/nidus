@@ -1,8 +1,8 @@
 # github.com/duckedup/nidus/sdks/go
 
-The Go client for [nidus](https://nidus.duckedup.org) — a small, fast vector store.
-This module connects to a running `nidus serve` instance over HTTP, whether it's on
-your laptop or a remote host.
+The Go client for [nidus](https://nidus.duckedup.org), a pure-Rust vector store with
+full-text search that runs anywhere Rust runs. This module connects to a running
+`nidus serve` instance over HTTP, whether it's on your laptop or a remote host.
 
 It is a **remote client**: zero dependencies, standard library only (`net/http`,
 `encoding/json`, `context`), so there is no `go.sum` beside `go.mod` and nothing that
@@ -12,7 +12,7 @@ can pull a transitive surprise into your binary.
 go get github.com/duckedup/nidus/sdks/go
 ```
 
-The module path ends in `go`, but the package is `nidus` — so imports read the way you
+The module path ends in `go`, but the package is `nidus`, so imports read the way you
 want and need no alias (a final path element that differs from the package name is
 legal Go; some editors will nonetheless offer to add one):
 
@@ -25,7 +25,7 @@ db, err := nidus.NewClient("http://127.0.0.1:7700")
 This module is versioned in lockstep with nidus itself, so `sdks/go@v0.39.0` is the
 client for nidus `0.39.x`. Match the two and the wire contract lines up. Because the
 module lives in a repository subdirectory, Go resolves it by a tag carrying that
-prefix — `sdks/go/v0.39.0` — which is what `@v0.39.0` finds:
+prefix (`sdks/go/v0.39.0`), which is what `@v0.39.0` finds:
 
 ```sh
 go get github.com/duckedup/nidus/sdks/go@v0.39.0
@@ -33,7 +33,7 @@ go get github.com/duckedup/nidus/sdks/go@v0.39.0
 
 ## Connecting
 
-"Local vs remote" is just the base URL — point the client at a local `nidus serve` or
+"Local vs remote" is just the base URL: point the client at a local `nidus serve` or
 any reachable host. Every method takes a `context.Context` first and returns
 `(T, error)`; cancellation and deadlines stay with the caller.
 
@@ -61,7 +61,7 @@ Attributes are typed: `nidus.Str`, `nidus.Int`, `nidus.Float`, `nidus.Bool`,
 the server and comparisons are same-type only, so `nidus.Int(2)` never matches a
 `Float` attribute; `nidus.ValueOf` decides between them from the Go type, which means
 `float64(2024)` is a `Float`. A `DateTime` is a UTC instant carried as epoch
-milliseconds — `nidus.DateTime(t)` from a `time.Time`, or `nidus.DateTimeMillis(ms)`
+milliseconds: `nidus.DateTime(t)` from a `time.Time`, or `nidus.DateTimeMillis(ms)`
 if you already have the count. NaN and ±Infinity are refused: JSON cannot spell them.
 
 ```go
@@ -75,7 +75,7 @@ n, err := db.Upsert(ctx, "docs", []nidus.Record{
             "score": nidus.Float(0.75), "seen": nidus.DateTime(time.Now())}},
     {ID: "b", Vector: []float32{0.4, 0.5, 0.6},
         Attrs: nidus.Attrs{"lang": nidus.Str("go"), "year": nidus.Int(2023)}},
-    // a text-only doc — omit the vector
+    // a text-only doc: omit the vector
     {ID: "c", Attrs: nidus.Attrs{"body": nidus.Str("vector stores are neat")}},
 })
 
@@ -86,7 +86,7 @@ for _, hit := range hits {
 }
 ```
 
-Leave `TopK` at zero to take the server's default (10) — a zero is omitted from the
+Leave `TopK` at zero to take the server's default (10): a zero is omitted from the
 request rather than sent, because `"top_k": 0` would be a request for no results. The
 knobs whose zero the server *does* treat as a real value are pointers instead, so an
 explicit zero can travel: `MinScore` (`nil` is "no floor", `&0` is a floor of exactly
@@ -105,7 +105,7 @@ hits, err := db.Search(ctx, nidus.SearchRequest{
 })
 ```
 
-If your attributes arrive as plain Go values — from your own JSON decode, say — use
+If your attributes arrive as plain Go values (from your own JSON decode, say), use
 `nidus.AttrsOf(map[string]any{…})` (or `nidus.ValueOf` for one value), which normalizes
 and names the offending key when a value has no nidus type.
 
@@ -123,7 +123,7 @@ seen, ok := hit.Attrs["seen"].DateTime() // a time.Time in UTC
 ```
 
 This is a deliberate deviation from the JavaScript SDK, which decodes attrs to plain JS
-values: in a statically typed language the typed accessor is the better surface —
+values: in a statically typed language the typed accessor is the better surface:
 `hit.Attrs["lang"].Str()` beats an `any` and a type assertion, and a wrong-type read
 gives you a testable `false` instead of a plausible-looking empty string. When you do
 want the loose map, ask for it:
@@ -136,7 +136,7 @@ plain := hit.Attrs.Decode() // map[string]any: string, int64, float64, bool, []s
 ## Filtering
 
 Build an AND-filter with the predicate constructors. Each predicate is a positive
-assertion about a **present** attribute — an absent key matches nothing, including the
+assertion about a **present** attribute, so an absent key matches nothing, including the
 negative predicates.
 
 ```go
@@ -158,10 +158,10 @@ so `nidus.Eq("year", 2024)` reads naturally; a value the store has no type for (
 `[]int`, say, or a NaN) is remembered on the predicate and surfaces as an ordinary error
 from the call that used the filter. Check it earlier with `Predicate.Err()` /
 `Filter.Err()`. Comparisons are same-type only, so give a range the same type the
-attribute was written with — `Ge("score", 0.5)` for a `Float`, `Ge("year", 2020)` for an
+attribute was written with: `Ge("score", 0.5)` for a `Float`, `Ge("year", 2020)` for an
 `Int`, `Ge("seen", t)` for a `DateTime`.
 
-Lists: `Contains`, `NotContains`, `ContainsAny`. Groups: `All`, `Any`, `Not` — `Not` is
+Lists: `Contains`, `NotContains`, `ContainsAny`. Groups: `All`, `Any`, `Not`. `Not` is
 genuine complement, so `Not(Eq(k, v))` matches a record with no `k` at all where
 `Ne(k, v)` does not.
 
@@ -177,7 +177,7 @@ nidus.Regex("path", "^src/.*\\.rs")            // anchored BOTH ends, like Glob
 
 `Fuzzy`'s edit budget is `0..8`; anything outside that is carried as a predicate error
 like an unnormalizable value. `Regex` is compiled server-side and anchored at both ends,
-so use `.*` to opt into a substring search — and an unparseable pattern comes back as a
+so use `.*` to opt into a substring search, and an unparseable pattern comes back as a
 request error, not a Go one.
 
 ## Indexing the text predicates
@@ -201,7 +201,7 @@ already written are indexed as part of the call; passing no fields drops the dec
 if err := db.SetFtsSchema(ctx, "docs", []string{"body"}); err != nil { /* … */ }
 // SetFtsFields is the same call with per-field BM25/analyzer tuning.
 
-// BM25 text search. Scores are raw BM25 — unbounded, not comparable across queries.
+// BM25 text search. Scores are raw BM25: unbounded, not comparable across queries.
 text, err := db.TextSearch(ctx, nidus.TextSearchRequest{
     Field: "body", Query: "vector store", TopK: 10,
 })
@@ -216,7 +216,7 @@ hybrid, err := db.HybridSearch(ctx, nidus.HybridSearchRequest{
 ```
 
 `RRFK` and `Candidates` are `*float32` / `*int`: leave them `nil` for the server's
-defaults (60 and 100). They are pointers because zero is a real request for both — the
+defaults (60 and 100). They are pointers because zero is a real request for both: the
 server fuses with `1/(rrf_k + rank + 1)`, so `RRFK: &zero` is the maximally top-heavy
 weighting, and `Candidates: &zero` fuses exactly `TopK` deep with no over-fetch. So are
 `VectorWeight` and `TextWeight`, which scale each leg's contribution and default to
@@ -224,7 +224,7 @@ weighting, and `Candidates: &zero` fuses exactly `TopK` deep with no over-fetch.
 tell apart from "unset".
 
 Query several fields at once with `Clauses` instead of `Field`+`Query` (or `Field`+`Text`
-on hybrid) — one or the other, never both:
+on hybrid): one or the other, never both:
 
 ```go
 hits, err := db.TextSearch(ctx, nidus.TextSearchRequest{
@@ -353,7 +353,7 @@ closed enums, since a newer server may report a value this SDK predates.
 ## Remembering and recalling (text-native)
 
 When the server is started with an embedder (`nidus serve --embed-provider …`), you can
-send **text** and let the server embed it — no vectors client-side. `Remember` embeds
+send **text** and let the server embed it, no vectors client-side. `Remember` embeds
 and upserts; `Recall` embeds the query and vector-searches.
 
 ```go
@@ -369,7 +369,7 @@ out, err = db.Remember(ctx, "notes", "b", longArticle,
 
 // Expire in an hour, and fold this write onto any entry it is >=0.95 similar to
 // rather than storing a competing near-duplicate. out.ID is the record that
-// actually changed — the match's id, not "c", whenever out.Deduped is true.
+// actually changed: the match's id, not "c", whenever out.Deduped is true.
 ttl, floor := int64(3600), float32(0.95)
 out, err = db.Remember(ctx, "notes", "c", "the quick brown fox",
     nidus.RememberOptions{TTLSeconds: &ttl, DedupeThreshold: &floor})
@@ -394,15 +394,15 @@ hits, err = db.Recall(ctx, "notes", "quick fox", nidus.RecallOptions{
 Both knobs are pointers because zero means something in each: a `TTLSeconds` of `0`
 expires the entry immediately, and a `DedupeThreshold` of `0` matches *any* entry rather
 than disabling dedupe. Dedupe is a vector search server-side, so it needs the same
-embedder `Remember` does, and an already-expired entry is never a candidate — a lapsed
+embedder `Remember` does, and an already-expired entry is never a candidate: a lapsed
 TTL cannot be revived by a later near-duplicate.
 
 Two different failures are worth telling apart when these do not work:
 
-- **`404`, with no message** — the server binary was built without the `memory` feature,
+- **`404`, with no message**: the server binary was built without the `memory` feature,
   so `/remember` and `/recall` are not routes it has at all. That is what a plain
   `cli`-feature build (`just build-cli`) produces.
-- **`400`** — the routes exist but the server was started without `--embed-provider`; the
+- **`400`**: the routes exist but the server was started without `--embed-provider`; the
   message names the flag. `Mode: "summarize"` without a summarizer is likewise a `400`.
 
 Recalling a collection that was written with a different embedding model is a `409` rather
@@ -411,7 +411,7 @@ than a silently meaningless ranking.
 ## Everything else
 
 ```go
-ok := db.Health(ctx)                       // bool — no token needed; "is it up", one answer
+ok := db.Health(ctx)                       // bool, no token needed; "is it up", one answer
 err = db.Ping(ctx)                         // the same call, keeping the reason it failed
 stats, err := db.Stats(ctx)                // dimension, distance, ANN config, footprint
 names, err := db.Collections(ctx)          // []string
@@ -443,12 +443,12 @@ if _, err := db.Upsert(ctx, "docs", records); err != nil {
     var nerr *nidus.Error
     if errors.As(err, &nerr) {
         switch {
-        case nerr.IsBadRequest():     // 400/422 — the request is wrong; retrying cannot help
-        case nerr.IsUnauthorized():   // 401 — missing or wrong bearer token
-        case nerr.IsReadOnly():       // 403 — a write against a read-only store
-        case nerr.IsLocked():         // 409 — the writer lock is held elsewhere
-        case nerr.IsUnavailable():    // 503 — shed under backpressure, or store not open
-        case nerr.IsOutOfCapacity():  // 507 — the store refused to grow; it is intact
+        case nerr.IsBadRequest():     // 400/422: the request is wrong; retrying cannot help
+        case nerr.IsUnauthorized():   // 401: missing or wrong bearer token
+        case nerr.IsReadOnly():       // 403: a write against a read-only store
+        case nerr.IsLocked():         // 409: the writer lock is held elsewhere
+        case nerr.IsUnavailable():    // 503: shed under backpressure, or store not open
+        case nerr.IsOutOfCapacity():  // 507: the store refused to grow; it is intact
         }
         log.Println(nerr.Status, nerr.Message)
     }
@@ -456,13 +456,13 @@ if _, err := db.Upsert(ctx, "docs", records); err != nil {
 ```
 
 `IsBadRequest()` covers `400` **and** `422`, because they are one thing to a caller: the
-request itself is wrong. The split is the server's HTTP layer — a JSON *syntax* error (and
+request itself is wrong. The split is the server's HTTP layer: a JSON *syntax* error (and
 the store's own client faults, like a dimension mismatch) is a `400`, while a body whose
 *types* do not deserialize (`TopK: -1`) is a `422`. Retrying either forever is the bug this
 grouping prevents. `409` and `503` are the two that a retry with backoff is the right
 answer to.
 
-`IsTransport()` (status `0`) means the request never got an answer at all — unreachable
+`IsTransport()` (status `0`) means the request never got an answer at all: unreachable
 server, timeout, cancelled context. Unlike the status-carrying cases it says nothing
 about whether the write was applied: a timeout can fire after the server committed.
 

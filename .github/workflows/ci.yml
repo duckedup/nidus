@@ -119,6 +119,44 @@ jobs:
             exit 1
           fi
 
+  # Lean tree's SHAPE, not its build time: `build-budget` above proves the lean build is
+  # fast, but nothing checked what Cargo.toml's "four crates plus the backends" comment
+  # claims, or how big the shipped binary is. Both are bounds in scripts/ceilings.env,
+  # checked by scripts/ceilings.sh (shared with `just ceilings` so the two cannot drift).
+  # Unlike the two jobs above this one isn't timing anything, so it uses the dependency
+  # cache — a cold build here would be pure waste.
+  ceilings:
+    name: ceilings (lean crate count + binary size)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Lane guard — skip the work when no changed path exercises this job
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --quiet --depth=1 origin "$BASE_SHA"
+          files="$(git diff --name-only "$BASE_SHA" HEAD | paste -sd, -)"
+          if [ -n "$files" ] && [ "$(.claude/skills/nidus/bin/nidus-check ci-guard ceilings --paths "$files")" = "skip" ]; then
+            echo "SKIP_LANE=true" >> "$GITHUB_ENV"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+      - uses: actions/cache@v5
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-ceilings-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ceilings-
+      - name: Check the lean crate count and stripped binary size against their ceilings
+        if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: ./scripts/ceilings.sh
+
   # clippy, test, and the release build are separate compiles (check-mode vs
   # build-mode artifacts vs the release profile), so they stay parallel jobs with a
   # cache slot each. Within a job the feature sets share one `target`, which is why

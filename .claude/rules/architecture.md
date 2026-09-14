@@ -5,8 +5,9 @@ paths:
 
 # Architecture, in the small
 
-nidus is an **embeddable vector store**: dense vectors plus typed metadata in a single on-disk
-store, answering nearest-neighbour queries by exact brute-force cosine. It is the local storage
+nidus is a **vector store with full-text search** that runs anywhere Rust runs: dense vectors
+plus typed metadata in a single store, answering nearest-neighbour queries by exact brute-force
+cosine. It is the local storage
 leg for semantic-search and indexing tools — a pure-Rust replacement for an embedded
 DuckDB/LanceDB. No SQL, no query engine, no background threads.
 

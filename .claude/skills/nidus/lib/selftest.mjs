@@ -489,14 +489,38 @@ test('lanes: the docs-index script is no longer unmapped', () => {
   eq(r.run.map(l => l.recipe), ['just docs-index'], 'recipes')
 })
 
+// nidus-yq9p.8: scripts/ceilings.sh and scripts/ceilings.env would otherwise fall
+// through every rule and land in `unmatched`, same failure mode as docs-index above.
+test('lanes: the ceilings script and env file are no longer unmapped', () => {
+  for (const f of ['scripts/ceilings.sh', 'scripts/ceilings.env']) {
+    const r = lanes([f])
+    eq(r.unmatched, [], `unmatched (${f})`)
+    eq(r.run.map(l => l.recipe), ['just ceilings'], `recipes (${f})`)
+  }
+})
+
 // ── ci-guard: the per-job skip oracle (nidus-0bs) ───────────────────────────
 // A wrong `skip` silently unguards a required check's work, so the failure modes
 // are pinned: docs-only skips, src runs, empty runs, unknown job throws.
 
 test('ci-guard: a docs/skill-only change skips the Rust jobs', () => {
-  for (const job of ['test', 'test-extended', 'miri', 'miri-integration', 'release', 'build-budget', 'build-budget-default']) {
+  for (const job of ['test', 'test-extended', 'miri', 'miri-integration', 'release', 'build-budget', 'build-budget-default', 'ceilings']) {
     eq(ciGuard(job, ['docs/src/content/docs/api.md', '.claude/skills/nidus/SKILL.md', 'README.md']).run, false, `${job} skips`)
   }
+})
+
+// nidus-yq9p.8: without this key, the ceilings job's own guard step throws `unknown job`
+// on the first PR that does not touch Rust — CI_JOBS must carry it, not just the recipe.
+// The ceilings.env/sh cases are the ones with a failing mode: both sit outside RUST, so
+// they are the only assertions here that go red if CI_JOBS['ceilings'] is narrowed back
+// to a bare RUST — which would silently stop a ceiling BUMP re-running its own gate.
+test('ci-guard: ceilings skips docs-only and runs for Rust', () => {
+  eq(ciGuard('ceilings', ['docs/x.md', 'README.md']).run, false, 'docs-only skips')
+  eq(ciGuard('ceilings', ['src/code/mod.rs']).run, true, 'Rust path runs')
+  eq(ciGuard('ceilings', ['scripts/ceilings.env']).run, true, 'a ceiling bump re-runs the gate')
+  eq(ciGuard('ceilings', ['scripts/ceilings.sh']).run, true, 'a change to the gate re-runs it')
+  // The guard must still be selective: scripts/ generally is not this job's business.
+  eq(ciGuard('ceilings', ['scripts/e2e-services.sh']).run, false, 'an unrelated script skips')
 })
 
 // nidus-3gm: without this key, unit 6a's guard step throws `unknown job` on the first

@@ -1,7 +1,7 @@
 # nidus — specification
 
 > _nidus_ (Latin, "nest") — a small place where things are kept safe. A pure-Rust
-> embeddable vector store, leaning on the bird theme.
+> vector store with full-text search, leaning on the bird theme.
 
 This document is the source of truth for nidus's design. It records not just
 *what* we build but *why*, including the decisions we deliberately deferred.
@@ -19,8 +19,9 @@ whole thing (built-in embedding, optionally summarizing first, with the provider
 your choice) or just the storage-and-search core if you bring your own vectors. Both ends
 are covered: `nidus ingest` walks a tree into a searchable corpus in one command, and rollup
 plus neighbour expansion (§7.10) hand back passages rather than the chunk fragments a
-chunked store would otherwise return. It runs fast, in-process, with no hosted service. The source can be anything — code,
-documents, issues, wiki pages — nidus does not care; it turns text into vectors,
+chunked store would otherwise return. It runs fast, and needs no hosted service of its
+own. The source can be anything — code, documents, issues, wiki pages — nidus does not
+care; it turns text into vectors,
 stores vectors and metadata, and ranks them.
 
 It exists because the obvious off-the-shelf options fail the *embedding* test —
@@ -37,9 +38,15 @@ not the functionality test, the **build-and-ship** test:
   top-k. Same disease as DuckDB, transitively-Rust instead of FFI.
 
 At its core the workload is a **vector store, not a database**: no joins, no SQL, no
-analytics, no larger-than-RAM scans (at the target scale). nidus is that store —
-plus a memory layer (embedding, optionally summarization) built on top — and nothing
-more; `--no-default-features` gives the storage-and-search core alone.
+analytics; the scan cost is what it is, and mmap, ANN, quantization and segments are the
+opt-ins that change it. nidus is that store — plus a memory layer (embedding, optionally
+summarization) built on top — and nothing more; `--no-default-features` gives the
+storage-and-search core alone.
+
+nidus is a pure-Rust vector store with full-text search that runs anywhere Rust runs: in
+process as a library, behind `nidus serve` over HTTP, as an MCP server, or in a browser on
+wasm. Its bytes live on local disk or in object storage (S3, GCS), with an optional shared
+memory tier (Redis, Valkey).
 
 ### Thesis (the product *is* the constraints)
 
@@ -91,9 +98,11 @@ Compiling a *large* C tree, or adding a *second* `unsafe` site to *our* code, is
 ## 2. Goals & non-goals
 
 **Goals**
-- Embeddable, in-process, single-store-per-directory.
-- Exact (100% recall) brute-force cosine search, fast at the target scale
-  (≤ a few million vectors, comfortably in RAM).
+- Runs anywhere Rust runs: in process as a library, behind `nidus serve` over HTTP, as an
+  MCP server, or in a browser on wasm. One store is one named set of byte objects (§13.2),
+  whether that is a local directory, an object-store prefix, or an OPFS handle pool.
+- Exact (100% recall) brute-force cosine search, whose scan cost scales with rows scanned;
+  mmap, ANN, and quantization are the opt-ins that change that.
 - Many logical collections (namespaces) in one store, sharing one dimension.
 - **Scoped search**: query one collection, a chosen subset, or the entire store in
   a single call, with results merged into one ranking. The API must not lock callers
@@ -2245,8 +2254,8 @@ minute — CI asserts it (§9, the build-time gate).**
   segment is an in-RAM buffer rewritten as one whole object on sync (`ObjectAppender`,
   `O(object)` per flush) under a race-free object lock — atomic create-if-absent (S3
   `If-None-Match: *`, GCS `ifGenerationMatch=0`, nidus-a7c), falling back to an advisory
-  get-then-put on a backend lacking the primitive. Best for low-write-rate / dev /
-  small-scale, single-writer use (nidus's positioning).
+  get-then-put on a backend lacking the primitive. Best for low-write-rate, single-writer
+  use, since each segment flush rewrites a whole object.
 - **Snapshot / backup (built).** PUT/GET the whole store as one archive (the `cli`-feature
   `tar.gz`). This is *exactly* object-granular, so every persistence backend does it
   trivially. `nidus backup --out <loc>` reads the source store's `data`/`log` objects via
