@@ -5,7 +5,7 @@ description: Every nidus subcommand and flag, with its environment variable and 
 
 Every flag the `nidus` binary accepts, generated from `nidus --help` and each subcommand's
 own `--help`. For a guided tour with worked examples, see the [command-line
-guide](/guides/cli-and-server/); this page is the exhaustive reference.
+guide](/guides/command-line/); this page is the exhaustive reference.
 
 The binary has **35 subcommands**: `serve`, `mcp`, `collections`, `create`, `drop`,
 `upsert`, `search`, `similar`, `query`, `aggregate`, `list`, `set-fts-schema`,
@@ -37,7 +37,7 @@ than merely inert. A reference that listed them anyway would be wrong for that
 install, so every flag below tagged **memory** or **mcp** is only present when
 the binary was built with that feature (the default build pulls in both).
 
-See [Install](/guides/cli-and-server/#install) for the two paths, and
+See [Install](/guides/command-line/#install) for the two paths, and
 [Remember & recall](/guides/remember-and-recall/#turn-it-on) for the Cargo
 features behind the memory layer if you are building from source yourself.
 
@@ -95,8 +95,8 @@ editing the env block it shares. Typing both sides on the same command line is s
 refused, since only there is the contradiction something you wrote yourself.
 
 See [Configuration](/reference/configuration/) for what each of these does to the
-open store, and [Approximate search (ANN)](/guides/cli-and-server/#approximate-search-ann)
-/ [Configure once](/guides/cli-and-server/#configure-once-recording-store-defaults) for
+open store, and [Approximate search (ANN)](/guides/command-line/#approximate-search-ann)
+/ [Configure once](/guides/command-line/#configure-once-recording-store-defaults) for
 how the `--ann`/`--quantization`/`--query-threads`/`--mmap` knobs can be recorded as a
 store's own defaults instead of repeated on every call.
 
@@ -497,7 +497,7 @@ Reclaim dead rows and superseded log records. Usage:
 Record `--ann`/`--quantization`/`--query-threads`/`--mmap` as this store's own
 open-time defaults, so later opens (including `serve`) need not repeat them. Usage:
 `nidus configure [OPTIONS] --dir <DIR>`. See
-[Configure once](/guides/cli-and-server/#configure-once-recording-store-defaults).
+[Configure once](/guides/command-line/#configure-once-recording-store-defaults).
 
 | Flag | Env | Description |
 | --- | --- | --- |
@@ -516,7 +516,7 @@ Snapshot a store into a single compressed `.tar.gz` archive. Usage:
 | `-o, --out <LOCATION>` | none | Output archive location: a local path, `file://…`, `s3://…`, or `gs://…`. Defaults to `<dir-name>-<unix-secs>.tar.gz`. |
 | `--verify` | none | After writing the archive, re-read it and prove it is restorable. |
 
-See [Backup, restore & verify](/guides/cli-and-server/#backup-restore--verify).
+See [Backup, restore & verify](/guides/command-line/#backup-restore--verify).
 
 ### `restore`
 
@@ -553,7 +553,7 @@ non-zero, naming the segment, on the first mismatch. Usage:
 | `-d, --dir <DIR>` | none | Store directory to check (the source when `--persistence` is omitted). |
 | `--persistence <LOCATION>` | none | Check a store at this persistence location instead of `--dir`. |
 
-See [Checking a live store](/guides/cli-and-server/#checking-a-live-store).
+See [Checking a live store](/guides/command-line/#checking-a-live-store).
 
 ### `stats`
 

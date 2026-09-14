@@ -326,15 +326,15 @@ Implements `Default` (`offset: 0`, `exact: false`, `explain: false`,
 Results are ordered by `(score desc, collection, id)`. The ranking is computed
 `offset + top_k` deep and the page cut once, at the end; an `offset` past the last
 result is an empty `Vec`, not an error. See
-[paginating a search](/guides/search/#paginating-a-search).
+[paginating a search](/guides/vector-search/#paginating-a-search).
 
 `exact: true` bypasses the ANN walk, the per-segment index, and the quantized first
 pass, running the exact brute-force scan for that one query; the index stays in place
-for every other. See [forcing an exact search](/guides/search/#forcing-an-exact-search).
+for every other. See [forcing an exact search](/guides/vector-search/#forcing-an-exact-search).
 
 ## `RankBy` & `Decay`
 
-An opt-in [ranking expression](/guides/search/#ranking-by-recency) layered over the
+An opt-in [ranking expression](/guides/vector-search/#ranking-by-recency) layered over the
 store's distance metric. `None` (the default) is the bare metric.
 
 ```rust
@@ -378,7 +378,7 @@ with no count knobs set ranks exactly as it always has.
 ## `LimitPer`
 
 A cap on how many hits may carry any one value of an attribute; see
-[capping hits per attribute value](/guides/search/#capping-hits-per-attribute-value).
+[capping hits per attribute value](/guides/vector-search/#capping-hits-per-attribute-value).
 
 ```rust
 pub struct LimitPer {
@@ -396,7 +396,7 @@ back shorter than `top_k`.
 
 A Maximal Marginal Relevance lambda in `[0.0, 1.0]`, spreading hits apart in vector space so
 near-duplicates stop filling a page; see
-[spreading near-duplicates apart](/guides/search/#spreading-near-duplicates-apart). `1.0` is
+[spreading near-duplicates apart](/guides/vector-search/#spreading-near-duplicates-apart). `1.0` is
 pure relevance, `0.0` pure variety, and `None` (the default) skips the pass entirely.
 
 Redundancy is **cosine** similarity computed from the stored vectors' own norms, so it means
@@ -409,7 +409,7 @@ Anything outside `[0.0, 1.0]`, or not finite, is a `400`.
 ## `Expand`
 
 Widen each hit with the neighbouring chunks of its own document, written to `Hit::context`;
-see [widening a chunked hit](/guides/search/#widening-a-chunked-hit-with-its-neighbours).
+see [widening a chunked hit](/guides/vector-search/#widening-a-chunked-hit-with-its-neighbours).
 
 ```rust
 pub struct Expand {
@@ -618,7 +618,7 @@ against a base64 blob or a minified bundle inflating the term dictionary.
 
 ## `HighlightOpts`, `Annotations` & friends
 
-The opt-in [explanation of a hit](/guides/search/#explaining-a-hit).
+The opt-in [explanation of a hit](/guides/vector-search/#explaining-a-hit).
 
 ```rust
 pub struct HighlightOpts {
@@ -777,7 +777,7 @@ pub struct Footprint {
 
 Configuration for vector quantization. Pass to `Config::quantization` to enable two-pass
 search (quantized first pass → exact f32 rerank). See
-[quantization](/guides/search/#quantization).
+[quantization](/guides/vector-search/#quantization).
 
 ```rust
 pub enum QuantKind {
@@ -804,7 +804,7 @@ overscan than int8.
 Configuration for the opt-in approximate-nearest-neighbour index. Pass to
 `Config::ann` to walk an index instead of scanning every vector. Construct with
 `AnnConfig::hnsw()` or `AnnConfig::ivf()` and adjust via the builder setters. See the
-[approximate search guide](/guides/search/#approximate-search-ann).
+[approximate search guide](/guides/vector-search/#approximate-search-ann).
 
 ```rust
 pub enum AnnKind { Hnsw, Ivf }
@@ -835,7 +835,7 @@ Recorded open-time defaults for `ann`, `quantization`, `query_threads`, and `mma
 carried in the store's manifest (SPEC §14.2). `Nidus::set_open_profile` writes the calling
 config's currently-set knobs here; every later `open()` merges a recorded field in
 wherever the caller left that knob unset, and an explicit [`Config`] setter for the
-same knob always wins. See [Configure once](/guides/cli-and-server/#configure-once-recording-store-defaults).
+same knob always wins. See [Configure once](/guides/command-line/#configure-once-recording-store-defaults).
 
 ```rust
 pub struct OpenProfile {

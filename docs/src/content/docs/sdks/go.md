@@ -192,7 +192,7 @@ text-only entry), returns an error naming the id and the reason, not an empty re
 
 Build an AND-filter with the predicate constructors. Each predicate is a positive
 assertion about a **present** attribute: an absent key matches nothing (including the
-negative predicates). See [Search & filters](/guides/search/) for the full semantics.
+negative predicates). See [Search & filters](/guides/vector-search/) for the full semantics.
 
 ```go
 hits, err := db.Search(ctx, nidus.SearchRequest{

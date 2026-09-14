@@ -5,7 +5,7 @@ description: "The typed metadata model and nidus's filter language: equality, ra
 
 Every record in nidus carries an open map of typed metadata beside its vector, and a
 filter narrows a search to the records worth scoring. Filters apply **before scoring**
-and work identically across [vector](/guides/search/),
+and work identically across [vector](/guides/vector-search/),
 [full-text](/guides/full-text-search/) and [hybrid](/guides/hybrid-search/) search, so
 this page is the one description of them all three share.
 
@@ -36,7 +36,7 @@ Comparison is **same-type only**, which has two consequences worth knowing up fr
 
 `DateTime` is an absolute instant: there is no timezone and no local-time form, and
 rendering it is the caller's business. It is a distinct variant from `Int` so a filter or
-a [recency ranking](/guides/search/#ranking-by-recency) can tell a time from a number without relying on
+a [recency ranking](/guides/vector-search/#ranking-by-recency) can tell a time from a number without relying on
 a naming convention.
 
 ## Filters
@@ -260,7 +260,7 @@ let page2 = db.list("code", &ListOpts { offset: 100, filter, ..Default::default(
 
 `list` accepts a [`Scope`](/reference/api/#scope) just like `search`, so you can
 list across multiple collections or the whole store. It also takes the same
-[`projection`](/guides/search/#choosing-the-attrs-a-hit-carries), so a listing can return ids alone.
+[`projection`](/guides/vector-search/#choosing-the-attrs-a-hit-carries), so a listing can return ids alone.
 
 ### Ordering by an attribute
 

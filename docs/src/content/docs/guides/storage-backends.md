@@ -134,7 +134,7 @@ nidus restore --in s3://my-bucket/backups/store.tar.gz --dir ./restored
 ```
 
 A backup is a safe hot snapshot: it doesn't take the writer lock, so it can run while a
-writer (or `nidus serve`) is busy. See the [command-line guide](/guides/cli-and-server/#backup-restore--verify)
+writer (or `nidus serve`) is busy. See the [command-line guide](/guides/command-line/#backup-restore--verify)
 for the full story.
 
 ## What gets stored

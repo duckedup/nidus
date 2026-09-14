@@ -3,11 +3,12 @@ title: Ingest a directory
 description: One command from a folder of files to a searchable corpus. nidus ingest walks a tree, chunks each file, embeds the chunks and upserts them, and a re-run over an unchanged tree costs nothing.
 ---
 
-`nidus ingest` is the whole pipeline in one command: walk a directory, split each
-file into chunks, embed the chunks with the provider you choose, and store them.
-
-Without it, everyone writes this script themselves, and most write it slightly
-wrong: no dedupe, no resume, and every run re-embeds the entire corpus.
+`nidus ingest` is one way to get a directory of files into a searchable corpus:
+walk the tree, split each file into chunks, embed the chunks with the provider you
+choose, and store them, so [vector](/guides/vector-search/),
+[full-text](/guides/full-text-search/), and hybrid search all work over the
+result. For the end-to-end shape this usually serves, see
+[Retrieval-augmented generation](/use-cases/rag/).
 
 Want keyword search and nothing else? `--fts-only` runs the same pipeline with no
 embedding provider at all: no API key, no network call, works offline and in CI.
@@ -229,7 +230,7 @@ chunk strategy is picked **per file** instead of once for the whole walk. A
 recognised language gets one chunk per symbol, tagged with its name, kind and line
 span; `.md`/`.mdx`/`.markdown` gets the markdown splitter; everything else falls back
 to the same generic splitter `nidus ingest` uses. One corpus, each file chunked for
-what it actually is. See the [code search guide](/guides/code/) for indexing and
+what it actually is. See the [code search guide](/guides/code-search/) for indexing and
 searching a repo end to end.
 
 ## Keyword-only, with no provider

@@ -9,7 +9,7 @@ default-members = ["."]
 
 [package]
 name = "nidus"
-version = "0.101.0"
+version = "0.102.0"
 edition = "2024"
 rust-version = "1.98"
 description = "A pure-Rust vector store with full-text search that runs anywhere Rust runs: brute-force or ANN cosine search with pluggable persistence (local files, S3, GCS), queryable via a typed API or a SQL-shaped syntax compiled to it. No SQL engine, no query planner."

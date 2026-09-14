@@ -49,7 +49,7 @@ different dimension is a hard error. One embedding space per store.
 [`Distance`](/reference/api/#distance), default `Distance::Cosine`. The
 similarity / distance metric used for scoring. Like dimension, it is pinned in
 the data header at creation; reopening with a different metric is a hard error.
-See [distance metrics](/guides/search/#distance-metrics) for details on each
+See [distance metrics](/guides/vector-search/#distance-metrics) for details on each
 metric.
 
 ### `fsync`
@@ -74,7 +74,7 @@ silent may be reclaimed: a stale lock file left by a crashed single-node process
 [cluster mode](/guides/storage-backends/#cooperating-instances-cluster), an unrenewed lease.
 
 In a cluster it is the **failover-latency knob**, and there is a tuning guide for it:
-[choosing `--lock-ttl`](/guides/cli-and-server/#choosing---lock-ttl).
+[choosing `--lock-ttl`](/guides/command-line/#choosing---lock-ttl).
 
 ### `lease_wait`
 
@@ -111,7 +111,7 @@ never fires. It counts physical rows including not-yet-compacted dead rows, so
 in-memory compressed copy of all vectors and uses a two-pass search: quantized
 first-pass → f32 rerank. `Quantization::int8()` (4× smaller, any distance metric) or
 `Quantization::binary()` (32× smaller, **cosine only**), each with a `rescore` overscan
-factor. See [quantization](/guides/search/#quantization) for details.
+factor. See [quantization](/guides/vector-search/#quantization) for details.
 
 ### `ann`
 
@@ -122,20 +122,20 @@ exact f32 rerank, trading recall for speed when a scan over every vector is more
 you need. Two algorithms, via `AnnConfig::hnsw()` (a navigable small-world graph, the
 default) and `AnnConfig::ivf()` (k-means inverted lists). May be combined with
 `quantization` (a quantized index walk plus an exact f32 rerank). See
-[approximate search](/guides/search/#approximate-search-ann) for details and tuning.
+[approximate search](/guides/vector-search/#approximate-search-ann) for details and tuning.
 
 ### `query_threads`
 
 `usize`, default `1` (single-threaded; no behavior change). When `> 1`, a single
 large search is split across this many `std::thread::scope` workers to cut one
 query's latency: both the exact f32 scan and, when
-[int8 quantization](/guides/search/#quantization) is on, its int8 first
+[int8 quantization](/guides/vector-search/#quantization) is on, its int8 first
 pass. The f32 scan is memory-bandwidth-bound (sublinear speedup); the int8 first
 pass is compute-bound and scales better with threads. Leave it at `1` if you already
 run concurrent searches under `Arc<RwLock<Nidus>>`; see
 [two kinds of parallelism](/guides/integrating/#two-kinds-of-parallelism).
 
-When an [HNSW index](/guides/search/#approximate-search-ann) is enabled, `> 1` also
+When an [HNSW index](/guides/vector-search/#approximate-search-ann) is enabled, `> 1` also
 parallelizes the from-scratch graph **build** (on `open` with no cache, and on
 `compact`) across this many threads, the expensive part of opening an ANN store.
 Incremental `upsert` and the serial build at `1` are unchanged; note a parallel build
@@ -167,7 +167,7 @@ an exhaustive-tail scan with the cold segments' index walks into one ranking. Ha
 without [`segment_max_rows`](#segment_max_rows) (a store only gets immutable segments to
 index once sealing is enabled), and is ignored when [`ann`](#ann) is set (that global index
 already covers every row). See
-[approximate search](/guides/search/#per-segment-indexing-at-scale).
+[approximate search](/guides/vector-search/#per-segment-indexing-at-scale).
 
 ### `mmap`
 

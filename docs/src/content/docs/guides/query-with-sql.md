@@ -5,7 +5,7 @@ description: "SELECT statements as read syntax over nidus's search: the grammar,
 
 A `SELECT` statement is a **front end, not a second query engine**. It lexes, parses, and
 compiles to the same `SearchOpts`/`HybridOpts`/`ListOpts`/`AggregateOpts`/`Filter`/`FtsQuery`
-values a typed caller builds by hand, then runs through the same [`search`](/guides/search/),
+values a typed caller builds by hand, then runs through the same [`search`](/guides/vector-search/),
 [`text_search`](/guides/full-text-search/), [`hybrid_search`](/guides/hybrid-search/),
 [`list`](/guides/filters/), and [`aggregate`](/guides/filters/#aggregation) this store already
 has. There is no planner and no second execution path: a query and its typed equivalent
@@ -97,7 +97,7 @@ typed API and HTTP surfaces. `WITH (...)` is a named-option bag, not a keyword p
 | [Filters & metadata](/guides/filters/) | `WHERE (a = 1 OR b = 2) AND NOT c` | `Predicate::Any` / `Predicate::All` / `Predicate::Not` |
 | [Filters & metadata](/guides/filters/) | `WHERE fuzzy(f, 'x', 1) AND match_all(f, 'a b')` | `Predicate::Fuzzy` / `Predicate::ContainsAllTokens` |
 | [Filters & metadata](/guides/filters/) | `WHERE field ~ '^the.*fox$'` | `Predicate::Regex` |
-| [Vector](/guides/search/) / [full-text](/guides/full-text-search/) / [hybrid](/guides/hybrid-search/) search | `ORDER BY knn([...])`, `ORDER BY match(f, 'q')`, `ORDER BY knn([...]) FUSE match(f, 'q')` | `search` / `text_search` / `hybrid_search` |
+| [Vector](/guides/vector-search/) / [full-text](/guides/full-text-search/) / [hybrid](/guides/hybrid-search/) search | `ORDER BY knn([...])`, `ORDER BY match(f, 'q')`, `ORDER BY knn([...]) FUSE match(f, 'q')` | `search` / `text_search` / `hybrid_search` |
 | [Filters & metadata](/guides/filters/#aggregation) | `SELECT sum(n), count(*) [GROUP BY f]`; `WITH (limit_per = (f, n))`; `WITH (diversity = d)` | `AggregateOpts`; `LimitPer`; `diversity` |
 | [Query annotations](/reference/http-api/#annotations-why-a-hit-matched) | `WITH (annotations)` | `explain: true` |
 | Batching (below) | `SELECT ...; SELECT ...` | `Nidus::query_batch` |

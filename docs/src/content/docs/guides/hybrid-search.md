@@ -11,7 +11,7 @@ fused score is `Σ 1 / (rrf_k + rank)` over the legs it appears in.
 RRF fuses *ranks*, not scores, which is what makes it safe here: a BM25 score and a
 cosine similarity are not on one scale and cannot be added, but their positions in
 two result lists can. See [full-text search](/guides/full-text-search/) for the BM25
-leg and [vector search](/guides/search/) for the other.
+leg and [vector search](/guides/vector-search/) for the other.
 
 ```rust
 use nidus::{FtsQuery, HybridOpts};

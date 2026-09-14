@@ -17,7 +17,7 @@ search it three ways, and they share one set of results, filters, and scoping:
 
 - **[Full-text search](/guides/full-text-search/)** ranks by keyword with BM25. No
   embedder, no model, no API key.
-- **[Vector search](/guides/search/)** ranks by meaning, over embeddings you supply.
+- **[Vector search](/guides/vector-search/)** ranks by meaning, over embeddings you supply.
 - **[Hybrid search](/guides/hybrid-search/)** runs both legs and fuses them into one
   ranking.
 
@@ -28,7 +28,7 @@ and needs no embeddings at all.
 :::tip[Prefer not to write Rust?]
 Install the `nidus` command-line tool (no toolchain required) and stand up a working
 local store in four commands. See
-[Quickstart: local search in four commands](/guides/cli-and-server/#quickstart-local-search-in-four-commands).
+[Quickstart: local search in four commands](/guides/command-line/#quickstart-local-search-in-four-commands).
 :::
 
 ## Add the dependency
@@ -36,7 +36,7 @@ local store in four commands. See
 ```toml
 # Cargo.toml
 [dependencies]
-nidus = "0.101"
+nidus = "0.102"
 anyhow = "1"     # nidus returns anyhow::Result
 ```
 
@@ -135,7 +135,7 @@ let hits = db.search(Scope::All, &query, &opts)?;
 ```
 
 Scoping the whole store is sound because every collection shares one embedding
-space; see [Search & filters](/guides/search/).
+space; see [Search & filters](/guides/vector-search/).
 
 ## Query with SQL
 

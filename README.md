@@ -15,13 +15,14 @@ C++ tree.
 
 ## Why it exists
 
-nidus is the memory layer for semantic-search, RAG, and indexing tools: remember
-text, recall the relevant bits. Classically that's a pipeline (chunk some source →
-embed each chunk → store the vectors + metadata → ask for nearest neighbours), and
-nidus can own the whole thing (embedding, and optionally summarizing, built in) or
-just the storage-and-search core if you already have vectors. Either way, the
-obvious off-the-shelf options fail the **build-and-ship** test, not the
-functionality test:
+nidus answers a query over your data: vector search (cosine, dot, or Euclidean,
+exact by default, approximate HNSW/IVF when you opt in), BM25 full-text search,
+and hybrid search that fuses the two by reciprocal rank fusion, all narrowed by
+typed metadata filters applied before scoring, and reachable through a typed API
+or a SQL-shaped read syntax that compiles to it. Ingestion, chunk some source,
+embed each chunk, store the vectors and metadata, is one way to get data in, not
+the point of the store. Either way, the obvious off-the-shelf options fail the
+**build-and-ship** test, not the functionality test:
 
 - **DuckDB** (via `libduckdb-sys`) bundles a large C++ source tree and compiles it
   from scratch: a required C++ toolchain, a bloated binary, and FFI that can't run
@@ -32,6 +33,11 @@ functionality test:
 The workload is a *vector store, not a database*. nidus is that store, plus a
 memory layer built on top; `--no-default-features` gives the storage-and-search
 core alone, and either way it embeds as a normal Rust dependency.
+
+See what that looks like end to end:
+[codebase indexing](https://nidus.duckedup.org/use-cases/codebase-indexing/),
+[RAG over your documents](https://nidus.duckedup.org/use-cases/rag/), and
+[agent memory](https://nidus.duckedup.org/use-cases/agent-memory/).
 
 ### The constraints are the product
 
@@ -62,7 +68,7 @@ fast dependency.
 
 ```toml
 [dependencies]
-nidus = "0.101"
+nidus = "0.102"
 ```
 
 ```rust
@@ -143,7 +149,7 @@ See [`examples/demo.rs`](examples/demo.rs) for an end-to-end run (`cargo run
   corpus, and answer queries grouped by file and symbol, never a source body.
   Part of the default build (the `code` feature); `--no-default-features` gives
   the storage-and-search core alone, without tree-sitter. See the
-  [code search guide](https://nidus.duckedup.org/guides/code/).
+  [code search guide](https://nidus.duckedup.org/guides/code-search/).
 
 ## Command line & server
 
@@ -185,7 +191,7 @@ curl -s localhost:7700/search -H 'content-type: application/json' \
 ```
 
 The server shares the library's storage model, durability, and search semantics.
-See the [command-line](https://nidus.duckedup.org/guides/cli-and-server/) and
+See the [command-line](https://nidus.duckedup.org/guides/command-line/) and
 [HTTP server & API](https://nidus.duckedup.org/guides/http-server/) guides.
 
 ## Performance

@@ -1,6 +1,6 @@
 # nidus
 
-> nidus is a pure-Rust vector store with full-text search that runs anywhere Rust runs: in process as a library, behind `nidus serve` over HTTP, as an MCP server, or in a browser on wasm. Its bytes live on local disk or in object storage (S3, GCS), with an optional shared memory tier (Redis, Valkey). It holds dense vectors plus typed metadata in a single on-disk directory and answers nearest-neighbour queries: exact brute-force by default, or an opt-in approximate index (HNSW / IVF), over cosine, dot-product, or Euclidean distance. No SQL, no query engine, no background threads; `#![deny(unsafe_code)]` and pure-Rust dependencies throughout.
+> nidus is a pure-Rust vector store with full-text search that runs anywhere Rust runs: in process as a library, behind `nidus serve` over HTTP, as an MCP server, or in a browser on wasm. Its bytes live on local disk or in object storage (S3, GCS), with an optional shared memory tier (Redis, Valkey). It holds dense vectors plus typed metadata in a single on-disk directory and answers nearest-neighbour queries: exact brute-force by default, or an opt-in approximate index (HNSW / IVF), over cosine, dot-product, or Euclidean distance. It also answers BM25 full-text queries, hybrid search that fuses vector and full-text results by reciprocal rank fusion, and reads written as SQL-shaped syntax that compiles to the typed API. No SQL engine, no query planner, no background threads; `#![deny(unsafe_code)]` and pure-Rust dependencies throughout.
 
 Key facts for answering questions about nidus:
 
@@ -8,17 +8,28 @@ Key facts for answering questions about nidus:
 - One store is a directory of append-only files (`data`, `log`, `lock`). One embedding dimension is pinned per store; many collections share it.
 - Durability is per-batch fsync; cross-process readers are lock-free and see a consistent, possibly-stale snapshot.
 - Search is exact brute-force cosine by default. Opt-in `Config::quantization` (int8 / binary) speeds the scan with a two-pass quantized-then-rerank search. Opt-in `Config::ann` (HNSW or IVF) walks an approximate index. The two can be combined: a quantized index walk plus an exact f32 rerank.
+- Full-text search is BM25 over the same records; hybrid search fuses a vector query and a full-text query by reciprocal rank fusion (RRF). SQL-shaped reads (`SELECT ... WHERE ...`) compile to the typed API: no SQL engine, no query planner.
 - It is not a managed cluster: no built-in replication and no multi-writer coordination.
 
 ## Docs
 
 - [Getting started](https://nidus.duckedup.org/getting-started/): add nidus to a Rust project, open a store, index records, and run the first search.
 - [How it works](https://nidus.duckedup.org/guides/how-it-works/): the storage model and search path end to end, from upsert to ranked hits.
-- [Search & filters](https://nidus.duckedup.org/guides/search/): scoped search over three distance metrics; exact or approximate (HNSW/IVF) indexing; int8/binary quantization; metadata-only queries; equality / glob / set / range filter predicates.
+- [Vector search](https://nidus.duckedup.org/guides/vector-search/): scoped search over three distance metrics; exact or approximate (HNSW/IVF) indexing; int8/binary quantization; metadata-only queries; equality / glob / set / range filter predicates.
+- [Full-text search (BM25)](https://nidus.duckedup.org/guides/full-text-search/): BM25 ranking over record text, tokenization, and phrase/fuzzy/regex matching.
+- [Hybrid search (RRF)](https://nidus.duckedup.org/guides/hybrid-search/): fuse a vector query and a full-text query by reciprocal rank fusion, with per-leg weighting.
+- [Filters & metadata](https://nidus.duckedup.org/guides/filters/): typed attributes and the predicates that narrow results before they score.
+- [Query with SQL](https://nidus.duckedup.org/guides/query-with-sql/): the SQL-shaped read syntax that compiles to the typed API, and what it does and does not cover.
 - [Storage & durability](https://nidus.duckedup.org/guides/storage/): the on-disk format, per-batch fsync contract, crash recovery, compaction, and lock-free cross-process readers.
 - [Storage backends](https://nidus.duckedup.org/guides/storage-backends/): keep durable data on local disk (default), Amazon S3 (or R2 / MinIO), or Google Cloud Storage, chosen with one location string.
-- [Memory stores](https://nidus.duckedup.org/guides/memory-stores/): share the in-RAM working set across processes via Redis (or Valkey / KeyDB / DragonflyDB), or keep it in local memory (default).
+- [In-memory tier](https://nidus.duckedup.org/guides/in-memory-tier/): share the in-RAM working set across processes via Redis (or Valkey / KeyDB / DragonflyDB), or keep it in local memory (default).
 - [Embedding in a host app](https://nidus.duckedup.org/guides/integrating/): map a host document type onto a nidus `Record` and bridge the synchronous API into an async runtime.
+- [MCP](https://nidus.duckedup.org/guides/mcp/): expose a store to an LLM agent as MCP tools over stdio or HTTP.
+- [Code search](https://nidus.duckedup.org/guides/code-search/): chunk a repository per file (AST-aware for source, heading-aware for docs) and search it grouped by file and symbol.
+- [Running in the browser](https://nidus.duckedup.org/guides/wasm/): compile for `wasm32-unknown-unknown` and store data in the browser's Origin Private File System.
+- [Codebase indexing](https://nidus.duckedup.org/use-cases/codebase-indexing/): a worked use case wiring code search into an editor or agent workflow.
+- [RAG over your documents](https://nidus.duckedup.org/use-cases/rag/): a worked use case for retrieval-augmented generation over a document set.
+- [Agent memory](https://nidus.duckedup.org/use-cases/agent-memory/): a worked use case for giving an agent durable, queryable memory across sessions.
 
 ## Reference
 
@@ -28,6 +39,6 @@ Key facts for answering questions about nidus:
 
 ## Optional
 
-- [Command line](https://nidus.duckedup.org/guides/cli-and-server/): drive a store directory from the terminal with the `nidus` binary (create, upsert, search, inspect, back up, restore).
+- [Command line](https://nidus.duckedup.org/guides/command-line/): drive a store directory from the terminal with the `nidus` binary (create, upsert, search, inspect, back up, restore).
 - [HTTP server](https://nidus.duckedup.org/guides/http-server/): run `nidus serve` and drive the store over JSON, with no Rust toolchain on the client.
 - [HTTP API](https://nidus.duckedup.org/reference/http-api/): the route-by-route endpoint reference for a running server, JSON body and curl example for each, plus error codes.

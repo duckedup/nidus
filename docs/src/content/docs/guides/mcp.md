@@ -102,7 +102,7 @@ client's writes rather than each client racing for its own.
 | `code_search`* | Search a chunked code/docs corpus, grouped by file with each hit's matching symbols: name, kind, line span. Never returns source; read the file at the given lines instead. |
 
 \* Needs the `code` feature on top of `mcp`, part of the default build. See the
-[code search guide](/guides/code/) for indexing a repo with `nidus code ingest` first.
+[code search guide](/guides/code-search/) for indexing a repo with `nidus code ingest` first.
 
 Every one of them takes **natural language, never vectors**. That is deliberate:
 a model cannot write a 1024-float array as a tool argument, so the raw
@@ -215,7 +215,7 @@ actually useful: **`reinforce`** stamps `nidus.access_count` and
 `nidus.last_accessed` on every entry the call returns, and **`extend_ttl_seconds`**
 additionally pushes an existing `nidus.expires_at` forward by that many seconds
 (only with `reinforce` set, and only on entries that already expire). Rank on
-`nidus.access_count` with the [count-decay knobs](/guides/search/#ranking-by-reinforcement)
+`nidus.access_count` with the [count-decay knobs](/guides/vector-search/#ranking-by-reinforcement)
 so memories that keep getting recalled float up and memories nothing ever recalls
 sink. Setting `reinforce` makes the call a write, so against a store opened read-only
 the tool call is refused rather than answered as though the stamp happened.
@@ -370,3 +370,10 @@ curl -s localhost:7700/mcp \
         "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
                  "io.modelcontextprotocol/clientCapabilities":{}}}}'
 ```
+
+## Where to next
+
+- [Agent memory](/use-cases/agent-memory/): the `remember`/`recall` tools above, as
+  a use case.
+- [Codebase indexing](/use-cases/codebase-indexing/): what `code_search` is for.
+- [Remember & recall](/guides/remember-and-recall/): the same layer from Rust.

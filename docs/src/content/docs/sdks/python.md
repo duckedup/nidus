@@ -188,7 +188,7 @@ entry), raises `NidusError` naming the id and the reason, not an empty result.
 
 Build an AND-filter with the `f.*` helpers. Each predicate is a positive assertion about a
 **present** attribute: an absent key matches nothing, including the negative predicates.
-See [Search & filters](/guides/search/) for the full semantics.
+See [Search & filters](/guides/vector-search/) for the full semantics.
 
 ```python
 from nidus import f

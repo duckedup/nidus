@@ -1,10 +1,10 @@
 apiVersion: v2
 name: nidus
 description: |
-  A small, pure-Rust vector store served over HTTP. This chart runs `nidus serve`
-  backed by shared, non-local storage — an object store (S3/GCS) for durable bytes
-  and a Redis-family tier for the working set — the configuration a container needs
-  since it has no durable local disk.
+  A pure-Rust vector store with full-text search, served over HTTP. This chart runs
+  `nidus serve` backed by shared, non-local storage: an object store (S3/GCS) for
+  durable bytes and a Redis-family tier for the working set, the configuration a
+  container needs since it has no durable local disk.
 type: application
 
 # BOTH versions below are STAMPED BY CI from the crate version at release time

@@ -6,7 +6,7 @@ description: The nidus storage model and search path, end to end, from upsert to
 nidus holds dense vectors plus typed metadata in a single on-disk directory and
 answers nearest-neighbour queries over cosine (the default), dot, or Euclidean.
 Scoring is **exact by default** (every in-scope vector is compared), and you can
-opt into an [approximate index](/guides/search/#approximate-search-ann) (HNSW or IVF)
+opt into an [approximate index](/guides/vector-search/#approximate-search-ann) (HNSW or IVF)
 for larger collections. There is no query planner and no background thread: the
 whole thing is a RAM-resident matrix, an optional in-RAM index, and a small amount of
 write glue.
@@ -99,7 +99,7 @@ succeeds. Nothing waits for a group to form, so a lone write is exactly as fast 
 Search scores (cosine, dot, or Euclidean) over a
 [`Scope`](/reference/api/#scope) (one collection, a named subset, or the whole
 store), merged into a single ranking. By default it is exact (every in-scope row is
-scored); with [`Config::ann`](/guides/search/#approximate-search-ann) set it instead
+scored); with [`Config::ann`](/guides/vector-search/#approximate-search-ann) set it instead
 walks an approximate index for a candidate set and applies the same scope/filter/rerank
 to those. The exact path is:
 
@@ -113,14 +113,14 @@ to those. The exact path is:
    `min_score`.
 5. Cut the page. The ranking is a **total order** (score descending, then
    `collection`, then `id`) computed `offset + top_k` deep, so
-   [pagination](/guides/search/#paginating-a-search) tiles it with no gap and no overlap.
+   [pagination](/guides/vector-search/#paginating-a-search) tiles it with no gap and no overlap.
 
 Steps 3–5 are where the opt-in ranking knobs sit: a
-[`rank_by`](/guides/search/#ranking-by-recency) recency penalty is subtracted from each
+[`rank_by`](/guides/vector-search/#ranking-by-recency) recency penalty is subtracted from each
 base score before the heap sees it, and
-[`limit_per`](/guides/search/#capping-hits-per-attribute-value) caps hits per attribute
+[`limit_per`](/guides/vector-search/#capping-hits-per-attribute-value) caps hits per attribute
 value as the page is cut, with
-[`diversity`](/guides/search/#spreading-near-duplicates-apart) reordering the survivors in
+[`diversity`](/guides/vector-search/#spreading-near-duplicates-apart) reordering the survivors in
 vector space between the two. All are off by default, and an untouched query returns exactly
 what it always did.
 
@@ -202,7 +202,7 @@ reading the source, not from a test suite.
 
 - **Exact by default.** The default search compares every in-scope vector: 100%
   recall, by construction. Approximate indexing (HNSW/IVF) is opt-in via
-  [`Config::ann`](/guides/search/#approximate-search-ann) when you want speed over
+  [`Config::ann`](/guides/vector-search/#approximate-search-ann) when you want speed over
   exactness at larger scale.
 - **Not a database.** SQL is accepted as read syntax only ([Query with SQL](/guides/query-with-sql/)),
   compiled to the same search calls the typed API makes. There is no engine behind it: no
@@ -215,8 +215,8 @@ reading the source, not from a test suite.
 
 None of those are walls: they are *seams*, additive over the same append-only
 format. Several have since shipped as opt-in modes: an [ANN
-index](/guides/search/#approximate-search-ann), [scalar/binary
-quantization](/guides/search/#quantization), and [memory-mapped
+index](/guides/vector-search/#approximate-search-ann), [scalar/binary
+quantization](/guides/vector-search/#quantization), and [memory-mapped
 larger-than-RAM stores](/guides/storage/#larger-than-ram-memory-mapped-segments).
 Each stays off by default, so the simple exact-in-RAM store is what you get until
 you opt in.

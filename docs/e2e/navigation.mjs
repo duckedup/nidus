@@ -130,8 +130,8 @@ async function main() {
     step("clicking a sidebar link");
     await clickUntilAt(
       session,
-      'a.nd-link[href="/guides/search/"]',
-      "/guides/search/",
+      'a.nd-link[href="/guides/vector-search/"]',
+      "/guides/vector-search/",
       "the sidebar link",
     );
     await waitFor(() => session.execute(SEARCH_BUTTON_READY), {
