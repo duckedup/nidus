@@ -145,7 +145,7 @@ default, which searches only the reserved `default` vector (what a plain `Vector
 populates), byte-identical to a call written before this existed. `SearchSimilar` and
 `HybridSearch` do not take `Names`/`NameWeights`/`Pool`: both always search or fuse
 against `default` over this HTTP client. See
-[Named vectors](/guides/search/#named-vectors) for the full behaviour, including the
+[Named vectors](/guides/vector-search/#named-vectors) for the full behaviour, including the
 library/CLI surfaces that do support it on a "more like this" query.
 
 ## Typed attributes on the way back
@@ -192,7 +192,7 @@ text-only entry), returns an error naming the id and the reason, not an empty re
 
 Build an AND-filter with the predicate constructors. Each predicate is a positive
 assertion about a **present** attribute: an absent key matches nothing (including the
-negative predicates). See [Search & filters](/guides/search/) for the full semantics.
+negative predicates). See [Search & filters](/guides/vector-search/) for the full semantics.
 
 ```go
 hits, err := db.Search(ctx, nidus.SearchRequest{

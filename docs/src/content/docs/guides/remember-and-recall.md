@@ -227,7 +227,7 @@ upserts a record under your `id` with your `attrs`. `recall` embeds the query
 (using the provider's query side, where it distinguishes document from query
 vectors) and runs a vector search. `RecallOpts` maps straight onto the store's
 search options: `top_k`, a `min_score` floor, and an optional metadata
-[`Filter`](/guides/search/). Two fields are sentinels: `top_k: 0` (the default)
+[`Filter`](/guides/vector-search/). Two fields are sentinels: `top_k: 0` (the default)
 means 10, and `min_score: 0.0` means no floor.
 
 `recall` also filters expiry automatically: an entry whose `nidus.expires_at` is
@@ -263,7 +263,7 @@ without stamping would be indistinguishable from having stamped. On the CLI,
 if a live `nidus serve` already holds the writer lock (a plain `nidus recall`, with no
 `--reinforce`, is unaffected).
 
-Reinforcement pairs with [`Decay::count_field`](/guides/search/#ranking-by-reinforcement)
+Reinforcement pairs with [`Decay::count_field`](/guides/vector-search/#ranking-by-reinforcement)
 to rank on `nidus.access_count` directly:
 
 ```rust
@@ -472,9 +472,10 @@ of `examples/memory.rs`.
 
 ## Where to next
 
+- [Agent memory](/use-cases/agent-memory/): the use case this layer is built for.
 - [MCP (agent memory)](/guides/mcp/): expose this layer to an agent over the
   Model Context Protocol.
-- [Search & filters](/guides/search/): what `recall` runs underneath.
+- [Search & filters](/guides/vector-search/): what `recall` runs underneath.
 - [Embedding in a host app](/guides/integrating/): mapping your document type
   onto a `Record`.
 - [API reference](/reference/api/): the full surface.

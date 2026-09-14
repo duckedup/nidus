@@ -10,14 +10,19 @@ export default defineConfig({
   // code-splitting build. Vite's default worker format is iife, which cannot split.
   vite: { worker: { format: "es" } },
   // The combined "backends" guide was split into Storage + Memory pages.
+  // The next three catch the guide renames that made the search family read
+  // as a family: the slug now matches each page's own title.
   redirects: {
     "/guides/backends/": "/guides/storage-backends/",
+    "/guides/search/": "/guides/vector-search/",
+    "/guides/code/": "/guides/code-search/",
+    "/guides/cli-and-server/": "/guides/command-line/",
   },
   integrations: [
     starlight({
       title: "nidus",
       description:
-        "One binary, one directory. A vector store you search from your shell, over HTTP, or as memory for an agent: semantic and keyword search, AST-aware code search, and MCP. Pure Rust: no FFI, no C, no SQL, no query engine.",
+        "One binary, one directory. A vector store you search from your shell, over HTTP, or as memory for an agent: vector, full-text (BM25) and hybrid search, AST-aware code search, and MCP. Pure Rust: no FFI, no C, no SQL engine, no query planner.",
       logo: {
         // The nest mark — full-colour illustration, reads on light and dark.
         src: "./src/assets/nidus.svg",
@@ -67,35 +72,48 @@ export default defineConfig({
             // "/" is the landing page (src/pages/index.astro), not a docs page.
             { label: "Home", link: "/" },
             { label: "Getting started", link: "/getting-started/" },
+            { label: "How it works", link: "/guides/how-it-works/" },
           ],
         },
         {
-          label: "Core",
+          label: "Search",
           items: [
-            { label: "How it works", link: "/guides/how-it-works/" },
-            { label: "Storage & durability", link: "/guides/storage/" },
-            { label: "Vector search", link: "/guides/search/" },
+            { label: "Vector search", link: "/guides/vector-search/" },
             { label: "Full-text search (BM25)", link: "/guides/full-text-search/" },
             { label: "Hybrid search (RRF)", link: "/guides/hybrid-search/" },
             { label: "Filters & metadata", link: "/guides/filters/" },
             { label: "Query with SQL", link: "/guides/query-with-sql/" },
             { label: "Reranking", link: "/guides/rerank/" },
+          ],
+        },
+        {
+          label: "Use cases",
+          items: [
+            { label: "Codebase indexing", link: "/use-cases/codebase-indexing/" },
+            { label: "RAG over your documents", link: "/use-cases/rag/" },
+            { label: "Agent memory", link: "/use-cases/agent-memory/" },
+          ],
+        },
+        {
+          label: "Getting data in",
+          items: [
+            { label: "Ingest a directory", link: "/guides/ingest/" },
             { label: "Remember & recall", link: "/guides/remember-and-recall/" },
           ],
         },
         {
-          label: "Loading data",
+          label: "Storage",
           items: [
-            { label: "Ingest a directory", link: "/guides/ingest/" },
+            { label: "Storage & durability", link: "/guides/storage/" },
+            { label: "Storage backends", link: "/guides/storage-backends/" },
+            { label: "In-memory tier", link: "/guides/in-memory-tier/" },
           ],
         },
         {
           label: "Operating",
           items: [
-            { label: "Command line", link: "/guides/cli-and-server/" },
+            { label: "Command line", link: "/guides/command-line/" },
             { label: "HTTP server", link: "/guides/http-server/" },
-            { label: "Storage backends", link: "/guides/storage-backends/" },
-            { label: "In-memory tier", link: "/guides/in-memory-tier/" },
             { label: "Blue/green reindexing", link: "/guides/blue-green-reindex/" },
             { label: "Running across a few boxes", link: "/guides/multi-box/" },
             { label: "Kubernetes (Helm)", link: "/guides/kubernetes/" },
@@ -112,7 +130,7 @@ export default defineConfig({
           label: "Also built in",
           items: [
             { label: "MCP", link: "/guides/mcp/" },
-            { label: "Code search", link: "/guides/code/" },
+            { label: "Code search", link: "/guides/code-search/" },
             { label: "Automatic memory", link: "/guides/automatic-memory/" },
           ],
         },

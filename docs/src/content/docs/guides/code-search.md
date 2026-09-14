@@ -9,6 +9,10 @@ markdown, and nidus's own generic splitter for everything else. Search comes bac
 grouped by file, each hit carrying a symbol name, kind and line span, never the source
 body itself: read the file at that line span for ground truth.
 
+For the "why would I do this" story, see
+[Codebase indexing](/use-cases/codebase-indexing/); this page is the feature
+reference for the `code` subcommands themselves.
+
 It ships behind the `code` feature, part of the default build, so `cargo install
 nidus` has it out of the box. `--no-default-features` excludes it along with the
 rest of the ingest layer; see [AST-aware code search is in the default

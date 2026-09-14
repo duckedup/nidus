@@ -7,7 +7,7 @@ description: "Run nidus as an HTTP server with `nidus serve`: start it, authenti
 has an endpoint, so a client that never links the crate can do the full job over
 the network: create collections, upsert vectors, search, filter, inspect, and
 maintain the store, all in JSON. The wire format is the same store directory the
-[library](/guides/integrating/) and the [CLI](/guides/cli-and-server/) read and
+[library](/guides/integrating/) and the [CLI](/guides/command-line/) read and
 write; the server is just another door into it.
 
 The raw vector routes store and search the vectors you give them: you compute
@@ -20,7 +20,7 @@ text out, and serves the same memory layer to agents at `/mcp`. See
 
 This page covers running the server. For the route-by-route reference, see the
 [HTTP API](/reference/http-api/); for driving a store from your shell, see the
-[command-line guide](/guides/cli-and-server/).
+[command-line guide](/guides/command-line/).
 
 ## Start the server
 
@@ -42,9 +42,9 @@ Pass `--read-only` to serve without taking the writer lock: a search-only proces
 that can run beside a separate writer.
 
 To serve approximate (ANN) search, add `--ann hnsw` or `--ann ivf` (with the
-optional `--ann-*` knobs from the [command-line guide](/guides/cli-and-server/)), or
+optional `--ann-*` knobs from the [command-line guide](/guides/command-line/)), or
 record it once as the store's default with `nidus configure --ann hnsw` (see
-[Configure once](/guides/cli-and-server/#configure-once-recording-store-defaults))
+[Configure once](/guides/command-line/#configure-once-recording-store-defaults))
 so `serve` picks it up without the flag. The index lives in memory for the life of
 the process; `GET /stats` reports the active configuration.
 
@@ -319,7 +319,7 @@ exactly the library's: each write batch is fsync'd before its response returns, 
 a `200` means the data is on disk. The storage model and search semantics are
 identical to the library: the server adds nothing and hides nothing.
 
-You can take a hot [backup](/guides/cli-and-server/#backup-restore--verify) of a store
+You can take a hot [backup](/guides/command-line/#backup-restore--verify) of a store
 while `nidus serve` is running: `nidus backup` does not take the writer lock.
 
 ### Getting write throughput

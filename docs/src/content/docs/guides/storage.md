@@ -87,7 +87,7 @@ Every **sealed** segment (an immutable `seg-…`, or `data` once something else 
 the active segment) now gets a small sidecar object, `<segment>.crc`, stamped the
 moment the segment becomes immutable: at seal time, and again at compaction, which
 restamps the rewritten base segment and drops the sidecars of the segments it collapses
-away. [`nidus check`](/guides/cli-and-server/#checking-a-live-store) recomputes each
+away. [`nidus check`](/guides/command-line/#checking-a-live-store) recomputes each
 sealed segment's checksum and compares it against its sidecar.
 
 A mismatch is real corruption, reported plainly and never silently recomputed and
@@ -137,7 +137,7 @@ Segments are also the unit of **indexing at scale**: with
 [`Config::segment_index_min_rows`](/reference/configuration/#segment_index_min_rows) set, a
 sealed segment large enough to cross that threshold gets its own IVF index (the active tail
 stays exact), so searches over a large store walk the cold segments and brute-force only the
-fresh data. See [per-segment indexing](/guides/search/#per-segment-indexing-at-scale).
+fresh data. See [per-segment indexing](/guides/vector-search/#per-segment-indexing-at-scale).
 
 ## Larger than RAM: memory-mapped segments
 
@@ -161,9 +161,9 @@ let store = Nidus::open(
 ```
 
 Search over mapped segments goes through the same row accessor as the in-RAM path, so
-**results are identical**: still exact (or, with an [index](/guides/search/), the same
+**results are identical**: still exact (or, with an [index](/guides/vector-search/), the same
 approximate set), still filter- and `min_score`-respecting. It composes with quantization
-and the [per-segment indexes](/guides/search/#per-segment-indexing-at-scale): a cold
+and the [per-segment indexes](/guides/vector-search/#per-segment-indexing-at-scale): a cold
 segment can be both mapped and indexed.
 
 A few conditions apply:

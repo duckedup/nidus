@@ -66,7 +66,7 @@ loop over a contiguous `f32` matrix that is already resident in RAM.
 Two opt-in knobs trade a little for more speed when the exact single-threaded
 sweep isn't enough. Both stay pure-safe-Rust and are off by default:
 
-- **[int8 quantization](/guides/search/#quantization)**: a two-pass
+- **[int8 quantization](/guides/vector-search/#quantization)**: a two-pass
   search (int8 first-pass → f32 rerank) returns essentially the exact neighbours
   (**~100% recall@10 at `rescore` ≥ 2**) for a **~1.4× speedup** at 1M × 768, at
   the cost of ~25% more RAM. Reproduce: `just bench-quant`.
@@ -78,11 +78,11 @@ sweep isn't enough. Both stay pure-safe-Rust and are off by default:
   bandwidth-bound and scales to **~2.4×** at 4 threads. Reproduce:
   `just bench-crit parallel_search` (the `parallel_search_quant` group is the
   quantized sweep).
-- **[approximate index (HNSW / IVF)](/guides/search/#approximate-search-ann)**
+- **[approximate index (HNSW / IVF)](/guides/vector-search/#approximate-search-ann)**
   (`Config::ann`): walks an index instead of scanning every vector, for when the
   collection outgrows a full scan. On realistic clustered data (n=20k, dim=768) HNSW
   returns **~0.99–1.0 recall@10 at ~7–10× the query speed** of the exact scan; IVF
-  ~1.0 recall at ~3×. The graph is in-RAM but [persisted](/guides/search/#approximate-search-ann)
+  ~1.0 recall at ~3×. The graph is in-RAM but [persisted](/guides/vector-search/#approximate-search-ann)
   so a warm `open()` is **~0.05 s** instead of rebuilding (~36 s here). `nidus serve`
   persists the cache when it stops cleanly, so a restart is warm without any
   out-of-band call. A cold
@@ -117,7 +117,7 @@ with the rows scanned, so where a full sweep is cheap, 100% recall with no index
 or tune beats an approximate index. Exact search is the default, so you never pay for an
 index you don't need.
 
-Past that scale, an [approximate index](/guides/search/#approximate-search-ann)
+Past that scale, an [approximate index](/guides/vector-search/#approximate-search-ann)
 (HNSW or IVF, via `Config::ann`) is available as an opt-in: it trades some recall
 for a smaller candidate walk instead of a full scan. It is pure-Rust, optional, and
 additive over the same append-only file; exact search is unchanged when it is off.
@@ -127,7 +127,7 @@ approximate variants' recall and latency on your own shapes.
 ## Benchmarks vs. `nidus tune`
 
 The numbers on this page and `nidus tune` (see [Measuring recall against your own
-data](/guides/search/#measuring-recall-against-your-own-data)) measure two
+data](/guides/vector-search/#measuring-recall-against-your-own-data)) measure two
 different things, and it is easy to conflate them:
 
 - **`benchmarks/`** measures **throughput on synthetic data** across engines

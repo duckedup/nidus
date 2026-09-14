@@ -7,10 +7,10 @@ Sometimes you know the exact words. A collection can declare **full-text-indexed
 fields** and be queried by keyword with
 [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) ranking, with no embedder and no
 model anywhere in the path. It reuses the same `Hit` results, `Filter`, scope, and
-`top_k` heap as [vector search](/guides/search/); only the scoring differs, so
+`top_k` heap as [vector search](/guides/vector-search/); only the scoring differs, so
 everything you know about filtering and scoping carries straight over.
 
-To search by meaning rather than spelling, see [vector search](/guides/search/). To
+To search by meaning rather than spelling, see [vector search](/guides/vector-search/). To
 run both legs and fuse them into one ranking, see
 [hybrid search](/guides/hybrid-search/).
 
@@ -237,7 +237,7 @@ field name still means "all defaults":
 - **`SearchOpts`.** `top_k`, `offset`, `filter`, `projection`, `rank_by`, `limit_per`, and
   `diversity` all work exactly as for vector search; only `min_score` differs, being a **raw BM25**
   floor rather than a cosine one. Results are tie-broken by `(collection, id)` for
-  determinism, the same total order [pagination](/guides/search/#paginating-a-search) relies on.
+  determinism, the same total order [pagination](/guides/vector-search/#paginating-a-search) relies on.
 - **Text-only documents.** A `Record` may carry no vector (`Record::text_only`), a
   pure full-text document. It is found by `text_search` and never by vector `search`.
   Vector-bearing and text-only docs coexist in one collection.

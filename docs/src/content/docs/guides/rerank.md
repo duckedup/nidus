@@ -148,6 +148,6 @@ const hits = await client.search({
 
 ## Where to next
 
-- [Search & filters](/guides/search/): the ranking a rerank stage runs over.
+- [Search & filters](/guides/vector-search/): the ranking a rerank stage runs over.
 - [Remember & recall](/guides/remember-and-recall/): where `nidus.text` comes from.
 - [HTTP API reference](/reference/http-api/): the exact wire shape.

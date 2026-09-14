@@ -112,7 +112,7 @@ Every name shares the store's one pinned dimension. `names` is empty by default,
 searches only the reserved `default` vector (what a plain `vector` field populates),
 byte-identical to a call written before this existed. `searchSimilar` and `hybridSearch`
 do not take `names`/`nameWeights`/`pool`: both always search or fuse against `default`
-over this HTTP client. See [Named vectors](/guides/search/#named-vectors) for the full
+over this HTTP client. See [Named vectors](/guides/vector-search/#named-vectors) for the full
 behaviour, including the library/CLI surfaces that do support it on a "more like this"
 query.
 
@@ -139,7 +139,7 @@ entry), throws a `NidusError` naming the id and the reason, not an empty result.
 
 Build an AND-filter with the `f.*` helpers. Each predicate is a positive assertion about
 a **present** attribute: an absent key matches nothing (including the negative
-predicates). See [Search & filters](/guides/search/) for the full semantics.
+predicates). See [Search & filters](/guides/vector-search/) for the full semantics.
 
 ```ts
 import { f } from "@duckedup/nidus";

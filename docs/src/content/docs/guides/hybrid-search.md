@@ -11,7 +11,7 @@ fused score is `Σ 1 / (rrf_k + rank)` over the legs it appears in.
 RRF fuses *ranks*, not scores, which is what makes it safe here: a BM25 score and a
 cosine similarity are not on one scale and cannot be added, but their positions in
 two result lists can. See [full-text search](/guides/full-text-search/) for the BM25
-leg and [vector search](/guides/search/) for the other.
+leg and [vector search](/guides/vector-search/) for the other.
 
 ```rust
 use nidus::{FtsQuery, HybridOpts};
@@ -65,8 +65,8 @@ weight would invert a leg rather than de-emphasize it, so both are refused.
 ### Capping and spreading fused hits
 
 `HybridOpts::limit_per` and `HybridOpts::diversity` work the same as their `SearchOpts`
-counterparts (see [Capping hits per attribute value](/guides/search/#capping-hits-per-attribute-value)
-and [Spreading near-duplicates apart](/guides/search/#spreading-near-duplicates-apart)),
+counterparts (see [Capping hits per attribute value](/guides/vector-search/#capping-hits-per-attribute-value)
+and [Spreading near-duplicates apart](/guides/vector-search/#spreading-near-duplicates-apart)),
 applied over the **fused** ranking rather than one leg:
 
 ```rust
@@ -93,5 +93,5 @@ survivors, then the page is cut.
 
 `HybridOpts` does not take `names`/`name_weights`/`pool`: `hybrid_search` always fuses
 the `default` vector's leg against the BM25 leg. See
-[Named vectors](/guides/search/#named-vectors) for scoring several named vectors on a
+[Named vectors](/guides/vector-search/#named-vectors) for scoring several named vectors on a
 plain `search`.

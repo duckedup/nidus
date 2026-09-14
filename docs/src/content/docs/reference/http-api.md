@@ -59,7 +59,7 @@ so the same id appears in your logs and the server's.
 `--no-default-features --features cli` build). See [Memory](#memory-remember--recall) below.
 \*\* Needs the `mcp` feature on top of `memory`. See [`/mcp`](#mcp) below.
 \*\*\* Needs the `code` feature on top of `memory`. See
-[`POST /code-search`](#post-code-search) below and the [code search guide](/guides/code/).
+[`POST /code-search`](#post-code-search) below and the [code search guide](/guides/code-search/).
 
 ## Health & introspection
 
@@ -310,7 +310,7 @@ curl -s -X POST localhost:7700/collections/docs/filter-index \
 Declare a collection's additional named-vector fields: the names an upsert may set on
 `Record::vectors` and a search may score with `names`, beyond the reserved `default`
 vector that `Record::vector` always populates. Run it before the first upsert or search
-that uses a name; see [Named vectors](/guides/search/#named-vectors).
+that uses a name; see [Named vectors](/guides/vector-search/#named-vectors).
 
 ```bash
 curl -s -X POST localhost:7700/collections/docs/vector-names \
@@ -449,7 +449,7 @@ curl -s localhost:7700/search \
 | `exact` | `false` | force the exact scan, bypassing any index and quantization |
 | `include_attributes` | all attrs | return only these attrs |
 | `exclude_attributes` | all attrs | return every attr but these |
-| `rank_by` | none | a [ranking expression](/guides/search/#ranking-by-recency) over the metric |
+| `rank_by` | none | a [ranking expression](/guides/vector-search/#ranking-by-recency) over the metric |
 | `limit_per` | none | cap hits per distinct value of an attribute |
 | `diversity` | none | MMR lambda spreading hits apart in vector space (`1.0` relevance, `0.0` variety) |
 | `expand` | none | widen each hit with its document's neighbouring chunks; see [`expand`](#expand-widen-a-hit-with-its-neighbouring-chunks) |
@@ -529,7 +529,7 @@ curl -s localhost:7700/search \
 | `decay` | `0.5` | the factor at one `scale` of age (`0.5` makes `scale` a half-life) |
 | `lambda` | `1.0` | score a fully-decayed hit gives up |
 | `missing` | `1.0` | factor for a record with no usable timestamp (**no penalty**) |
-| `count_field` | none | integer attr adding a second, subtracted [reinforcement term](/guides/search/#ranking-by-reinforcement); `field` may be empty when only this term is wanted |
+| `count_field` | none | integer attr adding a second, subtracted [reinforcement term](/guides/vector-search/#ranking-by-reinforcement); `field` may be empty when only this term is wanted |
 | `count_scale` | `10.0` | saturation constant `k` in `n / (n + k)`; must be positive when `count_field` is set |
 | `count_lambda` | `1.0` | penalty an entirely un-reinforced record pays |
 
@@ -601,7 +601,7 @@ curl -s localhost:7700/search/similar \
 | `exact` | `false` | force the exact scan, bypassing any index and quantization |
 | `include_attributes` | all attrs | return only these attrs |
 | `exclude_attributes` | all attrs | return every attr but these |
-| `rank_by` | none | a [ranking expression](/guides/search/#ranking-by-recency) over the metric |
+| `rank_by` | none | a [ranking expression](/guides/vector-search/#ranking-by-recency) over the metric |
 | `limit_per` | none | cap hits per distinct value of an attribute |
 | `diversity` | none | MMR lambda spreading hits apart in vector space (`1.0` relevance, `0.0` variety) |
 | `expand` | none | widen each hit with its document's neighbouring chunks; see [`expand`](#expand-widen-a-hit-with-its-neighbouring-chunks) |
@@ -689,7 +689,7 @@ reported through `explain` instead, as `expansion` on that clause's score.
 
 ### `POST /code-search`
 
-Search a corpus ingested with [`nidus code ingest`](/guides/code/), grouped by file
+Search a corpus ingested with [`nidus code ingest`](/guides/code-search/), grouped by file
 with each hit's matching symbols. Needs the `code` feature on top of `memory`,
 both part of the default build; a build without it (`--no-default-features`)
 answers `404` here, not `400`. Never returns a raw
@@ -845,7 +845,7 @@ curl -s localhost:7700/hybrid-search \
 
 `limit_per` and `diversity` cap and spread the **fused** ranking, the same as on
 `/search` (see [Capping hits per attribute value](#capping-hits-per-attribute-value)
-and [`diversity`](/guides/search/#spreading-near-duplicates-apart)); both run after
+and [`diversity`](/guides/vector-search/#spreading-near-duplicates-apart)); both run after
 fusion, on the one ranking that exists by then. `/hybrid-search` does not take
 `names`/`name_weights`/`pool`: a hybrid query always searches the `default` vector.
 

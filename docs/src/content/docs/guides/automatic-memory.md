@@ -56,7 +56,7 @@ The server needs the `memory` routes, which ship in the default build:
 There is no setup call. The first `remember` into a collection creates it **and**
 declares a default full-text schema over `nidus.text`, so a client that only ever
 speaks to the server goes from an empty directory to a working
-[`hybrid_search`](/guides/search/) without a CLI invocation or a provisioning
+[`hybrid_search`](/guides/vector-search/) without a CLI invocation or a provisioning
 request.
 
 That is what makes the hooks below safe to run on a machine where the store does not
@@ -295,7 +295,7 @@ whole point: a memory nothing has ever recalled sinks, without you having to dec
 when to delete it. `reinforce` makes the recall a write, so it queues behind the
 server's other writes; a plain recall with no `reinforce` stays exactly as before.
 See [reinforcement](/guides/remember-and-recall/#reinforcement) for the full
-contract, and [ranking by reinforcement](/guides/search/#ranking-by-reinforcement)
+contract, and [ranking by reinforcement](/guides/vector-search/#ranking-by-reinforcement)
 for the `Decay` fields above.
 
 ## Two limits worth knowing
@@ -344,10 +344,11 @@ field, opposite predicate, because the two are answering opposite questions.
 
 ## Where to next
 
+- [Agent memory](/use-cases/agent-memory/): the use case this layer is built for.
 - [MCP (agent memory)](/guides/mcp/): the tool surface the model sees, and the stdio
   transport for the single-client case.
 - [Remember & recall](/guides/remember-and-recall/): the same layer from Rust, and
   what an embedder needs from you. Note the attr table above describes what the
   **server** stamps; the in-process Rust `Memory::remember` does not currently write
   `nidus.text`, so `text_search` against it needs you to set that attr yourself.
-- [Search & filters](/guides/search/): the filter grammar the hooks above use.
+- [Search & filters](/guides/vector-search/): the filter grammar the hooks above use.
