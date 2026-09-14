@@ -29,12 +29,14 @@ none`, unique crate names — D0015 records a three-crate-higher number under `-
 which keeps build-dependencies) and the stripped `cargo build --release` binary's size.
 The committed bounds live in `scripts/ceilings.env`; the check itself is
 `scripts/ceilings.sh`, run by both `just ceilings` and the CI job so the two cannot drift.
-**The binary-size ceiling is asserted on Linux x86_64 only** (CI's `ubuntu-latest`) —
-binary size is platform-dependent, so elsewhere the script reports the number without
-failing on it. Unlike the two build-budget jobs, `ceilings` isn't timing anything, so it
-uses the dependency cache. A bump to either ceiling is a design change (D0005): it lands
-in the PR that needs it, with the reason in the `.env` comment, same discipline as a
-version bump.
+**The binary-size ceiling is per platform**, because binary size is platform-dependent and
+one number covering both would have to be loose enough for the larger. `ceilings.env` carries
+`BINARY_BYTES_MAX_LINUX_X86_64` (CI's `ubuntu-latest`, the only one that gates a merge) and
+`BINARY_BYTES_MAX_DARWIN_ARM64` (the local developer's gate). A platform with no key is
+reported and not gated: a bound nobody measured is not evidence. Unlike the two
+build-budget jobs, `ceilings` isn't timing anything, so it uses the dependency cache. A bump
+to either ceiling is a design change (D0005): it lands in the PR that needs it, with the
+reason in the `.env` comment, same discipline as a version bump.
 
 `release.yml` invokes the SDK and chart publish workflows via `workflow_call` rather than
 letting a tag trigger them: a tag pushed with `GITHUB_TOKEN` cannot trigger another workflow,

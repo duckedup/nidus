@@ -4,9 +4,9 @@
 #![deny(unsafe_code)]
 //! # nidus
 //!
-//! A small, pure-Rust embeddable vector store: brute-force cosine search over one
-//! append-only directory, with typed metadata filters and many collections sharing one
-//! embedding space. See `SPEC.md` for the full design.
+//! A pure-Rust vector store with full-text search that runs anywhere Rust runs:
+//! brute-force cosine search over an append-only store, with typed metadata filters and
+//! many collections sharing one embedding space. See `SPEC.md` for the full design.
 //!
 //! ```no_run
 //! use nidus::{Nidus, Config, Record, SearchOpts, Scope};

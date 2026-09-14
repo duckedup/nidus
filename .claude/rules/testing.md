@@ -38,10 +38,9 @@ first — the harness attaches the offending process's own stderr.
 tree's shape: its dependency count and the shipped binary's stripped size, against D0005
 (a dependency that blows the build budget is a design change needing an issue first — the
 same reasoning applies to one that blows the crate count). Run it locally to catch a
-dependency addition before CI does. A local macOS run still asserts the crate-count
-ceiling but only *reports* the binary size — that ceiling is asserted on Linux x86_64
-only, because binary size is platform-dependent and only the CI number has been measured
-there. If a change trips a ceiling, the right fix is usually not raising it: drop the
+dependency addition before CI does. A local run on darwin-arm64 or linux-x86_64 asserts
+both ceilings against that platform's own committed bound; any other platform has its
+binary size reported rather than gated, because a bound nobody measured is not evidence. If a change trips a ceiling, the right fix is usually not raising it: drop the
 dependency, or find a lighter one, and raise the ceiling only when the addition is a
 deliberate, reviewed design decision (file the issue D0005 asks for first).
 

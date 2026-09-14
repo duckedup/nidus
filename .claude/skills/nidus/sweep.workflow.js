@@ -29,8 +29,8 @@ const mode = cfg.mode === 'optimize' ? 'optimize' : 'simplify'
 const scope = cfg.scope || 'the whole repository'
 const perLens = Number.isInteger(cfg.perLens) ? cfg.perLens : 2
 
-const CONTEXT = `nidus is an embeddable pure-Rust vector store: dense vectors plus typed metadata in one
-on-disk directory, exact brute-force cosine search, with opt-in ANN, quantisation, an HTTP
+const CONTEXT = `nidus is a pure-Rust vector store with full-text search that runs anywhere Rust runs: dense
+vectors plus typed metadata in one store, exact brute-force cosine search, with opt-in ANN, quantisation, an HTTP
 server, an MCP surface, and three client SDKs. Read CLAUDE.md first. SPEC.md is 2577 lines —
 do NOT read it whole: \`.claude/skills/nidus/bin/spec toc\` is the index, \`spec find <words>\`
 says which section covers a topic, and \`spec <ref>\` prints just that one.

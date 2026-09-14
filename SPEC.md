@@ -1,7 +1,7 @@
 # nidus — specification
 
 > _nidus_ (Latin, "nest") — a small place where things are kept safe. A pure-Rust
-> embeddable vector store, leaning on the bird theme.
+> vector store with full-text search, leaning on the bird theme.
 
 This document is the source of truth for nidus's design. It records not just
 *what* we build but *why*, including the decisions we deliberately deferred.
@@ -19,8 +19,9 @@ whole thing (built-in embedding, optionally summarizing first, with the provider
 your choice) or just the storage-and-search core if you bring your own vectors. Both ends
 are covered: `nidus ingest` walks a tree into a searchable corpus in one command, and rollup
 plus neighbour expansion (§7.10) hand back passages rather than the chunk fragments a
-chunked store would otherwise return. It runs fast, in-process, with no hosted service. The source can be anything — code,
-documents, issues, wiki pages — nidus does not care; it turns text into vectors,
+chunked store would otherwise return. It runs fast, and needs no hosted service of its
+own. The source can be anything — code, documents, issues, wiki pages — nidus does not
+care; it turns text into vectors,
 stores vectors and metadata, and ranks them.
 
 It exists because the obvious off-the-shelf options fail the *embedding* test —
@@ -98,7 +99,8 @@ Compiling a *large* C tree, or adding a *second* `unsafe` site to *our* code, is
 
 **Goals**
 - Runs anywhere Rust runs: in process as a library, behind `nidus serve` over HTTP, as an
-  MCP server, or in a browser on wasm; single-store-per-directory.
+  MCP server, or in a browser on wasm. One store is one named set of byte objects (§13.2),
+  whether that is a local directory, an object-store prefix, or an OPFS handle pool.
 - Exact (100% recall) brute-force cosine search, whose scan cost scales with rows scanned;
   mmap, ANN, and quantization are the opt-ins that change that.
 - Many logical collections (namespaces) in one store, sharing one dimension.

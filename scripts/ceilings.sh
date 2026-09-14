@@ -40,18 +40,24 @@ strip "$tmp_bin"
 # Linux/macOS split.
 binary_bytes=$(wc -c <"$tmp_bin" | tr -d ' ')
 
-os=$(uname -s)
-arch=$(uname -m)
-echo "stripped release binary: ${binary_bytes} bytes on ${os}/${arch} (ceiling: ${BINARY_BYTES_MAX}, Linux x86_64 only)"
+# One bound per platform actually measured, because binary size is platform-dependent and
+# a single number would have to be loose enough for the largest of them. An unmeasured
+# platform is reported, never gated: a bound nobody measured is not evidence.
+case "$(uname -s)/$(uname -m)" in
+    Darwin/arm64) platform=darwin-arm64  ; ceiling=${BINARY_BYTES_MAX_DARWIN_ARM64} ;;
+    Linux/x86_64) platform=linux-x86_64  ; ceiling=${BINARY_BYTES_MAX_LINUX_X86_64} ;;
+    *)            platform="$(uname -s)/$(uname -m)" ; ceiling="" ;;
+esac
 
 size_over=false
-if [ "$os" = "Linux" ] && [ "$arch" = "x86_64" ]; then
-    if [ "$binary_bytes" -gt "$BINARY_BYTES_MAX" ]; then
-        echo "::error::stripped binary is ${binary_bytes} bytes, over the ceiling of ${BINARY_BYTES_MAX} (Linux x86_64). A new dependency likely grew the shipped binary; this is a design change, not an implementation detail."
+if [ -n "$ceiling" ]; then
+    echo "stripped release binary: ${binary_bytes} bytes on ${platform} (ceiling: ${ceiling})"
+    if [ "$binary_bytes" -gt "$ceiling" ]; then
+        echo "::error::stripped binary is ${binary_bytes} bytes on ${platform}, over the ceiling of ${ceiling}. A new dependency likely grew the shipped binary; this is a design change, not an implementation detail."
         size_over=true
     fi
 else
-    echo "binary-size ceiling is asserted on Linux x86_64 only (CI's ubuntu-latest); ${os}/${arch} is reported here, not gated."
+    echo "stripped release binary: ${binary_bytes} bytes on ${platform} (no committed ceiling for this platform; reported, not gated)"
 fi
 
 if [ "$crates_over" = true ] || [ "$size_over" = true ]; then
