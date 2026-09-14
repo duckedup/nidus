@@ -120,7 +120,12 @@ async function main() {
     // Starlight: "/" is a standalone landing page outside the router (nidus-e4k),
     // so the home icon is now an ordinary full page load and cannot reproduce
     // anything. A sidebar link is the client-side swap the bug lived in.
-    await session.navigate(`${root}/guides/how-it-works/`);
+    //
+    // Both pages must sit in ONE sidebar group: Sidebar.astro renders each group
+    // as <details open={hasCurrent(entry)}>, so a link in any other group is
+    // inside a collapsed <details> and cannot be clicked (nidus-jvu9). Full-text
+    // search and vector search are both in "Search".
+    await session.navigate(`${root}/guides/full-text-search/`);
     await waitFor(() => session.findElement("site-search").catch(() => null), {
       timeoutMs: 15000,
       label: "the header search element on first load",
@@ -144,8 +149,8 @@ async function main() {
     step("navigating back");
     await session.back();
     await waitFor(
-      async () => new URL(await session.currentUrl()).pathname === "/guides/how-it-works/",
-      { timeoutMs: 10000, label: "the how-it-works page after navigating back" },
+      async () => new URL(await session.currentUrl()).pathname === "/guides/full-text-search/",
+      { timeoutMs: 10000, label: "the full-text-search page after navigating back" },
     );
     await waitFor(() => session.execute(SEARCH_BUTTON_READY), {
       timeoutMs: 10000,

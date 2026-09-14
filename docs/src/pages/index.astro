@@ -11,8 +11,9 @@
  * developer who has never touched a vector store should read the whole page
  * without stopping.
  *
- * Every command and every block of output here was captured from `nidus 0.96.0`
- * against a real store. Nothing is illustrative.
+ * Every command and every block of output here was captured against a real store.
+ * Nothing is illustrative. The hero run was recaptured from `nidus 0.102.0` when
+ * the guide renames landed (nidus-jvu9); the rest are from `nidus 0.96.0`.
  */
 import { Image } from "astro:assets";
 import nest from "../assets/nidus.svg";
@@ -193,15 +194,15 @@ nidus text-search --dir ./store nidus.text -k 3 \\
   "how do we avoid losing data when the process crashes"`}
               out={`[
   { "id": "guides/storage.md#3",
-    "score": 11.747257,
+    "score": 11.89682,
     "attrs": { "nidus.source_path":
       { "Str": "guides/storage.md" } } },
   { "id": "guides/storage.md#0",
-    "score": 11.720629, "attrs": { … } },
-  { "id": "guides/cli-and-server.md#19",
-    "score": 9.665971, "attrs": { … } }
+    "score": 11.86455, "attrs": { … } },
+  { "id": "guides/command-line.md#19",
+    "score": 9.776753, "attrs": { … } }
 ]`}
-              note="27 markdown files became 758 searchable passages in 0.4 seconds, and the question landed on the durability guide."
+              note="34 markdown files became 796 searchable passages, with no API key, and the question landed on the durability guide."
             />
           </div>
         </section>
@@ -421,7 +422,7 @@ nidus text-search --dir ./store body "crash fsync" \\
                 title="or let it be your app's search endpoint"
                 cmd={`nidus serve --dir ./store --embed-provider voyage
 
-curl localhost:8080/collections/docs/recall \\
+curl localhost:7700/collections/docs/recall \\
   -d '{"query": "what is our refund window"}'`}
                 note="These three need an embedding provider (Voyage, OpenAI, Ollama and others). The run at the top of this page needed none."
               />

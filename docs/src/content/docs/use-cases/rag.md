@@ -39,7 +39,7 @@ nidus recall docs "how does compaction work" --dir ./store --embed-provider voya
 Over HTTP, the same query is a POST:
 
 ```sh
-curl -s localhost:8080/collections/docs/recall \
+curl -s localhost:7700/collections/docs/recall \
   -d '{"query": "how does compaction work", "rollup": {"neighbours": 1}}'
 ```
 

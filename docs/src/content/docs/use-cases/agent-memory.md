@@ -31,8 +31,9 @@ directly instead of shelling out.
 
 ## What to tune
 
-- [Reinforcement](/guides/remember-and-recall/#reinforcement): an entry recalled
-  often decays slower than one nobody asks for again.
+- [Reinforcement](/guides/remember-and-recall/#reinforcement): a recall can stamp
+  `nidus.access_count` and `nidus.last_accessed` on what it returned, which a ranking
+  expression can then read so an entry nobody asks for again sinks.
 - [Filters & metadata](/guides/filters/): scope memories to a project or a user,
   and combine that with recency-decay ranking so old notes fade rather than pile up.
 

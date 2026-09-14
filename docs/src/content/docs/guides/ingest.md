@@ -85,8 +85,8 @@ working either way.
 ## Record ids, so a re-ingest replaces
 
 Each chunk is stored as `<path>#<chunk-index>`, where the path is relative to the
-directory you pointed at. `docs/guides/search.md` chunk 3 becomes
-`guides/search.md#3`.
+directory you pointed at. `docs/guides/vector-search.md` chunk 3 becomes
+`guides/vector-search.md#3`.
 
 That makes a re-ingest a replacement rather than a duplication, and it means a
 file that got shorter has its leftover high-index chunks removed. Every chunk
@@ -208,7 +208,7 @@ Over HTTP the same knob is `rollup` on the recall body, and the `recall` MCP too
 takes it too:
 
 ```bash
-curl -s localhost:8080/collections/docs/recall \
+curl -s localhost:7700/collections/docs/recall \
   -d '{"query": "how does the writer lock work", "rollup": {"neighbours": 1}}'
 ```
 
