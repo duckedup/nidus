@@ -29,26 +29,32 @@ Needs blueprints. If none exist for this target, run **Spec** first (including i
    can no longer fail by accident for want of the code it covers. Revert the fix in the merged
    tree, watch the test go red, restore it. Once observed, say so — an unverified regression
    test claimed as verified is worse than none.
+
+   This is the one thing CI cannot do for you: a counterfactual needs the fix removed, and no
+   check ever runs that tree. It is **one targeted test**, not a lane — `cargo test <filter>`,
+   not `just ci`. **Commit first.** Reverting a file to mutate it and then restoring it with
+   `git checkout -- <file>` throws away every *other* uncommitted change in that file, which
+   is a real way to lose work you are about to push.
 6. **Check scope before you trust the merge.** A patch is cut with `git add -A`, so it carries
    everything in that worktree, not just the blueprint's directory. The workflow returns
    `out_of_scope` per patch, but it is derived from the agent's own `files_changed` — confirm
    it against the patch itself (`git apply --numstat <patch_file>`) rather than believing it,
-   and revert what does not belong. Then run the `run` lanes from `nidus-check lanes --json`
-   against the merged tree: agents passing individually does not mean the merged result passes.
-   Lanes the checker reports as `ci` (Miri today) are required PR checks — do not run them
-   locally; the PR is where they run once. Debugging a red CI lane is the exception.
-   In the full pipeline, start these lanes in the background and launch **Review**'s fan-out
-   immediately, so the wall clock is the slower of the two and not the sum. **What makes that
-   safe is a rule, not a property of reviewing**: `review.workflow.js` forbids its agents from
-   writing any tracked file in this checkout, and tells one that must run *changed* code to
-   copy it into its own worktree first. Reviewing is not inherently read-only — a skeptic
-   confirming a defect by executing it is the review working as intended, and one that added a
-   temporary `#[test]`, ran it and reverted it failed a concurrent `just ci-cli` on a test
-   attributable to nothing in the diff, leaving a byte-identical file behind to diagnose from
-   (nidus-jni). So if you fan out anything else beside the lanes, give it the same rule. The
-   overlap binds you too: do not edit the tree — review fixes included — until the lanes
-   report, or the green proves a tree nobody has.
+   and revert what does not belong.
+
+   **Do not run the verification lanes here. CI runs them.** `nidus-check lanes` still tells
+   you which CI jobs cover the files you touched, and blueprints still carry that list, but it
+   is a coverage map, not a script: reading it tells you what will be exercised and what will
+   not. What the main thread owes instead is a tree that is worth pushing — the patches
+   merged, scope confirmed, nothing obviously half-applied — and then **Ship**, which pushes
+   and watches the checks.
+
+   The reason is not just wall clock. A local run proves something about *your* machine and
+   *your* feature flags, and this pipeline writes to the tree constantly — reverting a file to
+   test a mutation, applying the next group's patch, formatting. A lane run overlapping any of
+   that is evidence about a tree nobody has, and a hang or a red result costs a debugging
+   detour into a machine-local artefact. CI runs a clean checkout, every lane, once.
 7. Report failures from the workflow with their blockers and log paths, and ask whether to
-   investigate, skip, or abort.
+   investigate, skip, or abort. A worker that could not finish is a different thing from a
+   red lane, and it is the only failure you can see before CI.
 8. On success delete the blueprint files, then continue to **Review**.
 

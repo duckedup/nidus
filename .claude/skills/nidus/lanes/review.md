@@ -48,10 +48,11 @@ worse than none, since `scope` would then review against the wrong requirements.
    quietly deciding it: a finding that changes the approach, contradicts the issue, or is a
    judgment call. A finding that reveals the **ticket** was wrong is worth saying out loud —
    this is the cheapest moment to learn the plan was off, and which to fix is the user's call.
-7. **Re-verify only what changed.** Skip this entirely if steps 5–6 changed no files: the
-   suite was already green and re-running it proves nothing. Otherwise run the lanes
-   `nidus-check lanes` names for the files you touched, not the full set.
-8. `--fix`: apply the findings to the working tree, then re-run the affected lanes.
+7. **Do not re-verify locally.** Fixes ride to CI with everything else; `nidus-check lanes`
+   says which jobs will cover them, and **Ship** step 7 watches those jobs. The exception is
+   the same one Implement carries: a counterfactual no check can run for you, which is one
+   targeted test on a committed tree, not a lane.
+8. `--fix`: apply the findings to the working tree and stop there.
    `--comment`: post them as PR comments, citing code by permalink with the full commit SHA
    (`https://github.com/duckedup/nidus/blob/<sha>/<path>#L10-L15` — a `$(git rev-parse)`
    substitution does not render in a comment).
