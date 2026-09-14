@@ -351,7 +351,7 @@ the affected field indexes.
 Declare a collection's additional named-vector fields, beyond the reserved `default`
 vector. Usage: `nidus set-vector-names [OPTIONS] --dir <DIR> <COLLECTION>`. Re-running
 replaces the whole set rather than adding to it, mirroring `set-fts-schema`. See
-[Named vectors](/guides/search/#named-vectors).
+[Named vectors](/guides/vector-search/#named-vectors).
 
 | Flag | Env | Description |
 | --- | --- | --- |

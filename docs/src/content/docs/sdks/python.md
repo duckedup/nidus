@@ -162,7 +162,7 @@ searches only the reserved `default` vector (what a plain `vector` field populat
 byte-identical to a call written before this existed. `search_similar` and
 `hybrid_search` do not take `names`/`name_weights`/`pool`: both always search or fuse
 against `default` over this HTTP client. See
-[Named vectors](/guides/search/#named-vectors) for the full behaviour, including the
+[Named vectors](/guides/vector-search/#named-vectors) for the full behaviour, including the
 library/CLI surfaces that do support it on a "more like this" query.
 
 ## Similar records ("more like this")

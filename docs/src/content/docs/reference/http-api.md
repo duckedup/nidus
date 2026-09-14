@@ -310,7 +310,7 @@ curl -s -X POST localhost:7700/collections/docs/filter-index \
 Declare a collection's additional named-vector fields: the names an upsert may set on
 `Record::vectors` and a search may score with `names`, beyond the reserved `default`
 vector that `Record::vector` always populates. Run it before the first upsert or search
-that uses a name; see [Named vectors](/guides/search/#named-vectors).
+that uses a name; see [Named vectors](/guides/vector-search/#named-vectors).
 
 ```bash
 curl -s -X POST localhost:7700/collections/docs/vector-names \
@@ -845,7 +845,7 @@ curl -s localhost:7700/hybrid-search \
 
 `limit_per` and `diversity` cap and spread the **fused** ranking, the same as on
 `/search` (see [Capping hits per attribute value](#capping-hits-per-attribute-value)
-and [`diversity`](/guides/search/#spreading-near-duplicates-apart)); both run after
+and [`diversity`](/guides/vector-search/#spreading-near-duplicates-apart)); both run after
 fusion, on the one ranking that exists by then. `/hybrid-search` does not take
 `names`/`name_weights`/`pool`: a hybrid query always searches the `default` vector.
 
