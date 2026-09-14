@@ -105,10 +105,11 @@ Compiling a *large* C tree, or adding a *second* `unsafe` site to *our* code, is
   whether that is a local directory, an object-store prefix, or an OPFS handle pool.
 - Exact (100% recall) brute-force cosine search, whose scan cost scales with rows scanned;
   mmap, ANN, and quantization are the opt-ins that change that.
-- Many logical collections (namespaces) in one store, sharing one dimension.
+- Many logical collections in one store, sharing one dimension. (A **namespace** is a
+  separate store, not a collection: see §13.9.)
 - **Scoped search**: query one collection, a chosen subset, or the entire store in
   a single call, with results merged into one ranking. The API must not lock callers
-  into a single namespace per query, and the storage layout must not make
+  into a single collection per query, and the storage layout must not make
   whole-store search expensive beyond the unavoidable scan cost.
 - Crash-safe writes; lock-free, consistent cross-process reads.
 - Idempotent upserts by caller-supplied id.
@@ -157,7 +158,7 @@ pub enum Value {
 }
 ```
 
-- **Collections** are logical partitions (namespaces) identified by a `&str`. There
+- **Collections** are logical partitions identified by a `&str`. There
   are many; each is created/dropped independently; all share the store's single
   pinned dimension. A collection may also have one or more **aliases**: an indirect
   name resolving to it in one hop, used to repoint a caller's fixed collection name
@@ -276,8 +277,8 @@ pub struct Aggregation { pub count: u64, pub sums: BTreeMap<String, Value>,
 // `value` is None for the records missing the attribute — not the same as Value::Null (§7.7).
 pub struct Group { pub value: Option<Value>, pub count: u64, pub sums: BTreeMap<String, Value> }
 
-// `collection` identifies the source namespace — required when a query spans more
-// than one, and (id) is only unique within a collection.
+// `collection` identifies which collection matched: required when a query spans
+// more than one, since (id) is only unique within a collection.
 pub struct Hit { pub collection: String, pub id: String, pub score: f32, pub attrs: BTreeMap<String, Value> } // no vector
 
 pub struct Filter(pub Vec<Predicate>);   // AND of predicates
@@ -2159,10 +2160,12 @@ document taxonomy; it is not the same thing as the `nidus.*`-namespaced reserved
 (§9's agent-memory write path, including `nidus.parent_id`/`nidus.chunk_index`), which
 nidus itself stamps and reads.
 
-The application's notion of a namespace → a nidus collection; any per-namespace
-bookkeeping (a sync high-water mark, the embedding model id) → the collection's
-string `meta` map; query options (top-k, path scoping, type/language filters,
-min-score) → `SearchOpts` with `Glob`/`Eq`/`In` predicates.
+The application's notion of a namespace maps to a nidus **store**, addressed through
+`Namespaces` (§13.9); a collection is a partition *within* one namespace, not the
+namespace itself. Any per-collection bookkeeping (a sync high-water mark, the
+embedding model id) still maps to that collection's string `meta` map; query options
+(top-k, path scoping, type/language filters, min-score) still map to `SearchOpts`
+with `Glob`/`Eq`/`In` predicates.
 
 The host owns the **store location**: it maps its own configured path (e.g. a
 `store.<name>.path` setting or a user flag) and any durability/lock preferences into
@@ -2500,6 +2503,53 @@ call block a worker on an async handle open without a pool, which looks simpler.
 the worker — a deployment requirement nidus cannot impose on an embedding application, and
 one many static-hosting setups cannot meet at all. The pre-opened pool needs no isolation
 header: all the async work happens once, up front, in ordinary JS.
+
+### 13.9 The namespace model: a namespace is a store (`Namespaces`, built)
+
+Earlier sections of this spec used "namespace" loosely, as a gloss on **collection**
+(§2, §3, §12 as originally written). That was wrong: a collection has no physical
+existence of its own (`Manifest.segments` is store-global, and `Store::open` loads
+every collection's rows together), so it cannot be the unit a multi-tenant caller
+isolates on. The unit that actually isolates, in storage terms, is the **store**: its
+own `data`/`log` objects, its own writer lock, its own in-RAM working set.
+
+So the model is: **a namespace is a store**, one per tenant, addressed by name under
+one shared base location rather than by a hardcoded path per tenant. `Namespaces` is
+the library handle for that: a thin registry over `Nidus::open`, not a new storage
+format and not a new backend.
+
+```rust
+Namespaces::new(template: Config, base: impl Into<String>) -> Self
+    .budget_bytes(bytes: u64) -> Self
+    .get(&mut self, name: &str) -> Result<&mut Nidus>
+    .warm(&self) -> Vec<String>
+    .evict(&mut self, name: &str) -> Result<bool>
+    .warm_bytes(&self) -> u64
+```
+
+- **One store per namespace, opened lazily.** `new` takes a template `Config` (§4.1,
+  every knob except the path) and a `base` location; no namespace is opened until
+  `get(name)` first asks for it, at which point its store lives at `base/name` (or the
+  equivalent backend-scheme child of `base`, §13.2) with the template's settings.
+  Each namespace therefore gets its **own** writer lock (§6.3) and its **own**
+  memory-tier key prefix (§13.3): two tenants can never contend on the same lock file
+  or collide in the same shared cache, even when both use a Redis/Valkey memory tier.
+- **A byte-bounded warm set, not an unbounded one.** `budget_bytes` caps how much
+  namespace state `Namespaces` keeps open across all tenants at once; `warm_bytes`
+  reports the current total and `warm` lists which namespaces it covers. A `get` that
+  would cross the budget evicts the coldest namespace first (flushing it) rather than
+  growing past the cap, and `evict` lets a caller reclaim one namespace by hand ahead
+  of that. This is what makes "one process, many tenants" viable at all: without a
+  bound, a caller with more tenants than fits in RAM would eventually hold every
+  tenant's full working set at once.
+- **What this is not.** `Namespaces` is a library-side handle only: it says nothing
+  about how many processes serve traffic or how a network request picks a namespace.
+  `nidus serve` (§9) still opens **one** store today; routing one HTTP or MCP server
+  across many namespaces by name is a separate, not-yet-shipped surface. Nothing here
+  should be read as "`nidus serve` hosts many tenants."
+- **Aliases and blue/green reindexing (§14.2) are unaffected.** Both operate on
+  collections *within* one store; a namespace-per-store model changes what a
+  namespace *is*, not what a collection can do inside one.
 
 ---
 

@@ -21,7 +21,12 @@ const RULES = [
   {
     recipe: 'just ci',
     why: 'library source changed — fmt-check + clippy + test on the pure library',
-    match: [/^src\//, /^tests\/(integration|build_thesis)\.rs$/, /^Cargo\.toml$/, /^rust-toolchain\.toml$/],
+    // Top-level `tests/*.rs` only: `just test` is `cargo test --no-default-features`, which
+    // builds every integration target directly under tests/. Subdirectory suites are excluded
+    // on purpose and carry their own lanes — tests/e2e/ is `#![cfg(feature = "cli")]` so the
+    // lean build compiles it to nothing, and tests/wasm_opfs/ needs a browser. Naming
+    // individual files here instead (as this rule once did) silently unmaps every new one.
+    match: [/^src\//, /^tests\/[^/]+\.rs$/, /^Cargo\.toml$/, /^rust-toolchain\.toml$/],
   },
   {
     recipe: 'just ci-cli',
