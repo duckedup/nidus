@@ -46,15 +46,15 @@
    measured and why it closes; it just contributes no files.
    - `BLUEPRINT-<id>.md` in **each directory** that will change.
    - `BLUEPRINT-<id>.md` at the **repo root**: summary, the table of sub-blueprints, complete
-     file create/modify/remove list, group ordering and why, and the global verification lanes
-     from `nidus-check lanes`.
+     file create/modify/remove list, group ordering and why, and the CI jobs that will cover
+     it, from `nidus-check lanes` — a coverage map for the reader, not commands to run.
    - **Exception: never write one inside `docs/src/content/docs/`.** Starlight's `docsLoader()`
      schema-validates every `.md` under that root, so a blueprint there fails `just docs-build`
      with an error pointing at the blueprint. Put that slice's file at `docs/BLUEPRINT-<id>.md`.
    - Never name these `SPEC-*.md` — `SPEC.md` at the root is nidus's product spec.
    - Each sub-blueprint carries: context, files to modify/create/remove, concrete code
      patterns to mirror (path + line range + snippet, so the agent never re-explores), the
-     test pattern for that area, acceptance criteria, its exact `verify` lanes, and a scope
+     test pattern for that area, acceptance criteria, the CI jobs that cover it, and a scope
      boundary naming the files it may NOT touch.
 5. **The plan gate.** One `AskUserQuestion`: what you are about to build in 2–3 sentences, the
    unit list, and the file create/modify/remove count. Options: approve / refine (they edit,

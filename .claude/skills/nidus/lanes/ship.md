@@ -1,10 +1,12 @@
 ## Ship
 
-1. `nidus-check laws --strict`, always — it is cheap and the diff has moved since Implement.
-   Lanes are NOT re-run wholesale here: the merged tree already passed them at Implement
-   step 6, and Review step 7 re-ran whatever its fixes touched. Re-run only the lanes for
-   files changed since the last green run; an unchanged green tree proves nothing twice.
-   `ci`-class lanes (Miri) stay with the PR's required checks. Do not ship red.
+1. `nidus-check laws --strict`, always — it is cheap, it is the one gate CI does not own,
+   and the diff has moved since Implement. Note it reads the **committed** range, so a fix
+   you have not committed does not count as fixed.
+
+   **Do not run the verification lanes. CI runs them**, on a clean checkout, with every
+   feature flag, once. `nidus-check lanes` is a coverage map for deciding what CI will and
+   will not exercise, not a list of commands to execute here.
 2. **Version.** Every user-visible or behavioural change bumps `Cargo.toml` `version`
    (patch for fixes/refactors, minor for features, major for breaks) — `release.yml` cuts a
    release only when the `v<version>` tag is new, so an un-bumped PR silently ships nothing.
@@ -40,6 +42,22 @@
    someone to come back and press the button. Print the URL.
    Auto-merge makes step 3's bead close easy to orphan — nobody is watching when it lands —
    so close it at your next touch of the repo rather than assuming someone saw it merge.
+7. **Watch the checks, and fix what goes red.** Pushing is not finishing: the lanes you did
+   not run locally run here, and a PR handed back with checks in flight is work of unknown
+   status. Poll in the background until every check settles:
+
+   ```bash
+   until gh pr checks <n> 2>&1 | grep -qvE 'pending|no checks'; do sleep 30; done
+   gh pr checks <n>
+   ```
+
+   On a failure, pull the job's log (`gh run view <run-id> --log-failed`), fix it, push, and
+   keep watching — no need to ask first. Say what broke and what you changed. Two things to
+   weigh before assuming the diff is at fault: a lane can be red for a reason nobody wrote
+   (a flake, a runner, an upstream crate), and a first-ever run of a lane is the most likely
+   place for a latent problem to surface rather than a new one.
+
+   Report only when every check is green or you are genuinely stuck, and never describe a
+   check as passing that you have not seen pass.
 
 Ask before the commit. Never commit or push without the user choosing to.
-

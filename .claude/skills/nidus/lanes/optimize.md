@@ -72,8 +72,9 @@ dependency that costs build time (D0005), a non-additive on-disk format change.
    - A unit whose number did not move is not done. Report it, do not narrate around it: the
      honest outcomes are "shipped, here is the delta", "no measurable win, reverted", and "the
      win was real but smaller than predicted, here is the actual number".
-   - Correctness first, always: the lanes from `nidus-check lanes`, including `just ci-cli`,
-     the SDK lanes and `just test-e2e`. A faster wrong answer is a bug.
+   - Correctness first, always. `nidus-check lanes` says which CI jobs cover the change
+     (`ci-cli`, the SDK lanes, `test-e2e`); **Ship** watches them. A faster wrong answer is a
+     bug, and a benchmark that never had its correctness lane run is not evidence of a win.
 9. **Review** — `lanes/review.md`, unchanged, with `issues` set to the bead from step 4. Its
    criteria pass will re-run your benchmark acceptance criteria from a context that did not
    write the code, which is exactly the check a performance claim needs. Then **Ship**

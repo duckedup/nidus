@@ -134,10 +134,14 @@ blocked. `lanes/spec.md` step 4 has the reasoning and the naming.
   reads it, each of which is being graded against it. So construct the counterfactual for each
   criterion *before* the scope gate, and when one has no failing mode say so, fix the ticket,
   and ship the criterion that does.
-- **A green lane run is evidence only about a tree nobody was writing to.** Anything sharing
-  the checkout while the lanes run — an agent, another session, you — can turn a lane red for
-  a reason that is nowhere in the diff and gone before you look. When a lane fails on
-  something the change cannot explain, check whether the tree moved under it (`git status`, a
-  hash against `HEAD`) before believing either "my change broke it" or "the suite is flaky".
+- **Verification is CI's job, not this session's.** Do not run `just ci`, `just ci-cli`,
+  `test-e2e`, the SDK lanes or Miri locally. `nidus-check lanes` is a coverage map — which CI
+  jobs touch which files — not a list of commands. **Ship** pushes, watches the checks, and
+  fixes what goes red. Two exceptions, both narrow: `nidus-check laws`, which CI does not run,
+  and a fails-without-fix counterfactual, which is one targeted test on a **committed** tree.
+  The reason is that a local run is evidence only about a tree nobody was writing to, and this
+  pipeline writes constantly — merging patches, reverting a file to mutate it, formatting. A
+  lane overlapping any of that can hang or go red for something nowhere in the diff, and the
+  debugging is a detour into a machine-local artefact. A clean checkout is CI's whole point.
 - Peers get worktrees under `.claude/worktrees/`, never a shared tree and never a fresh clone.
   Prune them when the ticket ships.

@@ -91,7 +91,7 @@ Rules:
   merge conflict.
 - Track work in beads (\`bd\`), never with markdown checklists.
 ${prior ? `\nYOUR PRIOR ATTEMPT FAILED — fix exactly this, do not start over:\n${prior}\n` : ''}
-When the blueprint is implemented and its lanes pass, write your patch:
+When the blueprint is implemented, write your patch (you were told not to run lanes, so\n"implemented" means written and read back, not verified):
     git add -A && git diff --cached > ${patchFile}
 Then return the structured result with patch_file set to "${patchFile}" (or "" if you changed nothing).
 Set files_changed to exactly what that patch contains — read it back with

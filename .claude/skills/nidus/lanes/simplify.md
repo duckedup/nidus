@@ -62,9 +62,10 @@ clothes. Stop and say so.
    - `git diff main...HEAD -- tests/ src/**/tests.rs` and any `#[cfg(test)]` hunk — **every
      changed or deleted assertion is a finding**, not a detail. Report them rather than
      explaining them away.
-   - the lanes `just ci` cannot see: `just ci-cli`, the SDK lanes, `just test-e2e`. A shared
-     helper that broke a caller in `src/cli` is the classic failure of this lane, and the core
-     lane is green while it happens.
+   - the callers the core lane never compiles: `src/cli`, `src/server`, the SDKs, the e2e
+     binary. A shared helper that broke a caller in `src/cli` is the classic failure of this
+     lane, and the core lane is green while it happens, so read those call sites rather than
+     trusting a green core. CI compiles them; **Ship** watches it.
 9. **Review** — `lanes/review.md`, unchanged, with `issues` set to the bead from step 4. The
    `seams` lens is the one that matters most here and it is already in the set; do not narrow
    with `only`. Then **Ship** (`lanes/ship.md`): a refactor with no user-visible change is
