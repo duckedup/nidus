@@ -180,6 +180,7 @@ fn build(
         .map(|(i, &id)| Record {
             id: id.to_string(),
             vector: Some(data.vectors[i * dim..(i + 1) * dim].to_vec()),
+            vectors: Default::default(),
             attrs: BTreeMap::new(),
         })
         .collect();

@@ -1,0 +1,95 @@
+{
+  "bench": "nidus-bench-named",
+  "cells": [
+    {
+      "baseline_p50_ms": 2.298167,
+      "baseline_rows_scanned": 50000,
+      "by_names_cost": [
+        {
+          "names": 1,
+          "p50_ms": 6.848166,
+          "ratio_vs_baseline": 2.979838279811694,
+          "rows_scanned": 50000
+        },
+        {
+          "names": 2,
+          "p50_ms": 8.621833,
+          "ratio_vs_baseline": 3.751612915858596,
+          "rows_scanned": 100000
+        },
+        {
+          "names": 4,
+          "p50_ms": 17.322542,
+          "ratio_vs_baseline": 7.537547097317123,
+          "rows_scanned": 200000
+        }
+      ],
+      "by_names_recall": [
+        {
+          "independent_check_vs_exact_ground_truth": 1.0,
+          "names": 1,
+          "recall_at_k": 1.0
+        },
+        {
+          "names": 2,
+          "recall_at_k": 1.0
+        },
+        {
+          "names": 4,
+          "recall_at_k": 1.0
+        }
+      ],
+      "by_threads": [
+        {
+          "control_per_s": 112.96825908230913,
+          "control_speedup": 1.0,
+          "per_s": 56.619697607783806,
+          "speedup": 1.0,
+          "threads": 1
+        },
+        {
+          "control_per_s": 182.3992394681311,
+          "control_speedup": 1.614606093338433,
+          "per_s": 61.55402618422099,
+          "speedup": 1.0871486211498034,
+          "threads": 4
+        }
+      ],
+      "dim": 384,
+      "n": 50000,
+      "pooling": {
+        "max_p50_ms": 17.396791,
+        "names": 4,
+        "sum_p50_ms": 17.349084
+      }
+    }
+  ],
+  "inputs": {
+    "clustered": false,
+    "clusters": 64,
+    "dim": [
+      384
+    ],
+    "iters": 5,
+    "min_scale": 0.6,
+    "n": [
+      50000
+    ],
+    "names": [
+      1,
+      2,
+      4
+    ],
+    "queries": 50,
+    "seed": 42,
+    "threads": [
+      1,
+      4
+    ],
+    "tolerance": 1.15,
+    "top_k": 10,
+    "unnamed_tolerance": 3.5,
+    "warmup": 10
+  },
+  "nidus_version": "unknown"
+}

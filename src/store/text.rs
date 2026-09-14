@@ -8,11 +8,11 @@ use anyhow::Result;
 use super::Store;
 use super::plan::PlanRec;
 use super::rank;
-use super::read::{check_query_opts, check_weight, depth, paginate};
+use super::read::{check_query_opts, check_weight, depth};
 use crate::annotate::{Annotations, ClauseScore, Expansion, Highlight, HighlightOpts, LegScore};
 use crate::filter;
 use crate::fts::Analyzer;
-use crate::fuse::{FusionLeg, rrf_fuse};
+use crate::fuse::{FusionLeg, LegScores, rrf_fuse};
 use crate::model::{
     FtsClause, FtsCombine, FtsQuery, Hit, HybridOpts, SearchOpts, SuggestOpts, Suggestion,
     Suggestions,
@@ -65,6 +65,24 @@ fn clause_scores(
 enum Leg {
     Prefix,
     Fuzzy,
+}
+
+/// How deep each hybrid leg must rank (nidus-29ui): a full page (`offset + top_k`), at least
+/// `candidates` deep, over-fetched further when a cap or MMR will thin/reorder the fused
+/// ranking — mirrors `read::depth`'s reasoning, one leg-agnostic function for both legs.
+fn leg_depth(opts: &HybridOpts) -> usize {
+    let page = opts.offset.saturating_add(opts.top_k).max(opts.candidates);
+    let cap = if opts.limit_per.is_some() {
+        super::aggregate::LIMIT_PER_OVERFETCH
+    } else {
+        1
+    };
+    let spread = if opts.diversity.is_some() {
+        super::diversity::MMR_OVERFETCH
+    } else {
+        1
+    };
+    page.saturating_mul(cap.max(spread))
 }
 
 impl Store {
@@ -363,14 +381,17 @@ impl Store {
         text.validate()?;
         check_weight("vector_weight", opts.vector_weight)?;
         check_weight("text_weight", opts.text_weight)?;
+        super::aggregate::validate(opts.limit_per.as_ref())?;
+        super::diversity::validate(opts.diversity)?;
 
         if opts.top_k == 0 {
             return Ok(Vec::new());
         }
-        // Pull each leg at least a full page deep (`offset + top_k`) so fusion can fill it.
-        let page = opts.offset.saturating_add(opts.top_k);
+        // Each leg over-fetches the way a capped search does (SPEC §7.7) — `limit_per`/
+        // `diversity` need a deeper fused window than a bare page, or the shared tail below
+        // thins one that was never widened for it.
         let leg_opts = SearchOpts {
-            top_k: opts.candidates.max(page),
+            top_k: leg_depth(opts),
             filter: opts.filter.clone(),
             explain: opts.explain,
             ..Default::default()
@@ -394,8 +415,8 @@ impl Store {
             })
             .collect();
 
-        // The page is cut on the *fused* ranking, never per leg — a leg's rank is an input to
-        // the fused score, so paginating a leg would change which documents fuse at all.
+        // Fusion decides which documents even compete, so it must run before any cap/spread/
+        // page cut, never per leg.
         let fused = rrf_fuse(
             vec![
                 FusionLeg::new(vector_leg).weight(opts.vector_weight),
@@ -403,30 +424,42 @@ impl Store {
             ],
             opts.rrf_k,
         );
-        let mut page = paginate(fused, opts.offset);
-        page.truncate(opts.top_k);
-
-        let mut hits: Vec<Hit> = page
+        // Split into the plain ranking the shared tail (nidus-29ui) can cap/spread/page-cut,
+        // and a side table so each survivor's per-leg detail is found back by identity rather
+        // than by a position the tail may have reordered or dropped.
+        let mut per_leg_by_key: HashMap<(String, String), LegScores> = HashMap::new();
+        let ranked: Vec<Hit> = fused
             .into_iter()
-            .map(|(mut hit, per_leg)| {
-                if opts.explain {
-                    let leg = |i: usize| per_leg[i].map(|(rank, score)| LegScore { rank, score });
-                    hit.annotations = Some(Annotations {
-                        vector: leg(0),
-                        text: leg(1),
-                        clauses: breakdown
-                            .remove(&(hit.collection.clone(), hit.id.clone()))
-                            .unwrap_or_default(),
-                        highlights: Vec::new(),
-                    });
-                }
+            .map(|(hit, per_leg)| {
+                per_leg_by_key.insert((hit.collection.clone(), hit.id.clone()), per_leg);
                 hit
             })
             .collect();
-        self.annotate(&mut hits, text, None);
-        if let Some(e) = &opts.expand {
-            self.expand_hits(&mut hits, e);
+        let mut hits = self.finish_hybrid(ranked, opts);
+
+        for hit in &mut hits {
+            if opts.explain {
+                let per_leg = per_leg_by_key
+                    .remove(&(hit.collection.clone(), hit.id.clone()))
+                    .unwrap_or_default();
+                let leg = |i: usize| {
+                    per_leg
+                        .get(i)
+                        .copied()
+                        .flatten()
+                        .map(|(rank, score)| LegScore { rank, score })
+                };
+                hit.annotations = Some(Annotations {
+                    vector: leg(0),
+                    text: leg(1),
+                    clauses: breakdown
+                        .remove(&(hit.collection.clone(), hit.id.clone()))
+                        .unwrap_or_default(),
+                    highlights: Vec::new(),
+                });
+            }
         }
+        self.annotate(&mut hits, text, None);
         Ok(hits)
     }
 

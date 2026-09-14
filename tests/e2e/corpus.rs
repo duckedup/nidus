@@ -197,6 +197,9 @@ fn run_dsl_lib(db: &Nidus, dsl: &Dsl) -> anyhow::Result<CaseResult> {
                 diversity: req.diversity,
                 rerank: None,
                 expand: req.expand.map(Into::into),
+                names: req.names,
+                name_weights: req.name_weights,
+                pool: req.pool,
             };
             let refs = scope_of(&req.scope);
             let scope = if refs.is_empty() {
@@ -260,6 +263,10 @@ fn run_dsl_lib(db: &Nidus, dsl: &Dsl) -> anyhow::Result<CaseResult> {
                 diversity: req.diversity,
                 rerank: None,
                 expand: req.expand.map(Into::into),
+                // text-search has no vector leg, so named-vector selection does not apply.
+                names: Vec::new(),
+                name_weights: Default::default(),
+                pool: Default::default(),
             };
             let field = req.field.expect("corpus /text-search dsl needs `field`");
             let text = req.query.expect("corpus /text-search dsl needs `query`");
@@ -294,6 +301,8 @@ fn run_dsl_lib(db: &Nidus, dsl: &Dsl) -> anyhow::Result<CaseResult> {
                 vector_weight: req.vector_weight,
                 text_weight: req.text_weight,
                 expand: req.expand.map(Into::into),
+                limit_per: req.limit_per,
+                diversity: req.diversity,
                 rerank: None,
             };
             let field = req.field.expect("corpus /hybrid-search dsl needs `field`");

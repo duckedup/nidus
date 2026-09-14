@@ -84,6 +84,38 @@ absent key ("not set / not indexed"). The SDK keeps the two apart in both direct
 a decoded `Date` (from `v.datetime`) re-encodes to the same `DateTime`, never a plain
 number, so a round trip through `attrs` never demotes an instant to an `Int`.
 
+## Named vectors
+
+A record can carry vectors under more than one name, each declared on the collection
+first:
+
+```ts
+await db.setVectorNames("docs", ["title", "body"]);
+
+await db.upsert("docs", [
+  {
+    id: "a",
+    vectors: { title: [0.1, 0.2, 0.3], body: [0.4, 0.5, 0.6] },
+    attrs: { lang: "rust" },
+  },
+]);
+
+const hits = await db.search({
+  query: [0.1, 0.2, 0.3],
+  names: ["title", "body"],
+  pool: "Sum", // or "Max" (the default): fold several named scores into one
+  nameWeights: { title: 2 }, // a name left out weights 1
+});
+```
+
+Every name shares the store's one pinned dimension. `names` is empty by default, which
+searches only the reserved `default` vector (what a plain `vector` field populates),
+byte-identical to a call written before this existed. `searchSimilar` and `hybridSearch`
+do not take `names`/`nameWeights`/`pool`: both always search or fuse against `default`
+over this HTTP client. See [Named vectors](/guides/search/#named-vectors) for the full
+behaviour, including the library/CLI surfaces that do support it on a "more like this"
+query.
+
 ## Similar records ("more like this")
 
 `searchSimilar` runs a search using the vector already stored at a record, instead of

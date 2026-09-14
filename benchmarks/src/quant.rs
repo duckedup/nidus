@@ -86,6 +86,7 @@ fn build(data: &data::Dataset, quant: Option<Quantization>) -> Result<(Nidus, te
         .map(|(i, &id)| Record {
             id: id.to_string(),
             vector: Some(data.vectors[i * dim..(i + 1) * dim].to_vec()),
+            vectors: Default::default(),
             attrs: BTreeMap::new(),
         })
         .collect();

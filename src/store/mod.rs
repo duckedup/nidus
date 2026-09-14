@@ -20,7 +20,9 @@ use crate::fts::{Fts, FtsField};
 use crate::log::OpLog;
 use crate::manifest::{MANIFEST_KEY, Manifest, history};
 use crate::meta::{META_ACCESS_COUNT, META_EXPIRES_AT, META_LAST_ACCESSED};
-use crate::model::{AnnConfig, ClusterStatus, Distance, Op, Role, StoreVersions, Value};
+use crate::model::{
+    AnnConfig, ClusterStatus, DEFAULT_VECTOR, Distance, Op, Role, StoreVersions, Value,
+};
 use crate::profile::OpenProfile;
 
 pub(crate) mod aggregate;
@@ -51,13 +53,24 @@ pub(crate) use read::BAD_QUERY;
 /// sorted by `row` (see [`Store::scan_order`]).
 type ScanOrder = Vec<(u64, String, String)>;
 
-/// One document's entry within a collection. `row` is `None` for a text-only doc, which stays
-/// out of the vector scan and ANN index. Serializable so the index can be published to a
-/// shared [`MemoryTier`](crate::backend::MemoryTier).
+/// One document's entry within a collection: `rows` maps each vector **name** it carries to
+/// its data-segment row (nidus-85t) — empty for a text-only doc, several for a named record.
+/// Serializable so the index can be published to a shared [`MemoryTier`](crate::backend::MemoryTier).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DocEntry {
-    row: Option<u64>,
+    rows: BTreeMap<String, u64>,
     attrs: BTreeMap<String, crate::model::Value>,
+}
+
+impl DocEntry {
+    /// One representative row for a caller that needs exactly one (MMR redundancy, a
+    /// `search_similar` source): [`DEFAULT_VECTOR`] when present, else the first named one.
+    fn primary_row(&self) -> Option<u64> {
+        self.rows
+            .get(DEFAULT_VECTOR)
+            .or_else(|| self.rows.values().next())
+            .copied()
+    }
 }
 
 /// One logical namespace within the store.
@@ -65,6 +78,10 @@ struct DocEntry {
 struct Collection {
     meta: BTreeMap<String, String>,
     docs: HashMap<String, DocEntry>,
+    /// Declared additional vector names (nidus-85t), never including [`DEFAULT_VECTOR`]. An
+    /// upsert naming anything else is refused (decision 4).
+    #[serde(default)]
+    vector_names: Vec<String>,
 }
 
 impl Collection {
@@ -72,6 +89,7 @@ impl Collection {
         Self {
             meta: BTreeMap::new(),
             docs: HashMap::new(),
+            vector_names: Vec::new(),
         }
     }
 }
@@ -214,10 +232,10 @@ pub struct Store {
     /// True for in-memory stores (no backing directory) — they never persist the ANN
     /// cache. `open`ed (file-backed) stores set this false.
     in_memory: bool,
-    /// Reverse map row → `(collection, id)`, ANN-only, so a candidate resolves to its doc in
-    /// O(1). A *hint*: every lookup is re-verified against `docs[id].row`, so deletes and
-    /// overwrites need no invalidation. Rebuilt wholesale on `compact`.
-    row_to_doc: Vec<Option<(String, String)>>,
+    /// Reverse map row → `(collection, id, name)` (nidus-85t), ANN-only, so a candidate
+    /// resolves to its doc (and its vector's name) in O(1). A *hint*: re-verified against
+    /// `docs[id].rows` on every lookup, so deletes/overwrites need no invalidation.
+    row_to_doc: Vec<Option<(String, String, String)>>,
     /// Row-sorted scan order over all live docs, so a whole-store scan reads the matrix in
     /// storage order without re-sorting per query (nidus-dxt). Built lazily, `None` = stale.
     /// `RwLock` because searches take `&self` and run concurrently.
@@ -1161,8 +1179,8 @@ impl Store {
                 }
                 Op::DropCollection { collection } => {
                     if let Some(col) = collections.remove(&collection) {
-                        // Only rowed docs leave a reclaimable data row behind.
-                        dead_rows += col.docs.values().filter(|e| e.row.is_some()).count();
+                        // Every named row an entry owns is independently reclaimable.
+                        dead_rows += col.docs.values().map(|e| e.rows.len()).sum::<usize>();
                     }
                 }
                 Op::SetMeta { collection, meta } => {
@@ -1184,16 +1202,11 @@ impl Store {
                     let col = collections
                         .entry(collection)
                         .or_insert_with(Collection::new);
-                    // Overwriting a *rowed* doc leaves its old row dead.
-                    if let Some(old) = col.docs.insert(
-                        id,
-                        DocEntry {
-                            row: Some(row),
-                            attrs,
-                        },
-                    ) && old.row.is_some()
-                    {
-                        dead_rows += 1;
+                    // The pre-nidus-85t shape: one row, under the reserved default name.
+                    let mut rows = BTreeMap::new();
+                    rows.insert(DEFAULT_VECTOR.to_string(), row);
+                    if let Some(old) = col.docs.insert(id, DocEntry { rows, attrs }) {
+                        dead_rows += old.rows.len();
                     }
                 }
                 Op::UpsertText {
@@ -1204,18 +1217,46 @@ impl Store {
                     let col = collections
                         .entry(collection)
                         .or_insert_with(Collection::new);
-                    if let Some(old) = col.docs.insert(id, DocEntry { row: None, attrs })
-                        && old.row.is_some()
-                    {
-                        dead_rows += 1;
+                    if let Some(old) = col.docs.insert(
+                        id,
+                        DocEntry {
+                            rows: BTreeMap::new(),
+                            attrs,
+                        },
+                    ) {
+                        dead_rows += old.rows.len();
                     }
+                }
+                Op::UpsertVectors {
+                    collection,
+                    id,
+                    rows,
+                    attrs,
+                } => {
+                    // Torn tail (§6.2): if any of this record's rows lie past the data file,
+                    // none of it is durable — skip the whole record, not just those rows.
+                    if rows.iter().any(|&(_, r)| r >= row_count) {
+                        continue;
+                    }
+                    let col = collections
+                        .entry(collection)
+                        .or_insert_with(Collection::new);
+                    let rows: BTreeMap<String, u64> = rows.into_iter().collect();
+                    if let Some(old) = col.docs.insert(id, DocEntry { rows, attrs }) {
+                        dead_rows += old.rows.len();
+                    }
+                }
+                Op::SetVectorNames { collection, names } => {
+                    let col = collections
+                        .entry(collection)
+                        .or_insert_with(Collection::new);
+                    col.vector_names = names;
                 }
                 Op::Delete { collection, id } => {
                     if let Some(col) = collections.get_mut(&collection)
                         && let Some(old) = col.docs.remove(&id)
-                        && old.row.is_some()
                     {
-                        dead_rows += 1;
+                        dead_rows += old.rows.len();
                     }
                 }
                 // Legacy shape: a language per field, no BM25/analyzer params. Adopting the
@@ -1280,21 +1321,27 @@ impl Store {
 
     // ── ANN index lifecycle ─────────────────────────────────────────────────────
 
-    /// Rebuild the `row → (collection, id)` reverse map from the live index and return
-    /// the live physical rows. Sized to the physical row count; dead rows stay `None`.
-    /// Shared by the ANN rebuild and the snapshot-load paths.
+    /// Rebuild the `row → (collection, id, name)` reverse map from the live index and return
+    /// the live physical rows — every named row of every doc (nidus-85t). Sized to the
+    /// physical row count; dead rows stay `None`. Shared by the ANN rebuild and snapshot-load.
     fn rebuild_row_to_doc(&mut self) -> Vec<u64> {
-        let mut row_to_doc: Vec<Option<(String, String)>> =
+        let mut row_to_doc: Vec<Option<(String, String, String)>> =
             vec![None; self.data.row_count() as usize];
         let mut live_rows: Vec<u64> = Vec::new();
         for (col_name, col) in &self.collections {
             for (id, entry) in &col.docs {
-                // Text-only docs (row None) have no vector — they never enter the index.
-                if let Some(row) = entry.row
-                    && (row as usize) < row_to_doc.len()
-                {
-                    row_to_doc[row as usize] = Some((col_name.clone(), id.clone()));
-                    live_rows.push(row);
+                // A text-only doc's `rows` is empty — it never enters the index.
+                for (name, &row) in &entry.rows {
+                    if (row as usize) < row_to_doc.len() {
+                        row_to_doc[row as usize] =
+                            Some((col_name.clone(), id.clone(), name.clone()));
+                        // `live_rows` seeds the ANN graph; only `default` belongs there. The
+                        // reverse map still carries every named row, because the staleness check
+                        // in `candidates_from_walk` resolves whatever row it walked into.
+                        if name == crate::model::DEFAULT_VECTOR {
+                            live_rows.push(row);
+                        }
+                    }
                 }
             }
         }
@@ -1474,9 +1521,14 @@ impl Store {
     }
 
     /// Incrementally index the rows `upsert` just appended (`[prev_rows, row_count())`),
-    /// all owned by `collection`, recording their owners in the reverse map — O(batch),
-    /// not O(N). No-op when ANN is off. `new_owners` is `(row, id)` captured at commit.
-    fn extend_ann(&mut self, collection: &str, prev_rows: u64, new_owners: &[(u64, String)]) {
+    /// all owned by `collection`, recording their owners (and vector name) in the reverse map —
+    /// O(batch). No-op when ANN is off. `new_owners` is `(row, id, name)` captured at commit.
+    fn extend_ann(
+        &mut self,
+        collection: &str,
+        prev_rows: u64,
+        new_owners: &[(u64, String, String)],
+    ) {
         if self.ann.is_none() {
             return;
         }
@@ -1484,10 +1536,18 @@ impl Store {
         if self.row_to_doc.len() < total as usize {
             self.row_to_doc.resize(total as usize, None);
         }
-        for (row, id) in new_owners {
-            self.row_to_doc[*row as usize] = Some((collection.to_string(), id.clone()));
+        for (row, id, name) in new_owners {
+            self.row_to_doc[*row as usize] =
+                Some((collection.to_string(), id.clone(), name.clone()));
         }
-        let new_rows: Vec<u64> = (prev_rows..total).collect();
+        // Only the reserved `default` row enters the ANN graph: a named search always takes the
+        // exact path, so a named row here only displaces default rows in the candidate budget —
+        // which starved plain search of results entirely (nidus-85t review).
+        let new_rows: Vec<u64> = new_owners
+            .iter()
+            .filter(|(row, _, name)| name == crate::model::DEFAULT_VECTOR && *row >= prev_rows)
+            .map(|(row, _, _)| *row)
+            .collect();
         let walk = quant::ann_walk_for(self.quant.as_ref(), &self.data, self.config.distance);
         if let Some(ann) = self.ann.as_mut() {
             ann.insert_rows(&walk, &new_rows);

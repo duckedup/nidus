@@ -362,3 +362,79 @@ fn quantized_search_at_scale_keeps_high_recall() {
          selecting sensible candidates"
     );
 }
+
+/// **Named-vector search reduces to one hit per record, ranked by the pooled score**
+/// (nidus-85t). Large enough to span several parallel shards, so a reduction bug that only
+/// shows up at a shard boundary cannot hide behind a handful of records.
+#[test]
+fn named_vector_search_at_scale_ranks_records_not_rows() {
+    const NAMED_N: usize = 2_000;
+    let title = Corpus::generate(0x71_7E1E, NAMED_N, DIM, 4);
+    let body = Corpus::generate(0x8_0D11, NAMED_N, DIM, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), DIM).start();
+
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/vector-names",
+                &json!({"names": ["title", "body"]}),
+            )
+            .0,
+        200
+    );
+    for b in 0..NAMED_N / BATCH {
+        let records: Vec<Value> = (0..BATCH)
+            .map(|j| {
+                let i = b * BATCH + j;
+                json!({
+                    "id": Corpus::id(i),
+                    "vectors": {"title": title.vectors[i], "body": body.vectors[i]},
+                    "attrs": {}
+                })
+            })
+            .collect();
+        let (status, resp) = server.post("/collections/docs/upsert", &json!({"records": records}));
+        assert_eq!(status, 200, "batch {b} failed: {resp}");
+        assert_eq!(resp["upserted"], BATCH);
+    }
+
+    for (qi, query) in title.queries.iter().enumerate() {
+        let (status, hits) = server.post(
+            "/search",
+            &json!({
+                "query": query, "top_k": TOP_K, "names": ["title", "body"], "pool": "Sum"
+            }),
+        );
+        assert_eq!(status, 200, "query {qi} failed: {hits}");
+        let ids = hit_ids(&hits);
+        assert_eq!(
+            ids.len(),
+            TOP_K,
+            "query {qi}: named search must return one hit per record, not one per row"
+        );
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            ids.len(),
+            "query {qi}: duplicate ids mean rows leaked past the per-record reduction"
+        );
+
+        // Ground truth: `Sum` pooling at weight 1.0 is title.dot(q) + body.dot(q) per record.
+        let q = normalise(query);
+        let mut scored: Vec<(usize, f32)> = (0..NAMED_N)
+            .map(|i| {
+                let t = dot(&normalise(&title.vectors[i]), &q);
+                let b = dot(&normalise(&body.vectors[i]), &q);
+                (i, t + b)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let expected: Vec<String> = scored
+            .into_iter()
+            .take(TOP_K)
+            .map(|(i, _)| Corpus::id(i))
+            .collect();
+        assert_eq!(ids, expected, "query {qi}: pooled ranking mismatch");
+    }
+}

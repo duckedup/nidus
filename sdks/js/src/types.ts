@@ -38,6 +38,12 @@ export interface NidusRecord {
   id: string;
   /** Omit for a text-only doc (indexed by FTS/metadata only, never by vector search). */
   vector?: number[];
+  /**
+   * Named vectors beyond the reserved `"default"` vector above (nidus-85t), keyed by
+   * name. Each name must be declared on the collection first with
+   * {@link NidusClient.setVectorNames}, and every vector must be the store's dimension.
+   */
+  vectors?: Record<string, number[]>;
   attrs: Record<string, Value>;
 }
 
@@ -45,6 +51,7 @@ export interface NidusRecord {
 export interface RecordInput {
   id: string;
   vector?: number[];
+  vectors?: Record<string, number[]>;
   attrs: Record<string, AttrInput>;
 }
 
@@ -52,6 +59,7 @@ export interface RecordInput {
 export interface DecodedRecord {
   id: string;
   vector?: number[];
+  vectors?: Record<string, number[]>;
   attrs: Record<string, DecodedValue>;
 }
 
@@ -367,6 +375,14 @@ export interface OrderBy {
   descending?: boolean;
 }
 
+/**
+ * How several named-vector scores fold into one per-record score, before top-k
+ * selection (nidus-85t). `"Max"` (the default) takes the best weighted per-name score;
+ * an absent name then contributes nothing and carries no penalty. `"Sum"` adds every
+ * weighted named score. Meaningless when {@link SearchOptions.names} is empty.
+ */
+export type Pool = "Max" | "Sum";
+
 /** Ranking knobs shared by {@link NidusClient.search} and {@link NidusClient.textSearch}. */
 export interface RankingOptions {
   rankBy?: RankBy;
@@ -447,6 +463,21 @@ export interface SearchOptions extends ProjectionOptions, RankingOptions {
   exact?: boolean;
   /** See {@link RerankOptions}. `query` is required here. */
   rerank?: RerankOptions;
+  /**
+   * Named vectors to score (nidus-85t), each declared on the collection first with
+   * {@link NidusClient.setVectorNames}. Omitted or empty (the default, and the only
+   * shape a pre-nidus-85t caller ever sends) searches only the reserved `"default"`
+   * vector, so an existing call is unaffected. A record is scored on whichever of
+   * these names it actually carries, reduced to one score by `pool`.
+   */
+  names?: string[];
+  /**
+   * Per-name weight multiplying that name's score before pooling. A name absent here
+   * weights `1`. Meaningless when `names` is empty.
+   */
+  nameWeights?: Record<string, number>;
+  /** How several named scores fold into one record score (default `"Max"`). See {@link Pool}. */
+  pool?: Pool;
 }
 
 /**
@@ -621,6 +652,13 @@ export interface HybridSearchBase extends AnnotationOptions {
   expand?: Expand;
   /** See {@link RerankOptions}. `query` is required here. */
   rerank?: RerankOptions;
+  /**
+   * Cap the fused hits carrying any one value of an attribute (nidus-29ui). Applied on
+   * the shared cap → MMR → page-cut tail, same as {@link NidusClient.search}.
+   */
+  limitPer?: LimitPer;
+  /** MMR lambda spreading the fused page in vector space (nidus-29ui). See {@link RankingOptions.diversity}. */
+  diversity?: number;
 }
 
 /** Options for {@link NidusClient.hybridSearch} (vector + BM25 fused via RRF). */

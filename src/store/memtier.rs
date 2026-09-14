@@ -73,7 +73,8 @@ impl AdoptedIndex {
 /// invalidates a cached blob (a differently-shaped store must not adopt it). The `ws-v`
 /// prefix bumps when the snapshot layout changes, discarding every deployed blob once.
 pub(super) fn working_set_key(config: &Config) -> Vec<u8> {
-    format!("ws-v2:{}:{:?}", config.dimension, config.distance).into_bytes()
+    // v3: `DocEntry.row: Option<u64>` became `rows: BTreeMap<String, u64>` (nidus-85t).
+    format!("ws-v3:{}:{:?}", config.dimension, config.distance).into_bytes()
 }
 
 /// Try to adopt the shared working set: `Some(index)` only when the tier holds a snapshot whose
@@ -160,19 +161,16 @@ mod tests {
         let mut docs = HashMap::new();
         let mut attrs = BTreeMap::new();
         attrs.insert("lang".to_string(), Value::Str("rust".to_string()));
-        docs.insert(
-            "doc1".to_string(),
-            super::super::DocEntry {
-                row: Some(0),
-                attrs,
-            },
-        );
+        let mut rows = BTreeMap::new();
+        rows.insert(crate::model::DEFAULT_VECTOR.to_string(), 0);
+        docs.insert("doc1".to_string(), super::super::DocEntry { rows, attrs });
         let mut cols = HashMap::new();
         cols.insert(
             "col".to_string(),
             Collection {
                 meta: BTreeMap::new(),
                 docs,
+                vector_names: Vec::new(),
             },
         );
         cols

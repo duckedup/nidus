@@ -182,6 +182,52 @@ await db.textSearch({ field: "title", query: "ru", prefix: true });
 await db.textSearch({ clauses: [{ field: "title", query: "ru", prefix: true }] });
 ```
 
+## Named vectors
+
+A record may carry several named vectors at the store's dimension, in addition to (or
+instead of) the plain `vector` field, which lives under the reserved name `"default"`.
+Declare the names a collection accepts first, then upsert and search them:
+
+```ts
+await db.setVectorNames("docs", ["title", "body"]);
+
+await db.upsert("docs", [
+  {
+    id: "a",
+    vectors: { title: [0.1, 0.2, 0.3], body: [0.4, 0.1, 0.2] },
+    attrs: { lang: "rust" },
+  },
+]);
+
+// Score both names and reduce each record to one hit before ranking.
+const hits = await db.search({
+  query: [0.1, 0.2, 0.3],
+  names: ["title", "body"],
+  nameWeights: { title: 2, body: 1 }, // a name absent here weights 1
+  pool: "Sum", // "Max" (the default) or "Sum"
+});
+```
+
+A search naming no vectors searches only `"default"`, unaffected by any named vectors a
+record also carries, so every existing call is unaffected. `pool` decides how several
+named scores become one record score: `"Max"` (the default) takes the best weighted
+score, so a record missing a name is not penalized for it; `"Sum"` adds every weighted
+score, rewarding a record that matches on several names at once. Upserting a name that
+was never declared is a `400` naming it.
+
+`limitPer` and `diversity` also work on `hybridSearch`, applied to the fused ranking on
+the same cap, then MMR, then page-cut order as `search`:
+
+```ts
+await db.hybridSearch({
+  vector: [0.1, 0.2, 0.3],
+  field: "body",
+  text: "vector store",
+  limitPer: { field: "path", max: 1 },
+  diversity: 0.5,
+});
+```
+
 ## Suggesting completions
 
 `suggest` completes a partial word from an indexed field's vocabulary, ranked by

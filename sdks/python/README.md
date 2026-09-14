@@ -220,7 +220,9 @@ hybrid_hits = db.hybrid_search(
 `hybrid_search` takes no `min_score`: its score is a fused RRF rank, not a similarity,
 so there is no meaningful floor to set. `rrf_k` and `candidates` tune the fusion, and
 `vector_weight`/`text_weight` scale each leg's contribution to it (both default to 1.0,
-which is the unweighted fusion exactly).
+which is the unweighted fusion exactly). It also takes `limit_per` and `diversity`,
+applied to the fused ranking exactly as the [Ranking](#ranking) section describes them
+for `search`.
 
 A query may name several fields instead of one, each with its own text, and ask *why* a
 document matched:
@@ -262,6 +264,33 @@ db.text_search(clauses=[{"field": "title", "query": "run", "prefix": True}])
 Only the clause's last term expands; earlier terms still need an exact stem match. The
 index holds stems, so `"runn"` will not prefix-match indexed `"run"`. The fragment itself
 is not stemmed, only fold-normalized (lowercased, accent-stripped).
+
+## Named vectors
+
+A record may carry several embeddings at the store's dimension instead of (or alongside)
+its plain `vector`, each under a name declared on the collection first:
+
+```python
+db.set_vector_names("docs", ["title", "body"])
+db.upsert("docs", [
+    {"id": "d1", "vectors": {"title": [0.1, 0.2, 0.3], "body": [0.4, 0.5, 0.6]}},
+])
+
+# Score both names and reduce a multi-vector record to ONE hit before top_k selection.
+hits = db.search(
+    query=[0.1, 0.2, 0.3],
+    names=["title", "body"],
+    name_weights={"title": 2.0, "body": 1.0},  # a name absent here weights 1.0
+    pool="Max",  # or "Sum"; "Max" is the server's default
+)
+```
+
+`pool` picks how several named scores fold into one: `"Max"` takes the best weighted
+score, so a record missing a name is never penalized for it; `"Sum"` adds every weighted
+score, so matching moderately on several names can outrank a spike on just one. A search
+that omits `names` (the default on every existing call) searches only `vector`, under its
+reserved name `default`, exactly as before this feature existed. Declaring a name is
+one-way: an undeclared name is refused on `upsert` with an error naming it.
 
 ## Suggest (typeahead)
 

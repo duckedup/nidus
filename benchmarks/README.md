@@ -70,6 +70,55 @@ harness's independent exact ground truth plus query latency and speedup vs the
 exact path. It's nidus-only (no engine deps) and is how the default `rescore` and
 the documented recall/speed expectations were chosen.
 
+## Named-vector cost, pooling, parallelism & recall sweep
+
+```bash
+just bench-named                                      # n=100k, dim=384/768, names=1,2,4
+just bench-named names=1,2,4 n=100000 dim=768          # extra key=value args pass through
+just bench-named names=4 threads=1,2,4,8               # parallelism sweep at names=4
+just bench-named help                                  # list every arg
+```
+
+`bench-named` (nidus-85t) answers whether scoring several named vectors per record, then
+reducing them to one score before top-k selection, is *worth* what it costs. Four numbers,
+one binary:
+
+1. **Cost of naming.** Per-query p50 and rows scanned at `names=1,2,4` over a fixed record
+   count, exact path, against a **pre-change baseline**: the same vectors and queries, but
+   ingested as a plain `vector` with no name declared at all (the code path `search` took
+   before this feature). `names=1` is asserted, not just printed, **not to exceed
+   `tolerance` (default 1.15x)** the baseline p50 — the number most likely to embarrass us,
+   since a store with one named vector must not be measurably slower than before.
+2. **`Max` vs `Sum` pooling**, over the identical rows. They walk the same scan, so a large
+   gap between them means the reduction itself, not the scan, is the cost.
+3. **A `threads=` sweep at `names=4`.** The core design snaps shard boundaries to record
+   boundaries so pooling stays exact *and* parallel. Throughput is asserted to reach at
+   least `min_scale` (default 40%) of ideal linear speedup at the top of the sweep; if it
+   doesn't, the reduction has serialized and the design claim needs revisiting, not the
+   benchmark.
+4. **ANN recall per `names=` value**, via the existing `exact_ground_truth` + `recall_at_k`.
+   At `names=1`, pooling is a no-op, so the harness's own independent brute-force ground
+   truth applies directly, as a genuine correctness cross-check. **Caveat, read before
+   trusting this number:** named-vector search always takes the exact path today,
+   regardless of `Config::ann` (`src/store/read.rs`), so recall@k is 1.0 by construction
+   for every `names=` value — this benchmark will start reporting real degradation only
+   once ANN composes with named vectors.
+
+**What this does NOT prove.** Retrieval *quality* (nDCG@10, Recall@100 against labeled
+relevance judgements) is unmeasured here — that needs a labeled corpus (`nidus-yq9p.5`, BEIR
+subset, open and unbuilt). This suite proves named vectors are fast enough and
+approximation-safe; it does not prove records are retrieved *better*.
+
+### Baselines
+
+```bash
+just bench-named json=benchmarks/baselines/named-<version>.json   # record
+```
+
+Same convention as `bench-write`'s baselines: the file records the *inputs* next to the
+results, and a comparison only means something **on the same box** and against a baseline
+recorded with the same knobs.
+
 ## Single-writer ingest decomposition
 
 ```bash

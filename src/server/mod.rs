@@ -31,7 +31,7 @@ use dto::{
     CompactRequest, DeleteRequest, FilterIndexRequest, FootprintDto, FtsSchemaRequest, HitDto,
     HybridSearchRequest, ListRequest, MAX_BATCH_QUERIES, MAX_TOP_K, QueryRequest, SearchRequest,
     SearchResponse, SetAliasRequest, SimilarRequest, SuggestRequest, SuggestionsDto,
-    TextSearchRequest, UpsertRequest, VersionsDto,
+    TextSearchRequest, UpsertRequest, VectorNamesRequest, VersionsDto,
 };
 
 // ── AI-ingest (memory) imports: only under the `memory` feature (pulled by the
@@ -466,6 +466,7 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/collections/{name}/records", get(records))
         .route("/collections/{name}/fts-schema", post(set_fts_schema))
         .route("/collections/{name}/filter-index", post(set_filter_index))
+        .route("/collections/{name}/vector-names", post(set_vector_names))
         .route("/suggest", post(suggest))
         .route("/search", post(search))
         .route("/search/batch", post(search_batch))
@@ -950,6 +951,9 @@ fn plan_search(req: SearchRequest) -> Result<SearchPlan, ApiError> {
         diversity: req.diversity,
         expand: req.expand.map(Into::into),
         rerank,
+        names: req.names,
+        name_weights: req.name_weights,
+        pool: req.pool,
     };
     #[cfg(feature = "rerank")]
     check_rerank_depth(&opts)?;
@@ -986,6 +990,11 @@ async fn search_similar(
         // No rerank here: a cross-encoder scores (query text, candidate) pairs, and
         // more-like-this starts from a stored vector with no query text to score against.
         rerank: None,
+        // Named vectors score the CANDIDATES; the source vector is still read from the
+        // subject's `default` row, since "more like this" starts from one stored vector.
+        names: req.names,
+        name_weights: req.name_weights,
+        pool: req.pool,
     };
     let scope = if req.scope.is_empty() {
         vec![req.collection.clone()]
@@ -1214,6 +1223,18 @@ async fn set_fts_schema(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// `POST /collections/{name}/vector-names` — declare the named-vector fields `upsert` and
+/// `search` may use beyond the reserved `default` vector (nidus-85t decision 4). Redeclaring
+/// replaces the set; an upsert naming an undeclared name is refused with a `400`.
+async fn set_vector_names(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<VectorNamesRequest>,
+) -> Result<Json<JsonValue>, ApiError> {
+    run_write(st, move |db| db.set_vector_names(&name, &req.names)).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 /// `POST /collections/{name}/filter-index` — declare the fields indexed for the text
 /// predicates. Speed only: results are identical with or without it.
 async fn set_filter_index(
@@ -1356,6 +1377,8 @@ async fn hybrid_search(
         #[cfg(feature = "rerank")]
         rerank,
         plan,
+        limit_per,
+        diversity,
     } = req;
     let clauses = check_clauses(field, text, clauses, prefix)?;
     #[cfg(feature = "rerank")]
@@ -1377,6 +1400,8 @@ async fn hybrid_search(
         text_weight,
         expand: expand.map(Into::into),
         rerank,
+        limit_per,
+        diversity,
     };
     #[cfg(feature = "rerank")]
     check_rerank_hybrid_depth(&opts)?;
@@ -1435,6 +1460,11 @@ async fn rerank_hybrid_and_finish(
             .saturating_mul(overscan),
         offset: 0,
         candidates: opts.candidates.saturating_mul(overscan),
+        // Deferred to the post-rerank tail, not dropped: capping the widened fetch freezes each
+        // group's winner at pre-rerank order. Mirrors `widened_opts` (src/store/rerank.rs).
+        limit_per: None,
+        diversity: None,
+        expand: None,
         ..opts.clone()
     };
     // The plan (when asked for) describes this widened pre-rerank fusion, not the caller's
@@ -2069,11 +2099,14 @@ fn classify(err: &anyhow::Error) -> StatusCode {
         || msg.contains("fts field")
         || msg.contains("filter index")
         || msg.contains("full-text query")
+        || msg.contains("vector name")
+        || msg.contains("reserved vector")
         || msg.contains(crate::store::BAD_QUERY)
         || msg.contains(crate::sql::SQL_PARSE_ERROR)
     {
-        // A rejected FTS or filter-index declaration, a clause-less text query, or a
-        // malformed ranking knob: bad request bodies, not server faults.
+        // A rejected FTS, filter-index, or vector-name declaration, an upsert naming an
+        // undeclared vector, a clause-less text query, or a malformed ranking knob: bad
+        // request bodies, not server faults.
         StatusCode::BAD_REQUEST
     } else if msg.contains("alias") {
         // Every alias rejection (nidus-klh) — bad name, chain, collision, dangling

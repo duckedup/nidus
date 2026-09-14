@@ -135,4 +135,45 @@ mod tests {
     fn no_legs_fuses_to_nothing() {
         assert!(rrf_fuse(Vec::new(), 60.0).is_empty());
     }
+
+    // ── 3+ legs (nidus-85t: `rrf_fuse` needs no change, only more coverage) ────
+
+    #[test]
+    fn three_legs_sum_their_individual_contributions() {
+        let fused = rrf_fuse(
+            vec![
+                FusionLeg::new(vec![hit("a", 0.9)]),
+                FusionLeg::new(vec![hit("a", 0.5)]),
+                FusionLeg::new(vec![hit("a", 0.1)]),
+            ],
+            60.0,
+        );
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].0.id, "a");
+        // Accumulated as `x + x + x`, which is one ulp off a direct `3.0 / 61.0` in f32 —
+        // the sum is what the fused score means, so compare within tolerance, not bit-exactly.
+        assert!((fused[0].0.score - 3.0 / 61.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn mixed_presence_across_three_legs_only_sums_the_legs_that_returned_it() {
+        let fused = rrf_fuse(
+            vec![
+                FusionLeg::new(vec![hit("a", 0.9), hit("b", 0.4)]),
+                FusionLeg::new(vec![hit("b", 0.7)]),
+                FusionLeg::new(vec![hit("c", 0.2)]),
+            ],
+            60.0,
+        );
+        // "a": leg 0 only. "b": legs 0 and 1. "c": leg 2 only.
+        let a = fused.iter().find(|(h, _)| h.id == "a").unwrap();
+        let b = fused.iter().find(|(h, _)| h.id == "b").unwrap();
+        let c = fused.iter().find(|(h, _)| h.id == "c").unwrap();
+        assert_eq!(a.1, vec![Some((0, 0.9)), None, None]);
+        assert_eq!(b.1, vec![Some((1, 0.4)), Some((0, 0.7)), None]);
+        assert_eq!(c.1, vec![None, None, Some((0, 0.2))]);
+        // "b" is carried by two legs, so it must outscore either single-leg-only doc.
+        assert!(b.0.score > a.0.score);
+        assert!(b.0.score > c.0.score);
+    }
 }

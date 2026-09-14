@@ -597,6 +597,131 @@ def test_the_ranking_and_annotation_surface(server: str) -> None:
         assert db.aggregate(scope=["posts"], sum=["absent"]).sums == {"absent": 0}
 
 
+# ── Named vectors (nidus-85t) and hybrid limit_per/diversity (nidus-29ui) ────────────────
+#
+# Mirrors sdks/go/integration_test.go and sdks/js/test/integration.test.ts step for step:
+# same corpora, same knobs, same assertions, because the point of these three files is that
+# the SDKs are demonstrably interchangeable.
+
+
+def test_named_vectors_reduce_to_one_hit_scored_by_pooling(server: str) -> None:
+    """Declaring names, then searching both, reduces a multi-vector record to ONE hit whose
+    score is the ``Sum``-pooled combination, different from either name's score alone."""
+    with NidusClient(server, timeout=10.0) as db:
+        db.create_collection("docs")
+        db.set_vector_names("docs", ["title", "body"])
+        assert (
+            db.upsert("docs", [{"id": "r1", "vectors": {"title": [1, 0, 0], "body": [0, 1, 0]}}])
+            == 1
+        )
+
+        query = [0.6, 0.8, 0.0]
+        title_only = db.search(query=query, top_k=5, names=["title"])
+        body_only = db.search(query=query, top_k=5, names=["body"])
+        both = db.search(query=query, top_k=5, names=["title", "body"], pool="Sum")
+
+        assert len(both) == 1, "one hit per record, not one per named row"
+        assert both[0].id == "r1"
+        pooled = both[0].score
+        assert pooled == pytest.approx(title_only[0].score + body_only[0].score, abs=1e-4)
+        assert pooled != title_only[0].score
+        assert pooled != body_only[0].score
+
+
+def test_named_vector_weights_change_the_top_hit(server: str) -> None:
+    """The same query at two different per-name weightings flips which record ranks
+    first, proving the weights are applied rather than dropped."""
+    with NidusClient(server, timeout=10.0) as db:
+        db.create_collection("docs")
+        db.set_vector_names("docs", ["title", "body"])
+        db.upsert(
+            "docs",
+            [
+                {"id": "titled", "vectors": {"title": [1, 0, 0]}},
+                {"id": "bodied", "vectors": {"body": [1, 0, 0]}},
+            ],
+        )
+
+        title_heavy = db.search(
+            query=[1, 0, 0],
+            top_k=1,
+            names=["title", "body"],
+            name_weights={"title": 2.0, "body": 1.0},
+        )
+        assert title_heavy[0].id == "titled"
+
+        body_heavy = db.search(
+            query=[1, 0, 0],
+            top_k=1,
+            names=["title", "body"],
+            name_weights={"title": 1.0, "body": 2.0},
+        )
+        assert body_heavy[0].id == "bodied"
+
+
+def test_search_naming_no_vectors_ignores_named_vectors(server: str) -> None:
+    """A search naming no vectors ranks on ``vector`` (the reserved ``default`` name)
+    alone, unaffected by a record that also carries named vectors."""
+    with NidusClient(server, timeout=10.0) as db:
+        db.create_collection("docs")
+        db.set_vector_names("docs", ["title"])
+        db.upsert(
+            "docs",
+            [{"id": "r1", "vector": [1, 0, 0], "vectors": {"title": [0, 1, 0]}}],
+        )
+
+        hits = db.search(query=[1, 0, 0], top_k=5)
+        assert [h.id for h in hits] == ["r1"]
+        assert hits[0].score == pytest.approx(1.0, abs=1e-5)
+
+
+def test_upserting_an_undeclared_vector_name_is_refused(server: str) -> None:
+    """An undeclared name is refused with an error naming it, not silently accepted."""
+    with NidusClient(server, timeout=10.0) as db:
+        db.create_collection("docs")
+        with pytest.raises(NidusError) as caught:
+            db.upsert("docs", [{"id": "r1", "vectors": {"nope": [1, 0, 0]}}])
+        assert caught.value.status == 400
+        assert "nope" in caught.value.message
+
+
+def test_hybrid_search_limit_per_and_diversity_reshape_the_fused_page(server: str) -> None:
+    """nidus-29ui: ``limit_per`` and ``diversity`` on ``hybrid_search`` reshape the fused
+    page, each returning a DIFFERENT hit set than the same query with the knob unset."""
+    with NidusClient(server, timeout=10.0) as db:
+        db.create_collection("docs")
+        db.set_fts_schema("docs", ["body"])
+        text = "cats and foxes"
+        db.upsert(
+            "docs",
+            [
+                {"id": "a1", "vector": [1, 0, 0], "attrs": {"src": "A", "body": text}},
+                {"id": "a2", "vector": [0.9, 0.1, 0], "attrs": {"src": "A", "body": text}},
+                {"id": "a3", "vector": [0.8, 0.2, 0], "attrs": {"src": "A", "body": text}},
+                {"id": "b1", "vector": [0.7, 0.3, 0], "attrs": {"src": "B", "body": text}},
+                {"id": "b2", "vector": [0.6, 0.4, 0], "attrs": {"src": "B", "body": text}},
+            ],
+        )
+
+        unset = db.hybrid_search(vector=[1, 0, 0], field="body", text="cats", top_k=5)
+        assert len(unset) == 5
+
+        capped = db.hybrid_search(
+            vector=[1, 0, 0],
+            field="body",
+            text="cats",
+            top_k=5,
+            limit_per={"field": "src", "max": 1},
+        )
+        assert len(capped) == 2, "at most one hit per `src` value"
+        assert {h.id for h in capped} != {h.id for h in unset}
+
+        diverse = db.hybrid_search(
+            vector=[1, 0, 0], field="body", text="cats", top_k=2, diversity=0.3
+        )
+        assert [h.id for h in diverse] != [h.id for h in unset][:2]
+
+
 def test_prefix_matches_a_truncated_query_against_a_real_server(server: str) -> None:
     """A truncated query matches only with ``prefix=True`` — both spellings, both routes.
 

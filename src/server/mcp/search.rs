@@ -13,12 +13,12 @@ use crate::embed::Embedder;
 use crate::memory::not_expired_predicate;
 use crate::meta::now_ms;
 use crate::server::dto::SuggestionsDto;
-use crate::{Filter, HybridOpts, SearchOpts};
+use crate::{Filter, HybridOpts, Pool, SearchOpts};
 
 use super::NidusMcp;
 use super::args::{
-    api_error, optional_bool, optional_bool_or, optional_f32, optional_top_k, optional_usize,
-    required_str, tool,
+    api_error, optional_bool, optional_bool_or, optional_f32, optional_string_array,
+    optional_top_k, optional_usize, required_str, tool,
 };
 use super::{HitDto, hits_content, hits_with_plan_content};
 
@@ -199,8 +199,8 @@ fn check_rerank_search_depth(opts: &SearchOpts) -> Result<(), McpError> {
     Ok(())
 }
 
-/// Hybrid analogue of [`check_rerank_search_depth`]: `HybridOpts` has no `limit_per`, so the
-/// depth is just `(offset + top_k) * overscan`.
+/// Hybrid analogue of [`check_rerank_search_depth`]: depth is `(offset + top_k) * overscan`,
+/// since `HybridOpts` widens by candidate count rather than `rerank_depth`'s formula.
 fn check_rerank_hybrid_depth(opts: &HybridOpts) -> Result<(), McpError> {
     let Some(r) = &opts.rerank else {
         return Ok(());
@@ -242,7 +242,8 @@ fn plan_schema() -> JsonValue {
     })
 }
 
-/// `diversity`: the MMR knob, shared by every tool whose ranking `Store::finish` shapes.
+/// `diversity`: the MMR knob, shared by every tool whose ranking `Store::finish`/
+/// `finish_hybrid` shapes.
 fn diversity_schema() -> JsonValue {
     json!({
         "type": "number",
@@ -250,6 +251,87 @@ fn diversity_schema() -> JsonValue {
         "minimum": 0.0,
         "maximum": 1.0
     })
+}
+
+/// `names`: restrict a vector query to specific named vectors on a record (nidus-85t),
+/// shared by every tool whose ranking runs over a query vector. A plain array of strings —
+/// never a raw vector — so this stays text-native.
+pub(super) fn names_schema() -> JsonValue {
+    json!({
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Restrict the search to these named vectors, for a collection whose \
+            records carry more than one (e.g. \"title\", \"body\"), declared ahead of time on \
+            the collection. Omit or leave empty to search only the record's default vector, \
+            the same behaviour as before named vectors existed. A record missing some of the \
+            names listed here still ranks on the ones it has; it is never penalized or dropped \
+            for the rest."
+    })
+}
+
+/// `pool`: how several named scores fold into one per-record score. Meaningless, and ignored
+/// by the store, unless `names` is also set.
+pub(super) fn pool_schema() -> JsonValue {
+    json!({
+        "type": "string",
+        "enum": ["max", "sum"],
+        "description": "How multiple `names` scores combine into one per-record score. \
+            \"max\" (the default) takes the single best-matching name, so a record missing a \
+            name pays no penalty. \"sum\" adds every named score together, rewarding a record \
+            that matches on several names at once over one that only spikes on one. Ignored \
+            unless `names` is set."
+    })
+}
+
+/// `name_weights`: a per-name multiplier applied before `pool` combines the scores.
+/// Meaningless, and ignored by the store, unless `names` is also set.
+pub(super) fn name_weights_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "additionalProperties": {"type": "number"},
+        "description": "Per-name weight multiplying that name's score before `pool` combines \
+            them, e.g. {\"title\": 2.0, \"body\": 1.0} to favor a title match over a body \
+            match. A name left out of this object still searches, weighted 1.0. Ignored \
+            unless `names` is set."
+    })
+}
+
+/// Parse the `pool` argument into a [`Pool`], defaulting to [`Pool::Max`] — the same default
+/// `Pool` itself carries, so an absent argument changes nothing.
+pub(super) fn parse_pool(args: &Map<String, JsonValue>) -> Result<Pool, McpError> {
+    match args.get("pool") {
+        None | Some(JsonValue::Null) => Ok(Pool::Max),
+        // Case-insensitive: HTTP and the three SDKs serialize this enum as "Max"/"Sum"
+        // (serde's variant names), so a caller copying a working HTTP body into an MCP tool
+        // call must not be rejected over capitalization (nidus-85t review).
+        Some(JsonValue::String(s)) if s.eq_ignore_ascii_case("max") => Ok(Pool::Max),
+        Some(JsonValue::String(s)) if s.eq_ignore_ascii_case("sum") => Ok(Pool::Sum),
+        _ => Err(McpError::invalid_params(
+            "`pool` must be \"max\" or \"sum\"",
+            None,
+        )),
+    }
+}
+
+/// Parse `name_weights` into a name→weight map. Type-checked only; an unusable value (`NaN`,
+/// negative) is refused later by the store with the same message every surface gets.
+pub(super) fn parse_name_weights(
+    args: &Map<String, JsonValue>,
+) -> Result<std::collections::BTreeMap<String, f32>, McpError> {
+    let Some(value) = args.get("name_weights").filter(|v| !v.is_null()) else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let obj = value.as_object().ok_or_else(|| {
+        McpError::invalid_params("`name_weights` must be an object".to_string(), None)
+    })?;
+    obj.iter()
+        .map(|(k, v)| {
+            let w = v.as_f64().ok_or_else(|| {
+                McpError::invalid_params(format!("`name_weights[{k}]` must be a number"), None)
+            })?;
+            Ok((k.clone(), w as f32))
+        })
+        .collect()
 }
 
 /// Parse the `rollup` object into the `limit_per`/`expand` pair, through
@@ -416,6 +498,9 @@ pub(super) fn tools() -> Vec<Tool> {
                     },
                     "filter": filter_schema(),
                     "diversity": diversity_schema(),
+                    "names": names_schema(),
+                    "pool": pool_schema(),
+                    "name_weights": name_weights_schema(),
                     "rollup": rollup_schema(),
                     "rerank": rerank_bool_schema(),
                     "rerank_overscan": rerank_overscan_schema(),
@@ -499,6 +584,8 @@ pub(super) fn tools() -> Vec<Tool> {
                         "minimum": 1
                     },
                     "filter": filter_schema(),
+                    "diversity": diversity_schema(),
+                    "rollup": rollup_schema(),
                     "rerank": rerank_bool_schema(),
                     "rerank_overscan": rerank_overscan_schema()
                 },
@@ -542,6 +629,9 @@ pub(super) fn related_tool() -> Tool {
                 },
                 "filter": filter_schema(),
                 "diversity": diversity_schema(),
+                "names": names_schema(),
+                "pool": pool_schema(),
+                "name_weights": name_weights_schema(),
                 "rollup": rollup_schema(),
                 "plan": plan_schema()
             },
@@ -608,6 +698,9 @@ impl NidusMcp {
         let min_score = optional_f32(args, "min_score")?;
         let filter = parse_filter(args)?;
         let diversity = optional_f32(args, "diversity")?;
+        let names = optional_string_array(args, "names")?;
+        let pool = parse_pool(args)?;
+        let name_weights = parse_name_weights(args)?;
         let rollup = parse_rollup(args)?;
         let rerank = parse_rerank(args)?;
         let reinforce = optional_bool(args, "reinforce")?;
@@ -626,6 +719,9 @@ impl NidusMcp {
             diversity,
             limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
             expand: rollup.map(|(_, e)| e),
+            names,
+            name_weights,
+            pool,
             rerank,
             plan,
             ..Default::default()
@@ -766,6 +862,8 @@ impl NidusMcp {
         let query = required_str(args, "query")?;
         let top_k = optional_top_k(args)?;
         let filter = parse_filter(args)?;
+        let diversity = optional_f32(args, "diversity")?;
+        let rollup = parse_rollup(args)?;
         let rerank = parse_rerank(args)?;
 
         // The one divergence from `POST /hybrid-search`, which takes a caller-supplied
@@ -778,9 +876,13 @@ impl NidusMcp {
 
         // `rrf_k`/`candidates` stay default: fusion knobs mean nothing to a model, so
         // exposing them adds ways to get worse results and none to get better ones.
+        // No `names`/`pool` here: `HybridOpts` carries neither field yet (nidus-85t).
         let opts = HybridOpts {
             top_k,
             filter: with_ttl_guard(filter),
+            limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
+            expand: rollup.map(|(_, e)| e),
+            diversity,
             rerank,
             ..Default::default()
         };
@@ -835,6 +937,9 @@ impl NidusMcp {
         let min_score = optional_f32(args, "min_score")?;
         let filter = parse_filter(args)?;
         let diversity = optional_f32(args, "diversity")?;
+        let names = optional_string_array(args, "names")?;
+        let pool = parse_pool(args)?;
+        let name_weights = parse_name_weights(args)?;
         let rollup = parse_rollup(args)?;
         let plan = optional_bool(args, "plan")?;
 
@@ -855,6 +960,9 @@ impl NidusMcp {
                 diversity,
                 limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
                 expand: rollup.map(|(_, e)| e),
+                names,
+                name_weights,
+                pool,
                 plan,
                 ..Default::default()
             };

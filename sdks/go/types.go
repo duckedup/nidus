@@ -61,7 +61,13 @@ import (
 type Record struct {
 	ID     string    `json:"id"`
 	Vector []float32 `json:"vector,omitempty"`
-	Attrs  Attrs     `json:"attrs"`
+	// Vectors carries named vectors beyond the reserved "default" one Vector writes
+	// (nidus-85t). Each key must be declared first with [Client.SetVectorNames], and
+	// every vector — named or default — must be the store's dimension. Nil is the
+	// common case and every existing caller's record, so this key is omitted entirely
+	// rather than sent as {}.
+	Vectors map[string][]float32 `json:"vectors,omitempty"`
+	Attrs   Attrs                `json:"attrs"`
 }
 
 // A Hit is one search or list result row.
@@ -335,6 +341,17 @@ type OrderBy struct {
 	Descending bool   `json:"descending,omitempty"`
 }
 
+// How several named-vector scores fold into one record score, for the Pool field of a
+// [SearchRequest] (nidus-85t). PoolMax is the server's default, so leaving Pool empty
+// is it. Meaningless when Names is empty.
+const (
+	// The best weighted per-name score wins: max(weight_i * score_i). A name a record
+	// lacks contributes nothing and is not penalized.
+	PoolMax = "Max"
+	// Every named score adds: sum(weight_i * score_i).
+	PoolSum = "Sum"
+)
+
 // A SearchRequest is a vector (cosine) nearest-neighbour query. An empty Scope
 // searches every collection, merged into one ranking — sound because all
 // collections share one embedding space.
@@ -343,6 +360,12 @@ type OrderBy struct {
 // for every other query. IncludeAttributes/ExcludeAttributes project the returned attrs;
 // see [Projection]. RankBy and LimitPer reshape the ranking after scoring; see [Decay]
 // and [LimitPer].
+//
+// Names selects which named vectors to score (nidus-85t); empty (the default, and the
+// only shape a pre-85t caller ever sent) searches only the reserved "default" vector,
+// so an old request is byte-identical. Every named row of a record is reduced to one
+// score per record, by NameWeights and Pool, before top-k selection — a search naming
+// several vectors still returns one hit per record, never one per name.
 type SearchRequest struct {
 	Query    []float32 `json:"query"`
 	Scope    []string  `json:"scope,omitempty"`
@@ -362,6 +385,15 @@ type SearchRequest struct {
 	// Plan is set by [Client.SearchWithPlan], never by [Client.Search]; do not set it
 	// by hand.
 	Plan bool `json:"plan,omitempty"`
+	// Names are the named vectors to score; each must already be declared with
+	// [Client.SetVectorNames]. Empty searches only the reserved "default" vector.
+	Names []string `json:"names,omitempty"`
+	// NameWeights multiplies a named score before pooling, keyed by name; a name
+	// absent here weights 1.0. Meaningless when Names is empty.
+	NameWeights map[string]float32 `json:"name_weights,omitempty"`
+	// Pool folds several named scores into one record score: PoolMax (default) or
+	// PoolSum. Meaningless when Names is empty.
+	Pool string `json:"pool,omitempty"`
 	Projection
 }
 
@@ -629,6 +661,10 @@ type TextSearchRequest struct {
 // is the maximally top-heavy fusion, Candidates &0 fuses exactly TopK deep, and a weight
 // of &0 drops that leg's contribution entirely. nil, not zero, is how you ask for the
 // server's default (60.0, 100, 1.0 and 1.0).
+//
+// LimitPer and Diversity (nidus-29ui) apply on the fused ranking, through the shared
+// cap -> MMR -> page-cut tail: without LimitPer, a value that dominates both legs can
+// otherwise take several of the top slots and crowd out everything else.
 type HybridSearchRequest struct {
 	Vector  []float32   `json:"vector"`
 	Field   string      `json:"field,omitempty"`
@@ -653,6 +689,13 @@ type HybridSearchRequest struct {
 	// Plan is set by [Client.HybridSearchWithPlan], never by [Client.HybridSearch]; do
 	// not set it by hand.
 	Plan bool `json:"plan,omitempty"`
+	// LimitPer caps how many fused hits may carry any one value of an attribute
+	// (nidus-29ui): &LimitPer{Field: "path", Max: 2}.
+	LimitPer *LimitPer `json:"limit_per,omitempty"`
+	// Diversity is a Maximal Marginal Relevance lambda spreading the fused page apart
+	// in vector space (nidus-29ui): 1 is pure relevance, 0 pure variety. A pointer
+	// because &0 is a meaningful lambda that omitempty would drop.
+	Diversity *float32 `json:"diversity,omitempty"`
 }
 
 // A ListRequest is a metadata-only query: no vector, paginated, filter-driven.

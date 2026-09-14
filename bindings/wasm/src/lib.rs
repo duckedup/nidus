@@ -61,8 +61,9 @@ impl NidusHandle {
             .map_err(js_err)
     }
 
-    /// Upsert records given as a JS array of `{id, vector?, attrs}` (mirrors
-    /// `server::dto::UpsertRequest`'s `Record` shape); returns the count written.
+    /// Upsert records given as a JS array of `{id, vector?, vectors?, attrs}` (mirrors
+    /// `server::dto::UpsertRequest`'s `Record`, the same type). `vectors` (nidus-85t) is a
+    /// plain `{name: embedding}` object; confirmed round-tripping via `serde-wasm-bindgen`.
     pub fn upsert(&mut self, collection: &str, records: JsValue) -> Result<u32, JsValue> {
         let records: Vec<Record> = serde_wasm_bindgen::from_value(records).map_err(js_value_err)?;
         let n = self.0.upsert(collection, &records).map_err(js_err)?;

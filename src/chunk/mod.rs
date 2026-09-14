@@ -68,6 +68,27 @@ pub struct Chunk {
     pub char_start: usize,
 }
 
+/// A document's title: the first non-blank line, if it's a markdown ATX heading
+/// (`#` through `######`), feeding `remember_chunked`'s named-vector write (nidus-85t
+/// decision 6). Gated on `memory`, its only caller, so the lean build stays dead-code-free.
+#[cfg(feature = "memory")]
+pub(crate) fn extract_title(text: &str) -> Option<String> {
+    let line = text.lines().find(|l| !l.trim().is_empty())?;
+    let trimmed = line.trim_start();
+    let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    // Same rule as the markdown splitter's `is_atx_heading`: the run of `#` must end at
+    // end-of-line or a space/tab, or `"#tag"` would misparse as a level-1 heading.
+    let rest = &trimmed[hashes..];
+    if !matches!(rest.chars().next(), None | Some(' ') | Some('\t')) {
+        return None;
+    }
+    let title = rest.trim();
+    (!title.is_empty()).then(|| title.to_string())
+}
+
 /// Splits `text` into ordered [`Chunk`]s per `opts` (see the module docs for the char
 /// slice invariant every chunk satisfies). `Err` on invalid options; `Ok(vec![])` for
 /// empty or all-whitespace input.
@@ -524,5 +545,31 @@ mod tests {
         );
         assert_char_slice_invariant(&src, &chunks);
         assert_dense_ascending(&chunks);
+    }
+
+    #[cfg(feature = "memory")]
+    #[test]
+    fn extract_title_reads_a_leading_atx_heading_at_any_level() {
+        assert_eq!(extract_title("# Title\nbody"), Some("Title".to_string()));
+        assert_eq!(extract_title("###### Deep\nbody"), Some("Deep".to_string()));
+        assert_eq!(
+            extract_title("\n\n  ## Padded  \nbody"),
+            Some("Padded".to_string()),
+            "leading blank lines and surrounding heading whitespace are skipped"
+        );
+    }
+
+    #[cfg(feature = "memory")]
+    #[test]
+    fn extract_title_is_none_without_a_real_heading() {
+        assert_eq!(extract_title(""), None, "empty text");
+        assert_eq!(extract_title("just a paragraph"), None, "no heading");
+        assert_eq!(
+            extract_title("#nospace"),
+            None,
+            "not a heading: no space after #"
+        );
+        assert_eq!(extract_title("####### seven\nbody"), None, "past level 6");
+        assert_eq!(extract_title("#   \nbody"), None, "heading with no text");
     }
 }

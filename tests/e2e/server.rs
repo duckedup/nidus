@@ -1632,3 +1632,229 @@ fn versions_endpoint_reports_the_pin() {
         "history is recording, so this must not be null: {versions}"
     );
 }
+
+// ── Named vectors (nidus-85t) and hybrid limit_per/diversity (nidus-29ui) ──────────────
+
+/// Declaring names, then searching both, reduces a multi-vector record to **one** hit whose
+/// score is the `Sum`-pooled combination — different from either name's score alone.
+#[test]
+fn named_vectors_reduce_to_one_hit_scored_by_pooling_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/vector-names",
+                &json!({"names": ["title", "body"]}),
+            )
+            .0,
+        200
+    );
+    let (status, body) = server.post(
+        "/collections/docs/upsert",
+        &json!({"records": [
+            {"id": "r1", "vectors": {"title": [1, 0, 0], "body": [0, 1, 0]}, "attrs": {}}
+        ]}),
+    );
+    assert_eq!(status, 200, "upsert failed: {body}");
+
+    let query = json!([0.6, 0.8, 0]);
+    let (status, title_only) = server.post(
+        "/search",
+        &json!({"query": query, "top_k": 5, "names": ["title"]}),
+    );
+    assert_eq!(status, 200, "{title_only}");
+    let (status, body_only) = server.post(
+        "/search",
+        &json!({"query": query, "top_k": 5, "names": ["body"]}),
+    );
+    assert_eq!(status, 200, "{body_only}");
+    let (status, both) = server.post(
+        "/search",
+        &json!({"query": query, "top_k": 5, "names": ["title", "body"], "pool": "Sum"}),
+    );
+    assert_eq!(status, 200, "{both}");
+
+    assert_eq!(
+        both.as_array().map(Vec::len),
+        Some(1),
+        "one hit per record: {both}"
+    );
+    assert_eq!(both[0]["id"], "r1");
+    let title_score = title_only[0]["score"].as_f64().unwrap();
+    let body_score = body_only[0]["score"].as_f64().unwrap();
+    let pooled_score = both[0]["score"].as_f64().unwrap();
+    assert!(
+        (pooled_score - (title_score + body_score)).abs() < 1e-4,
+        "{both}"
+    );
+    assert!(pooled_score != title_score && pooled_score != body_score);
+}
+
+/// The same query at two different per-name weightings flips which record ranks first,
+/// proving the weights are actually applied rather than dropped.
+#[test]
+fn named_vector_weights_change_the_top_hit_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/vector-names",
+                &json!({"names": ["title", "body"]}),
+            )
+            .0,
+        200
+    );
+    let (status, body) = server.post(
+        "/collections/docs/upsert",
+        &json!({"records": [
+            {"id": "titled", "vectors": {"title": [1, 0, 0]}, "attrs": {}},
+            {"id": "bodied", "vectors": {"body": [1, 0, 0]}, "attrs": {}}
+        ]}),
+    );
+    assert_eq!(status, 200, "upsert failed: {body}");
+
+    let (status, title_heavy) = server.post(
+        "/search",
+        &json!({
+            "query": [1, 0, 0], "top_k": 1, "names": ["title", "body"],
+            "name_weights": {"title": 2.0, "body": 1.0}
+        }),
+    );
+    assert_eq!(status, 200, "{title_heavy}");
+    assert_eq!(title_heavy[0]["id"], "titled");
+
+    let (status, body_heavy) = server.post(
+        "/search",
+        &json!({
+            "query": [1, 0, 0], "top_k": 1, "names": ["title", "body"],
+            "name_weights": {"title": 1.0, "body": 2.0}
+        }),
+    );
+    assert_eq!(status, 200, "{body_heavy}");
+    assert_eq!(body_heavy[0]["id"], "bodied");
+}
+
+/// A search naming no vectors is unaffected by a record that also carries named vectors:
+/// it must still rank on `vector` (the reserved `default`) alone, exactly as before this
+/// feature existed.
+#[test]
+fn search_naming_no_vectors_ignores_named_vectors_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/vector-names",
+                &json!({"names": ["title"]}),
+            )
+            .0,
+        200
+    );
+    let (status, body) = server.post(
+        "/collections/docs/upsert",
+        &json!({"records": [
+            {"id": "r1", "vector": [1, 0, 0], "vectors": {"title": [0, 1, 0]}, "attrs": {}}
+        ]}),
+    );
+    assert_eq!(status, 200, "upsert failed: {body}");
+
+    let (status, hits) = server.post("/search", &json!({"query": [1, 0, 0], "top_k": 5}));
+    assert_eq!(status, 200, "{hits}");
+    assert_eq!(hits[0]["id"], "r1");
+    assert!(
+        (hits[0]["score"].as_f64().unwrap() - 1.0).abs() < 1e-4,
+        "{hits}"
+    );
+
+    // The query is orthogonal to `vector` but exactly matches the named `title` vector.
+    // A search naming no vectors must score only `vector` (0.0), never fall back to `title`.
+    let (status, hits) = server.post("/search", &json!({"query": [0, 1, 0], "top_k": 5}));
+    assert_eq!(status, 200, "{hits}");
+    assert_eq!(hits[0]["id"], "r1");
+    assert!(
+        (hits[0]["score"].as_f64().unwrap()).abs() < 1e-4,
+        "the default-vector-only search must not match on the named `title` vector: {hits}"
+    );
+}
+
+/// Upserting a name that was never declared is a `400` naming the offending name, not a
+/// silent write or a `500`.
+#[test]
+fn upserting_an_undeclared_vector_name_is_a_400_naming_it_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+
+    let (status, body) = server.post(
+        "/collections/docs/upsert",
+        &json!({"records": [
+            {"id": "r1", "vectors": {"nope": [1, 0, 0]}, "attrs": {}}
+        ]}),
+    );
+    assert_eq!(status, 400, "{body}");
+    let msg = body["error"].as_str().unwrap_or_default();
+    assert!(msg.contains("nope"), "error must name the bad name: {msg}");
+}
+
+/// nidus-29ui: `limit_per` on `/hybrid-search` caps hits per attribute value, returning a
+/// **different hit set** (not just a shorter page) than the same query unset.
+#[test]
+fn hybrid_search_limit_per_returns_a_different_hit_set_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    assert_eq!(server.post("/collections/docs", &json!({})).0, 200);
+    assert_eq!(
+        server
+            .post("/collections/docs/fts-schema", &json!({"fields": ["body"]}))
+            .0,
+        200
+    );
+    let records = json!({"records": [
+        {"id": "a1", "vector": [1, 0, 0], "attrs": {"src": {"Str": "A"}, "body": {"Str": "cats and foxes"}}},
+        {"id": "a2", "vector": [0.9, 0.1, 0], "attrs": {"src": {"Str": "A"}, "body": {"Str": "cats and foxes"}}},
+        {"id": "a3", "vector": [0.8, 0.2, 0], "attrs": {"src": {"Str": "A"}, "body": {"Str": "cats and foxes"}}},
+        {"id": "b1", "vector": [0.7, 0.3, 0], "attrs": {"src": {"Str": "B"}, "body": {"Str": "cats and foxes"}}},
+        {"id": "b2", "vector": [0.6, 0.4, 0], "attrs": {"src": {"Str": "B"}, "body": {"Str": "cats and foxes"}}}
+    ]});
+    let (status, body) = server.post("/collections/docs/upsert", &records);
+    assert_eq!(status, 200, "upsert failed: {body}");
+
+    let ids = |hits: &Value| -> Vec<String> {
+        hits.as_array()
+            .expect("hits array")
+            .iter()
+            .map(|h| h["id"].as_str().expect("id").to_string())
+            .collect()
+    };
+    let (status, unset) = server.post(
+        "/hybrid-search",
+        &json!({"vector": [1, 0, 0], "field": "body", "text": "cats", "top_k": 5}),
+    );
+    assert_eq!(status, 200, "{unset}");
+    assert_eq!(ids(&unset).len(), 5, "{unset}");
+
+    let (status, capped) = server.post(
+        "/hybrid-search",
+        &json!({
+            "vector": [1, 0, 0], "field": "body", "text": "cats", "top_k": 5,
+            "limit_per": {"field": "src", "max": 1}
+        }),
+    );
+    assert_eq!(status, 200, "{capped}");
+    let capped_ids = ids(&capped);
+    assert_eq!(
+        capped_ids.len(),
+        2,
+        "at most one hit per `src` value: {capped}"
+    );
+    assert_ne!(
+        capped_ids,
+        ids(&unset),
+        "limit_per must change the hit set, not just cap a count"
+    );
+}

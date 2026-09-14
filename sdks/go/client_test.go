@@ -388,6 +388,9 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 		{"SetFtsSchema", `{"ok":true}`, http.MethodPost, "/collections/docs/fts-schema", func(c *Client) error {
 			return c.SetFtsSchema(ctx, "docs", []string{"body"})
 		}},
+		{"SetVectorNames", `{"ok":true}`, http.MethodPost, "/collections/docs/vector-names", func(c *Client) error {
+			return c.SetVectorNames(ctx, "docs", []string{"title"})
+		}},
 		{"SetFilterIndex", `{"ok":true}`, http.MethodPost, "/collections/docs/filter-index", func(c *Client) error {
 			return c.SetFilterIndex(ctx, "docs", []string{"body"})
 		}},

@@ -230,6 +230,15 @@ class NidusClient:
         """
         self._request("POST", _wire.filter_index_path(name), _wire.filter_index_body(fields))
 
+    def set_vector_names(self, name: str, names: Sequence[str]) -> None:
+        """Declare which named-vector fields a collection accepts (nidus-85t).
+
+        A record's ``vector`` (the reserved ``default`` name) needs no declaration; every
+        other name an ``upsert`` or a search's ``names`` argument uses must be declared here
+        first, or the write is refused naming the undeclared name.
+        """
+        self._request("POST", _wire.vector_names_path(name), _wire.vector_names_body(names))
+
     # ── Search ───────────────────────────────────────────────────────────────────────
     #
     # Every optional defaults to `None`, which means "omit the key" so the server's
@@ -255,6 +264,9 @@ class NidusClient:
         diversity: Optional[float] = None,
         expand: Optional[Expand] = None,
         rerank: Optional[RerankOpts] = None,
+        names: Optional[Sequence[str]] = None,
+        name_weights: Optional[Mapping[str, float]] = None,
+        pool: Optional[str] = None,
     ) -> Hits:
         """Vector (cosine) nearest-neighbour search. An empty ``scope`` searches everything.
 
@@ -269,6 +281,15 @@ class NidusClient:
         in vector space so near-duplicates stop filling a page: ``1.0`` is pure relevance,
         ``0.0`` pure variety, and omitting it leaves the ranking untouched. ``rerank`` is
         documented on :class:`~nidus.RerankOpts`.
+
+        ``names`` scores a record's named vectors (nidus-85t, see
+        :meth:`~nidus.NidusClient.set_vector_names`) instead of its plain ``vector``,
+        reducing a multi-vector record to one hit before ``top_k`` selection; omitting it
+        (the default) searches only the reserved ``default`` vector, exactly as before this
+        argument existed. ``name_weights={"title": 2.0}`` multiplies a named score before
+        pooling (a name absent there weights ``1.0``), and ``pool`` picks how several named
+        scores fold into one: ``"Max"`` (the server's default, an absent name costs nothing)
+        or ``"Sum"``. Both are meaningless when ``names`` is omitted.
         """
         return self._search(
             _wire.SEARCH,
@@ -287,6 +308,9 @@ class NidusClient:
                 diversity=diversity,
                 expand=expand,
                 rerank=rerank,
+                names=names,
+                name_weights=name_weights,
+                pool=pool,
             ),
         )
 
@@ -307,6 +331,9 @@ class NidusClient:
         diversity: Optional[float] = None,
         expand: Optional[Expand] = None,
         rerank: Optional[RerankOpts] = None,
+        names: Optional[Sequence[str]] = None,
+        name_weights: Optional[Mapping[str, float]] = None,
+        pool: Optional[str] = None,
     ) -> tuple[Hits, QueryPlan]:
         """Like :meth:`search`, but also returns the :class:`~nidus.QueryPlan` that answered it.
 
@@ -330,6 +357,9 @@ class NidusClient:
                 diversity=diversity,
                 expand=expand,
                 rerank=rerank,
+                names=names,
+                name_weights=name_weights,
+                pool=pool,
                 plan=True,
             ),
         )
@@ -562,6 +592,8 @@ class NidusClient:
         text_weight: Optional[float] = None,
         expand: Optional[Expand] = None,
         rerank: Optional[RerankOpts] = None,
+        limit_per: Optional[LimitPer] = None,
+        diversity: Optional[float] = None,
     ) -> Hits:
         """Hybrid search: fuse a vector query and a BM25 text query via RRF.
 
@@ -576,6 +608,9 @@ class NidusClient:
         each hit reports both legs' own rank and score in ``hit.annotations``, which is the
         only way to see a leg's rank — the returned score is the fused one. ``rerank`` is
         documented on :class:`~nidus.RerankOpts`; its ``query`` is required here.
+
+        ``limit_per`` and ``diversity`` (nidus-29ui) apply to the *fused* ranking, the same
+        cap -> MMR -> page-cut tail :meth:`search` documents.
         """
         return self._search(
             _wire.HYBRID_SEARCH,
@@ -598,6 +633,8 @@ class NidusClient:
                 text_weight=text_weight,
                 expand=expand,
                 rerank=rerank,
+                limit_per=limit_per,
+                diversity=diversity,
             ),
         )
 
@@ -622,6 +659,8 @@ class NidusClient:
         text_weight: Optional[float] = None,
         expand: Optional[Expand] = None,
         rerank: Optional[RerankOpts] = None,
+        limit_per: Optional[LimitPer] = None,
+        diversity: Optional[float] = None,
     ) -> tuple[Hits, QueryPlan]:
         """Like :meth:`hybrid_search`, but also returns the :class:`~nidus.QueryPlan`."""
         return self._search_with_plan(
@@ -645,6 +684,8 @@ class NidusClient:
                 text_weight=text_weight,
                 expand=expand,
                 rerank=rerank,
+                limit_per=limit_per,
+                diversity=diversity,
                 plan=True,
             ),
         )

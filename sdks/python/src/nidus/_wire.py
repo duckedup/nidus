@@ -154,6 +154,10 @@ def filter_index_path(name: str) -> str:
     return f"{collection_path(name)}/filter-index"
 
 
+def vector_names_path(name: str) -> str:
+    return f"{collection_path(name)}/vector-names"
+
+
 def remember_path(name: str) -> str:
     return f"{collection_path(name)}/remember"
 
@@ -192,6 +196,14 @@ def upsert_body(records: Iterable[RecordInput]) -> dict[str, Any]:
         # the honest outcome for an empty vector.
         if vector is not None:
             out["vector"] = _guards.float_sequence(vector, f"record {rec['id']!r} vector")
+        vectors = rec.get("vectors")
+        # Same rule as `vector`: absent means none, and an empty map is left out entirely
+        # rather than sent as `{}`, matching the server's own elision.
+        if vectors:
+            out["vectors"] = {
+                str(name): _guards.float_sequence(vec, f"record {rec['id']!r} vectors[{name!r}]")
+                for name, vec in vectors.items()
+            }
         wire.append(out)
     return {"records": wire}
 
@@ -249,6 +261,16 @@ def fts_schema_body(fields: Sequence[Union[str, FtsField]]) -> dict[str, Any]:
     """
     _guards.reject_bare_string(fields, "set_fts_schema(name, fields)")
     return {"fields": [_fts_field(f) for f in fields]}
+
+
+def vector_names_body(names: Sequence[str]) -> dict[str, Any]:
+    """Body for ``POST /collections/{name}/vector-names`` (nidus-85t decision 4).
+
+    Declares which named-vector fields ``upsert`` and search may use beyond the reserved
+    ``default`` vector. An undeclared name is refused by the server at upsert time, naming
+    the name.
+    """
+    return {"names": _guards.str_sequence(names, "set_vector_names(name, names)")}
 
 
 def _fts_field(spec: Union[str, FtsField]) -> Union[str, dict[str, Any]]:
@@ -353,6 +375,9 @@ def search_body(
     expand: Optional[Expand] = None,
     rerank: Optional[RerankOpts] = None,
     plan: Optional[bool] = None,
+    names: Optional[Sequence[str]] = None,
+    name_weights: Optional[Mapping[str, float]] = None,
+    pool: Optional[str] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /search`` (vector nearest-neighbour).
 
@@ -362,6 +387,13 @@ def search_body(
     ``offset`` (or projection, or ranking expression) is byte-identical to the request
     before it existed. ``rerank`` is documented on :class:`~nidus.types.RerankOpts`. ``plan``
     is set only by the ``*_with_plan`` methods.
+
+    ``names`` scores the record's named vectors (nidus-85t) instead of its plain ``vector``,
+    reduced to one score per record before top-k selection; omitted (the default) searches
+    only the reserved ``default`` vector, byte-identical to a request from before this field
+    existed. ``name_weights`` multiplies a named score before pooling (a name absent there
+    weights ``1.0``); ``pool`` picks how several named scores fold into one: ``"Max"`` (the
+    server's default) or ``"Sum"``. Both are meaningless when ``names`` is unset.
     """
     return prune(
         {
@@ -379,6 +411,9 @@ def search_body(
             "expand": _expand(expand),
             "rerank": _rerank(rerank),
             "plan": plan,
+            "names": _names(names),
+            "name_weights": _name_weights(name_weights),
+            "pool": pool,
         }
     )
 
@@ -523,6 +558,8 @@ def hybrid_search_body(
     expand: Optional[Expand] = None,
     rerank: Optional[RerankOpts] = None,
     plan: Optional[bool] = None,
+    limit_per: Optional[LimitPer] = None,
+    diversity: Optional[float] = None,
 ) -> dict[str, Any]:
     """Body for ``POST /hybrid-search`` (vector + BM25 fused via RRF).
 
@@ -532,7 +569,9 @@ def hybrid_search_body(
     called ``text``; a clause's is ``query`` on both routes. ``prefix`` expands the
     shorthand's final term; a ``clauses`` call sets it per clause instead. ``rerank`` is
     documented on :class:`~nidus.types.RerankOpts`. ``plan`` is set only by the
-    ``*_with_plan`` methods.
+    ``*_with_plan`` methods. ``limit_per`` and ``diversity`` (nidus-29ui) apply to the fused
+    ranking, on the shared cap -> MMR -> page-cut tail :meth:`~nidus.NidusClient.search`
+    documents.
     """
     return prune(
         {
@@ -549,6 +588,8 @@ def hybrid_search_body(
             "highlight": _highlight(highlight),
             "vector_weight": vector_weight,
             "text_weight": text_weight,
+            "limit_per": _limit_per(limit_per),
+            "diversity": diversity,
             "expand": _expand(expand),
             "rerank": _rerank(rerank),
             "plan": plan,
@@ -921,6 +962,10 @@ def decode_records(payload: Any) -> list[Record]:
             Record(
                 id=str(r["id"]),
                 vector=None if vector is None else [float(x) for x in vector],
+                vectors={
+                    str(name): [float(x) for x in vec]
+                    for name, vec in (r.get("vectors") or {}).items()
+                },
                 attrs=decode_attrs(_attrs_of(r)),
             )
         )
@@ -1243,6 +1288,16 @@ def _highlight(highlight: Optional[Union[bool, HighlightOpts]]) -> Optional[dict
 
 def _limit_per(limit_per: Optional[LimitPer]) -> Optional[dict[str, Any]]:
     return None if limit_per is None else _spec(limit_per, "limit_per", ("field", "max"))
+
+
+def _names(names: Optional[Sequence[str]]) -> Optional[list[str]]:
+    """``names=`` as it goes on the wire (nidus-85t); ``None`` omits the key entirely."""
+    return None if names is None else _guards.str_sequence(names, "search(names=...)")
+
+
+def _name_weights(name_weights: Optional[Mapping[str, float]]) -> Optional[dict[str, float]]:
+    """Per-name weight multipliers, keyed by name; ``None`` omits the key entirely."""
+    return None if name_weights is None else {str(k): float(v) for k, v in name_weights.items()}
 
 
 def _expand(expand: Optional[Expand]) -> Optional[dict[str, Any]]:

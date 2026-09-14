@@ -9996,6 +9996,7 @@ fn reinforce_saturates_instead_of_overflowing() {
             &[Record {
                 id: "a".into(),
                 vector: Some(vec![1.0, 0.0]),
+                vectors: Default::default(),
                 attrs,
             }],
         )
@@ -10030,6 +10031,7 @@ fn reinforce_does_not_reindex_a_collection_it_does_not_touch() {
             &[Record {
                 id: "a".into(),
                 vector: Some(vec![1.0, 0.0]),
+                vectors: Default::default(),
                 attrs,
             }],
         )
@@ -10578,4 +10580,451 @@ fn nidus_structural_verbs_refuse_an_alias() {
             .is_err()
     );
     assert!(db.create_collection("a").is_err());
+}
+
+// ── Named vectors per record (nidus-85t) ──────────────────────────────────
+
+use crate::model::{DEFAULT_VECTOR, Pool};
+
+#[test]
+fn two_named_vectors_reduce_to_one_hit_with_a_different_score_than_either_alone() {
+    let mut store = Store::in_memory(2).unwrap();
+    store
+        .set_vector_names("docs", &["title".to_string(), "body".to_string()])
+        .unwrap();
+    let r = Record::named(
+        "r1",
+        BTreeMap::from([
+            ("title".to_string(), vec![1.0, 0.0]),
+            ("body".to_string(), vec![0.0, 1.0]),
+        ]),
+        BTreeMap::new(),
+    );
+    store.upsert("docs", &[r]).unwrap();
+
+    let q = [0.6, 0.8];
+    let by_name = |names: Vec<String>| SearchOpts {
+        top_k: 5,
+        names,
+        pool: Pool::Sum,
+        ..Default::default()
+    };
+    let title_only = store
+        .search(&["docs"], &q, &by_name(vec!["title".to_string()]))
+        .unwrap();
+    let body_only = store
+        .search(&["docs"], &q, &by_name(vec!["body".to_string()]))
+        .unwrap();
+    let both = store
+        .search(
+            &["docs"],
+            &q,
+            &by_name(vec!["title".to_string(), "body".to_string()]),
+        )
+        .unwrap();
+
+    assert_eq!(
+        both.len(),
+        1,
+        "one hit per record, not one per named row: {both:?}"
+    );
+    assert_ne!(both[0].score, title_only[0].score);
+    assert_ne!(both[0].score, body_only[0].score);
+}
+
+#[test]
+fn max_and_sum_pooling_rank_a_two_name_match_differently_than_a_one_name_spike() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_vector_names("docs", &["title".to_string(), "body".to_string()])
+        .unwrap();
+    // "moderate": both names align with the query at cosine 0.6.
+    let moderate = Record::named(
+        "moderate",
+        BTreeMap::from([
+            ("title".to_string(), vec![0.6, 0.8, 0.0]),
+            ("body".to_string(), vec![0.6, -0.8, 0.0]),
+        ]),
+        BTreeMap::new(),
+    );
+    // "spike": only `title`, exactly aligned with the query (cosine 1.0).
+    let spike = Record::named(
+        "spike",
+        BTreeMap::from([("title".to_string(), vec![1.0, 0.0, 0.0])]),
+        BTreeMap::new(),
+    );
+    store.upsert("docs", &[moderate, spike]).unwrap();
+
+    let q = [1.0, 0.0, 0.0];
+    let names = vec!["title".to_string(), "body".to_string()];
+    let ranked = |pool: Pool| -> Vec<String> {
+        store
+            .search(
+                &["docs"],
+                &q,
+                &SearchOpts {
+                    top_k: 5,
+                    names: names.clone(),
+                    pool,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect()
+    };
+    assert_eq!(
+        ranked(Pool::Max),
+        vec!["spike", "moderate"],
+        "Max: the one-name spike wins"
+    );
+    assert_eq!(
+        ranked(Pool::Sum),
+        vec!["moderate", "spike"],
+        "Sum: the two-name moderate match wins"
+    );
+}
+
+#[test]
+fn per_name_weights_change_the_top_hit() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .set_vector_names("docs", &["title".to_string(), "body".to_string()])
+        .unwrap();
+    // "c": only `title`, cosine 0.5 with the query.
+    let c = Record::named(
+        "c",
+        BTreeMap::from([("title".to_string(), vec![0.5, 0.866_025_4, 0.0])]),
+        BTreeMap::new(),
+    );
+    // "d": only `body`, cosine 0.6 — outranks "c" when both names weigh the same.
+    let d = Record::named(
+        "d",
+        BTreeMap::from([("body".to_string(), vec![0.6, 0.8, 0.0])]),
+        BTreeMap::new(),
+    );
+    store.upsert("docs", &[c, d]).unwrap();
+
+    let q = [1.0, 0.0, 0.0];
+    let names = vec!["title".to_string(), "body".to_string()];
+    let top = |weights: BTreeMap<String, f32>| -> String {
+        store
+            .search(
+                &["docs"],
+                &q,
+                &SearchOpts {
+                    top_k: 1,
+                    names: names.clone(),
+                    name_weights: weights,
+                    ..Default::default()
+                },
+            )
+            .unwrap()[0]
+            .id
+            .clone()
+    };
+    assert_eq!(
+        top(BTreeMap::new()),
+        "d",
+        "unweighted: body's 0.6 beats title's 0.5"
+    );
+    assert_eq!(
+        top(BTreeMap::from([("title".to_string(), 2.0)])),
+        "c",
+        "title weighted 2x: 1.0 beats body's 0.6"
+    );
+}
+
+#[test]
+fn an_unnamed_query_is_byte_identical_to_the_bare_metric() {
+    let mut store = Store::in_memory(3).unwrap();
+    store
+        .upsert(
+            "docs",
+            &[
+                rec("a", vec![1.0, 0.0, 0.0]),
+                rec("b", vec![0.6, 0.8, 0.0]),
+                rec("c", vec![0.0, 1.0, 0.0]),
+            ],
+        )
+        .unwrap();
+    let q = [1.0, 0.0, 0.0];
+    let hits = store.search(&["docs"], &q, &default_opts(3)).unwrap();
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, vec!["a", "b", "c"]);
+    // The bare metric, computed by hand: query and stored vectors are all already unit
+    // length, so the score is the plain dot product — decision 5's byte-identical claim.
+    assert_eq!(hits[0].score, 1.0);
+    assert_eq!(hits[1].score, 0.6);
+    assert_eq!(hits[2].score, 0.0);
+}
+
+#[test]
+fn a_partially_populated_record_ranks_on_what_it_has_and_is_not_dropped() {
+    let mut store = Store::in_memory(2).unwrap();
+    store
+        .set_vector_names("docs", &["title".to_string(), "body".to_string()])
+        .unwrap();
+    // Only `title`; no `body` at all.
+    let only_title = Record::named(
+        "only_title",
+        BTreeMap::from([("title".to_string(), vec![0.6, 0.8])]),
+        BTreeMap::new(),
+    );
+    store.upsert("docs", &[only_title]).unwrap();
+
+    let q = [1.0, 0.0];
+    let hits = store
+        .search(
+            &["docs"],
+            &q,
+            &SearchOpts {
+                top_k: 5,
+                names: vec!["title".to_string(), "body".to_string()],
+                pool: Pool::Max,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "never dropped for lacking a requested name: {hits:?}"
+    );
+    assert_eq!(hits[0].id, "only_title");
+    assert!(
+        (hits[0].score - 0.6).abs() < 1e-6,
+        "unpenalized: scores exactly on `title` alone, got {}",
+        hits[0].score
+    );
+}
+
+#[test]
+fn upserting_an_undeclared_vector_name_is_refused_naming_it() {
+    let mut store = Store::in_memory(2).unwrap();
+    let r = Record::named(
+        "r",
+        BTreeMap::from([("nope".to_string(), vec![1.0, 0.0])]),
+        BTreeMap::new(),
+    );
+    let err = store.upsert("docs", &[r]).unwrap_err();
+    assert!(err.to_string().contains("nope"), "{err}");
+}
+
+#[test]
+fn compact_relocates_every_named_row_and_zeros_dead_rows() {
+    let mut store = Store::in_memory_with(2, Distance::DotProduct).unwrap();
+    store
+        .set_vector_names("docs", &["title".to_string(), "body".to_string()])
+        .unwrap();
+    let first = Record::named(
+        "r1",
+        BTreeMap::from([
+            ("title".to_string(), vec![1.0, 0.0]),
+            ("body".to_string(), vec![0.0, 1.0]),
+        ]),
+        BTreeMap::new(),
+    );
+    store.upsert("docs", &[first]).unwrap();
+    // Overwrite with different vectors, so compact has real dead rows to reclaim.
+    let second = Record::named(
+        "r1",
+        BTreeMap::from([
+            ("title".to_string(), vec![2.0, 0.0]),
+            ("body".to_string(), vec![0.0, 2.0]),
+        ]),
+        BTreeMap::new(),
+    );
+    store.upsert("docs", &[second]).unwrap();
+    assert_eq!(
+        store.footprint().dead_rows,
+        2,
+        "the first upsert's two rows are dead"
+    );
+
+    store.compact().unwrap();
+    assert_eq!(store.footprint().dead_rows, 0);
+
+    let record = store.get("docs", "r1").expect("survives compaction");
+    assert_eq!(record.vectors.get("title"), Some(&vec![2.0, 0.0]));
+    assert_eq!(record.vectors.get("body"), Some(&vec![0.0, 2.0]));
+    assert!(
+        record.vector.is_none(),
+        "no default vector was ever written"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // fsync
+fn a_pre_85t_log_replays_its_vector_under_the_default_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    {
+        let mut store = Store::open(Config::new(&path, 2)).unwrap();
+        store.create_collection("docs").unwrap();
+        // Simulate a pre-nidus-85t write: the vector row plus the *old* `Op::Upsert` —
+        // never `Op::UpsertVectors` — exactly what that binary would have produced.
+        let row = store.data.append(&[1.0, 0.0]).unwrap();
+        store
+            .log
+            .append(&Op::Upsert {
+                collection: "docs".to_string(),
+                id: "a".to_string(),
+                row,
+                attrs: BTreeMap::new(),
+            })
+            .unwrap();
+        store.flush().unwrap();
+    }
+    let store = Store::open(Config::new(&path, 2)).unwrap();
+    let record = store.get("docs", "a").expect("the legacy row replays");
+    assert_eq!(
+        record.vector,
+        Some(vec![1.0, 0.0]),
+        "surfaces under `vector`, i.e. under {DEFAULT_VECTOR}"
+    );
+    assert!(record.vectors.is_empty());
+}
+
+#[test]
+fn dead_rows_counts_every_named_row_independently() {
+    let mut store = Store::in_memory(2).unwrap();
+    store
+        .set_vector_names("docs", &["title".to_string(), "body".to_string()])
+        .unwrap();
+    let full = Record::named(
+        "r1",
+        BTreeMap::from([
+            ("title".to_string(), vec![1.0, 0.0]),
+            ("body".to_string(), vec![0.0, 1.0]),
+        ]),
+        BTreeMap::new(),
+    );
+    store.upsert("docs", &[full]).unwrap();
+    assert_eq!(store.footprint().dead_rows, 0);
+
+    // Overwrite with only one of the two names: both of the old entry's rows die.
+    let partial = Record::named(
+        "r1",
+        BTreeMap::from([("title".to_string(), vec![1.0, 0.0])]),
+        BTreeMap::new(),
+    );
+    store.upsert("docs", &[partial]).unwrap();
+    assert_eq!(
+        store.footprint().dead_rows,
+        2,
+        "the old entry's two rows both die, even though the new one has just one"
+    );
+
+    store.delete("docs", &["r1"]).unwrap();
+    assert_eq!(
+        store.footprint().dead_rows,
+        3,
+        "the surviving single row dies too"
+    );
+}
+
+#[test]
+fn hybrid_limit_per_yields_a_different_hit_set_than_unset() {
+    let mut store = Store::in_memory(2).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    let recs: Vec<Record> = (0..6)
+        .map(|i| {
+            let file = if i % 2 == 0 { "a.rs" } else { "b.rs" };
+            let angle = 0.02 * i as f32;
+            rec_with(
+                &format!("d{i}"),
+                vec![1.0 - angle, angle],
+                BTreeMap::from([
+                    ("file".to_string(), Value::Str(file.to_string())),
+                    ("body".to_string(), Value::Str("rust code".to_string())),
+                ]),
+            )
+        })
+        .collect();
+    store.upsert("docs", &recs).unwrap();
+
+    let ids = |limit_per| -> Vec<String> {
+        store
+            .hybrid_search(
+                &["docs"],
+                &[1.0, 0.0],
+                &FtsQuery::new("body", "rust code"),
+                &HybridOpts {
+                    top_k: 6,
+                    // Zero the text leg out: it would otherwise tie every doc and let
+                    // (collection, id) tie-breaking, not the vector score, decide rank.
+                    text_weight: 0.0,
+                    limit_per,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect()
+    };
+    let unset = ids(None);
+    assert_eq!(unset.len(), 6);
+    let capped = ids(Some(LimitPer::new("file", 1)));
+    assert_ne!(capped, unset, "the cap must change the returned hit set");
+    assert_eq!(capped.len(), 2, "one hit per file value: {capped:?}");
+}
+
+#[test]
+fn hybrid_diversity_yields_a_different_hit_set_than_unset() {
+    let mut store = Store::in_memory(2).unwrap();
+    store
+        .set_fts_schema("docs", &[FtsField::new("body")])
+        .unwrap();
+    let matched = || Value::Str("match".to_string());
+    let recs = vec![
+        rec_with(
+            "top",
+            vec![1.0, 0.0],
+            BTreeMap::from([("body".to_string(), matched())]),
+        ),
+        rec_with(
+            "dup",
+            vec![0.999, 0.0447],
+            BTreeMap::from([("body".to_string(), matched())]),
+        ),
+        rec_with(
+            "novel",
+            vec![0.0, 1.0],
+            BTreeMap::from([("body".to_string(), matched())]),
+        ),
+    ];
+    store.upsert("docs", &recs).unwrap();
+
+    let ids = |diversity| -> Vec<String> {
+        store
+            .hybrid_search(
+                &["docs"],
+                &[1.0, 0.0],
+                &FtsQuery::new("body", "match"),
+                &HybridOpts {
+                    top_k: 2,
+                    text_weight: 0.0,
+                    diversity,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect()
+    };
+    let unset = ids(None);
+    assert_eq!(unset, vec!["top", "dup"], "the two closest by raw score");
+    let diversified = ids(Some(0.0));
+    assert_ne!(diversified, unset, "MMR must reorder, not no-op");
+    assert_eq!(
+        diversified,
+        vec!["top", "novel"],
+        "pure spread promotes the novel candidate over the near-duplicate"
+    );
 }

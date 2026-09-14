@@ -2384,3 +2384,210 @@ fn cold_read_of_a_local_persistence_store_needs_no_dim() {
         "check on a typo'd path must not create it: {err}"
     );
 }
+
+// ── Named vectors (nidus-85t) + nidus-29ui hybrid-search cap/diversity ───────────────
+
+/// `set-vector-names` declares a collection's names, and `upsert` then refuses any name
+/// not on that list, naming it in the error (decision 4/6).
+#[test]
+fn cli_upsert_rejects_an_undeclared_vector_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    let out = ok(
+        &["set-vector-names", "--dir", dir, "docs", "--name", "title"],
+        "",
+    );
+    assert_eq!(out["vector_names"], json!(["title"]));
+
+    let bad = json!([{"id": "a", "vectors": {"nope": [1, 0, 0]}, "attrs": {}}]).to_string();
+    let err = fails(&["upsert", "--dir", dir, "docs"], &bad);
+    assert!(err.contains("nope"), "must name the undeclared name: {err}");
+
+    // `set-vector-names` itself refuses an empty declaration rather than silently no-op'ing.
+    let err = fails(&["set-vector-names", "--dir", dir, "docs"], "");
+    assert!(err.contains("--name"), "{err}");
+}
+
+/// `--pool max`/`--pool sum` must reorder the same corpus differently (acceptance #2): a
+/// record spiking on one name only beats a moderate-on-both record under `max`, and loses
+/// under `sum`, where the two moderate scores add past the spike.
+#[test]
+fn cli_search_pool_changes_the_top_hit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(
+        &[
+            "set-vector-names",
+            "--dir",
+            dir,
+            "docs",
+            "--name",
+            "title",
+            "--name",
+            "body",
+        ],
+        "",
+    );
+    let seed = json!([
+        {"id": "spike", "vectors": {"title": [1, 0, 0], "body": [0, 1, 0]}, "attrs": {}},
+        {"id": "moderate", "vectors": {"title": [0.6, 0.8, 0], "body": [0.6, 0.8, 0]}, "attrs": {}}
+    ])
+    .to_string();
+    ok(&["upsert", "--dir", dir, "docs"], &seed);
+
+    let top = |pool: &str| -> String {
+        ids(&ok(
+            &[
+                "search", "--dir", dir, "-k", "1", "--name", "title", "--name", "body", "--pool",
+                pool, "docs",
+            ],
+            "[1, 0, 0]",
+        ))[0]
+            .clone()
+    };
+    assert_eq!(
+        top("max"),
+        "spike",
+        "--pool max must favor the one-name spike"
+    );
+    assert_eq!(
+        top("sum"),
+        "moderate",
+        "--pool sum must favor the record that scores on both names"
+    );
+}
+
+/// Per-name `--weight` must change the ranking (acceptance #3): the same query at
+/// `title=2.0` vs unweighted returns a different top hit.
+#[test]
+fn cli_search_name_weights_change_the_top_hit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(
+        &[
+            "set-vector-names",
+            "--dir",
+            dir,
+            "docs",
+            "--name",
+            "title",
+            "--name",
+            "body",
+        ],
+        "",
+    );
+    // p leads on `title`, q leads on `body`; q wins unweighted, p wins once `title`
+    // outweighs `body` 2-to-1.
+    let seed = json!([
+        {"id": "p", "vectors": {"title": [0.8, 0.6, 0], "body": [0.28, 0.96, 0]}, "attrs": {}},
+        {"id": "q", "vectors": {"title": [0.28, 0.96, 0], "body": [0.96, 0.28, 0]}, "attrs": {}}
+    ])
+    .to_string();
+    ok(&["upsert", "--dir", dir, "docs"], &seed);
+
+    let top = |extra: &[&str]| -> String {
+        let mut args = vec![
+            "search", "--dir", dir, "-k", "1", "--name", "title", "--name", "body", "--pool", "sum",
+        ];
+        args.extend_from_slice(extra);
+        args.push("docs");
+        ids(&ok(&args, "[1, 0, 0]"))[0].clone()
+    };
+    assert_eq!(
+        top(&[]),
+        "q",
+        "unweighted, q's stronger body score must win"
+    );
+    assert_eq!(
+        top(&["--weight", "title=2.0"]),
+        "p",
+        "--weight title=2.0 must flip the ranking to p"
+    );
+}
+
+/// `hybrid-search --limit-per` (nidus-29ui): caps fused hits per distinct attribute value,
+/// same as `search`/`text-search`, so at most one of several same-`file` docs survives.
+#[test]
+fn cli_hybrid_search_limit_per_caps_the_fused_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(
+        &["set-fts-schema", "--dir", dir, "docs", "--field", "body"],
+        "",
+    );
+    let seed = json!([
+        {"id": "d1", "vector": [1, 0, 0], "attrs": {
+            "body": {"Str": "alpha alpha alpha"}, "file": {"Str": "a.md"}}},
+        {"id": "d2", "vector": [1, 0, 0], "attrs": {
+            "body": {"Str": "alpha alpha"}, "file": {"Str": "a.md"}}},
+        {"id": "d3", "vector": [0, 1, 0], "attrs": {
+            "body": {"Str": "alpha"}, "file": {"Str": "a.md"}}},
+        {"id": "d4", "vector": [0, 0, 1], "attrs": {
+            "body": {"Str": "alpha beta"}, "file": {"Str": "b.md"}}}
+    ])
+    .to_string();
+    ok(&["upsert", "--dir", dir, "docs"], &seed);
+
+    let hits = |extra: &[&str]| -> Value {
+        let mut args = vec!["hybrid-search", "--dir", dir, "--in", "docs", "-k", "4"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["body", "alpha"]);
+        ok(&args, "[1, 0, 0]")
+    };
+    let a_md_hits = |page: &[String]| page.iter().filter(|id| *id != "d4").count();
+
+    let unlimited = ids(&hits(&[]));
+    assert!(
+        a_md_hits(&unlimited) >= 2,
+        "test premise: a.md needs 2+ fused hits, got {unlimited:?}"
+    );
+
+    let capped = ids(&hits(&["--limit-per", "file", "--limit-per-max", "1"]));
+    assert!(
+        a_md_hits(&capped) <= 1,
+        "--limit-per did not cap the fused page: {capped:?}"
+    );
+    assert_ne!(
+        capped, unlimited,
+        "--limit-per did not change the fused hit set"
+    );
+}
+
+/// `hybrid-search --diversity` (nidus-29ui) must reshape the fused page, not merely parse.
+#[test]
+fn cli_hybrid_search_diversity_reshapes_the_fused_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    ok(&["create", "--dir", dir, "--dim", "3", "docs"], "");
+    ok(
+        &["set-fts-schema", "--dir", dir, "docs", "--field", "body"],
+        "",
+    );
+    // Identical body text ties out the BM25 leg, so the fused order (and what --diversity
+    // reshapes) comes from the crowded vector leg, same corpus as the plain-search case.
+    let seed = json!([
+        {"id": "dup0", "vector": [1, 0.02, 0], "attrs": {"body": {"Str": "alpha"}}},
+        {"id": "dup1", "vector": [1, 0.03, 0], "attrs": {"body": {"Str": "alpha"}}},
+        {"id": "dup2", "vector": [1, 0.04, 0], "attrs": {"body": {"Str": "alpha"}}},
+        {"id": "novel", "vector": [0.6, 0.8, 0], "attrs": {"body": {"Str": "alpha"}}}
+    ])
+    .to_string();
+    ok(&["upsert", "--dir", dir, "docs"], &seed);
+
+    let hits = |extra: &[&str]| -> Value {
+        let mut args = vec!["hybrid-search", "--dir", dir, "--in", "docs", "-k", "2"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["body", "alpha"]);
+        ok(&args, "[1, 0, 0]")
+    };
+    let base = ids(&hits(&[]));
+    let diverse = ids(&hits(&["--diversity", "0.3"]));
+    assert_ne!(
+        diverse, base,
+        "--diversity did not reshape the fused page: base={base:?} diverse={diverse:?}"
+    );
+}

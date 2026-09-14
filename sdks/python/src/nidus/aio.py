@@ -211,6 +211,15 @@ class AsyncNidusClient:
         """
         await self._request("POST", _wire.filter_index_path(name), _wire.filter_index_body(fields))
 
+    async def set_vector_names(self, name: str, names: Sequence[str]) -> None:
+        """Declare which named-vector fields a collection accepts (nidus-85t).
+
+        A record's ``vector`` (the reserved ``default`` name) needs no declaration; every
+        other name an ``upsert`` or a search's ``names`` argument uses must be declared here
+        first, or the write is refused naming the undeclared name.
+        """
+        await self._request("POST", _wire.vector_names_path(name), _wire.vector_names_body(names))
+
     # ── Search ───────────────────────────────────────────────────────────────────────
     #
     # As in the sync client, every optional defaults to `None` = "omit the key", leaving
@@ -233,13 +242,17 @@ class AsyncNidusClient:
         diversity: Optional[float] = None,
         expand: Optional[Expand] = None,
         rerank: Optional[RerankOpts] = None,
+        names: Optional[Sequence[str]] = None,
+        name_weights: Optional[Mapping[str, float]] = None,
+        pool: Optional[str] = None,
     ) -> Hits:
         """Vector (cosine) nearest-neighbour search. An empty ``scope`` searches everything.
 
         ``offset`` skips that many top-ranked hits, so successive pages tile one ranking;
         the server refuses ``offset + top_k`` above 10000. ``exact=True`` forces the exact
         scan past any index; the projection arguments are mutually exclusive. ``rank_by``,
-        ``limit_per`` and ``rerank`` are as in :meth:`nidus.client.NidusClient.search`.
+        ``limit_per``, ``rerank``, ``names``, ``name_weights`` and ``pool`` are as in
+        :meth:`nidus.client.NidusClient.search`.
         """
         return await self._search(
             _wire.SEARCH,
@@ -258,6 +271,9 @@ class AsyncNidusClient:
                 diversity=diversity,
                 expand=expand,
                 rerank=rerank,
+                names=names,
+                name_weights=name_weights,
+                pool=pool,
             ),
         )
 
@@ -278,6 +294,9 @@ class AsyncNidusClient:
         diversity: Optional[float] = None,
         expand: Optional[Expand] = None,
         rerank: Optional[RerankOpts] = None,
+        names: Optional[Sequence[str]] = None,
+        name_weights: Optional[Mapping[str, float]] = None,
+        pool: Optional[str] = None,
     ) -> tuple[Hits, QueryPlan]:
         """Like :meth:`search`, but also returns the :class:`~nidus.QueryPlan` that answered it.
 
@@ -300,6 +319,9 @@ class AsyncNidusClient:
                 diversity=diversity,
                 expand=expand,
                 rerank=rerank,
+                names=names,
+                name_weights=name_weights,
+                pool=pool,
                 plan=True,
             ),
         )
@@ -515,12 +537,15 @@ class AsyncNidusClient:
         text_weight: Optional[float] = None,
         expand: Optional[Expand] = None,
         rerank: Optional[RerankOpts] = None,
+        limit_per: Optional[LimitPer] = None,
+        diversity: Optional[float] = None,
     ) -> Hits:
         """Hybrid search: fuse a vector query and a BM25 text query via RRF.
 
         ``offset`` pages the *fused* ranking, never a leg — a leg's rank is an input to
         the fused score. The text leg, ``prefix``, the weights, ``explain`` and ``rerank``
-        behave exactly as in :meth:`nidus.client.NidusClient.hybrid_search`.
+        behave exactly as in :meth:`nidus.client.NidusClient.hybrid_search`. ``limit_per``
+        and ``diversity`` (nidus-29ui) apply to the fused ranking.
         """
         return await self._search(
             _wire.HYBRID_SEARCH,
@@ -543,6 +568,8 @@ class AsyncNidusClient:
                 text_weight=text_weight,
                 expand=expand,
                 rerank=rerank,
+                limit_per=limit_per,
+                diversity=diversity,
             ),
         )
 
@@ -567,6 +594,8 @@ class AsyncNidusClient:
         text_weight: Optional[float] = None,
         expand: Optional[Expand] = None,
         rerank: Optional[RerankOpts] = None,
+        limit_per: Optional[LimitPer] = None,
+        diversity: Optional[float] = None,
     ) -> tuple[Hits, QueryPlan]:
         """Like :meth:`hybrid_search`, but also returns the :class:`~nidus.QueryPlan`."""
         return await self._search_with_plan(
@@ -590,6 +619,8 @@ class AsyncNidusClient:
                 text_weight=text_weight,
                 expand=expand,
                 rerank=rerank,
+                limit_per=limit_per,
+                diversity=diversity,
                 plan=True,
             ),
         )

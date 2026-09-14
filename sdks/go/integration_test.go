@@ -1748,6 +1748,312 @@ func TestUnreachableServerIsATransportError(t *testing.T) {
 	}
 }
 
+// TestNamedVectorsAgainstARealServer checks named vectors end to end (nidus-85t): a
+// record is the ranking unit even when several of its named vectors are scored, Max and
+// Sum pool differently, per-name weights change the winner, an unpopulated name is not
+// penalized under Max, and an undeclared name is refused naming it.
+//
+// It mirrors sdks/js/test/integration.test.ts and sdks/python/tests/test_integration.py
+// step for step.
+func TestNamedVectorsAgainstARealServer(t *testing.T) {
+	db := startServer(t)
+	ctx := context.Background()
+
+	if err := db.CreateCollection(ctx, "docs"); err != nil {
+		t.Fatalf("CreateCollection failed: %v", err)
+	}
+	if err := db.SetVectorNames(ctx, "docs", []string{"title", "body"}); err != nil {
+		t.Fatalf("SetVectorNames failed: %v", err)
+	}
+
+	t.Run("upserting an undeclared vector name is refused, naming it", func(t *testing.T) {
+		_, err := db.Upsert(ctx, "docs", []Record{
+			{ID: "bad", Vectors: map[string][]float32{"caption": {1, 0, 0}}, Attrs: Attrs{}},
+		})
+		if err == nil {
+			t.Fatal("upsert of an undeclared vector name succeeded, want a refusal")
+		}
+		if !strings.Contains(err.Error(), "caption") {
+			t.Errorf("error %q does not name the offending vector `caption`", err.Error())
+		}
+	})
+
+	// a's title is a perfect match for the query and its body orthogonal (1.0/0.0); b
+	// matches moderately on both ([0.6, 0.8, 0] is a unit vector, so its cosine with
+	// [1, 0, 0] is exactly 0.6). only-title carries no body at all. None of the three
+	// sets Record.Vector, so an unnamed search must see none of them.
+	if _, err := db.Upsert(ctx, "docs", []Record{
+		{ID: "a", Vectors: map[string][]float32{"title": {1, 0, 0}, "body": {0, 1, 0}},
+			Attrs: Attrs{"kind": Str("mixed")}},
+		{ID: "b", Vectors: map[string][]float32{"title": {0.6, 0.8, 0}, "body": {0.6, 0.8, 0}},
+			Attrs: Attrs{"kind": Str("mixed")}},
+		{ID: "only-title", Vectors: map[string][]float32{"title": {1, 0, 0}},
+			Attrs: Attrs{"kind": Str("partial")}},
+	}); err != nil {
+		t.Fatalf("Upsert failed: %v", err)
+	}
+	query := []float32{1, 0, 0}
+	mixed := And(Eq("kind", "mixed"))
+
+	t.Run("naming no vectors searches only the reserved default vector", func(t *testing.T) {
+		hits, err := db.Search(ctx, SearchRequest{Query: query, Scope: []string{"docs"}})
+		if err != nil {
+			t.Fatalf("Search failed: %v", err)
+		}
+		if len(hits) != 0 {
+			t.Errorf("hits = %v, want none: a/b/only-title carry no default vector", ids(hits))
+		}
+	})
+
+	t.Run("naming several vectors returns one hit per record, its score not equal to either name alone", func(t *testing.T) {
+		titleOnly, err := db.Search(ctx, SearchRequest{
+			Query: query, Scope: []string{"docs"}, Filter: mixed,
+			Names: []string{"title"}, Pool: PoolSum,
+		})
+		if err != nil {
+			t.Fatalf("Search (title only) failed: %v", err)
+		}
+		var titleScore float32
+		for _, h := range titleOnly {
+			if h.ID == "b" {
+				titleScore = h.Score
+			}
+		}
+
+		both, err := db.Search(ctx, SearchRequest{
+			Query: query, Scope: []string{"docs"}, Filter: mixed,
+			Names: []string{"title", "body"}, Pool: PoolSum,
+		})
+		if err != nil {
+			t.Fatalf("Search (title+body) failed: %v", err)
+		}
+		if len(both) != 2 {
+			t.Fatalf("hits = %v, want exactly one hit per record (a, b), not one per name", ids(both))
+		}
+		var bothScore float32
+		var seenB int
+		for _, h := range both {
+			if h.ID == "b" {
+				bothScore = h.Score
+				seenB++
+			}
+		}
+		if seenB != 1 {
+			t.Fatalf("record b appeared %d times naming both vectors, want exactly 1 (dedup by record)", seenB)
+		}
+		if bothScore == titleScore {
+			t.Errorf("score naming both vectors (%v) equals title alone (%v); the reduction looks like a no-op",
+				bothScore, titleScore)
+		}
+	})
+
+	t.Run("Max and Sum pool differently, reordering the ranking", func(t *testing.T) {
+		maxHits, err := db.Search(ctx, SearchRequest{
+			Query: query, Scope: []string{"docs"}, Filter: mixed,
+			Names: []string{"title", "body"}, Pool: PoolMax,
+		})
+		if err != nil {
+			t.Fatalf("Search (Max) failed: %v", err)
+		}
+		// a's best name (title, 1.0) beats b's best name (either, 0.6).
+		if got := ids(maxHits); len(got) != 2 || got[0] != "a" {
+			t.Errorf("Max ranking = %v, want a first", got)
+		}
+
+		sumHits, err := db.Search(ctx, SearchRequest{
+			Query: query, Scope: []string{"docs"}, Filter: mixed,
+			Names: []string{"title", "body"}, Pool: PoolSum,
+		})
+		if err != nil {
+			t.Fatalf("Search (Sum) failed: %v", err)
+		}
+		// b's two moderate matches (0.6 + 0.6 = 1.2) now outweigh a's one spike
+		// (1.0 + 0.0 = 1.0): Sum must reorder relative to Max, not merely rescore.
+		if got := ids(sumHits); len(got) != 2 || got[0] != "b" {
+			t.Errorf("Sum ranking = %v, want b first (Max and Sum must disagree)", got)
+		}
+	})
+
+	// c and d each carry a strong match on one name and a weak match on the other, in
+	// opposite names, so which one leads under Sum flips with which name is weighted.
+	if _, err := db.Upsert(ctx, "docs", []Record{
+		{ID: "c", Vectors: map[string][]float32{"title": {1, 0, 0}, "body": {0.2, 0.9798, 0}},
+			Attrs: Attrs{"kind": Str("weighted")}},
+		{ID: "d", Vectors: map[string][]float32{"title": {0.3, 0.9539, 0}, "body": {1, 0, 0}},
+			Attrs: Attrs{"kind": Str("weighted")}},
+	}); err != nil {
+		t.Fatalf("Upsert failed: %v", err)
+	}
+
+	t.Run("per-name weights change which record ranks first", func(t *testing.T) {
+		weighted := And(Eq("kind", "weighted"))
+		unweighted, err := db.Search(ctx, SearchRequest{
+			Query: query, Scope: []string{"docs"}, Filter: weighted,
+			Names: []string{"title", "body"}, Pool: PoolSum,
+		})
+		if err != nil {
+			t.Fatalf("Search (1.0/1.0) failed: %v", err)
+		}
+		// d: 0.3 + 1.0 = 1.3 beats c: 1.0 + 0.2 = 1.2.
+		if got := ids(unweighted); len(got) != 2 || got[0] != "d" {
+			t.Fatalf("unweighted ranking = %v, want d first", got)
+		}
+
+		favorTitle, err := db.Search(ctx, SearchRequest{
+			Query: query, Scope: []string{"docs"}, Filter: weighted,
+			Names: []string{"title", "body"}, Pool: PoolSum,
+			NameWeights: map[string]float32{"title": 2.0, "body": 1.0},
+		})
+		if err != nil {
+			t.Fatalf("Search (2.0/1.0) failed: %v", err)
+		}
+		// c: 2*1.0 + 0.2 = 2.2 now beats d: 2*0.3 + 1.0 = 1.6.
+		if got := ids(favorTitle); len(got) != 2 || got[0] != "c" {
+			t.Errorf("title-weighted ranking = %v, want c first (weights must change the winner)", got)
+		}
+	})
+
+	t.Run("a record populated on only some names ranks on what it has, unpenalized under Max", func(t *testing.T) {
+		hits, err := db.Search(ctx, SearchRequest{
+			Query: query, Scope: []string{"docs"}, Filter: And(Eq("kind", "partial")),
+			Names: []string{"title", "body"}, Pool: PoolMax,
+		})
+		if err != nil {
+			t.Fatalf("Search failed: %v", err)
+		}
+		if got := ids(hits); len(got) != 1 || got[0] != "only-title" {
+			t.Fatalf("hits = %v, want exactly only-title; a populated-only-on-one-name record must not be dropped", got)
+		}
+		if hits[0].Score < 0.99 {
+			t.Errorf("score = %v, want ~1.0 (its title alone, unpenalized for the absent body)", hits[0].Score)
+		}
+	})
+}
+
+// TestHybridLimitPerAndDiversityAgainstARealServer checks nidus-29ui's fold into
+// hybrid search: without a cap, several hits may carry the same attribute value; with
+// LimitPer, at most one does, and the returned hit set actually shrinks rather than
+// merely reordering.
+func TestHybridLimitPerAndDiversityAgainstARealServer(t *testing.T) {
+	db := startServer(t)
+	ctx := context.Background()
+
+	if err := db.CreateCollection(ctx, "docs"); err != nil {
+		t.Fatalf("CreateCollection failed: %v", err)
+	}
+	if err := db.SetFtsSchema(ctx, "docs", []string{"title", "body"}); err != nil {
+		t.Fatalf("SetFtsSchema failed: %v", err)
+	}
+	_, err := db.Upsert(ctx, "docs", []Record{
+		{ID: "a", Vector: []float32{1, 0, 0}, Attrs: Attrs{
+			"title": Str("rust async runtime"), "body": Str("the executor"), "path": Str("src/main.rs"),
+		}},
+		{ID: "b", Vector: []float32{0.99, 0.14, 0}, Attrs: Attrs{
+			"title": Str("go scheduler"), "body": Str("the runtime schedules goroutines"), "path": Str("src/main.rs"),
+		}},
+		{ID: "c", Vector: []float32{0.1, 0.9, 0}, Attrs: Attrs{
+			"title": Str("unrelated"), "body": Str("nothing to see"), "path": Str("docs/notes.md"),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Upsert failed: %v", err)
+	}
+
+	uncapped, err := db.HybridSearch(ctx, HybridSearchRequest{
+		Vector: []float32{1, 0, 0},
+		Clauses: []FtsClause{
+			{Field: "title", Query: "runtime"},
+			{Field: "body", Query: "runtime"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("HybridSearch failed: %v", err)
+	}
+	// Both docs sharing the capped path must be present; the fused page legitimately also
+	// carries docs that match no text clause but still rank on the vector leg, so this is a
+	// containment check, not set equality.
+	if !containsAll(ids(uncapped), "a", "b") {
+		t.Fatalf("uncapped hits = %v, want a and b present (both share path src/main.rs)", ids(uncapped))
+	}
+
+	capped, err := db.HybridSearch(ctx, HybridSearchRequest{
+		Vector: []float32{1, 0, 0},
+		Clauses: []FtsClause{
+			{Field: "title", Query: "runtime"},
+			{Field: "body", Query: "runtime"},
+		},
+		LimitPer: &LimitPer{Field: "path", Max: 1},
+	})
+	if err != nil {
+		t.Fatalf("HybridSearch (limit_per) failed: %v", err)
+	}
+	// `a` and `b` share src/main.rs; `c` does not, so max=1 per path leaves one of {a,b}
+	// PLUS c. Asserting a total of one would be asserting the wrong behaviour. What must hold
+	// is that the cap thinned the set and that no path survives twice.
+	if len(capped) >= len(uncapped) {
+		t.Fatalf("capped hits = %v (%d) did not shrink the uncapped %v (%d); the cap was ignored",
+			ids(capped), len(capped), ids(uncapped), len(uncapped))
+	}
+	if containsAll(ids(capped), "a", "b") {
+		t.Fatalf("capped hits = %v still carry BOTH docs sharing src/main.rs", ids(capped))
+	}
+
+	// Diversity must travel too, without erroring, over the same fused ranking.
+	spread, err := db.HybridSearch(ctx, HybridSearchRequest{
+		Vector: []float32{1, 0, 0},
+		Clauses: []FtsClause{
+			{Field: "title", Query: "runtime"},
+			{Field: "body", Query: "runtime"},
+		},
+		Diversity: f32(0),
+	})
+	if err != nil {
+		t.Fatalf("HybridSearch (diversity) failed: %v", err)
+	}
+	// Asserting the same set as the uncapped page would pass even if the server dropped
+	// `diversity` on the floor. Pure spread (lambda 0) must REORDER the fused page, so
+	// compare the ordering, not the membership.
+	if len(spread) < 2 {
+		t.Fatalf("diversity-spread hits = %v, want at least two to reorder", ids(spread))
+	}
+	if !containsAll(ids(spread), "a", "b") {
+		t.Errorf("diversity-spread hits = %v, want a and b present", ids(spread))
+	}
+	if equalOrder(ids(spread), ids(uncapped)) {
+		t.Errorf("diversity=0 returned the same ORDER as unset (%v); the knob was ignored", ids(spread))
+	}
+}
+
+// containsAll reports whether every want is present in got.
+func containsAll(got []string, want ...string) bool {
+	for _, w := range want {
+		found := false
+		for _, g := range got {
+			if g == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// equalOrder reports whether two id sequences are identical, order included.
+func equalOrder(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // ── Small assertions helpers ────────────────────────────────────────────────
 
 // idsOf projects rows onto the ids they carry. One generic loop rather than one per row

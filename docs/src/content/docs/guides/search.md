@@ -1,6 +1,6 @@
 ---
 title: Vector search
-description: "Scoped vector search across nidus collections: three distance metrics, exact by default, optional HNSW/IVF approximate indexing, int8/binary quantization, recency and reinforcement ranking, per-attribute caps, and MMR diversity."
+description: "Scoped vector search across nidus collections: three distance metrics, exact by default, optional HNSW/IVF approximate indexing, int8/binary quantization, recency and reinforcement ranking, per-attribute caps, MMR diversity, and named vectors per record."
 ---
 
 Search in nidus runs over a scope you choose, using one of three distance metrics,
@@ -57,6 +57,68 @@ dimension is pinned at store creation, so a vector in `code` and a vector in
 `docs` are directly comparable: one ranking over both is meaningful, not a
 category error.
 
+## Named vectors
+
+A record's default embedding lives in `Record::vector`. A record can also carry any
+number of **named** vectors in `Record::vectors`, each declared on the collection first:
+
+```rust
+use nidus::{Nidus, Record, SearchOpts};
+use std::collections::BTreeMap;
+
+db.set_vector_names("docs", &["title".to_string(), "body".to_string()])?;
+
+db.upsert("docs", &[Record::named(
+    "a1",
+    BTreeMap::from([
+        ("title".to_string(), vec![0.1_f32; 384]),
+        ("body".to_string(), vec![0.2_f32; 384]),
+    ]),
+    BTreeMap::new(),
+)])?;
+# anyhow::Ok(())
+```
+
+Every named vector shares the store's one pinned dimension: there is still one
+embedding space per store, just several named columns a record may fill in it. Upserting
+an undeclared name, or naming the reserved `default` inside `vectors` (set `Record::vector`
+for that one instead), is refused rather than silently accepted.
+
+`SearchOpts::names` chooses which of them a query scores, folding several into one
+record score with `pool`:
+
+```rust
+use nidus::{Pool, SearchOpts};
+
+let query = vec![0.1_f32; 384];
+let hits = db.search(
+    "docs",
+    &query,
+    &SearchOpts {
+        top_k: 10,
+        names: vec!["title".to_string(), "body".to_string()],
+        pool: Pool::Max, // the best of the two wins; Pool::Sum adds them instead
+        ..Default::default()
+    },
+)?;
+# anyhow::Ok(())
+```
+
+Things worth knowing:
+
+- **`names` empty is the default**, and searches only `default`: byte-identical to a
+  query written before this existed.
+- **A record missing one of `names` is not penalized.** It is scored on whichever of
+  them it actually carries; an entirely absent name contributes nothing, not a zero.
+- **`name_weights` scales one name's score before pooling.** A name left out of the map
+  weights `1.0`.
+- **`pool` is `Max` by default**: the best weighted per-name score wins. `Pool::Sum` adds
+  every weighted score instead, favouring a record that matches on several names at once
+  over one that only spikes on one.
+- **`search_similar` takes the same three fields**, scoring the source record's own named
+  vectors the same way. `hybrid_search` does not: a hybrid query always searches
+  `default`.
+
 ## More like this
 
 `search_similar` runs an ordinary search using the vector already stored at a
@@ -86,7 +148,8 @@ surprised by otherwise:
   matters, exactly like any other search.
 
 Every other `SearchOpts` field (`filter`, `min_score`, `exact`, projections,
-`rank_by`, `limit_per`, `diversity`) works the same as it does for `search`.
+`rank_by`, `limit_per`, `diversity`, [`names`/`name_weights`/`pool`](#named-vectors))
+works the same as it does for `search`.
 
 ## Scoring
 

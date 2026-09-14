@@ -109,6 +109,38 @@ If your attributes arrive as plain Go values (from your own JSON decode, say), u
 `nidus.AttrsOf(map[string]any{…})` (or `nidus.ValueOf` for one value), which normalizes
 and names the offending key when a value has no nidus type.
 
+## Named vectors
+
+A record may carry several named vectors, at the store's dimension, alongside (or
+instead of) its plain `Vector`. Declare each name on the collection before writing or
+searching it; upserting an undeclared one is refused, naming it:
+
+```go
+if err := db.SetVectorNames(ctx, "docs", []string{"title", "body"}); err != nil { /* … */ }
+
+n, err := db.Upsert(ctx, "docs", []nidus.Record{
+    {ID: "a", Vectors: map[string][]float32{
+        "title": {0.1, 0.2, 0.3},
+        "body":  {0.4, 0.5, 0.6},
+    }, Attrs: nidus.Attrs{"lang": nidus.Str("rust")}},
+})
+
+// A record naming several vectors is still one ranking unit: every named row
+// reduces to one score per record, by Pool, before the top-k page is chosen.
+hits, err := db.Search(ctx, nidus.SearchRequest{
+    Query:       []float32{0.1, 0.2, 0.3},
+    Names:       []string{"title", "body"},
+    NameWeights: map[string]float32{"title": 2.0, "body": 1.0},
+    Pool:        nidus.PoolMax, // or PoolSum; PoolMax is the server's default
+})
+```
+
+A search naming no vectors searches only the reserved `"default"` vector that plain
+`Vector` writes to, so an old request stays byte-identical. `PoolMax` scores a record on
+whichever named vector matches best and does not penalize the names it lacks; `PoolSum`
+adds every named score, so a record matching moderately on both names can outrank a
+one-name spike.
+
 ## Typed attributes on the way back
 
 `Hit.Attrs` and `Record.Attrs` keep typed `Value`s rather than decoding to `any`. Read
@@ -326,8 +358,10 @@ base score, never multiplied, so it stays meaningful where scores are negative o
 unbounded (Euclidean, DotProduct, BM25). Ages are measured from `Origin` rather than the
 wall clock, so the same query against an unchanged store ranks the same way twice. A
 record whose timestamp is missing or unusable is *not* penalized by default; set
-`Missing: &zero` to bury it instead. `RankBy`, `LimitPer` and `Expand` ride on `/search`
-and `/text-search`; `OrderBy` on `/list`; `Rollup` on `/recall`.
+`Missing: &zero` to bury it instead. `RankBy` rides on `/search`, `/search/similar` and
+`/text-search`; `LimitPer`, `Diversity` and `Expand` ride on those three and, as of
+nidus-29ui, on `/hybrid-search` as well, over the fused ranking; `OrderBy` on `/list`;
+`Rollup` on `/recall`.
 
 ## Explaining a query plan
 

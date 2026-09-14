@@ -198,7 +198,9 @@ fn diversity_is_advertised_on_the_tools_that_honour_it() {
 
     let listed = super::result(&body);
     let tools = listed["tools"].as_array().expect("tools array");
-    for want in ["recall", "text_search", "related"] {
+    // `HybridOpts` gained `diversity` (nidus-29ui), so `hybrid_search` now honours it the
+    // same as every other ranked tool.
+    for want in ["recall", "text_search", "related", "hybrid_search"] {
         let tool = tools
             .iter()
             .find(|t| t["name"] == want)
@@ -213,16 +215,6 @@ fn diversity_is_advertised_on_the_tools_that_honour_it() {
             "`{want}`'s diversity needs a hand-written description: {props}"
         );
     }
-    // hybrid_search fuses two legs through `HybridOpts`, which carries no diversity, so
-    // advertising one there would promise a knob the handler cannot honour.
-    let hybrid = tools
-        .iter()
-        .find(|t| t["name"] == "hybrid_search")
-        .expect("no `hybrid_search` tool");
-    assert!(
-        hybrid["inputSchema"]["properties"]["diversity"].is_null(),
-        "hybrid_search must not advertise diversity: {hybrid}"
-    );
     for tool in tools {
         assert!(
             tool["inputSchema"]["properties"]["vector"].is_null(),
@@ -230,4 +222,110 @@ fn diversity_is_advertised_on_the_tools_that_honour_it() {
             tool["name"]
         );
     }
+}
+
+/// nidus-85t's law: no MCP tool may take a raw vector, and vector **names** are strings, so
+/// `names`/`pool`/`name_weights` must render as a string array, a string enum, and a plain
+/// object — never anything shaped like a float vector.
+#[test]
+fn named_vector_arguments_are_text_native() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    let (status, body) = super::mcp(
+        &server,
+        "tools/list",
+        None,
+        &super::rpc(1, "tools/list", json!({})),
+    );
+    assert_eq!(status, 200, "tools/list failed: {body}");
+
+    let listed = super::result(&body);
+    let tools = listed["tools"].as_array().expect("tools array");
+    // `code_search` ships only under the `code` feature, so assert it when present rather
+    // than requiring it: this binary is built without it in the e2e lane.
+    for want in ["recall", "related", "code_search"] {
+        let Some(tool) = tools.iter().find(|t| t["name"] == want) else {
+            assert_ne!(want, "recall", "`recall` must always be listed");
+            continue;
+        };
+        let props = &tool["inputSchema"]["properties"];
+        assert_eq!(
+            props["names"]["type"], "array",
+            "`{want}`'s `names` must be a plain string array: {props}"
+        );
+        assert_eq!(
+            props["names"]["items"]["type"], "string",
+            "`{want}`'s `names` items must be strings, never numbers: {props}"
+        );
+        assert_eq!(
+            props["pool"]["type"], "string",
+            "`{want}`'s `pool` must be a string enum: {props}"
+        );
+        assert_eq!(
+            props["name_weights"]["type"], "object",
+            "`{want}`'s `name_weights` must be a plain object: {props}"
+        );
+    }
+    // `HybridOpts` carries no `names`/`pool` field (nidus-85t), so `hybrid_search` must not
+    // advertise a knob its handler cannot honour.
+    let hybrid = tools
+        .iter()
+        .find(|t| t["name"] == "hybrid_search")
+        .expect("no `hybrid_search` tool");
+    assert!(
+        hybrid["inputSchema"]["properties"]["names"].is_null(),
+        "hybrid_search must not advertise `names`: {hybrid}"
+    );
+    let rendered = listed.to_string();
+    assert!(
+        !rendered.contains("\"vector\""),
+        "named-vector selection must stay text-native: {rendered}"
+    );
+}
+
+/// `names: ["default"]` restricts the search to the reserved default vector — the one every
+/// pre-nidus-85t record already carries — so the result must be byte-identical to omitting
+/// `names` entirely (decision 5).
+#[test]
+fn restricting_to_the_default_name_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    seed(&server);
+
+    let (plain_status, plain_body) =
+        call_related(&server, json!({"collection": "sim", "id": "src"}));
+    let (named_status, named_body) = call_related(
+        &server,
+        json!({"collection": "sim", "id": "src", "names": ["default"]}),
+    );
+    assert_eq!(plain_status, 200, "{plain_body}");
+    assert_eq!(named_status, 200, "{named_body}");
+    assert_eq!(
+        super::text(&super::result(&plain_body)),
+        super::text(&super::result(&named_body)),
+        "naming only the default vector must not change the result"
+    );
+}
+
+/// An unrecognised `pool` value is a caller fault naming the argument, not a silent fallback
+/// to `max`.
+#[test]
+fn an_unknown_pool_value_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new(dir.path(), 3).start();
+    seed(&server);
+
+    let (status, body) = call_related(
+        &server,
+        json!({"collection": "sim", "id": "src", "pool": "average"}),
+    );
+    assert_eq!(
+        status, 400,
+        "an unknown pool value is a caller fault: {body}"
+    );
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("pool"),
+        "the error should name the argument: {message}"
+    );
 }

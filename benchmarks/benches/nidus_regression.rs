@@ -20,6 +20,7 @@ fn records(n: usize, dim: usize) -> Vec<Record> {
         .map(|i| Record {
             id: i.to_string(),
             vector: Some(ds.vectors[i * dim..(i + 1) * dim].to_vec()),
+            vectors: Default::default(),
             attrs: BTreeMap::new(),
         })
         .collect()
@@ -144,6 +145,7 @@ fn build_text_store(n: usize, dim: usize) -> Nidus {
             Record {
                 id: i.to_string(),
                 vector: Some(ds.vectors[i * dim..(i + 1) * dim].to_vec()),
+                vectors: Default::default(),
                 attrs,
             }
         })
@@ -169,6 +171,7 @@ fn build_filter_indexed_store(n: usize, dim: usize) -> Nidus {
             Record {
                 id: i.to_string(),
                 vector: Some(ds.vectors[i * dim..(i + 1) * dim].to_vec()),
+                vectors: Default::default(),
                 attrs,
             }
         })
@@ -244,6 +247,7 @@ fn bench_ingest(c: &mut Criterion) {
         .map(|i| Record {
             id: i.to_string(),
             vector: Some(ds.vectors[i * dim..(i + 1) * dim].to_vec()),
+            vectors: Default::default(),
             attrs: BTreeMap::new(),
         })
         .collect();
@@ -389,6 +393,7 @@ fn bench_rank_by(c: &mut Criterion) {
             Record {
                 id: i.to_string(),
                 vector: Some(ds.vectors[i * dim..(i + 1) * dim].to_vec()),
+                vectors: Default::default(),
                 attrs,
             }
         })

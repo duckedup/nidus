@@ -8,14 +8,23 @@ use serde_json::{Value as JsonValue, json};
 use crate::{
     Aggregation, AnnConfig, AnnKind, Annotations, Compiled, Expand, Filter, FilterIndexField,
     Footprint, FtsClause, FtsCombine, FtsField, HighlightOpts, Hit, HybridOpts, Language, LimitPer,
-    ListOpts, OrderBy, Projection, QueryAnswer, QueryPlan, RankBy, Record, RerankOpts, SearchOpts,
-    StoreVersions, Suggestion, Suggestions, Value,
+    ListOpts, OrderBy, Pool, Projection, QueryAnswer, QueryPlan, RankBy, Record, RerankOpts,
+    SearchOpts, StoreVersions, Suggestion, Suggestions, Value,
 };
 
-/// Body of `POST /collections/{name}/upsert`.
+/// Body of `POST /collections/{name}/upsert`. Named vectors ride on [`Record::vectors`]
+/// itself (nidus-85t), so no field is added here.
 #[derive(Debug, Deserialize)]
 pub struct UpsertRequest {
     pub records: Vec<Record>,
+}
+
+/// Body of `POST /collections/{name}/vector-names`: the named-vector fields the collection
+/// accepts on upsert and search, beyond the reserved `default` vector (nidus-85t decision 4).
+/// Mirrors [`FtsSchemaRequest`]'s declare-then-use shape.
+#[derive(Debug, Deserialize)]
+pub struct VectorNamesRequest {
+    pub names: Vec<String>,
 }
 
 /// Body of `POST /collections/{name}/delete`. Supply `ids` to delete by id, or
@@ -161,6 +170,20 @@ pub struct SearchRequest {
     /// of the bare array. Default `false` keeps today's response byte-identical.
     #[serde(default)]
     pub plan: bool,
+    /// Named vectors to score (nidus-85t). Empty (the default, and the only shape an old
+    /// client ever sends) searches only the reserved `default` vector, so an old request is
+    /// byte-identical.
+    #[serde(default)]
+    pub names: Vec<String>,
+    /// Per-name weight multiplying that name's score before pooling, keyed the same as
+    /// [`crate::SearchOpts::name_weights`] rather than a positional list — a name absent
+    /// here weights `1.0`. Meaningless when `names` is empty.
+    #[serde(default)]
+    pub name_weights: BTreeMap<String, f32>,
+    /// How several named scores fold into one record score: `"Max"` (default) or `"Sum"`.
+    /// Meaningless when `names` is empty.
+    #[serde(default)]
+    pub pool: Pool,
 }
 
 /// The opt-in cross-encoder stage on a search request. `query` back-fills from the request's
@@ -215,6 +238,18 @@ pub struct SimilarRequest {
     /// of the bare array. Default `false` keeps today's response byte-identical.
     #[serde(default)]
     pub plan: bool,
+    /// Named vectors to score (nidus-85t). Empty (the default) searches only the reserved
+    /// `default` vector, so an old request is byte-identical.
+    #[serde(default)]
+    pub names: Vec<String>,
+    /// Per-name weight multiplying that name's score before pooling; a name absent here
+    /// weights `1.0`. Meaningless when `names` is empty.
+    #[serde(default)]
+    pub name_weights: BTreeMap<String, f32>,
+    /// How several named scores fold into one record score: `"Max"` (default) or `"Sum"`.
+    /// Meaningless when `names` is empty.
+    #[serde(default)]
+    pub pool: Pool,
 }
 
 /// Most queries one batch may carry. Matches turbopuffer's documented cap; the point is that
@@ -433,6 +468,14 @@ pub struct HybridSearchRequest {
     /// of the bare array. Default `false` keeps today's response byte-identical.
     #[serde(default)]
     pub plan: bool,
+    /// Cap the fused hits carrying any one value of an attribute (nidus-29ui):
+    /// `{"field": "path", "max": 2}`. Applied on the shared cap -> MMR -> page-cut tail.
+    #[serde(default)]
+    pub limit_per: Option<LimitPer>,
+    /// MMR lambda spreading the fused page in vector space (nidus-29ui): `1.0` pure
+    /// relevance, `0.0` pure spread.
+    #[serde(default)]
+    pub diversity: Option<f32>,
 }
 
 fn default_weight() -> f32 {

@@ -1873,10 +1873,19 @@ build until a real need exists.
   serving stale bytes. New object keys only (`hist-*`); the live `manifest` is unchanged.
   See §14.2.
 
-#### Exotic vector types — DECIDED, 2026-08 (nidus-m50.14)
+#### Exotic vector types — DECIDED, 2026-08 (nidus-m50.14), revised 2026-09 (nidus-85t)
 
-One dense vector per record, one dimension per store, stays the model. Three variants
-were evaluated against turbopuffer's surface and answered separately:
+Several **named** vectors per record, all at the store's one pinned dimension, is the
+model (nidus-85t): a record may carry `vector` (the reserved `default` name) and any
+number of additional names declared on the collection first, each scored on its own and
+folded into one record score by `Pool::Max` or `Pool::Sum`. One dimension per store is
+**unchanged**: every name shares that single pinned dimension, and a vector at a
+different dimension remains out of scope. This does **not** un-defer either of the two
+variants below: multi-vector late interaction (nidus-flz) is a different shape, a
+rerank-stage feature scoring token-level vectors post-retrieval rather than named
+columns on a record; sparse vectors (nidus-t52) are a different shape again, a genuine
+on-disk format change carrying a different kind of value entirely. Both remain deferred.
+Three variants were evaluated against turbopuffer's surface and answered separately:
 
 - **`f16` storage — rejected, not deferred.** It buys ~2× on the vector matrix, which
   int8 quantization (shipped, `Config::quantization`) already beats at 4× with a rerank

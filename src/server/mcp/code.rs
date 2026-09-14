@@ -12,8 +12,11 @@ use serde_json::{Map, Value as JsonValue, json};
 use crate::embed::Embedder;
 
 use super::NidusMcp;
-use super::args::{api_error, optional_usize, required_str, tool};
-use super::search::{filter_defs, filter_schema, parse_filter};
+use super::args::{api_error, optional_string_array, optional_usize, required_str, tool};
+use super::search::{
+    filter_defs, filter_schema, name_weights_schema, names_schema, parse_filter,
+    parse_name_weights, parse_pool, pool_schema,
+};
 
 /// The optional `semantic` argument (named to avoid `vector`, a boolean flag being no such
 /// thing): `Some(true/false)` forces a ranking, `None` defers to the store — the same
@@ -58,7 +61,10 @@ pub(super) fn tools() -> Vec<Tool> {
                 "semantic": {
                     "type": "boolean",
                     "description": "Force meaning-based (true) or keyword (false) ranking. Omit to let the server decide."
-                }
+                },
+                "names": names_schema(),
+                "pool": pool_schema(),
+                "name_weights": name_weights_schema()
             },
             "required": ["collection", "query"],
             "additionalProperties": false
@@ -83,6 +89,11 @@ impl NidusMcp {
         }
         let filter = parse_filter(args)?.unwrap_or_default();
         let want_semantic = optional_tri_bool(args, "semantic")?;
+        // Only the vector branch below reads these: a name or pool is meaningless for the
+        // keyword (BM25) branch, which never scores a vector at all.
+        let names = optional_string_array(args, "names")?;
+        let pool = parse_pool(args)?;
+        let name_weights = parse_name_weights(args)?;
 
         let use_vector = match want_semantic {
             Some(v) => v,
@@ -100,6 +111,9 @@ impl NidusMcp {
             let opts = crate::SearchOpts {
                 top_k: limit,
                 filter,
+                names,
+                name_weights,
+                pool,
                 ..Default::default()
             };
             crate::server::run_read(self.state.clone(), move |db| {

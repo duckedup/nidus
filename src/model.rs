@@ -218,6 +218,15 @@ pub enum Value {
     // would silently reinterpret every value in every existing store.
 }
 
+/// Reserved name for a record's primary vector — what [`Record::vector`] populates and what a
+/// [`SearchOpts`] naming no vectors searches (nidus-85t decision 5). Refused as an explicit key
+/// of [`Record::vectors`]: set `vector` for it instead.
+pub const DEFAULT_VECTOR: &str = "default";
+
+/// Most named vectors one search may score. A named search costs `docs_in_scope × names`, so
+/// this bounds what a single request can spend, mirroring `MAX_BATCH_QUERIES` for batches.
+pub const MAX_VECTOR_NAMES: usize = 16;
+
 /// A document: a caller-supplied id, an **optional** embedding, and typed metadata.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Record {
@@ -228,6 +237,11 @@ pub struct Record {
     /// and is elided when absent, so a text-only doc is just `{ id, attrs }`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector: Option<Vec<f32>>,
+    /// Named vectors beyond [`DEFAULT_VECTOR`] (nidus-85t), each declared on the collection
+    /// first (`Store::set_vector_names`) and of the store's dimension. Empty for every
+    /// existing caller, so this is elided over the wire.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vectors: BTreeMap<String, Vec<f32>>,
     /// Arbitrary typed metadata.
     pub attrs: BTreeMap<String, Value>,
 }
@@ -238,6 +252,7 @@ impl Record {
         Self {
             id: id.into(),
             vector: Some(vector),
+            vectors: BTreeMap::new(),
             attrs,
         }
     }
@@ -248,6 +263,22 @@ impl Record {
         Self {
             id: id.into(),
             vector: None,
+            vectors: BTreeMap::new(),
+            attrs,
+        }
+    }
+
+    /// A record carrying several **named** vectors (nidus-85t), none of them under
+    /// [`DEFAULT_VECTOR`]. Each name must be declared on the collection first.
+    pub fn named(
+        id: impl Into<String>,
+        vectors: BTreeMap<String, Vec<f32>>,
+        attrs: BTreeMap<String, Value>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            vector: None,
+            vectors,
             attrs,
         }
     }
@@ -619,6 +650,20 @@ impl Decay {
     }
 }
 
+/// How several named-vector scores fold into one per-record score, before top-k selection
+/// (nidus-85t). `Max` is the default: an absent name contributes nothing and carries no
+/// penalty, matching [`Decay::missing`]'s default of `1.0`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Pool {
+    /// The best weighted per-name score wins: `max(weight_i * score_i)`.
+    #[default]
+    #[serde(alias = "max")]
+    Max,
+    /// Every named score adds: `Σ weight_i * score_i`.
+    #[serde(alias = "sum")]
+    Sum,
+}
+
 /// A ranking expression layered over the store's distance metric. `None` on
 /// [`SearchOpts::rank_by`] is the bare metric — the ranking nidus has always returned.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -828,6 +873,15 @@ pub struct SearchOpts {
     /// Widen each hit with its document's neighbouring chunks. Runs last, after every pass
     /// that can reorder, and writes only [`Hit::context`]. `None` (the default) skips it.
     pub expand: Option<Expand>,
+    /// Named vectors to score (nidus-85t). Empty (the default) searches only [`DEFAULT_VECTOR`]
+    /// — byte-identical to every caller that predates this field. A record is scored on
+    /// whichever of these names it actually carries, reduced to one score by `pool`.
+    pub names: Vec<String>,
+    /// Per-name weight multiplying that name's score before pooling. A name absent here
+    /// weights `1.0`. Meaningless when `names` is empty.
+    pub name_weights: BTreeMap<String, f32>,
+    /// How several named scores fold into one record score. Meaningless when `names` is empty.
+    pub pool: Pool,
 }
 
 /// Query parameters for a metadata-only listing (no vector scoring).
@@ -890,6 +944,12 @@ pub struct HybridOpts {
     /// Rerank the fused candidate window with a hosted cross-encoder (`crate::rerank`,
     /// feature-gated). `None` (the default) leaves the RRF ranking untouched.
     pub rerank: Option<RerankOpts>,
+    /// Cap the fused hits carrying any one value of an attribute (nidus-29ui). `None` (the
+    /// default) is uncapped. Applied on the shared cap → MMR → page-cut tail, same as `search`.
+    pub limit_per: Option<LimitPer>,
+    /// Maximal Marginal Relevance lambda over the fused ranking (nidus-29ui). `None` (the
+    /// default) skips the pass. See [`SearchOpts::diversity`].
+    pub diversity: Option<f32>,
 }
 
 impl Default for HybridOpts {
@@ -906,6 +966,8 @@ impl Default for HybridOpts {
             vector_weight: 1.0,
             text_weight: 1.0,
             expand: None,
+            limit_per: None,
+            diversity: None,
         }
     }
 }
@@ -1078,9 +1140,9 @@ pub enum Op {
         collection: String,
         fields: Vec<FilterIndexField>,
     },
-    /// Bump an entry's reinforcement counters in place. Carries no `row`; replay leaves
-    /// `DocEntry.row` alone (an attrs-only `UpsertText` would null it and strip the vector).
-    /// Appended last, like `UpsertText`, for the same forward-compatibility reason.
+    /// Bump an entry's reinforcement counters in place. Carries no rows; replay leaves the
+    /// entry's row set alone (an attrs-only `UpsertText` would clear it and strip the vectors).
+    /// Appended after `SetFilterIndex`, for the same forward-compatibility reason.
     Reinforce {
         collection: String,
         id: String,
@@ -1089,6 +1151,22 @@ pub enum Op {
         /// New `nidus.expires_at`, when the recall asked to extend a TTL. `None` leaves
         /// expiry untouched.
         expires_at: Option<i64>,
+    },
+    /// Upsert a record carrying several **named** vectors (nidus-85t): `rows` is `name → row`,
+    /// including [`DEFAULT_VECTOR`] when `Record::vector` was set. Appended after `Reinforce`
+    /// so existing logs, which never contain it, still decode.
+    UpsertVectors {
+        collection: String,
+        id: String,
+        rows: Vec<(String, u64)>,
+        attrs: BTreeMap<String, Value>,
+    },
+    /// Declare a collection's additional vector names (nidus-85t), mirroring `SetFtsFields`.
+    /// Replayed on open and re-emitted by `compact`. Never contains [`DEFAULT_VECTOR`], which
+    /// needs no declaration.
+    SetVectorNames {
+        collection: String,
+        names: Vec<String>,
     },
 }
 
@@ -1100,7 +1178,7 @@ mod tests {
     fn appending_variants_did_not_renumber_the_existing_ones() {
         // bincode tags a variant by its **declaration index**, so inserting one anywhere
         // but the end silently reinterprets every op in every store's existing log.
-        let cases: [(Op, u32); 10] = [
+        let cases: [(Op, u32); 12] = [
             (
                 Op::CreateCollection {
                     collection: "c".into(),
@@ -1174,6 +1252,22 @@ mod tests {
                     expires_at: None,
                 },
                 9,
+            ),
+            (
+                Op::UpsertVectors {
+                    collection: "c".into(),
+                    id: "i".into(),
+                    rows: vec![(DEFAULT_VECTOR.into(), 0)],
+                    attrs: BTreeMap::new(),
+                },
+                10,
+            ),
+            (
+                Op::SetVectorNames {
+                    collection: "c".into(),
+                    names: vec!["title".into()],
+                },
+                11,
             ),
         ];
         for (op, want) in cases {

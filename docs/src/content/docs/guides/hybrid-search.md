@@ -1,6 +1,6 @@
 ---
 title: Hybrid search (RRF)
-description: "Combine BM25 full-text and vector search into one ranking with reciprocal rank fusion, and weight the two legs."
+description: "Combine BM25 full-text and vector search into one ranking with reciprocal rank fusion, weight the two legs, and cap or spread the fused hits."
 ---
 
 Keyword search finds the exact term. Vector search finds the thing you meant.
@@ -61,3 +61,37 @@ let hits = db.hybrid_search(
 
 A weight must be finite and non-negative: a `NaN` would poison the sort and a negative
 weight would invert a leg rather than de-emphasize it, so both are refused.
+
+### Capping and spreading fused hits
+
+`HybridOpts::limit_per` and `HybridOpts::diversity` work the same as their `SearchOpts`
+counterparts (see [Capping hits per attribute value](/guides/search/#capping-hits-per-attribute-value)
+and [Spreading near-duplicates apart](/guides/search/#spreading-near-duplicates-apart)),
+applied over the **fused** ranking rather than one leg:
+
+```rust
+use nidus::{FtsQuery, HybridOpts, LimitPer};
+
+let query_vector = vec![0.1_f32; 384];
+let hits = db.hybrid_search(
+    "docs",
+    &query_vector,
+    &FtsQuery::new("body", "vector database"),
+    &HybridOpts {
+        top_k: 10,
+        limit_per: Some(LimitPer::new("path", 2)), // at most 2 fused hits per file
+        diversity: Some(0.5),
+        ..Default::default()
+    },
+)?;
+# anyhow::Ok(())
+```
+
+Both default to `None` (uncapped, no spreading), so an existing call is unchanged.
+Order of operations matches `search`: the cap runs first, `diversity` reorders the
+survivors, then the page is cut.
+
+`HybridOpts` does not take `names`/`name_weights`/`pool`: `hybrid_search` always fuses
+the `default` vector's leg against the BM25 leg. See
+[Named vectors](/guides/search/#named-vectors) for scoring several named vectors on a
+plain `search`.

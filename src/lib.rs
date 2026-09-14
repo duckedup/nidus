@@ -134,11 +134,11 @@ pub use findex::FilterIndexField;
 pub use fts::{Analyzer, FtsField, Language};
 pub use meta::{META_ACCESS_COUNT, META_EXPIRES_AT, META_LAST_ACCESSED};
 pub use model::{
-    AggregateOpts, Aggregation, AnnConfig, AnnKind, ClusterStatus, DEFAULT_RERANK_OVERSCAN, Decay,
-    Distance, Expand, Filter, Footprint, FtsClause, FtsCombine, FtsQuery, Group, Hit, HybridOpts,
-    LimitPer, ListOpts, META_CHAR_START, META_CHUNK_INDEX, META_PARENT_ID, OrderBy, Predicate,
-    Projection, QuantKind, Quantization, RankBy, Record, RerankOpts, Role, SearchOpts,
-    StoreVersions, SuggestOpts, Suggestion, Suggestions, Value,
+    AggregateOpts, Aggregation, AnnConfig, AnnKind, ClusterStatus, DEFAULT_RERANK_OVERSCAN,
+    DEFAULT_VECTOR, Decay, Distance, Expand, Filter, Footprint, FtsClause, FtsCombine, FtsQuery,
+    Group, Hit, HybridOpts, LimitPer, ListOpts, META_CHAR_START, META_CHUNK_INDEX, META_PARENT_ID,
+    OrderBy, Pool, Predicate, Projection, QuantKind, Quantization, RankBy, Record, RerankOpts,
+    Role, SearchOpts, StoreVersions, SuggestOpts, Suggestion, Suggestions, Value,
 };
 pub use plan::{Candidates, Narrowing, QueryPath, QueryPlan, Timings};
 pub use profile::OpenProfile;
@@ -329,6 +329,25 @@ impl Nidus {
         fields: &[FilterIndexField],
     ) -> Result<()> {
         self.store.set_filter_index(collection, fields)
+    }
+
+    /// Declare `collection`'s additional named-vector names (nidus-85t decision 4), mirroring
+    /// `set_fts_schema`. Never include [`DEFAULT_VECTOR`] — it needs no declaration.
+    ///
+    /// ```
+    /// # use nidus::Nidus;
+    /// # fn main() -> nidus::Result<()> {
+    /// # let mut db = Nidus::open_in_memory(3)?;
+    /// db.set_vector_names("docs", &["title".to_string(), "body".to_string()])?;
+    /// # Ok(()) }
+    /// ```
+    pub fn set_vector_names(&mut self, collection: &str, names: &[String]) -> Result<()> {
+        self.store.set_vector_names(collection, names)
+    }
+
+    /// `collection`'s declared additional vector names, if any (never [`DEFAULT_VECTOR`]).
+    pub fn vector_names(&self, collection: &str) -> &[String] {
+        self.store.vector_names(collection)
     }
 
     pub fn drop_collection(&mut self, name: &str) -> Result<()> {

@@ -283,6 +283,138 @@ describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
     expect(hybrid[0]!.annotations!.text).toBeDefined();
   });
 
+  // Declaring names, then searching both, reduces a multi-vector record to **one** hit
+  // whose score is the `Sum`-pooled combination, different from either name's score alone.
+  it("named vectors reduce to one hit, scored by pooling", async () => {
+    await db.createCollection("named_docs");
+    await db.setVectorNames("named_docs", ["title", "body"]);
+    await db.upsert("named_docs", [
+      { id: "r1", vectors: { title: [1, 0, 0], body: [0, 1, 0] }, attrs: {} },
+    ]);
+
+    const query = [0.6, 0.8, 0];
+    const scope = ["named_docs"];
+    const titleOnly = await db.search({ scope, query, topK: 5, names: ["title"] });
+    const bodyOnly = await db.search({ scope, query, topK: 5, names: ["body"] });
+    const both = await db.search({
+      scope,
+      query,
+      topK: 5,
+      names: ["title", "body"],
+      pool: "Sum",
+    });
+
+    expect(both.length).toBe(1);
+    expect(both[0]!.id).toBe("r1");
+    const titleScore = titleOnly[0]!.score;
+    const bodyScore = bodyOnly[0]!.score;
+    const pooledScore = both[0]!.score;
+    expect(Math.abs(pooledScore - (titleScore + bodyScore))).toBeLessThan(1e-4);
+    expect(pooledScore).not.toBe(titleScore);
+    expect(pooledScore).not.toBe(bodyScore);
+  });
+
+  // The same query at two different per-name weightings flips which record ranks first,
+  // proving the weights are actually applied rather than dropped.
+  it("per-name weights change the top hit", async () => {
+    await db.createCollection("named_weights");
+    await db.setVectorNames("named_weights", ["title", "body"]);
+    await db.upsert("named_weights", [
+      { id: "titled", vectors: { title: [1, 0, 0] }, attrs: {} },
+      { id: "bodied", vectors: { body: [1, 0, 0] }, attrs: {} },
+    ]);
+
+    const scope = ["named_weights"];
+    const titleHeavy = await db.search({
+      scope,
+      query: [1, 0, 0],
+      topK: 1,
+      names: ["title", "body"],
+      nameWeights: { title: 2, body: 1 },
+    });
+    expect(titleHeavy[0]!.id).toBe("titled");
+
+    const bodyHeavy = await db.search({
+      scope,
+      query: [1, 0, 0],
+      topK: 1,
+      names: ["title", "body"],
+      nameWeights: { title: 1, body: 2 },
+    });
+    expect(bodyHeavy[0]!.id).toBe("bodied");
+  });
+
+  // A search naming no vectors must still rank on `vector` (the reserved `default`)
+  // alone, unaffected by a record that also carries named vectors.
+  it("a search naming no vectors ignores named vectors on the same record", async () => {
+    await db.createCollection("named_default");
+    await db.setVectorNames("named_default", ["title"]);
+    await db.upsert("named_default", [
+      { id: "r1", vector: [1, 0, 0], vectors: { title: [0, 1, 0] }, attrs: {} },
+    ]);
+
+    const scope = ["named_default"];
+    const matching = await db.search({ scope, query: [1, 0, 0], topK: 5 });
+    expect(matching[0]!.id).toBe("r1");
+    expect(Math.abs(matching[0]!.score - 1.0)).toBeLessThan(1e-4);
+
+    // Orthogonal to `vector` but exactly matches the named `title` vector: a search
+    // naming no vectors must not fall back to it.
+    const orthogonal = await db.search({ scope, query: [0, 1, 0], topK: 5 });
+    expect(orthogonal[0]!.id).toBe("r1");
+    expect(Math.abs(orthogonal[0]!.score)).toBeLessThan(1e-4);
+  });
+
+  // Upserting a name that was never declared is a 400 naming the offending name, not a
+  // silent write.
+  it("upserting an undeclared vector name is refused, naming it", async () => {
+    await db.createCollection("named_undeclared");
+    const err = (await db
+      .upsert("named_undeclared", [{ id: "r1", vectors: { nope: [1, 0, 0] }, attrs: {} }])
+      .then(
+        () => null,
+        (e) => e,
+      )) as NidusError;
+    expect(err).toBeInstanceOf(NidusError);
+    expect(err.status).toBe(400);
+    expect(err.message).toContain("nope");
+  });
+
+  // nidus-29ui: `limitPer` on `hybridSearch` caps hits per attribute value, returning a
+  // **different hit set** (not just a shorter page) than the same query unset.
+  it("hybridSearch limitPer returns a different hit set, not just a shorter page", async () => {
+    await db.createCollection("hybrid_limit");
+    await db.setFtsSchema("hybrid_limit", ["body"]);
+    await db.upsert("hybrid_limit", [
+      { id: "a1", vector: [1, 0, 0], attrs: { src: "A", body: "cats and foxes" } },
+      { id: "a2", vector: [0.9, 0.1, 0], attrs: { src: "A", body: "cats and foxes" } },
+      { id: "a3", vector: [0.8, 0.2, 0], attrs: { src: "A", body: "cats and foxes" } },
+      { id: "b1", vector: [0.7, 0.3, 0], attrs: { src: "B", body: "cats and foxes" } },
+      { id: "b2", vector: [0.6, 0.4, 0], attrs: { src: "B", body: "cats and foxes" } },
+    ]);
+
+    const scope = ["hybrid_limit"];
+    const unset = await db.hybridSearch({
+      scope,
+      vector: [1, 0, 0],
+      field: "body",
+      text: "cats",
+      topK: 5,
+    });
+    expect(unset.length).toBe(5);
+
+    const capped = await db.hybridSearch({
+      scope,
+      vector: [1, 0, 0],
+      field: "body",
+      text: "cats",
+      topK: 5,
+      limitPer: { field: "src", max: 1 },
+    });
+    expect(capped.length).toBe(2);
+    expect(capped.map((h) => h.id)).not.toEqual(unset.map((h) => h.id));
+  });
+
   // A truncated query matches only with `prefix: true` — asserting solely the positive case
   // would pass against a client that drops the field entirely.
   it("prefix expands a truncated clause's final term, on both spellings", async () => {

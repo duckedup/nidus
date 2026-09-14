@@ -432,6 +432,21 @@ func (c *Client) SetFilterIndexFields(ctx context.Context, name string, fields [
 	return c.request(ctx, http.MethodPost, collPath(name, "/filter-index"), body, nil)
 }
 
+// SetVectorNames declares which named-vector fields a collection accepts on [Client.Upsert]
+// and [Client.Search], beyond the reserved "default" vector that [Record.Vector] always
+// writes to (nidus-85t). Upserting a name not declared here is refused, naming it, so a
+// typo cannot silently create a vector nothing ever searches; "search every name" then has
+// an authoritative list to answer from.
+func (c *Client) SetVectorNames(ctx context.Context, name string, names []string) error {
+	if names == nil {
+		names = []string{}
+	}
+	body := struct {
+		Names []string `json:"names"`
+	}{names}
+	return c.request(ctx, http.MethodPost, collPath(name, "/vector-names"), body, nil)
+}
+
 // ── Search ──────────────────────────────────────────────────────────────────
 
 // Search runs a vector nearest-neighbour query, best-first.
