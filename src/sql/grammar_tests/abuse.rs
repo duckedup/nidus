@@ -201,6 +201,9 @@ fn depth_exceeded_only_in_the_second_branch_reports_that_branchs_offset() {
 // ── size: chains, lists, vectors, and raw byte volume ───────────────────────────────
 
 #[test]
+#[cfg_attr(miri, ignore)] // runtime cost: a 500-term OR chain under the interpreter, not an
+// unsupported syscall — the lexer's per-byte loop is what is slow, and it is covered
+// by the small cases above
 fn or_chain_of_500_terms_parses_cleanly() {
     let terms: Vec<String> = (0..500).map(|i| format!("a = {i}")).collect();
     let sql = format!("{PREFIX}{}", terms.join(" OR "));
@@ -228,6 +231,9 @@ fn or_chain_of_500_terms_parses_cleanly() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // runtime cost: a 500-term AND chain under the interpreter, not an
+// unsupported syscall — the lexer's per-byte loop is what is slow, and it is covered
+// by the small cases above
 fn and_chain_of_500_terms_parses_cleanly() {
     let terms: Vec<String> = (0..500).map(|i| format!("a = {i}")).collect();
     let sql = format!("{PREFIX}{}", terms.join(" AND "));
@@ -255,6 +261,9 @@ fn and_chain_of_500_terms_parses_cleanly() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // runtime cost: a 1000-element IN list under the interpreter, not an
+// unsupported syscall — the lexer's per-byte loop is what is slow, and it is covered
+// by the small cases above
 fn in_list_with_1000_elements_parses_cleanly() {
     let vals: Vec<String> = (0..1000).map(|i| i.to_string()).collect();
     let sql = format!("{PREFIX}a IN ({})", vals.join(", "));
@@ -275,6 +284,9 @@ fn in_list_with_1000_elements_parses_cleanly() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // runtime cost: a 4096-component vector under the interpreter, not an
+// unsupported syscall — the lexer's per-byte loop is what is slow, and it is covered
+// by the small cases above
 fn knn_vector_with_4096_components_parses_cleanly() {
     let nums: Vec<String> = (0..4096).map(|i| format!("{i}.0")).collect();
     let sql = format!("SELECT * FROM docs ORDER BY knn([{}])", nums.join(", "));
@@ -288,6 +300,9 @@ fn knn_vector_with_4096_components_parses_cleanly() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // runtime cost: a 100KB input under the interpreter, not an
+// unsupported syscall — the lexer's per-byte loop is what is slow, and it is covered
+// by the small cases above
 fn hundred_kb_input_by_repetition_parses_cleanly() {
     let mut sql = PREFIX.to_string();
     let mut n = 0usize;
@@ -308,6 +323,9 @@ fn hundred_kb_input_by_repetition_parses_cleanly() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // runtime cost: a 10k-char identifier under the interpreter, not an
+// unsupported syscall — the lexer's per-byte loop is what is slow, and it is covered
+// by the small cases above
 fn single_identifier_10000_characters_long_parses_cleanly() {
     let field = "a".repeat(10_000);
     let sql = format!("{PREFIX}{field} = 1");
@@ -320,6 +338,9 @@ fn single_identifier_10000_characters_long_parses_cleanly() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // runtime cost: a 50k-char string literal under the interpreter, not an
+// unsupported syscall — the lexer's per-byte loop is what is slow, and it is covered
+// by the small cases above
 fn string_literal_50000_characters_long_round_trips() {
     let text = "x".repeat(50_000);
     let sql = format!("{PREFIX}a = '{text}'");
