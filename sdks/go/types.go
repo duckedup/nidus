@@ -39,6 +39,7 @@
 package nidus
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 )
@@ -705,6 +706,174 @@ type Group struct {
 	Value *Value `json:"value"`
 	Count uint64 `json:"count"`
 	Sums  Attrs  `json:"sums"`
+}
+
+// ── SQL (SPEC §7.12) ─────────────────────────────────────────────────────────
+//
+// A SELECT is compiled to the same typed SearchOpts/HybridOpts/ListOpts/AggregateOpts
+// values Search and its four siblings already run — see [Client.Query].
+
+// A QueryAnswer is one SQL statement's answer to [Client.Query] or [Client.QueryBatch].
+//
+// Exactly one of Hits and Aggregation is populated: which, is decided entirely by the
+// statement's own `ORDER BY` (or `GROUP BY`, with neither) — SPEC §7.12's dispatch
+// table, not anything this SDK chooses. Go has no sum type to enforce that split, so
+// this documents the invariant rather than encoding it. Plan rides along with Hits
+// only when the statement asked `WITH (plan)`.
+type QueryAnswer struct {
+	Hits        []Hit
+	Plan        *QueryPlan
+	Aggregation *Aggregation
+}
+
+// UnmarshalJSON reads one statement's answer in whichever of the three shapes
+// `POST /query` sends it in (src/server/dto.rs's QueryAnswerDto, untagged so a single
+// statement's answer is byte-identical to the equivalent typed endpoint's own body): a
+// bare hits array, a {"hits": …, "plan": …} envelope, or an aggregation object.
+func (a *QueryAnswer) UnmarshalJSON(b []byte) error {
+	if t := bytes.TrimSpace(b); len(t) > 0 && t[0] == '[' {
+		var hits []Hit
+		if err := json.Unmarshal(b, &hits); err != nil {
+			return fmt.Errorf("nidus: decoding a query answer's hits: %w", err)
+		}
+		a.Hits = hits
+		return nil
+	}
+	// Peek for "hits" vs "count" before committing to a shape: an aggregation's sums
+	// can hold arbitrary field names, so nothing here can be assumed absent by chance.
+	var probe struct {
+		Hits  json.RawMessage `json:"hits"`
+		Count json.RawMessage `json:"count"`
+	}
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return fmt.Errorf("nidus: decoding a query answer: %w", err)
+	}
+	switch {
+	case probe.Hits != nil:
+		var env struct {
+			Hits []Hit      `json:"hits"`
+			Plan *QueryPlan `json:"plan"`
+		}
+		if err := json.Unmarshal(b, &env); err != nil {
+			return fmt.Errorf("nidus: decoding a query answer's {hits,plan}: %w", err)
+		}
+		a.Hits, a.Plan = env.Hits, env.Plan
+		return nil
+	case probe.Count != nil:
+		var agg Aggregation
+		if err := json.Unmarshal(b, &agg); err != nil {
+			return fmt.Errorf("nidus: decoding a query answer's aggregation: %w", err)
+		}
+		a.Aggregation = &agg
+		return nil
+	default:
+		return fmt.Errorf(
+			"nidus: query answer is neither a hits array, a {hits,plan} envelope, nor an "+
+				"aggregation object: %s", b,
+		)
+	}
+}
+
+// decodeQueryAnswers turns a `POST /query` response into one [QueryAnswer] per
+// statement. The wire shape (src/server/dto.rs's render_query_answers) is
+// context-sensitive: a single statement's answer is rendered bare (one of
+// [QueryAnswer.UnmarshalJSON]'s three shapes), while a `;`-separated script's answers
+// are a JSON array of those same shapes, in order.
+//
+// The one thing that array form must be told apart from is a *bare* hits array for a
+// single Hits statement — also, on the wire, a JSON array. The tell: a Hits statement's
+// elements are Hit objects (an "id" and a "collection", never "hits" or "count"), while
+// a script's elements are themselves one of the three answer shapes.
+func decodeQueryAnswers(raw []byte) ([]QueryAnswer, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("nidus: /query returned an empty response")
+	}
+	if trimmed[0] != '[' {
+		var a QueryAnswer
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return nil, fmt.Errorf("nidus: decoding the /query response: %w", err)
+		}
+		return []QueryAnswer{a}, nil
+	}
+
+	var elems []json.RawMessage
+	if err := json.Unmarshal(raw, &elems); err != nil {
+		return nil, fmt.Errorf("nidus: decoding the /query response: %w", err)
+	}
+	if len(elems) == 0 || !looksLikeQueryAnswer(elems[0]) {
+		var hits []Hit
+		if err := json.Unmarshal(raw, &hits); err != nil {
+			return nil, fmt.Errorf("nidus: decoding the /query response: %w", err)
+		}
+		return []QueryAnswer{{Hits: hits}}, nil
+	}
+	out := make([]QueryAnswer, len(elems))
+	for i, e := range elems {
+		if err := json.Unmarshal(e, &out[i]); err != nil {
+			return nil, fmt.Errorf("nidus: decoding /query statement %d: %w", i, err)
+		}
+	}
+	return out, nil
+}
+
+// looksLikeQueryAnswer reports whether a top-level array element is itself a statement
+// answer (a nested hits array, or an object carrying "hits" or "count") rather than a
+// bare Hit — see [decodeQueryAnswers].
+func looksLikeQueryAnswer(e json.RawMessage) bool {
+	t := bytes.TrimSpace(e)
+	if len(t) == 0 {
+		return false
+	}
+	if t[0] == '[' {
+		return true
+	}
+	if t[0] != '{' {
+		return false
+	}
+	var probe struct {
+		Hits  json.RawMessage `json:"hits"`
+		Count json.RawMessage `json:"count"`
+	}
+	_ = json.Unmarshal(t, &probe)
+	return probe.Hits != nil || probe.Count != nil
+}
+
+// A Compiled is one `SELECT` statement compiled to its typed form (SPEC §7.12), from
+// [Client.Compile] — introspection only, never executed. Kind names which dispatch-table
+// entry it is: "search", "text_search", "hybrid", "list", or "aggregate". Vector, Query
+// and Text are present only for the kinds that carry them (src/server/dto.rs's
+// compiled_json); Opts is that kind's own SearchOpts/HybridOpts/ListOpts/AggregateOpts
+// shape, left as raw JSON since it differs by kind and this value is never sent back to
+// the server.
+type Compiled struct {
+	Kind        string          `json:"kind"`
+	Collections []string        `json:"collections"`
+	Vector      []float32       `json:"vector,omitempty"`
+	Query       json.RawMessage `json:"query,omitempty"`
+	Text        json.RawMessage `json:"text,omitempty"`
+	Opts        json.RawMessage `json:"opts"`
+}
+
+// decodeCompiled reads a compile-only `/query` response: a bare [Compiled] object for
+// one statement, a JSON array of them for a `;`-separated script
+// (src/server/dto.rs's render_compiled). Unlike [decodeQueryAnswers] this is
+// unambiguous — a Compiled is always a JSON object, so only the script form is ever an
+// array.
+func decodeCompiled(raw []byte) ([]Compiled, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var out []Compiled
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, fmt.Errorf("nidus: decoding the /query compile response: %w", err)
+		}
+		return out, nil
+	}
+	var one Compiled
+	if err := json.Unmarshal(raw, &one); err != nil {
+		return nil, fmt.Errorf("nidus: decoding the /query compile response: %w", err)
+	}
+	return []Compiled{one}, nil
 }
 
 // A BatchSearchRequest answers several vector queries in one round-trip, saving a network

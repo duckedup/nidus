@@ -644,6 +644,23 @@ class AsyncNidusClient:
             )
         )
 
+    async def query(self, sql: str) -> Any:
+        """Run one or more ``;``-separated SQL statements (SPEC §7.12) against ``POST
+        /query``. See :meth:`nidus.client.NidusClient.query` for the shape rule: a single
+        statement decodes like its equivalent typed method's answer, and a ``;``-separated
+        script decodes to a ``list`` of those answers, in order (§7.9).
+        """
+        return _wire.decode_query_response(
+            await self._request("POST", _wire.QUERY, _wire.query_body(sql))
+        )
+
+    async def compile(self, sql: str) -> Any:
+        """Compile ``sql`` without running it. See
+        :meth:`nidus.client.NidusClient.compile`: never issues the search/list/aggregate
+        request itself, only the compile step.
+        """
+        return await self._request("POST", _wire.QUERY, _wire.query_body(sql, compile_only=True))
+
     async def batch_search(
         self,
         queries: Sequence[Mapping[str, Any]],

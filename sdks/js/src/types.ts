@@ -804,3 +804,37 @@ export interface RecallOptions {
    */
   rankBy?: RankBy;
 }
+
+// ── SQL-shaped read syntax (`POST /query`, SPEC §7.12) ──────────────────────
+
+/**
+ * One statement's answer from {@link NidusClient.query}: a ranked/listed statement decodes
+ * to a bare {@link Hit} array, or to `{hits, plan}` when it asked `WITH (plan)`; a `GROUP BY`
+ * statement decodes to an {@link Aggregation}.
+ */
+export type QueryAnswer = Hit[] | { hits: Hit[]; plan: QueryPlan } | Aggregation;
+
+/**
+ * One compiled statement from {@link NidusClient.compile}: the typed value the SQL front end
+ * would hand the matching `Store` method (`search`/`text_search`/`hybrid_search`/`list`/
+ * `aggregate`), rendered for introspection only. `opts` (and, for `text_search`/`hybrid`,
+ * `query`/`text`) are the server's raw snake_case JSON — never executed, so never decoded
+ * into this SDK's own camelCase option shapes.
+ */
+export type Compiled =
+  | { kind: "search"; collections: string[]; vector: number[]; opts: Record<string, unknown> }
+  | {
+      kind: "text_search";
+      collections: string[];
+      query: unknown;
+      opts: Record<string, unknown>;
+    }
+  | {
+      kind: "hybrid";
+      collections: string[];
+      vector: number[];
+      text: unknown;
+      opts: Record<string, unknown>;
+    }
+  | { kind: "list"; collections: string[]; opts: Record<string, unknown> }
+  | { kind: "aggregate"; collections: string[]; opts: Record<string, unknown> };

@@ -7,8 +7,9 @@ optional shared memory tier (Redis, Valkey). Hand it natural language and nidus 
 the text for you (optionally summarizing first) with the provider of your choice, or
 bring your own vectors: exact-by-default nearest-neighbour search (cosine, dot, or
 Euclidean), approximate (HNSW/IVF) when you opt in, with typed metadata filters and
-many logical collections sharing one embedding space. No SQL, no query engine, no
-bundled C++ tree.
+many logical collections sharing one embedding space, queryable through a typed API or
+a SQL-shaped syntax that compiles to it. No SQL engine, no query planner, no bundled
+C++ tree.
 
 > _nidus_ (Latin, "nest"): a small place where things are kept safe.
 
@@ -61,7 +62,7 @@ fast dependency.
 
 ```toml
 [dependencies]
-nidus = "0.99"
+nidus = "0.100"
 ```
 
 ```rust

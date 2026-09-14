@@ -204,7 +204,9 @@ reading the source, not from a test suite.
   recall, by construction. Approximate indexing (HNSW/IVF) is opt-in via
   [`Config::ann`](/guides/search/#approximate-search-ann) when you want speed over
   exactness at larger scale.
-- **Not a database.** No SQL, no joins, no transactions across calls.
+- **Not a database.** SQL is accepted as read syntax only ([Query with SQL](/guides/query-with-sql/)),
+  compiled to the same search calls the typed API makes. There is no engine behind it: no
+  planner, no joins, no transactions across calls.
 - **Not async.** The hot path is CPU-bound; the library API is synchronous (see
   [Embedding in a host app](/guides/integrating/)).
 - **In-process by default.** You embed it and call methods directly; when you

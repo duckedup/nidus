@@ -1,12 +1,13 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { NidusClient, NidusError, f, v } from "../src/index.js";
+import { NidusClient, NidusError, decodeAttrs, decodeValue, f, v } from "../src/index.js";
+import type { Value } from "../src/index.js";
 
 // End-to-end against a real `nidus serve`. Mirrors the server's own
 // `full_lifecycle_over_http` test, but driven entirely through the SDK.
@@ -490,4 +491,184 @@ describe.skipIf(!codeFeatureAvailable)("codeSearch over a code-featured nidus se
     expect(symbol!.startLine).toBe(2);
     expect(symbol!.endLine).toBe(4);
   });
+});
+
+// ── SQL conformance corpus (nidus-yq9p.2) ───────────────────────────────────
+//
+// Replays `tests/corpus/queries.json` (shape and workflow: `tests/corpus/README.md`) over
+// this SDK's own `query()`, and asserts it returns identical ordered ids to the equivalent
+// typed `dsl` request run directly over HTTP. Read the file; never transcribe the cases.
+
+interface CorpusFixtureRecord {
+  id: string;
+  vector: number[];
+  attrs: Record<string, unknown>;
+}
+
+interface CorpusCase {
+  name: string;
+  section: string;
+  sql: string;
+  dsl: { endpoint: string; body: unknown } | null;
+  expect: {
+    ids?: string[];
+    aggregation?: {
+      count: number;
+      sums: Record<string, Value>;
+      groups?: { value: Value | null; count: number; sums: Record<string, Value> }[];
+    };
+    batch_ids?: string[][];
+  };
+  surfaces: string[];
+  note?: string;
+}
+
+interface Corpus {
+  fixture: {
+    dim: number;
+    fts: Record<string, string[]>;
+    collections: Record<string, CorpusFixtureRecord[]>;
+  };
+  cases: CorpusCase[];
+}
+
+const corpus: Corpus = JSON.parse(
+  readFileSync(join(repoRoot, "tests/corpus/queries.json"), "utf8"),
+);
+const jsCases = corpus.cases.filter((c) => c.surfaces.includes("js"));
+
+const CORPUS_PORT = 7797;
+const corpusBaseUrl = `http://127.0.0.1:${CORPUS_PORT}`;
+
+/** A ranked/listed answer's ordered ids, whichever of the two `/query` shapes it took. */
+function idsFrom(answer: unknown): string[] {
+  if (Array.isArray(answer)) return (answer as { id: string }[]).map((h) => h.id);
+  const withPlan = answer as { hits?: { id: string }[] };
+  if (withPlan.hits) return withPlan.hits.map((h) => h.id);
+  throw new Error(`not a hits answer: ${JSON.stringify(answer)}`);
+}
+
+/** Normalize a raw (still tagged-`Value`) `/aggregate` response for comparison, dropping
+ * `groups_truncated` per the corpus README (every case here keeps it `false`). */
+function normalizeAggregation(raw: {
+  count: number;
+  sums: Record<string, Value>;
+  groups?: { value: Value | null; count: number; sums: Record<string, Value> }[];
+}) {
+  return {
+    count: raw.count,
+    sums: decodeAttrs(raw.sums) as Record<string, number>,
+    groups: (raw.groups ?? []).map((g) => ({
+      value: g.value === null ? null : decodeValue(g.value),
+      count: g.count,
+      sums: decodeAttrs(g.sums) as Record<string, number>,
+    })),
+  };
+}
+
+describe.skipIf(!binaryExists || jsCases.length === 0)("SQL conformance corpus", () => {
+  let server: ChildProcess;
+  let dir: string;
+  const db = new NidusClient({ baseUrl: corpusBaseUrl, timeoutMs: 5000 });
+
+  beforeAll(async () => {
+    dir = mkdtempSync(join(tmpdir(), "nidus-sdk-sql-"));
+    server = spawn(
+      binary,
+      [
+        "serve",
+        "--dir",
+        dir,
+        "--dim",
+        String(corpus.fixture.dim),
+        "--addr",
+        `127.0.0.1:${CORPUS_PORT}`,
+      ],
+      { stdio: "ignore" },
+    );
+    const deadline = Date.now() + 5000;
+    let last = "";
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetch(`${corpusBaseUrl}/ready`);
+        if (res.status === 200) break;
+        last = `/ready answered ${res.status}`;
+      } catch (e) {
+        last = String(e);
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (Date.now() >= deadline) throw new Error(`nidus serve did not become ready in time (${last})`);
+
+    // Seed every fixture collection over raw HTTP, attrs passed through as the corpus's own
+    // tagged wire form — the one write path the whole corpus uses (mirrors `tests/e2e/corpus.rs`).
+    for (const [name, records] of Object.entries(corpus.fixture.collections)) {
+      await fetch(`${corpusBaseUrl}/collections/${name}`, { method: "POST", body: "{}" });
+      const fields = corpus.fixture.fts[name];
+      if (fields) {
+        await fetch(`${corpusBaseUrl}/collections/${name}/fts-schema`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ fields }),
+        });
+      }
+      const res = await fetch(`${corpusBaseUrl}/collections/${name}/upsert`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ records }),
+      });
+      if (!res.ok) {
+        throw new Error(`seeding ${name} failed: ${await res.text()}`);
+      }
+    }
+  });
+
+  afterAll(async () => {
+    if (server) await stopServer(server);
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  for (const c of jsCases) {
+    it(`${c.section} ${c.name}`, async () => {
+      if (c.expect.batch_ids) {
+        // §7.9 multi-query batching: no typed endpoint runs a script, so this is checked
+        // directly against `expect.batch_ids` rather than a `dsl` twin.
+        const answers = (await db.query(c.sql)) as unknown[];
+        expect(answers.map((a) => idsFrom(a))).toEqual(c.expect.batch_ids);
+        return;
+      }
+
+      const sqlAnswer = await db.query(c.sql);
+      if (!c.dsl) throw new Error(`case ${c.name} has no dsl and is not a batch case`);
+      const dslRes = await fetch(`${corpusBaseUrl}${c.dsl.endpoint}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(c.dsl.body),
+      });
+      const dslBody = await dslRes.json();
+      if (!dslRes.ok) {
+        throw new Error(`dsl twin for ${c.name} failed: ${JSON.stringify(dslBody)}`);
+      }
+
+      if (c.expect.aggregation) {
+        const sqlAgg = sqlAnswer as {
+          count: number;
+          sums: Record<string, number>;
+          groups?: unknown[];
+        };
+        expect({ ...sqlAgg, groups: sqlAgg.groups ?? [] }).toEqual(
+          normalizeAggregation(dslBody),
+        );
+        expect({ ...sqlAgg, groups: sqlAgg.groups ?? [] }).toEqual(
+          normalizeAggregation(c.expect.aggregation!),
+        );
+        return;
+      }
+
+      const sqlIds = idsFrom(sqlAnswer);
+      const dslIds = idsFrom(dslBody);
+      expect(sqlIds).toEqual(dslIds);
+      if (c.expect.ids) expect(sqlIds).toEqual(c.expect.ids);
+    });
+  }
 });

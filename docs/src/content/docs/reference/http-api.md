@@ -42,6 +42,7 @@ so the same id appears in your logs and the server's.
 | `POST /code-search`*** | search a chunked code/docs corpus, grouped by file and symbol | `search` / `text_search` |
 | `POST /list` | metadata-only query (no vector) | `list` |
 | `POST /aggregate` | count + sum over a filter, no records materialized | `aggregate` |
+| `POST /query` | SQL-shaped read syntax, compiled to the same routes above | `query` / `query_batch` / `compile` |
 | `POST /flush` | flush buffered writes to disk | `flush` |
 | `POST /compact` | reclaim dead rows and superseded log records | `compact` |
 | `POST /refresh` | adopt another instance's newer committed state | `refresh` |
@@ -1071,6 +1072,31 @@ the same as records holding a `Null`. `groups` is omitted entirely when no `grou
 asked for, so an existing client sees the response it always saw. If the distinct values
 exceed the server's cap (10 000), later ones are dropped and `groups_truncated` is `true`.
 
+### `POST /query`
+
+SQL-shaped read syntax (see the [SQL guide](/guides/query-with-sql/)): a `SELECT` compiled
+to the same typed request the five routes above already run, then run through it. A single
+statement's response is byte-identical to the equivalent typed route's; a `;`-separated
+script answers as a JSON array, in request order.
+
+```bash
+curl -s localhost:7700/query \
+  -H 'content-type: application/json' \
+  -d "{\"sql\": \"SELECT * FROM notes WHERE lang LIKE 'r*' ORDER BY knn([1,0,0,0]) LIMIT 3\"}"
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `sql` | – (required) | one or more `;`-separated `SELECT` statements |
+| `compile_only` | `false` | compile without running; the response is the compiled form (`kind`, `collections`, and the resolved options), never hits |
+
+A parse or compile failure names a byte offset, what went wrong, and the `SPEC.md` §7
+section that owns the rule, and is a `400`:
+
+```json
+{"error": "sql parse error at byte 17: expected a value after '=' (§7.3 boolean composition)"}
+```
+
 ### The `filter` grammar
 
 Every route that takes a `filter` (`/search`, `/text-search`, `/hybrid-search`, `/list`,
@@ -1299,7 +1325,7 @@ mistake from a server fault:
 
 | Status | When |
 | --- | --- |
-| `400 Bad Request` | malformed JSON; a query/vector whose length ≠ store dimension; or any vector query against a dimension-0 store, which holds no vectors ([keyword-only ingest](/reference/cli/#keyword-only-ingest-with-no-embedding-provider)) |
+| `400 Bad Request` | malformed JSON; a query/vector whose length ≠ store dimension; any vector query against a dimension-0 store, which holds no vectors ([keyword-only ingest](/reference/cli/#keyword-only-ingest-with-no-embedding-provider)); or a [`POST /query`](#post-query) SQL parse/compile error |
 | `401 Unauthorized` | missing or wrong bearer token (when a token is configured) |
 | `403 Forbidden` | a write against a `--read-only` server |
 | `409 Conflict` | the store's writer lock is held by another process |

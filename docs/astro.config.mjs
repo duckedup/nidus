@@ -78,6 +78,7 @@ export default defineConfig({
             { label: "Full-text search (BM25)", link: "/guides/full-text-search/" },
             { label: "Hybrid search (RRF)", link: "/guides/hybrid-search/" },
             { label: "Filters & metadata", link: "/guides/filters/" },
+            { label: "Query with SQL", link: "/guides/query-with-sql/" },
             { label: "Reranking", link: "/guides/rerank/" },
             { label: "Remember & recall", link: "/guides/remember-and-recall/" },
           ],

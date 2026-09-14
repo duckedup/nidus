@@ -28,13 +28,16 @@ package nidus
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -117,9 +120,16 @@ type child struct {
 // whichever test happened to run first.
 func spawn(t *testing.T, dir string, extra ...string) *child {
 	t.Helper()
+	return spawnDim(t, dir, 3, extra...)
+}
+
+// spawnDim is [spawn] with an explicit dimension, for a fixture that is not
+// 3-dimensional — the corpus replay's `tests/corpus/queries.json` is dim 4.
+func spawnDim(t *testing.T, dir string, dim int, extra ...string) *child {
+	t.Helper()
 	bin := binaryPath(t)
 	args := append([]string{
-		"serve", "--dir", dir, "--dim", "3", "--addr", "127.0.0.1:0",
+		"serve", "--dir", dir, "--dim", strconv.Itoa(dim), "--addr", "127.0.0.1:0",
 	}, extra...)
 
 	c := &child{cmd: exec.Command(bin, args...), log: &logBuffer{}, done: make(chan struct{})}
@@ -242,6 +252,12 @@ func (c *child) client(t *testing.T, opts ...Option) *Client {
 func startServer(t *testing.T) *Client {
 	t.Helper()
 	return spawn(t, t.TempDir()).client(t)
+}
+
+// startServerDim is [startServer] with an explicit dimension.
+func startServerDim(t *testing.T, dim int) *Client {
+	t.Helper()
+	return spawnDim(t, t.TempDir(), dim).client(t)
 }
 
 // ── The lifecycle ───────────────────────────────────────────────────────────
@@ -1523,6 +1539,187 @@ func TestWriterLockIsExclusive(t *testing.T) {
 	if !nerr.IsLocked() && !nerr.IsUnavailable() {
 		t.Errorf("status = %d (%s), want 409 (lock held) or 503 (store not open)%s",
 			nerr.Status, nerr.Message, second.transcript())
+	}
+}
+
+// ── The conformance corpus (nidus-yq9p.2 / .6) ───────────────────────────────
+//
+// tests/corpus/queries.json is the one shared source of query cases (tests/corpus/
+// README.md): the Rust e2e binary and all three SDK integration suites read the same
+// file, so a case added once runs everywhere. This suite replays every case whose
+// `surfaces` list contains "go", and for each one asserts the SQL spelling — and its
+// typed `dsl` twin, when the case has one — return identical ordered ids (or an
+// identical aggregation). That equality is the whole claim behind nidus-yq9p.6: SQL is
+// a front end over the same typed opts, not a second engine.
+//
+// The dsl twin is replayed through db.request directly rather than through this SDK's
+// own Search/List/TextSearch/HybridSearch/Aggregate builders: the corpus's dsl.body is
+// already valid wire JSON (the same tagged-predicate shape Filter's MarshalJSON writes
+// but has no matching UnmarshalJSON for), so sending it verbatim is both simpler and a
+// more direct proof that this SDK's transport, not a second hand-built request, agrees
+// with the SQL spelling.
+
+// corpusFile is tests/corpus/queries.json's top level — see tests/corpus/README.md.
+type corpusFile struct {
+	Fixture corpusFixture `json:"fixture"`
+	Cases   []corpusCase  `json:"cases"`
+}
+
+type corpusFixture struct {
+	Dim         int                       `json:"dim"`
+	FTS         map[string][]string       `json:"fts"`
+	Collections map[string][]corpusRecord `json:"collections"`
+}
+
+// A corpusRecord's Attrs decodes straight into this SDK's own [Attrs]: the fixture's
+// tagged wire values ({"Str": …}, {"Int": …}, …) are exactly [Value]'s own shape.
+type corpusRecord struct {
+	ID     string    `json:"id"`
+	Vector []float32 `json:"vector"`
+	Attrs  Attrs     `json:"attrs"`
+}
+
+type corpusDsl struct {
+	Endpoint string          `json:"endpoint"`
+	Body     json.RawMessage `json:"body"`
+}
+
+// corpusExpect is one of three shapes (see tests/corpus/README.md): IDs for a
+// Hits-dispatch case, Aggregation for a GROUP BY case, or BatchIDs for the one
+// `;`-batching case, which has no `dsl` twin.
+type corpusExpect struct {
+	IDs         []string        `json:"ids"`
+	Aggregation json.RawMessage `json:"aggregation"`
+	BatchIDs    [][]string      `json:"batch_ids"`
+}
+
+type corpusCase struct {
+	Name     string       `json:"name"`
+	Section  string       `json:"section"`
+	SQL      string       `json:"sql"`
+	Dsl      *corpusDsl   `json:"dsl"`
+	Expect   corpusExpect `json:"expect"`
+	Surfaces []string     `json:"surfaces"`
+}
+
+// loadCorpus reads the one shared conformance corpus from the repo root — sdks/go is
+// two levels down from it.
+func loadCorpus(t *testing.T) corpusFile {
+	t.Helper()
+	path := filepath.Join("..", "..", "tests", "corpus", "queries.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	var out corpusFile
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("parsing %s: %v", path, err)
+	}
+	return out
+}
+
+// seedCorpus writes the fixture through this SDK's own CreateCollection/SetFtsSchema/
+// Upsert — the one seed path every case in this suite reads back.
+func seedCorpus(t *testing.T, db *Client, fx corpusFixture) {
+	t.Helper()
+	ctx := context.Background()
+	for name, records := range fx.Collections {
+		if err := db.CreateCollection(ctx, name); err != nil {
+			t.Fatalf("CreateCollection(%q): %v", name, err)
+		}
+		if fields, ok := fx.FTS[name]; ok {
+			if err := db.SetFtsSchema(ctx, name, fields); err != nil {
+				t.Fatalf("SetFtsSchema(%q): %v", name, err)
+			}
+		}
+		recs := make([]Record, len(records))
+		for i, r := range records {
+			recs[i] = Record{ID: r.ID, Vector: r.Vector, Attrs: r.Attrs}
+		}
+		if _, err := db.Upsert(ctx, name, recs); err != nil {
+			t.Fatalf("seeding %q: %v", name, err)
+		}
+	}
+}
+
+// runDsl replays a case's typed twin over the wire, decoded through [QueryAnswer]:
+// a dsl response is shaped identically to a single /query statement's answer (a bare
+// hits array, a {hits,plan} envelope, or an aggregation object), so the same decoder
+// applies to both.
+func runDsl(t *testing.T, db *Client, dsl *corpusDsl) QueryAnswer {
+	t.Helper()
+	var out QueryAnswer
+	if err := db.request(context.Background(), http.MethodPost, dsl.Endpoint, dsl.Body, &out); err != nil {
+		t.Fatalf("dsl %s failed: %v", dsl.Endpoint, err)
+	}
+	return out
+}
+
+// TestCorpusConformance replays every case in tests/corpus/queries.json whose
+// `surfaces` list contains "go". See tests/corpus/README.md for the file's shape and
+// the workflow for adding a case.
+func TestCorpusConformance(t *testing.T) {
+	corpus := loadCorpus(t)
+	db := startServerDim(t, corpus.Fixture.Dim)
+	seedCorpus(t, db, corpus.Fixture)
+	ctx := context.Background()
+
+	for _, tc := range corpus.Cases {
+		if !slices.Contains(tc.Surfaces, "go") {
+			continue
+		}
+		t.Run(tc.Name, func(t *testing.T) {
+			sqlAnswers, err := db.QueryBatch(ctx, tc.SQL)
+			if err != nil {
+				t.Fatalf("QueryBatch(%q): %v", tc.SQL, err)
+			}
+
+			if tc.Expect.BatchIDs != nil {
+				if len(sqlAnswers) != len(tc.Expect.BatchIDs) {
+					t.Fatalf("got %d statement answers, want %d", len(sqlAnswers), len(tc.Expect.BatchIDs))
+				}
+				for i, want := range tc.Expect.BatchIDs {
+					if got := ids(sqlAnswers[i].Hits); !slices.Equal(got, want) {
+						t.Errorf("statement %d ids = %v, want %v", i, got, want)
+					}
+				}
+				return
+			}
+
+			if len(sqlAnswers) != 1 {
+				t.Fatalf("got %d statement answers for a single-statement case, want 1", len(sqlAnswers))
+			}
+
+			if tc.Expect.Aggregation != nil {
+				var want Aggregation
+				if err := json.Unmarshal(tc.Expect.Aggregation, &want); err != nil {
+					t.Fatalf("parsing expect.aggregation: %v", err)
+				}
+				if sqlAnswers[0].Aggregation == nil {
+					t.Fatalf("sql answer for %q carries no aggregation", tc.SQL)
+				}
+				if !reflect.DeepEqual(*sqlAnswers[0].Aggregation, want) {
+					t.Errorf("sql aggregation = %+v, want %+v", *sqlAnswers[0].Aggregation, want)
+				}
+				if tc.Dsl != nil {
+					got := runDsl(t, db, tc.Dsl)
+					if got.Aggregation == nil || !reflect.DeepEqual(*got.Aggregation, want) {
+						t.Errorf("dsl aggregation = %+v, want %+v", got.Aggregation, want)
+					}
+				}
+				return
+			}
+
+			if got := ids(sqlAnswers[0].Hits); !slices.Equal(got, tc.Expect.IDs) {
+				t.Errorf("sql ids = %v, want %v", got, tc.Expect.IDs)
+			}
+			if tc.Dsl != nil {
+				got := runDsl(t, db, tc.Dsl)
+				if dgot := ids(got.Hits); !slices.Equal(dgot, tc.Expect.IDs) {
+					t.Errorf("dsl ids = %v, want %v", dgot, tc.Expect.IDs)
+				}
+			}
+		})
 	}
 }
 

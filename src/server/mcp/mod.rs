@@ -125,6 +125,9 @@ fn tools() -> Vec<Tool> {
     // The alias lifecycle tools: appended last for the same reason, so a future edit to
     // `admin::tools()` never shifts them or anything that predates them.
     v.extend(admin::alias_tools());
+    // SQL-shaped read syntax (nidus-yq9p.2/.3/.6): appended after everything that predates
+    // it, before the feature-gated tail, for the same SEP-2549 ordering reason.
+    v.push(search::query_tool());
     // `code_search` (nidus-3gm unit 5): present only with the `code` feature, so it must
     // append last too — nothing may ever be inserted after a feature-gated tail (SEP-2549).
     #[cfg(feature = "code")]
@@ -186,7 +189,10 @@ impl ServerHandler for NidusMcp {
                  it. Use `get` to check a specific id, and `forget` to correct or remove a \
                  memory that turned out wrong. Use `related` to find entries like one you \
                  already have, by id rather than a new query. Pass natural language \
-                 throughout — never vectors. Memories are also addressable as `nidus://` \
+                 throughout — never vectors. `query` runs a SQL-shaped SELECT for filters, \
+                 keyword ranking, aggregation, and options the other tools do not expose; it \
+                 has no vector argument either, so reach for `recall`/`hybrid_search` when the \
+                 ranking itself is by meaning. Memories are also addressable as `nidus://` \
                  resources, and `recall_then_answer` is a prompt that runs the recall for you.",
         )
     }
@@ -220,6 +226,7 @@ impl ServerHandler for NidusMcp {
             "browse" => self.browse(&args).await,
             "related" => self.related(&args).await,
             "suggest" => self.suggest(&args).await,
+            "query" => self.query(&args).await,
             "list_aliases" => self.list_aliases().await,
             "set_alias" => self.set_alias(&args).await,
             "drop_alias" => self.drop_alias(&args).await,

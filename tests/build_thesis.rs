@@ -137,6 +137,61 @@ fn ingest_lane_enables_the_async_edge() {
     );
 }
 
+// ── SQL front end (nidus-yq9p.2/.3/.6): the lean tree gains no parser crate ─────────────
+// `src/sql/` is hand-rolled and dependency-free by design (root
+// `BLUEPRINT-nidus-yq9p-2-3-6.md`); this is nidus-yq9p.6's real failing-mode criterion.
+
+/// No parser crate among nidus's *direct* lean dependencies, and no `sqlparser` at any
+/// depth. Depth 1 because deeper names are someone else's (`redis` has pulled `combine`
+/// since long before `src/sql/` existed).
+#[cfg_attr(miri, ignore)] // spawns `cargo tree` — a syscall Miri does not implement
+#[test]
+fn lean_tree_gains_no_parser_crate() {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let tree = |depth: &str| {
+        let out = std::process::Command::new(&cargo)
+            .args([
+                "tree",
+                "-p",
+                "nidus",
+                "--no-default-features",
+                "--depth",
+                depth,
+            ])
+            .output()
+            .expect("run `cargo tree`");
+        assert!(
+            out.status.success(),
+            "cargo tree failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_lowercase()
+    };
+
+    let direct = tree("1");
+    for forbidden in [
+        "sqlparser",
+        "nom ",
+        "nom-",
+        "pest",
+        "combine",
+        "chumsky",
+        "lalrpop",
+        "winnow",
+        "peg ",
+    ] {
+        assert!(
+            !direct.contains(forbidden),
+            "nidus took a direct dependency on a parser crate (`{forbidden}`); `src/sql/` is \
+             hand-rolled and dependency-free by design (D0017):\n{direct}"
+        );
+    }
+    assert!(
+        !tree("16").contains("sqlparser"),
+        "`sqlparser` reached the lean tree; the SQL front end is hand-rolled (D0017)"
+    );
+}
+
 /// `src/chunk` is deliberately ungated (no Cargo feature), so it must compile and split
 /// text with zero features enabled. A `#[cfg(feature = "…")]` added above `pub mod chunk`
 /// would fail this test to compile on the pure lane, catching the regression this guards.

@@ -34,17 +34,23 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from nidus import NidusClient, NidusError, f, rank, v
+from nidus import Aggregation, NidusClient, NidusError, _wire, f, rank, v
 
 # tests → python → sdks → repo root.
 REPO_ROOT = Path(__file__).resolve().parents[3]
 BINARY = Path(os.environ.get("NIDUS_BIN") or REPO_ROOT / "target" / "release" / "nidus")
+
+#: nidus-yq9p.2's shared conformance corpus, read once at collection time — a repo file
+#: every surface's suite reads, never copied in, so a new case reaches this suite for free.
+CORPUS: dict[str, Any] = json.loads((REPO_ROOT / "tests" / "corpus" / "queries.json").read_text())
+CORPUS_CASES: list[dict[str, Any]] = [c for c in CORPUS["cases"] if "python" in c["surfaces"]]
 
 # Generous: a debug-built binary on a loaded machine is slow to bind, and a flaky skip-or-fail
 # boundary is worse than a slow one. Nothing here is a timing assertion.
@@ -790,3 +796,168 @@ async def test_the_async_client_drives_the_same_server(server: str) -> None:
         assert (await db.ready()).ready is True
         assert (await db.cluster()).role
         assert isinstance(await db.refresh(), bool)
+
+
+# ── The shared conformance corpus (nidus-yq9p.2) ────────────────────────────────────────
+#
+# `tests/corpus/queries.json` is replayed here rather than transcribed: a case added there
+# reaches this suite with no edit here, which is the property `.2` exists to guarantee (see
+# `tests/corpus/README.md`). Every case is a read against a fixed fixture, so one real
+# server seeded once serves the whole module rather than one per case.
+
+
+def _seed_corpus(db: NidusClient, fixture: Mapping[str, Any]) -> None:
+    """Load the corpus fixture's collections into ``db``.
+
+    ``attrs`` in the fixture are already the wire's tagged ``Value`` form (``{"Str": …}``)
+    — the same shape every other surface's fixture loader uses — and ``encode_value``
+    passes an already-tagged value through unchanged, so no re-encoding is needed here.
+    """
+    for name, records in fixture["collections"].items():
+        db.create_collection(name)
+        fts_fields = fixture.get("fts", {}).get(name)
+        if fts_fields:
+            db.set_fts_schema(name, fts_fields)
+        db.upsert(
+            name,
+            [{"id": r["id"], "vector": r["vector"], "attrs": r["attrs"]} for r in records],
+        )
+
+
+@pytest.fixture(scope="module")
+def corpus_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+    """One real ``nidus serve``, seeded with the corpus fixture, shared by every case."""
+    tmp_path = tmp_path_factory.mktemp("corpus")
+    log = tmp_path / "server.log"
+    store = tmp_path / "store"
+    with log.open("wb") as sink:
+        child = subprocess.Popen(
+            [
+                str(BINARY),
+                "serve",
+                "--dir",
+                str(store),
+                "--dim",
+                str(CORPUS["fixture"]["dim"]),
+                "--addr",
+                "127.0.0.1:0",
+            ],
+            stdout=sink,
+            stderr=sink,
+        )
+    try:
+        base_url = _await_base_url(child, log)
+        deadline = time.monotonic() + STARTUP_TIMEOUT
+        while not _ready(base_url):
+            if time.monotonic() > deadline:
+                pytest.fail(f"nidus serve never became ready\n{_transcript(log)}")
+            time.sleep(0.05)
+        with NidusClient(base_url, timeout=10.0) as db:
+            _seed_corpus(db, CORPUS["fixture"])
+        yield base_url
+    finally:
+        child.terminate()
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:  # pragma: no cover - only if shutdown hangs
+            child.kill()
+            child.wait()
+
+
+def _ids_of(answer: Any) -> list[str]:
+    """Ordered ids from one statement's :meth:`~nidus.NidusClient.query` answer.
+
+    A ``WITH (plan)``/``WITH (annotations)`` statement decodes to a ``(hits, plan)`` pair
+    like :meth:`~nidus.NidusClient.search_with_plan`'s; every other hits-dispatch statement
+    decodes to the bare hits list, exactly like the equivalent typed method's answer.
+    """
+    hits = answer[0] if isinstance(answer, tuple) else answer
+    return [h.id for h in hits]
+
+
+def _dsl_ids(db: NidusClient, dsl: Mapping[str, Any]) -> list[str]:
+    """Run a corpus case's typed ``dsl`` twin through the SDK's own public methods — the
+    same entry point ``db.query(case["sql"])`` compiles down to (SPEC §7.12's dispatch
+    table) — and return its ordered ids.
+    """
+    endpoint, body = dsl["endpoint"], dsl["body"]
+    if endpoint == "/search":
+        if body.get("plan"):
+            hits, _plan = db.search_with_plan(
+                query=body["query"],
+                scope=body.get("scope"),
+                top_k=body.get("top_k"),
+                filter=body.get("filter"),
+            )
+        else:
+            hits = db.search(
+                query=body["query"],
+                scope=body.get("scope"),
+                top_k=body.get("top_k"),
+                filter=body.get("filter"),
+            )
+    elif endpoint == "/list":
+        hits = db.list(
+            scope=body.get("scope"),
+            filter=body.get("filter"),
+            order_by=body.get("order_by"),
+        )
+    elif endpoint == "/text-search":
+        hits = db.text_search(
+            field=body.get("field"),
+            query=body.get("query"),
+            scope=body.get("scope"),
+            top_k=body.get("top_k"),
+            filter=body.get("filter"),
+            limit_per=body.get("limit_per"),
+            explain=body.get("explain"),
+            expand=body.get("expand"),
+        )
+    elif endpoint == "/hybrid-search":
+        hits = db.hybrid_search(
+            vector=body["vector"],
+            field=body.get("field"),
+            text=body.get("text"),
+            scope=body.get("scope"),
+            top_k=body.get("top_k"),
+        )
+    else:  # pragma: no cover - every corpus dsl endpoint today is one of the above
+        raise AssertionError(f"corpus dsl endpoint not handled by this replay: {endpoint}")
+    return [h.id for h in hits]
+
+
+def _dsl_aggregation(db: NidusClient, dsl: Mapping[str, Any]) -> Aggregation:
+    """Run a corpus case's ``/aggregate`` ``dsl`` twin through :meth:`~nidus.NidusClient.aggregate`,
+    the same way :func:`_dsl_ids` runs the hits-dispatch endpoints' twins.
+    """
+    body = dsl["body"]
+    return db.aggregate(
+        scope=body.get("scope"),
+        filter=body.get("filter"),
+        sum=body.get("sum"),
+        group_by=body.get("group_by"),
+    )
+
+
+@pytest.mark.parametrize("case", CORPUS_CASES, ids=[c["name"] for c in CORPUS_CASES])
+def test_corpus_case_against_a_real_server(case: dict[str, Any], corpus_server: str) -> None:
+    """Replay one ``tests/corpus/queries.json`` case (nidus-yq9p.2 / .6): the SQL spelling
+    through :meth:`~nidus.NidusClient.query`, checked against the case's ``expect``, and
+    — where the case carries a typed ``dsl`` twin — checked again against that same typed
+    SDK method, so a divergence names this surface and this case rather than failing as a
+    bare assert.
+    """
+    with NidusClient(corpus_server, timeout=10.0) as db:
+        answer = db.query(case["sql"])
+        if "batch_ids" in case["expect"]:
+            assert [_ids_of(stmt) for stmt in answer] == case["expect"]["batch_ids"]
+            return
+        if "aggregation" in case["expect"]:
+            assert answer == _wire.decode_aggregation(case["expect"]["aggregation"])
+        else:
+            assert _ids_of(answer) == case["expect"]["ids"]
+        if case["dsl"] is not None:
+            if case["dsl"]["endpoint"] == "/aggregate":
+                assert answer == _dsl_aggregation(db, case["dsl"])
+            else:
+                assert _ids_of(answer) == _dsl_ids(db, case["dsl"])

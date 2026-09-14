@@ -17,6 +17,7 @@ package nidus
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -562,6 +563,68 @@ func (c *Client) Aggregate(ctx context.Context, req AggregateRequest) (*Aggregat
 		return nil, err
 	}
 	return &out, nil
+}
+
+// ── SQL (SPEC §7.12) ────────────────────────────────────────────────────────
+//
+// SQL is a front end over the same typed opts Search and its four siblings already
+// run — no second engine, no planner. One `POST /query` for all of it; see
+// src/server/dto.rs and SPEC.md §7.12 for the compiler and the wire shapes.
+
+// Query runs a single `SELECT` statement (SPEC §7.12) and returns its answer.
+//
+// It errors if sql holds more than one `;`-separated statement — use
+// [Client.QueryBatch] for a script. Which of [QueryAnswer]'s fields comes back
+// populated is decided by the statement's `ORDER BY` (or `GROUP BY`, with neither):
+// `knn`/`match`/a bare field land in Hits, `GROUP BY` lands in Aggregation, and Plan
+// rides along with Hits only when the statement asked `WITH (plan)`. Go has no sum
+// type to enforce that split; [QueryAnswer] documents the invariant instead.
+func (c *Client) Query(ctx context.Context, sql string) (*QueryAnswer, error) {
+	answers, err := c.query(ctx, sql)
+	if err != nil {
+		return nil, err
+	}
+	if len(answers) != 1 {
+		return nil, fmt.Errorf(
+			"nidus: Query got %d statements from a `;`-separated script; use QueryBatch",
+			len(answers),
+		)
+	}
+	return &answers[0], nil
+}
+
+// QueryBatch runs a `;`-separated script of one or more `SELECT` statements (SPEC
+// §7.9) and returns one [QueryAnswer] per statement, in the script's own order.
+func (c *Client) QueryBatch(ctx context.Context, sql string) ([]QueryAnswer, error) {
+	return c.query(ctx, sql)
+}
+
+// Compile compiles sql to the typed SearchOpts/HybridOpts/ListOpts/AggregateOpts
+// value each statement resolves to (SPEC §7.12) — introspection only: nothing runs,
+// and no request beyond this one call reaches the store. One [Compiled] per
+// `;`-separated statement, in order.
+func (c *Client) Compile(ctx context.Context, sql string) ([]Compiled, error) {
+	var raw json.RawMessage
+	body := struct {
+		SQL         string `json:"sql"`
+		CompileOnly bool   `json:"compile_only"`
+	}{sql, true}
+	if err := c.request(ctx, http.MethodPost, "/query", body, &raw); err != nil {
+		return nil, err
+	}
+	return decodeCompiled(raw)
+}
+
+// query is the shared POST /query call behind Query and QueryBatch.
+func (c *Client) query(ctx context.Context, sql string) ([]QueryAnswer, error) {
+	var raw json.RawMessage
+	body := struct {
+		SQL string `json:"sql"`
+	}{sql}
+	if err := c.request(ctx, http.MethodPost, "/query", body, &raw); err != nil {
+		return nil, err
+	}
+	return decodeQueryAnswers(raw)
 }
 
 // ── Memory (text in, text out) ──────────────────────────────────────────────

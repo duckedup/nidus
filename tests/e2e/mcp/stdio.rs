@@ -89,6 +89,7 @@ fn tools_list_matches_http_order() {
         "list_aliases",
         "set_alias",
         "drop_alias",
+        "query",
     ];
     if cfg!(feature = "code") {
         expected.push("code_search");

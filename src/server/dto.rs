@@ -3,11 +3,13 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value as JsonValue, json};
 
 use crate::{
-    Aggregation, AnnConfig, AnnKind, Annotations, Expand, Filter, FilterIndexField, Footprint,
-    FtsClause, FtsCombine, FtsField, HighlightOpts, Hit, Language, LimitPer, ListOpts, OrderBy,
-    Projection, QueryPlan, RankBy, Record, StoreVersions, Suggestion, Suggestions, Value,
+    Aggregation, AnnConfig, AnnKind, Annotations, Compiled, Expand, Filter, FilterIndexField,
+    Footprint, FtsClause, FtsCombine, FtsField, HighlightOpts, Hit, HybridOpts, Language, LimitPer,
+    ListOpts, OrderBy, Projection, QueryAnswer, QueryPlan, RankBy, Record, RerankOpts, SearchOpts,
+    StoreVersions, Suggestion, Suggestions, Value,
 };
 
 /// Body of `POST /collections/{name}/upsert`.
@@ -648,6 +650,189 @@ impl From<Aggregation> for AggregationDto {
             groups_truncated: a.groups_truncated,
         }
     }
+}
+
+// ── `POST /query` (SPEC §7.12): SQL-shaped read syntax ──────────────────────
+
+/// Body of `POST /query`: one or more `;`-separated `SELECT` statements (§7.9), compiled to
+/// the same typed opts `/search` and its four siblings already run. `compile_only` renders
+/// the compiled form and runs nothing.
+#[derive(Debug, Deserialize)]
+pub struct QueryRequest {
+    pub sql: String,
+    #[serde(default)]
+    pub compile_only: bool,
+}
+
+/// One statement's answer on the wire: a `Hits` answer shaped exactly like `/search`'s body,
+/// an `Aggregation` shaped exactly like `/aggregate`'s. Untagged so a single-statement
+/// `/query` is byte-identical to the equivalent typed request's response.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum QueryAnswerDto {
+    Hits(SearchResponse),
+    Aggregation(AggregationDto),
+}
+
+impl From<QueryAnswer> for QueryAnswerDto {
+    fn from(a: QueryAnswer) -> Self {
+        match a {
+            QueryAnswer::Hits { hits, plan } => Self::Hits(SearchResponse::new(hits, plan)),
+            QueryAnswer::Aggregation(agg) => Self::Aggregation(AggregationDto::from(agg)),
+        }
+    }
+}
+
+/// Render every statement's answer for `POST /query`: a single statement's answer bare (so
+/// it matches `/search`/`/aggregate`'s own body), a `;`-separated script's answers as a JSON
+/// array in order (§7.9).
+pub(super) fn render_query_answers(answers: Vec<QueryAnswer>) -> JsonValue {
+    let mut rendered: Vec<JsonValue> = answers
+        .into_iter()
+        .map(|a| {
+            serde_json::to_value(QueryAnswerDto::from(a))
+                .expect("QueryAnswerDto holds only always-serializable fields")
+        })
+        .collect();
+    if rendered.len() == 1 {
+        rendered.remove(0)
+    } else {
+        JsonValue::Array(rendered)
+    }
+}
+
+/// Render every compiled statement for `QueryRequest::compile_only` — plain introspection,
+/// never executed. Single statement bare, a script as a JSON array, mirroring
+/// [`render_query_answers`]'s shape rule.
+pub(super) fn render_compiled(compiled: &[Compiled]) -> JsonValue {
+    if let [only] = compiled {
+        compiled_json(only)
+    } else {
+        JsonValue::Array(compiled.iter().map(compiled_json).collect())
+    }
+}
+
+/// One [`Compiled`] statement, rendered by hand: [`SearchOpts`]/[`HybridOpts`]/[`ListOpts`]/
+/// [`crate::FtsQuery`] carry no `Serialize` in the lean `sql` lane (`serde_json` is optional
+/// there), so this is the one place that gap is bridged, with `serde_json` available here.
+fn compiled_json(c: &Compiled) -> JsonValue {
+    match c {
+        Compiled::Search {
+            collections,
+            vector,
+            opts,
+        } => json!({
+            "kind": "search",
+            "collections": collections,
+            "vector": vector,
+            "opts": search_opts_json(opts),
+        }),
+        Compiled::TextSearch {
+            collections,
+            query,
+            opts,
+        } => json!({
+            "kind": "text_search",
+            "collections": collections,
+            "query": fts_query_json(query),
+            "opts": search_opts_json(opts),
+        }),
+        Compiled::Hybrid {
+            collections,
+            vector,
+            text,
+            opts,
+        } => json!({
+            "kind": "hybrid",
+            "collections": collections,
+            "vector": vector,
+            "text": fts_query_json(text),
+            "opts": hybrid_opts_json(opts),
+        }),
+        Compiled::List { collections, opts } => json!({
+            "kind": "list",
+            "collections": collections,
+            "opts": list_opts_json(opts),
+        }),
+        Compiled::Aggregate { collections, opts } => json!({
+            "kind": "aggregate",
+            "collections": collections,
+            "opts": opts,
+        }),
+    }
+}
+
+fn projection_json(p: &Projection) -> JsonValue {
+    match p {
+        Projection::All => json!("all"),
+        Projection::Include(keys) => json!({"include": keys}),
+        Projection::Exclude(keys) => json!({"exclude": keys}),
+    }
+}
+
+fn rerank_opts_json(r: &RerankOpts) -> JsonValue {
+    json!({"overscan": r.overscan, "text_attr": r.text_attr})
+}
+
+fn highlight_opts_json(h: &HighlightOpts) -> JsonValue {
+    json!({"max_fragments": h.max_fragments, "fragment_chars": h.fragment_chars})
+}
+
+fn fts_query_json(q: &crate::FtsQuery) -> JsonValue {
+    let clauses: Vec<JsonValue> = q
+        .clauses
+        .iter()
+        .map(|c| json!({"field": c.field, "text": c.text, "prefix": c.prefix}))
+        .collect();
+    json!({
+        "clauses": clauses,
+        "combine": q.combine,
+        "highlight": q.highlight.as_ref().map(highlight_opts_json),
+    })
+}
+
+fn search_opts_json(o: &SearchOpts) -> JsonValue {
+    json!({
+        "top_k": o.top_k,
+        "offset": o.offset,
+        "filter": o.filter,
+        "min_score": o.min_score,
+        "exact": o.exact,
+        "projection": projection_json(&o.projection),
+        "explain": o.explain,
+        "plan": o.plan,
+        "rank_by": o.rank_by,
+        "limit_per": o.limit_per,
+        "diversity": o.diversity,
+        "rerank": o.rerank.as_ref().map(rerank_opts_json),
+        "expand": o.expand,
+    })
+}
+
+fn list_opts_json(o: &ListOpts) -> JsonValue {
+    json!({
+        "offset": o.offset,
+        "limit": o.limit,
+        "filter": o.filter,
+        "projection": projection_json(&o.projection),
+        "order_by": o.order_by,
+    })
+}
+
+fn hybrid_opts_json(o: &HybridOpts) -> JsonValue {
+    json!({
+        "top_k": o.top_k,
+        "offset": o.offset,
+        "filter": o.filter,
+        "rrf_k": o.rrf_k,
+        "candidates": o.candidates,
+        "explain": o.explain,
+        "plan": o.plan,
+        "vector_weight": o.vector_weight,
+        "text_weight": o.text_weight,
+        "expand": o.expand,
+        "rerank": o.rerank.as_ref().map(rerank_opts_json),
+    })
 }
 
 /// Body of `POST /collections/{name}/remember` (the `memory` feature).

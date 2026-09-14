@@ -56,6 +56,9 @@ mod model;
 mod plan;
 mod profile;
 mod search;
+// SQL-shaped read syntax (nidus-yq9p.2/.3/.6): lexes, parses and compiles a SELECT statement
+// to the same typed opts the rest of the crate already runs. No new execution path.
+mod sql;
 mod store;
 // Recall/latency sweep over a caller's own store (nidus-sk9). Ungated: it must run
 // under `just miri` and ship to every `cargo add nidus`, not just the `cli` feature.
@@ -139,6 +142,7 @@ pub use model::{
 };
 pub use plan::{Candidates, Narrowing, QueryPath, QueryPlan, Timings};
 pub use profile::OpenProfile;
+pub use sql::{Compiled, QueryAnswer};
 pub use store::Readiness;
 pub use store::SegmentReport;
 pub use tune::{TuneCell, TuneOpts, TuneReport, recall_at_k, tune};
@@ -591,6 +595,125 @@ impl Nidus {
             .hybrid_search_with_plan(&refs, vector, text, opts)
     }
 
+    // ── SQL (nidus-yq9p.2/.3/.6) ──────────────────────────────────────────
+
+    /// Run one SQL statement (`SPEC.md` §7.12). Errors if `sql` holds more than one
+    /// statement — use [`Nidus::query_batch`] for a `;`-separated script.
+    pub fn query(&self, sql: &str) -> Result<QueryAnswer> {
+        let mut compiled = self.compile(sql)?;
+        if compiled.len() != 1 {
+            anyhow::bail!(
+                "{}: expected exactly one statement, found {} (use query_batch for a script)",
+                sql::SQL_PARSE_ERROR,
+                compiled.len()
+            );
+        }
+        self.execute(compiled.remove(0))
+    }
+
+    /// Run every `;`-separated statement in `sql`, in order (§7.9 multi-query batching).
+    pub fn query_batch(&self, sql: &str) -> Result<Vec<QueryAnswer>> {
+        self.compile(sql)?
+            .into_iter()
+            .map(|c| self.execute(c))
+            .collect()
+    }
+
+    /// Compile `sql` without executing it. Returns the typed [`Compiled`] value, not JSON —
+    /// `serde_json` is optional and absent from the lean lane; a surface that has it (CLI,
+    /// HTTP) renders this itself.
+    pub fn compile(&self, sql: &str) -> Result<Vec<Compiled>> {
+        sql::compile_all(sql)
+    }
+
+    /// Run one compiled statement: a plain `match` onto the existing `Store` methods, each
+    /// arm the typed call a caller would make by hand — the `_with_plan` sibling runs iff
+    /// `WITH (plan)` asked for one.
+    fn execute(&self, compiled: Compiled) -> Result<QueryAnswer> {
+        match compiled {
+            Compiled::Search {
+                collections,
+                vector,
+                opts,
+            } => {
+                let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
+                let scope = if refs.is_empty() {
+                    Scope::All
+                } else {
+                    Scope::Collections(&refs)
+                };
+                if opts.plan {
+                    let (hits, plan) = self.search_with_plan(scope, &vector, &opts)?;
+                    Ok(QueryAnswer::Hits {
+                        hits,
+                        plan: Some(plan),
+                    })
+                } else {
+                    let hits = self.search(scope, &vector, &opts)?;
+                    Ok(QueryAnswer::Hits { hits, plan: None })
+                }
+            }
+            Compiled::TextSearch {
+                collections,
+                query,
+                opts,
+            } => {
+                let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
+                let scope = if refs.is_empty() {
+                    Scope::All
+                } else {
+                    Scope::Collections(&refs)
+                };
+                let hits = self.text_search(scope, &query, &opts)?;
+                Ok(QueryAnswer::Hits { hits, plan: None })
+            }
+            Compiled::Hybrid {
+                collections,
+                vector,
+                text,
+                opts,
+            } => {
+                let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
+                let scope = if refs.is_empty() {
+                    Scope::All
+                } else {
+                    Scope::Collections(&refs)
+                };
+                if opts.plan {
+                    let (hits, plan) =
+                        self.hybrid_search_with_plan(scope, &vector, &text, &opts)?;
+                    Ok(QueryAnswer::Hits {
+                        hits,
+                        plan: Some(plan),
+                    })
+                } else {
+                    let hits = self.hybrid_search(scope, &vector, &text, &opts)?;
+                    Ok(QueryAnswer::Hits { hits, plan: None })
+                }
+            }
+            Compiled::List { collections, opts } => {
+                let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
+                let scope = if refs.is_empty() {
+                    Scope::All
+                } else {
+                    Scope::Collections(&refs)
+                };
+                let hits = self.list(scope, &opts)?;
+                Ok(QueryAnswer::Hits { hits, plan: None })
+            }
+            Compiled::Aggregate { collections, opts } => {
+                let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
+                let scope = if refs.is_empty() {
+                    Scope::All
+                } else {
+                    Scope::Collections(&refs)
+                };
+                let agg = self.aggregate(scope, &opts)?;
+                Ok(QueryAnswer::Aggregation(agg))
+            }
+        }
+    }
+
     // ── Group commit (nidus-xb9.1) ───────────────────────────────────────
 
     /// Run `f` with the per-batch durable barrier **deferred**, so several mutations can
@@ -691,5 +814,188 @@ impl Nidus {
     /// Retune `ef_search`/`n_probe`/`overscan` in place for the `tune` sweep — no rebuild.
     pub(crate) fn retune_ann(&mut self, cfg: AnnConfig) {
         self.store.retune_ann(cfg)
+    }
+}
+
+#[cfg(test)]
+mod sql_tests {
+    // `Nidus::query`/`query_batch`/`compile` (nidus-yq9p.2/.3/.6): the SQL spelling must
+    // reach the exact same typed entry points a caller would call by hand. Pure in-memory
+    // logic throughout, so this runs unmodified under `just miri`.
+    use std::collections::BTreeMap;
+
+    use crate::{FtsField, Nidus, QueryAnswer, Record, SearchOpts, Value};
+
+    fn store_with_docs() -> Nidus {
+        let mut db = Nidus::open_in_memory(3).unwrap();
+        db.create_collection_with_fts("docs", &[FtsField::new("body")])
+            .unwrap();
+        db.upsert(
+            "docs",
+            &[
+                Record::new(
+                    "a",
+                    vec![1.0, 0.0, 0.0],
+                    BTreeMap::from([
+                        ("lang".to_string(), Value::Str("rust".into())),
+                        (
+                            "body".to_string(),
+                            Value::Str("fast systems language".into()),
+                        ),
+                    ]),
+                ),
+                Record::new(
+                    "b",
+                    vec![0.0, 1.0, 0.0],
+                    BTreeMap::from([
+                        ("lang".to_string(), Value::Str("go".into())),
+                        (
+                            "body".to_string(),
+                            Value::Str("simple concurrent language".into()),
+                        ),
+                    ]),
+                ),
+            ],
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn query_search_matches_the_typed_call() {
+        let db = store_with_docs();
+        let sql_hits = match db
+            .query("SELECT * FROM docs WHERE lang = 'rust' ORDER BY knn([1.0, 0.0, 0.0]) LIMIT 5")
+            .unwrap()
+        {
+            QueryAnswer::Hits { hits, plan } => {
+                assert!(plan.is_none(), "no WITH (plan) was asked for");
+                hits
+            }
+            QueryAnswer::Aggregation(_) => panic!("expected Hits"),
+        };
+        let typed_hits = db
+            .search(
+                "docs",
+                &[1.0, 0.0, 0.0],
+                &SearchOpts {
+                    top_k: 5,
+                    filter: crate::Filter(vec![crate::Predicate::Eq(
+                        "lang".into(),
+                        Value::Str("rust".into()),
+                    )]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(sql_hits, typed_hits);
+    }
+
+    #[test]
+    fn query_with_plan_matches_the_typed_with_plan_call() {
+        let db = store_with_docs();
+        let (sql_hits, sql_plan) = match db
+            .query("SELECT * FROM docs ORDER BY knn([1.0, 0.0, 0.0]) LIMIT 5 WITH (plan)")
+            .unwrap()
+        {
+            QueryAnswer::Hits {
+                hits,
+                plan: Some(plan),
+            } => (hits, plan),
+            _ => panic!("expected Hits with a plan"),
+        };
+        let (typed_hits, typed_plan) = db
+            .search_with_plan(
+                "docs",
+                &[1.0, 0.0, 0.0],
+                &SearchOpts {
+                    top_k: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Byte-identical on every field except wall-clock `timings`, which two separate
+        // calls can never share — the §7.12's parity claim is about the plan's
+        // shape (path, rows scanned, candidate survival), not its timing measurements.
+        assert_eq!(sql_hits, typed_hits);
+        assert_eq!(sql_plan.path, typed_plan.path);
+        assert_eq!(sql_plan.rows_scanned, typed_plan.rows_scanned);
+        assert_eq!(sql_plan.candidates, typed_plan.candidates);
+        assert_eq!(sql_plan.narrowing, typed_plan.narrowing);
+    }
+
+    #[test]
+    fn query_text_search_and_list_and_aggregate_all_dispatch_correctly() {
+        let db = store_with_docs();
+
+        let QueryAnswer::Hits { hits, .. } = db
+            .query("SELECT * FROM docs ORDER BY match(body, 'concurrent') LIMIT 5")
+            .unwrap()
+        else {
+            panic!("expected Hits")
+        };
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "b");
+
+        let QueryAnswer::Hits { hits, .. } = db.query("SELECT * FROM docs ORDER BY lang").unwrap()
+        else {
+            panic!("expected Hits")
+        };
+        assert_eq!(hits.len(), 2);
+
+        let QueryAnswer::Aggregation(agg) = db.query("SELECT * FROM docs GROUP BY lang").unwrap()
+        else {
+            panic!("expected an Aggregation")
+        };
+        assert_eq!(agg.count, 2);
+        assert_eq!(agg.groups.len(), 2);
+    }
+
+    #[test]
+    fn query_rejects_more_than_one_statement() {
+        let db = store_with_docs();
+        let err = db
+            .query("SELECT * FROM docs; SELECT * FROM docs")
+            .unwrap_err();
+        assert!(err.to_string().contains("query_batch"));
+    }
+
+    #[test]
+    fn query_batch_runs_every_statement_in_order() {
+        let db = store_with_docs();
+        let answers = db
+            .query_batch(
+                "SELECT * FROM docs WHERE lang = 'rust'; SELECT * FROM docs WHERE lang = 'go'",
+            )
+            .unwrap();
+        assert_eq!(answers.len(), 2);
+        let QueryAnswer::Hits { hits: a, .. } = &answers[0] else {
+            panic!()
+        };
+        let QueryAnswer::Hits { hits: b, .. } = &answers[1] else {
+            panic!()
+        };
+        assert_eq!(a[0].id, "a");
+        assert_eq!(b[0].id, "b");
+    }
+
+    #[test]
+    fn compile_does_not_execute() {
+        let db = store_with_docs();
+        let compiled = db
+            .compile("SELECT * FROM docs ORDER BY knn([1.0, 0.0, 0.0])")
+            .unwrap();
+        assert_eq!(compiled.len(), 1);
+        assert!(matches!(compiled[0], crate::Compiled::Search { .. }));
+    }
+
+    #[test]
+    fn a_sql_parse_error_surfaces_through_query() {
+        let db = store_with_docs();
+        let err = db
+            .query("SELECT * FROM docs WHERE")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sql parse error"), "{err}");
     }
 }
