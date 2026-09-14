@@ -53,6 +53,9 @@ mod meta;
 // in-process by an embedding application (nidus-abx.4).
 pub mod metrics;
 mod model;
+// A namespace name mapped to its own `Store` under a base location, opened lazily and
+// held in a bounded warm set (nidus-pcpc.1).
+mod namespaces;
 mod plan;
 mod profile;
 mod search;
@@ -174,6 +177,8 @@ impl<'a> From<&'a [&'a str]> for Scope<'a> {
         Scope::Collections(s)
     }
 }
+
+pub use namespaces::Namespaces;
 
 /// An open vector store. Synchronous; wrap in `Arc<RwLock<Nidus>>` for concurrent
 /// searchers + one writer (SPEC.md §6.5).
