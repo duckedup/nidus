@@ -8,8 +8,8 @@ use rmcp::{
 use serde_json::{Map, Value as JsonValue};
 
 // Imported for its methods on `AnyEmbedder` — a trait method, not inherent.
-use crate::SearchOpts;
 use crate::embed::Embedder;
+use crate::{Pool, SearchOpts};
 
 use super::HitDto;
 use super::NidusMcp;
@@ -41,6 +41,47 @@ fn prompt_top_k(args: &Map<String, JsonValue>) -> Result<usize, McpError> {
     Ok(k)
 }
 
+/// `names` for a prompt: a `PromptArgument` carries no type, so a filled-in template most
+/// often sends a plain string (nidus-85t) — comma-separated, mirroring [`prompt_top_k`]'s
+/// leniency. A JSON array is also accepted for a client sophisticated enough to send one.
+fn prompt_names(args: &Map<String, JsonValue>) -> Result<Vec<String>, McpError> {
+    match args.get("names") {
+        None | Some(JsonValue::Null) => Ok(Vec::new()),
+        Some(JsonValue::String(s)) => Ok(s
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Some(JsonValue::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| McpError::invalid_params("`names` items must be strings", None))
+            })
+            .collect(),
+        Some(_) => Err(McpError::invalid_params(
+            "`names` must be a string or an array of strings",
+            None,
+        )),
+    }
+}
+
+/// `pool` for a prompt, accepted case-insensitively for the same reason [`prompt_top_k`]
+/// accepts a numeric string: nothing here enforces the value came from a schema.
+fn prompt_pool(args: &Map<String, JsonValue>) -> Result<Pool, McpError> {
+    match args.get("pool") {
+        None | Some(JsonValue::Null) => Ok(Pool::Max),
+        Some(JsonValue::String(s)) if s.eq_ignore_ascii_case("max") => Ok(Pool::Max),
+        Some(JsonValue::String(s)) if s.eq_ignore_ascii_case("sum") => Ok(Pool::Sum),
+        _ => Err(McpError::invalid_params(
+            "`pool` must be \"max\" or \"sum\"",
+            None,
+        )),
+    }
+}
+
 pub(super) fn prompts() -> Vec<Prompt> {
     vec![Prompt::new(
         "recall_then_answer",
@@ -62,6 +103,19 @@ pub(super) fn prompts() -> Vec<Prompt> {
                      server's default.",
                 )
                 .with_required(false),
+            PromptArgument::new("names")
+                .with_description(
+                    "Named vectors to search, comma-separated (e.g. \"title,body\"), for a \
+                     collection whose records carry more than one. Omit to search only the \
+                     default vector.",
+                )
+                .with_required(false),
+            PromptArgument::new("pool")
+                .with_description(
+                    "How several `names` scores combine: \"max\" (default) or \"sum\". \
+                     Ignored unless `names` is set.",
+                )
+                .with_required(false),
         ]),
     )]
 }
@@ -75,6 +129,8 @@ impl NidusMcp {
         let question = required_str(args, "question")?;
         let collection = required_str(args, "collection")?;
         let top_k = prompt_top_k(args)?;
+        let names = prompt_names(args)?;
+        let pool = prompt_pool(args)?;
 
         let vector = embedder
             .embed_query(&question)
@@ -84,6 +140,8 @@ impl NidusMcp {
         let opts = SearchOpts {
             top_k,
             filter: with_ttl_guard(None),
+            names,
+            pool,
             ..Default::default()
         };
         let collection_for_run = collection.clone();

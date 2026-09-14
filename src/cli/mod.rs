@@ -2,6 +2,7 @@
 //! serve`. Everything here is synchronous (matching the library); only `serve`
 //! spins up a Tokio runtime, so the common, fast subcommands pay no async cost.
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -16,8 +17,8 @@ use crate::server::dto::{AnnDto, FootprintDto, HitDto, SearchResponse};
 use crate::{
     AggregateOpts, AnnConfig, Compiled, Config, Distance, Expand, Filter, Fsync, FtsClause,
     FtsCombine, FtsField, FtsQuery, HighlightOpts, HybridOpts, LeaseWait, LimitPer, ListOpts,
-    Nidus, OpenMode, OrderBy, Projection, Quantization, QueryAnswer, Record, Scope, SearchOpts,
-    SuggestOpts,
+    Nidus, OpenMode, OrderBy, Pool, Projection, Quantization, QueryAnswer, Record, Scope,
+    SearchOpts, SuggestOpts,
 };
 
 // AI-ingest (memory) wiring for `serve`: only under the `memory` feature (pulled
@@ -963,6 +964,24 @@ impl From<CombineArg> for FtsCombine {
     }
 }
 
+/// How several named-vector scores fold into one per-record score (nidus-85t), mirroring
+/// [`Pool`]. `Max` is the default: an absent name contributes nothing and carries no penalty.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum PoolArg {
+    #[default]
+    Max,
+    Sum,
+}
+
+impl From<PoolArg> for Pool {
+    fn from(p: PoolArg) -> Self {
+        match p {
+            PoolArg::Max => Pool::Max,
+            PoolArg::Sum => Pool::Sum,
+        }
+    }
+}
+
 /// The multi-clause / annotation half of a text or hybrid query, shared by both subcommands
 /// so the two cannot drift (nidus-m50.10, nidus-m50.5).
 #[derive(Args, Debug, Default)]
@@ -1171,7 +1190,9 @@ enum Command {
         store: StoreArgs,
         name: String,
     },
-    /// Upsert records (JSON array of records) from a file or stdin.
+    /// Upsert records (JSON array of records) from a file or stdin. Each record may carry
+    /// `vector` (the default), `vectors` (a name → vector map, nidus-85t), or both; every
+    /// name in `vectors` must be declared first with `set-vector-names`.
     Upsert {
         #[command(flatten)]
         store: StoreArgs,
@@ -1222,6 +1243,17 @@ enum Command {
         /// MMR lambda spreading hits in vector space: 1.0 pure relevance, 0.0 pure spread.
         #[arg(long = "diversity")]
         diversity: Option<f32>,
+        /// Named vector to score (nidus-85t), repeatable. Omit to search only the default
+        /// vector, declared on the collection first with `set-vector-names`.
+        #[arg(long = "name")]
+        names: Vec<String>,
+        /// Per-name weight as `name=weight` (repeatable). A name not given here weights 1.0.
+        /// Meaningless with no `--name`.
+        #[arg(long = "weight")]
+        name_weights: Vec<String>,
+        /// How several `--name` scores fold into one per-record score before top-k.
+        #[arg(long, value_enum, default_value_t = PoolArg::Max)]
+        pool: PoolArg,
         /// Report how the query ran — path taken, rows scanned, candidate survival, timings.
         #[arg(long)]
         plan: bool,
@@ -1274,6 +1306,17 @@ enum Command {
         /// MMR lambda spreading hits in vector space: 1.0 pure relevance, 0.0 pure spread.
         #[arg(long = "diversity")]
         diversity: Option<f32>,
+        /// Named vector to score (nidus-85t), repeatable. Omit to search only the default
+        /// vector.
+        #[arg(long = "name")]
+        names: Vec<String>,
+        /// Per-name weight as `name=weight` (repeatable). A name not given here weights 1.0.
+        /// Meaningless with no `--name`.
+        #[arg(long = "weight")]
+        name_weights: Vec<String>,
+        /// How several `--name` scores fold into one per-record score before top-k.
+        #[arg(long, value_enum, default_value_t = PoolArg::Max)]
+        pool: PoolArg,
         /// Report how the query ran — path taken, rows scanned, candidate survival, timings.
         #[arg(long)]
         plan: bool,
@@ -1351,6 +1394,17 @@ enum Command {
         /// Drop tokens longer than this many characters (default: no limit).
         #[arg(long)]
         max_token_len: Option<usize>,
+    },
+    /// Declare a collection's additional named-vector names (nidus-85t), mirroring
+    /// `set-fts-schema`. Never declare "default" — it needs no declaration. Re-running
+    /// replaces the set; upserting an undeclared name is refused.
+    SetVectorNames {
+        #[command(flatten)]
+        store: StoreArgs,
+        collection: String,
+        /// Vector name to declare (repeatable). At least one is required.
+        #[arg(long = "name")]
+        names: Vec<String>,
     },
     /// Ranked term completions for a prefix, for an autocomplete dropdown.
     Suggest {
@@ -1459,6 +1513,17 @@ enum Command {
         /// Weight on the BM25 leg's fused contribution.
         #[arg(long, default_value_t = 1.0)]
         text_weight: f32,
+        /// Cap fused hits per distinct value of this attribute (needs --limit-per-max,
+        /// nidus-29ui). Applied on the shared cap → MMR → page-cut tail, same as `search`.
+        #[arg(long = "limit-per", requires = "limit_per_max")]
+        limit_per: Option<String>,
+        /// Maximum fused hits kept per distinct --limit-per value.
+        #[arg(long = "limit-per-max", requires = "limit_per")]
+        limit_per_max: Option<usize>,
+        /// MMR lambda spreading fused hits in vector space: 1.0 pure relevance, 0.0 pure
+        /// spread (nidus-29ui).
+        #[arg(long = "diversity")]
+        diversity: Option<f32>,
         /// Report how the query ran — path taken, rows scanned, candidate survival, timings.
         #[arg(long)]
         plan: bool,
@@ -1847,6 +1912,9 @@ pub fn run(cli: Cli) -> Result<()> {
             limit_per,
             limit_per_max,
             diversity,
+            names,
+            name_weights,
+            pool,
             plan,
             #[cfg(feature = "rerank")]
             rerank,
@@ -1874,6 +1942,9 @@ pub fn run(cli: Cli) -> Result<()> {
                     .zip(limit_per_max)
                     .map(|(f, m)| LimitPer::new(f, m)),
                 diversity,
+                names,
+                name_weights: parse_vector_weights(&name_weights)?,
+                pool: pool.into(),
                 expand: expand.resolve(),
                 plan,
                 #[cfg(feature = "rerank")]
@@ -1937,6 +2008,9 @@ pub fn run(cli: Cli) -> Result<()> {
             limit_per,
             limit_per_max,
             diversity,
+            names,
+            name_weights,
+            pool,
             plan,
             expand,
         } => {
@@ -1958,6 +2032,9 @@ pub fn run(cli: Cli) -> Result<()> {
                     .zip(limit_per_max)
                     .map(|(f, m)| LimitPer::new(f, m)),
                 diversity,
+                names,
+                name_weights: parse_vector_weights(&name_weights)?,
+                pool: pool.into(),
                 expand: expand.resolve(),
                 plan,
                 ..Default::default()
@@ -2090,6 +2167,21 @@ pub fn run(cli: Cli) -> Result<()> {
                 "fts_fields": reported,
             }))
         }
+        Command::SetVectorNames {
+            store,
+            collection,
+            names,
+        } => {
+            if names.is_empty() {
+                bail!("set-vector-names needs at least one --name");
+            }
+            let mut db = open(&store, true)?;
+            db.set_vector_names(&collection, &names)?;
+            print_json(&serde_json::json!({
+                "collection": collection,
+                "vector_names": names,
+            }))
+        }
         Command::Suggest {
             store,
             field,
@@ -2206,6 +2298,9 @@ pub fn run(cli: Cli) -> Result<()> {
             candidates,
             vector_weight,
             text_weight,
+            limit_per,
+            limit_per_max,
+            diversity,
             plan,
             #[cfg(feature = "rerank")]
             rerank,
@@ -2231,6 +2326,11 @@ pub fn run(cli: Cli) -> Result<()> {
                 explain: query.explain,
                 vector_weight,
                 text_weight,
+                // clap's `requires` pairing means either both flags are present or neither is.
+                limit_per: limit_per
+                    .zip(limit_per_max)
+                    .map(|(f, m)| LimitPer::new(f, m)),
+                diversity,
                 expand: expand.resolve(),
                 plan,
                 #[cfg(feature = "rerank")]
@@ -2731,6 +2831,21 @@ fn first_duplicate(decl: &[FtsField]) -> Option<&str> {
     decl.iter()
         .find(|f| !seen.insert(f.field.as_str()))
         .map(|f| f.field.as_str())
+}
+
+/// Parse repeatable `--weight name=value` entries (nidus-85t) into a name→weight map.
+fn parse_vector_weights(raw: &[String]) -> Result<BTreeMap<String, f32>> {
+    raw.iter()
+        .map(|w| {
+            let (name, value) = w
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("--weight must be name=weight, got '{w}'"))?;
+            let weight: f32 = value
+                .parse()
+                .with_context(|| format!("--weight '{w}' has a non-numeric weight"))?;
+            Ok((name.to_string(), weight))
+        })
+        .collect()
 }
 
 /// Open the store. `mutating` commands take the writer lock; read commands open
@@ -3635,6 +3750,152 @@ mod tests {
                 "docs",
                 "--limit-per",
                 "file"
+            ])
+            .is_err()
+        );
+    }
+
+    /// `search --name`/`--weight`/`--pool` (nidus-85t): repeatable names, `name=weight`
+    /// pairs, and the pooling enum, all the way to `SearchOpts`.
+    #[test]
+    fn search_parses_the_named_vector_knobs() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "search",
+            "--dir",
+            "/tmp/s",
+            "docs",
+            "--name",
+            "title",
+            "--name",
+            "body",
+            "--weight",
+            "title=2.0",
+            "--pool",
+            "sum",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Search {
+                names,
+                name_weights,
+                pool,
+                ..
+            } => {
+                assert_eq!(names, vec!["title", "body"]);
+                assert_eq!(name_weights, vec!["title=2.0"]);
+                assert!(matches!(pool, PoolArg::Sum));
+            }
+            _ => panic!("expected Search"),
+        }
+        // Omitted entirely, `--pool` defaults to `Max` (an absent name costs nothing).
+        let cli = Cli::try_parse_from(["nidus", "search", "--dir", "/tmp/s", "docs"]).unwrap();
+        match cli.command {
+            Command::Search { pool, names, .. } => {
+                assert!(matches!(pool, PoolArg::Max));
+                assert!(names.is_empty());
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    /// The same three flags on `similar`, since it shares `SearchOpts`.
+    #[test]
+    fn similar_parses_the_named_vector_knobs() {
+        let cli = Cli::try_parse_from([
+            "nidus", "similar", "--dir", "/tmp/s", "docs", "a", "--name", "title", "--pool", "sum",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Similar { names, pool, .. } => {
+                assert_eq!(names, vec!["title"]);
+                assert!(matches!(pool, PoolArg::Sum));
+            }
+            _ => panic!("expected Similar"),
+        }
+    }
+
+    /// `--weight` must be `name=value`; a malformed or non-numeric one is a caller error
+    /// surfaced at `run`, not a panic (parsing is deferred to `parse_vector_weights`).
+    #[test]
+    fn malformed_weight_is_refused_at_run() {
+        assert!(parse_vector_weights(&["title".to_string()]).is_err());
+        assert!(parse_vector_weights(&["title=not-a-number".to_string()]).is_err());
+        assert_eq!(
+            parse_vector_weights(&["title=2.0".to_string(), "body=1".to_string()]).unwrap(),
+            BTreeMap::from([("title".to_string(), 2.0), ("body".to_string(), 1.0)])
+        );
+    }
+
+    /// `set-vector-names` (nidus-85t), mirroring `set-fts-schema`'s own parse test.
+    #[test]
+    fn set_vector_names_parses_repeated_names() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "set-vector-names",
+            "--dir",
+            "/tmp/s",
+            "docs",
+            "--name",
+            "title",
+            "--name",
+            "body",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::SetVectorNames {
+                collection, names, ..
+            } => {
+                assert_eq!(collection, "docs");
+                assert_eq!(names, vec!["title", "body"]);
+            }
+            _ => panic!("expected SetVectorNames"),
+        }
+    }
+
+    /// `hybrid-search --limit-per`/`--diversity` (nidus-29ui): the same cap → MMR knobs
+    /// `search`/`text-search` already carry, now on the fused ranking too.
+    #[test]
+    fn hybrid_search_parses_limit_per_and_diversity() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "hybrid-search",
+            "--dir",
+            "/tmp/s",
+            "body",
+            "quantum",
+            "--limit-per",
+            "file",
+            "--limit-per-max",
+            "1",
+            "--diversity",
+            "0.3",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::HybridSearch {
+                limit_per,
+                limit_per_max,
+                diversity,
+                ..
+            } => {
+                assert_eq!(limit_per.as_deref(), Some("file"));
+                assert_eq!(limit_per_max, Some(1));
+                assert_eq!(diversity, Some(0.3));
+            }
+            _ => panic!("expected HybridSearch"),
+        }
+        // Same clap `requires` pairing as `search`.
+        assert!(
+            Cli::try_parse_from([
+                "nidus",
+                "hybrid-search",
+                "--dir",
+                "/tmp/s",
+                "body",
+                "quantum",
+                "--limit-per",
+                "file",
             ])
             .is_err()
         );

@@ -456,6 +456,20 @@ bench-quant *ARGS:
 bench-ann *ARGS:
     cargo run -p nidus-bench --release --bin nidus-bench-ann -- {{ARGS}}
 
+# Named-vector cost, pooling, parallelism & recall sweep (nidus-85t; nidus-only, no engine
+# deps). Reports (1) the cost of naming at names=1,2,4, gated against the pre-change
+# single-vector baseline; (2) Max vs Sum pooling over the same rows; (3) a threads= sweep
+# proving the shard-boundary-snapped reduction still scales; (4) ANN recall per names=.
+#   just bench-named                                     defaults (n=100k, dim=384/768)
+#   just bench-named names=1,2,4 n=100000 dim=768         pass-through args
+#   just bench-named names=4 threads=1,2,4,8               parallelism sweep
+#   just bench-named json=benchmarks/baselines/named-<version>.json   record a baseline
+bench-named *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NIDUS_VERSION="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')" \
+        cargo run -p nidus-bench --release --bin nidus-bench-named -- {{ARGS}}
+
 # Single-writer ingest decomposition (nidus-xb9): splits the write path into JSON
 # encode / decode / store append / fsync / transport, then sweeps batch size and
 # concurrent writers. Answers which layer a single writer actually saturates on,

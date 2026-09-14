@@ -85,7 +85,12 @@ impl Store {
     /// Reorder the head of a ranking by MMR. The head is bounded by [`MAX_DIVERSITY_WINDOW`];
     /// anything deeper keeps its score order, so the cost stays bounded rather than quadratic
     /// in whatever depth the caller over-fetched to.
-    pub(super) fn diversify(&self, mut ranked: Vec<Hit>, lambda: f32) -> Vec<Hit> {
+    pub(super) fn diversify(
+        &self,
+        mut ranked: Vec<Hit>,
+        lambda: f32,
+        names: &[String],
+    ) -> Vec<Hit> {
         let width = ranked.len().min(MAX_DIVERSITY_WINDOW);
         if width < 2 {
             return ranked;
@@ -97,11 +102,16 @@ impl Store {
         let window: Vec<Candidate<'_>> = ranked
             .iter()
             .map(|h| {
-                let row = self
+                // Measure redundancy in the space the query actually SCORED: comparing
+                // `default` vectors for a `title` query measures the wrong space entirely.
+                let entry = self
                     .collections
                     .get(&h.collection)
-                    .and_then(|c| c.docs.get(&h.id))
-                    .and_then(|e| e.row)?;
+                    .and_then(|c| c.docs.get(&h.id))?;
+                let row = names
+                    .iter()
+                    .find_map(|n| entry.rows.get(n.as_str()).copied())
+                    .or_else(|| entry.primary_row())?;
                 let v = self.data.row(row);
                 let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
                 Some((v, norm))

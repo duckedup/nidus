@@ -21,7 +21,7 @@ use crate::code::present::{FileGroup, group_by_file};
 use crate::code::META_SYMBOL;
 use crate::embed::cache::CachedEmbedder;
 use crate::embed::{Embedder, embedder_identity};
-use crate::memory::{META_TEXT, RememberWrite, commit_remember_chunks, stamp_recency};
+use crate::memory::{META_TEXT, RememberWrite, commit_remember_chunks_with_title, stamp_recency};
 use crate::{
     Filter, FtsField, META_CHAR_START, META_CHUNK_INDEX, META_PARENT_ID, Nidus, Predicate, Record,
     SearchOpts, Value,
@@ -462,7 +462,8 @@ async fn ingest_chunks_embedded<E: Embedder>(
 
     let n_i64 = n as i64;
     db.deferred(|db| {
-        let remembered = commit_remember_chunks(db, embedder, collection, rel, writes)?;
+        let remembered =
+            commit_remember_chunks_with_title(db, embedder, collection, rel, writes, None)?;
         db.delete_where(
             collection,
             &Filter(vec![Predicate::All(vec![

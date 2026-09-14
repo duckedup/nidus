@@ -19,9 +19,13 @@ use crate::manifest::history::{self, HistoryEntry, HistoryFloor};
 /// The floor already makes every excluded entry unreachable, so a backlog is cheap to leave.
 const HISTORY_PRUNE_BATCH: usize = 32;
 use crate::manifest::{BASE_SEGMENT, MANIFEST_KEY, Manifest};
-use crate::model::{Distance, Filter, Op, Record, Value};
+use crate::model::{DEFAULT_VECTOR, Distance, Filter, Op, Record, Value};
 use crate::profile::OpenProfile;
 use crate::search::normalize;
+
+/// One record staged for commit inside `upsert`'s phase-0 reservation: its id, the
+/// name -> data-segment row map it will own, and its attrs.
+type StagedUpsert = (String, BTreeMap<String, u64>, BTreeMap<String, Value>);
 
 /// One live segment's checksum-sidecar finding, named so a mismatch identifies exactly which
 /// segment's bytes disagree with its sidecar (#160). Order matches the manifest: oldest first,
@@ -39,6 +43,24 @@ fn is_reinforced_attr(field: &str) -> bool {
     field == crate::meta::META_ACCESS_COUNT
         || field == crate::meta::META_LAST_ACCESSED
         || field == crate::meta::META_EXPIRES_AT
+}
+
+/// Reject an unusable vector-name declaration once per call: empty, [`DEFAULT_VECTOR`]
+/// (reserved, needs no declaration), or repeated.
+fn validate_vector_names(names: &[String]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if name.is_empty() {
+            bail!("a declared vector name must not be empty");
+        }
+        if name == DEFAULT_VECTOR {
+            bail!("vector name `{DEFAULT_VECTOR}` is reserved and needs no declaration");
+        }
+        if !seen.insert(name.as_str()) {
+            bail!("vector name `{name}` is declared twice");
+        }
+    }
+    Ok(())
 }
 
 impl Store {
@@ -395,8 +417,8 @@ impl Store {
             );
         }
         if let Some(col) = self.collections.remove(name) {
-            // Only rowed docs leave a reclaimable data row behind.
-            self.dead_rows += col.docs.values().filter(|e| e.row.is_some()).count();
+            // Every named row an entry owns is independently reclaimable.
+            self.dead_rows += col.docs.values().map(|e| e.rows.len()).sum::<usize>();
             // Drop the collection's FTS schema + field indexes.
             if self.fts.is_active() {
                 self.fts.drop_collection(name);
@@ -483,6 +505,25 @@ impl Store {
         Ok(())
     }
 
+    /// Declare `collection`'s additional vector names (nidus-85t decision 4), mirroring
+    /// `set_fts_schema`. Redeclaring replaces the set. Never include [`DEFAULT_VECTOR`] —
+    /// it needs no declaration and is refused here.
+    pub fn set_vector_names(&mut self, collection: &str, names: &[String]) -> Result<()> {
+        self.check_writable()?;
+        self.reject_if_alias("set_vector_names", collection)?;
+        validate_vector_names(names)?;
+        self.collections
+            .entry(collection.to_string())
+            .or_insert_with(Collection::new);
+        self.log.append(&Op::SetVectorNames {
+            collection: collection.to_string(),
+            names: names.to_vec(),
+        })?;
+        self.maybe_sync()?;
+        self.collections.get_mut(collection).unwrap().vector_names = names.to_vec();
+        Ok(())
+    }
+
     /// Create `collection` (idempotent) and declare its full-text fields up front. The
     /// recommended FTS path: indexing is fully incremental from the first upsert.
     pub fn create_collection_with_fts(&mut self, name: &str, fields: &[FtsField]) -> Result<()> {
@@ -514,18 +555,57 @@ impl Store {
 
         let dim = self.data.dimension();
 
-        // Validate all present vectors first (fail fast before any mutation). A
-        // text-only record (`vector: None`) is exempt — it occupies no data row.
+        // Validate every named vector up front (fail fast before any mutation): dimension, no
+        // `vectors["default"]`, and every non-default name declared (nidus-85t decision 4). A
+        // text-only record (nothing in either field) is exempt — it occupies no data row.
+        let declared: Vec<String> = self
+            .collections
+            .get(collection)
+            .map(|c| c.vector_names.clone())
+            .unwrap_or_default();
+        // Borrowed, never cloned: a second copy of every vector would allocate the whole batch
+        // again before `max_vector_bytes` and Phase 0 could refuse it (SPEC §6.6).
+        let mut per_record: Vec<BTreeMap<&str, &[f32]>> = Vec::new();
+        per_record
+            .try_reserve_exact(records.len())
+            .map_err(|_| oom("upsert staging vectors", records.len()))?;
         for rec in records {
-            if let Some(v) = &rec.vector
-                && v.len() != dim
-            {
+            if rec.vectors.contains_key(DEFAULT_VECTOR) {
                 bail!(
-                    "vector length {} does not match store dimension {}",
-                    v.len(),
-                    dim
+                    "record `{}` names the reserved vector `{DEFAULT_VECTOR}` in `vectors`; \
+                     set `Record::vector` instead",
+                    rec.id
                 );
             }
+            let mut named: BTreeMap<&str, &[f32]> = BTreeMap::new();
+            if let Some(v) = &rec.vector {
+                if v.len() != dim {
+                    bail!(
+                        "vector length {} does not match store dimension {}",
+                        v.len(),
+                        dim
+                    );
+                }
+                named.insert(DEFAULT_VECTOR, v.as_slice());
+            }
+            for (name, v) in &rec.vectors {
+                if v.len() != dim {
+                    bail!(
+                        "named vector `{name}` length {} does not match store dimension {}",
+                        v.len(),
+                        dim
+                    );
+                }
+                if !declared.iter().any(|d| d == name) {
+                    bail!(
+                        "record `{}` upserts undeclared vector name `{name}`; call \
+                         `set_vector_names` first",
+                        rec.id
+                    );
+                }
+                named.insert(name.as_str(), v.as_slice());
+            }
+            per_record.push(named);
         }
 
         let need_create = !self.collections.contains_key(collection);
@@ -550,8 +630,8 @@ impl Store {
 
         // Capacity gate: refuse, before any append, a batch that would grow the matrix past the
         // cap — clean refusal, no rollback. Counts physical rows including dead ones, so
-        // `compact` reclaims headroom; text-only records cost no rows.
-        let vector_count = records.iter().filter(|r| r.vector.is_some()).count() as u64;
+        // `compact` reclaims headroom; text-only records cost no rows, a named record N.
+        let vector_count: u64 = per_record.iter().map(|m| m.len() as u64).sum();
         if let Some(cap) = self.config.max_vector_bytes {
             let projected =
                 (self.data.row_count() + vector_count) * self.data.dimension() as u64 * 4;
@@ -570,7 +650,7 @@ impl Store {
         // Phase 0: reserve every growable buffer up-front, fallibly, so the commit
         // phase (Phase 5) can never reallocate / OOM. Nothing is mutated here, so an
         // OOM just returns — no rollback needed (data + log untouched).
-        let mut staged: Vec<(String, Option<u64>, BTreeMap<String, Value>)> = Vec::new();
+        let mut staged: Vec<StagedUpsert> = Vec::new();
         staged
             .try_reserve_exact(records.len())
             .map_err(|_| oom("upsert staging entries", records.len()))?;
@@ -596,30 +676,29 @@ impl Store {
                 .map_err(|_| oom("collection docs map", records.len()))?;
         }
 
-        // Phase 1: append all vectors to data (SPEC §6.2 write order). Roll back on
-        // any failure — nothing else has been touched yet.
+        // Phase 1: append every named vector to data, one row each, in name order — one
+        // record's rows land contiguously (SPEC §6.2 write order). Roll back on any failure.
         let should_normalize = self.config.distance == Distance::Cosine;
-        for rec in records {
-            let row = match &rec.vector {
-                Some(v) => {
-                    let mut v = v.clone();
-                    if should_normalize {
-                        normalize(&mut v);
+        for (rec, named) in records.iter().zip(&per_record) {
+            let mut rows: BTreeMap<String, u64> = BTreeMap::new();
+            for (name, v) in named {
+                let mut v = v.to_vec();
+                if should_normalize {
+                    normalize(&mut v);
+                }
+                match self.data.append(&v) {
+                    Ok(row) => {
+                        rows.insert((*name).to_string(), row);
                     }
-                    match self.data.append(&v) {
-                        Ok(row) => Some(row),
-                        Err(e) => {
-                            self.data
-                                .truncate_to(data_mark)
-                                .context("rollback data after failed append")?;
-                            return Err(e);
-                        }
+                    Err(e) => {
+                        self.data
+                            .truncate_to(data_mark)
+                            .context("rollback data after failed append")?;
+                        return Err(e);
                     }
                 }
-                // Text-only doc: no embedding, no data row.
-                None => None,
-            };
-            staged.push((rec.id.clone(), row, rec.attrs.clone()));
+            }
+            staged.push((rec.id.clone(), rows, rec.attrs.clone()));
         }
 
         // Whether this batch takes its own barrier, decided once so phases 2 and 4 cannot
@@ -635,25 +714,28 @@ impl Store {
             return Err(e);
         }
 
-        // Phase 3: append log records (CreateCollection, if needed, then the
-        // Upserts). On any failure, roll back both files to their marks.
+        // Phase 3: append log records (CreateCollection, if needed, then one UpsertVectors/
+        // UpsertText per record). On any failure, roll back both files to their marks.
         let log_ops = need_create
             .then(|| Op::CreateCollection {
                 collection: collection.to_string(),
             })
             .into_iter()
-            .chain(staged.iter().map(|(id, row, attrs)| match row {
-                Some(row) => Op::Upsert {
-                    collection: collection.to_string(),
-                    id: id.clone(),
-                    row: *row,
-                    attrs: attrs.clone(),
-                },
-                None => Op::UpsertText {
-                    collection: collection.to_string(),
-                    id: id.clone(),
-                    attrs: attrs.clone(),
-                },
+            .chain(staged.iter().map(|(id, rows, attrs)| {
+                if rows.is_empty() {
+                    Op::UpsertText {
+                        collection: collection.to_string(),
+                        id: id.clone(),
+                        attrs: attrs.clone(),
+                    }
+                } else {
+                    Op::UpsertVectors {
+                        collection: collection.to_string(),
+                        id: id.clone(),
+                        rows: rows.iter().map(|(n, r)| (n.clone(), *r)).collect(),
+                        attrs: attrs.clone(),
+                    }
+                }
             }));
         for op in log_ops {
             if let Err(e) = self.log.append(&op) {
@@ -683,12 +765,14 @@ impl Store {
         let ann_on = self.ann.is_some();
         let fts_on = self.fts.is_active();
         let findex_on = self.findex.is_active();
-        let mut new_owners: Vec<(u64, String)> = Vec::new();
+        let mut new_owners: Vec<(u64, String, String)> = Vec::new();
         let mut count = 0usize;
-        for (id, row, attrs) in staged {
-            // Only a vector-bearing new doc joins the ANN index.
-            if ann_on && let Some(r) = row {
-                new_owners.push((r, id.clone()));
+        for (id, rows, attrs) in staged {
+            // Every named row of a new doc joins the ANN index.
+            if ann_on {
+                for (name, &row) in &rows {
+                    new_owners.push((row, id.clone(), name.clone()));
+                }
             }
             // Index the doc's text into any FTS fields (no-op if this collection has no
             // schema). Done before the attrs move into the index. O(batch).
@@ -700,11 +784,9 @@ impl Store {
             if findex_on {
                 self.findex.index_doc(collection, &id, &attrs);
             }
-            // Overwriting a *rowed* doc leaves its old row dead.
-            if let Some(old) = col.docs.insert(id, DocEntry { row, attrs })
-                && old.row.is_some()
-            {
-                self.dead_rows += 1;
+            // Overwriting a doc leaves every one of its old named rows dead.
+            if let Some(old) = col.docs.insert(id, DocEntry { rows, attrs }) {
+                self.dead_rows += old.rows.len();
             }
             count += 1;
         }
@@ -754,10 +836,8 @@ impl Store {
             let Some(old) = col.docs.remove(id) else {
                 continue;
             };
-            // Only a rowed doc leaves a reclaimable data row.
-            if old.row.is_some() {
-                self.dead_rows += 1;
-            }
+            // Every named row the doc owned is independently reclaimable.
+            self.dead_rows += old.rows.len();
             // Tombstone the doc in any FTS field indexes (no-op when none).
             self.fts.remove_doc(collection, id);
             self.findex.remove_doc(collection, id);
@@ -868,10 +948,8 @@ impl Store {
                 let Some(old) = col.docs.remove(id) else {
                     continue;
                 };
-                // Only a rowed doc leaves a reclaimable data row.
-                if old.row.is_some() {
-                    self.dead_rows += 1;
-                }
+                // Every named row the doc owned is independently reclaimable.
+                self.dead_rows += old.rows.len();
                 self.fts.remove_doc(collection, id);
                 self.findex.remove_doc(collection, id);
                 count += 1;
@@ -1104,19 +1182,24 @@ impl Store {
     pub fn compact(&mut self) -> Result<()> {
         self.check_writable()?;
 
-        // 1. Assign fresh contiguous row indices to live *rowed* docs (text-only docs
-        //    carry no vector and are re-emitted as `UpsertText`). Walk collections in
-        //    sorted order for determinism.
-        let rowed: usize = self
+        // 1. Assign fresh contiguous row indices to every live named vector (nidus-85t): a
+        //    doc's whole row set relocates together, keeping the name→row association. Walk
+        //    collections and docs in sorted order for determinism.
+        let total_rows: usize = self
             .collections
             .values()
             .flat_map(|c| c.docs.values())
-            .filter(|e| e.row.is_some())
-            .count();
+            .map(|e| e.rows.len())
+            .sum();
         let mut new_rows: Vec<f32> = Vec::new();
         new_rows
-            .try_reserve_exact(rowed * self.data.dimension())
-            .map_err(|_| oom("compacted vector matrix", rowed * self.data.dimension()))?;
+            .try_reserve_exact(total_rows * self.data.dimension())
+            .map_err(|_| {
+                oom(
+                    "compacted vector matrix",
+                    total_rows * self.data.dimension(),
+                )
+            })?;
         let mut next_row: u64 = 0;
 
         // Build the new ops list for the log: CreateCollection + SetMeta + Upserts.
@@ -1126,12 +1209,11 @@ impl Store {
         let mut col_names: Vec<String> = self.collections.keys().cloned().collect();
         col_names.sort();
 
-        // Collect all the row updates we need to apply to each collection's docs.
-        // We map: (collection_name, id) -> new_row
+        // Collect the row-set updates to apply to each collection's docs.
         struct PendingUpdate {
             col: String,
             id: String,
-            new_row: u64,
+            new_rows: BTreeMap<String, u64>,
         }
         let mut updates: Vec<PendingUpdate> = Vec::new();
 
@@ -1167,40 +1249,50 @@ impl Store {
                 });
             }
 
+            // Re-emit the declared vector names, same reason.
+            if !col.vector_names.is_empty() {
+                log_ops.push(Op::SetVectorNames {
+                    collection: col_name.clone(),
+                    names: col.vector_names.clone(),
+                });
+            }
+
             // Assign new rows to live docs (sorted by id for determinism).
             let mut doc_ids: Vec<&String> = col.docs.keys().collect();
             doc_ids.sort();
 
             for id in doc_ids {
                 let entry = &col.docs[id];
-                match entry.row {
-                    Some(old_row) => {
-                        // Copy the vector from the old data segment to its new row.
-                        let vec_slice = self.data.row(old_row);
-                        new_rows.extend_from_slice(vec_slice);
-
-                        let new_row = next_row;
-                        next_row += 1;
-
-                        log_ops.push(Op::Upsert {
-                            collection: col_name.clone(),
-                            id: id.clone(),
-                            row: new_row,
-                            attrs: entry.attrs.clone(),
-                        });
-                        updates.push(PendingUpdate {
-                            col: col_name.clone(),
-                            id: id.clone(),
-                            new_row,
-                        });
-                    }
+                if entry.rows.is_empty() {
                     // Text-only doc: no vector to relocate; re-emit as UpsertText.
-                    None => log_ops.push(Op::UpsertText {
+                    log_ops.push(Op::UpsertText {
                         collection: col_name.clone(),
                         id: id.clone(),
                         attrs: entry.attrs.clone(),
-                    }),
+                    });
+                    continue;
                 }
+                // Named rows relocate together, in name order (BTreeMap iteration), so a
+                // doc's row set stays contiguous the way `upsert` first wrote it.
+                let mut assigned: BTreeMap<String, u64> = BTreeMap::new();
+                for (name, &old_row) in &entry.rows {
+                    let vec_slice = self.data.row(old_row);
+                    new_rows.extend_from_slice(vec_slice);
+                    let new_row = next_row;
+                    next_row += 1;
+                    assigned.insert(name.clone(), new_row);
+                }
+                log_ops.push(Op::UpsertVectors {
+                    collection: col_name.clone(),
+                    id: id.clone(),
+                    rows: assigned.iter().map(|(n, r)| (n.clone(), *r)).collect(),
+                    attrs: entry.attrs.clone(),
+                });
+                updates.push(PendingUpdate {
+                    col: col_name.clone(),
+                    id: id.clone(),
+                    new_rows: assigned,
+                });
             }
         }
 
@@ -1262,12 +1354,12 @@ impl Store {
         stale.push(BASE_SEGMENT.to_string());
         self.delete_seg_index_sidecars(&stale);
 
-        // 3. Update in-RAM DocEntry rows.
+        // 3. Update in-RAM DocEntry row sets.
         for update in updates {
             if let Some(col) = self.collections.get_mut(&update.col)
                 && let Some(entry) = col.docs.get_mut(&update.id)
             {
-                entry.row = Some(update.new_row);
+                entry.rows = update.new_rows;
             }
         }
 

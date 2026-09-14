@@ -69,6 +69,7 @@ fn docs(seed: u64, n: usize) -> Vec<Record> {
             Record {
                 id: format!("d{i}"),
                 vector: Some(vector),
+                vectors: Default::default(),
                 attrs,
             }
         })
@@ -250,6 +251,7 @@ fn a_document_written_after_the_declaration_is_found() {
         &[Record {
             id: "late".into(),
             vector: Some(vec![0.5; DIM]),
+            vectors: Default::default(),
             attrs,
         }],
     )
@@ -282,6 +284,7 @@ fn documents_written_before_the_declaration_are_indexed_by_it() {
         &[Record {
             id: "early".into(),
             vector: Some(vec![0.5; DIM]),
+            vectors: Default::default(),
             attrs,
         }],
     )
@@ -320,6 +323,7 @@ fn an_overwritten_document_is_not_found_under_its_old_text() {
             &[Record {
                 id: "d".into(),
                 vector: Some(vec![0.5; DIM]),
+                vectors: Default::default(),
                 attrs,
             }],
         )
@@ -366,6 +370,7 @@ fn edge_case_inputs_agree_with_the_unindexed_path() {
             Record {
                 id: (*id).into(),
                 vector: Some(vec![i as f32 / 10.0; DIM]),
+                vectors: Default::default(),
                 attrs,
             }
         })
@@ -473,6 +478,7 @@ fn text_rec(id: &str, text: &str) -> Record {
     Record {
         id: id.into(),
         vector: Some(vec![0.5; DIM]),
+        vectors: Default::default(),
         attrs,
     }
 }

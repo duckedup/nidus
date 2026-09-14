@@ -130,3 +130,79 @@ fn hybrid_search_works_on_an_auto_provisioned_collection() {
         "the text-matching entry should surface through the fused ranking: {rendered}"
     );
 }
+
+/// nidus-29ui: `hybrid_search`'s `rollup` must cap chunks per parent, the same as `recall`
+/// and `text_search` already do — proving `HybridOpts.limit_per`/`expand` are wired through
+/// the fused ranking, not silently dropped.
+#[test]
+fn hybrid_search_rollup_caps_chunks_per_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = per_text_embedder_server(dir.path(), DIM);
+
+    assert_eq!(
+        server
+            .post(
+                "/collections/docs/fts-schema",
+                &json!({"fields": ["nidus.text"]})
+            )
+            .0,
+        200
+    );
+    let (status, body) = server.post(
+        "/collections/docs/upsert",
+        &json!({"records": [
+            {"id": "p1-a", "vector": [1, 0, 0], "attrs": {
+                "nidus.parent_id": {"Str": "p1"}, "nidus.chunk_index": {"Int": 0},
+                "nidus.text": {"Str": "swifts over the estuary at dawn"}
+            }},
+            {"id": "p1-b", "vector": [0.9, 0.1, 0], "attrs": {
+                "nidus.parent_id": {"Str": "p1"}, "nidus.chunk_index": {"Int": 1},
+                "nidus.text": {"Str": "swifts and estuary birds past noon"}
+            }},
+            {"id": "p2-a", "vector": [0, 1, 0], "attrs": {
+                "nidus.parent_id": {"Str": "p2"}, "nidus.chunk_index": {"Int": 0},
+                "nidus.text": {"Str": "an unrelated grocery list"}
+            }}
+        ]}),
+    );
+    assert_eq!(status, 200, "seed upsert failed: {body}");
+
+    let ids = |args: serde_json::Value| -> std::collections::BTreeSet<String> {
+        let (status, body) = mcp(
+            &server,
+            "tools/call",
+            Some("hybrid_search"),
+            &call(1, "hybrid_search", args),
+        );
+        assert_eq!(status, 200, "{body}");
+        let hits: serde_json::Value =
+            serde_json::from_str(&text(&result(&body))).expect("hits JSON");
+        hits.as_array()
+            .expect("hits array")
+            .iter()
+            .map(|h| h["id"].as_str().expect("hit id").to_string())
+            .collect()
+    };
+
+    let plain = ids(
+        json!({"collection": "docs", "field": "nidus.text", "query": "swifts estuary", "top_k": 5}),
+    );
+    assert!(
+        plain.contains("p1-a") && plain.contains("p1-b"),
+        "both p1 chunks should surface without a rollup cap: {plain:?}"
+    );
+
+    let capped = ids(json!({
+        "collection": "docs", "field": "nidus.text", "query": "swifts estuary",
+        "top_k": 5, "rollup": {"per_parent": 1}
+    }));
+    assert_eq!(
+        capped.iter().filter(|id| id.starts_with("p1")).count(),
+        1,
+        "rollup {{per_parent: 1}} must cap p1's chunks to one: {capped:?}"
+    );
+    assert_ne!(
+        plain, capped,
+        "rollup must change the hit set, not be a no-op: {capped:?}"
+    );
+}

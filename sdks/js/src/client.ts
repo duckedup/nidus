@@ -187,6 +187,7 @@ export class NidusClient {
     const wire: NidusRecord[] = records.map((r) => ({
       id: r.id,
       ...(r.vector !== undefined ? { vector: r.vector } : {}),
+      ...(r.vectors !== undefined ? { vectors: r.vectors } : {}),
       attrs: encodeAttrs(r.attrs),
     }));
     const res = await this.request<{ upserted: number }>(
@@ -226,6 +227,7 @@ export class NidusClient {
     return recs.map((r) => ({
       id: r.id,
       ...(r.vector !== undefined ? { vector: r.vector } : {}),
+      ...(r.vectors !== undefined ? { vectors: r.vectors } : {}),
       attrs: decodeAttrs(r.attrs),
     }));
   }
@@ -262,6 +264,15 @@ export class NidusClient {
     });
   }
 
+  /**
+   * Declare the named-vector fields a collection accepts on upsert and search, beyond
+   * the reserved `"default"` vector (nidus-85t). Upserting an undeclared name is a
+   * `400` naming it; mirrors {@link NidusClient.setFtsSchema}'s declare-then-use shape.
+   */
+  async setVectorNames(name: string, names: string[]): Promise<void> {
+    await this.request("POST", `/collections/${enc(name)}/vector-names`, { names });
+  }
+
   // ── Search ──────────────────────────────────────────────────────────────
 
   /** Vector (cosine) nearest-neighbour search. Empty `scope` searches all collections. */
@@ -281,6 +292,9 @@ export class NidusClient {
       diversity: opts.diversity,
       expand: encodeExpand(opts.expand),
       rerank: encodeRerank(opts.rerank),
+      names: opts.names,
+      name_weights: opts.nameWeights,
+      pool: opts.pool,
     });
   }
 
@@ -303,6 +317,9 @@ export class NidusClient {
       diversity: opts.diversity,
       expand: encodeExpand(opts.expand),
       rerank: encodeRerank(opts.rerank),
+      names: opts.names,
+      name_weights: opts.nameWeights,
+      pool: opts.pool,
     });
   }
 
@@ -451,6 +468,8 @@ export class NidusClient {
       text_weight: opts.textWeight,
       expand: encodeExpand(opts.expand),
       rerank: encodeRerank(opts.rerank),
+      limit_per: opts.limitPer,
+      diversity: opts.diversity,
     });
   }
 
@@ -475,6 +494,8 @@ export class NidusClient {
       text_weight: opts.textWeight,
       expand: encodeExpand(opts.expand),
       rerank: encodeRerank(opts.rerank),
+      limit_per: opts.limitPer,
+      diversity: opts.diversity,
     });
   }
 

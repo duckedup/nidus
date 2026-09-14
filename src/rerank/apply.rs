@@ -104,8 +104,8 @@ pub async fn text_search_reranked<'a, R: Reranker>(
     Ok(db.store().finish(reranked, opts))
 }
 
-/// Hybrid (vector + BM25) search, reranked the same way as [`search_reranked`]. `HybridOpts`
-/// has no `limit_per`, so the tail is just the page cut (`Store::finish_hybrid`).
+/// Hybrid (vector + BM25) search, reranked the same way as [`search_reranked`]. The post-rerank
+/// tail is `Store::finish_hybrid` (nidus-29ui): cap by value, spread by MMR, cut the page.
 pub async fn hybrid_reranked<'a, R: Reranker>(
     db: &Nidus,
     reranker: &R,
@@ -126,6 +126,11 @@ pub async fn hybrid_reranked<'a, R: Reranker>(
             .saturating_mul(overscan),
         offset: 0,
         candidates: opts.candidates.saturating_mul(overscan),
+        // Deferred to the post-rerank tail, not dropped: capping the widened fetch freezes each
+        // group's winner at pre-rerank order. Mirrors `widened_opts` (src/store/rerank.rs).
+        limit_per: None,
+        diversity: None,
+        expand: None,
         ..opts.clone()
     };
     let hits = db.hybrid_search(scope, vector, text, &widened)?;
@@ -155,6 +160,11 @@ pub async fn hybrid_reranked_with_plan<'a, R: Reranker>(
             .saturating_mul(overscan),
         offset: 0,
         candidates: opts.candidates.saturating_mul(overscan),
+        // Deferred to the post-rerank tail, not dropped: capping the widened fetch freezes each
+        // group's winner at pre-rerank order. Mirrors `widened_opts` (src/store/rerank.rs).
+        limit_per: None,
+        diversity: None,
+        expand: None,
         ..opts.clone()
     };
     let (hits, plan) = db.hybrid_search_with_plan(scope, vector, text, &widened)?;
@@ -367,6 +377,36 @@ mod tests {
             ids(&out),
             vec!["d", "b"],
             "one hit per group, in reranked order"
+        );
+    }
+
+    /// The hybrid twin of `search_reranked_reapplies_limit_per` (nidus-29ui). Without the
+    /// `limit_per: None` on the widened fetch this returns the pre-rerank RRF winners
+    /// `["c", "a"]`, because `hybrid_search` caps before the cross-encoder is consulted.
+    #[tokio::test]
+    async fn hybrid_reranked_reapplies_limit_per_after_the_reranker() {
+        let db = store();
+        let opts = HybridOpts {
+            top_k: 4,
+            limit_per: Some(LimitPer::new("group", 1)),
+            rerank: Some(RerankOpts::default()),
+            ..Default::default()
+        };
+        let out = hybrid_reranked(
+            &db,
+            &LenReranker,
+            "docs",
+            &[1.0, 0.0],
+            &crate::FtsQuery::new("body", "w"),
+            "q",
+            &opts,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ids(&out),
+            vec!["d", "b"],
+            "one hit per group, picked in RERANKED order — not the pre-rerank fused winners"
         );
     }
 

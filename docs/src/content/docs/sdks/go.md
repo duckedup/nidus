@@ -117,6 +117,37 @@ If your attributes arrive as plain Go values (out of your own JSON decode, say),
 `nidus.AttrsOf(map[string]any{…})`, or `nidus.ValueOf` for a single value. Both reject
 what the store has no type for and name the offending key.
 
+## Named vectors
+
+A record can carry vectors under more than one name, each declared on the collection
+first:
+
+```go
+err := db.SetVectorNames(ctx, "docs", []string{"title", "body"})
+
+n, err := db.Upsert(ctx, "docs", []nidus.Record{
+    {ID: "a", Vectors: map[string][]float32{
+        "title": {0.1, 0.2, 0.3},
+        "body":  {0.4, 0.5, 0.6},
+    }, Attrs: nidus.Attrs{"lang": nidus.Str("rust")}},
+})
+
+hits, err := db.Search(ctx, nidus.SearchRequest{
+    Query:       []float32{0.1, 0.2, 0.3},
+    Names:       []string{"title", "body"},
+    Pool:        nidus.PoolSum, // or nidus.PoolMax (the default)
+    NameWeights: map[string]float32{"title": 2}, // a name left out weights 1
+})
+```
+
+Every name shares the store's one pinned dimension. `Names` is empty (`nil`) by
+default, which searches only the reserved `default` vector (what a plain `Vector` field
+populates), byte-identical to a call written before this existed. `SearchSimilar` and
+`HybridSearch` do not take `Names`/`NameWeights`/`Pool`: both always search or fuse
+against `default` over this HTTP client. See
+[Named vectors](/guides/search/#named-vectors) for the full behaviour, including the
+library/CLI surfaces that do support it on a "more like this" query.
+
 ## Typed attributes on the way back
 
 `Hit.Attrs` and `Record.Attrs` keep typed `Value`s rather than decoding to `any`. Read

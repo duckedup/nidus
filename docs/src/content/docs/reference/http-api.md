@@ -33,6 +33,7 @@ so the same id appears in your logs and the server's.
 | `GET /collections/{name}/records` | every record in a collection | `get_all` |
 | `POST /collections/{name}/fts-schema` | declare full-text-indexed fields | `set_fts_schema` |
 | `POST /collections/{name}/filter-index` | declare filter-indexed fields | `set_filter_index` |
+| `POST /collections/{name}/vector-names` | declare a collection's named-vector fields | `set_vector_names` |
 | `POST /suggest` | ranked term completions from the full-text vocabulary | `suggest` |
 | `POST /search` | nearest-neighbour search | `search` |
 | `POST /search/similar` | "more like this" using a stored record's own vector | `search_similar` |
@@ -304,6 +305,25 @@ curl -s -X POST localhost:7700/collections/docs/filter-index \
 # → {"ok": true}
 ```
 
+### `POST /collections/{name}/vector-names`
+
+Declare a collection's additional named-vector fields: the names an upsert may set on
+`Record::vectors` and a search may score with `names`, beyond the reserved `default`
+vector that `Record::vector` always populates. Run it before the first upsert or search
+that uses a name; see [Named vectors](/guides/search/#named-vectors).
+
+```bash
+curl -s -X POST localhost:7700/collections/docs/vector-names \
+  -H 'content-type: application/json' \
+  -d '{"names": ["title", "summary"]}'
+# → {"ok": true}
+```
+
+Never include `"default"` here: it needs no declaration and is refused with a `400`
+naming the reason. Re-running replaces the whole set rather than adding to it, mirroring
+`fts-schema`. An upsert naming an undeclared vector is a `400` naming the record and the
+missing declaration.
+
 ## Aliases
 
 An alias is an indirect name resolving to one concrete collection, one hop only (an
@@ -347,6 +367,10 @@ curl -s -X DELETE localhost:7700/aliases/docs   # → {"dropped": "docs"}
 
 Insert or overwrite records by id. Each record is `{id, vector, attrs}`; `vector`
 length must match the store dimension, and may be **omitted** for a text-only document.
+A record may also carry `vectors`, a `{name: [floats]}` map of additional named vectors
+declared on the collection first (see [`vector-names`](#post-collectionsnamevector-names)
+above); every entry must match the store dimension, and `"default"` is refused there,
+since that name is what the bare `vector` field is for.
 `attrs` values are tagged: `{"Str": …}`, `{"Int": …}`, `{"Bool": …}`, `{"List": […]}`,
 `{"Float": …}`, `{"DateTime": …}` (epoch milliseconds), and the unit variant `Null` is
 the bare string `"Null"`, not an object.
@@ -431,6 +455,9 @@ curl -s localhost:7700/search \
 | `expand` | none | widen each hit with its document's neighbouring chunks; see [`expand`](#expand-widen-a-hit-with-its-neighbouring-chunks) |
 | `rerank` | none | re-score the candidate window with a hosted cross-encoder; see below |
 | `plan` | `false` | report how the query ran alongside the hits; see [Query plans](#query-plans-how-a-query-ran) |
+| `names` | none | named vectors to score; see [Scoring several named vectors](#scoring-several-named-vectors) |
+| `name_weights` | none | per-name weight, keyed by name; meaningless when `names` is empty |
+| `pool` | `"Max"` | how several `names` scores fold into one; meaningless when `names` is empty |
 
 Omitting `rerank` leaves the response byte-identical to a nidus without the feature.
 `rerank` is compiled in under the `rerank` feature, part of the default build;
@@ -532,6 +559,25 @@ record, so `exclude_attributes` cannot lift the cap. The cap is exact only withi
 over-fetch window, so a capped page may come back shorter than `top_k`; what is guaranteed
 is that no page carries more than `max` hits for one value.
 
+#### Scoring several named vectors
+
+A collection with [named vectors](#post-collectionsnamevector-names) declared can be
+searched on more than the `default` one:
+
+```bash
+curl -s localhost:7700/search \
+  -H 'content-type: application/json' \
+  -d '{"query": [1, 0, 0], "names": ["title", "summary"], "pool": "Max"}'
+```
+
+`names` is empty by default, so an old request that never sends it searches only
+`default`, byte-identical to before this existed. A record is scored on whichever of
+`names` it actually carries, so a record missing one of them is not penalized for the
+gap. `name_weights` scales one name's score before pooling; a name absent there weights
+`1.0`. `pool` folds the (weighted) per-name scores into one record score: `"Max"` (the
+default) takes the best, `"Sum"` adds them all. Both fields are ignored, by the store,
+when `names` is empty.
+
 ### `POST /search/similar`
 
 "More like this": search using the vector already stored at `collection`/`id`, instead of
@@ -562,7 +608,11 @@ curl -s localhost:7700/search/similar \
 | `plan` | `false` | report how the query ran alongside the hits; see [Query plans](#query-plans-how-a-query-ran) |
 
 The one difference from `/search`: an omitted or empty `scope` searches only the source's
-own collection, not every collection in the store.
+own collection, not every collection in the store. `/search/similar` does not take
+`names`/`name_weights`/`pool`: it always searches the source record's `default` vector.
+The [`nidus similar` CLI](/reference/cli/#similar) and the library's `search_similar` are
+not limited this way, since they call `SearchOpts` directly rather than going through this
+narrower wire shape.
 
 The source record is always excluded from its own results, by `(collection, id)` identity
 rather than by score, so a genuine duplicate of the source (also scoring near 1.0) still
@@ -791,6 +841,18 @@ rules, which apply here unchanged.
 curl -s localhost:7700/hybrid-search \
   -H 'content-type: application/json' \
   -d '{"vector": [1,0,0], "field": "body", "text": "CVE-2026-1234", "text_weight": 3.0}'
+```
+
+`limit_per` and `diversity` cap and spread the **fused** ranking, the same as on
+`/search` (see [Capping hits per attribute value](#capping-hits-per-attribute-value)
+and [`diversity`](/guides/search/#spreading-near-duplicates-apart)); both run after
+fusion, on the one ranking that exists by then. `/hybrid-search` does not take
+`names`/`name_weights`/`pool`: a hybrid query always searches the `default` vector.
+
+```bash
+curl -s localhost:7700/hybrid-search \
+  -H 'content-type: application/json' \
+  -d '{"vector": [1,0,0], "field": "body", "text": "vector database", "limit_per": {"field": "path", "max": 2}}'
 ```
 
 ### `expand`: widen a hit with its neighbouring chunks

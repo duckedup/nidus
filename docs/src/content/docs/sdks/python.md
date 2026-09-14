@@ -136,6 +136,35 @@ db.upsert("docs", [{"id": "d", "attrs": {"tags": v.list(["a", "b"]), "rank": v.i
 `v.nil()` is the explicit `Null` value ("set, and empty"), which is a different fact from
 an absent key ("not set / not indexed"). The SDK keeps the two apart in both directions.
 
+## Named vectors
+
+A record can carry vectors under more than one name, each declared on the collection
+first:
+
+```python
+db.set_vector_names("docs", ["title", "body"])
+
+db.upsert("docs", [
+    {"id": "a", "vectors": {"title": [0.1, 0.2, 0.3], "body": [0.4, 0.5, 0.6]},
+     "attrs": {"lang": "rust"}},
+])
+
+hits = db.search(
+    query=[0.1, 0.2, 0.3],
+    names=["title", "body"],
+    pool="Sum",  # or "Max" (the default): fold several named scores into one
+    name_weights={"title": 2.0},  # a name left out weights 1
+)
+```
+
+Every name shares the store's one pinned dimension. `names` is empty by default, which
+searches only the reserved `default` vector (what a plain `vector` field populates),
+byte-identical to a call written before this existed. `search_similar` and
+`hybrid_search` do not take `names`/`name_weights`/`pool`: both always search or fuse
+against `default` over this HTTP client. See
+[Named vectors](/guides/search/#named-vectors) for the full behaviour, including the
+library/CLI surfaces that do support it on a "more like this" query.
+
 ## Similar records ("more like this")
 
 `search_similar` runs a search using the vector already stored at a record, instead of

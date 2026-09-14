@@ -40,6 +40,11 @@ pub const META_CREATED_AT: &str = "nidus.created_at";
 /// Attr key holding the `Value::DateTime` (UTC epoch ms) an entry was last written.
 pub const META_UPDATED_AT: &str = "nidus.updated_at";
 
+/// Declared vector name a chunked document's title embeds under (nidus-85t decision 6),
+/// alongside the chunk body's own [`crate::DEFAULT_VECTOR`]. Declared on first use, never
+/// invented at upsert time (unit 1's per-collection name schema).
+pub const VECTOR_TITLE: &str = "title";
+
 /// Default `top_k` used by [`recall`](Memory::recall) when [`RecallOpts::top_k`]
 /// is left at its `0` default.
 pub(crate) const DEFAULT_TOP_K: usize = 10;
@@ -398,6 +403,24 @@ pub(crate) fn ensure_collection_and_pin<E: Embedder>(
     Ok(())
 }
 
+/// Declare [`VECTOR_TITLE`] on `collection` if not already declared, additively — never
+/// clobbering names some other write already declared. Called only when this write actually
+/// has a title, so a title-less document never touches an unrelated collection's schema.
+fn ensure_title_vector_declared(db: &mut Nidus, collection: &str) -> anyhow::Result<()> {
+    let resolved = db.resolve_alias(collection);
+    let collection = resolved.as_deref().unwrap_or(collection);
+    if !db
+        .vector_names(collection)
+        .iter()
+        .any(|n| n == VECTOR_TITLE)
+    {
+        let mut names = db.vector_names(collection).to_vec();
+        names.push(VECTOR_TITLE.to_string());
+        db.set_vector_names(collection, &names)?;
+    }
+    Ok(())
+}
+
 /// Whether `collection` already holds rows. Counted from the in-RAM index, so this is a
 /// map walk rather than a scan of the vectors.
 fn collection_has_rows(db: &Nidus, collection: &str) -> anyhow::Result<bool> {
@@ -497,8 +520,15 @@ pub(crate) async fn remember_chunked_with<E: Embedder>(
         });
     }
 
-    let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-    let vectors = embedder.embed_batch(&texts).await.with_context(|| {
+    // The document's title (nidus-85t decision 6), if any: one extra text in the same
+    // `embed_batch` call, not a second provider round-trip. Shared across every chunk of
+    // this document, since the title names the whole document, not one span of it.
+    let title = crate::chunk::extract_title(text);
+    let mut texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+    if let Some(t) = &title {
+        texts.push(t.as_str());
+    }
+    let mut vectors = embedder.embed_batch(&texts).await.with_context(|| {
         format!(
             "embedding {} chunks for '{collection}/{parent_id}'",
             texts.len()
@@ -508,13 +538,16 @@ pub(crate) async fn remember_chunked_with<E: Embedder>(
     let n = chunks.len();
     // `zip` would silently drop the tail while `n` still gates the prune below, writing
     // fewer chunks than the prune assumes survive.
-    if vectors.len() != n {
+    if vectors.len() != texts.len() {
         bail!(
-            "remember_chunked: embedder returned {} vectors for {n} chunks of \
+            "remember_chunked: embedder returned {} vectors for {} texts of \
              '{collection}/{parent_id}'",
-            vectors.len()
+            vectors.len(),
+            texts.len()
         );
     }
+    // The title, when present, was appended last (see above), so its vector is the tail.
+    let title_vector = title.as_ref().map(|_| vectors.pop().unwrap());
     let writes: Vec<(RememberWrite, Vec<f32>, i64, i64)> = chunks
         .into_iter()
         .zip(vectors)
@@ -535,7 +568,14 @@ pub(crate) async fn remember_chunked_with<E: Embedder>(
     // durability barrier between them, so the two generations are never both committed —
     // a per-chunk loop committed each independently and tore on any crash (nidus-lvo.5).
     let (remembered, pruned) = db.deferred(|db| {
-        let remembered = commit_remember_chunks(db, embedder, collection, parent_id, writes)?;
+        let remembered = commit_remember_chunks_with_title(
+            db,
+            embedder,
+            collection,
+            parent_id,
+            writes,
+            title_vector,
+        )?;
         let pruned = db.delete_where(
             collection,
             &Filter(vec![Predicate::All(vec![
@@ -622,7 +662,9 @@ pub fn remember_chunked_text_only(
         if !db.has_collection(&target) {
             db.create_collection(&target)?;
         }
-        let remembered = commit_chunks_inner(db, &target, parent_id, writes)?;
+        // No embedder on this path (nidus-gmy.6), so no title vector either — a text-only
+        // write has nothing to embed a title *or* a body with.
+        let remembered = commit_chunks_inner(db, &target, parent_id, writes, None)?;
         let pruned = db.delete_where(
             &target,
             &Filter(vec![Predicate::All(vec![
@@ -661,25 +703,29 @@ pub(crate) fn commit_remember<E: Embedder>(
     commit_remember_inner(db, embedder, collection, write, vector, None)
 }
 
-/// [`commit_remember`] for **every** chunk of one document, as a single `upsert`, plus the
-/// `(parent_id, chunk_index, char_start)` provenance stamped here so a caller cannot forge it.
-/// One batch, because a per-chunk loop left two generations mixed on a crash (nidus-lvo.5).
-pub(crate) fn commit_remember_chunks<E: Embedder>(
+/// [`commit_remember`] for **every** chunk of one document as one `upsert`, with the
+/// `(parent_id, chunk_index, char_start)` provenance stamped here so a caller cannot forge it,
+/// plus an optional [`VECTOR_TITLE`] vector on every chunk (nidus-85t); `None` writes none.
+pub(crate) fn commit_remember_chunks_with_title<E: Embedder>(
     db: &mut Nidus,
     embedder: &E,
     collection: &str,
     parent_id: &str,
     chunks: Vec<(RememberWrite, Vec<f32>, i64, i64)>,
+    title_vector: Option<Vec<f32>>,
 ) -> anyhow::Result<Vec<Remembered>> {
     ensure_collection_and_pin(db, embedder, collection)?;
+    if title_vector.is_some() {
+        ensure_title_vector_declared(db, collection)?;
+    }
     let chunks = chunks
         .into_iter()
         .map(|(w, v, i, c)| (w, Some(v), i, c))
         .collect();
-    commit_chunks_inner(db, collection, parent_id, chunks)
+    commit_chunks_inner(db, collection, parent_id, chunks, title_vector)
 }
 
-/// The embedder-free half of [`commit_remember_chunks`]: stamping, provenance and the one
+/// The embedder-free half of [`commit_remember_chunks_with_title`]: stamping, provenance and the one
 /// all-or-nothing `upsert`. Split out so the text-only ingest path (nidus-gmy.6) reuses the
 /// exact write semantics without an embedder to pin the collection with.
 fn commit_chunks_inner(
@@ -687,6 +733,7 @@ fn commit_chunks_inner(
     collection: &str,
     parent_id: &str,
     chunks: Vec<(RememberWrite, Option<Vec<f32>>, i64, i64)>,
+    title_vector: Option<Vec<f32>>,
 ) -> anyhow::Result<Vec<Remembered>> {
     let mut records = Vec::with_capacity(chunks.len());
     let mut out = Vec::with_capacity(chunks.len());
@@ -701,7 +748,15 @@ fn commit_chunks_inner(
             vector,
             Some((parent_id, index, char_start)),
         )?;
-        records.push(record_from(&p));
+        // Every chunk of one document shares the same title (nidus-85t decision 6): a
+        // second named vector alongside the chunk's own body vector, not a replacement.
+        let mut record = record_from(&p);
+        if let Some(title) = &title_vector {
+            record
+                .vectors
+                .insert(VECTOR_TITLE.to_string(), title.clone());
+        }
+        records.push(record);
         out.push((p.id, p.deduped));
     }
     // One all-or-nothing batch (SPEC §6.1): every fallible step rolls `data` and `log` back
@@ -2582,6 +2637,149 @@ mod tests {
         );
         for i in 0..10 {
             assert!(ids.contains(&format!("doc-a#{i}")));
+        }
+    }
+
+    /// nidus-85t decision 6: a chunked document with a leading markdown heading writes its
+    /// title as a *second* named vector alongside each chunk's own (unchanged) default body
+    /// vector, and the title becomes searchable by name. Fails if ingest writes one vector.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn remember_chunked_with_a_title_writes_a_second_named_vector() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+        let text = format!("# My Title\n{}", "a".repeat(95));
+
+        let result = remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-1",
+            &text,
+            &small_chunk_opts(),
+            RememberOpts::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.chunks.is_empty());
+
+        assert_eq!(
+            db.vector_names("docs").to_vec(),
+            vec![VECTOR_TITLE.to_string()]
+        );
+        // `data` stores unit vectors (SPEC 5.1: normalized before writing), so the stored
+        // title vector is the normalized form of what the embedder returned, not the raw one.
+        let title_vector = emb.vector_for("My Title");
+        let stored_title = {
+            let mut v = title_vector.clone();
+            crate::search::normalize(&mut v);
+            v
+        };
+        for remembered in &result.chunks {
+            let record = db.get("docs", &remembered.id).unwrap();
+            assert!(record.vector.is_some(), "the body vector is unchanged");
+            assert_eq!(
+                record.vectors.get(VECTOR_TITLE),
+                Some(&stored_title),
+                "every chunk of the document shares the same title vector"
+            );
+        }
+
+        // Named search over "title" alone finds the document; an unnamed search still finds
+        // it via the untouched default (body) vector — decision 5, both vectors coexist.
+        let by_title = db
+            .search(
+                "docs",
+                &title_vector,
+                &SearchOpts {
+                    top_k: 5,
+                    names: vec![VECTOR_TITLE.to_string()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            by_title.iter().any(|h| h.id.starts_with("doc-1#")),
+            "searching the title name alone must return the document: {by_title:?}"
+        );
+
+        let first = db.get("docs", &result.chunks[0].id).unwrap();
+        let by_body = db
+            .search(
+                "docs",
+                first.vector.as_ref().unwrap(),
+                &SearchOpts {
+                    top_k: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            by_body.iter().any(|h| h.id == result.chunks[0].id),
+            "an unnamed search must still match via the untouched default body vector: {by_body:?}"
+        );
+    }
+
+    /// nidus-85t decision 6, the partially-populated case: a document with no leading
+    /// heading writes only the body (default) vector — no `vectors` entry at all — so an
+    /// existing corpus with no titles is untouched in shape.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    async fn remember_chunked_without_a_title_writes_only_the_default_vector() {
+        let (_dir, mut db) = open_tmp(8);
+        let emb = FakeEmbedder::new(8, "fake", "v1");
+
+        let result = remember_chunked_with(
+            &mut db,
+            &emb,
+            "docs",
+            "doc-1",
+            &"a".repeat(95),
+            &small_chunk_opts(),
+            RememberOpts::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.chunks.is_empty());
+
+        assert!(
+            db.vector_names("docs").is_empty(),
+            "no name was ever declared"
+        );
+        for remembered in &result.chunks {
+            let record = db.get("docs", &remembered.id).unwrap();
+            assert!(record.vector.is_some());
+            assert!(
+                record.vectors.is_empty(),
+                "a title-less document must carry only the body name: {record:?}"
+            );
+        }
+    }
+
+    /// The FTS-only ingest path has no embedder at all (nidus-gmy.6), so a leading heading
+    /// must not produce a title vector — there is nothing to embed it with.
+    #[test]
+    #[cfg_attr(miri, ignore)] // upsert fsyncs
+    fn remember_chunked_text_only_never_writes_a_title_vector() {
+        let (_dir, mut db) = open_tmp(8);
+        let text = format!("# My Title\n{}", "a".repeat(95));
+
+        let result = remember_chunked_text_only(
+            &mut db,
+            "docs",
+            "doc-1",
+            &text,
+            &small_chunk_opts(),
+            RememberOpts::default(),
+        )
+        .unwrap();
+        assert!(!result.chunks.is_empty());
+
+        assert!(db.vector_names("docs").is_empty());
+        for remembered in &result.chunks {
+            let record = db.get("docs", &remembered.id).unwrap();
+            assert!(record.vector.is_none(), "text-only records carry no vector");
+            assert!(record.vectors.is_empty());
         }
     }
 }

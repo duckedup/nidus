@@ -78,10 +78,16 @@ fn prompts_list_advertises_recall_then_answer() {
     let names: Vec<&str> = args.iter().filter_map(|a| a["name"].as_str()).collect();
     assert_eq!(
         names,
-        vec!["question", "collection", "top_k"],
+        vec!["question", "collection", "top_k", "names", "pool"],
         "argument set/order changed: {args:?}"
     );
-    for (name, required) in [("question", true), ("collection", true), ("top_k", false)] {
+    for (name, required) in [
+        ("question", true),
+        ("collection", true),
+        ("top_k", false),
+        ("names", false),
+        ("pool", false),
+    ] {
         let arg = args
             .iter()
             .find(|a| a["name"] == name)
@@ -296,6 +302,64 @@ fn a_non_numeric_top_k_is_still_rejected() {
             .as_str()
             .unwrap_or_default()
             .contains("top_k"),
+        "the error should name the argument: {body}"
+    );
+}
+
+/// `names: "default"` restricts the prompt's recall to the reserved default vector — the one
+/// every pre-nidus-85t memory already carries — so the prompt must come back unchanged
+/// (decision 5).
+#[test]
+fn naming_only_the_default_vector_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = per_text_embedder_server(dir.path(), DIM);
+
+    remember(
+        &server,
+        json!({"collection": "notes", "text": "the ranking bug is in the upsert path", "id": "bug"}),
+    );
+
+    let (plain_status, plain_body) = get_prompt(
+        &server,
+        "recall_then_answer",
+        json!({"question": "ranking bug", "collection": "notes"}),
+    );
+    let (named_status, named_body) = get_prompt(
+        &server,
+        "recall_then_answer",
+        json!({"question": "ranking bug", "collection": "notes", "names": "default"}),
+    );
+    assert_eq!(plain_status, 200, "{plain_body}");
+    assert_eq!(named_status, 200, "{named_body}");
+    assert_eq!(
+        message_text(&result(&plain_body)),
+        message_text(&result(&named_body)),
+        "naming only the default vector must not change the prompt"
+    );
+}
+
+/// An unrecognised `pool` value is a caller fault naming the argument, not a silent
+/// fallback to `max`.
+#[test]
+fn an_unknown_pool_value_is_a_caller_fault() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = per_text_embedder_server(dir.path(), DIM);
+
+    let (status, body) = get_prompt(
+        &server,
+        "recall_then_answer",
+        json!({"question": "anything", "collection": "notes", "pool": "average"}),
+    );
+    assert_eq!(
+        status, 400,
+        "an unknown pool value is a caller fault: {body}"
+    );
+    assert_eq!(body["error"]["code"].as_i64(), Some(-32602), "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pool"),
         "the error should name the argument: {body}"
     );
 }

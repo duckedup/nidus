@@ -7,8 +7,9 @@ Every flag the `nidus` binary accepts, generated from `nidus --help` and each su
 own `--help`. For a guided tour with worked examples, see the [command-line
 guide](/guides/cli-and-server/); this page is the exhaustive reference.
 
-The binary has **34 subcommands**: `serve`, `mcp`, `collections`, `create`, `drop`,
-`upsert`, `search`, `similar`, `query`, `aggregate`, `list`, `set-fts-schema`, `suggest`,
+The binary has **35 subcommands**: `serve`, `mcp`, `collections`, `create`, `drop`,
+`upsert`, `search`, `similar`, `query`, `aggregate`, `list`, `set-fts-schema`,
+`set-vector-names`, `suggest`,
 `text-search`, `hybrid-search`, `get`, `delete`, `compact`, `versions`, `configure`,
 `backup`, `restore`, `verify`, `check`, `stats`, `tune`, `ingest`, `code ingest`,
 `code search`, `remember`, `recall`, `aliases`, `set-alias`, `drop-alias`.
@@ -20,7 +21,7 @@ binary was built:
 
 | Install | Command | Surface |
 | --- | --- | --- |
-| `cargo install nidus`, `cargo binstall nidus`, the install script, or the release tarballs | n/a | Everything below: all 34 subcommands, every `--embed-*`/`--summarize-*` flag, `mcp`, `ingest`, `code ingest`, `code search`, `remember`, `recall` |
+| `cargo install nidus`, `cargo binstall nidus`, the install script, or the release tarballs | n/a | Everything below: all 35 subcommands, every `--embed-*`/`--summarize-*` flag, `mcp`, `ingest`, `code ingest`, `code search`, `remember`, `recall` |
 | `cargo install nidus --no-default-features --features cli` | build from source | No `mcp`, `ingest`, `code ingest`, `code search`, `remember`, or `recall` subcommand, and `serve` has **no** `--embed-*`/`--summarize-*` flags |
 
 `cargo install nidus` builds with `default = ["serve"]`, the umbrella feature
@@ -222,7 +223,10 @@ nidus drop-alias --dir ./mystore docs
 ### `upsert`
 
 Upsert records (JSON array) from a file or stdin. Usage:
-`nidus upsert [OPTIONS] --dir <DIR> <COLLECTION>`.
+`nidus upsert [OPTIONS] --dir <DIR> <COLLECTION>`. Each record may carry `vector` (the
+`default` vector), `vectors` (a `{name: [floats]}` map of additional named vectors, or
+both); every name in `vectors` must be declared first with
+[`set-vector-names`](#set-vector-names).
 
 | Flag | Env | Description |
 | --- | --- | --- |
@@ -255,6 +259,9 @@ Nearest-neighbour search; the query vector is a JSON array of floats. Usage:
 | `--rerank-query <TEXT>` (`rerank` feature) | none | Text scored against each candidate by the cross-encoder. |
 | `--rerank-overscan <N>` (`rerank` feature) | none | Candidates retrieved per `top_k` before the cross-encoder rerank (default `10`). |
 | `--rerank-text-attr <ATTR>` (`rerank` feature) | none | Attr holding each candidate's text for the cross-encoder rerank (default `nidus.text`). |
+| `--name <NAME>` | none | Named vector to score (repeatable), declared first with `set-vector-names`. Omit to search only `default`. |
+| `--weight <NAME=N>` | none | Per-`--name` weight (repeatable), e.g. `title=2.0`. A name not given here weights `1.0`. Meaningless with no `--name`. |
+| `--pool <max\|sum>` | none | How several `--name` scores fold into one per-record score before top-k (default `max`). |
 | `--plan` | none | Print `{hits, plan}` instead of the bare hit array: path taken, rows scanned, candidate survival, timings. See [Query plans](/reference/http-api/#query-plans-how-a-query-ran). |
 
 ### `similar`
@@ -338,6 +345,17 @@ the affected field indexes.
 | `--b <N>` | none | BM25 length normalization, `0..=1` (default `0.75`). |
 | `--ascii-folding` | none | Fold Latin diacritics to ASCII, so "café" and "cafe" share a term. |
 | `--max-token-len <N>` | none | Drop tokens longer than this many characters (default: no limit). |
+
+### `set-vector-names`
+
+Declare a collection's additional named-vector fields, beyond the reserved `default`
+vector. Usage: `nidus set-vector-names [OPTIONS] --dir <DIR> <COLLECTION>`. Re-running
+replaces the whole set rather than adding to it, mirroring `set-fts-schema`. See
+[Named vectors](/guides/search/#named-vectors).
+
+| Flag | Env | Description |
+| --- | --- | --- |
+| `--name <NAME>` | none | Vector name to declare (repeatable). At least one is required; never `default`, which needs no declaration. |
 
 ### `suggest`
 
@@ -438,6 +456,9 @@ Fuse a vector query and a BM25 text query with Reciprocal Rank Fusion. Usage:
 | `--candidates <N>` | none | Candidates pulled per leg before fusing (default `100`). |
 | `--vector-weight <N>` | none | Weight on the vector leg's fused contribution (default `1`). |
 | `--text-weight <N>` | none | Weight on the BM25 leg's fused contribution (default `1`). |
+| `--limit-per <ATTR>` | none | Cap fused hits per distinct value of this attribute (needs `--limit-per-max`). |
+| `--limit-per-max <N>` | none | Maximum fused hits kept per distinct `--limit-per` value. |
+| `--diversity <LAMBDA>` | none | MMR lambda spreading the fused hits in vector space: `1.0` pure relevance, `0.0` pure spread. |
 | `--expand-radius <N>` | none | Widen each fused hit with this many neighbouring chunks of its own document, either side. Adds a `context` field; changes nothing about the ranking. |
 | `--expand-parent-field <ATTR>` | none | Attr grouping a document's chunks (default `nidus.parent_id`); needs `--expand-radius`. |
 | `--expand-index-field <ATTR>` | none | Attr ordering the chunks within a document (default `nidus.chunk_index`); needs `--expand-radius`. |

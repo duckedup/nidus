@@ -98,6 +98,32 @@ pub(super) fn optional_f32(
     }
 }
 
+/// An optional array of strings, e.g. named-vector selection (nidus-85t). Type-checked only;
+/// semantic checks (empty, duplicate) are the store's job, so the error names the same rule
+/// regardless of which surface sent the query.
+pub(super) fn optional_string_array(
+    args: &Map<String, JsonValue>,
+    key: &str,
+) -> Result<Vec<String>, McpError> {
+    match args.get(key) {
+        None | Some(JsonValue::Null) => Ok(Vec::new()),
+        Some(JsonValue::Array(items)) => items
+            .iter()
+            .map(|v| match v {
+                JsonValue::String(s) => Ok(s.clone()),
+                _ => Err(McpError::invalid_params(
+                    format!("`{key}` items must be strings"),
+                    None,
+                )),
+            })
+            .collect(),
+        Some(_) => Err(McpError::invalid_params(
+            format!("`{key}` must be an array of strings"),
+            None,
+        )),
+    }
+}
+
 /// Map a [`crate::server::ApiError`] onto an MCP error, split by status: a `4xx` is worth a
 /// retry, a `5xx` is not. Reporting a server fault as bad arguments causes rephrase-and-retry loops.
 pub(super) fn api_error(err: crate::server::ApiError) -> McpError {

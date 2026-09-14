@@ -622,6 +622,66 @@ mod tests {
         assert_eq!(hits[0].id, "a");
     }
 
+    /// **Load-bearing** (nidus-85t): every named row of a record must survive backup and
+    /// restore, not just the default one — losing one is silent data loss. Fails if either
+    /// name reads back as absent or as the other name's vector.
+    #[test]
+    fn round_trip_preserves_every_named_vector() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let archive = src.path().join("snap.tar.gz");
+
+        let mut db = Nidus::open(Config::new(src.path().to_path_buf(), 3)).unwrap();
+        db.set_vector_names("docs", &["title".to_string(), "body".to_string()])
+            .unwrap();
+        let title = vec![1.0, 0.0, 0.0];
+        let body = vec![0.0, 1.0, 0.0];
+        let mut vectors = BTreeMap::new();
+        vectors.insert("title".to_string(), title.clone());
+        vectors.insert("body".to_string(), body.clone());
+        // Carries the default vector too, so the record has three rows total: the export
+        // must not silently keep only one of them.
+        let record = Record {
+            id: "a".to_string(),
+            vector: Some(vec![0.0, 0.0, 1.0]),
+            vectors,
+            attrs: BTreeMap::new(),
+        };
+        db.upsert("docs", std::slice::from_ref(&record)).unwrap();
+        db.flush().unwrap();
+
+        let report = backup(&src.path().to_string_lossy(), &archive.to_string_lossy()).unwrap();
+        assert_eq!(report.dimension, 3);
+
+        let restored = dst.path().join("store");
+        let rr = restore(
+            &archive.to_string_lossy(),
+            &restored.to_string_lossy(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(rr.records, 1);
+
+        let restored_db =
+            Nidus::open(Config::new(restored, 3).open_mode(OpenMode::ReadOnly)).unwrap();
+        // The declaration itself survives (replayed from `log`), not only the rows.
+        assert_eq!(restored_db.vector_names("docs"), ["title", "body"]);
+        let got = restored_db
+            .get("docs", "a")
+            .expect("restored record must still exist");
+        assert_eq!(got.vector, record.vector, "the default row was dropped");
+        assert_eq!(
+            got.vectors.get("title"),
+            Some(&title),
+            "the 'title' named row was dropped"
+        );
+        assert_eq!(
+            got.vectors.get("body"),
+            Some(&body),
+            "the 'body' named row was dropped"
+        );
+    }
+
     #[test]
     fn backup_to_file_url_then_restore() {
         let src = tempfile::tempdir().unwrap();

@@ -234,6 +234,9 @@ class Record:
     id: str
     #: ``None`` for a text-only doc (the field is absent on the wire), distinct from ``[]``.
     vector: Optional[list[float]] = None
+    #: Named vectors beyond ``vector`` (nidus-85t), keyed by name. Empty for a record that
+    #: carries none, mirroring the server's own elision of an empty map.
+    vectors: dict[str, list[float]] = field(default_factory=dict)
     attrs: dict[str, DecodedValue] = field(default_factory=dict)
 
 
@@ -399,9 +402,14 @@ class RecordInput(_RecordRequired, total=False):
     ``attrs`` takes plain Python values (or ``v.*`` helpers) and the SDK normalizes them.
     Omitting ``vector`` stores a text-only doc. Omitting ``attrs`` is allowed here even
     though the wire field is mandatory — the request builder sends ``{}`` for you.
+
+    ``vectors`` carries named vectors beyond ``vector`` (nidus-85t): each name must be
+    declared on the collection first with :meth:`~nidus.NidusClient.set_vector_names`, and
+    every vector, named or not, must match the store's dimension.
     """
 
     vector: Sequence[float]
+    vectors: Mapping[str, Sequence[float]]
     attrs: Mapping[str, AttrInput]
 
 

@@ -20,6 +20,35 @@ function mockFetch(body: unknown, status = 200) {
   return { fn, calls };
 }
 
+/// A minimal but COMPLETE `{ hits, plan }` body. `decodeQueryPlan` reads `plan.timings.*`,
+/// so a bare `{}` plan throws rather than decoding — any `*WithPlan` call needs this shape.
+function emptyPlanBody() {
+  return {
+    hits: [],
+    plan: {
+      path: "brute_force",
+      rows_scanned: 0,
+      candidates: {
+        surfaced: 0,
+        survived: 0,
+        dropped_out_of_scope: 0,
+        dropped_stale: 0,
+        dropped_filtered: 0,
+        dropped_min_score: 0,
+      },
+      narrowing: { state: "not_narrowed", candidates: 0 },
+      timings: {
+        narrow_us: 0,
+        gather_us: 0,
+        walk_us: 0,
+        resolve_us: 0,
+        score_us: 0,
+        total_us: 0,
+      },
+    },
+  };
+}
+
 describe("value encoding", () => {
   it("maps plain JS scalars to the externally-tagged wire shape", () => {
     expect(encodeValue("rust")).toEqual({ Str: "rust" });
@@ -707,6 +736,100 @@ describe("NidusClient request shaping", () => {
       textWeight: 0.5,
     });
     expect(calls[2]!.json).toMatchObject({ vector_weight: 2, text_weight: 0.5 });
+  });
+
+  it("declares vector names by posting to /vector-names", async () => {
+    const { fn, calls } = mockFetch({ ok: true });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.setVectorNames("docs", ["title", "body"]);
+    expect(calls[0]!.url).toBe("http://x/collections/docs/vector-names");
+    expect(calls[0]!.json).toEqual({ names: ["title", "body"] });
+  });
+
+  it("sends a record's named vectors on upsert, omitted when unset", async () => {
+    const { fn, calls } = mockFetch({ upserted: 1 });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.upsert("docs", [
+      { id: "a", vectors: { title: [1, 0, 0], body: [0, 1, 0] }, attrs: {} },
+    ]);
+    expect(calls[0]!.json).toEqual({
+      records: [
+        {
+          id: "a",
+          vectors: { title: [1, 0, 0], body: [0, 1, 0] },
+          attrs: {},
+        },
+      ],
+    });
+
+    await db.upsert("docs", [{ id: "b", vector: [1, 0, 0], attrs: {} }]);
+    expect("vectors" in (calls[1]!.json as { records: object[] }).records[0]!).toBe(false);
+  });
+
+  it("omits names/nameWeights/pool unless asked, and maps them to snake_case", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    // Unset: byte-identical to a client that predates named vectors (nidus-85t).
+    await db.search({ query: [1, 0, 0], topK: 5 });
+    expect(calls[0]!.json).toEqual({ query: [1, 0, 0], scope: [], top_k: 5, filter: [] });
+
+    await db.search({
+      query: [1, 0, 0],
+      topK: 5,
+      names: ["title", "body"],
+      nameWeights: { title: 2, body: 1 },
+      pool: "Sum",
+    });
+    expect(calls[1]!.json).toMatchObject({
+      names: ["title", "body"],
+      name_weights: { title: 2, body: 1 },
+      pool: "Sum",
+    });
+
+    // `*WithPlan` decodes `{ hits, plan }`, not a bare array, so it needs its own mock body.
+    const { fn: planFn, calls: planCalls } = mockFetch(emptyPlanBody());
+    const planDb = new NidusClient({ baseUrl: "http://x", fetch: planFn });
+    await planDb.searchWithPlan({ query: [1, 0, 0], names: ["title"] });
+    expect(planCalls[0]!.json).toMatchObject({ names: ["title"] });
+  });
+
+  it("omits limitPer/diversity on hybridSearch unless asked, and maps limitPer to snake_case", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+
+    // Unset: byte-identical to a client that predates nidus-29ui.
+    await db.hybridSearch({ vector: [1, 0, 0], field: "body", text: "fox" });
+    expect(calls[0]!.json).toEqual({
+      vector: [1, 0, 0],
+      field: "body",
+      text: "fox",
+      scope: [],
+      filter: [],
+    });
+
+    await db.hybridSearch({
+      vector: [1, 0, 0],
+      field: "body",
+      text: "fox",
+      limitPer: { field: "path", max: 1 },
+      diversity: 0.5,
+    });
+    expect(calls[1]!.json).toMatchObject({
+      limit_per: { field: "path", max: 1 },
+      diversity: 0.5,
+    });
+
+    // `*WithPlan` decodes `{ hits, plan }`, not a bare array, so it needs its own mock body.
+    const { fn: planFn, calls: planCalls } = mockFetch(emptyPlanBody());
+    const planDb = new NidusClient({ baseUrl: "http://x", fetch: planFn });
+    await planDb.hybridSearchWithPlan({
+      vector: [1, 0, 0],
+      field: "body",
+      text: "fox",
+      limitPer: { field: "path", max: 1 },
+    });
+    expect(planCalls[0]!.json).toMatchObject({ limit_per: { field: "path", max: 1 } });
   });
 
   it("omits explain and highlight unless asked, sending `true` as the defaults object", async () => {

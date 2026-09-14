@@ -10,14 +10,18 @@ use super::aggregate::LIMIT_PER_OVERFETCH;
 use super::diversity::MMR_OVERFETCH;
 use super::plan::{Phase, PlanRec};
 use super::rank;
-use super::scoring::{PARALLEL_SCAN_WORK_FLOOR, parallel_topk, score_chunk};
-use super::{ScanOrder, Store, oom};
+use super::scoring::{
+    NamedReduce, PARALLEL_SCAN_WORK_FLOOR, parallel_topk, parallel_topk_grouped, score_chunk,
+    score_chunk_named,
+};
+use super::{DocEntry, ScanOrder, Store, oom};
 use crate::ann::Walk;
 use crate::config::Config;
 use crate::filter;
 use crate::fts::FtsField;
 use crate::model::{
-    AnnConfig, Distance, Filter, Footprint, Hit, HybridOpts, ListOpts, Projection, SearchOpts,
+    AnnConfig, DEFAULT_VECTOR, Distance, Filter, Footprint, Hit, HybridOpts, ListOpts,
+    MAX_VECTOR_NAMES, Projection, SearchOpts,
 };
 use crate::plan::{Candidates, Narrowing, QueryPath, QueryPlan};
 use crate::search::{TopK, dot, euclidean_neg_sq, normalize};
@@ -78,7 +82,36 @@ pub(super) fn check_query_opts(opts: &SearchOpts) -> Result<()> {
         .and_then(|()| super::aggregate::validate(opts.limit_per.as_ref()))
         .and_then(|()| super::diversity::validate(opts.diversity))
         .and_then(|()| super::expand::validate(opts.expand.as_ref()))
+        .and_then(|()| validate_names(opts))
         .context(BAD_QUERY)
+}
+
+/// Refuse an unusable named-vector query (nidus-85t): an empty or repeated name, or a
+/// `name_weights` entry that would poison pooling.
+fn validate_names(opts: &SearchOpts) -> Result<()> {
+    // A named search scans `docs × names`, so an uncapped `names` lets one request multiply the
+    // store's per-query cost freely. Bounded like `MAX_BATCH_QUERIES` bounds a batch.
+    if opts.names.len() > MAX_VECTOR_NAMES {
+        bail!(
+            "a search may name at most {MAX_VECTOR_NAMES} vectors, got {}",
+            opts.names.len()
+        );
+    }
+    let mut seen = HashSet::new();
+    for name in &opts.names {
+        if name.is_empty() {
+            bail!("a named-vector search name must not be empty");
+        }
+        if !seen.insert(name.as_str()) {
+            bail!("named-vector search names must not repeat: `{name}`");
+        }
+    }
+    for (name, w) in &opts.name_weights {
+        if !w.is_finite() || *w < 0.0 {
+            bail!("name_weights[`{name}`] must be finite and non-negative, got {w}");
+        }
+    }
+    Ok(())
 }
 
 /// Refuse a fusion weight that would poison the fused score. A `NaN` weight makes every
@@ -114,7 +147,7 @@ impl Store {
             None => ranked,
         };
         let spread = match opts.diversity {
-            Some(lambda) => self.diversify(capped, lambda),
+            Some(lambda) => self.diversify(capped, lambda, &opts.names),
             None => capped,
         };
         let mut hits = paginate(spread, opts.offset);
@@ -127,12 +160,21 @@ impl Store {
         hits
     }
 
-    /// The hybrid tail for an already-fused `Vec<Hit>`: no `limit_per` on `HybridOpts`, so
-    /// just the page cut (SPEC §7). Used by `crate::rerank`'s async wrapper post-rerank;
-    /// `hybrid_search` itself cuts inline, since its fused list still carries per-leg detail.
-    #[cfg_attr(not(feature = "rerank"), allow(dead_code))]
+    /// The hybrid tail for an already-fused `Vec<Hit>` (nidus-29ui): cap by value, spread by
+    /// MMR, cut the page — the same order `finish` uses. Used by `hybrid_search_inner` (whose
+    /// per-leg detail is re-attached afterward by key) and `crate::rerank`'s post-rerank wrapper.
     pub(crate) fn finish_hybrid(&self, ranked: Vec<Hit>, opts: &HybridOpts) -> Vec<Hit> {
-        let mut hits = paginate(ranked, opts.offset);
+        let capped = match &opts.limit_per {
+            Some(cap) => self.cap_per_value(ranked, cap),
+            None => ranked,
+        };
+        let spread = match opts.diversity {
+            // Hybrid has no named-vector selection of its own (its vector leg is the default
+            // vector), so the default representative row is the right one here.
+            Some(lambda) => self.diversify(capped, lambda, &[]),
+            None => capped,
+        };
+        let mut hits = paginate(spread, opts.offset);
         hits.truncate(opts.top_k);
         if let Some(e) = &opts.expand {
             self.expand_hits(&mut hits, e);
@@ -193,6 +235,15 @@ impl Store {
         self.fts.schema_for(collection)
     }
 
+    /// `collection`'s declared additional vector names (nidus-85t), never including
+    /// [`DEFAULT_VECTOR`]. Empty when none are declared.
+    pub fn vector_names(&self, collection: &str) -> &[String] {
+        self.collections
+            .get(collection)
+            .map(|c| c.vector_names.as_slice())
+            .unwrap_or(&[])
+    }
+
     /// Returns collection names sorted alphabetically.
     pub fn collections(&self) -> Vec<String> {
         let mut names: Vec<String> = self.collections.keys().cloned().collect();
@@ -217,24 +268,35 @@ impl Store {
 
         col.docs
             .iter()
-            .map(|(id, entry)| crate::model::Record {
-                id: id.clone(),
-                // Text-only docs (row None) have no embedding.
-                vector: entry.row.map(|r| self.data.row(r).to_vec()),
-                attrs: entry.attrs.clone(),
-            })
+            .map(|(id, entry)| self.record_from_entry(id, entry))
             .collect()
     }
 
     /// O(1) id-keyed lookup; a missing collection or id is `None`, not an error.
     pub fn get(&self, collection: &str, id: &str) -> Option<crate::model::Record> {
         let entry = self.collections.get(collection)?.docs.get(id)?;
-        Some(crate::model::Record {
+        Some(self.record_from_entry(id, entry))
+    }
+
+    /// Materialize a live [`super::DocEntry`] into a [`crate::model::Record`] (nidus-85t): the
+    /// [`DEFAULT_VECTOR`] row (if any) becomes `vector`, every other name becomes `vectors`.
+    fn record_from_entry(&self, id: &str, entry: &DocEntry) -> crate::model::Record {
+        let mut vector = None;
+        let mut vectors = BTreeMap::new();
+        for (name, &row) in &entry.rows {
+            let v = self.data.row(row).to_vec();
+            if name == DEFAULT_VECTOR {
+                vector = Some(v);
+            } else {
+                vectors.insert(name.clone(), v);
+            }
+        }
+        crate::model::Record {
             id: id.to_string(),
-            // Text-only docs (row None) have no embedding.
-            vector: entry.row.map(|r| self.data.row(r).to_vec()),
+            vector,
+            vectors,
             attrs: entry.attrs.clone(),
-        })
+        }
     }
 
     /// List records matching `opts.filter` across `collections`, without vector scoring.
@@ -261,7 +323,7 @@ impl Store {
                     if !filter::matches(&opts.filter, &entry.attrs) {
                         continue;
                     }
-                    scan.push((entry.row, col_name, id.as_str()));
+                    scan.push((entry.primary_row(), col_name, id.as_str()));
                 }
                 continue;
             }
@@ -269,7 +331,7 @@ impl Store {
                 if !filter::matches(&opts.filter, &entry.attrs) {
                     continue;
                 }
-                scan.push((entry.row, col_name, id.as_str()));
+                scan.push((entry.primary_row(), col_name, id.as_str()));
             }
         }
         // Rowed docs by row, then text-only docs by id — a stable order for pagination.
@@ -323,7 +385,7 @@ impl Store {
         self.collections
             .values()
             .flat_map(|c| c.docs.values())
-            .filter(|e| e.row.is_some())
+            .filter(|e| e.rows.contains_key(DEFAULT_VECTOR))
             .count()
     }
 
@@ -334,7 +396,7 @@ impl Store {
             .iter()
             .filter_map(|c| self.collections.get(*c))
             .flat_map(|c| c.docs.values())
-            .filter(|e| e.row.is_some())
+            .filter(|e| e.rows.contains_key(DEFAULT_VECTOR))
             .count()
     }
 
@@ -365,8 +427,8 @@ impl Store {
                     .map_err(|_| oom("scan-order cache", n))?;
                 for (col_name, col) in &self.collections {
                     for (id, entry) in &col.docs {
-                        // Only vector-bearing docs belong in the scan order.
-                        if let Some(row) = entry.row {
+                        // Only the default-named vector belongs in the ordinary scan order.
+                        if let Some(&row) = entry.rows.get(DEFAULT_VECTOR) {
                             order.push((row, col_name.clone(), id.clone()));
                         }
                     }
@@ -456,7 +518,9 @@ impl Store {
                     continue;
                 };
                 for (id, entry) in &col.docs {
-                    let Some(row) = entry.row else { continue };
+                    let Some(&row) = entry.rows.get(DEFAULT_VECTOR) else {
+                        continue;
+                    };
                     if !filter::matches(filter, &entry.attrs) {
                         continue;
                     }
@@ -498,7 +562,9 @@ impl Store {
                 let Some((id, entry)) = col.docs.get_key_value(&id) else {
                     continue;
                 };
-                let Some(row) = entry.row else { continue };
+                let Some(&row) = entry.rows.get(DEFAULT_VECTOR) else {
+                    continue;
+                };
                 // The index narrows; this decides. Skipping it would ship the
                 // over-approximation straight to the caller.
                 if !filter::matches(filter, &entry.attrs) {
@@ -600,7 +666,18 @@ impl Store {
         let deep = deepened(opts);
         // `opts.exact` gates every approximate branch below (nidus-m50.12). Store-level config
         // decides what exists; this decides, per query, whether to use it.
-        let ranked = if self.ann.is_some() && !deep.exact {
+        let ranked = if !deep.names.is_empty() {
+            // Named-vector search (nidus-85t): reduce inside the scan, before top-k selection,
+            // so a multi-name record yields one hit. Bypasses ANN/quantized/segmented for now,
+            // which do not yet pool several named rows of one record from an index walk.
+            m.search_exact.inc();
+            rec.path(QueryPath::Exact);
+            let mut scan = self.named_scan(collections, &deep.filter, &deep.names)?;
+            rec.rows_scanned(scan.len() as u64);
+            rec.phase(Phase::Score, || {
+                self.rank_scan_named(&q, &mut scan, score_fn, &deep)
+            })?
+        } else if self.ann.is_some() && !deep.exact {
             // ANN: walk the index for an over-fetched candidate set, then post-filter and rerank —
             // recall traded for speed. A selective filter/scope can starve the walk, so `search_ann`
             // falls back to an exact prefilter when survivors are few (nidus-0ou).
@@ -696,7 +773,9 @@ impl Store {
             .with_context(|| {
                 format!("{BAD_QUERY}: no record `{id}` in collection `{collection}`")
             })?;
-        let Some(row) = entry.row else {
+        // The default row when present, else the first named one (nidus-85t) — same
+        // representative choice as MMR's, since neither has a per-name query score to pick by.
+        let Some(row) = entry.primary_row() else {
             bail!(
                 "{BAD_QUERY}: record `{collection}/{id}` is text-only and has no vector to search with"
             );
@@ -719,6 +798,96 @@ impl Store {
             .filter(|h| !(h.collection == collection && h.id == id))
             .collect();
         Ok(self.finish(ranked, opts))
+    }
+
+    /// Build the named-vector scan: one entry per (record, requested name) that exists and
+    /// passes the filter, carrying the name's **index into `names`** rather than its text — the
+    /// hot loop then indexes an array instead of probing a map per scanned row (nidus-85t).
+    fn named_scan<'b>(
+        &'b self,
+        collections: &[&'b str],
+        filter: &Filter,
+        names: &[String],
+    ) -> Result<Vec<(u64, &'b str, &'b str, u32)>> {
+        let doc_count: usize = collections
+            .iter()
+            .filter_map(|c| self.collections.get(*c))
+            .map(|c| c.docs.len())
+            .sum();
+        let cap = doc_count.saturating_mul(names.len().max(1));
+        let mut scan = Vec::new();
+        scan.try_reserve(cap)
+            .map_err(|_| oom("named search scan buffer", cap))?;
+        for &col_name in collections {
+            let Some(col) = self.collections.get(col_name) else {
+                continue;
+            };
+            for (id, entry) in &col.docs {
+                if entry.rows.is_empty() || !filter::matches(filter, &entry.attrs) {
+                    continue;
+                }
+                for (i, name) in names.iter().enumerate() {
+                    if let Some(&row) = entry.rows.get(name.as_str()) {
+                        scan.push((row, col_name, id.as_str(), i as u32));
+                    }
+                }
+            }
+        }
+        // Storage order, like the unnamed path's `scan_order`: dropping this sort cost more
+        // than the rest of this function combined. It also keeps a record's rows adjacent,
+        // which the pooling needs (nidus-vttd).
+        scan.sort_unstable_by_key(|&(row, _, _, _)| row);
+        Ok(scan)
+    }
+
+    /// Score a named-vector scan into ranked [`Hit`]s, pooling each record's several rows into
+    /// one score before the top-k push (nidus-85t) — the load-bearing reduction. Splits across
+    /// workers with shard boundaries snapped to record boundaries, so pooling stays exact.
+    fn rank_scan_named<'b>(
+        &self,
+        q: &[f32],
+        scan: &mut [(u64, &'b str, &'b str, u32)],
+        score_fn: fn(&[f32], &[f32]) -> f32,
+        opts: &SearchOpts,
+    ) -> Result<Vec<Hit>> {
+        // Resolve the per-name weights ONCE, positionally, so the scoring loop never touches a
+        // map. A name absent from `name_weights` weights 1.0, as documented.
+        let weights: Vec<f32> = opts
+            .names
+            .iter()
+            .map(|n| opts.name_weights.get(n).copied().unwrap_or(1.0))
+            .collect();
+        let workers = self.parallel_workers(scan.len());
+        let topk = if workers > 1 {
+            parallel_topk_grouped(scan, workers, opts.top_k, |chunk| {
+                score_chunk_named(
+                    &self.data,
+                    chunk,
+                    q,
+                    score_fn,
+                    opts.top_k,
+                    opts.min_score,
+                    &NamedReduce {
+                        weights: &weights,
+                        pool: opts.pool,
+                    },
+                )
+            })?
+        } else {
+            score_chunk_named(
+                &self.data,
+                scan,
+                q,
+                score_fn,
+                opts.top_k,
+                opts.min_score,
+                &NamedReduce {
+                    weights: &weights,
+                    pool: opts.pool,
+                },
+            )?
+        };
+        Ok(self.hits_from_topk(topk, &opts.projection))
     }
 
     /// Score an already-gathered, filter-passing scan exactly into ranked [`Hit`]s — the shared
@@ -849,10 +1018,16 @@ impl Store {
         } = ctx;
         acc.surfaced += candidates.len() as u64;
         for (row, _) in candidates {
-            let Some(Some((col_name, id))) = self.row_to_doc.get(*row as usize) else {
+            let Some(Some((col_name, id, name))) = self.row_to_doc.get(*row as usize) else {
                 acc.dropped_stale += 1;
                 continue;
             };
+            // Ordinary (unnamed) search reaches this walk only for the default vector
+            // (nidus-85t decision 5); an ANN graph may hold other named rows too.
+            if name != DEFAULT_VECTOR {
+                acc.dropped_out_of_scope += 1;
+                continue;
+            }
             if !scope.contains(col_name.as_str()) {
                 acc.dropped_out_of_scope += 1;
                 continue;
@@ -865,7 +1040,7 @@ impl Store {
                 acc.dropped_stale += 1;
                 continue;
             };
-            if entry.row != Some(*row) {
+            if entry.rows.get(DEFAULT_VECTOR) != Some(row) {
                 acc.dropped_stale += 1; // stale reverse-map hint — row was overwritten/cleared
                 continue;
             }
@@ -921,7 +1096,9 @@ impl Store {
                 continue;
             };
             for (id, entry) in &col.docs {
-                let Some(row) = entry.row else { continue };
+                let Some(&row) = entry.rows.get(DEFAULT_VECTOR) else {
+                    continue;
+                };
                 if indexed.iter().any(|&(s, e)| row >= s && row < e) {
                     continue; // covered by the IVF leg
                 }
@@ -987,7 +1164,9 @@ impl Store {
                 continue;
             };
             for (id, entry) in &col.docs {
-                let Some(row) = entry.row else { continue };
+                let Some(&row) = entry.rows.get(DEFAULT_VECTOR) else {
+                    continue;
+                };
                 if !filter::matches(filter, &entry.attrs) {
                     continue;
                 }
