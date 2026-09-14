@@ -209,6 +209,7 @@ takes it too:
 
 ```bash
 curl -s localhost:7700/collections/docs/recall \
+  -H 'content-type: application/json' \
   -d '{"query": "how does the writer lock work", "rollup": {"neighbours": 1}}'
 ```
 

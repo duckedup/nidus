@@ -40,6 +40,7 @@ Over HTTP, the same query is a POST:
 
 ```sh
 curl -s localhost:7700/collections/docs/recall \
+  -H 'content-type: application/json' \
   -d '{"query": "how does compaction work", "rollup": {"neighbours": 1}}'
 ```
 

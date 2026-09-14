@@ -423,6 +423,7 @@ nidus text-search --dir ./store body "crash fsync" \\
                 cmd={`nidus serve --dir ./store --embed-provider voyage
 
 curl localhost:7700/collections/docs/recall \\
+  -H 'content-type: application/json' \\
   -d '{"query": "what is our refund window"}'`}
                 note="These three need an embedding provider (Voyage, OpenAI, Ollama and others). The run at the top of this page needed none."
               />
