@@ -469,6 +469,18 @@ func TestClientMethodsHitTheRightRoute(t *testing.T) {
 			_, err := c.Refresh(ctx)
 			return err
 		}},
+		{"Query", `[]`, http.MethodPost, "/query", func(c *Client) error {
+			_, err := c.Query(ctx, "SELECT * FROM docs")
+			return err
+		}},
+		{"QueryBatch", `[[]]`, http.MethodPost, "/query", func(c *Client) error {
+			_, err := c.QueryBatch(ctx, "SELECT * FROM docs; SELECT * FROM notes")
+			return err
+		}},
+		{"Compile", `{"kind":"list","collections":["docs"],"opts":{}}`, http.MethodPost, "/query", func(c *Client) error {
+			_, err := c.Compile(ctx, "SELECT * FROM docs")
+			return err
+		}},
 	}
 
 	covered := make(map[string]bool, len(cases))
