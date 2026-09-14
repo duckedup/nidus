@@ -31,3 +31,4 @@ Fetch one with `just spec --file decisions/<file> toc`, or just read it.
 | D0014 | [nidus depends on `wdpkr-core`, behind the off-by-default `code` feature](0014-nidus-depends-on-wdpkr-core-behind-code.md) |
 | D0015 | [The default build ships the whole binary](0015-the-default-build-ships-the-whole-binary.md) |
 | D0016 | [Positioning describes shipped modes, not a size ceiling](0016-nidus-is-usable-everywhere.md) |
+| D0017 | [SQL is syntax over §7, not an engine](0017-sql-is-syntax-not-an-engine.md) |

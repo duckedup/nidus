@@ -13,6 +13,7 @@ mod prompts;
 mod recency;
 mod related;
 mod resources;
+mod sql;
 mod stdio;
 pub(super) mod support;
 
@@ -190,7 +191,7 @@ fn tools_list_is_complete_ordered_and_cacheable() {
 
     // `code_search` only exists with the `code` feature (off in the `just test-e2e` lane,
     // present under `--features serve`), and it must append *after* every fixed tool below,
-    // never insert among them (SEP-2549).
+    // never insert among them (SEP-2549); `query` sits just before it, same reason.
     #[cfg_attr(not(feature = "code"), allow(unused_mut))]
     let mut want = vec![
         "remember",
@@ -207,6 +208,7 @@ fn tools_list_is_complete_ordered_and_cacheable() {
         "list_aliases",
         "set_alias",
         "drop_alias",
+        "query",
     ];
     #[cfg(feature = "code")]
     want.push("code_search");
@@ -214,7 +216,7 @@ fn tools_list_is_complete_ordered_and_cacheable() {
         tool_names(&result),
         want,
         "tool list changed — if this is deliberate, append rather than reorder. The alias \
-         tools (and `code_search`, when the `code` feature is on) must stay last so \
+         tools, `query`, and `code_search` (when the `code` feature is on) must stay last so \
          `related`'s position never shifts (SEP-2549)."
     );
 

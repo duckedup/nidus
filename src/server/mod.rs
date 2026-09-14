@@ -29,9 +29,9 @@ use crate::{
 use dto::{
     AggregateRequest, AggregationDto, AnnDto, BatchFuse, BatchSearchRequest, BatchSearchResponse,
     CompactRequest, DeleteRequest, FilterIndexRequest, FootprintDto, FtsSchemaRequest, HitDto,
-    HybridSearchRequest, ListRequest, MAX_BATCH_QUERIES, MAX_TOP_K, SearchRequest, SearchResponse,
-    SetAliasRequest, SimilarRequest, SuggestRequest, SuggestionsDto, TextSearchRequest,
-    UpsertRequest, VersionsDto,
+    HybridSearchRequest, ListRequest, MAX_BATCH_QUERIES, MAX_TOP_K, QueryRequest, SearchRequest,
+    SearchResponse, SetAliasRequest, SimilarRequest, SuggestRequest, SuggestionsDto,
+    TextSearchRequest, UpsertRequest, VersionsDto,
 };
 
 // ── AI-ingest (memory) imports: only under the `memory` feature (pulled by the
@@ -474,6 +474,7 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/hybrid-search", post(hybrid_search))
         .route("/list", post(list))
         .route("/aggregate", post(aggregate))
+        .route("/query", post(query))
         .route("/flush", post(flush))
         .route("/compact", post(compact))
         .route("/refresh", post(refresh));
@@ -1142,6 +1143,22 @@ async fn aggregate(
     };
     let out = run_read(st, move |db| scoped(&scope, |s| db.aggregate(s, &opts))).await?;
     Ok(Json(AggregationDto::from(out)))
+}
+
+/// `POST /query` (SPEC §7.12): SQL-shaped read syntax over the same typed entry points the
+/// five sibling routes call. A single statement's answer is byte-identical to the typed
+/// request's; a `;`-separated script answers as a JSON array, in order (§7.9).
+async fn query(
+    State(st): State<AppState>,
+    Json(req): Json<QueryRequest>,
+) -> Result<Json<JsonValue>, ApiError> {
+    let QueryRequest { sql, compile_only } = req;
+    if compile_only {
+        let compiled = run_read(st, move |db| db.compile(&sql)).await?;
+        return Ok(Json(dto::render_compiled(&compiled)));
+    }
+    let answers = run_read(st, move |db| db.query_batch(&sql)).await?;
+    Ok(Json(dto::render_query_answers(answers)))
 }
 
 /// Resolve a wire `scope` (an empty list means "every collection") and run `f` with the
@@ -2053,6 +2070,7 @@ fn classify(err: &anyhow::Error) -> StatusCode {
         || msg.contains("filter index")
         || msg.contains("full-text query")
         || msg.contains(crate::store::BAD_QUERY)
+        || msg.contains(crate::sql::SQL_PARSE_ERROR)
     {
         // A rejected FTS or filter-index declaration, a clause-less text query, or a
         // malformed ranking knob: bad request bodies, not server faults.
@@ -3059,6 +3077,114 @@ mod tests {
         let out = json_body(resp).await;
         assert_eq!(out["count"], 0);
         assert_eq!(out["sums"]["bytes"], json!({"Int": 0}));
+    }
+
+    /// `POST /query`'s single-statement answer must be byte-identical to what the equivalent
+    /// typed `/search` request returns (root blueprint's parity claim, U2 acceptance).
+    #[tokio::test]
+    async fn query_search_matches_the_typed_search_response() {
+        let app = ranked_router().await;
+        let sql = "SELECT * FROM docs WHERE file = 'a.rs' ORDER BY knn([1, 0, 0]) LIMIT 2";
+        let resp = app
+            .clone()
+            .oneshot(post("/query", json!({"sql": sql})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let via_sql = json_body(resp).await;
+
+        let typed =
+            json!({"query": [1, 0, 0], "top_k": 2, "filter": [{"Eq": ["file", {"Str": "a.rs"}]}]});
+        let resp = app.oneshot(post("/search", typed)).await.unwrap();
+        assert_eq!(json_body(resp).await, via_sql);
+    }
+
+    /// Same parity claim for the `GROUP BY` dispatch: `/query`'s answer matches `/aggregate`'s.
+    #[tokio::test]
+    async fn query_aggregate_matches_the_typed_aggregate_response() {
+        let app = ranked_router().await;
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/query",
+                json!({"sql": "SELECT * FROM docs GROUP BY file, SUM(bytes)"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let via_sql = json_body(resp).await;
+
+        let typed = json!({"sum": ["bytes"], "group_by": "file"});
+        let resp = app.oneshot(post("/aggregate", typed)).await.unwrap();
+        assert_eq!(json_body(resp).await, via_sql);
+    }
+
+    /// `WITH (plan)` (§7.11) routes through the same plan serialization `/search?plan` uses,
+    /// rather than a second one (U2's "Plans" note).
+    #[tokio::test]
+    async fn query_with_plan_returns_the_plan_shape() {
+        let app = plan_test_fixture().await;
+        let sql = "SELECT * FROM docs ORDER BY knn([1, 0, 0]) LIMIT 5 WITH (plan)";
+        let resp = app
+            .oneshot(post("/query", json!({"sql": sql})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert!(body["hits"].is_array(), "{body}");
+        assert!(body["plan"]["path"].is_string(), "{body}");
+    }
+
+    /// A `;`-separated script (§7.9) answers as a JSON array, in order — unlike a single
+    /// statement, whose answer is bare.
+    #[tokio::test]
+    async fn query_batch_answers_as_an_ordered_array() {
+        let app = ranked_router().await;
+        let sql = "SELECT * FROM docs WHERE file = 'a.rs'; SELECT * FROM docs WHERE file = 'nope'";
+        let resp = app
+            .oneshot(post("/query", json!({"sql": sql})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        let batch = body.as_array().expect("a script answers as an array");
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].as_array().unwrap().len(), 2);
+        assert_eq!(batch[1].as_array().unwrap().len(), 0);
+    }
+
+    /// `compile_only: true` renders the compiled form and runs nothing — no hits, no
+    /// aggregation, just the typed opts SQL compiled down to.
+    #[tokio::test]
+    async fn compile_only_renders_without_executing() {
+        let app = ranked_router().await;
+        let sql = "SELECT * FROM docs ORDER BY knn([1, 0, 0]) LIMIT 3";
+        let resp = app
+            .oneshot(post("/query", json!({"sql": sql, "compile_only": true})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["kind"], "search");
+        assert_eq!(body["collections"], json!(["docs"]));
+        assert_eq!(body["vector"], json!([1.0, 0.0, 0.0]));
+        assert_eq!(body["opts"]["top_k"], 3);
+    }
+
+    /// Malformed SQL is a `400` carrying the parse-error text verbatim (root blueprint's
+    /// error model) — not the `500` a caller's typo would fall through to without the
+    /// `classify()` arm.
+    #[tokio::test]
+    async fn malformed_sql_is_a_400_with_the_parse_error_text() {
+        let app = test_router(3);
+        let resp = app
+            .oneshot(post("/query", json!({"sql": "SELECT * FROM docs WHERE"})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let msg = json_body(resp).await["error"].as_str().unwrap().to_string();
+        assert!(msg.contains("sql parse error"), "{msg}");
+        assert!(msg.contains("byte"), "{msg}");
     }
 
     /// A batch answers each query independently and in request order — the point of the
@@ -4204,6 +4330,11 @@ mod tests {
             (
                 "something unexpected blew up",
                 StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            // A `/query` parse failure (SPEC §7.12): a caller's typo, not a server fault.
+            (
+                "sql parse error at byte 17: expected a value after '=' (§7.3 boolean composition)",
+                StatusCode::BAD_REQUEST,
             ),
         ];
         for (msg, want) in cases {

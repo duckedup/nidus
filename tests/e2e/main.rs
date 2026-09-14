@@ -8,6 +8,7 @@ mod aliases;
 mod cluster;
 #[cfg(all(feature = "memory", feature = "code"))]
 mod code;
+mod corpus;
 #[cfg(all(feature = "memory", feature = "code"))]
 mod docs_index;
 mod env_flags;
@@ -28,4 +29,5 @@ mod scale;
 #[cfg(all(feature = "mcp", feature = "embed-ollama"))]
 mod serve_dim;
 mod server;
+mod sql;
 mod tune;

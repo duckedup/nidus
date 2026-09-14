@@ -1,0 +1,302 @@
+{
+  "fixture": {
+    "dim": 4,
+    "fts": { "notes": ["body"], "docs": ["body"] },
+    "collections": {
+      "notes": [
+        {
+          "id": "n1",
+          "vector": [1, 0, 0, 0],
+          "attrs": {
+            "lang": { "Str": "rust" },
+            "tags": { "List": ["backend", "cli"] },
+            "bytes": { "Int": 120 },
+            "ts": { "Int": 1700000000000 },
+            "body": { "Str": "the quick brown fox jumps over a lazy fox" }
+          }
+        },
+        {
+          "id": "n2",
+          "vector": [0.8, 0.6, 0, 0],
+          "attrs": {
+            "lang": { "Str": "rust" },
+            "tags": { "List": ["backend"] },
+            "bytes": { "Int": 80 },
+            "ts": { "Int": 1700003600000 },
+            "body": { "Str": "a swift fox sprints across the meadow" }
+          }
+        },
+        {
+          "id": "n3",
+          "vector": [0.6, 0.8, 0, 0],
+          "attrs": {
+            "lang": { "Str": "go" },
+            "tags": { "List": ["infra"] },
+            "bytes": { "Int": 200 },
+            "ts": { "Int": 1700007200000 },
+            "body": { "Str": "goroutines schedule many cheap green threads" }
+          }
+        },
+        {
+          "id": "n4",
+          "vector": [0, 1, 0, 0],
+          "attrs": {
+            "lang": { "Str": "python" },
+            "tags": { "List": ["ml", "cli"] },
+            "bytes": { "Int": 150 },
+            "ts": { "Int": 1700010800000 },
+            "body": { "Str": "machine learning pipelines process large text corpora" }
+          }
+        }
+      ],
+      "docs": [
+        {
+          "id": "c1",
+          "vector": [1, 1, 0, 0],
+          "attrs": {
+            "doc_id": { "Str": "docA" },
+            "chunk_idx": { "Int": 0 },
+            "chunk_text": { "Str": "intro to docA" },
+            "body": { "Str": "chunk zero placeholder" }
+          }
+        },
+        {
+          "id": "c2",
+          "vector": [1, 1, 1, 0],
+          "attrs": {
+            "doc_id": { "Str": "docA" },
+            "chunk_idx": { "Int": 1 },
+            "chunk_text": { "Str": "body of docA" },
+            "body": { "Str": "chunk one mentions rollup here" }
+          }
+        },
+        {
+          "id": "c3",
+          "vector": [1, 1, 1, 1],
+          "attrs": {
+            "doc_id": { "Str": "docA" },
+            "chunk_idx": { "Int": 2 },
+            "chunk_text": { "Str": "outro of docA" },
+            "body": { "Str": "chunk two placeholder" }
+          }
+        }
+      ]
+    }
+  },
+  "cases": [
+    {
+      "name": "glob-predicate-knn-order",
+      "section": "7.1",
+      "sql": "SELECT * FROM notes WHERE lang LIKE 'r*' ORDER BY knn([1,0,0,0]) LIMIT 3",
+      "dsl": {
+        "endpoint": "/search",
+        "body": {
+          "query": [1, 0, 0, 0],
+          "scope": ["notes"],
+          "top_k": 3,
+          "filter": [{ "Glob": ["lang", "r*"] }]
+        }
+      },
+      "expect": { "ids": ["n1", "n2"] },
+      "surfaces": ["lib", "http", "cli", "python", "js", "go"],
+      "note": "ORDER BY knn(...) takes a literal vector; MCP's text-native `query` tool refuses it (U4's law), so mcp is not in this case's surfaces."
+    },
+    {
+      "name": "array-containment-tags",
+      "section": "7.2",
+      "sql": "SELECT * FROM notes WHERE contains(tags, 'cli') ORDER BY bytes",
+      "dsl": {
+        "endpoint": "/list",
+        "body": {
+          "scope": ["notes"],
+          "filter": [{ "Contains": ["tags", { "Str": "cli" }] }],
+          "order_by": { "field": "bytes", "descending": false }
+        }
+      },
+      "expect": { "ids": ["n1", "n4"] },
+      "surfaces": ["lib", "http", "cli", "mcp", "python", "js", "go"]
+    },
+    {
+      "name": "boolean-composition-and-or-not",
+      "section": "7.3",
+      "sql": "SELECT * FROM notes WHERE (lang = 'rust' OR lang = 'go') AND NOT bytes > 150 ORDER BY bytes",
+      "dsl": {
+        "endpoint": "/list",
+        "body": {
+          "scope": ["notes"],
+          "filter": [
+            { "Any": [{ "Eq": ["lang", { "Str": "rust" }] }, { "Eq": ["lang", { "Str": "go" }] }] },
+            { "Not": { "Gt": ["bytes", { "Int": 150 }] } }
+          ],
+          "order_by": { "field": "bytes", "descending": false }
+        }
+      },
+      "expect": { "ids": ["n2", "n1"] },
+      "surfaces": ["lib", "http", "cli", "mcp", "python", "js", "go"]
+    },
+    {
+      "name": "fuzzy-and-match-all-token-predicates",
+      "section": "7.4",
+      "sql": "SELECT * FROM notes WHERE fuzzy(lang, 'ruzt', 1) AND match_all(body, 'quick fox') ORDER BY bytes",
+      "dsl": {
+        "endpoint": "/list",
+        "body": {
+          "scope": ["notes"],
+          "filter": [
+            { "Fuzzy": ["lang", "ruzt", 1] },
+            { "ContainsAllTokens": ["body", "quick fox"] }
+          ],
+          "order_by": { "field": "bytes", "descending": false }
+        }
+      },
+      "expect": { "ids": ["n1"] },
+      "surfaces": ["lib", "http", "cli", "mcp", "python", "js", "go"]
+    },
+    {
+      "name": "regex-predicate",
+      "section": "7.5",
+      "sql": "SELECT * FROM notes WHERE body ~ '^the quick.*fox$' ORDER BY bytes",
+      "dsl": {
+        "endpoint": "/list",
+        "body": {
+          "scope": ["notes"],
+          "filter": [{ "Regex": ["body", "^the quick.*fox$"] }],
+          "order_by": { "field": "bytes", "descending": false }
+        }
+      },
+      "expect": { "ids": ["n1"] },
+      "surfaces": ["lib", "http", "cli", "mcp", "python", "js", "go"]
+    },
+    {
+      "name": "match-ranking-single-hit",
+      "section": "7.6",
+      "sql": "SELECT * FROM notes ORDER BY match(body, 'goroutines')",
+      "dsl": {
+        "endpoint": "/text-search",
+        "body": { "field": "body", "query": "goroutines", "scope": ["notes"], "top_k": 10 }
+      },
+      "expect": { "ids": ["n3"] },
+      "surfaces": ["lib", "http", "cli", "mcp", "python", "js", "go"]
+    },
+    {
+      "name": "hybrid-knn-fuse-match",
+      "section": "7.6",
+      "sql": "SELECT * FROM notes ORDER BY knn([1,0,0,0]) FUSE match(body, 'brown') LIMIT 4",
+      "dsl": {
+        "endpoint": "/hybrid-search",
+        "body": {
+          "vector": [1, 0, 0, 0],
+          "field": "body",
+          "text": "brown",
+          "scope": ["notes"],
+          "top_k": 4
+        }
+      },
+      "expect": { "ids": ["n1", "n2", "n3", "n4"] },
+      "surfaces": ["lib", "http", "cli", "python", "js", "go"],
+      "note": "the ranking's ORDER BY head is knn(...), so mcp refuses the literal vector (U4's law)."
+    },
+    {
+      "name": "aggregation-group-by-sum",
+      "section": "7.7",
+      "sql": "SELECT * FROM notes GROUP BY lang, SUM(bytes)",
+      "dsl": {
+        "endpoint": "/aggregate",
+        "body": { "scope": ["notes"], "sum": ["bytes"], "group_by": "lang" }
+      },
+      "expect": {
+        "aggregation": {
+          "count": 4,
+          "sums": { "bytes": { "Int": 550 } },
+          "groups": [
+            { "value": { "Str": "rust" }, "count": 2, "sums": { "bytes": { "Int": 200 } } },
+            { "value": { "Str": "go" }, "count": 1, "sums": { "bytes": { "Int": 200 } } },
+            { "value": { "Str": "python" }, "count": 1, "sums": { "bytes": { "Int": 150 } } }
+          ]
+        }
+      },
+      "surfaces": ["lib", "http", "cli", "mcp", "python", "js", "go"]
+    },
+    {
+      "name": "limit-per-result-diversity",
+      "section": "7.7",
+      "sql": "SELECT * FROM notes ORDER BY match(body, 'fox') WITH (limit_per = (lang, 1))",
+      "dsl": {
+        "endpoint": "/text-search",
+        "body": {
+          "field": "body",
+          "query": "fox",
+          "scope": ["notes"],
+          "top_k": 10,
+          "limit_per": { "field": "lang", "max": 1 }
+        }
+      },
+      "expect": { "ids": ["n1"] },
+      "surfaces": ["lib", "http", "cli", "mcp", "python", "js", "go"],
+      "note": "n1 and n2 both match 'fox' and share lang=rust; n1 says it twice so it ranks first, and limit_per caps the rust group at one hit."
+    },
+    {
+      "name": "result-annotations",
+      "section": "7.8",
+      "sql": "SELECT * FROM notes WHERE lang = 'go' ORDER BY match(body, 'goroutines') WITH (annotations)",
+      "dsl": {
+        "endpoint": "/text-search",
+        "body": {
+          "field": "body",
+          "query": "goroutines",
+          "scope": ["notes"],
+          "top_k": 10,
+          "filter": [{ "Eq": ["lang", { "Str": "go" }] }],
+          "explain": true
+        }
+      },
+      "expect": { "ids": ["n3"] },
+      "surfaces": ["lib", "http", "cli", "mcp", "python", "js", "go"]
+    },
+    {
+      "name": "multi-query-batching",
+      "section": "7.9",
+      "sql": "SELECT * FROM notes WHERE lang = 'rust' ORDER BY bytes; SELECT * FROM notes WHERE lang = 'go' ORDER BY bytes",
+      "dsl": null,
+      "expect": { "batch_ids": [["n2", "n1"], ["n3"]] },
+      "surfaces": ["lib", "http", "cli", "python", "js", "go"],
+      "note": "batching is SQL-only (no typed endpoint runs a script), so this case has no `dsl` twin — the runner checks each statement's own ids against `batch_ids` directly. MCP's `query` tool runs Nidus::query (single statement only), so a `;`-separated script is out of scope for that surface."
+    },
+    {
+      "name": "parent-rollup-context-expansion",
+      "section": "7.10",
+      "sql": "SELECT * FROM docs WHERE doc_id = 'docA' ORDER BY match(body, 'rollup') WITH (context = (radius 1, parent \"doc_id\", index \"chunk_idx\", text \"chunk_text\"))",
+      "dsl": {
+        "endpoint": "/text-search",
+        "body": {
+          "field": "body",
+          "query": "rollup",
+          "scope": ["docs"],
+          "top_k": 10,
+          "filter": [{ "Eq": ["doc_id", { "Str": "docA" }] }],
+          "expand": { "parent_field": "doc_id", "index_field": "chunk_idx", "text_field": "chunk_text", "radius": 1 }
+        }
+      },
+      "expect": { "ids": ["c2"] },
+      "surfaces": ["lib", "http", "cli", "mcp", "python", "js", "go"]
+    },
+    {
+      "name": "query-plan-annotation",
+      "section": "7.11",
+      "sql": "SELECT * FROM notes WHERE lang = 'go' ORDER BY knn([0.6,0.8,0,0]) WITH (plan)",
+      "dsl": {
+        "endpoint": "/search",
+        "body": {
+          "query": [0.6, 0.8, 0, 0],
+          "scope": ["notes"],
+          "top_k": 10,
+          "filter": [{ "Eq": ["lang", { "Str": "go" }] }],
+          "plan": true
+        }
+      },
+      "expect": { "ids": ["n3"] },
+      "surfaces": ["lib", "http", "cli", "python", "js", "go"],
+      "note": "ORDER BY knn(...) takes a literal vector; mcp refuses it (U4's law)."
+    }
+  ]
+}

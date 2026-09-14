@@ -14,9 +14,10 @@ use serde::Serialize;
 
 use crate::server::dto::{AnnDto, FootprintDto, HitDto, SearchResponse};
 use crate::{
-    AggregateOpts, AnnConfig, Config, Distance, Expand, Filter, Fsync, FtsClause, FtsCombine,
-    FtsField, FtsQuery, HighlightOpts, HybridOpts, LeaseWait, LimitPer, ListOpts, Nidus, OpenMode,
-    OrderBy, Projection, Quantization, Record, Scope, SearchOpts, SuggestOpts,
+    AggregateOpts, AnnConfig, Compiled, Config, Distance, Expand, Filter, Fsync, FtsClause,
+    FtsCombine, FtsField, FtsQuery, HighlightOpts, HybridOpts, LeaseWait, LimitPer, ListOpts,
+    Nidus, OpenMode, OrderBy, Projection, Quantization, QueryAnswer, Record, Scope, SearchOpts,
+    SuggestOpts,
 };
 
 // AI-ingest (memory) wiring for `serve`: only under the `memory` feature (pulled
@@ -1467,6 +1468,21 @@ enum Command {
         #[command(flatten)]
         rerank: RerankArgs,
     },
+    /// SQL-shaped read syntax (`SPEC.md` §7.12): a `SELECT` compiled to whichever of the
+    /// commands above its `ORDER BY` head selects, then run through it. `;`-separated
+    /// statements run as a script, each answer printed in order.
+    Query {
+        #[command(flatten)]
+        store: StoreArgs,
+        /// The SQL to run, or `-` to read it from stdin. Omit when using `--sql-file`.
+        sql: Option<String>,
+        /// Read the SQL from this file instead of the positional argument or stdin.
+        #[arg(long)]
+        sql_file: Option<PathBuf>,
+        /// Compile only: print the compiled form as JSON, run nothing.
+        #[arg(long)]
+        compile: bool,
+    },
     /// Print every record in a collection (JSON).
     Get {
         #[command(flatten)]
@@ -2265,6 +2281,29 @@ pub fn run(cli: Cli) -> Result<()> {
             let out: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
             print_json(&out)
         }
+        Command::Query {
+            store,
+            sql,
+            sql_file,
+            compile,
+        } => {
+            let db = open(&store, false)?;
+            let sql = resolve_sql(sql, sql_file.as_ref())?;
+            if compile {
+                let compiled = db.compile(&sql)?;
+                let out: Vec<_> = compiled.iter().map(compiled_json).collect();
+                return print_json(&out);
+            }
+            for answer in db.query_batch(&sql)? {
+                match answer {
+                    QueryAnswer::Hits { hits, plan } => {
+                        print_json(&SearchResponse::new(hits, plan))?;
+                    }
+                    QueryAnswer::Aggregation(agg) => print_json(&agg)?,
+                }
+            }
+            Ok(())
+        }
         Command::Get { store, collection } => {
             let db = open(&store, false)?;
             print_json(&db.get_all(&collection))
@@ -2887,6 +2926,113 @@ fn read_input(file: Option<&PathBuf>) -> Result<String> {
 fn print_json<T: Serialize>(v: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
+}
+
+/// Resolve `nidus query`'s SQL source: `--sql-file` wins if given, else the positional
+/// argument, else stdin (also reached by a bare `-` positional).
+fn resolve_sql(sql: Option<String>, sql_file: Option<&PathBuf>) -> Result<String> {
+    if let Some(path) = sql_file {
+        return std::fs::read_to_string(path)
+            .with_context(|| format!("reading {}", path.display()));
+    }
+    match sql {
+        Some(s) if s != "-" => Ok(s),
+        _ => read_input(None),
+    }
+}
+
+/// Render one compiled statement as JSON for `nidus query --compile`. `Compiled` and its
+/// option types stay outside `serde` (kept out of the lean lib's dependency set), so this
+/// mirrors their fields by hand rather than deriving `Serialize` on them.
+fn compiled_json(c: &Compiled) -> serde_json::Value {
+    match c {
+        Compiled::Search {
+            collections,
+            vector,
+            opts,
+        } => serde_json::json!({
+            "kind": "search", "collections": collections, "vector": vector,
+            "opts": search_opts_json(opts),
+        }),
+        Compiled::TextSearch {
+            collections,
+            query,
+            opts,
+        } => serde_json::json!({
+            "kind": "text_search", "collections": collections, "query": fts_query_json(query),
+            "opts": search_opts_json(opts),
+        }),
+        Compiled::Hybrid {
+            collections,
+            vector,
+            text,
+            opts,
+        } => serde_json::json!({
+            "kind": "hybrid", "collections": collections, "vector": vector,
+            "text": fts_query_json(text), "opts": hybrid_opts_json(opts),
+        }),
+        Compiled::List { collections, opts } => serde_json::json!({
+            "kind": "list", "collections": collections, "opts": list_opts_json(opts),
+        }),
+        Compiled::Aggregate { collections, opts } => serde_json::json!({
+            "kind": "aggregate", "collections": collections, "opts": opts,
+        }),
+    }
+}
+
+/// `SearchOpts` has no `Serialize` (kept out of the lean lib's dependency set), so this
+/// mirrors its fields by hand; `rerank`'s field type is named only through inference here,
+/// so this needs no import the `rerank` feature would otherwise gate.
+fn search_opts_json(o: &SearchOpts) -> serde_json::Value {
+    serde_json::json!({
+        "top_k": o.top_k, "offset": o.offset, "filter": &o.filter, "min_score": o.min_score,
+        "exact": o.exact, "projection": projection_json(&o.projection), "explain": o.explain,
+        "plan": o.plan, "rank_by": &o.rank_by, "limit_per": &o.limit_per,
+        "diversity": o.diversity, "expand": &o.expand,
+        "rerank": o.rerank.as_ref().map(|r| serde_json::json!({
+            "overscan": r.overscan, "text_attr": &r.text_attr,
+        })),
+    })
+}
+
+fn list_opts_json(o: &ListOpts) -> serde_json::Value {
+    serde_json::json!({
+        "offset": o.offset, "limit": o.limit, "filter": &o.filter,
+        "projection": projection_json(&o.projection), "order_by": &o.order_by,
+    })
+}
+
+fn hybrid_opts_json(o: &HybridOpts) -> serde_json::Value {
+    serde_json::json!({
+        "top_k": o.top_k, "offset": o.offset, "filter": &o.filter, "rrf_k": o.rrf_k,
+        "candidates": o.candidates, "explain": o.explain, "plan": o.plan,
+        "vector_weight": o.vector_weight, "text_weight": o.text_weight, "expand": &o.expand,
+        "rerank": o.rerank.as_ref().map(|r| serde_json::json!({
+            "overscan": r.overscan, "text_attr": &r.text_attr,
+        })),
+    })
+}
+
+fn fts_query_json(q: &FtsQuery) -> serde_json::Value {
+    let clauses: Vec<_> = q
+        .clauses
+        .iter()
+        .map(|c| serde_json::json!({ "field": &c.field, "text": &c.text, "prefix": c.prefix }))
+        .collect();
+    serde_json::json!({
+        "clauses": clauses, "combine": q.combine,
+        "highlight": q.highlight.map(|h| serde_json::json!({
+            "max_fragments": h.max_fragments, "fragment_chars": h.fragment_chars,
+        })),
+    })
+}
+
+fn projection_json(p: &Projection) -> serde_json::Value {
+    match p {
+        Projection::All => serde_json::json!({ "mode": "all" }),
+        Projection::Include(fields) => serde_json::json!({ "mode": "include", "fields": fields }),
+        Projection::Exclude(fields) => serde_json::json!({ "mode": "exclude", "fields": fields }),
+    }
 }
 
 #[cfg(test)]
@@ -4905,5 +5051,66 @@ mod tests {
         };
         args.apply_embedder_dim(Some(&embedder)).unwrap();
         assert_eq!(args.dim, Some(7));
+    }
+
+    #[test]
+    fn query_parses_the_positional_sql() {
+        let cli = Cli::try_parse_from(["nidus", "query", "--dir", "/tmp/s", "SELECT * FROM notes"])
+            .unwrap();
+        match cli.command {
+            Command::Query {
+                sql,
+                sql_file,
+                compile,
+                ..
+            } => {
+                assert_eq!(sql.as_deref(), Some("SELECT * FROM notes"));
+                assert_eq!(sql_file, None);
+                assert!(!compile);
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn query_parses_sql_file_and_compile() {
+        let cli = Cli::try_parse_from([
+            "nidus",
+            "query",
+            "--dir",
+            "/tmp/s",
+            "--sql-file",
+            "q.sql",
+            "--compile",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Query {
+                sql,
+                sql_file,
+                compile,
+                ..
+            } => {
+                assert_eq!(sql, None);
+                assert_eq!(sql_file, Some(PathBuf::from("q.sql")));
+                assert!(compile);
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn resolve_sql_prefers_sql_file_over_positional() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.sql");
+        std::fs::write(&path, "SELECT * FROM notes").unwrap();
+        let sql = resolve_sql(Some("ignored".to_string()), Some(&path)).unwrap();
+        assert_eq!(sql, "SELECT * FROM notes");
+    }
+
+    #[test]
+    fn resolve_sql_returns_the_positional_argument() {
+        let sql = resolve_sql(Some("SELECT * FROM notes".to_string()), None).unwrap();
+        assert_eq!(sql, "SELECT * FROM notes");
     }
 }

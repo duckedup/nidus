@@ -37,11 +37,12 @@ not the functionality test, the **build-and-ship** test:
   + object_store**. Hundreds of crates and a query engine, to do a distance-ranked
   top-k. Same disease as DuckDB, transitively-Rust instead of FFI.
 
-At its core the workload is a **vector store, not a database**: no joins, no SQL, no
+At its core the workload is a **vector store, not a database**: no joins, no SQL engine, no
 analytics; the scan cost is what it is, and mmap, ANN, quantization and segments are the
-opt-ins that change it. nidus is that store — plus a memory layer (embedding, optionally
-summarization) built on top — and nothing more; `--no-default-features` gives the
-storage-and-search core alone.
+opt-ins that change it. SQL as *read syntax* over that same workload does ship (§7.12): a
+compiled front end, not a second engine. nidus is that store — plus a memory layer
+(embedding, optionally summarization) built on top — and nothing more;
+`--no-default-features` gives the storage-and-search core alone.
 
 nidus is a pure-Rust vector store with full-text search that runs anywhere Rust runs: in
 process as a library, behind `nidus serve` over HTTP, as an MCP server, or in a browser on
@@ -121,8 +122,12 @@ Compiling a *large* C tree, or adding a *second* `unsafe` site to *our* code, is
   while the active segment stays in RAM (§9 / §14.6 phase 3).
 - Quantization — int8 scalar and binary (sign-bit) quantization have since shipped
   (§9, opt-in via `Config::quantization`).
-- SQL, a query planner, transactions spanning multiple operations, multi-writer
-  concurrency, or replication.
+- A SQL *engine* was, and remains, a non-goal: no planner, no joins, no DML
+  (`INSERT`/`UPDATE`/`DELETE`), no subqueries, no transactions spanning multiple
+  operations, multi-writer concurrency, or replication. SQL as *read syntax* over
+  the existing search below is a different claim and has since shipped (§7.12): a
+  compiled front end onto the same `SearchOpts`/`Filter`/etc. values a typed caller
+  builds by hand, with no second execution path.
 - A query *protocol* over the network was a non-goal; the opt-in `nidus serve` (§9)
   has since shipped as a separate `cli`-feature wrapper, not a core change. Pluggable
   *persistence* backends (S3/GCS) and a shared *memory tier* (Redis/Valkey/Memcached)
@@ -1332,6 +1337,158 @@ covers the whole traced call.
 `NIDUS_SLOW_QUERY_MS` logs the short form (path, `total_us`, rows scanned, candidates) for any
 query crossing that threshold, unconditionally: it needs no per-query `plan` opt-in, since an
 operator chasing a slow store cannot annotate every query in advance.
+
+### 7.12 SQL-shaped read syntax
+
+A `SELECT` statement is a **compiled front end over §7.1-§7.11**, not a second query engine:
+it lexes, parses, and compiles to the same `SearchOpts`/`HybridOpts`/`ListOpts`/
+`AggregateOpts`/`Filter`/`FtsQuery` values a typed caller builds by hand, then runs through
+the same `Store` methods. There is no planner and no second execution path — a SQL query and
+the equivalent typed call produce byte-identical plans (§7.11) and identical ordered ids.
+
+**Grammar:**
+
+```
+script     := statement (';' statement)* [';']              -- §7.9 multi-query batching
+statement  := SELECT projection FROM scope
+              [WHERE predicate]
+              [GROUP BY field]                               -- §7.7 aggregation
+              [ORDER BY ranking]                             -- §7.6
+              [LIMIT n] [OFFSET n]
+              [WITH '(' option (',' option)* ')']            -- everything else in §7
+
+projection := '*' | '*' EXCEPT '(' field, ... ')' | field (',' field)*
+            | aggregate (',' aggregate)*                      -- §7.7 aggregation
+aggregate  := 'sum' '(' field ')' | 'count' '(' '*' ')'
+scope      := '*' | ident (',' ident)*
+
+predicate  := or_expr
+or_expr    := and_expr (OR and_expr)*                        -- Predicate::Any
+and_expr   := not_expr (AND not_expr)*                       -- Predicate::All
+not_expr   := [NOT] primary                                  -- Predicate::Not
+primary    := '(' predicate ')' | comparison | fn_predicate
+comparison := field ('=' | '!=' | '<' | '<=' | '>' | '>=') literal
+            -- literal := int | float | string | TRUE | FALSE | NULL
+            --          | 'timestamp' ( string | int )   -- Value::DateTime, §3
+            | field [NOT] IN '(' literal, ... ')'
+            | field [NOT] LIKE  string                       -- Glob  / Not(Glob)
+            | field ILIKE string                             -- IGlob
+            | field '~' string                                -- Regex
+fn_predicate := contains '(' field ',' literal ')'
+            | not_contains '(' field ',' literal ')'
+            | contains_any '(' field ',' literal, ... ')'
+            | fuzzy '(' field ',' string ',' int ')'
+            | match_all '(' field ',' string ')'              -- ContainsAllTokens
+            | match_any '(' field ',' string ')'              -- ContainsAnyToken
+            | phrase '(' field ',' string ')'                 -- ContainsTokenSequence
+
+ranking    := knn '(' vector ')' [decay_tail]                 -- Store::search
+            | match '(' clause (',' clause)* ')'              -- Store::text_search
+            | knn '(' vector ')' FUSE match '(' ... ')'       -- Store::hybrid_search
+            | field [ASC | DESC]                              -- Store::list, OrderBy
+decay_tail := '-' decay '(' field ',' origin ',' scale [',' decay [',' lambda]] ')'
+clause     := field ',' string [PREFIX]
+```
+
+`WITH (...)` is a named-option bag, not a keyword per feature: §7 grows by adding a key here,
+not by growing the grammar.
+
+| `WITH` key | Compiles to |
+|---|---|
+| `annotations` | `explain: true` (§7.8) |
+| `plan` | `plan: true` (§7.11) |
+| `exact` | `exact: true` |
+| `min_score = f` | `min_score` |
+| `diversity = f` | `diversity` (§7.7) |
+| `limit_per = (field, n)` | `LimitPer` (§7.7) |
+| `context = (radius n [, parent f, index f, text f])` | `Expand` (§7.10) |
+| `rerank = ([overscan n] [, text f])` | `RerankOpts` |
+| `candidates = n`, `rrf_k = f`, `weights = (v, t)` | `HybridOpts` fusion knobs (§7.6) |
+
+**Dispatch.** The `ORDER BY` head alone decides which existing entry point runs; no other
+clause affects it:
+
+| `ORDER BY` | Entry point |
+|---|---|
+| `knn(...)` | `Store::search` / `search_with_plan` |
+| `match(...)` | `Store::text_search` |
+| `knn(...) FUSE match(...)` | `Store::hybrid_search` / `hybrid_search_with_plan` |
+| a bare field, or absent, with `GROUP BY` or a `sum(...)`/`count(*)` projection | `Store::aggregate` |
+| a bare field, or absent, otherwise | `Store::list` |
+
+**Mapping table.** One row per §7 subsection, the SQL spelling that reaches it, and the
+typed value it compiles to (`tests/corpus/queries.json` carries a runnable case for every
+row, checked against the typed spelling for identical ordered ids):
+
+| §7 | SQL spelling | Compiles to |
+|---|---|---|
+| §7.1 glob subset | `WHERE field LIKE 'r*'` | `Predicate::Glob` |
+| §7.2 array containment | `WHERE contains(tags, 'cli')` | `Predicate::Contains` |
+| §7.3 boolean composition | `WHERE (a = 1 OR b = 2) AND NOT c` | `Predicate::Any` / `Predicate::All` / `Predicate::Not` |
+| §7.4 fuzzy and token text predicates | `WHERE fuzzy(f, 'x', 1) AND match_all(f, 'a b')` | `Predicate::Fuzzy` / `Predicate::ContainsAllTokens` |
+| §7.5 regular expressions | `WHERE field ~ '^the.*fox$'` | `Predicate::Regex` |
+| §7.6 ranking expressions | `ORDER BY knn([...])`, `ORDER BY match(f, 'q')`, `ORDER BY knn([...]) FUSE match(f, 'q')` | `Store::search` / `text_search` / `hybrid_search` |
+| §7.7 aggregation and result diversity | `SELECT sum(n), count(*) [GROUP BY f]`; `WITH (limit_per = (f, n))`, `WITH (diversity = d)` | `AggregateOpts`; `LimitPer` / `diversity` |
+| §7.8 result annotations | `WITH (annotations)` | `explain: true` |
+| §7.9 multi-query batching | `SELECT ...; SELECT ...` | `Nidus::query_batch` |
+| §7.10 parent rollup and neighbour expansion | `WITH (context = (radius 1, parent "p", index "i", text "t"))` | `Expand` |
+| §7.11 query plans | `WITH (plan)` | `plan: true` |
+
+**Per-surface reachability.** Every row above is reachable on the library, HTTP, and CLI
+surfaces. MCP's `query` tool narrows one case deliberately: it refuses a literal
+`ORDER BY knn([...])` vector (400/`invalid_params`, naming the byte offset and §7.6), because
+that surface is text-native and has no way for a caller to type a vector argument — use
+`match(...)` ranking or a `WHERE` filter instead, or the `recall`/`hybrid_search` tools for
+vector search. A `;`-separated batch is out of scope on MCP for the same reason: its `query`
+tool calls `Nidus::query`, which is single-statement by design. This mirrors a narrowing that
+already existed before this feature: `predicate_schema()` (`src/server/mcp/search.rs`) exposes
+a curated 13 of `Predicate`'s 21 variants to MCP's other filter-taking tools, because the full
+set is too large to be a usable tool-selection prompt; SQL's `WHERE` clause compiles the same
+21 variants everywhere else.
+
+| Surface | Reaches |
+|---|---|
+| Library (`Nidus::query`/`query_batch`/`compile`) | Every row above. |
+| HTTP (`POST /query`) | Every row above. |
+| CLI (`nidus query`) | Every row above. |
+| MCP (`query` tool) | Every row above **except** `ORDER BY knn([...])` (refused: no vector literal) and `;`-batching (refused: single-statement only). |
+
+**Exclusions**, and why each is a design change rather than an oversight — nidus is a vector
+store with no engine to run any of these, not a case where they were merely hard to parse:
+
+| Excluded | Why |
+|---|---|
+| Joins | No second table to join against — a store's collections share one embedding space and are unioned in scope, never joined. |
+| `INSERT` / `UPDATE` / `DELETE` (DML) | Writes go through `upsert`/`delete`/`delete_where`; §7 is read-only by construction, and this syntax is a read front end onto it. |
+| Subqueries | Would require a planner to sequence and materialize intermediate results; there is no planner. |
+| Transactions | Multi-operation transactions were already a non-goal (§2); nothing about read syntax changes that. |
+
+**The parser decision.** Hand-rolled recursive-descent, dependency-free, in the lean core
+(`src/sql/`, no feature gate) — measured against a `sqlparser`-crate front end, clean offline
+debug build, `rm -rf target`, pinned 1.98 toolchain, one machine:
+
+| Candidate | Transitive crates | Wall | Native code |
+|---|---|---|---|
+| `sqlparser` 0.63, default features | +18 | 13.25s | yes — `psm`/`stacker` via `cc` |
+| `sqlparser` 0.63, `default-features = false, features = ["std"]` | +2 | 5.78s | none, but no recursion protection |
+| hand-rolled (chosen) | 0 | 0s | none |
+
+The cheap `sqlparser` spelling drops `recursive-protection`, so deeply nested SQL overflows
+the stack and aborts rather than returning an error: a *Stable* commitment failure (§1), not
+a preference. The hand-rolled parser carries an explicit depth cap instead
+(`MAX_NEST_DEPTH = 128`, matching `serde_json`'s de facto cap on the JSON spelling, so the two
+spellings accept the same shapes) and returns an error rather than aborting. See
+[D0017](decisions/0017-sql-is-syntax-not-an-engine.md) for the full record.
+
+**Errors.** Every SQL front-end failure carries one format, from every surface, via the
+`anyhow::Error` chain each surface already had:
+
+```
+sql parse error at byte 17: expected a value after '=' (§7.3 boolean composition)
+```
+
+HTTP answers `400` for a `sql parse error`-marked failure (`classify()`,
+`src/server/mod.rs`), the same status a malformed typed request gets.
 
 ## 8. Compaction
 

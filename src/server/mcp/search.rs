@@ -324,6 +324,67 @@ fn prefix_schema() -> JsonValue {
     })
 }
 
+/// Byte offset of the first case-insensitive, word-bounded `knn(` in `sql`, or `None` — the
+/// text-native surface has no vector argument to compile a literal one with (§7.6), so a
+/// `query` call scans for it before the SQL ever reaches [`crate::Nidus::query`].
+fn vector_literal_offset(sql: &str) -> Option<usize> {
+    let lower = sql.to_ascii_lowercase();
+    let bytes = sql.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = lower[search_from..].find("knn") {
+        let at = search_from + rel;
+        let prev = at.checked_sub(1).map(|i| bytes[i]);
+        let boundary_ok = !matches!(prev, Some(b) if b.is_ascii_alphanumeric() || b == b'_');
+        if boundary_ok && sql[at + 3..].trim_start().starts_with('(') {
+            return Some(at);
+        }
+        search_from = at + 3;
+    }
+    None
+}
+
+/// Render a [`crate::QueryAnswer`] the way every other search tool renders its hits — plus
+/// a plain JSON body for the `Aggregation` arm, which has no hits to speak of.
+fn query_answer_content(answer: crate::QueryAnswer) -> CallToolResult {
+    match answer {
+        crate::QueryAnswer::Hits { hits, plan } => {
+            hits_with_plan_content(hits.into_iter().map(HitDto::from).collect(), plan)
+        }
+        crate::QueryAnswer::Aggregation(agg) => {
+            let rendered = serde_json::to_string_pretty(&agg).unwrap_or_else(|_| "{}".to_string());
+            CallToolResult::success(vec![ContentBlock::text(rendered)])
+        }
+    }
+}
+
+/// `query`'s schema, kept separate from [`tools`] and registered in `mod.rs` after every
+/// tool that predates it (SEP-2549) — see the root `BLUEPRINT-nidus-yq9p-2-3-6.md`.
+pub(super) fn query_tool() -> Tool {
+    tool(
+        "query",
+        "Run one SQL-shaped SELECT statement over this store (SPEC.md §7.12): WHERE \
+         filters, ORDER BY match(...) full-text ranking or a bare field, GROUP BY \
+         aggregation, LIMIT/OFFSET, and a WITH (...) option bag covering annotations, \
+         plans, diversity, rollup, and rerank. `ORDER BY knn(...)` vector ranking is \
+         refused here because it takes a literal vector this text-only surface cannot \
+         type — use `ORDER BY match(field, 'text')` for ranking by keyword, a WHERE \
+         filter for metadata, or the `recall`/`hybrid_search` tools for vector search.",
+        json!({
+            "type": "object",
+            "properties": {
+                "sql": {
+                    "type": "string",
+                    "description": "One SELECT statement. Example: \"SELECT * FROM \
+                        docs WHERE lang = 'rust' ORDER BY match(body, 'async retry') \
+                        LIMIT 10\"."
+                }
+            },
+            "required": ["sql"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 pub(super) fn tools() -> Vec<Tool> {
     vec![
         tool(
@@ -869,6 +930,29 @@ impl NidusMcp {
         let rendered = serde_json::to_string_pretty(&dto).unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![ContentBlock::text(rendered)]))
     }
+
+    /// SQL-shaped read syntax (`SPEC.md` §7.12), minus `ORDER BY knn(...)`: this surface is
+    /// text-native, so a vector literal is refused here rather than reaching the parser.
+    pub(super) async fn query(
+        &self,
+        args: &Map<String, JsonValue>,
+    ) -> Result<CallToolResult, McpError> {
+        let sql = required_str(args, "sql")?;
+        if let Some(at) = vector_literal_offset(&sql) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "{} at byte {at}: knn(...) needs a vector the caller cannot type here; \
+                     use match(...) or a filter (§7.6 ranking expressions)",
+                    crate::sql::SQL_PARSE_ERROR
+                ),
+                None,
+            ));
+        }
+        let answer = crate::server::run_read(self.state.clone(), move |db| db.query(&sql))
+            .await
+            .map_err(api_error)?;
+        Ok(query_answer_content(answer))
+    }
 }
 
 /// The async half of MCP rerank: widen inside `run_read`, rerank outside it (network IO
@@ -1212,5 +1296,134 @@ mod tests {
             .iter()
             .map(|h| h["id"].as_str().expect("id").to_string())
             .collect()
+    }
+}
+
+/// The `query` tool (nidus-yq9p.2/.3/.6): SQL runs over MCP, minus a vector literal. Its own
+/// module so it compiles under a plain `mcp` build, unlike the rerank-gated tests above.
+#[cfg(test)]
+mod query_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::{FtsField, Record, Value};
+
+    fn obj(v: JsonValue) -> Map<String, JsonValue> {
+        match v {
+            JsonValue::Object(m) => m,
+            _ => panic!("expected a JSON object"),
+        }
+    }
+
+    fn text_of(result: CallToolResult) -> String {
+        let rmcp::model::ContentBlock::Text(text) =
+            result.content.into_iter().next().expect("content block")
+        else {
+            panic!("expected text content");
+        };
+        text.text
+    }
+
+    fn store_with_docs() -> crate::Nidus {
+        let mut db = crate::Nidus::open_in_memory(3).unwrap();
+        db.create_collection_with_fts("docs", &[FtsField::new("body")])
+            .unwrap();
+        db.upsert(
+            "docs",
+            &[Record::new(
+                "a",
+                vec![1.0, 0.0, 0.0],
+                BTreeMap::from([("body".to_string(), Value::Str("rust async retry".into()))]),
+            )],
+        )
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn query_runs_a_match_select_and_returns_the_hit() {
+        let mcp = NidusMcp::new(crate::server::test_state(Some(store_with_docs())));
+
+        let result = mcp
+            .query(&obj(
+                json!({"sql": "SELECT * FROM docs ORDER BY match(body, 'rust')"}),
+            ))
+            .await
+            .unwrap();
+        assert!(text_of(result).contains("\"a\""));
+    }
+
+    #[tokio::test]
+    async fn query_runs_a_where_and_limit_select_like_list() {
+        let mcp = NidusMcp::new(crate::server::test_state(Some(store_with_docs())));
+
+        let result = mcp
+            .query(&obj(
+                json!({"sql": "SELECT * FROM docs WHERE body ~ '.*async.*' LIMIT 5"}),
+            ))
+            .await
+            .unwrap();
+        assert!(text_of(result).contains("\"a\""));
+    }
+
+    #[tokio::test]
+    async fn query_rejects_a_knn_vector_literal() {
+        let mcp = NidusMcp::new(crate::server::test_state(Some(store_with_docs())));
+
+        let err = mcp
+            .query(&obj(
+                json!({"sql": "SELECT * FROM docs ORDER BY knn([1.0, 0.0, 0.0])"}),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains(crate::sql::SQL_PARSE_ERROR),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("at byte"), "{}", err.message);
+        assert!(err.message.contains("§7.6"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn query_rejects_knn_inside_a_fuse_ranking_too() {
+        let mcp = NidusMcp::new(crate::server::test_state(Some(store_with_docs())));
+
+        let err = mcp
+            .query(&obj(json!({
+                "sql": "SELECT * FROM docs ORDER BY knn([1.0, 0.0, 0.0]) FUSE match(body, 'x')"
+            })))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("knn"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn query_with_more_than_one_statement_is_an_error() {
+        let mcp = NidusMcp::new(crate::server::test_state(Some(store_with_docs())));
+
+        let err = mcp
+            .query(&obj(
+                json!({"sql": "SELECT * FROM docs; SELECT * FROM docs"}),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains(crate::sql::SQL_PARSE_ERROR),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn no_tool_schema_declares_a_vector_argument() {
+        // The law `tests/e2e/mcp/` asserts over the wire: no tool schema names a raw
+        // `vector` property. `query`'s own schema is the one new surface to check here.
+        let schema = query_tool().input_schema;
+        let props = schema.get("properties").and_then(|p| p.as_object());
+        assert!(
+            props.is_none_or(|p| !p.contains_key("vector")),
+            "query tool schema must not expose a raw vector argument"
+        );
     }
 }

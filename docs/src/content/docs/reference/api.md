@@ -76,6 +76,9 @@ An indirect name resolving to one concrete collection, one hop only; see the
 | `suggest` | `fn suggest<'a>(&self, scope: impl Into<Scope<'a>>, field: &str, prefix: &str, opts: &SuggestOpts) -> Result<Suggestions>` | [Ranked term completions](/guides/full-text-search/) from `field`'s full-text vocabulary across a scope, ranked by document frequency (not idf). Each `df` counts only documents passing `opts.filter` and carrying every word before the final token. An unindexed field or unknown collection contributes nothing rather than erroring. |
 | `hybrid_search` | `fn hybrid_search<'a>(&self, scope: impl Into<Scope<'a>>, vector: &[f32], text: &FtsQuery, opts: &HybridOpts) -> Result<Vec<Hit>>` | [Hybrid vector + BM25](/guides/hybrid-search/), fused with Reciprocal Rank Fusion. |
 | `aggregate` | `fn aggregate<'a>(&self, scope: impl Into<Scope<'a>>, opts: &AggregateOpts) -> Result<Aggregation>` | [Count and sum](/guides/filters/#aggregation) over a filter, straight off the in-memory index; no record is materialized. |
+| `query` | `fn query(&self, sql: &str) -> Result<QueryAnswer>` | Run one [SQL-shaped](/guides/query-with-sql/) `SELECT` statement, compiled to whichever of the methods above its `ORDER BY` head selects. Errors if `sql` holds more than one `;`-separated statement. |
+| `query_batch` | `fn query_batch(&self, sql: &str) -> Result<Vec<QueryAnswer>>` | Like `query`, but runs every `;`-separated statement in `sql` in order, one `QueryAnswer` per statement. |
+| `compile` | `fn compile(&self, sql: &str) -> Result<Vec<Compiled>>` | Compile `sql` without running it: the typed [`Compiled`](#compiled--queryanswer) value each statement resolves to, one per `;`-separated statement. |
 | `flush` | `fn flush(&mut self) -> Result<()>` | Force an fsync (relevant under `Fsync::OnFlush`). |
 | `deferred` | `fn deferred<T>(&mut self, f: impl FnOnce(&mut Nidus) -> Result<T>) -> Result<T>` | Run `f`'s mutations with their durable barrier deferred, so several can share one; see [group commit](/guides/how-it-works/#group-commit). **Report nothing successful until `commit` returns `Ok`**: until then the bytes are appended but not durable. |
 | `commit` | `fn commit(&mut self) -> Result<()>` | Take one barrier covering everything appended by `deferred` (fsync `data`, then `log`). A no-op when no barrier is owed, so the ordinary path pays nothing. Narrower than `flush`: no segment seal, no working-set publish. |
@@ -724,6 +727,35 @@ impl Hit {
     ) -> Self;
 }
 ```
+
+## `Compiled` & `QueryAnswer`
+
+What [`compile`](#nidus) resolves a `SELECT` statement to, and what
+[`query`](#nidus)/[`query_batch`](#nidus) hand back after running it. See
+[Query with SQL](/guides/query-with-sql/) and `SPEC.md` §7.12 for the grammar.
+
+```rust
+pub enum Compiled {
+    Search { collections: Vec<String>, vector: Vec<f32>, opts: SearchOpts },
+    TextSearch { collections: Vec<String>, query: FtsQuery, opts: SearchOpts },
+    Hybrid { collections: Vec<String>, vector: Vec<f32>, text: FtsQuery, opts: HybridOpts },
+    List { collections: Vec<String>, opts: ListOpts },
+    Aggregate { collections: Vec<String>, opts: AggregateOpts },
+}
+
+pub enum QueryAnswer {
+    Hits { hits: Vec<Hit>, plan: Option<QueryPlan> },
+    Aggregation(Aggregation),
+}
+```
+
+Each `Compiled` variant names the entry point the statement's `ORDER BY` head selected
+(`Store::search`, `text_search`, `hybrid_search`, `list`, or `aggregate`) and the same typed
+options a caller of that method would build by hand; `compile` never runs anything, so
+`serde_json` (optional in the lean library build) is not needed to produce it. `QueryAnswer`
+is what running a `Compiled` value produces: `Hits` for every ranking or listing dispatch,
+with `plan` populated only when the statement asked for one (`WITH (plan)`); `Aggregation`
+for a `GROUP BY` statement, which has no plan-carrying entry point.
 
 ## `Footprint`
 

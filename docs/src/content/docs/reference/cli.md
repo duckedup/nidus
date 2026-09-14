@@ -7,8 +7,8 @@ Every flag the `nidus` binary accepts, generated from `nidus --help` and each su
 own `--help`. For a guided tour with worked examples, see the [command-line
 guide](/guides/cli-and-server/); this page is the exhaustive reference.
 
-The binary has **33 subcommands**: `serve`, `mcp`, `collections`, `create`, `drop`,
-`upsert`, `search`, `similar`, `aggregate`, `list`, `set-fts-schema`, `suggest`,
+The binary has **34 subcommands**: `serve`, `mcp`, `collections`, `create`, `drop`,
+`upsert`, `search`, `similar`, `query`, `aggregate`, `list`, `set-fts-schema`, `suggest`,
 `text-search`, `hybrid-search`, `get`, `delete`, `compact`, `versions`, `configure`,
 `backup`, `restore`, `verify`, `check`, `stats`, `tune`, `ingest`, `code ingest`,
 `code search`, `remember`, `recall`, `aliases`, `set-alias`, `drop-alias`.
@@ -20,7 +20,7 @@ binary was built:
 
 | Install | Command | Surface |
 | --- | --- | --- |
-| `cargo install nidus`, `cargo binstall nidus`, the install script, or the release tarballs | n/a | Everything below: all 33 subcommands, every `--embed-*`/`--summarize-*` flag, `mcp`, `ingest`, `code ingest`, `code search`, `remember`, `recall` |
+| `cargo install nidus`, `cargo binstall nidus`, the install script, or the release tarballs | n/a | Everything below: all 34 subcommands, every `--embed-*`/`--summarize-*` flag, `mcp`, `ingest`, `code ingest`, `code search`, `remember`, `recall` |
 | `cargo install nidus --no-default-features --features cli` | build from source | No `mcp`, `ingest`, `code ingest`, `code search`, `remember`, or `recall` subcommand, and `serve` has **no** `--embed-*`/`--summarize-*` flags |
 
 `cargo install nidus` builds with `default = ["serve"]`, the umbrella feature
@@ -301,6 +301,27 @@ List records by metadata filter, no vector query. Usage:
 | `--exclude-attr <ATTR>` | none | Return every attr but this one (repeatable). Exclusive with `--include-attr`. |
 | `--order-by <ATTR>` | none | Sort by this attribute instead of storage order. |
 | `--desc` | none | Sort `--order-by` descending; requires `--order-by`. |
+
+### `query`
+
+SQL-shaped read syntax (see the [SQL guide](/guides/query-with-sql/)): a `SELECT` compiled
+to whichever of the commands above its `ORDER BY` head selects, then run through it.
+`;`-separated statements run as a script, each answer printed in order. Usage:
+`nidus query [OPTIONS] --dir <DIR> [SQL]`.
+
+```bash
+nidus query --dir ./store "SELECT * FROM notes WHERE lang LIKE 'r*' ORDER BY knn([1,0,0,0]) LIMIT 3"
+```
+
+| Flag | Env | Description |
+| --- | --- | --- |
+| `SQL` (positional) | none | The SQL to run, or `-` to read it from stdin. Omit when using `--sql-file`. |
+| `--sql-file <FILE>` | none | Read the SQL from this file instead of the positional argument or stdin. |
+| `--compile` | none | Compile only: print the compiled form as JSON, run nothing. |
+
+A parse or compile failure names a byte offset, what went wrong, and the `SPEC.md` §7
+section that owns the rule: `sql parse error at byte 17: expected a value after '=' (§7.3
+boolean composition)`.
 
 ### `set-fts-schema`
 

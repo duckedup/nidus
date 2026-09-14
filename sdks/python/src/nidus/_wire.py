@@ -112,6 +112,7 @@ HYBRID_SEARCH = "/hybrid-search"
 CODE_SEARCH = "/code-search"
 LIST = "/list"
 AGGREGATE = "/aggregate"
+QUERY = "/query"
 FLUSH = "/flush"
 COMPACT = "/compact"
 ALIASES = "/aliases"
@@ -599,6 +600,13 @@ def aggregate_body(
     )
 
 
+def query_body(sql: str, *, compile_only: Optional[bool] = None) -> dict[str, Any]:
+    """Body for ``POST /query`` (SPEC §7.12). ``compile_only`` is pruned when unset so the
+    server's own default (``false`` — execute) applies.
+    """
+    return prune({"sql": sql, "compile_only": compile_only})
+
+
 def batch_search_body(
     queries: Sequence[Mapping[str, Any]],
     rrf_k: Optional[float] = None,
@@ -846,6 +854,46 @@ def _group_of(payload: Mapping[str, Any]) -> Group:
         count=int(payload["count"]),
         sums={str(k): decode_value(v) for k, v in (payload.get("sums") or {}).items()},
     )
+
+
+def decode_query_answer(payload: Any) -> Any:
+    """Decode one ``/query`` statement's answer: a bare hits list (mirrors ``/search``'s own
+    body), ``{"hits": ..., "plan": ...}`` when ``WITH (plan)``/``WITH (annotations)`` asked
+    for one (mirrors a ``*_with_plan`` call), or an aggregation (mirrors ``/aggregate``'s).
+    """
+    if isinstance(payload, list):
+        return decode_hits(payload)
+    if isinstance(payload, Mapping):
+        if "count" in payload:
+            return decode_aggregation(payload)
+        if "hits" in payload:
+            return (decode_hits(payload.get("hits")), decode_plan(payload.get("plan")))
+    raise NidusError(f"/query returned an unrecognised answer shape (got {payload!r})", 0)
+
+
+def _is_batch_answer(payload: list[Any]) -> bool:
+    """Tell a bare ``Hits`` answer (a list of hit objects) from a ``;``-script's own answers
+    (a list whose elements are themselves hits-lists, ``{hits, plan}``, or aggregations).
+
+    The server unwraps a single statement's answer to the bare shape and only wraps a
+    script's answers in an array (the Rust side's ``render_query_answers``), so a batch
+    array is never length 1 — but it can still be as short as a bare two-hit answer, which
+    is why the check is on each element's own shape rather than on the array's length: a
+    hit object always carries ``collection``; no per-statement wrapper element does.
+    """
+    if not payload:
+        return False
+    first = payload[0]
+    return isinstance(first, list) or (isinstance(first, Mapping) and "collection" not in first)
+
+
+def decode_query_response(payload: Any) -> Any:
+    """Decode ``/query``'s top-level shape (SPEC §7.9): one statement's answer bare, or a
+    ``;``-separated script's answers as a list, in the order the statements were written.
+    """
+    if isinstance(payload, list) and _is_batch_answer(payload):
+        return [decode_query_answer(item) for item in payload]
+    return decode_query_answer(payload)
 
 
 def decode_batch(payload: Any) -> Batch:

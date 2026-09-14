@@ -704,6 +704,32 @@ class NidusClient:
             )
         )
 
+    def query(self, sql: str) -> Any:
+        """Run one or more ``;``-separated SQL statements (SPEC §7.12) against ``POST
+        /query``, the same typed entry points :meth:`search`, :meth:`text_search`,
+        :meth:`hybrid_search`, :meth:`list` and :meth:`aggregate` already call.
+
+        A single statement decodes exactly like the equivalent typed method's answer: a
+        ranking as :data:`~nidus.Hits`, ``WITH (plan)``/``WITH (annotations)`` as a
+        ``(hits, plan)`` pair like :meth:`search_with_plan`, ``GROUP BY`` as an
+        :class:`~nidus.Aggregation`. A ``;``-separated script decodes to a ``list`` of those
+        answers, in the order the statements were written (§7.9). A parse error raises
+        :class:`~nidus.NidusError` carrying the server's message verbatim (byte offset and
+        §7 feature name intact) with ``status == 400``.
+        """
+        return _wire.decode_query_response(
+            self._request("POST", _wire.QUERY, _wire.query_body(sql))
+        )
+
+    def compile(self, sql: str) -> Any:
+        """Compile ``sql`` without running it: the typed, JSON-rendered form of each
+        statement `POST /query` would otherwise execute — a single statement bare, a
+        ``;``-separated script as a ``list``, mirroring :meth:`query`'s own shape rule.
+
+        Never issues the search/list/aggregate request itself; only the compile step runs.
+        """
+        return self._request("POST", _wire.QUERY, _wire.query_body(sql, compile_only=True))
+
     def batch_search(
         self,
         queries: Sequence[Mapping[str, Any]],

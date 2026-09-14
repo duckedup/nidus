@@ -14,6 +14,7 @@ import type {
   ClusterStatus,
   CodeFileHit,
   CodeSearchOptions,
+  Compiled,
   DecodedRecord,
   Expand,
   Filter,
@@ -27,6 +28,7 @@ import type {
   PlanCandidates,
   PlanNarrowing,
   PlanTimings,
+  QueryAnswer,
   QueryPlan,
   RankBy,
   Readiness,
@@ -519,6 +521,72 @@ export class NidusClient {
           }
         : {}),
       ...(res.groups_truncated ? { groupsTruncated: true } : {}),
+    };
+  }
+
+  // ── SQL (SPEC §7.12) ────────────────────────────────────────────────────
+
+  /**
+   * Compile and run a `SELECT ...` script against `POST /query` (SPEC §7.12). A single
+   * statement decodes to its own answer (hits, `{hits, plan}`, or an {@link Aggregation});
+   * a `;`-separated script answers one {@link QueryAnswer} per statement, in request order.
+   * A parse error rejects with the server's message verbatim (byte offset and §7 section).
+   */
+  async query(sql: string): Promise<QueryAnswer | QueryAnswer[]> {
+    const raw = await this.request<unknown>("POST", "/query", { sql });
+    if (Array.isArray(raw) && raw.length > 0 && !this.isHitShaped(raw[0])) {
+      return raw.map((a) => this.decodeQueryAnswer(a));
+    }
+    return this.decodeQueryAnswer(raw);
+  }
+
+  /**
+   * Compile a `SELECT ...` script without running it: the typed value(s) the matching
+   * `Store` method would receive. Always an array, one entry per `;`-separated statement.
+   */
+  async compile(sql: string): Promise<Compiled[]> {
+    const raw = await this.request<unknown>("POST", "/query", {
+      sql,
+      compile_only: true,
+    });
+    return Array.isArray(raw) ? (raw as Compiled[]) : [raw as Compiled];
+  }
+
+  /** A wire hit's shape, distinguishing a bare hits-answer from a batch of answers. */
+  private isHitShaped(x: unknown): x is RawHit {
+    return (
+      typeof x === "object" &&
+      x !== null &&
+      !Array.isArray(x) &&
+      typeof (x as { id?: unknown }).id === "string"
+    );
+  }
+
+  /** Decode one statement's `/query` answer: hits (bare or `{hits, plan}`), or an aggregation. */
+  private decodeQueryAnswer(raw: unknown): QueryAnswer {
+    if (Array.isArray(raw)) {
+      return raw.map((h) => this.decodeHit(h as RawHit));
+    }
+    const obj = raw as Record<string, unknown>;
+    if ("count" in obj) {
+      return {
+        count: obj.count as number,
+        sums: decodeAttrs(obj.sums as Record<string, Value>) as Record<string, number>,
+        ...(obj.groups
+          ? {
+              groups: (obj.groups as NonNullable<RawAggregation["groups"]>).map((g) => ({
+                value: g.value === null ? null : decodeValue(g.value),
+                count: g.count,
+                sums: decodeAttrs(g.sums) as Record<string, number>,
+              })),
+            }
+          : {}),
+        ...(obj.groups_truncated ? { groupsTruncated: true } : {}),
+      };
+    }
+    return {
+      hits: (obj.hits as RawHit[]).map((h) => this.decodeHit(h)),
+      plan: decodeQueryPlan(obj.plan as RawQueryPlan),
     };
   }
 

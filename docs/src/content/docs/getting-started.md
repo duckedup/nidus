@@ -36,7 +36,7 @@ local store in four commands. See
 ```toml
 # Cargo.toml
 [dependencies]
-nidus = "0.99"
+nidus = "0.100"
 anyhow = "1"     # nidus returns anyhow::Result
 ```
 
@@ -136,6 +136,28 @@ let hits = db.search(Scope::All, &query, &opts)?;
 
 Scoping the whole store is sound because every collection shares one embedding
 space; see [Search & filters](/guides/search/).
+
+## Query with SQL
+
+The same search compiles from a `SELECT` statement instead of a typed call, for
+anywhere a string is easier to reach for than a struct (a CLI one-liner, a notebook):
+
+```rust
+use nidus::QueryAnswer;
+
+let QueryAnswer::Hits { hits, .. } = db.query(
+    "SELECT * FROM code WHERE path LIKE 'src/auth/*' \
+     ORDER BY knn([/* 768 f32s */]) WITH (min_score = 0.5) LIMIT 10",
+)?
+else {
+    unreachable!("a search-ranked query always answers Hits")
+};
+# anyhow::Ok(())
+```
+
+`query` compiles the statement to the same `SearchOpts`/`Filter` values the typed call
+above builds by hand, then runs it. See [Query with SQL](/guides/query-with-sql/) for
+the full grammar and what each clause compiles to.
 
 ## Run the example
 
