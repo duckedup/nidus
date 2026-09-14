@@ -20,14 +20,14 @@ pub(crate) use error::SQL_PARSE_ERROR;
 use crate::model::{AggregateOpts, Aggregation, FtsQuery, Hit, HybridOpts, ListOpts, SearchOpts};
 use crate::plan::QueryPlan;
 
-/// Nested-`(...)` recursion guard for the `WHERE` boolean tree (root blueprint): a
+/// Nested-`(...)` recursion guard for the `WHERE` boolean tree (SPEC §7.12): a
 /// hand-rolled parser inherits none of `serde_json`'s de facto 128-level cap, and unbounded
 /// recursion on attacker-supplied text is a stack overflow, not an error (SPEC §1 Stable).
 const MAX_NEST_DEPTH: usize = 128;
 
 /// One statement, compiled: the store entry point its `ORDER BY` head selected, and the
 /// typed options that entry point runs with. Never executed by this module — `src/lib.rs`
-/// matches over it and calls the existing `Store` methods (root blueprint's dispatch table).
+/// matches over it and calls the existing `Store` methods (SPEC §7.12's dispatch table).
 #[derive(Clone, Debug)]
 pub enum Compiled {
     Search {
@@ -70,7 +70,7 @@ pub enum QueryAnswer {
 
 /// Parse and compile every statement in `sql` (§7.9: `;`-separated). The one place a
 /// [`error::SqlError`] becomes an `anyhow::Error` — every downstream surface sees the same
-/// `Display` text through the chain that already exists (root blueprint's error model).
+/// `Display` text through the chain that already exists (SPEC §7.12's error model).
 pub(crate) fn compile_all(sql: &str) -> anyhow::Result<Vec<Compiled>> {
     parse::parse(sql)
         .map_err(|e| anyhow::anyhow!("{e}"))?

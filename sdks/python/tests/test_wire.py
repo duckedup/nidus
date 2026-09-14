@@ -492,7 +492,7 @@ def test_empty_rerank_is_sent_as_an_empty_dict() -> None:
 
 
 def test_rerank_rejects_an_unknown_key() -> None:
-    """The stale ``text_field`` spelling from the earlier blueprint draft must not pass."""
+    """The stale ``text_field`` spelling from an earlier draft must not pass."""
     with pytest.raises(TypeError, match="unknown key"):
         _wire.search_body([1.0], rerank={"text_field": "body"})  # type: ignore[typeddict-unknown-key]
 

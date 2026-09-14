@@ -112,7 +112,7 @@ fn query_tool_runs_a_real_filter_and_match_query() {
 }
 
 /// A parse error is a caller fault, `invalid_params`, carrying the same marker/offset/section
-/// text every other surface produces (root blueprint's error model).
+/// text every other surface produces (SPEC §7.12's error model).
 #[test]
 fn query_tool_reports_a_parse_error_as_invalid_params() {
     let dir = tempfile::tempdir().unwrap();

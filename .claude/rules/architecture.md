@@ -7,12 +7,14 @@ paths:
 
 nidus is a **vector store with full-text search** that runs anywhere Rust runs: dense vectors
 plus typed metadata in a single store, answering nearest-neighbour queries by exact brute-force
-cosine. It is the local storage
-leg for semantic-search and indexing tools — a pure-Rust replacement for an embedded
-DuckDB/LanceDB. No SQL engine, no query planner, no background threads. SQL *read syntax*
-does exist (`src/sql/`, `just spec 7.12`): a hand-rolled, dependency-free compiler onto the
-same `SearchOpts`/`Filter`/etc. values below, never a second execution path — a sub-blueprint
-editing `src/store/` or `src/plan.rs` to support it has outrun the design.
+cosine. It is the local storage leg for semantic-search and indexing tools — a pure-Rust
+replacement for an embedded DuckDB/LanceDB. No background threads.
+
+**SQL is read syntax, not an engine.** `src/sql/` (`just spec 7.12`) compiles `SELECT` text
+onto the same `SearchOpts`/`Filter` values the typed API takes, by hand and with no
+dependency, so both spellings run one code path. What is absent is the engine: no planner,
+no joins, no DML, no transactions. Supporting a SQL feature never requires editing
+`src/store/` or `src/plan.rs`; if it seems to, the grammar has outrun §7.
 
 **For the module map, run `just spec 10`** — it is the same tree with more detail per module,
 and it cannot drift from the spec the way a second copy here would. `just spec find <words>`

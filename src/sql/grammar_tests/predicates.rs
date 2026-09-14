@@ -1,7 +1,7 @@
 //! The `WHERE` grammar, exhaustively: every comparison operator against every literal type,
 //! every predicate spelling, precedence/grouping/negation, field-name shapes, and keyword
 //! casing. Each test asserts the parsed [`PredNode`] tree or a real `err_at` offset, never
-//! merely that parsing succeeded (root blueprint's bar).
+//! merely that parsing succeeded (this module's bar).
 
 use super::super::error::{SEC_ARRAY, SEC_GLOB, SEC_REGEX, SEC_SYNTAX, SEC_TEXT};
 use super::super::parse::{CmpOp, Lit, PredNode};

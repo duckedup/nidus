@@ -1,5 +1,5 @@
 //! Recursive descent: tokens -> a small private syntax tree. One function per grammar
-//! production (root blueprint's grammar); `compile.rs` turns the tree into `model.rs` values.
+//! production (SPEC §7.12's grammar); `compile.rs` turns the tree into `model.rs` values.
 
 use super::MAX_NEST_DEPTH;
 use super::error::{
@@ -125,7 +125,7 @@ pub(super) struct DecayLit {
     pub lambda: Option<f32>,
 }
 
-/// The `ORDER BY` head — the sole input to dispatch (root blueprint's dispatch table).
+/// The `ORDER BY` head — the sole input to dispatch (SPEC §7.12's dispatch table).
 #[derive(Debug, PartialEq)]
 pub(super) enum Ranking {
     Knn {
@@ -157,7 +157,7 @@ pub(super) enum AnyLit {
 }
 
 /// One argument inside a parenthesized `WITH` option value: a bare value, or a `keyword
-/// value` pair (`radius 5`, `parent "pid"`) — see root blueprint's `WITH` key table.
+/// value` pair (`radius 5`, `parent "pid"`) — see SPEC §7.12's `WITH` key table.
 #[derive(Debug, PartialEq)]
 pub(super) enum OptArg {
     Bare(AnyLit),
@@ -187,7 +187,7 @@ pub(super) struct Statement {
     pub at: usize,
     pub select: Selection,
     /// Concrete collection names; empty means every collection (`FROM *` or an omitted
-    /// `FROM` — recommendation in the root blueprint's open questions).
+    /// `FROM` — recommendation in the SPEC §7.12).
     pub from: Vec<String>,
     pub filter: Option<PredNode>,
     pub group_by: Option<String>,
@@ -494,7 +494,7 @@ impl<'a> Parser<'a> {
 
     /// `primary := '(' predicate ')' | comparison | fn_predicate`. The depth cap guards
     /// **only** this recursive `(...)` entry — the real, unbounded-recursion risk on
-    /// attacker-supplied text (root blueprint: `serde_json`'s 128-cap has no SQL analogue).
+    /// attacker-supplied text (`serde_json`'s 128-cap has no SQL analogue).
     fn parse_primary(&mut self) -> Result<PredNode, SqlError> {
         if self.kind() == Kind::LParen {
             self.depth += 1;
@@ -823,7 +823,7 @@ impl<'a> Parser<'a> {
 
     /// One list argument: a bare value, or `keyword value` when the first token is an
     /// identifier immediately followed by another value (not a `,` or `)`) — see
-    /// `WithOption`'s doc and the root blueprint's `WITH` key table (`radius n`, `parent f`).
+    /// `WithOption`'s doc and the SPEC §7.12's `WITH` key table (`radius n`, `parent f`).
     fn parse_with_arg(&mut self) -> Result<OptArg, SqlError> {
         let v1 = self.parse_any_lit()?;
         if let AnyLit::Ident(name) = &v1

@@ -1,5 +1,5 @@
 //! Tokenizer for the SQL front end. Tokens carry byte offsets into the original source —
-//! `at` is the only position [`SqlError`] ever reports (see root blueprint's error model).
+//! `at` is the only position [`SqlError`] ever reports (see SPEC §7.12's error model).
 
 use std::ops::Range;
 

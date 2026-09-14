@@ -37,10 +37,11 @@ not the functionality test, the **build-and-ship** test:
   + object_store**. Hundreds of crates and a query engine, to do a distance-ranked
   top-k. Same disease as DuckDB, transitively-Rust instead of FFI.
 
-At its core the workload is a **vector store, not a database**: no joins, no SQL engine, no
-analytics; the scan cost is what it is, and mmap, ANN, quantization and segments are the
-opt-ins that change it. SQL as *read syntax* over that same workload does ship (§7.12): a
-compiled front end, not a second engine. nidus is that store — plus a memory layer
+At its core the workload is a **vector store, not a database**: the scan cost is what it is,
+and mmap, ANN, quantization and segments are the opt-ins that change it. SQL ships over that
+workload as *read syntax* (§7.12), compiled to the same calls the typed API makes. What does
+not ship is the engine the paragraph above is arguing against: no planner, no joins, no
+analytics. nidus is that store — plus a memory layer
 (embedding, optionally summarization) built on top — and nothing more;
 `--no-default-features` gives the storage-and-search core alone.
 

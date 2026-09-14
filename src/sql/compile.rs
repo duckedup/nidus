@@ -21,7 +21,7 @@ use super::parse::{
 const DEFAULT_RANKED_LIMIT: usize = 10;
 
 /// Turn one parsed statement into the `Compiled` value that runs it. The `ORDER BY` head
-/// alone picks the dispatch (root blueprint's dispatch table); nothing else affects it.
+/// alone picks the dispatch (SPEC §7.12's dispatch table); nothing else affects it.
 pub(super) fn compile(stmt: &Statement) -> Result<Compiled, SqlError> {
     match &stmt.order {
         Some(Ranking::Knn { vector, decay, at }) => {
@@ -372,7 +372,7 @@ fn to_usize(n: i64, at: usize, section: &'static str) -> Result<usize, SqlError>
 
 // ── WITH (...) — every key, validated against what the dispatch's opts can hold ─────
 
-/// Which `SPEC.md` §7 section a `WITH` key's own rows live under (root blueprint's table).
+/// Which `SPEC.md` §7 section a `WITH` key's own rows live under (SPEC §7.12's table).
 fn with_key_section(key: &str) -> &'static str {
     match key {
         "annotations" => SEC_ANNOTATE,
@@ -460,7 +460,7 @@ fn lit_f32(v: &AnyLit) -> Option<f32> {
 }
 
 /// A field name, spelled either as a bare/quoted identifier or as a string literal — the
-/// `WITH` grammar's `f` placeholder accepts both (root blueprint's key table).
+/// `WITH` grammar's `f` placeholder accepts both (SPEC §7.12's key table).
 fn lit_field(v: &AnyLit) -> Option<String> {
     match v {
         AnyLit::Ident(s) => Some(s.clone()),

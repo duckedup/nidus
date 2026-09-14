@@ -877,7 +877,7 @@ def _ids_of(answer: Any) -> list[str]:
 
 def _dsl_ids(db: NidusClient, dsl: Mapping[str, Any]) -> list[str]:
     """Run a corpus case's typed ``dsl`` twin through the SDK's own public methods — the
-    same entry point ``db.query(case["sql"])`` compiles down to (root blueprint's dispatch
+    same entry point ``db.query(case["sql"])`` compiles down to (SPEC §7.12's dispatch
     table) — and return its ordered ids.
     """
     endpoint, body = dsl["endpoint"], dsl["body"]

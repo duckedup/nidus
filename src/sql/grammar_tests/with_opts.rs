@@ -356,7 +356,7 @@ fn weights_two_ints() {
 }
 
 #[test]
-fn weights_keyed_form_parses_though_the_blueprint_only_documents_bare_args() {
+fn weights_keyed_form_parses_though_only_bare_args_are_documented() {
     let w = withs("SELECT * FROM t WITH (weights = (vector 1.0, text 2.0))");
     assert_eq!(
         w[0].value,

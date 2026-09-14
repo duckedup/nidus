@@ -99,7 +99,7 @@ fn cli_parse_error_classes_report_offset_and_section() {
 }
 
 /// The same classes, over `POST /query`: `400`, and the exact same message text in the body
-/// (the error chain the root blueprint promises — `anyhow::Error` -> `ApiError` -> `{"error":
+/// (the error chain the SPEC §7.12 promises — `anyhow::Error` -> `ApiError` -> `{"error":
 /// "..."}`, no re-wording at the HTTP boundary).
 #[test]
 fn http_parse_error_classes_are_400_with_the_same_message() {

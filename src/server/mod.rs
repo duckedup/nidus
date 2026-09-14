@@ -1032,7 +1032,7 @@ async fn search_batch(
     if let Some(f) = &fuse {
         check_fuse(f, queries.len())?;
     }
-    // Rerank is not supported on `/search/batch` in v1 (root blueprint, decision 5): reject
+    // Rerank is not supported on `/search/batch` in v1 (D0017): reject
     // rather than silently ignore, so a caller asking for it never mistakes plain metric
     // order for a reranked one.
     #[cfg(feature = "rerank")]
@@ -3080,7 +3080,7 @@ mod tests {
     }
 
     /// `POST /query`'s single-statement answer must be byte-identical to what the equivalent
-    /// typed `/search` request returns (root blueprint's parity claim, U2 acceptance).
+    /// typed `/search` request returns (§7.12's parity claim, U2 acceptance).
     #[tokio::test]
     async fn query_search_matches_the_typed_search_response() {
         let app = ranked_router().await;
@@ -3171,7 +3171,7 @@ mod tests {
         assert_eq!(body["opts"]["top_k"], 3);
     }
 
-    /// Malformed SQL is a `400` carrying the parse-error text verbatim (root blueprint's
+    /// Malformed SQL is a `400` carrying the parse-error text verbatim (SPEC §7.12's
     /// error model) — not the `500` a caller's typo would fall through to without the
     /// `classify()` arm.
     #[tokio::test]

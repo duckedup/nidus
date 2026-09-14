@@ -915,7 +915,7 @@ mod sql_tests {
             )
             .unwrap();
         // Byte-identical on every field except wall-clock `timings`, which two separate
-        // calls can never share — the root blueprint's parity claim is about the plan's
+        // calls can never share — the §7.12's parity claim is about the plan's
         // shape (path, rows scanned, candidate survival), not its timing measurements.
         assert_eq!(sql_hits, typed_hits);
         assert_eq!(sql_plan.path, typed_plan.path);
