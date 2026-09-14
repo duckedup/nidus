@@ -25,8 +25,11 @@ change: file an issue first (D0005).
 
 A third job, `ceilings`, bounds the lean tree's *shape* rather than its build time: the
 lean dependency count (`cargo tree -p nidus --no-default-features --edges normal --prefix
-none`, unique crate names — D0015 records a three-crate-higher number under `-e no-dev`,
-which keeps build-dependencies) and the stripped `cargo build --release` binary's size.
+none`, unique crate names — D0015 records a higher number under `-e no-dev`, which keeps
+build-dependencies) and the stripped `cargo build --release` binary's size. **The crate count
+is platform-dependent too** (117 on darwin-arm64, 113 on linux-x86_64; four crates are
+cfg-gated to macOS), so its single bound has to clear the higher of the two — re-measuring on
+Linux and seeing a smaller number is expected, not a regression.
 The committed bounds live in `scripts/ceilings.env`; the check itself is
 `scripts/ceilings.sh`, run by both `just ceilings` and the CI job so the two cannot drift.
 **The binary-size ceiling is per platform**, because binary size is platform-dependent and
