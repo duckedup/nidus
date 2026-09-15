@@ -48,6 +48,15 @@ record it once as the store's default with `nidus configure --ann hnsw` (see
 so `serve` picks it up without the flag. The index lives in memory for the life of
 the process; `GET /stats` reports the active configuration.
 
+## Namespaced mode
+
+`--namespaced` turns `--dir`/`--persistence` into a **base location** for many
+independent stores instead of one: `nidus serve --namespaced --dir ./tenants --dim 768`
+opens nothing at startup, and each request opens its own tenant's store, lazily, the
+first time it is named. See the [multi-tenancy guide](/guides/multi-tenancy/) for the
+full model (isolation, the byte budget, the single-credential caveat); this page keeps
+covering single-store mode except where noted.
+
 ## A complete session over HTTP
 
 From an empty directory to ranked results without ever touching the binary again
@@ -480,6 +489,8 @@ detail on one flag.
 | `NIDUS_SEGMENT_INDEX_MIN_ROWS` | `--segment-index-min-rows` | Minimum rows for a sealed segment to get its own IVF index | never index (exact brute-force) |
 | `NIDUS_AUTO_COMPACT` | `--auto-compact` | Rewrite the data matrix once this fraction of rows is dead | `0.5` |
 | `NIDUS_NO_AUTO_COMPACT` | `--no-auto-compact` | Never auto-compact; reclaim dead rows only on an explicit `compact` | off |
+| `NIDUS_NAMESPACED` | `--namespaced` | Serve every namespace under `--dir`/`--persistence` as its own store, addressed per request; see [Namespaced mode](#namespaced-mode) | off (one store) |
+| `NIDUS_WARM_BUDGET_BYTES` | `--warm-budget-bytes` | Byte budget for namespaces kept open at once in `--namespaced` mode; ignored otherwise | `Namespaces`'s own default (1 GiB) |
 
 ### Server, bind, and auth
 

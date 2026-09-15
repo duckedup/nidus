@@ -1062,3 +1062,77 @@ fn cold_read_of_an_existing_object_store_needs_no_dim() {
         "the error must name the persistence location, got: {stderr}"
     );
 }
+
+// ── Namespaced mode over a real memory tier (nidus-pcpc.2) ───────────────────
+
+/// A `--namespaced` instance over real minio + valkey, no `--cluster` — namespaces are
+/// independent stores, not a cluster. `extra` carries flags like `--warm-budget-bytes`.
+fn namespaced_instance(prefix: &str, extra: &[&str]) -> (tempfile::TempDir, RunningServer) {
+    require_services();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let bucket = service("NIDUS_E2E_S3_BUCKET", "nidus-test");
+    let mut args = vec![
+        "--persistence".to_string(),
+        format!("s3://{bucket}/{prefix}"),
+        "--memory".to_string(),
+        service("NIDUS_E2E_REDIS_URL", "redis://127.0.0.1:6479"),
+    ];
+    args.extend(extra.iter().map(|s| s.to_string()));
+    let server = Server::over_base(dir.path(), 3)
+        .args(&args)
+        .env(
+            "AWS_ENDPOINT_URL",
+            &service("NIDUS_E2E_S3_ENDPOINT", "http://127.0.0.1:9100"),
+        )
+        .env(
+            "AWS_ACCESS_KEY_ID",
+            &service("NIDUS_E2E_S3_KEY", "minioadmin"),
+        )
+        .env(
+            "AWS_SECRET_ACCESS_KEY",
+            &service("NIDUS_E2E_S3_SECRET", "minioadmin"),
+        )
+        .env("AWS_REGION", &service("NIDUS_E2E_S3_REGION", "us-east-1"))
+        .start();
+    (dir, server)
+}
+
+fn ns_upsert(server: &RunningServer, ns: &str, id: &str, vector: [i32; 3]) -> (u16, Value) {
+    server.post(
+        &format!("/ns/{ns}/collections/c/upsert"),
+        &json!({"records": [{"id": id, "vector": vector, "attrs": {}}]}),
+    )
+}
+
+fn ns_ids(server: &RunningServer, ns: &str) -> Vec<String> {
+    let (status, hits) = server.get(&format!("/ns/{ns}/collections/c/records"));
+    assert_eq!(status, 200, "records failed: {hits}");
+    hits.as_array()
+        .expect("records array")
+        .iter()
+        .filter_map(|r| r["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Sibling-namespace isolation over a REAL memory tier: the local-disk tier has no shared
+/// keyspace to collide in, so only a real `?prefix=` rewrite bug shows up here. "a" and "b"
+/// share one row count and log watermark, or `try_adopt`'s guards (`memtier.rs:86`) mask it.
+#[test]
+#[ignore = "needs minio + valkey (just test-e2e-cluster)"]
+fn sibling_namespaces_do_not_collide_in_a_shared_memory_tier() {
+    let prefix = unique_prefix("ns-isolation");
+    let (_dir, server) = namespaced_instance(&prefix, &["--warm-budget-bytes", "1"]);
+
+    assert_eq!(ns_upsert(&server, "a", "a-only", [1, 0, 0]).0, 200);
+    // Evicts and flushes "a" under the 1-byte budget, publishing its working set.
+    assert_eq!(ns_upsert(&server, "b", "b-only", [0, 1, 0]).0, 200);
+    // Evicts and flushes "b" too: an unprefixed tier key now holds "b"'s snapshot last.
+    assert_eq!(ns_upsert(&server, "c", "c-only", [0, 0, 1]).0, 200);
+
+    // Reopening "a" must adopt only its own row, never "b"'s.
+    assert_eq!(
+        ns_ids(&server, "a"),
+        vec!["a-only"],
+        "namespace \"a\" adopted a sibling's memory-tier snapshot"
+    );
+}

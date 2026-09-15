@@ -11,7 +11,9 @@ use serde_json::{Map, Value as JsonValue, json};
 use crate::{ListOpts, Projection, Scope};
 
 use super::NidusMcp;
-use super::args::{api_error, optional_usize, required_str, tool};
+use super::args::{
+    api_error, namespace_schema, optional_namespace, optional_usize, required_str, tool,
+};
 use super::search::{filter_defs, filter_schema, parse_filter, with_ttl_guard};
 use super::{HitDto, hits_content};
 
@@ -76,7 +78,8 @@ pub(super) fn tools() -> Vec<Tool> {
                         "items": {"type": "string"},
                         "description": "Specific memory ids to remove. Ignored if `filter` is also given."
                     },
-                    "filter": filter_schema()
+                    "filter": filter_schema(),
+                    "namespace": namespace_schema()
                 },
                 "required": ["collection"],
                 "anyOf": [
@@ -102,7 +105,8 @@ pub(super) fn tools() -> Vec<Tool> {
                     "id": {
                         "type": "string",
                         "description": "The memory's id."
-                    }
+                    },
+                    "namespace": namespace_schema()
                 },
                 "required": ["collection", "id"],
                 "additionalProperties": false
@@ -132,7 +136,8 @@ pub(super) fn tools() -> Vec<Tool> {
                         "description": "How many matching entries to skip, for paging through a larger collection.",
                         "minimum": 0
                     },
-                    "filter": filter_schema()
+                    "filter": filter_schema(),
+                    "namespace": namespace_schema()
                 },
                 "required": [],
                 "additionalProperties": false
@@ -146,6 +151,7 @@ impl NidusMcp {
         &self,
         args: &Map<String, JsonValue>,
     ) -> Result<CallToolResult, McpError> {
+        let namespace = optional_namespace(args)?;
         let collection = required_str(args, "collection")?;
         let ids = optional_string_array(args, "ids")?;
         let filter = parse_filter(args)?;
@@ -161,15 +167,19 @@ impl NidusMcp {
 
         let name = collection.clone();
         let ids = ids.unwrap_or_default();
-        let n = crate::server::run_write(self.state.clone(), move |db| match filter {
-            Some(f) => db.delete_where(&name, &f),
-            None => {
-                let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-                db.delete(&name, &refs)
-            }
-        })
-        .await
-        .map_err(api_error)?;
+        let n = self
+            .with_namespace(namespace, async {
+                crate::server::run_write(self.state.clone(), move |db| match filter {
+                    Some(f) => db.delete_where(&name, &f),
+                    None => {
+                        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+                        db.delete(&name, &refs)
+                    }
+                })
+                .await
+                .map_err(api_error)
+            })
+            .await?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Forgot {n} entr{} from `{collection}`.",
@@ -181,15 +191,19 @@ impl NidusMcp {
         &self,
         args: &Map<String, JsonValue>,
     ) -> Result<CallToolResult, McpError> {
+        let namespace = optional_namespace(args)?;
         let collection = required_str(args, "collection")?;
         let id = required_str(args, "id")?;
 
         let name = collection.clone();
         let lookup_id = id.clone();
-        let record =
-            crate::server::run_read(self.state.clone(), move |db| Ok(db.get(&name, &lookup_id)))
-                .await
-                .map_err(api_error)?;
+        let record = self
+            .with_namespace(namespace, async {
+                crate::server::run_read(self.state.clone(), move |db| Ok(db.get(&name, &lookup_id)))
+                    .await
+                    .map_err(api_error)
+            })
+            .await?;
 
         // `get` is a direct map lookup that bypasses `Filter`, so it cannot inherit the
         // guard via `with_ttl_guard`; reusing `filter::matches` keeps the absent-key
@@ -218,6 +232,7 @@ impl NidusMcp {
         &self,
         args: &Map<String, JsonValue>,
     ) -> Result<CallToolResult, McpError> {
+        let namespace = optional_namespace(args)?;
         let collection = optional_str(args, "collection")?;
         let limit =
             optional_usize(args, "limit")?.unwrap_or_else(crate::server::dto::default_top_k);
@@ -230,21 +245,25 @@ impl NidusMcp {
         let offset = optional_usize(args, "offset")?.unwrap_or(0);
         let filter = with_ttl_guard(parse_filter(args)?);
 
-        let hits = crate::server::run_read(self.state.clone(), move |db| {
-            let opts = ListOpts {
-                offset,
-                limit,
-                filter,
-                projection: Projection::default(),
-                order_by: None,
-            };
-            match &collection {
-                Some(name) => db.list(name.as_str(), &opts),
-                None => db.list(Scope::All, &opts),
-            }
-        })
-        .await
-        .map_err(api_error)?;
+        let hits = self
+            .with_namespace(namespace, async {
+                crate::server::run_read(self.state.clone(), move |db| {
+                    let opts = ListOpts {
+                        offset,
+                        limit,
+                        filter,
+                        projection: Projection::default(),
+                        order_by: None,
+                    };
+                    match &collection {
+                        Some(name) => db.list(name.as_str(), &opts),
+                        None => db.list(Scope::All, &opts),
+                    }
+                })
+                .await
+                .map_err(api_error)
+            })
+            .await?;
 
         Ok(hits_content(hits.into_iter().map(HitDto::from).collect()))
     }

@@ -82,6 +82,15 @@ fn prompt_pool(args: &Map<String, JsonValue>) -> Result<Pool, McpError> {
     }
 }
 
+/// `namespace` for a prompt (nidus-pcpc.2): a `PromptArgument` carries only strings, so
+/// unlike a tool's typed schema there is no separate type check to fail first.
+fn prompt_namespace(args: &Map<String, JsonValue>) -> Option<String> {
+    match args.get("namespace") {
+        Some(JsonValue::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
 pub(super) fn prompts() -> Vec<Prompt> {
     vec![Prompt::new(
         "recall_then_answer",
@@ -116,6 +125,13 @@ pub(super) fn prompts() -> Vec<Prompt> {
                      Ignored unless `names` is set.",
                 )
                 .with_required(false),
+            PromptArgument::new("namespace")
+                .with_description(
+                    "Which namespace to recall from, on a server running in namespaced \
+                     mode. Omit in single-store mode, or to use the namespace this \
+                     connection was already opened against.",
+                )
+                .with_required(false),
         ]),
     )]
 }
@@ -126,6 +142,7 @@ impl NidusMcp {
         args: &Map<String, JsonValue>,
     ) -> Result<GetPromptResult, McpError> {
         let embedder = self.embedder()?;
+        let namespace = prompt_namespace(args);
         let question = required_str(args, "question")?;
         let collection = required_str(args, "collection")?;
         let top_k = prompt_top_k(args)?;
@@ -145,12 +162,20 @@ impl NidusMcp {
             ..Default::default()
         };
         let collection_for_run = collection.clone();
-        let hits = crate::server::run_read(self.state.clone(), move |db| {
-            crate::memory::guard_recall_identity(db, embedder.as_ref(), &collection_for_run)?;
-            db.search(collection_for_run.as_str(), &vector, &opts)
-        })
-        .await
-        .map_err(api_error)?;
+        let hits = self
+            .with_namespace(namespace, async {
+                crate::server::run_read(self.state.clone(), move |db| {
+                    crate::memory::guard_recall_identity(
+                        db,
+                        embedder.as_ref(),
+                        &collection_for_run,
+                    )?;
+                    db.search(collection_for_run.as_str(), &vector, &opts)
+                })
+                .await
+                .map_err(api_error)
+            })
+            .await?;
 
         let hits: Vec<HitDto> = hits.into_iter().map(HitDto::from).collect();
         let count = hits.len();

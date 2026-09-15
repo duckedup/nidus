@@ -81,6 +81,7 @@ class AsyncNidusClient:
         timeout: Optional[float] = None,
         headers: Optional[Mapping[str, str]] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        namespace: Optional[str] = None,
     ) -> None:
         """Configure a client and its underlying ``httpx.AsyncClient``.
 
@@ -92,12 +93,16 @@ class AsyncNidusClient:
             ``httpx.MockTransport`` so a test needs no server. This is the async
             counterpart of the sync client's ``transport=`` callable; each takes the
             natural extension point of its own HTTP stack rather than inventing one.
+        :param namespace: address one namespace of a ``--namespaced`` server
+            (``/ns/{namespace}/...``, nidus-pcpc.2). Omit against a single-store server;
+            every path is then today's exact flat path, unchanged.
 
         Note ``timeout=None`` means *no* timeout, matching the sync client, rather than
         ``httpx``'s own 5-second default — one client, one documented meaning.
         """
         self._base_url = _wire.normalize_base_url(base_url)
         self._token = token
+        self._namespace = namespace
         self._headers = dict(headers or {})
         self._client = httpx.AsyncClient(timeout=timeout, transport=transport)
 
@@ -833,6 +838,7 @@ class AsyncNidusClient:
 
     async def _send(self, method: str, path: str, body: Any) -> tuple[int, str]:
         """The transport boundary, and the only code here that is not ``_wire``'s call."""
+        path = _wire.with_namespace(path, self._namespace)
         payload, headers = _wire.prepare(self._token, self._headers, body)
         try:
             response = await self._client.request(

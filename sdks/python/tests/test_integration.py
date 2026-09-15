@@ -884,6 +884,112 @@ def test_alias_lifecycle_against_a_real_server(server: str) -> None:
         assert [h.id for h in db.list(scope=["docs_v2"])] == ["a"]
 
 
+# ── Namespaces (nidus-pcpc.2) ────────────────────────────────────────────────────────────
+#
+# Mirrors sdks/js/test/integration.test.ts and sdks/go/integration_test.go step for step: a
+# `--namespaced` server, two namespaces addressed by `namespace=` on the same client class,
+# and the guarantee that a client configured with no namespace keeps hitting today's exact
+# flat paths even against this server. `_await_base_url` (not `_await_base_url_or_skip`) on
+# purpose: `--namespaced` needs no optional feature, so a binary that cannot start under it
+# is a real regression and must fail the test, not read green from a skip.
+
+
+@pytest.fixture()
+def namespaced_server(tmp_path: Path) -> Iterator[str]:
+    """A real ``nidus serve --namespaced`` over a fresh base directory; yields its bound,
+    unprefixed base URL. Each namespace is its own store, opened lazily on first request
+    to ``/ns/{namespace}/...`` — callers pick their namespace via ``NidusClient(...,
+    namespace=...)`` themselves.
+    """
+    log = tmp_path / "server.log"
+    base = tmp_path / "base"
+    with log.open("wb") as sink:
+        child = subprocess.Popen(
+            [
+                str(BINARY),
+                "serve",
+                "--dir",
+                str(base),
+                "--dim",
+                "3",
+                "--addr",
+                "127.0.0.1:0",
+                "--namespaced",
+            ],
+            stdout=sink,
+            stderr=sink,
+        )
+    try:
+        base_url = _await_base_url(child, log)
+        deadline = time.monotonic() + STARTUP_TIMEOUT
+        while not _ready(base_url):
+            if time.monotonic() > deadline:
+                pytest.fail(f"nidus serve --namespaced never became ready\n{_transcript(log)}")
+            time.sleep(0.05)
+        yield base_url
+    finally:
+        child.terminate()
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:  # pragma: no cover - only if shutdown hangs
+            child.kill()
+            child.wait()
+
+
+def test_namespaced_clients_never_see_each_others_records(namespaced_server: str) -> None:
+    """Two ``NidusClient``s, same base URL, different ``namespace=``, same collection name:
+    each writes and reads back only its own record. Proves the SDK threads ``namespace``
+    into every request rather than only the first, and that the prefix really reaches a
+    distinct on-disk store on the other side of the socket, not just a distinct URL string.
+    """
+    with NidusClient(namespaced_server, namespace="tenant-a", timeout=10.0) as a:
+        with NidusClient(namespaced_server, namespace="tenant-b", timeout=10.0) as b:
+            a.create_collection("docs")
+            b.create_collection("docs")
+            a.upsert("docs", [{"id": "1", "vector": [1.0, 0.0, 0.0], "attrs": {"tenant": "a"}}])
+            b.upsert("docs", [{"id": "1", "vector": [0.0, 1.0, 0.0], "attrs": {"tenant": "b"}}])
+
+            assert [r.id for r in a.records("docs")] == ["1"]
+            assert a.records("docs")[0].attrs == {"tenant": "a"}
+            assert [r.id for r in b.records("docs")] == ["1"]
+            assert b.records("docs")[0].attrs == {"tenant": "b"}
+
+            hits = a.search(query=[1.0, 0.0, 0.0], scope=["docs"], top_k=5)
+            assert [h.id for h in hits] == ["1"]
+
+
+def test_no_namespace_configured_against_a_namespaced_server_is_refused(
+    namespaced_server: str,
+) -> None:
+    """A client built the ordinary way (``namespace`` omitted) still sends today's exact
+    flat path, byte for byte — which a ``--namespaced`` server refuses with a 400 naming
+    the fix, rather than silently routing to some default namespace.
+    """
+    with NidusClient(namespaced_server, timeout=10.0) as flat:
+        with pytest.raises(NidusError) as caught:
+            flat.collections()
+        assert caught.value.status == 400
+        assert "namespace" in caught.value.message
+
+
+async def test_the_async_client_threads_namespace_too(namespaced_server: str) -> None:
+    """The async twin carries ``namespace`` through the same ``_wire`` seam as the sync
+    client (both call ``_wire.with_namespace`` from their own ``_send``), so this is what
+    would catch the two clients drifting apart on how the prefix is built or applied.
+    """
+    pytest.importorskip("httpx", reason="the async client needs the nidus[async] extra")
+    from nidus.aio import AsyncNidusClient
+
+    async with AsyncNidusClient(namespaced_server, namespace="async-tenant", timeout=10.0) as db:
+        await db.create_collection("docs")
+        assert await db.upsert("docs", [{"id": "1", "vector": [1.0, 0.0, 0.0]}]) == 1
+        assert [r.id for r in await db.records("docs")] == ["1"]
+
+    # A sibling namespace never sees it — same guarantee, other client.
+    async with AsyncNidusClient(namespaced_server, namespace="other-tenant", timeout=10.0) as db:
+        assert await db.collections() == []
+
+
 async def test_the_async_client_drives_the_same_server(server: str) -> None:
     """The async twin against the real thing, so ``httpx``'s own URL handling is covered too.
 

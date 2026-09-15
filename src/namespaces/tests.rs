@@ -244,13 +244,16 @@ fn eviction_flushes_before_dropping_the_store() {
         .history_versions(Some(4));
     let mut ns = Namespaces::new(template, base.to_string_lossy().into_owned());
 
-    let db = ns.get("a").unwrap();
-    db.create_collection("c").unwrap();
-    db.upsert(
-        "c",
-        &[Record::new("1", vec![1.0, 0.0, 0.0], BTreeMap::new())],
-    )
-    .unwrap();
+    {
+        let handle = ns.get("a").unwrap();
+        let mut db = handle.write().unwrap();
+        db.create_collection("c").unwrap();
+        db.upsert(
+            "c",
+            &[Record::new("1", vec![1.0, 0.0, 0.0], BTreeMap::new())],
+        )
+        .unwrap();
+    }
 
     let manifest = base.join("a").join(crate::manifest::MANIFEST_KEY);
     let before = std::fs::read(&manifest).unwrap();

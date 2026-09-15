@@ -337,15 +337,29 @@ fn is_mutation(method: &Method, path: &str, body: Option<&Bytes>) -> bool {
     if method == Method::GET || method == Method::HEAD {
         return false;
     }
+    let path = strip_namespace_prefix(path);
     // A `reinforce` recall queues through the write committer, so it is judged on the write
     // deadline; a plain one stays a read and keeps the scan bound that buys (nidus-a34).
     if path.ends_with("/recall") {
         return body.is_some_and(reinforce_requested);
     }
     !matches!(
-        path,
+        path.as_ref(),
         "/search" | "/text-search" | "/hybrid-search" | "/list"
     )
+}
+
+/// Strip a leading `/ns/{namespace}` so classification matches the underlying route
+/// (nidus-pcpc.2). Defensive: `rewrite_namespace` wraps the router from outside, so this
+/// already sees the flat path. It keeps classification right if that layering moves.
+fn strip_namespace_prefix(path: &str) -> std::borrow::Cow<'_, str> {
+    match path
+        .strip_prefix("/ns/")
+        .and_then(|rest| rest.split_once('/'))
+    {
+        Some((ns, tail)) if !ns.is_empty() => std::borrow::Cow::Owned(format!("/{tail}")),
+        _ => std::borrow::Cow::Borrowed(path),
+    }
 }
 
 /// Whether a recall body opts into reinforcement. Serde ignores the rest of `RecallRequest`,
@@ -494,6 +508,18 @@ mod tests {
         // 1 is testing shedding and must get it.
         assert_eq!(resolve_concurrency(1), 1);
         assert_eq!(resolve_concurrency(500), 500);
+    }
+
+    /// Counterfactual: without stripping the `/ns/{namespace}` prefix, this reads as a GET
+    /// on an unrecognised path and takes the read deadline instead of the write one.
+    #[test]
+    fn namespaced_writes_still_get_the_write_deadline() {
+        assert!(classify(&Method::POST, "/ns/acme/collections/docs/upsert"));
+        assert!(classify(&Method::POST, "/ns/acme/compact"));
+        assert!(
+            !classify(&Method::POST, "/ns/acme/search"),
+            "search stays a read even namespaced"
+        );
     }
 
     #[test]

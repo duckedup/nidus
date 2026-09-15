@@ -7,13 +7,14 @@ mod limits;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod metrics;
+mod registry;
 
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Request, State},
     http::StatusCode,
     middleware,
     response::{IntoResponse, Response},
@@ -23,8 +24,8 @@ use serde_json::{Value as JsonValue, json};
 use tokio::net::TcpListener;
 
 use crate::{
-    FilterIndexField, FtsField, FtsQuery, HybridOpts, ListOpts, Nidus, Record, RerankOpts, Scope,
-    SearchOpts, SuggestOpts,
+    Config, FilterIndexField, FtsField, FtsQuery, HybridOpts, ListOpts, Nidus, Record, RerankOpts,
+    Scope, SearchOpts, SuggestOpts,
 };
 use dto::{
     AggregateRequest, AggregationDto, AnnDto, BatchFuse, BatchSearchRequest, BatchSearchResponse,
@@ -132,31 +133,44 @@ pub struct StdioConfig {
     pub lease_renew_interval: std::time::Duration,
 }
 
-/// Shared, cloneable handle to the one open store.
+/// Which store (or store set) a request reaches, and how (nidus-pcpc.2).
+#[derive(Clone)]
+enum Store {
+    /// Single-`--dir` mode: today's shape, one process-wide store that opens exactly once.
+    Single {
+        /// `None` until the store finishes opening — a standby writer waiting for promotion
+        /// sits here indefinitely by design. Data routes answer `503` while it is empty; see
+        /// [`serve`] for why the listener comes up first.
+        db: Arc<RwLock<Option<Nidus>>>,
+        /// Mirrors `db.is_some()` for [`ready`] to read.
+        open: Arc<std::sync::atomic::AtomicBool>,
+        /// The lock-free readiness handle, published once the store opens. A `OnceLock`
+        /// because this store opens exactly once; reading it costs an atomic load, which
+        /// keeps [`ready`] off the store lock entirely (nidus-abx.3).
+        readiness: Arc<std::sync::OnceLock<crate::Readiness>>,
+        /// Readiness fails past this much reader staleness (`Config::max_staleness`), copied
+        /// here so a probe never has to reach into the store's config behind the lock.
+        max_staleness: Option<std::time::Duration>,
+        /// Group commit (nidus-xb9.1): concurrent writes share one store guard and one disk
+        /// barrier. `Arc` because `AppState` is cloned per request and every clone must
+        /// share the *same* queue — a per-clone one would coalesce nothing.
+        commit: Arc<commit::Committer>,
+    },
+    /// Namespaced mode: many stores behind one byte-bounded warm set, admitted lazily per
+    /// request, each with its own group-commit queue (`commit::Target`'s doc explains why
+    /// one shared across namespaces would be cross-tenant data corruption).
+    Namespaced(Arc<registry::Registry>),
+}
+
+/// Shared, cloneable per-request handle.
 #[derive(Clone)]
 struct AppState {
-    /// `None` until the store finishes opening — a standby writer waiting for promotion
-    /// sits here indefinitely by design. Data routes answer `503` while it is empty; see
-    /// [`serve`] for why the listener comes up first.
-    db: Arc<RwLock<Option<Nidus>>>,
-    /// Mirrors `db.is_some()` for [`ready`] to read.
-    open: Arc<std::sync::atomic::AtomicBool>,
-    /// The lock-free readiness handle, published once the store opens. A `OnceLock` because a
-    /// store opens exactly once per process; reading it costs an atomic load, which keeps
-    /// [`ready`] off the store lock entirely (nidus-abx.3).
-    readiness: Arc<std::sync::OnceLock<crate::Readiness>>,
-    /// Readiness fails past this much reader staleness (`Config::max_staleness`), copied
-    /// here so a probe never has to reach into the store's config behind the lock.
-    max_staleness: Option<std::time::Duration>,
+    store: Store,
     token: Option<auth::Token>,
-    /// Admission control: the concurrency permits and the per-request deadlines
-    /// (nidus-abx.2). `Arc` because `AppState` is cloned per request and the permit pool
-    /// must be the *same* pool for all of them — a per-clone semaphore would cap nothing.
+    /// Admission control (nidus-abx.2). One process-wide pool regardless of `store`: the
+    /// process has one CPU and RAM budget, and a per-namespace pool would cap nothing
+    /// global (nidus-pcpc.2) — `Arc` since every clone must share the same pool.
     limits: Arc<limits::Limits>,
-    /// Group commit for the write path (nidus-xb9.1): concurrent writes are applied together
-    /// under one store guard and share one disk barrier instead of taking one each. `Arc` for
-    /// the same reason as `limits` — a per-clone queue would coalesce nothing.
-    commit: Arc<commit::Committer>,
     /// Shared embedder for the `memory` routes; `None` disables them (→ `400`).
     #[cfg(feature = "memory")]
     embedder: Option<Arc<AnyEmbedder>>,
@@ -168,6 +182,26 @@ struct AppState {
     reranker: Option<Arc<AnyReranker>>,
 }
 
+#[cfg(test)]
+impl AppState {
+    /// The single-mode store slot. Panics in namespaced mode: every caller is a test that
+    /// built `Store::Single` itself.
+    fn db(&self) -> &Arc<RwLock<Option<Nidus>>> {
+        match &self.store {
+            Store::Single { db, .. } => db,
+            Store::Namespaced(_) => panic!("db() is single-store only"),
+        }
+    }
+
+    /// The single-mode group-commit queue. Panics in namespaced mode, as `db` does.
+    fn commit(&self) -> &Arc<commit::Committer> {
+        match &self.store {
+            Store::Single { commit, .. } => commit,
+            Store::Namespaced(_) => panic!("commit() is single-store only"),
+        }
+    }
+}
+
 /// Bind the address, open the store, and serve until a shutdown signal (Ctrl-C /
 /// SIGTERM); flush and release the writer handle on shutdown.
 pub async fn serve<F>(open: F, cfg: ServeConfig) -> anyhow::Result<()>
@@ -175,11 +209,17 @@ where
     F: FnOnce() -> anyhow::Result<Nidus> + Send + 'static,
 {
     let concurrency = limits::resolve_concurrency(cfg.max_concurrent_requests);
+    let db_slot: Arc<RwLock<Option<Nidus>>> = Arc::new(RwLock::new(None));
+    let open_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readiness_slot = Arc::new(std::sync::OnceLock::new());
     let state = AppState {
-        db: Arc::new(RwLock::new(None)),
-        open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        readiness: Arc::new(std::sync::OnceLock::new()),
-        max_staleness: cfg.max_staleness,
+        store: Store::Single {
+            db: db_slot.clone(),
+            open: open_flag.clone(),
+            readiness: readiness_slot.clone(),
+            max_staleness: cfg.max_staleness,
+            commit: commit::Committer::new(),
+        },
         token: cfg.token.map(auth::Token::new),
         limits: Arc::new(limits::Limits::new(
             concurrency,
@@ -188,7 +228,6 @@ where
             cfg.body_idle_timeout,
             cfg.max_body_bytes,
         )),
-        commit: commit::Committer::new(),
         #[cfg(feature = "memory")]
         embedder: cfg.embedder,
         #[cfg(all(feature = "memory", feature = "summarize"))]
@@ -222,9 +261,9 @@ where
     // re-raised after `axum::serve` returns so the process exits non-zero.
     let open_failed = Arc::new(RwLock::new(None::<anyhow::Error>));
     let abort = Arc::new(tokio::sync::Notify::new());
-    let slot = state.db.clone();
-    let open_flag = state.open.clone();
-    let readiness_slot = state.readiness.clone();
+    let slot = db_slot.clone();
+    let open_flag_for_open = open_flag.clone();
+    let readiness_for_open = readiness_slot.clone();
     let failure_slot = open_failed.clone();
     let abort_tx = abort.clone();
     tokio::task::spawn_blocking(move || match open() {
@@ -232,11 +271,11 @@ where
             if let Ok(mut slot) = slot.write() {
                 // Take the lock-free readiness handle before publishing, so that whenever
                 // `open` reads true the handle is guaranteed to be there (nidus-abx.3).
-                let _ = readiness_slot.set(db.readiness());
+                let _ = readiness_for_open.set(db.readiness());
                 *slot = Some(db);
                 // Publish only after the store is in place, so a probe never sees
                 // `ready` before a request could actually be served.
-                open_flag.store(true, std::sync::atomic::Ordering::Release);
+                open_flag_for_open.store(true, std::sync::atomic::Ordering::Release);
                 crate::diag::diag!(
                     crate::diag::Level::Info,
                     "server",
@@ -253,13 +292,13 @@ where
     });
 
     // Keep the writer lease warm on a timer.
-    spawn_lease_renewal(state.db.clone(), renew_every);
+    spawn_lease_renewal(db_slot.clone(), renew_every);
 
     // Optional self-refresh, so a read-only instance stays current without a sidecar
     // calling POST /refresh. A tokio task rather than a library background thread: "no
     // background threads" is a property of the sync core, and the server is already async.
     if let Some(interval) = cfg.refresh_interval {
-        let db = state.db.clone();
+        let db = db_slot.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             // Skip missed ticks rather than firing a burst to catch up — a backlog of
@@ -301,13 +340,65 @@ where
         .await
         .context("server error");
 
-    shutdown_store(&state.db);
+    shutdown_store(&db_slot);
 
     // A failed open outranks the serve result: it is the actual cause.
     if let Some(e) = open_failed.write().ok().and_then(|mut f| f.take()) {
         return Err(e);
     }
     served
+}
+
+/// Namespaced entry point (nidus-pcpc.2): like [`serve`], but every request names a
+/// namespace (`/ns/{namespace}/...`), each lazily opening its own [`Nidus`] behind a
+/// byte-bounded warm set (`nidus::Namespaces`) under `base`, from `template`'s `Config`.
+pub async fn serve_namespaced(
+    template: Config,
+    base: String,
+    budget_bytes: Option<u64>,
+    cfg: ServeConfig,
+) -> anyhow::Result<()> {
+    let concurrency = limits::resolve_concurrency(cfg.max_concurrent_requests);
+    let registry = registry::Registry::new(template, base, budget_bytes, cfg.lease_renew_interval);
+    let state = AppState {
+        store: Store::Namespaced(registry),
+        token: cfg.token.map(auth::Token::new),
+        limits: Arc::new(limits::Limits::new(
+            concurrency,
+            cfg.read_timeout,
+            cfg.write_timeout,
+            cfg.body_idle_timeout,
+            cfg.max_body_bytes,
+        )),
+        #[cfg(feature = "memory")]
+        embedder: cfg.embedder,
+        #[cfg(all(feature = "memory", feature = "summarize"))]
+        summarizer: cfg.summarizer,
+        #[cfg(feature = "rerank")]
+        reranker: cfg.reranker,
+    };
+    let app = router(state.clone(), cfg.max_body_bytes);
+
+    let listener = TcpListener::bind(&cfg.addr)
+        .await
+        .with_context(|| format!("binding {}", cfg.addr))?;
+    let auth_note = if state.token.is_some() {
+        " (bearer-token auth required)"
+    } else {
+        ""
+    };
+    let bound = listener
+        .local_addr()
+        .map_or_else(|_| cfg.addr.clone(), |a| a.to_string());
+    eprintln!("nidus serving namespaces on http://{bound} (Ctrl-C / SIGTERM to stop){auth_note}");
+    warn_on_exposure(listener.local_addr().ok(), state.token.is_some());
+
+    // Unlike `serve`, there is no single store to open eagerly: each namespace opens on
+    // first access, so the listener (and `/ready`) is live immediately.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("server error")
 }
 
 /// Speak MCP over stdio, for a local client that spawns its own `nidus mcp --dir …`. Unlike
@@ -334,10 +425,13 @@ where
     // `usize::MAX`: tokio's `Semaphore` panics past 2^61-1 and `Limits` multiplies by 4.
     const EFFECTIVELY_UNBOUNDED: usize = 1 << 20;
     let state = AppState {
-        db: slot.clone(),
-        open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        readiness: Arc::new(readiness),
-        max_staleness: None,
+        store: Store::Single {
+            db: slot.clone(),
+            open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            readiness: Arc::new(readiness),
+            max_staleness: None,
+            commit: commit::Committer::new(),
+        },
         token: None,
         limits: Arc::new(limits::Limits::new(
             EFFECTIVELY_UNBOUNDED,
@@ -346,7 +440,6 @@ where
             None,
             usize::MAX,
         )),
-        commit: commit::Committer::new(),
         #[cfg(feature = "memory")]
         embedder: cfg.embedder,
         #[cfg(all(feature = "memory", feature = "summarize"))]
@@ -446,6 +539,8 @@ fn exposure(addr: std::net::SocketAddr, has_token: bool) -> Exposure {
 }
 
 fn router(state: AppState, max_body_bytes: usize) -> Router {
+    let namespaced = matches!(state.store, Store::Namespaced(_));
+
     let router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -480,6 +575,15 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/compact", post(compact))
         .route("/refresh", post(refresh));
 
+    // The namespace-listing route (nidus-pcpc.2): process-level, namespaced mode only —
+    // every other route above is reached either flat or through `/ns/{namespace}`, which
+    // `rewrite_namespace` strips before any of them ever match.
+    let router = if namespaced {
+        router.route("/namespaces", get(list_namespaces))
+    } else {
+        router
+    };
+
     // Text-native memory routes: the SDKs send TEXT and the server embeds /
     // summarizes. Present only when the `memory` feature is compiled in (the
     // `serve` umbrella); a plain `cli` build ships the raw endpoints above only.
@@ -499,17 +603,77 @@ fn router(state: AppState, max_body_bytes: usize) -> Router {
     let router = router.route("/code-search", post(code_search));
 
     // `.layer()` applies outermost last, so inside-out this reads: body limit, backpressure,
-    // auth (outside backpressure, so an unauthenticated request never consumes a permit), then
-    // observe outermost, so a 401 and a shed 503 are both counted.
-    router
+    // auth (outside backpressure, so an unauthenticated request never consumes a permit).
+    let inner = router
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             limits::backpressure,
         ))
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth))
-        .layer(middleware::from_fn(metrics::observe))
-        .with_state(state)
+        .with_state(state);
+
+    // `Router::layer` runs AFTER routing picks a route, so the `/ns/{namespace}` strip cannot
+    // live there: the prefixed path would match nothing and 404 first. Wrap the finished router
+    // instead, inside `observe` so metrics still see the original path.
+    let routed = if namespaced {
+        Router::new()
+            .fallback_service(inner)
+            .layer(middleware::from_fn(rewrite_namespace))
+    } else {
+        inner
+    };
+
+    // Outermost, so a 401 and a shed 503 are both counted.
+    routed.layer(middleware::from_fn(metrics::observe))
+}
+
+tokio::task_local! {
+    /// The namespace `rewrite_namespace` resolved for this request (nidus-pcpc.2). Set once,
+    /// at the seam, so every handler and the nested MCP service inherit it without parsing
+    /// a path themselves — mirrors `limits::CANCEL`'s async-side-only task-local pattern.
+    static NAMESPACE: String;
+}
+
+/// Resolve `/ns/{namespace}/...` down to the flat path every handler expects, carrying the
+/// namespace forward as [`NAMESPACE`] — see `router`'s layering comment for the ordering.
+async fn rewrite_namespace(mut req: Request, next: middleware::Next) -> Response {
+    let Some(rest) = req.uri().path().strip_prefix("/ns/") else {
+        return next.run(req).await;
+    };
+    let Some((namespace, tail)) = rest.split_once('/') else {
+        return next.run(req).await;
+    };
+    if namespace.is_empty() {
+        return next.run(req).await;
+    }
+    let namespace = namespace.to_string();
+    let new_path_and_query = match req.uri().query() {
+        Some(q) => format!("/{tail}?{q}"),
+        None => format!("/{tail}"),
+    };
+    let Ok(path_and_query) = new_path_and_query.parse::<axum::http::uri::PathAndQuery>() else {
+        return next.run(req).await;
+    };
+    let mut parts = req.uri().clone().into_parts();
+    parts.path_and_query = Some(path_and_query);
+    let Ok(new_uri) = axum::http::Uri::from_parts(parts) else {
+        return next.run(req).await;
+    };
+    *req.uri_mut() = new_uri;
+
+    NAMESPACE.scope(namespace, next.run(req)).await
+}
+
+/// The namespace [`rewrite_namespace`] resolved for this request, or a `400` naming the fix.
+/// Every `/ns/{namespace}` request sets this before any handler runs; reaching a namespaced
+/// store without it means a route was hit directly, bypassing `/ns/…`.
+fn current_namespace() -> Result<String, ApiError> {
+    NAMESPACE.try_with(Clone::clone).map_err(|_| {
+        ApiError::bad_request(anyhow::anyhow!(
+            "this endpoint requires a namespace: request /ns/{{namespace}}/... instead"
+        ))
+    })
 }
 
 /// Renew the cluster writer lease on a timer, independent of write traffic. Without it an
@@ -604,7 +768,11 @@ async fn shutdown_signal() {
 async fn health(State(st): State<AppState>) -> Response {
     // A **poisoned** store lock is the one condition under which this process is broken
     // beyond recovery, and it must be escalated rather than papered over (nidus-abx.1).
-    if st.db.is_poisoned() {
+    let poisoned = match &st.store {
+        Store::Single { db, .. } => db.is_poisoned(),
+        Store::Namespaced(registry) => registry.is_poisoned(),
+    };
+    if poisoned {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
@@ -631,15 +799,38 @@ async fn ready(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> 
     })))
 }
 
-/// The readiness decision, in one place.
+/// The readiness decision, in one place. Namespaced mode keeps `/ready`'s exact
+/// process-level contract (listener up, base reachable) without ever touching a namespace —
+/// role/staleness/fenced are per-namespace, answered by the listing route instead.
 fn readiness_check(st: &AppState) -> Result<(String, u64), ApiError> {
-    if !st.open.load(std::sync::atomic::Ordering::Acquire) {
+    let (open, db, readiness, max_staleness) = match &st.store {
+        Store::Single {
+            open,
+            db,
+            readiness,
+            max_staleness,
+            ..
+        } => (open, db, readiness, max_staleness),
+        Store::Namespaced(registry) => {
+            if registry.is_poisoned() {
+                return Err(ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    err: anyhow::anyhow!(
+                        "registry lock poisoned: a panic left this instance's in-RAM state \
+                         untrustworthy — it must be restarted"
+                    ),
+                });
+            }
+            return Ok(("namespaced".to_string(), 0));
+        }
+    };
+    if !open.load(std::sync::atomic::Ordering::Acquire) {
         return Err(ApiError::from(not_open()));
     }
     // A poisoned lock means every data route now fails permanently (nidus-abx.1), so this
     // instance must leave the Service as well as being restarted by liveness — waiting for
     // the restart would keep traffic arriving at something that can only 500.
-    if st.db.is_poisoned() {
+    if db.is_poisoned() {
         return Err(ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             err: anyhow::anyhow!(
@@ -649,7 +840,7 @@ fn readiness_check(st: &AppState) -> Result<(String, u64), ApiError> {
         });
     }
     // Published before the `open` flag above, so this is always present once open is true.
-    let Some(status) = st.readiness.get() else {
+    let Some(status) = readiness.get() else {
         return Err(ApiError::from(not_open()));
     };
     if status.fenced() {
@@ -662,7 +853,7 @@ fn readiness_check(st: &AppState) -> Result<(String, u64), ApiError> {
         });
     }
     let staleness_secs = status.staleness_secs();
-    if let Some(max) = st.max_staleness
+    if let Some(max) = *max_staleness
         && staleness_secs > max.as_secs()
     {
         return Err(ApiError {
@@ -679,8 +870,17 @@ fn readiness_check(st: &AppState) -> Result<(String, u64), ApiError> {
 }
 
 /// `GET /cluster` — role, writer-handle state, fencing token, commit counter, staleness.
+/// Single-store mode keeps the exact non-blocking fast path; namespaced mode resolves this
+/// request's namespace (the `run_read` seam) since there is no one store to try-read.
 async fn cluster(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
-    let s = read_status(&st)?;
+    let max_staleness = match &st.store {
+        Store::Single { max_staleness, .. } => *max_staleness,
+        Store::Namespaced(_) => None,
+    };
+    let s = match &st.store {
+        Store::Single { .. } => read_status(&st)?,
+        Store::Namespaced(_) => run_read(st.clone(), |db| Ok(db.cluster_status())).await?,
+    };
     Ok(Json(json!({
         "role": format!("{:?}", s.role),
         "cluster": s.cluster,
@@ -689,7 +889,7 @@ async fn cluster(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError
         "lease_owner": s.lease_owner,
         "commit_version": s.commit_version,
         "staleness_secs": s.staleness_secs,
-        "max_staleness_secs": st.max_staleness.map(|d| d.as_secs()),
+        "max_staleness_secs": max_staleness.map(|d| d.as_secs()),
     })))
 }
 
@@ -699,9 +899,15 @@ async fn versions(State(st): State<AppState>) -> Result<Json<VersionsDto>, ApiEr
     Ok(Json(VersionsDto::from(v)))
 }
 
-/// Read [`ClusterStatus`] without blocking the async executor.
+/// Read [`ClusterStatus`] without blocking the async executor. Single-store mode only —
+/// [`cluster`] takes the `run_read` seam instead when namespaced.
 fn read_status(st: &AppState) -> Result<crate::ClusterStatus, ApiError> {
-    match st.db.try_read() {
+    let Store::Single { db, .. } = &st.store else {
+        return Err(ApiError::internal(anyhow::anyhow!(
+            "read_status called outside single-store mode"
+        )));
+    };
+    match db.try_read() {
         Ok(guard) => match guard.as_ref() {
             Some(db) => Ok(db.cluster_status()),
             None => Err(ApiError::from(not_open())),
@@ -734,6 +940,30 @@ async fn stats(State(st): State<AppState>) -> Result<Json<JsonValue>, ApiError> 
     })
     .await?;
     Ok(Json(body))
+}
+
+/// `GET /namespaces` (namespaced mode only, nidus-pcpc.2): every warm namespace's name,
+/// byte footprint, and readiness. Opens nothing — reads `warm_entries`, not `get`.
+async fn list_namespaces(
+    State(st): State<AppState>,
+) -> Result<Json<Vec<dto::NamespaceDto>>, ApiError> {
+    let Store::Namespaced(registry) = &st.store else {
+        return Err(ApiError::internal(anyhow::anyhow!(
+            "not running in namespaced mode"
+        )));
+    };
+    let out = registry
+        .warm_snapshot()
+        .into_iter()
+        .map(|(name, bytes, readiness)| dto::NamespaceDto {
+            name,
+            bytes,
+            role: readiness.as_ref().map(|r| format!("{:?}", r.role())),
+            fenced: readiness.as_ref().map(crate::Readiness::fenced),
+            staleness_secs: readiness.as_ref().map(crate::Readiness::staleness_secs),
+        })
+        .collect();
+    Ok(Json(out))
 }
 
 async fn list_collections(State(st): State<AppState>) -> Result<Json<Vec<String>>, ApiError> {
@@ -1978,43 +2208,76 @@ where
     // blocking thread — this is the handoff, and doing it in the two `run_*` helpers means
     // every handler gets cancellation without knowing the concept exists.
     let cancel = limits::current_cancel();
-    tokio::task::spawn_blocking(move || {
-        let db = st
-            .db
-            .read()
-            .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
-        let db = db.as_ref().ok_or_else(not_open)?;
-        match cancel {
-            Some(cancel) => cancel.scope(|| f(db)),
-            None => f(db),
+    match st.store {
+        Store::Single { db, .. } => tokio::task::spawn_blocking(move || {
+            let db = db
+                .read()
+                .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
+            let db = db.as_ref().ok_or_else(not_open)?;
+            match cancel {
+                Some(cancel) => cancel.scope(|| f(db)),
+                None => f(db),
+            }
+        })
+        .await
+        .map_err(|e| ApiError::internal(anyhow::anyhow!("task join error: {e}")))?
+        .map_err(ApiError::from),
+        Store::Namespaced(registry) => {
+            let name = current_namespace()?;
+            tokio::task::spawn_blocking(move || {
+                registry.read(&name, |db| match cancel {
+                    Some(cancel) => cancel.scope(|| f(db)),
+                    None => f(db),
+                })
+            })
+            .await
+            .map_err(|e| ApiError::internal(anyhow::anyhow!("task join error: {e}")))?
+            .map_err(ApiError::from)
         }
-    })
-    .await
-    .map_err(|e| ApiError::internal(anyhow::anyhow!("task join error: {e}")))?
-    .map_err(ApiError::from)
+    }
 }
 
-/// Run a **write** operation under the exclusive lock, **group-committed**: it is applied
-/// together with whatever other writes are queued at that moment, and the group shares one
-/// disk barrier (see [`commit`], nidus-xb9.1).
+/// Run a **write** operation, **group-committed**: applied with whatever else is queued at
+/// that moment, sharing one disk barrier (nidus-xb9.1). Namespaced mode resolves this
+/// request's namespace and submits through ITS OWN committer, never a shared one.
 async fn run_write<F, T>(st: AppState, f: F) -> Result<T, ApiError>
 where
     F: FnOnce(&mut Nidus) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    // Refuse before queueing when there is no store to write to, so the honest `503` comes
-    // from here rather than from the committer's cannot-answer fallback. Reads an atomic, not
-    // the store lock — a queue of writes must not be able to delay this.
-    if !st.open.load(std::sync::atomic::Ordering::Acquire) {
-        return Err(ApiError::from(not_open()));
-    }
     // Picked up on the async side for the same reason as in `run_read`: a task-local does not
     // follow work onto the blocking thread that ends up applying it.
     let cancel = limits::current_cancel();
-    st.commit
-        .submit(st.db.clone(), cancel, f)
-        .await
-        .map_err(ApiError::from)
+    match st.store {
+        Store::Single {
+            open, db, commit, ..
+        } => {
+            // Refuse before queueing when there is no store to write to, so the honest
+            // `503` comes from here rather than from the committer's fallback. Reads an
+            // atomic, not the store lock — a queue of writes must not be able to delay this.
+            if !open.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(ApiError::from(not_open()));
+            }
+            commit
+                .submit(commit::Target::Single(db), cancel, f)
+                .await
+                .map_err(ApiError::from)
+        }
+        Store::Namespaced(registry) => {
+            let name = current_namespace()?;
+            let admit_registry = registry.clone();
+            let admit_name = name.clone();
+            let (committer, _readiness) =
+                tokio::task::spawn_blocking(move || admit_registry.admit(&admit_name))
+                    .await
+                    .map_err(|e| ApiError::internal(anyhow::anyhow!("task join error: {e}")))?
+                    .map_err(ApiError::from)?;
+            committer
+                .submit(commit::Target::Namespace { registry, name }, cancel, f)
+                .await
+                .map_err(ApiError::from)
+        }
+    }
 }
 
 // ── Error response ──────────────────────────────────────────────────────────
@@ -2159,10 +2422,13 @@ fn test_state(db: Option<Nidus>) -> AppState {
         let _ = readiness.set(db.readiness());
     }
     AppState {
-        db: Arc::new(RwLock::new(db)),
-        open: Arc::new(std::sync::atomic::AtomicBool::new(open)),
-        readiness: Arc::new(readiness),
-        max_staleness: None,
+        store: Store::Single {
+            db: Arc::new(RwLock::new(db)),
+            open: Arc::new(std::sync::atomic::AtomicBool::new(open)),
+            readiness: Arc::new(readiness),
+            max_staleness: None,
+            commit: commit::Committer::new(),
+        },
         token: None,
         // Generous by default so an ordinary test never trips admission control; the
         // backpressure tests build their own tight `Limits`.
@@ -2173,7 +2439,6 @@ fn test_state(db: Option<Nidus>) -> AppState {
             None,
             16 * 1024 * 1024,
         )),
-        commit: commit::Committer::new(),
         #[cfg(feature = "memory")]
         embedder: None,
         #[cfg(all(feature = "memory", feature = "summarize"))]
@@ -2181,6 +2446,47 @@ fn test_state(db: Option<Nidus>) -> AppState {
         #[cfg(feature = "rerank")]
         reranker: None,
     }
+}
+
+/// The namespaced analogue of `test_state`: namespaced mode cannot hand in a pre-opened
+/// `Nidus` (every namespace opens lazily), so this takes a base directory and a template
+/// instead. Kept beside `test_state` as the second, and only other, construction site.
+#[cfg(test)]
+fn test_state_namespaced(base: &std::path::Path, template: crate::Config) -> AppState {
+    let registry = registry::Registry::new(
+        template,
+        base.to_string_lossy().into_owned(),
+        None,
+        std::time::Duration::from_secs(3600),
+    );
+    AppState {
+        store: Store::Namespaced(registry),
+        token: None,
+        limits: Arc::new(limits::Limits::new(
+            1024,
+            None,
+            None,
+            None,
+            16 * 1024 * 1024,
+        )),
+        #[cfg(feature = "memory")]
+        embedder: None,
+        #[cfg(all(feature = "memory", feature = "summarize"))]
+        summarizer: None,
+        #[cfg(feature = "rerank")]
+        reranker: None,
+    }
+}
+
+/// Build a namespaced router **and keep the state**, over a fresh base directory — the
+/// namespaced analogue of `mod tests`'s `router_and_state`, which hands in a pre-opened
+/// `Nidus` that namespaced mode cannot. The `TempDir` must outlive the router.
+#[cfg(test)]
+fn namespaced_router_and_state(dim: usize) -> (Router, AppState, tempfile::TempDir) {
+    let base = tempfile::tempdir().unwrap();
+    let template = crate::Config::new("unused", dim);
+    let state = test_state_namespaced(base.path(), template);
+    (router(state.clone(), 16 * 1024 * 1024), state, base)
 }
 
 #[cfg(test)]
@@ -3489,7 +3795,7 @@ mod tests {
 
         // Hold the exclusive guard for the length of the test — exactly what a long upsert
         // does. Nothing below may block on it.
-        let guard = state.db.write().unwrap();
+        let guard = state.db().write().unwrap();
 
         let resp = app.clone().oneshot(get("/ready")).await.unwrap();
         assert_eq!(
@@ -3520,7 +3826,7 @@ mod tests {
         let (app, state) = router_and_state(3);
 
         const N: usize = 8;
-        let guard = state.db.write().unwrap();
+        let guard = state.db().write().unwrap();
         let mut tasks = tokio::task::JoinSet::new();
         for i in 0..N {
             let app = app.clone();
@@ -3538,13 +3844,13 @@ mod tests {
         // rather than queue length — the length is 0 in exactly the case where coalescing worked
         // best. `sleep`, not `yield_now`: a spin loop keeps the CPU the workers need.
         for _ in 0..2_000 {
-            if state.commit.submitted() >= N as u64 {
+            if state.commit().submitted() >= N as u64 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         assert_eq!(
-            state.commit.submitted(),
+            state.commit().submitted(),
             N as u64,
             "not every write reached the queue, so this test would not be measuring group commit"
         );
@@ -3558,7 +3864,7 @@ mod tests {
             );
         }
 
-        let (groups, writes) = state.commit.stats();
+        let (groups, writes) = state.commit().stats();
         assert_eq!(writes, N as u64, "every write was applied exactly once");
         assert!(
             groups < writes,
@@ -3589,7 +3895,7 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
         }
         assert_eq!(
-            state.commit.stats(),
+            state.commit().stats(),
             (3, 3),
             "three sequential writes must be three groups of one, with no waiting"
         );
@@ -3606,7 +3912,7 @@ mod tests {
         // Poison it the way a panicking write handler would: unwind holding the exclusive guard.
         // The panic hook is silenced meanwhile so a deliberate panic does not look like a test
         // failure; worst case a concurrent test's message is suppressed, and it still fails.
-        let db = state.db.clone();
+        let db = state.db().clone();
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let _ = std::thread::spawn(move || {
@@ -3616,7 +3922,7 @@ mod tests {
         .join();
         std::panic::set_hook(hook);
         assert!(
-            state.db.is_poisoned(),
+            state.db().is_poisoned(),
             "a panic on the WRITE path must poison the lock"
         );
 
@@ -3643,7 +3949,7 @@ mod tests {
     async fn a_panic_on_the_read_path_leaves_the_instance_healthy() {
         let (app, state) = router_and_state(3);
 
-        let db = state.db.clone();
+        let db = state.db().clone();
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let _ = std::thread::spawn(move || {
@@ -3654,7 +3960,7 @@ mod tests {
         std::panic::set_hook(hook);
 
         assert!(
-            !state.db.is_poisoned(),
+            !state.db().is_poisoned(),
             "a read-path panic must not poison the lock"
         );
         let resp = app.clone().oneshot(get("/health")).await.unwrap();
@@ -3707,11 +4013,11 @@ mod tests {
     #[tokio::test]
     async fn staleness_bound_does_not_fail_a_writer() {
         let db = Nidus::open_in_memory(3).unwrap();
-        let state = AppState {
-            // Zero tolerance: anything with nonzero staleness would fail.
-            max_staleness: Some(std::time::Duration::ZERO),
-            ..test_state(Some(db))
-        };
+        let mut state = test_state(Some(db));
+        // Zero tolerance: anything with nonzero staleness would fail.
+        if let Store::Single { max_staleness, .. } = &mut state.store {
+            *max_staleness = Some(std::time::Duration::ZERO);
+        }
         let app = router(state, 16 * 1024 * 1024);
         let resp = app.oneshot(get("/ready")).await.unwrap();
         assert_eq!(
@@ -4090,7 +4396,7 @@ mod tests {
         };
         let app = router(state.clone(), 16 * 1024 * 1024);
 
-        let guard = state.db.write().unwrap();
+        let guard = state.db().write().unwrap();
         let resp = app.clone().oneshot(get("/stats")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
         let body = json_body(resp).await;
@@ -4245,7 +4551,7 @@ mod tests {
         assert!(probe && gauge, "open: probe={probe} gauge={gauge}");
 
         // Poisoned by a panic on the write path: both must flip.
-        let db = state.db.clone();
+        let db = state.db().clone();
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let _ = std::thread::spawn(move || {
@@ -4814,7 +5120,7 @@ mod memory_tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let guard = state.db.write().unwrap();
+        let guard = state.db().write().unwrap();
 
         let plain = app
             .clone()
@@ -5492,6 +5798,170 @@ mod rerank_tests {
                 .unwrap()
                 .contains("--rerank-provider"),
             "message names the flag: {body}"
+        );
+    }
+}
+
+// ── Namespaced-mode tests (nidus-pcpc.2) ─────────────────────────────────────
+// A separate module (mirroring `memory_tests`/`rerank_tests` above) rather than folded into
+// `mod tests`: it needs no extra feature gate, only its own router/state constructor.
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn post(path: &str, body: JsonValue) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn get(path: &str) -> Request<Body> {
+        Request::builder().uri(path).body(Body::empty()).unwrap()
+    }
+
+    /// Each namespace gets its OWN `Committer`, never a process-wide shared one.
+    /// Counterfactual: a shared committer would hand back the same `Arc` for both names,
+    /// which is exactly what would let one namespace's queued write land in another's store.
+    #[tokio::test]
+    async fn each_namespace_gets_its_own_committer() {
+        let (_app, state, _base) = namespaced_router_and_state(3);
+        let Store::Namespaced(registry) = &state.store else {
+            panic!("expected namespaced mode");
+        };
+        let (committer_a, _) = registry.admit("a").unwrap();
+        let (committer_b, _) = registry.admit("b").unwrap();
+        assert!(
+            !Arc::ptr_eq(&committer_a, &committer_b),
+            "namespaces a and b share one Committer"
+        );
+    }
+
+    /// Two namespaces must not serialize against each other: the registry guard covers
+    /// lookup and eviction only. Counterfactual: holding it across the store operation (the
+    /// shape this replaced) makes b's read wait for a's write, so the recv times out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_namespace_does_not_block_another() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let base = tempfile::tempdir().unwrap();
+        let registry = registry::Registry::new(
+            crate::Config::new("unused", 3),
+            base.path().to_string_lossy().into_owned(),
+            None,
+            Duration::from_secs(60),
+        );
+
+        // Hold namespace a's store for as long as this test wants it held.
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let rt = tokio::runtime::Handle::current();
+        let reg_a = Arc::clone(&registry);
+        let rt_a = rt.clone();
+        let writer = std::thread::spawn(move || {
+            // `ensure_side` spawns the lease-renewal task, so these threads need the runtime.
+            let _enter = rt_a.enter();
+            reg_a
+                .write("a", |_db| {
+                    held_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                })
+                .unwrap();
+        });
+        held_rx.recv().expect("a's store is held");
+
+        // b must be reachable meanwhile. Off-thread with a deadline so the pre-fix shape
+        // reports a clean failure instead of hanging the suite.
+        let (done_tx, done_rx) = mpsc::channel();
+        let reg_b = Arc::clone(&registry);
+        std::thread::spawn(move || {
+            let _enter = rt.enter();
+            let out = reg_b.read("b", |_db| Ok(()));
+            let _ = done_tx.send(out.is_ok());
+        });
+        let reached_b = done_rx.recv_timeout(Duration::from_secs(5));
+
+        let _ = release_tx.send(());
+        writer.join().unwrap();
+        assert_eq!(
+            reached_b.ok(),
+            Some(true),
+            "namespace b blocked while a was in use: the registry serializes tenants"
+        );
+    }
+
+    /// THE corruption test: concurrent writes to two different namespaces must never cross
+    /// over. Counterfactual: with one shared `Committer`, a write queued for B while A's
+    /// leader drains the group is applied against A instead (`commit::Target`'s doc explains).
+    #[tokio::test]
+    async fn a_write_to_b_never_lands_in_a_even_while_a_is_committing() {
+        let (app, _state, _base) = namespaced_router_and_state(3);
+        let mut handles = Vec::new();
+        for i in 0..12 {
+            let app = app.clone();
+            let ns = if i % 2 == 0 { "a" } else { "b" };
+            let id = format!("{ns}-{i}");
+            handles.push(tokio::spawn(async move {
+                let resp = app
+                    .oneshot(post(
+                        &format!("/ns/{ns}/collections/c/upsert"),
+                        serde_json::json!({"records": [
+                            {"id": id, "vector": [1.0, 0.0, 0.0], "attrs": {}}
+                        ]}),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{ns}'s write must succeed");
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        for ns in ["a", "b"] {
+            let resp = app
+                .clone()
+                .oneshot(get(&format!("/ns/{ns}/collections/c/records")))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let records: Vec<JsonValue> =
+                serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            for r in &records {
+                let id = r["id"].as_str().unwrap();
+                assert!(
+                    id.starts_with(&format!("{ns}-")),
+                    "namespace {ns} contains a foreign record: {id}"
+                );
+            }
+        }
+    }
+
+    /// `/ready` keeps its exact process-level contract in namespaced mode: listener up, no
+    /// namespace ever touched. Counterfactual: an aggregate implementation has nothing to
+    /// answer from (no namespace is ever warm here) and would fail rather than answer.
+    #[tokio::test]
+    async fn ready_answers_without_touching_any_namespace() {
+        let (app, state, _base) = namespaced_router_and_state(3);
+        let resp = app.oneshot(get("/ready")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: JsonValue = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ready"], JsonValue::Bool(true));
+
+        let Store::Namespaced(registry) = &state.store else {
+            panic!("expected namespaced mode");
+        };
+        assert!(
+            registry.warm_snapshot().is_empty(),
+            "answering /ready must not have opened any namespace"
         );
     }
 }

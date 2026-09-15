@@ -77,7 +77,7 @@ func (c *Client) request(ctx context.Context, method, path string, body, out any
 		defer cancel()
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, payload)
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+c.nsPath(path), payload)
 	if err != nil {
 		return fmt.Errorf("nidus: building the request for %s: %w", path, err)
 	}
@@ -186,6 +186,21 @@ func extractError(raw []byte, status int) string {
 		return msg
 	}
 	return "HTTP " + strconv.Itoa(status)
+}
+
+// nsPath prepends the /ns/{namespace} prefix configured via [WithNamespace], or returns
+// path unchanged when none is set — the one place that prefix is spliced in, so every
+// method funnels through it via [Client.request] rather than each building its own URL.
+//
+// The namespace is escaped the same way [collPath] escapes a collection name: it is
+// just as opaque a string, and the server resolves it by splitting on the first "/"
+// after "/ns/", so an unescaped slash would silently address a different, shorter
+// namespace instead of the one the caller named.
+func (c *Client) nsPath(path string) string {
+	if c.namespace == "" {
+		return path
+	}
+	return "/ns/" + url.PathEscape(c.namespace) + path
 }
 
 // collPath builds /collections/{name}{suffix} — the one place a collection name

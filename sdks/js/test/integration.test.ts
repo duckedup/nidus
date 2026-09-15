@@ -551,6 +551,85 @@ describe.skipIf(!binaryExists)("lifecycle over a real nidus serve", () => {
   });
 });
 
+// ── Namespaced mode (nidus-pcpc.2) ───────────────────────────────────────────
+//
+// `--namespaced` turns `--dir` into a base holding one independent store per
+// namespace, addressed as `/ns/{namespace}/...`. Proves the SDK's `namespace`
+// option reaches a real server: two namespaces stay isolated, and a client with
+// no namespace configured still produces today's flat paths (which a namespaced
+// server refuses, naming the fix, rather than silently reinterpreting them).
+
+const NS_PORT = 7796;
+const nsBaseUrl = `http://127.0.0.1:${NS_PORT}`;
+
+describe.skipIf(!binaryExists)("namespaced client over a real nidus serve --namespaced", () => {
+  let server: ChildProcess;
+  let base: string;
+
+  beforeAll(async () => {
+    base = mkdtempSync(join(tmpdir(), "nidus-sdk-ns-"));
+    server = spawn(
+      binary,
+      ["serve", "--dir", base, "--dim", "3", "--addr", `127.0.0.1:${NS_PORT}`, "--namespaced"],
+      { stdio: "ignore" },
+    );
+    const deadline = Date.now() + 5000;
+    let last = "";
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetch(`${nsBaseUrl}/ready`);
+        if (res.status === 200) return;
+        last = `/ready answered ${res.status}`;
+      } catch (e) {
+        last = String(e);
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    throw new Error(`nidus serve --namespaced did not become ready in time (${last})`);
+  });
+
+  afterAll(async () => {
+    if (server) await stopServer(server);
+    if (base) rmSync(base, { recursive: true, force: true });
+  });
+
+  it("addresses one namespace's own store, isolated from a sibling namespace", async () => {
+    const dbA = new NidusClient({ baseUrl: nsBaseUrl, namespace: "tenant-a", timeoutMs: 5000 });
+    const dbB = new NidusClient({ baseUrl: nsBaseUrl, namespace: "tenant-b", timeoutMs: 5000 });
+
+    await dbA.createCollection("docs");
+    await dbA.upsert("docs", [{ id: "a", vector: [1, 0, 0], attrs: { lang: "rust" } }]);
+    expect(await dbA.collections()).toContain("docs");
+
+    const hits = await dbA.search({ query: [1, 0, 0], topK: 1 });
+    expect(hits[0]!.id).toBe("a");
+
+    // A sibling namespace never opened `docs` — its own store starts empty.
+    expect(await dbB.collections()).not.toContain("docs");
+  });
+
+  it("a client with no namespace configured sends today's flat paths, which the namespaced server refuses, naming the fix", async () => {
+    const flat = new NidusClient({ baseUrl: nsBaseUrl, timeoutMs: 5000 });
+    const err = (await flat.collections().then(
+      () => null,
+      (e) => e,
+    )) as NidusError;
+    expect(err).toBeInstanceOf(NidusError);
+    expect(err.status).toBe(400);
+    expect(err.message).toContain("/ns/{namespace}/");
+  });
+
+  it("lists warm namespaces via GET /namespaces", async () => {
+    const dbC = new NidusClient({ baseUrl: nsBaseUrl, namespace: "tenant-c", timeoutMs: 5000 });
+    await dbC.createCollection("warm");
+
+    const res = await fetch(`${nsBaseUrl}/namespaces`);
+    expect(res.ok).toBe(true);
+    const namespaces = (await res.json()) as { name: string }[];
+    expect(namespaces.map((n) => n.name)).toContain("tenant-c");
+  });
+});
+
 // A known fixture: one `pub fn add`, so the AST chunker's start/end line span is
 // predictable (the doc comment sits outside the `function_item` node, so the span starts
 // at `pub fn`, not at `///`).

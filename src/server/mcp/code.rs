@@ -12,7 +12,10 @@ use serde_json::{Map, Value as JsonValue, json};
 use crate::embed::Embedder;
 
 use super::NidusMcp;
-use super::args::{api_error, optional_string_array, optional_usize, required_str, tool};
+use super::args::{
+    api_error, namespace_schema, optional_namespace, optional_string_array, optional_usize,
+    required_str, tool,
+};
 use super::search::{
     filter_defs, filter_schema, name_weights_schema, names_schema, parse_filter,
     parse_name_weights, parse_pool, pool_schema,
@@ -64,7 +67,8 @@ pub(super) fn tools() -> Vec<Tool> {
                 },
                 "names": names_schema(),
                 "pool": pool_schema(),
-                "name_weights": name_weights_schema()
+                "name_weights": name_weights_schema(),
+                "namespace": namespace_schema()
             },
             "required": ["collection", "query"],
             "additionalProperties": false
@@ -77,6 +81,7 @@ impl NidusMcp {
         &self,
         args: &Map<String, JsonValue>,
     ) -> Result<CallToolResult, McpError> {
+        let namespace = optional_namespace(args)?;
         let collection = required_str(args, "collection")?;
         let query = required_str(args, "query")?;
         let limit =
@@ -95,45 +100,51 @@ impl NidusMcp {
         let pool = parse_pool(args)?;
         let name_weights = parse_name_weights(args)?;
 
-        let use_vector = match want_semantic {
-            Some(v) => v,
-            None => crate::server::run_read(self.state.clone(), |db| Ok(db.dimension() > 0))
-                .await
-                .map_err(api_error)?,
-        };
+        let hits = self
+            .with_namespace(namespace, async {
+                let use_vector = match want_semantic {
+                    Some(v) => v,
+                    None => {
+                        crate::server::run_read(self.state.clone(), |db| Ok(db.dimension() > 0))
+                            .await
+                            .map_err(api_error)?
+                    }
+                };
 
-        let hits = if use_vector {
-            let embedder = self.embedder()?;
-            let vector = embedder
-                .embed_query(&query)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            let opts = crate::SearchOpts {
-                top_k: limit,
-                filter,
-                names,
-                name_weights,
-                pool,
-                ..Default::default()
-            };
-            crate::server::run_read(self.state.clone(), move |db| {
-                db.search(collection.as_str(), &vector, &opts)
+                if use_vector {
+                    let embedder = self.embedder()?;
+                    let vector = embedder
+                        .embed_query(&query)
+                        .await
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                    let opts = crate::SearchOpts {
+                        top_k: limit,
+                        filter,
+                        names,
+                        name_weights,
+                        pool,
+                        ..Default::default()
+                    };
+                    crate::server::run_read(self.state.clone(), move |db| {
+                        db.search(collection.as_str(), &vector, &opts)
+                    })
+                    .await
+                    .map_err(api_error)
+                } else {
+                    let opts = crate::SearchOpts {
+                        top_k: limit,
+                        filter,
+                        ..Default::default()
+                    };
+                    let q = crate::code::search::fts_query(&query);
+                    crate::server::run_read(self.state.clone(), move |db| {
+                        db.text_search(collection.as_str(), &q, &opts)
+                    })
+                    .await
+                    .map_err(api_error)
+                }
             })
-            .await
-            .map_err(api_error)?
-        } else {
-            let opts = crate::SearchOpts {
-                top_k: limit,
-                filter,
-                ..Default::default()
-            };
-            let q = crate::code::search::fts_query(&query);
-            crate::server::run_read(self.state.clone(), move |db| {
-                db.text_search(collection.as_str(), &q, &opts)
-            })
-            .await
-            .map_err(api_error)?
-        };
+            .await?;
 
         Ok(code_search_content(&hits))
     }

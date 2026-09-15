@@ -2058,6 +2058,9 @@ src/
 │                 s3.rs, aws_creds.rs, gcs.rs, redis.rs, opfs.rs (the wasm32 browser
 │                 backend over a pre-opened OPFS handle pool, §13.8; compiled for
 │                 wasm32 and under cfg(test), dead code on a native build), tests.rs
+├── namespaces/   a namespace is a store (§13.9): mod.rs (Namespaces: name to Config
+│                 derivation, lazy Nidus::open, the Redis-family ?prefix= rewrite),
+│                 warm.rs (WarmSet: byte-measured LRU accounting and eviction), tests.rs
 └── store/        the integrator: mod.rs (Store type, open/in_memory ctors, lock +
                   ANN lifecycle glue), scoring.rs (scan kernels + parallel engine),
                   quant.rs (int8/binary state + quantized two-pass search), read.rs
@@ -2087,12 +2090,16 @@ src/
 # ── `cli` feature only (the `nidus` binary, --features cli) ──
 ├── bin/nidus.rs  thin entry point: parse args → cli::run
 ├── cli/          clap subcommands over a store dir: mod.rs + backup.rs (snapshot)
-└── server/       axum/tokio HTTP wrapper over one Nidus: mod.rs (routes + handlers),
-                  dto.rs (wire types), auth.rs (bearer token), limits.rs (backpressure,
-                  deadlines, body-idle timeout), commit.rs (group commit), metrics.rs
-                  (Prometheus scrape + access log), mcp/ (the MCP 2026-07-28 adapter,
-                  `mcp` feature: mod.rs, args.rs, remember.rs, search.rs, hygiene.rs,
-                  admin.rs, stdio.rs, resources.rs, prompts.rs, uri.rs)
+└── server/       axum/tokio HTTP wrapper over one Nidus, or (`--namespaced`, §13.9.1)
+                  over many: mod.rs (routes + handlers; `Store::{Single, Namespaced}`
+                  and the `/ns/{namespace}` middleware), dto.rs (wire types), auth.rs
+                  (bearer token), limits.rs (backpressure, deadlines, body-idle
+                  timeout), commit.rs (group commit), registry.rs (namespaced-mode
+                  registry: `Namespaces` plus one committer + readiness handle + lease
+                  task per namespace), metrics.rs (Prometheus scrape + access log),
+                  mcp/ (the MCP 2026-07-28 adapter, `mcp` feature: mod.rs, args.rs,
+                  remember.rs, search.rs, hygiene.rs, admin.rs, stdio.rs, resources.rs,
+                  prompts.rs, uri.rs)
 
 tests/            file-backed integration (temp dirs; #[cfg_attr(miri, ignore)] on fsync
                   paths); tests/e2e/ drives the real binary (one test target, §11)
@@ -2105,9 +2112,10 @@ matching the common convention; no hand-rolled error enum.
 
 Build order (bottom-up, each with tests, keeping `cargo build` in seconds):
 `config → model → glob → filter → search → data → log → lock → index_cache →
-ann/fts → backend → manifest → store → lib` (the `data` segment aggregator and `manifest`
-sit over `backend`; the ingest layer and the `cli`/`server` binary layers sit above
-`lib`, behind their features). The shared type vocabulary in `model` is frozen as
+ann/fts → backend → manifest → store → namespaces → lib` (the `data` segment aggregator
+and `manifest` sit over `backend`; `namespaces` sits over `store`, wrapping `Nidus::open`
+rather than reaching into it; the ingest layer and the `cli`/`server` binary layers sit
+above `lib`, behind their features). The shared type vocabulary in `model` is frozen as
 signatures first so the modules above can be implemented independently and still
 compile together.
 
@@ -2542,14 +2550,50 @@ Namespaces::new(template: Config, base: impl Into<String>) -> Self
   of that. This is what makes "one process, many tenants" viable at all: without a
   bound, a caller with more tenants than fits in RAM would eventually hold every
   tenant's full working set at once.
-- **What this is not.** `Namespaces` is a library-side handle only: it says nothing
-  about how many processes serve traffic or how a network request picks a namespace.
-  `nidus serve` (§9) still opens **one** store today; routing one HTTP or MCP server
-  across many namespaces by name is a separate, not-yet-shipped surface. Nothing here
-  should be read as "`nidus serve` hosts many tenants."
 - **Aliases and blue/green reindexing (§14.2) are unaffected.** Both operate on
   collections *within* one store; a namespace-per-store model changes what a
   namespace *is*, not what a collection can do inside one.
+- **The wire surface is §13.9.1, below.** `Namespaces` itself is a library-side handle
+  only, and says nothing about how a network request picks a namespace; `nidus serve
+  --namespaced` is what routes one HTTP/MCP process across many of them by name.
+
+#### 13.9.1 The wire surface: `nidus serve --namespaced` (built, nidus-pcpc.2)
+
+`nidus serve --namespaced` routes one process across many namespaces, each behind
+`Namespaces`'s own byte-bounded warm set (`registry::Registry` wraps `Namespaces` plus
+one group-commit queue and one lease-renewal task per namespace, since sharing either
+across namespaces would be cross-tenant data corruption, not merely a missed
+optimization). `--dir`/`--persistence` becomes the base location. `--dim` is still
+required at start: it is the template every namespace is created from, even though no
+store opens until a request names one.
+
+- **Addressing.** Every route this server answers (HTTP and `/mcp` alike) is reached
+  either flat, exactly as in single-store mode, or as `/ns/{namespace}/...`, a prefix a
+  middleware layer strips before the request reaches the ordinary handler. So every
+  route's fields, response shape, and error codes are unchanged; only the path grows a
+  prefix. **MCP is the exception**: a tool call carries its own `namespace` argument, and
+  the connection path does not scope it. The prefix is stripped before routing, so the
+  namespace is not available to a tool handler, which runs on the MCP session's own task
+  rather than the HTTP request's (nidus-k9rj).
+- **`GET /namespaces`**, namespaced mode only: every warm namespace's name, byte size,
+  and readiness, reading what the warm set already measured rather than opening
+  anything. This is where per-namespace role/fenced/staleness live.
+- **`/health` and `/ready` stay process-level.** Neither takes the `/ns/` prefix and
+  neither opens or inspects any one namespace: `/ready` answers as soon as the listener
+  is serving, since there is no single store whose absence would hold it back.
+  Per-namespace health is `GET /namespaces`'s job, not `/ready`'s.
+- **Single-credential.** `--token`, where set, is still the one process-wide bearer
+  token: it gates every namespace this process serves identically, with no per-tenant
+  scoping. A caller holding it can reach every tenant by name. Per-tenant credentials
+  are `nidus-uyb`, not this ticket; do not read namespaced mode as tenant isolation at
+  the network layer, only as storage isolation (this section, above).
+- **Admission control stays one process-wide pool.** `--max-concurrent-requests` (and
+  the read/write/body-idle deadlines) cap the whole process, not each namespace: the
+  process has one CPU and RAM budget regardless of how many tenants it serves.
+
+See the [multi-tenancy guide](/guides/multi-tenancy/) and the [HTTP API
+reference](/reference/http-api/#namespaced-mode) for the operator-facing version of the
+above, with worked examples.
 
 ---
 

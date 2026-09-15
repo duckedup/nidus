@@ -1139,6 +1139,15 @@ enum Command {
         /// image runs under, since a container has no durable disk and would lose data on restart.
         #[arg(long, env = "NIDUS_REQUIRE_REMOTE")]
         require_remote: bool,
+        /// Serve every namespace under one base location instead of a single store:
+        /// `--dir`/`--persistence` becomes that base, and each request names its
+        /// namespace via `/ns/{namespace}/...` (SPEC §13.9). Omit for today's behaviour.
+        #[arg(long, env = "NIDUS_NAMESPACED")]
+        namespaced: bool,
+        /// Byte budget for namespaces kept open at once in `--namespaced` mode. Omit for
+        /// `Namespaces`'s own default (1 GiB). Ignored without `--namespaced`.
+        #[arg(long, env = "NIDUS_WARM_BUDGET_BYTES")]
+        warm_budget_bytes: Option<u64>,
         /// Embedder / summarizer flags for the text-native `/remember` + `/recall`
         /// routes. Present only when built with the `memory` feature (the `serve`
         /// umbrella).
@@ -1827,6 +1836,8 @@ pub fn run(cli: Cli) -> Result<()> {
             body_idle_timeout,
             refresh_interval,
             require_remote,
+            namespaced,
+            warm_budget_bytes,
             #[cfg(feature = "memory")]
             ingest,
         } => serve(
@@ -1840,6 +1851,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 body_idle_timeout,
                 refresh_interval,
                 require_remote,
+                namespaced,
+                warm_budget_bytes,
             },
             store,
             #[cfg(feature = "memory")]
@@ -2875,6 +2888,8 @@ struct ServeArgs {
     body_idle_timeout: u64,
     refresh_interval: Option<u64>,
     require_remote: bool,
+    namespaced: bool,
+    warm_budget_bytes: Option<u64>,
 }
 
 /// Seconds from a flag to a deadline, where `0` means "no deadline".
@@ -2898,6 +2913,8 @@ fn serve(
         body_idle_timeout,
         refresh_interval,
         require_remote,
+        namespaced,
+        warm_budget_bytes,
     } = args;
     // The container contract: no durable local disk, so refuse anything that would
     // keep its state process-local (a local-file store or process-RAM working set).
@@ -2967,7 +2984,17 @@ fn serve(
         #[cfg(feature = "rerank")]
         reranker,
     };
-    rt.block_on(crate::server::serve(move || Nidus::open(open_config), cfg))
+    if namespaced {
+        let base = store.store_location();
+        rt.block_on(crate::server::serve_namespaced(
+            open_config,
+            base,
+            warm_budget_bytes,
+            cfg,
+        ))
+    } else {
+        rt.block_on(crate::server::serve(move || Nidus::open(open_config), cfg))
+    }
 }
 
 /// `nidus mcp`: speak MCP over stdio. Always opens read-write — there is exactly one
@@ -5078,6 +5105,8 @@ mod tests {
         ServeArgs {
             addr: "x".into(),
             token: None,
+            namespaced: false,
+            warm_budget_bytes: None,
             max_body_bytes: 1,
             max_concurrent_requests: 0,
             read_timeout: 30,

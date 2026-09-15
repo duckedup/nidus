@@ -32,15 +32,16 @@ import (
 // is itself concurrent. One Client per server, shared, is the intended shape — that is
 // what keeps connections pooled.
 type Client struct {
-	baseURL string
-	token   string
-	hc      *http.Client
-	timeout time.Duration
-	headers map[string]string
+	baseURL   string
+	token     string
+	namespace string
+	hc        *http.Client
+	timeout   time.Duration
+	headers   map[string]string
 }
 
 // An Option configures a [Client] at construction. See [WithToken],
-// [WithHTTPClient], [WithTimeout], and [WithHeader].
+// [WithHTTPClient], [WithTimeout], [WithHeader], and [WithNamespace].
 type Option func(*Client)
 
 // NewClient returns a client for the nidus server at baseURL, e.g.
@@ -132,6 +133,17 @@ func WithHTTPClient(hc *http.Client) Option {
 // deadline is earlier wins. Zero or negative means no SDK-imposed timeout.
 func WithTimeout(d time.Duration) Option {
 	return func(c *Client) { c.timeout = d }
+}
+
+// WithNamespace scopes every request to one namespace of a server started with
+// `nidus serve --namespaced` (nidus-pcpc.2), addressing it via /ns/{namespace}/...
+// instead of today's flat paths. The prefix is spliced in at the SDK's single request
+// site (transport.go), so every method — present and future — gets it for free.
+//
+// Leave this unset against an ordinary single-store server: a [Client] with no
+// namespace configured produces today's exact flat paths, unchanged.
+func WithNamespace(namespace string) Option {
+	return func(c *Client) { c.namespace = namespace }
 }
 
 // WithHeader adds a header sent on every request — a trace id, a gateway's own

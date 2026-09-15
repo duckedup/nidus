@@ -26,6 +26,8 @@ pub struct Server {
     args: Vec<String>,
     token: Option<String>,
     env: Vec<(String, String)>,
+    /// `--namespaced`: `dir` is a base location, not one store (nidus-pcpc.2).
+    namespaced: bool,
 }
 
 /// A running `nidus serve` child process.
@@ -47,6 +49,17 @@ impl Server {
             args: Vec::new(),
             token: None,
             env: Vec::new(),
+            namespaced: false,
+        }
+    }
+
+    /// A namespaced server (nidus-pcpc.2): `base` is a shared location under which each
+    /// request's `/ns/{namespace}/...` opens (and lazily creates) its own store, all
+    /// sharing `dim`. Every other builder method still applies (`.args`, `.token`, …).
+    pub fn over_base(base: impl Into<std::path::PathBuf>, dim: usize) -> Self {
+        Server {
+            namespaced: true,
+            ..Self::new(base, dim)
         }
     }
 
@@ -61,6 +74,7 @@ impl Server {
             args: Vec::new(),
             token: None,
             env: Vec::new(),
+            namespaced: false,
         }
     }
 
@@ -111,6 +125,7 @@ impl Server {
             .arg("--addr")
             .arg("127.0.0.1:0")
             .args(&self.args)
+            .args(self.namespaced.then_some("--namespaced"))
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             // Inherited NIDUS_* vars would silently override the flags under test.

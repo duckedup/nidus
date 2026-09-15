@@ -5,24 +5,32 @@
 //! via `WriteLock`/`ObjectLock`/`ClusterLease`, which need no unlock call of their own.
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 
 use crate::Nidus;
 
+/// One namespace's store, shared so a request can hold it while the registry guard that
+/// found it is released. The writer lock releases when the LAST holder drops, so an
+/// eviction racing an in-flight request frees the lock when that request finishes.
+pub type Handle = Arc<RwLock<Nidus>>;
+
 /// One warm namespace: its open store, its byte size as of the last refresh, and a
 /// monotonic access stamp (never a wall clock — cheap, immune to clock skew) for LRU.
 struct Entry {
-    store: Nidus,
+    store: Handle,
     size: u64,
     stamp: u64,
 }
 
-/// `vector_bytes + filter_index_bytes` from `Nidus::footprint` — the one byte-counting
-/// scheme the warm set uses, not a second one. Cheap: live counters, no IO.
-fn footprint_bytes(n: &Nidus) -> u64 {
-    let fp = n.footprint();
-    fp.vector_bytes + fp.filter_index_bytes
+/// `vector_bytes + filter_index_bytes` from `Nidus::footprint`, the one byte-counting scheme
+/// the warm set uses. `Some` only when the store is free: blocking to measure a namespace
+/// mid-write would re-serialize every other tenant, so a busy store keeps its last size.
+fn try_footprint_bytes(h: &Handle) -> Option<u64> {
+    let db = h.try_read().ok()?;
+    let fp = db.footprint();
+    Some(fp.vector_bytes + fp.filter_index_bytes)
 }
 
 /// The set of currently-open namespace stores. Pure accounting; opening a store and
@@ -42,13 +50,14 @@ impl WarmSet {
         self.entries.contains_key(name)
     }
 
-    /// Touches `name`'s LRU stamp and returns its store, if warm.
-    pub(super) fn get_mut(&mut self, name: &str) -> Option<&mut Nidus> {
+    /// Touches `name`'s LRU stamp and hands back a shared handle to its store, if warm.
+    /// Owned, not borrowed: the caller can release the set's guard before using it.
+    pub(super) fn handle(&mut self, name: &str) -> Option<Handle> {
         self.clock += 1;
         let stamp = self.clock;
         let entry = self.entries.get_mut(name)?;
         entry.stamp = stamp;
-        Some(&mut entry.store)
+        Some(Arc::clone(&entry.store))
     }
 
     pub(super) fn names(&self) -> Vec<String> {
@@ -60,9 +69,9 @@ impl WarmSet {
         match self.entries.remove(name) {
             // Removed first, so a failed flush still frees the lock rather than stranding
             // a store nobody can reach; the error still reaches the caller.
-            Some(mut entry) => {
-                if writable {
-                    entry.store.flush()?;
+            Some(entry) => {
+                if writable && let Ok(mut db) = entry.store.write() {
+                    db.flush()?;
                 }
                 Ok(true)
             }
@@ -74,12 +83,22 @@ impl WarmSet {
         self.entries.values().map(|e| e.size).sum()
     }
 
+    /// Every warm entry's name and last-measured byte size. Opens nothing: reads the sizes
+    /// `enforce` already computed rather than re-measuring anything.
+    pub(super) fn entries(&self) -> Vec<(String, u64)> {
+        self.entries
+            .iter()
+            .map(|(k, e)| (k.clone(), e.size))
+            .collect()
+    }
+
     /// Inserts a freshly opened `name`. Sizing and budget enforcement are `enforce`'s job:
     /// a store is measured at 0 rows here and only grows once the caller writes to it.
     pub(super) fn admit(&mut self, name: String, store: Nidus) {
         self.clock += 1;
         let stamp = self.clock;
-        let size = footprint_bytes(&store);
+        let store: Handle = Arc::new(RwLock::new(store));
+        let size = try_footprint_bytes(&store).unwrap_or(0);
         self.entries.insert(name, Entry { store, size, stamp });
     }
 
@@ -88,7 +107,9 @@ impl WarmSet {
     /// only once written through, so sizing once at admission would bound nothing.
     pub(super) fn enforce(&mut self, keep: &str, budget: u64, writable: bool) -> Result<()> {
         for entry in self.entries.values_mut() {
-            entry.size = footprint_bytes(&entry.store);
+            if let Some(size) = try_footprint_bytes(&entry.store) {
+                entry.size = size;
+            }
         }
         while self.total_bytes() > budget {
             let victim = self

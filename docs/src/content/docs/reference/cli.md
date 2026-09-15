@@ -162,6 +162,8 @@ Run the HTTP server. Usage: `nidus serve [OPTIONS] --dir <DIR>`.
 | `--body-idle-timeout <SECONDS>` | `NIDUS_BODY_IDLE_TIMEOUT` | Abandon a stalled request body (default `15`; `0` disables). |
 | `--refresh-interval <SECONDS>` | `NIDUS_REFRESH_INTERVAL` | Refresh this instance on a timer instead of leaving it to the caller. |
 | `--require-remote` | `NIDUS_REQUIRE_REMOTE` | Refuse to start unless `--persistence` and `--memory` are both shared, non-local backends. |
+| `--namespaced` | `NIDUS_NAMESPACED` | Serve every namespace under one base location (`--dir`/`--persistence`) instead of a single store, each request naming its namespace via `/ns/{namespace}/...`. Omit for today's single-store behaviour. |
+| `--warm-budget-bytes <N>` | `NIDUS_WARM_BUDGET_BYTES` | Byte budget for namespaces kept open at once under `--namespaced`. Omit for the 1 GiB default. Ignored without `--namespaced`. |
 | `--embed-*`/`--summarize-*` | see above | Present only under the `memory` feature; see [Ingest flags](#ingest-flags-memory-feature). |
 
 The full operator-facing environment table, authentication model, and request
