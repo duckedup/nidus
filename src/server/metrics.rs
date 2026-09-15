@@ -41,6 +41,7 @@ const ROUTES: &[&str] = &[
     "/flush",
     "/compact",
     "/refresh",
+    "/namespaces",
     "/aliases",
     "/aliases/{name}",
     "other",
@@ -152,8 +153,19 @@ pub(super) fn http() -> &'static HttpMetrics {
     &HTTP
 }
 
-/// Map a request path to its slot in [`ROUTES`].
+/// Map a request path to its slot in [`ROUTES`]. A `/ns/{namespace}` prefix (nidus-pcpc.2)
+/// is collapsed exactly like a collection or alias name before matching, so an unbounded
+/// namespace count never multiplies the label set — never a second, `/ns/`-shaped table.
 fn route_index(path: &str) -> usize {
+    if let Some(rest) = path.strip_prefix("/ns/") {
+        return match rest.split_once('/') {
+            Some((ns, tail)) if !ns.is_empty() => route_index(&format!("/{tail}")),
+            _ => ROUTES
+                .iter()
+                .position(|r| *r == "other")
+                .expect("known route"),
+        };
+    }
     let slot = |name: &str| ROUTES.iter().position(|r| *r == name).expect("known route");
     // Exact routes first — the common case, and unambiguous.
     if let Some(i) = ROUTES.iter().position(|r| *r == path && !r.contains('{')) {
@@ -371,9 +383,12 @@ fn render(out: &mut String, st: &AppState) {
     }
 
     // ── Group commit (nidus-xb9.1) ──────────────────────────────────────────
-    // `writes / groups` is the average number of requests sharing one disk barrier. The store's own
-    // barrier counters above count them whoever asked; these attribute coalescing to HTTP writes.
-    let (groups, writes) = st.commit.stats();
+    // `writes / groups` is coalescing per HTTP write. Namespaced mode has one committer per
+    // namespace, not a process-wide one to report here — see the listing route instead.
+    let (groups, writes) = match &st.store {
+        super::Store::Single { commit, .. } => commit.stats(),
+        super::Store::Namespaced(_) => (0, 0),
+    };
     for (name, help, value) in [
         (
             "nidus_write_groups_total",
@@ -412,7 +427,10 @@ fn render(out: &mut String, st: &AppState) {
         (
             "nidus_write_queue_depth",
             "Writes submitted to the group committer and not yet applied",
-            st.commit.depth(),
+            match &st.store {
+                super::Store::Single { commit, .. } => commit.depth(),
+                super::Store::Namespaced(_) => 0,
+            },
         ),
     ] {
         let _ = writeln!(out, "# HELP {name} {help}");
@@ -434,7 +452,12 @@ fn render(out: &mut String, st: &AppState) {
         u8::from(super::readiness_check(st).is_ok())
     );
 
-    if let Some(r) = st.readiness.get() {
+    // Per-instance readiness detail: only meaningful for the single process-wide store.
+    // Namespaced mode reports role/fenced/staleness per namespace via the listing route.
+    let super::Store::Single { readiness, .. } = &st.store else {
+        return;
+    };
+    if let Some(r) = readiness.get() {
         let _ = writeln!(
             out,
             "# HELP nidus_staleness_seconds Seconds since this instance last verified it was current"
@@ -561,6 +584,22 @@ mod tests {
             route_label("/aliases/docs")
         );
         assert_eq!(route_label("/aliases/docs/extra"), "other");
+    }
+
+    /// Counterfactual: without the prefix collapse above, every namespaced request buckets
+    /// into `other` rather than its own template — a silent cardinality bucket, not a crash.
+    #[test]
+    fn namespaced_paths_collapse_to_the_underlying_route_not_other() {
+        assert_eq!(
+            route_label("/ns/acme/collections/docs/upsert"),
+            "/collections/{name}/upsert"
+        );
+        assert_ne!(route_label("/ns/acme/collections/docs/upsert"), "other");
+        assert_eq!(route_label("/ns/acme/search"), "/search");
+        assert_eq!(
+            route_label("/ns/other-name/search"),
+            route_label("/ns/acme/search")
+        );
     }
 
     #[test]

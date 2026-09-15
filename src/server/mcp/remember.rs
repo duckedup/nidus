@@ -14,7 +14,10 @@ use crate::embed::Embedder;
 use crate::summarize::Summarizer;
 
 use super::NidusMcp;
-use super::args::{api_error, optional_f32, optional_usize, required_str, tool};
+use super::args::{
+    api_error, namespace_schema, optional_f32, optional_namespace, optional_usize, required_str,
+    tool,
+};
 
 /// The `remember` tool definition.
 pub(super) fn tools() -> Vec<Tool> {
@@ -110,7 +113,8 @@ pub(super) fn tools() -> Vec<Tool> {
                     "minimum": 0,
                     "maximum": 1,
                     "description": "Opt-in near-duplicate suppression: if an existing entry in this collection scores at or above this cosine similarity to the new text, update that entry in place instead of inserting a competing one. Attrs are merged, not replaced — fields already on the matched entry that this call omits survive, and its created_at carries forward; only overlapping keys are overwritten. Omit to always insert/replace by id as usual."
-                }
+                },
+                "namespace": namespace_schema()
             },
             "required": ["collection", "text"],
             "additionalProperties": false
@@ -157,6 +161,7 @@ impl NidusMcp {
         args: &Map<String, JsonValue>,
     ) -> Result<CallToolResult, McpError> {
         let embedder = self.embedder()?;
+        let namespace = optional_namespace(args)?;
         let collection = required_str(args, "collection")?;
         let text = required_str(args, "text")?;
         let id = match args.get("id") {
@@ -217,11 +222,15 @@ impl NidusMcp {
             ttl_seconds,
             dedupe_threshold,
         };
-        let written = crate::server::run_write(self.state.clone(), move |db| {
-            crate::memory::commit_remember(db, embedder.as_ref(), &name, write, vector)
-        })
-        .await
-        .map_err(api_error)?;
+        let written = self
+            .with_namespace(namespace, async {
+                crate::server::run_write(self.state.clone(), move |db| {
+                    crate::memory::commit_remember(db, embedder.as_ref(), &name, write, vector)
+                })
+                .await
+                .map_err(api_error)
+            })
+            .await?;
 
         // The model reads this back and acts on it: it must say which happened and the
         // resolved id, because a derived id (or a dedupe match) is otherwise unknowable to

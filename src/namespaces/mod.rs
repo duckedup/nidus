@@ -11,6 +11,7 @@ use anyhow::{Result, bail};
 use crate::{Config, Nidus};
 
 mod warm;
+pub use warm::Handle;
 use warm::WarmSet;
 
 #[cfg(test)]
@@ -50,9 +51,10 @@ impl Namespaces {
         self
     }
 
-    /// The open store for `name`, opening it on first access. Admitting it may evict
-    /// other warm namespaces (never `name` itself) to fit the byte budget.
-    pub fn get(&mut self, name: &str) -> Result<&mut Nidus> {
+    /// A shared handle to `name`'s store, opening it on first access. Admitting it may
+    /// evict other warm namespaces (never `name` itself) to fit the byte budget. Owned, not
+    /// borrowed: the caller can drop its own guard over this set before using the store.
+    pub fn get(&mut self, name: &str) -> Result<Handle> {
         validate_name(name)?;
         if !self.warm.contains(name) {
             let cfg = derive_config(&self.template, &self.base, name);
@@ -63,13 +65,20 @@ impl Namespaces {
         self.warm.enforce(name, self.budget, self.writable())?;
         Ok(self
             .warm
-            .get_mut(name)
+            .handle(name)
             .expect("just admitted or already warm"))
     }
 
     /// Namespace names currently warm. Opens nothing.
     pub fn warm(&self) -> Vec<String> {
         self.warm.names()
+    }
+
+    /// Warm namespaces with their last-measured byte size. Opens nothing — this is what
+    /// makes the byte budget observable (the `nidus serve` namespace-listing route) without
+    /// perturbing it.
+    pub fn warm_entries(&self) -> Vec<(String, u64)> {
+        self.warm.entries()
     }
 
     /// Flush `name` and drop it from the warm set, releasing its writer lock via `Drop`.

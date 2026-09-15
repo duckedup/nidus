@@ -78,7 +78,14 @@ fn prompts_list_advertises_recall_then_answer() {
     let names: Vec<&str> = args.iter().filter_map(|a| a["name"].as_str()).collect();
     assert_eq!(
         names,
-        vec!["question", "collection", "top_k", "names", "pool"],
+        vec![
+            "question",
+            "collection",
+            "top_k",
+            "names",
+            "pool",
+            "namespace"
+        ],
         "argument set/order changed: {args:?}"
     );
     for (name, required) in [

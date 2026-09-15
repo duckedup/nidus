@@ -676,6 +676,18 @@ pub struct GroupDto {
     pub sums: BTreeMap<String, Value>,
 }
 
+/// Body of `GET /namespaces` (namespaced mode only, nidus-pcpc.2): one warm namespace's
+/// name, byte footprint (`Namespaces::warm_entries`), and its own readiness — never the
+/// process-level one, which answers no namespace ever touched.
+#[derive(Debug, Serialize)]
+pub struct NamespaceDto {
+    pub name: String,
+    pub bytes: u64,
+    pub role: Option<String>,
+    pub fenced: Option<bool>,
+    pub staleness_secs: Option<u64>,
+}
+
 impl From<Aggregation> for AggregationDto {
     fn from(a: Aggregation) -> Self {
         Self {

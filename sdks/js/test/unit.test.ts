@@ -1657,3 +1657,45 @@ describe("codeSearch", () => {
   });
 });
 
+describe("namespace (nidus-pcpc.2)", () => {
+  it("with no namespace configured, produces today's flat paths unchanged", async () => {
+    const { fn, calls } = mockFetch({ upserted: 1 });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn });
+    await db.upsert("docs", [{ id: "a", vector: [1, 0, 0], attrs: {} }]);
+    expect(calls[0]!.url).toBe("http://x/collections/docs/upsert");
+
+    const { fn: fn2, calls: calls2 } = mockFetch(true);
+    const db2 = new NidusClient({ baseUrl: "http://x", fetch: fn2 });
+    await db2.health();
+    expect(calls2[0]!.url).toBe("http://x/health");
+  });
+
+  it("prefixes every request with /ns/{namespace} when configured", async () => {
+    const { fn, calls } = mockFetch({ upserted: 1 });
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn, namespace: "tenant-1" });
+    await db.upsert("docs", [{ id: "a", vector: [1, 0, 0], attrs: {} }]);
+    expect(calls[0]!.url).toBe("http://x/ns/tenant-1/collections/docs/upsert");
+  });
+
+  it("applies the namespace prefix to every kind of call: GET, search, and admin", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn, namespace: "acme" });
+
+    await db.collections();
+    expect(calls[0]!.url).toBe("http://x/ns/acme/collections");
+
+    await db.search({ query: [1, 0, 0] });
+    expect(calls[1]!.url).toBe("http://x/ns/acme/search");
+
+    await db.setAlias("docs", "docs_v2");
+    expect(calls[2]!.url).toBe("http://x/ns/acme/aliases/docs");
+  });
+
+  it("path-encodes a namespace name needing escaping", async () => {
+    const { fn, calls } = mockFetch([]);
+    const db = new NidusClient({ baseUrl: "http://x", fetch: fn, namespace: "a b" });
+    await db.collections();
+    expect(calls[0]!.url).toBe("http://x/ns/a%20b/collections");
+  });
+});
+

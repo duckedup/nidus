@@ -7,7 +7,7 @@ use rmcp::{
 use serde_json::{Map, Value as JsonValue, json};
 
 use super::NidusMcp;
-use super::args::{api_error, required_str, tool};
+use super::args::{api_error, namespace_schema, optional_namespace, required_str, tool};
 
 pub(super) fn tools() -> Vec<Tool> {
     vec![
@@ -15,14 +15,22 @@ pub(super) fn tools() -> Vec<Tool> {
             "list_collections",
             "List the collections in this store. Call this first if you do not already \
              know which collection to read from or write to.",
-            json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            json!({
+                "type": "object",
+                "properties": { "namespace": namespace_schema() },
+                "additionalProperties": false
+            }),
         ),
         tool(
             "stats",
             "Report the store's dimension, distance metric, collections, and memory \
              footprint. Diagnostic — useful for answering \"how much is in here\" and for \
              confirming the store is configured as expected.",
-            json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            json!({
+                "type": "object",
+                "properties": { "namespace": namespace_schema() },
+                "additionalProperties": false
+            }),
         ),
     ]
 }
@@ -36,7 +44,11 @@ pub(super) fn alias_tools() -> Vec<Tool> {
             "List every collection alias in this store, as alias -> concrete collection. A \
              collection name you were given elsewhere may actually be an indirect alias; \
              call this to see what it really resolves to.",
-            json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            json!({
+                "type": "object",
+                "properties": { "namespace": namespace_schema() },
+                "additionalProperties": false
+            }),
         ),
         tool(
             "set_alias",
@@ -48,7 +60,8 @@ pub(super) fn alias_tools() -> Vec<Tool> {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "The alias name to create or repoint." },
-                    "target": { "type": "string", "description": "The existing concrete collection the alias should point at." }
+                    "target": { "type": "string", "description": "The existing concrete collection the alias should point at." },
+                    "namespace": namespace_schema()
                 },
                 "required": ["name", "target"],
                 "additionalProperties": false
@@ -61,7 +74,8 @@ pub(super) fn alias_tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "The alias name to remove." }
+                    "name": { "type": "string", "description": "The alias name to remove." },
+                    "namespace": namespace_schema()
                 },
                 "required": ["name"],
                 "additionalProperties": false
@@ -71,10 +85,18 @@ pub(super) fn alias_tools() -> Vec<Tool> {
 }
 
 impl NidusMcp {
-    pub(super) async fn list_collections(&self) -> Result<CallToolResult, McpError> {
-        let names = crate::server::run_read(self.state.clone(), |db| Ok(db.collections()))
-            .await
-            .map_err(api_error)?;
+    pub(super) async fn list_collections(
+        &self,
+        args: &Map<String, JsonValue>,
+    ) -> Result<CallToolResult, McpError> {
+        let namespace = optional_namespace(args)?;
+        let names = self
+            .with_namespace(namespace, async {
+                crate::server::run_read(self.state.clone(), |db| Ok(db.collections()))
+                    .await
+                    .map_err(api_error)
+            })
+            .await?;
         if names.is_empty() {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "This store has no collections yet. `remember` creates one on first use."
@@ -86,26 +108,42 @@ impl NidusMcp {
         )]))
     }
 
-    pub(super) async fn stats(&self) -> Result<CallToolResult, McpError> {
-        let body = crate::server::run_read(self.state.clone(), |db| {
-            Ok(json!({
-                "dimension": db.dimension(),
-                "distance": format!("{:?}", db.config().distance),
-                "collections": db.collections(),
-                "footprint": crate::server::dto::FootprintDto::from(db.footprint()),
-            }))
-        })
-        .await
-        .map_err(api_error)?;
+    pub(super) async fn stats(
+        &self,
+        args: &Map<String, JsonValue>,
+    ) -> Result<CallToolResult, McpError> {
+        let namespace = optional_namespace(args)?;
+        let body = self
+            .with_namespace(namespace, async {
+                crate::server::run_read(self.state.clone(), |db| {
+                    Ok(json!({
+                        "dimension": db.dimension(),
+                        "distance": format!("{:?}", db.config().distance),
+                        "collections": db.collections(),
+                        "footprint": crate::server::dto::FootprintDto::from(db.footprint()),
+                    }))
+                })
+                .await
+                .map_err(api_error)
+            })
+            .await?;
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()),
         )]))
     }
 
-    pub(super) async fn list_aliases(&self) -> Result<CallToolResult, McpError> {
-        let aliases = crate::server::run_read(self.state.clone(), |db| Ok(db.aliases()))
-            .await
-            .map_err(api_error)?;
+    pub(super) async fn list_aliases(
+        &self,
+        args: &Map<String, JsonValue>,
+    ) -> Result<CallToolResult, McpError> {
+        let namespace = optional_namespace(args)?;
+        let aliases = self
+            .with_namespace(namespace, async {
+                crate::server::run_read(self.state.clone(), |db| Ok(db.aliases()))
+                    .await
+                    .map_err(api_error)
+            })
+            .await?;
         if aliases.is_empty() {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "This store has no aliases. Every collection name resolves to itself.".to_string(),
@@ -120,14 +158,19 @@ impl NidusMcp {
         &self,
         args: &Map<String, JsonValue>,
     ) -> Result<CallToolResult, McpError> {
+        let namespace = optional_namespace(args)?;
         let name = required_str(args, "name")?;
         let target = required_str(args, "target")?;
-        let (name, target) = crate::server::run_write(self.state.clone(), move |db| {
-            db.set_alias(&name, &target)?;
-            Ok((name, target))
-        })
-        .await
-        .map_err(api_error)?;
+        let (name, target) = self
+            .with_namespace(namespace, async {
+                crate::server::run_write(self.state.clone(), move |db| {
+                    db.set_alias(&name, &target)?;
+                    Ok((name, target))
+                })
+                .await
+                .map_err(api_error)
+            })
+            .await?;
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Alias `{name}` now points at collection `{target}`."
         ))]))
@@ -137,14 +180,19 @@ impl NidusMcp {
         &self,
         args: &Map<String, JsonValue>,
     ) -> Result<CallToolResult, McpError> {
+        let namespace = optional_namespace(args)?;
         let name = required_str(args, "name")?;
-        let (name, dropped, target) = crate::server::run_write(self.state.clone(), move |db| {
-            let target = db.resolve_alias(&name);
-            let dropped = db.drop_alias(&name)?;
-            Ok((name, dropped, target))
-        })
-        .await
-        .map_err(api_error)?;
+        let (name, dropped, target) = self
+            .with_namespace(namespace, async {
+                crate::server::run_write(self.state.clone(), move |db| {
+                    let target = db.resolve_alias(&name);
+                    let dropped = db.drop_alias(&name)?;
+                    Ok((name, dropped, target))
+                })
+                .await
+                .map_err(api_error)
+            })
+            .await?;
         let message = if dropped {
             let target = target.unwrap_or_default();
             format!("Dropped alias `{name}`. Collection `{target}` and its records are unaffected.")

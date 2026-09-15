@@ -1,4 +1,7 @@
-//! Bearer-token authentication for `nidus serve` (nidus-abx.5).
+//! Bearer-token authentication for `nidus serve` (nidus-abx.5). One credential for the
+//! whole process, checked before any namespace is resolved: in namespaced mode (nidus-pcpc.2)
+//! the token is NOT scoped per namespace, so a caller holding it can reach every namespace
+//! this process serves. There is no tenant isolation here — only process-wide gatekeeping.
 
 use axum::{
     Json,

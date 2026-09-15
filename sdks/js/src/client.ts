@@ -67,6 +67,13 @@ export interface NidusClientOptions {
   timeoutMs?: number;
   /** Extra headers sent on every request. */
   headers?: Record<string, string>;
+  /**
+   * Address a single namespace on a server started with `--namespaced` (nidus-pcpc.2):
+   * every request is sent as `/ns/{namespace}/...` instead of flat. Omit against a
+   * single-store server; every path is produced byte-for-byte as it was before this
+   * option existed.
+   */
+  namespace?: string;
 }
 
 export class NidusClient {
@@ -75,6 +82,7 @@ export class NidusClient {
   private readonly doFetch: FetchLike;
   private readonly timeoutMs: number;
   private readonly extraHeaders: Record<string, string>;
+  private readonly namespace?: string;
 
   constructor(options: NidusClientOptions) {
     if (!options.baseUrl) {
@@ -84,6 +92,7 @@ export class NidusClient {
     this.token = options.token;
     this.timeoutMs = options.timeoutMs ?? 0;
     this.extraHeaders = options.headers ?? {};
+    this.namespace = options.namespace;
     const f = options.fetch ?? globalThis.fetch;
     if (typeof f !== "function") {
       throw new TypeError(
@@ -795,6 +804,16 @@ export class NidusClient {
     return (text ? JSON.parse(text) : undefined) as T;
   }
 
+  /**
+   * Prefix `path` with `/ns/{namespace}` when the client was constructed with one
+   * (nidus-pcpc.2), so every call builds its path the same way it always did and the
+   * namespace is applied in this one place. No namespace configured means no prefix:
+   * today's flat paths, byte for byte.
+   */
+  private namespaced(path: string): string {
+    return this.namespace ? `/ns/${enc(this.namespace)}${path}` : path;
+  }
+
   /** The bare transport: headers, auth, timeout, and transport-error mapping. */
   private async raw(
     method: string,
@@ -815,7 +834,7 @@ export class NidusClient {
         ? setTimeout(() => controller.abort(), this.timeoutMs)
         : undefined;
     try {
-      return await this.doFetch(`${this.baseUrl}${path}`, {
+      return await this.doFetch(`${this.baseUrl}${this.namespaced(path)}`, {
         method,
         headers,
         body: payload,

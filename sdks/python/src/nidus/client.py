@@ -96,6 +96,7 @@ class NidusClient:
         timeout: Optional[float] = None,
         headers: Optional[Mapping[str, str]] = None,
         transport: Optional[Transport] = None,
+        namespace: Optional[str] = None,
     ) -> None:
         """Configure a client. Nothing is opened until the first request.
 
@@ -104,10 +105,14 @@ class NidusClient:
         :param timeout: per-request timeout in **seconds**; ``None`` means no timeout.
         :param headers: extra headers sent on every request.
         :param transport: replace the ``urllib`` transport (pooling, retries, tests).
+        :param namespace: address one namespace of a ``--namespaced`` server
+            (``/ns/{namespace}/...``, nidus-pcpc.2). Omit against a single-store server;
+            every path is then today's exact flat path, unchanged.
         """
         self._base_url = _wire.normalize_base_url(base_url)
         self._token = token
         self._timeout = timeout
+        self._namespace = namespace
         # Copied so a later mutation of the caller's dict cannot silently change our auth
         # or content-type handling mid-run.
         self._headers = dict(headers or {})
@@ -941,6 +946,7 @@ class NidusClient:
 
     def _send(self, method: str, path: str, body: Any) -> tuple[int, str]:
         """The transport boundary, and the only code here that is not ``_wire``'s call."""
+        path = _wire.with_namespace(path, self._namespace)
         payload, headers = _wire.prepare(self._token, self._headers, body)
         try:
             return self._transport(

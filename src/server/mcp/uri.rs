@@ -1,42 +1,88 @@
 //! The `nidus://` resource URI codec. Percent-encoded to the unreserved set so a URI
 //! survives the `Mcp-Name` header un-base64'd, and so a `/` in a name stays unambiguous.
+//!
+//! `ns/{namespace}/...` (nidus-pcpc.2) is an optional leading segment, present only when a
+//! URI addresses a specific namespace explicitly; omitted, a URI means whatever namespace
+//! the reading connection is already scoped to (see `mod.rs`'s `with_namespace`).
 
 pub(super) const SCHEME: &str = "nidus://";
 pub(super) const COLLECTION_TEMPLATE: &str = "nidus://collections/{collection}";
 pub(super) const ENTRY_TEMPLATE: &str = "nidus://collections/{collection}/entries/{id}";
+pub(super) const NS_ENTRY_TEMPLATE: &str =
+    "nidus://ns/{namespace}/collections/{collection}/entries/{id}";
 
-/// What a `nidus://` URI addresses.
+/// What a `nidus://` URI addresses. `namespace` is `None` for a URI that leaves this to the
+/// reading connection's own scoping — see the module doc.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Target {
-    Collection(String),
-    Entry { collection: String, id: String },
+    Collection {
+        namespace: Option<String>,
+        collection: String,
+    },
+    Entry {
+        namespace: Option<String>,
+        collection: String,
+        id: String,
+    },
 }
 
-pub(super) fn collection_uri(collection: &str) -> String {
-    format!("{SCHEME}collections/{}", encode(collection))
+pub(super) fn collection_uri(namespace: Option<&str>, collection: &str) -> String {
+    match namespace {
+        Some(ns) => format!(
+            "{SCHEME}ns/{}/collections/{}",
+            encode(ns),
+            encode(collection)
+        ),
+        None => format!("{SCHEME}collections/{}", encode(collection)),
+    }
 }
 
-pub(super) fn entry_uri(collection: &str, id: &str) -> String {
-    format!(
-        "{SCHEME}collections/{}/entries/{}",
-        encode(collection),
-        encode(id)
-    )
+pub(super) fn entry_uri(namespace: Option<&str>, collection: &str, id: &str) -> String {
+    match namespace {
+        Some(ns) => format!(
+            "{SCHEME}ns/{}/collections/{}/entries/{}",
+            encode(ns),
+            encode(collection),
+            encode(id)
+        ),
+        None => format!(
+            "{SCHEME}collections/{}/entries/{}",
+            encode(collection),
+            encode(id)
+        ),
+    }
 }
 
 /// `None` when the URI is not a well-formed `nidus://` resource URI.
 pub(super) fn parse(uri: &str) -> Option<Target> {
     let rest = uri.strip_prefix(SCHEME)?;
-    let segments: Vec<&str> = rest.split('/').collect();
-    match segments.as_slice() {
+    let all: Vec<&str> = rest.split('/').collect();
+    let (namespace, segments): (Option<String>, &[&str]) = match all.as_slice() {
+        ["ns", ns, tail @ ..] => {
+            let ns = decode(ns)?;
+            if ns.is_empty() {
+                return None;
+            }
+            (Some(ns), tail)
+        }
+        segs => (None, segs),
+    };
+    match segments {
         ["collections", c] => {
             let collection = decode(c)?;
-            (!collection.is_empty()).then_some(Target::Collection(collection))
+            (!collection.is_empty()).then_some(Target::Collection {
+                namespace,
+                collection,
+            })
         }
         ["collections", c, "entries", id] => {
             let collection = decode(c)?;
             let id = decode(id)?;
-            (!collection.is_empty() && !id.is_empty()).then_some(Target::Entry { collection, id })
+            (!collection.is_empty() && !id.is_empty()).then_some(Target::Entry {
+                namespace,
+                collection,
+                id,
+            })
         }
         _ => None,
     }
@@ -93,10 +139,11 @@ mod tests {
 
     #[test]
     fn round_trips_a_plain_name() {
-        let uri = entry_uri("newsletters", "e1");
+        let uri = entry_uri(None, "newsletters", "e1");
         assert_eq!(
             parse(&uri),
             Some(Target::Entry {
+                namespace: None,
                 collection: "newsletters".to_string(),
                 id: "e1".to_string(),
             })
@@ -105,10 +152,11 @@ mod tests {
 
     #[test]
     fn round_trips_a_name_containing_slash() {
-        let uri = entry_uri("a/b", "id/1");
+        let uri = entry_uri(None, "a/b", "id/1");
         assert_eq!(
             parse(&uri),
             Some(Target::Entry {
+                namespace: None,
                 collection: "a/b".to_string(),
                 id: "id/1".to_string(),
             })
@@ -117,10 +165,11 @@ mod tests {
 
     #[test]
     fn round_trips_a_name_containing_percent() {
-        let uri = entry_uri("50%", "id");
+        let uri = entry_uri(None, "50%", "id");
         assert_eq!(
             parse(&uri),
             Some(Target::Entry {
+                namespace: None,
                 collection: "50%".to_string(),
                 id: "id".to_string(),
             })
@@ -129,10 +178,11 @@ mod tests {
 
     #[test]
     fn round_trips_a_name_containing_space() {
-        let uri = entry_uri("my collection", "an id");
+        let uri = entry_uri(None, "my collection", "an id");
         assert_eq!(
             parse(&uri),
             Some(Target::Entry {
+                namespace: None,
                 collection: "my collection".to_string(),
                 id: "an id".to_string(),
             })
@@ -141,14 +191,45 @@ mod tests {
 
     #[test]
     fn round_trips_a_non_ascii_name() {
-        let uri = entry_uri("réunions", "id");
+        let uri = entry_uri(None, "réunions", "id");
         assert_eq!(
             parse(&uri),
             Some(Target::Entry {
+                namespace: None,
                 collection: "réunions".to_string(),
                 id: "id".to_string(),
             })
         );
+    }
+
+    /// An explicit namespace (nidus-pcpc.2) round-trips for both a collection and an entry
+    /// URI, and is kept distinct from a `None` namespace on the same collection/id.
+    #[test]
+    fn round_trips_an_explicit_namespace() {
+        let entry = entry_uri(Some("tenant-a"), "notes", "e1");
+        assert_eq!(
+            parse(&entry),
+            Some(Target::Entry {
+                namespace: Some("tenant-a".to_string()),
+                collection: "notes".to_string(),
+                id: "e1".to_string(),
+            })
+        );
+        assert_ne!(parse(&entry), parse(&entry_uri(None, "notes", "e1")));
+
+        let collection = collection_uri(Some("tenant-a"), "notes");
+        assert_eq!(
+            parse(&collection),
+            Some(Target::Collection {
+                namespace: Some("tenant-a".to_string()),
+                collection: "notes".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn empty_namespace_segment_is_rejected() {
+        assert_eq!(parse("nidus://ns//collections/notes"), None);
     }
 
     /// A `/` in a name must be percent-encoded rather than split the path: the literal
@@ -156,8 +237,8 @@ mod tests {
     /// collection/id names contain.
     #[test]
     fn slash_in_a_name_encodes_rather_than_splits_the_path() {
-        let plain = entry_uri("plain", "id");
-        let with_slash = entry_uri("a/b/c", "id");
+        let plain = entry_uri(None, "plain", "id");
+        let with_slash = entry_uri(None, "a/b/c", "id");
         assert_eq!(plain.matches('/').count(), 5);
         assert_eq!(with_slash.matches('/').count(), 5);
     }
@@ -165,8 +246,9 @@ mod tests {
     #[test]
     fn emitted_uris_are_pure_ascii_with_no_space_or_control_bytes() {
         for uri in [
-            collection_uri("réunions/wéird one"),
-            entry_uri("a b", "c\td\ne"),
+            collection_uri(None, "réunions/wéird one"),
+            entry_uri(None, "a b", "c\td\ne"),
+            entry_uri(Some("tenant é"), "a b", "c\td\ne"),
         ] {
             assert!(uri.is_ascii());
             assert!(!uri.bytes().any(|b| b == b' ' || b.is_ascii_control()));
@@ -181,5 +263,6 @@ mod tests {
         assert_eq!(parse("nidus://collections/a/entries/b/c"), None);
         assert_eq!(parse("nidus://collections/%ZZ"), None);
         assert_eq!(parse("nidus://collections/%4"), None);
+        assert_eq!(parse("nidus://ns/tenant-a"), None);
     }
 }

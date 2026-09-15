@@ -114,10 +114,18 @@ fn resources_and_prompts_match_over_stdio() {
     let templates = listed["resourceTemplates"]
         .as_array()
         .expect("resourceTemplates array");
-    assert_eq!(templates.len(), 1, "{listed}");
+    // Two since nidus-pcpc.2: the bare entry, and the one naming its namespace explicitly.
+    let uris: Vec<&str> = templates
+        .iter()
+        .filter_map(|t| t["uriTemplate"].as_str())
+        .collect();
     assert_eq!(
-        templates[0]["uriTemplate"], "nidus://collections/{collection}/entries/{id}",
-        "stdio's entry template must match HTTP's: {listed}"
+        uris,
+        vec![
+            "nidus://collections/{collection}/entries/{id}",
+            "nidus://ns/{namespace}/collections/{collection}/entries/{id}",
+        ],
+        "stdio's entry templates must match HTTP's: {listed}"
     );
 
     let resp = server.request(&request(3, "prompts/list", json!({})));

@@ -1487,6 +1487,70 @@ func TestBearerTokenIsEnforced(t *testing.T) {
 	}
 }
 
+// TestNamespacePrefixAgainstARealServer proves the one splice site in transport.go
+// (nidus-pcpc.2): a client configured with WithNamespace addresses its own store under
+// /ns/{namespace}/..., isolated from a sibling namespace, while a client with no
+// namespace configured still produces today's exact flat paths — which a real
+// `--namespaced` server refuses with a 400 naming the missing prefix, itself the proof
+// that the request really did go out unprefixed.
+func TestNamespacePrefixAgainstARealServer(t *testing.T) {
+	server := spawn(t, t.TempDir(), "--namespaced")
+	addr := server.baseURL(t)
+	ctx := context.Background()
+
+	// No namespace configured: this is the client startServer's readiness wait already
+	// proved can reach /ready, a flat route, unprefixed.
+	flat := server.client(t)
+
+	a, err := NewClient(addr, WithNamespace("tenant-a"), WithTimeout(requestTimeout))
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	b, err := NewClient(addr, WithNamespace("tenant-b"), WithTimeout(requestTimeout))
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	if err := a.CreateCollection(ctx, "docs"); err != nil {
+		t.Fatalf("CreateCollection in tenant-a failed: %v", err)
+	}
+	if _, err := a.Upsert(ctx, "docs", []Record{
+		{ID: "x", Vector: []float32{1, 0, 0}},
+	}); err != nil {
+		t.Fatalf("Upsert in tenant-a failed: %v", err)
+	}
+	hits, err := a.Search(ctx, SearchRequest{Query: []float32{1, 0, 0}})
+	if err != nil {
+		t.Fatalf("Search in tenant-a failed: %v", err)
+	}
+	if len(hits) != 1 || hits[0].ID != "x" {
+		t.Fatalf("tenant-a search = %v, want the one record it wrote", ids(hits))
+	}
+
+	// A sibling namespace never sees tenant-a's collection — the two stores are
+	// independent, not a shared one keyed by prefix alone.
+	names, err := b.Collections(ctx)
+	if err != nil {
+		t.Fatalf("Collections in tenant-b failed: %v", err)
+	}
+	if slices.Contains(names, "docs") {
+		t.Fatalf("tenant-b sees tenant-a's collection %v — namespaces are not isolated", names)
+	}
+
+	err = flat.CreateCollection(ctx, "nope")
+	if err == nil {
+		t.Fatal("an unnamespaced write succeeded against a --namespaced server")
+	}
+	var nerr *Error
+	if !errors.As(err, &nerr) {
+		t.Fatalf("error is %T, want *nidus.Error", err)
+	}
+	if nerr.Status != http.StatusBadRequest {
+		t.Errorf("status = %d (%s), want 400 for a request missing /ns/{namespace}",
+			nerr.Status, nerr.Message)
+	}
+}
+
 // TestWriterLockIsExclusive — two servers over one directory. Cross-process exclusion
 // is invisible to an in-process test, and a 409 is the one status a caller is expected
 // to retry on, so the SDK's classification of it is worth checking for real.

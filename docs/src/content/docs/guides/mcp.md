@@ -84,6 +84,38 @@ you did not. Unlike stdio, several clients can share one `nidus serve` process.
 There is one writer lock either way, but the server holds it and applies every
 client's writes rather than each client racing for its own.
 
+## Namespaced mode
+
+A server started with `--namespaced` (see the [multi-tenancy
+guide](/guides/multi-tenancy/)) serves many tenants' stores from one process, and `/mcp`
+picks that up the same way the HTTP routes do: prefix the path with `/ns/{namespace}`.
+
+```json
+{
+  "mcpServers": {
+    "nidus-acme": {
+      "type": "http",
+      "url": "http://127.0.0.1:7700/mcp",
+      "headers": { "Authorization": "Bearer YOUR_TOKEN" }
+    }
+  }
+}
+```
+
+Against a `--namespaced` server, each tool call names its tenant with a `namespace`
+argument: same tools, same responses, one extra field. The connection path does **not**
+scope a session, so connecting at `/ns/acme-corp/mcp` and omitting the argument is an
+error rather than a default. A tool handler runs on the MCP session's own task, not the
+HTTP request's, so the path prefix the router strips never reaches it. `nidus-k9rj` tracks
+making a namespaced connection scope its session.
+
+Supplying `namespace` against a server that was **not** started with `--namespaced` is
+refused, naming the reason, rather than silently ignored.
+
+The token is still the one process-wide credential covering every tenant; see [Namespaced
+mode is single-credential](/guides/multi-tenancy/#single-credential-not-tenant-isolation)
+in the multi-tenancy guide before treating one namespace as isolated from another.
+
 ## The tools
 
 | Tool | What it does |

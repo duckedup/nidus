@@ -8,10 +8,14 @@ route maps one-to-one onto a library method; bodies and responses are JSON. To r
 server, set a bind address, and configure auth, see the
 [HTTP server guide](/guides/http-server/).
 
-**Base URL** is wherever the server is bound (the examples use `localhost:7700`).
+**Base URL** is wherever the server is bound (the examples use `localhost:7700`). A server
+started with `--namespaced` (see [Namespaced mode](#namespaced-mode) below) adds a
+`/ns/{namespace}` prefix in front of every path below except `/health`, `/ready`,
+`/metrics`, and `/namespaces` itself.
 **Auth:** when the server is started with a token, every request except the probe endpoints
 (`GET /health`, `GET /ready`, `GET /metrics`) must send `Authorization: Bearer <token>`; see
-[Authentication](/guides/http-server/#authentication).
+[Authentication](/guides/http-server/#authentication). That token is process-wide even in
+namespaced mode; see [single-credential](/guides/multi-tenancy/#single-credential-not-tenant-isolation).
 **Errors** return `{"error": "<message>"}` with a status code; see [Errors](#errors).
 **Correlation:** every response carries `X-Request-Id`. Send your own and nidus echoes it,
 so the same id appears in your logs and the server's.
@@ -19,6 +23,7 @@ so the same id appears in your logs and the server's.
 | Method & path | Operation | Library method |
 | --- | --- | --- |
 | `GET /health` | liveness check: `503` only when unrecoverably broken (always unauthenticated) | – |
+| `GET /namespaces`**** | namespaced mode only: every warm namespace's name, byte size, and readiness | – |
 | `GET /stats` | dimension, distance, the resolved open profile (ann, quantization, query_threads, mmap), collections, footprint | `dimension` / `footprint` |
 | `GET /collections` | list collection names | `collections` |
 | `GET /aliases` | list alias to concrete collection mappings | `aliases` |
@@ -60,6 +65,62 @@ so the same id appears in your logs and the server's.
 \*\* Needs the `mcp` feature on top of `memory`. See [`/mcp`](#mcp) below.
 \*\*\* Needs the `code` feature on top of `memory`. See
 [`POST /code-search`](#post-code-search) below and the [code search guide](/guides/code-search/).
+\*\*\*\* Only present when the server was started with `--namespaced`; a single-store server
+has no `/namespaces` route at all. See [Namespaced mode](#namespaced-mode) below.
+
+## Namespaced mode
+
+Started with `--namespaced`, `nidus serve` opens no single store: `--dir`/`--persistence`
+names a **base location**, and each request's `/ns/{namespace}` prefix names which
+tenant's store it addresses, opened lazily on first use. The prefix is stripped before the
+request reaches the handler, so every route documented on this page (its fields, its
+response shape, its error codes) is otherwise unchanged; only the path grows a prefix:
+
+```bash
+curl -s -X POST localhost:7700/ns/acme-corp/collections/docs/upsert \
+  -H 'content-type: application/json' \
+  -d '{"records": [{"id": "a", "vector": [1,0,0]}]}'
+```
+
+`/health`, `/ready`, `/metrics`, and `/namespaces` itself take **no** prefix: they answer
+at the process level, not per tenant (see [`GET /ready`](#get-ready) below for why).
+`/mcp` takes the prefix like any other route (`/ns/acme-corp/mcp`); see the [MCP
+guide](/guides/mcp/#namespaced-mode) for the tool-argument alternative.
+
+Omitting the prefix against a namespaced server, on any route that requires one, is a
+`400` naming the fix rather than a silent fall-through to some default tenant: there is no
+such thing as an unscoped store once `--namespaced` is on.
+
+### `GET /namespaces`
+
+Every namespace currently held in the byte-bounded warm set: its name, its last-measured
+byte footprint, and its readiness. Opens nothing beyond what earlier requests already
+opened.
+
+```bash
+curl -s localhost:7700/namespaces
+```
+
+```json
+[
+  {"name": "acme-corp", "bytes": 40960, "role": "Writer", "fenced": false, "staleness_secs": 0},
+  {"name": "initech", "bytes": 8192, "role": "Writer", "fenced": false, "staleness_secs": 0}
+]
+```
+
+`role`/`fenced`/`staleness_secs` are `null` for a namespace that has been admitted but has
+not yet finished opening; otherwise each means the same thing its [`GET
+/cluster`](#get-cluster) namesake does for a single store, just reported per namespace
+rather than for the whole process. There is no `cluster`/`holds_writer_handle`/
+`lease_owner`/`commit_version` here: those describe cluster-wide lease state, which this
+route does not report per tenant. A namespace evicted from the warm set (see the [byte
+budget](/guides/multi-tenancy/#the-byte-budget)) simply does not appear here; its data is
+untouched on disk and the next request against it reopens it.
+A single-store server (no `--namespaced`) never registers this route at all, so requesting
+it there is a plain `404`, not a mode-specific error.
+
+See the [multi-tenancy guide](/guides/multi-tenancy/#over-the-network-nidus-serve---namespaced)
+for the full model: isolation, the warm set, and the single-credential caveat.
 
 ## Health & introspection
 
@@ -119,6 +180,11 @@ active writer to release the handle.
 
 Data routes answer `503` during that window too, with an error explaining that the
 instance is waiting or still starting up.
+
+**Namespaced mode (`--namespaced`) keeps this exact meaning: process-up, nothing more.**
+There is no single store to be ready or not, so `/ready` answers `200` as soon as the
+listener is serving, before any namespace has ever been requested. Role, fencing, and
+staleness are answered per namespace instead, by [`GET /namespaces`](#get-namespaces).
 
 ### `GET /cluster`
 
@@ -1309,6 +1375,11 @@ stays that way.
 This page does not restate the tool schemas, the transport details, or protocol
 negotiation; see the [MCP guide](/guides/mcp/) for those, including the stdio transport
 (`nidus mcp`) that does not go through this HTTP surface at all.
+
+In [namespaced mode](#namespaced-mode), `/mcp` takes the same `/ns/{namespace}` prefix as
+every other route, and a tool call may also carry an explicit `namespace` argument in
+place of (or alongside) that; see [Namespaced mode](/guides/mcp/#namespaced-mode) in the
+MCP guide.
 
 ## Maintenance
 

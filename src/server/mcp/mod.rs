@@ -109,6 +109,28 @@ impl NidusMcp {
             )
         })
     }
+
+    /// Resolve one call's optional `namespace` (nidus-pcpc.2) and run `body` under it:
+    /// refused if supplied in single-store mode, else scoped over `body` — omitted, `body`
+    /// inherits whatever `/ns/{name}/mcp` the connection already resolved.
+    async fn with_namespace<F, T>(&self, namespace: Option<String>, body: F) -> Result<T, McpError>
+    where
+        F: std::future::Future<Output = Result<T, McpError>>,
+    {
+        let Some(ns) = namespace else {
+            return body.await;
+        };
+        if matches!(self.state.store, super::Store::Single { .. }) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "`namespace` (\"{ns}\") was supplied but this server is running in \
+                     single-store mode (one `--dir`, no namespaces) — omit it"
+                ),
+                None,
+            ));
+        }
+        super::NAMESPACE.scope(ns, body).await
+    }
 }
 
 /// The tool list. Order must stay stable — reordering invalidates every client's cached
@@ -219,15 +241,15 @@ impl ServerHandler for NidusMcp {
             "recall" => self.recall(&args).await,
             "text_search" => self.text_search(&args).await,
             "hybrid_search" => self.hybrid_search(&args).await,
-            "list_collections" => self.list_collections().await,
-            "stats" => self.stats().await,
+            "list_collections" => self.list_collections(&args).await,
+            "stats" => self.stats(&args).await,
             "forget" => self.forget(&args).await,
             "get" => self.get(&args).await,
             "browse" => self.browse(&args).await,
             "related" => self.related(&args).await,
             "suggest" => self.suggest(&args).await,
             "query" => self.query(&args).await,
-            "list_aliases" => self.list_aliases().await,
+            "list_aliases" => self.list_aliases(&args).await,
             "set_alias" => self.set_alias(&args).await,
             "drop_alias" => self.drop_alias(&args).await,
             #[cfg(feature = "code")]

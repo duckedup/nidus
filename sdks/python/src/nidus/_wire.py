@@ -128,6 +128,19 @@ def alias_path(name: str) -> str:
     return f"{ALIASES}/{quote(name, safe='')}"
 
 
+def with_namespace(path: str, namespace: Optional[str]) -> str:
+    """Prefix ``path`` with ``/ns/{namespace}`` (nidus-pcpc.2), or leave it unchanged when
+    no namespace is configured — today's exact flat paths, byte for byte.
+
+    The single seam both clients thread a namespace through (each calls this from its own
+    ``_send``), so the sync and async clients cannot drift on how it is applied. Escaped
+    like a collection name, since a namespace is itself one path segment.
+    """
+    if namespace is None:
+        return path
+    return f"/ns/{quote(namespace, safe='')}{path}"
+
+
 def meta_path(name: str) -> str:
     """``/collections/{name}/meta`` — read (GET) or replace (PUT)."""
     return f"{collection_path(name)}/meta"

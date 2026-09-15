@@ -1,6 +1,10 @@
 //! Group commit for the write path (nidus-xb9.1): concurrent writes queue, the first to
 //! reach the store applies the whole queue under one exclusive guard, and one barrier covers
 //! them all. No timed window, so a lone write still pays exactly what it did. SPEC §6.4.
+//!
+//! A [`Committer`] is one queue plus one leadership flag. In namespaced mode (nidus-pcpc.2)
+//! every namespace gets its OWN `Committer` — see [`Target`] for why sharing one across
+//! namespaces would be cross-tenant data corruption, not merely a missed optimisation.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,8 +15,33 @@ use tokio::sync::oneshot;
 
 use crate::Nidus;
 
-/// The store slot every write goes through, shared with [`super::AppState`].
-type Db = Arc<RwLock<Option<Nidus>>>;
+use super::registry::Registry;
+
+/// What a group's leader commits against: the single process-wide store, or one namespace
+/// inside a [`Registry`]. Each namespace owns its own [`Committer`] so a leader here only
+/// ever sees jobs meant for this one store (see the module docs).
+pub(super) enum Target {
+    Single(Arc<RwLock<Option<Nidus>>>),
+    Namespace {
+        registry: Arc<Registry>,
+        name: String,
+    },
+}
+
+impl Target {
+    /// Exclusive store access for the leader, or `None` if it cannot be reached — the group
+    /// is then dropped, and its members recover via `submit`'s oneshot fallback.
+    fn with_store<T>(&self, f: impl FnOnce(&mut Nidus) -> T) -> Option<T> {
+        match self {
+            Target::Single(db) => {
+                let mut guard = db.write().ok()?;
+                let db = guard.as_mut()?;
+                Some(f(db))
+            }
+            Target::Namespace { registry, name } => registry.write(name, f).ok(),
+        }
+    }
+}
 
 /// Deliver one queued write's answer, now that the group's barrier has been resolved.
 type Ack = Box<dyn FnOnce(Option<&str>) + Send>;
@@ -84,7 +113,7 @@ impl Committer {
     /// Submit `f` and wait for the barrier that makes it durable.
     pub(super) async fn submit<F, T>(
         self: &Arc<Self>,
-        db: Db,
+        target: Target,
         cancel: Option<crate::Cancel>,
         f: F,
     ) -> anyhow::Result<T>
@@ -137,13 +166,13 @@ impl Committer {
             // Detached, not awaited: the leader may keep working through later groups after
             // our own answer is ready, and this response must not wait on other people's
             // writes. `spawn_blocking` because it takes the store guard and fsyncs.
-            tokio::task::spawn_blocking(move || me.drive(&db));
+            tokio::task::spawn_blocking(move || me.drive(&target));
         }
 
         rx.await.unwrap_or_else(|_| {
-            // The leader dropped our job without answering: the store slot was empty or its
-            // lock was poisoned (see `commit_group`), or the leader's blocking task never ran
-            // because the runtime is shutting down.
+            // The leader dropped our job without answering: the target could not be reached
+            // (single-store lock poisoned/not open, or a namespace failed to admit), or the
+            // leader's blocking task never ran because the runtime is shutting down.
             Err(anyhow!(
                 "store is not open yet: the write could not be committed"
             ))
@@ -151,7 +180,7 @@ impl Committer {
     }
 
     /// Lead: commit group after group until the queue is empty, then stand down.
-    fn drive(&self, db: &Db) {
+    fn drive(&self, target: &Target) {
         // Backstop for an unwind out of `commit_group`: a panicking write must not leave the queue
         // leaderless, which would hang every write behind it. Disarmed on the orderly exit below,
         // where standing down happens under the same lock as the emptiness check behind it.
@@ -168,47 +197,45 @@ impl Committer {
                 }
                 inner.queue.drain(..).collect()
             };
-            self.commit_group(db, group);
+            self.commit_group(target, group);
         }
     }
 
     /// Apply one group under a single exclusive store guard, then one barrier for all of it.
-    fn commit_group(&self, db: &Db, group: Vec<Apply>) {
-        // A poisoned store lock means a previous write panicked mid-mutation; the store's
-        // invariants are unknown, so refuse rather than write into it. Dropping the jobs
-        // answers their submitters through the `rx` fallback.
-        let Ok(mut guard) = db.write() else {
-            return;
-        };
-        // Still opening, or a standby that never got the writer handle. Same fallback.
-        let Some(nidus) = guard.as_mut() else {
-            return;
-        };
+    fn commit_group(&self, target: &Target, group: Vec<Apply>) {
+        let groups = &self.groups;
+        let writes = &self.writes;
+        // `None` means the store could not be reached; the group's jobs are dropped and
+        // recover through `submit`'s oneshot fallback, same as an unavailable guard before.
+        let ran = target.with_store(move |nidus| {
+            groups.fetch_add(1, Ordering::Relaxed);
+            writes.fetch_add(group.len() as u64, Ordering::Relaxed);
 
-        self.groups.fetch_add(1, Ordering::Relaxed);
-        self.writes.fetch_add(group.len() as u64, Ordering::Relaxed);
+            // Phase 1: apply every write, each with its own barrier deferred.
+            let mut acks: Vec<Ack> = Vec::with_capacity(group.len());
+            let mut needs_barrier = false;
+            for apply in group {
+                let (ack, needed) = apply(nidus);
+                needs_barrier |= needed;
+                acks.push(ack);
+            }
 
-        // Phase 1: apply every write, each with its own barrier deferred.
-        let mut acks: Vec<Ack> = Vec::with_capacity(group.len());
-        let mut needs_barrier = false;
-        for apply in group {
-            let (ack, needed) = apply(nidus);
-            needs_barrier |= needed;
-            acks.push(ack);
-        }
+            // Phase 2: one barrier for the group. Skipped entirely when every write in it
+            // failed and rolled back — there is nothing to make durable.
+            let barrier = if needs_barrier {
+                nidus.commit().err().map(|e| format!("{e:#}"))
+            } else {
+                None
+            };
+            (acks, barrier)
+        });
 
-        // Phase 2: one barrier for the group. Skipped entirely when every write in it failed
-        // and rolled back — there is nothing to make durable.
-        let barrier = if needs_barrier {
-            nidus.commit().err().map(|e| format!("{e:#}"))
-        } else {
-            None
-        };
-
-        // Phase 3: answer. Outside the guard, so a slow client cannot hold the store lock.
-        drop(guard);
-        for ack in acks {
-            ack(barrier.as_deref());
+        // Phase 3: answer, outside the store guard (`with_store` already released it), so a
+        // slow client cannot hold the store lock.
+        if let Some((acks, barrier)) = ran {
+            for ack in acks {
+                ack(barrier.as_deref());
+            }
         }
     }
 }

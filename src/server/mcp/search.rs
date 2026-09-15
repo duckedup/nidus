@@ -17,8 +17,8 @@ use crate::{Filter, HybridOpts, Pool, SearchOpts};
 
 use super::NidusMcp;
 use super::args::{
-    api_error, optional_bool, optional_bool_or, optional_f32, optional_string_array,
-    optional_top_k, optional_usize, required_str, tool,
+    api_error, namespace_schema, optional_bool, optional_bool_or, optional_f32, optional_namespace,
+    optional_string_array, optional_top_k, optional_usize, required_str, tool,
 };
 use super::{HitDto, hits_content, hits_with_plan_content};
 
@@ -459,7 +459,8 @@ pub(super) fn query_tool() -> Tool {
                     "description": "One SELECT statement. Example: \"SELECT * FROM \
                         docs WHERE lang = 'rust' ORDER BY match(body, 'async retry') \
                         LIMIT 10\"."
-                }
+                },
+                "namespace": namespace_schema()
             },
             "required": ["sql"],
             "additionalProperties": false
@@ -513,7 +514,8 @@ pub(super) fn tools() -> Vec<Tool> {
                         "type": "integer",
                         "description": "Also push the expiry of every returned entry out to this many seconds from now. Only applies with `reinforce`, and only to entries that already expire.",
                         "minimum": 1
-                    }
+                    },
+                    "namespace": namespace_schema()
                 },
                 "required": ["collection", "query"],
                 "additionalProperties": false
@@ -550,7 +552,8 @@ pub(super) fn tools() -> Vec<Tool> {
                     "diversity": diversity_schema(),
                     "rollup": rollup_schema(),
                     "rerank": rerank_bool_schema(),
-                    "rerank_overscan": rerank_overscan_schema()
+                    "rerank_overscan": rerank_overscan_schema(),
+                    "namespace": namespace_schema()
                 },
                 "required": ["collection", "field", "query"],
                 "additionalProperties": false
@@ -587,7 +590,8 @@ pub(super) fn tools() -> Vec<Tool> {
                     "diversity": diversity_schema(),
                     "rollup": rollup_schema(),
                     "rerank": rerank_bool_schema(),
-                    "rerank_overscan": rerank_overscan_schema()
+                    "rerank_overscan": rerank_overscan_schema(),
+                    "namespace": namespace_schema()
                 },
                 "required": ["collection", "field", "query"],
                 "additionalProperties": false
@@ -633,7 +637,8 @@ pub(super) fn related_tool() -> Tool {
                 "pool": pool_schema(),
                 "name_weights": name_weights_schema(),
                 "rollup": rollup_schema(),
-                "plan": plan_schema()
+                "plan": plan_schema(),
+                "namespace": namespace_schema()
             },
             "required": ["collection", "id"],
             "additionalProperties": false
@@ -678,7 +683,8 @@ pub(super) fn suggest_tool() -> Tool {
                     "type": "boolean",
                     "description": "Typo tolerance: when the exact-prefix scan finds nothing, retry within a short edit budget. Defaults to true."
                 },
-                "filter": filter_schema()
+                "filter": filter_schema(),
+                "namespace": namespace_schema()
             },
             "required": ["collection", "field", "prefix"],
             "additionalProperties": false
@@ -691,6 +697,7 @@ impl NidusMcp {
         &self,
         args: &Map<String, JsonValue>,
     ) -> Result<CallToolResult, McpError> {
+        let namespace = optional_namespace(args)?;
         let embedder = self.embedder()?;
         let collection = required_str(args, "collection")?;
         let query = required_str(args, "query")?;
@@ -707,100 +714,106 @@ impl NidusMcp {
         let extend_ttl_seconds = optional_usize(args, "extend_ttl_seconds")?.map(|s| s as i64);
         let plan = optional_bool(args, "plan")?;
 
-        let vector = embedder
-            .embed_query(&query)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.with_namespace(namespace, async move {
+            let vector = embedder
+                .embed_query(&query)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let opts = SearchOpts {
-            top_k,
-            min_score,
-            filter: with_ttl_guard(filter),
-            diversity,
-            limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
-            expand: rollup.map(|(_, e)| e),
-            names,
-            name_weights,
-            pool,
-            rerank,
-            plan,
-            ..Default::default()
-        };
-        check_rerank_search_depth(&opts)?;
+            let opts = SearchOpts {
+                top_k,
+                min_score,
+                filter: with_ttl_guard(filter),
+                diversity,
+                limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
+                expand: rollup.map(|(_, e)| e),
+                names,
+                name_weights,
+                pool,
+                rerank,
+                plan,
+                ..Default::default()
+            };
+            check_rerank_search_depth(&opts)?;
 
-        #[cfg(feature = "rerank")]
-        if opts.rerank.is_some() {
-            let reranker = self.reranker()?;
-            let (hits, plan) = self
-                .rerank_recall_and_finish(
-                    reranker,
-                    embedder,
-                    collection,
-                    vector,
-                    (query, reinforce.then_some(extend_ttl_seconds)),
-                    opts,
-                )
-                .await?;
-            return Ok(hits_with_plan_content(
+            #[cfg(feature = "rerank")]
+            if opts.rerank.is_some() {
+                let reranker = self.reranker()?;
+                let (hits, plan) = self
+                    .rerank_recall_and_finish(
+                        reranker,
+                        embedder,
+                        collection,
+                        vector,
+                        (query, reinforce.then_some(extend_ttl_seconds)),
+                        opts,
+                    )
+                    .await?;
+                return Ok(hits_with_plan_content(
+                    hits.into_iter().map(HitDto::from).collect(),
+                    plan,
+                ));
+            }
+            #[cfg(not(feature = "rerank"))]
+            if opts.rerank.is_some() {
+                return Err(McpError::invalid_params(
+                    "this nidus server was built without rerank support (the `rerank` feature); \
+                     `rerank` is unavailable",
+                    None,
+                ));
+            }
+
+            let (hits, plan) = if reinforce {
+                crate::server::run_write(self.state.clone(), move |db| {
+                    crate::memory::guard_recall_identity(db, embedder.as_ref(), &collection)?;
+                    if opts.plan {
+                        let (hits, plan) =
+                            db.search_with_plan(collection.as_str(), &vector, &opts)?;
+                        crate::memory::reinforce_hits(db, &collection, &hits, extend_ttl_seconds)?;
+                        Ok((hits, Some(plan)))
+                    } else {
+                        let hits = crate::memory::commit_recall(
+                            db,
+                            &collection,
+                            &vector,
+                            &opts,
+                            extend_ttl_seconds,
+                        )?;
+                        Ok((hits, None))
+                    }
+                })
+                .await
+                .map_err(api_error)?
+            } else {
+                crate::server::run_read(self.state.clone(), move |db| {
+                    // Recalling with a different embedder than wrote the collection returns
+                    // nonsense, so the same guard the HTTP route uses refuses it.
+                    crate::memory::guard_recall_identity(db, embedder.as_ref(), &collection)?;
+                    if opts.plan {
+                        let (hits, plan) =
+                            db.search_with_plan(collection.as_str(), &vector, &opts)?;
+                        Ok((hits, Some(plan)))
+                    } else {
+                        Ok((db.search(collection.as_str(), &vector, &opts)?, None))
+                    }
+                })
+                .await
+                .map_err(api_error)?
+            };
+
+            Ok(hits_with_plan_content(
                 hits.into_iter().map(HitDto::from).collect(),
                 plan,
-            ));
-        }
-        #[cfg(not(feature = "rerank"))]
-        if opts.rerank.is_some() {
-            return Err(McpError::invalid_params(
-                "this nidus server was built without rerank support (the `rerank` feature); \
-                 `rerank` is unavailable",
-                None,
-            ));
-        }
-
-        let (hits, plan) = if reinforce {
-            crate::server::run_write(self.state.clone(), move |db| {
-                crate::memory::guard_recall_identity(db, embedder.as_ref(), &collection)?;
-                if opts.plan {
-                    let (hits, plan) = db.search_with_plan(collection.as_str(), &vector, &opts)?;
-                    crate::memory::reinforce_hits(db, &collection, &hits, extend_ttl_seconds)?;
-                    Ok((hits, Some(plan)))
-                } else {
-                    let hits = crate::memory::commit_recall(
-                        db,
-                        &collection,
-                        &vector,
-                        &opts,
-                        extend_ttl_seconds,
-                    )?;
-                    Ok((hits, None))
-                }
-            })
-            .await
-            .map_err(api_error)?
-        } else {
-            crate::server::run_read(self.state.clone(), move |db| {
-                // Recalling with a different embedder than wrote the collection returns
-                // nonsense, so the same guard the HTTP route uses refuses it.
-                crate::memory::guard_recall_identity(db, embedder.as_ref(), &collection)?;
-                if opts.plan {
-                    let (hits, plan) = db.search_with_plan(collection.as_str(), &vector, &opts)?;
-                    Ok((hits, Some(plan)))
-                } else {
-                    Ok((db.search(collection.as_str(), &vector, &opts)?, None))
-                }
-            })
-            .await
-            .map_err(api_error)?
-        };
-
-        Ok(hits_with_plan_content(
-            hits.into_iter().map(HitDto::from).collect(),
-            plan,
-        ))
+            ))
+        })
+        .await
     }
 
     pub(super) async fn text_search(
         &self,
         args: &Map<String, JsonValue>,
     ) -> Result<CallToolResult, McpError> {
+        let namespace = optional_namespace(args)?;
         let collection = required_str(args, "collection")?;
         let field = required_str(args, "field")?;
         let query = required_str(args, "query")?;
@@ -809,53 +822,58 @@ impl NidusMcp {
         let diversity = optional_f32(args, "diversity")?;
         let rollup = parse_rollup(args)?;
         let rerank = parse_rerank(args)?;
+        let prefix = optional_bool(args, "prefix")?;
 
-        let opts = SearchOpts {
-            top_k,
-            filter: with_ttl_guard(filter),
-            diversity,
-            limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
-            expand: rollup.map(|(_, e)| e),
-            rerank,
-            ..Default::default()
-        };
-        check_rerank_search_depth(&opts)?;
-        let mut clause = crate::FtsClause::new(field, query.clone());
-        if optional_bool(args, "prefix")? {
-            clause = clause.prefix();
-        }
-        let q = crate::FtsQuery::multi([clause]);
+        self.with_namespace(namespace, async move {
+            let opts = SearchOpts {
+                top_k,
+                filter: with_ttl_guard(filter),
+                diversity,
+                limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
+                expand: rollup.map(|(_, e)| e),
+                rerank,
+                ..Default::default()
+            };
+            check_rerank_search_depth(&opts)?;
+            let mut clause = crate::FtsClause::new(field, query.clone());
+            if prefix {
+                clause = clause.prefix();
+            }
+            let q = crate::FtsQuery::multi([clause]);
 
-        #[cfg(feature = "rerank")]
-        if opts.rerank.is_some() {
-            let reranker = self.reranker()?;
-            let hits = self
-                .rerank_text_search_and_finish(reranker, collection, q, query, opts)
-                .await?;
-            return Ok(hits_content(hits.into_iter().map(HitDto::from).collect()));
-        }
-        #[cfg(not(feature = "rerank"))]
-        if opts.rerank.is_some() {
-            return Err(McpError::invalid_params(
-                "this nidus server was built without rerank support (the `rerank` feature); \
-                 `rerank` is unavailable",
-                None,
-            ));
-        }
+            #[cfg(feature = "rerank")]
+            if opts.rerank.is_some() {
+                let reranker = self.reranker()?;
+                let hits = self
+                    .rerank_text_search_and_finish(reranker, collection, q, query, opts)
+                    .await?;
+                return Ok(hits_content(hits.into_iter().map(HitDto::from).collect()));
+            }
+            #[cfg(not(feature = "rerank"))]
+            if opts.rerank.is_some() {
+                return Err(McpError::invalid_params(
+                    "this nidus server was built without rerank support (the `rerank` feature); \
+                     `rerank` is unavailable",
+                    None,
+                ));
+            }
 
-        let hits = crate::server::run_read(self.state.clone(), move |db| {
-            db.text_search(crate::Scope::Collections(&[collection.as_str()]), &q, &opts)
+            let hits = crate::server::run_read(self.state.clone(), move |db| {
+                db.text_search(crate::Scope::Collections(&[collection.as_str()]), &q, &opts)
+            })
+            .await
+            .map_err(api_error)?;
+
+            Ok(hits_content(hits.into_iter().map(HitDto::from).collect()))
         })
         .await
-        .map_err(api_error)?;
-
-        Ok(hits_content(hits.into_iter().map(HitDto::from).collect()))
     }
 
     pub(super) async fn hybrid_search(
         &self,
         args: &Map<String, JsonValue>,
     ) -> Result<CallToolResult, McpError> {
+        let namespace = optional_namespace(args)?;
         let embedder = self.embedder()?;
         let collection = required_str(args, "collection")?;
         let field = required_str(args, "field")?;
@@ -865,63 +883,67 @@ impl NidusMcp {
         let diversity = optional_f32(args, "diversity")?;
         let rollup = parse_rollup(args)?;
         let rerank = parse_rerank(args)?;
+        let prefix = optional_bool(args, "prefix")?;
 
-        // The one divergence from `POST /hybrid-search`, which takes a caller-supplied
-        // `vector`: embedding the query text gives the same fusion from an argument a model
-        // can actually write.
-        let vector = embedder
-            .embed_query(&query)
+        self.with_namespace(namespace, async move {
+            // The one divergence from `POST /hybrid-search`, which takes a caller-supplied
+            // `vector`: embedding the query text gives the same fusion from an argument a
+            // model can actually write.
+            let vector = embedder
+                .embed_query(&query)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+            // `rrf_k`/`candidates` stay default: fusion knobs mean nothing to a model, so
+            // exposing them adds ways to get worse results and none to get better ones.
+            // No `names`/`pool` here: `HybridOpts` carries neither field yet (nidus-85t).
+            let opts = HybridOpts {
+                top_k,
+                filter: with_ttl_guard(filter),
+                limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
+                expand: rollup.map(|(_, e)| e),
+                diversity,
+                rerank,
+                ..Default::default()
+            };
+            check_rerank_hybrid_depth(&opts)?;
+            let mut clause = crate::FtsClause::new(field, query.clone());
+            if prefix {
+                clause = clause.prefix();
+            }
+            let q = crate::FtsQuery::multi([clause]);
+
+            #[cfg(feature = "rerank")]
+            if opts.rerank.is_some() {
+                let reranker = self.reranker()?;
+                let hits = self
+                    .rerank_hybrid_and_finish(reranker, collection, vector, q, query, opts)
+                    .await?;
+                return Ok(hits_content(hits.into_iter().map(HitDto::from).collect()));
+            }
+            #[cfg(not(feature = "rerank"))]
+            if opts.rerank.is_some() {
+                return Err(McpError::invalid_params(
+                    "this nidus server was built without rerank support (the `rerank` feature); \
+                     `rerank` is unavailable",
+                    None,
+                ));
+            }
+
+            let hits = crate::server::run_read(self.state.clone(), move |db| {
+                db.hybrid_search(
+                    crate::Scope::Collections(&[collection.as_str()]),
+                    &vector,
+                    &q,
+                    &opts,
+                )
+            })
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(api_error)?;
 
-        // `rrf_k`/`candidates` stay default: fusion knobs mean nothing to a model, so
-        // exposing them adds ways to get worse results and none to get better ones.
-        // No `names`/`pool` here: `HybridOpts` carries neither field yet (nidus-85t).
-        let opts = HybridOpts {
-            top_k,
-            filter: with_ttl_guard(filter),
-            limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
-            expand: rollup.map(|(_, e)| e),
-            diversity,
-            rerank,
-            ..Default::default()
-        };
-        check_rerank_hybrid_depth(&opts)?;
-        let mut clause = crate::FtsClause::new(field, query.clone());
-        if optional_bool(args, "prefix")? {
-            clause = clause.prefix();
-        }
-        let q = crate::FtsQuery::multi([clause]);
-
-        #[cfg(feature = "rerank")]
-        if opts.rerank.is_some() {
-            let reranker = self.reranker()?;
-            let hits = self
-                .rerank_hybrid_and_finish(reranker, collection, vector, q, query, opts)
-                .await?;
-            return Ok(hits_content(hits.into_iter().map(HitDto::from).collect()));
-        }
-        #[cfg(not(feature = "rerank"))]
-        if opts.rerank.is_some() {
-            return Err(McpError::invalid_params(
-                "this nidus server was built without rerank support (the `rerank` feature); \
-                 `rerank` is unavailable",
-                None,
-            ));
-        }
-
-        let hits = crate::server::run_read(self.state.clone(), move |db| {
-            db.hybrid_search(
-                crate::Scope::Collections(&[collection.as_str()]),
-                &vector,
-                &q,
-                &opts,
-            )
+            Ok(hits_content(hits.into_iter().map(HitDto::from).collect()))
         })
         .await
-        .map_err(api_error)?;
-
-        Ok(hits_content(hits.into_iter().map(HitDto::from).collect()))
     }
 
     /// "More like this": search using an already-stored entry instead of embedding new
@@ -934,6 +956,7 @@ impl NidusMcp {
         let collection = required_str(args, "collection")?;
         let id = required_str(args, "id")?;
         let top_k = optional_top_k(args)?;
+        let namespace = optional_namespace(args)?;
         let min_score = optional_f32(args, "min_score")?;
         let filter = parse_filter(args)?;
         let diversity = optional_f32(args, "diversity")?;
@@ -943,49 +966,54 @@ impl NidusMcp {
         let rollup = parse_rollup(args)?;
         let plan = optional_bool(args, "plan")?;
 
-        let (hits, plan) = crate::server::run_read(self.state.clone(), move |db| {
-            if let Some(source) = db.get(&collection, &id) {
-                let guard = Filter(vec![not_expired_predicate(now_ms())]);
-                if !crate::filter::matches(&guard, &source.attrs) {
-                    anyhow::bail!(
-                        "{}: record `{collection}/{id}` has expired and cannot be used as a query",
-                        crate::store::BAD_QUERY
-                    );
-                }
-            }
-            let opts = SearchOpts {
-                top_k,
-                min_score,
-                filter: with_ttl_guard(filter),
-                diversity,
-                limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
-                expand: rollup.map(|(_, e)| e),
-                names,
-                name_weights,
-                pool,
-                plan,
-                ..Default::default()
-            };
-            if opts.plan {
-                let (hits, plan) = db.search_similar_with_plan(
-                    collection.as_str(),
-                    collection.as_str(),
-                    id.as_str(),
-                    &opts,
-                )?;
-                Ok((hits, Some(plan)))
-            } else {
-                let hits = db.search_similar(
-                    collection.as_str(),
-                    collection.as_str(),
-                    id.as_str(),
-                    &opts,
-                )?;
-                Ok((hits, None))
-            }
-        })
-        .await
-        .map_err(api_error)?;
+        let (hits, plan) = self
+            .with_namespace(namespace, async move {
+                crate::server::run_read(self.state.clone(), move |db| {
+                    if let Some(source) = db.get(&collection, &id) {
+                        let guard = Filter(vec![not_expired_predicate(now_ms())]);
+                        if !crate::filter::matches(&guard, &source.attrs) {
+                            anyhow::bail!(
+                                "{}: record `{collection}/{id}` has expired and cannot be used \
+                                 as a query",
+                                crate::store::BAD_QUERY
+                            );
+                        }
+                    }
+                    let opts = SearchOpts {
+                        top_k,
+                        min_score,
+                        filter: with_ttl_guard(filter),
+                        diversity,
+                        limit_per: rollup.as_ref().map(|(cap, _)| cap.clone()),
+                        expand: rollup.map(|(_, e)| e),
+                        names,
+                        name_weights,
+                        pool,
+                        plan,
+                        ..Default::default()
+                    };
+                    if opts.plan {
+                        let (hits, plan) = db.search_similar_with_plan(
+                            collection.as_str(),
+                            collection.as_str(),
+                            id.as_str(),
+                            &opts,
+                        )?;
+                        Ok((hits, Some(plan)))
+                    } else {
+                        let hits = db.search_similar(
+                            collection.as_str(),
+                            collection.as_str(),
+                            id.as_str(),
+                            &opts,
+                        )?;
+                        Ok((hits, None))
+                    }
+                })
+                .await
+                .map_err(api_error)
+            })
+            .await?;
 
         Ok(hits_with_plan_content(
             hits.into_iter().map(HitDto::from).collect(),
@@ -999,6 +1027,7 @@ impl NidusMcp {
         &self,
         args: &Map<String, JsonValue>,
     ) -> Result<CallToolResult, McpError> {
+        let namespace = optional_namespace(args)?;
         let collection = required_str(args, "collection")?;
         let field = required_str(args, "field")?;
         let prefix = required_str(args, "prefix")?;
@@ -1012,20 +1041,24 @@ impl NidusMcp {
         let filter = parse_filter(args)?;
         let fuzzy = optional_bool_or(args, "fuzzy", true)?;
 
-        let out = crate::server::run_read(self.state.clone(), move |db| {
-            db.suggest(
-                collection.as_str(),
-                &field,
-                &prefix,
-                &crate::SuggestOpts {
-                    limit,
-                    filter: filter.unwrap_or_default(),
-                    fuzzy,
-                },
-            )
-        })
-        .await
-        .map_err(api_error)?;
+        let out = self
+            .with_namespace(namespace, async move {
+                crate::server::run_read(self.state.clone(), move |db| {
+                    db.suggest(
+                        collection.as_str(),
+                        &field,
+                        &prefix,
+                        &crate::SuggestOpts {
+                            limit,
+                            filter: filter.unwrap_or_default(),
+                            fuzzy,
+                        },
+                    )
+                })
+                .await
+                .map_err(api_error)
+            })
+            .await?;
 
         if out.suggestions.is_empty() {
             // A sentence, not `[]`: mirrors `hits_content` (mod.rs) so a model broadens
@@ -1045,6 +1078,7 @@ impl NidusMcp {
         &self,
         args: &Map<String, JsonValue>,
     ) -> Result<CallToolResult, McpError> {
+        let namespace = optional_namespace(args)?;
         let sql = required_str(args, "sql")?;
         if let Some(at) = vector_literal_offset(&sql) {
             return Err(McpError::invalid_params(
@@ -1056,9 +1090,13 @@ impl NidusMcp {
                 None,
             ));
         }
-        let answer = crate::server::run_read(self.state.clone(), move |db| db.query(&sql))
-            .await
-            .map_err(api_error)?;
+        let answer = self
+            .with_namespace(namespace, async move {
+                crate::server::run_read(self.state.clone(), move |db| db.query(&sql))
+                    .await
+                    .map_err(api_error)
+            })
+            .await?;
         Ok(query_answer_content(answer))
     }
 }
@@ -1372,7 +1410,7 @@ mod tests {
         .await
         .unwrap();
 
-        let guard = mcp.state.db.read().expect("lock");
+        let guard = mcp.state.db().read().expect("lock");
         let db = guard.as_ref().expect("store");
         for id in ["a", "b"] {
             let rec = db
@@ -1533,5 +1571,107 @@ mod query_tests {
             props.is_none_or(|p| !p.contains_key("vector")),
             "query tool schema must not expose a raw vector argument"
         );
+    }
+}
+
+/// The `namespace` argument (nidus-pcpc.2): refused when supplied in single-store mode, and
+/// routing two calls to genuinely distinct stores in namespaced mode. Its own module so it
+/// compiles under a plain `mcp` build, like `query_tests` above.
+#[cfg(test)]
+mod namespace_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::{Config, Record, Value};
+
+    fn obj(v: JsonValue) -> Map<String, JsonValue> {
+        match v {
+            JsonValue::Object(m) => m,
+            _ => panic!("expected a JSON object"),
+        }
+    }
+
+    fn text_of(result: CallToolResult) -> String {
+        let rmcp::model::ContentBlock::Text(text) =
+            result.content.into_iter().next().expect("content block")
+        else {
+            panic!("expected text content");
+        };
+        text.text
+    }
+
+    /// Seed `base/name` with one record directly, at the exact path `Namespaces::get`
+    /// derives — so a later namespaced tool call proves it reached this real, distinct
+    /// store rather than one it opened for itself.
+    fn seed(base: &std::path::Path, name: &str, id: &str) {
+        let mut db = crate::Nidus::open(Config::new(base.join(name), 3)).unwrap();
+        db.upsert(
+            "notes",
+            &[Record::new(
+                id,
+                vec![1.0, 0.0, 0.0],
+                BTreeMap::from([("body".to_string(), Value::Str(id.to_string()))]),
+            )],
+        )
+        .unwrap();
+        db.flush().unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_namespace_in_single_store_mode_is_refused() {
+        let db = crate::Nidus::open_in_memory(3).unwrap();
+        let mcp = NidusMcp::new(crate::server::test_state(Some(db)));
+
+        let err = mcp
+            .browse(&obj(json!({ "namespace": "tenant-a" })))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("single-store mode"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn omitted_namespace_in_single_store_mode_is_unaffected() {
+        let db = crate::Nidus::open_in_memory(3).unwrap();
+        let mcp = NidusMcp::new(crate::server::test_state(Some(db)));
+
+        let result = mcp.browse(&obj(json!({}))).await.unwrap();
+        assert!(text_of(result).contains("No matching"));
+    }
+
+    #[tokio::test]
+    async fn two_namespaces_read_back_distinct_data_through_the_same_tool() {
+        let base = tempfile::tempdir().unwrap();
+        seed(base.path(), "tenant-a", "a1");
+        seed(base.path(), "tenant-b", "b1");
+
+        let template = Config::new("unused", 3);
+        let mcp = NidusMcp::new(crate::server::test_state_namespaced(base.path(), template));
+
+        let a = text_of(
+            mcp.browse(&obj(
+                json!({ "collection": "notes", "namespace": "tenant-a" }),
+            ))
+            .await
+            .unwrap(),
+        );
+        let b = text_of(
+            mcp.browse(&obj(
+                json!({ "collection": "notes", "namespace": "tenant-b" }),
+            ))
+            .await
+            .unwrap(),
+        );
+        assert!(a.contains("\"a1\"") && !a.contains("\"b1\""));
+        assert!(b.contains("\"b1\"") && !b.contains("\"a1\""));
+    }
+
+    #[tokio::test]
+    async fn omitted_namespace_in_namespaced_mode_names_the_fix() {
+        let base = tempfile::tempdir().unwrap();
+        let template = Config::new("unused", 3);
+        let mcp = NidusMcp::new(crate::server::test_state_namespaced(base.path(), template));
+
+        let err = mcp.browse(&obj(json!({}))).await.unwrap_err();
+        assert!(err.message.contains("/ns/"), "{}", err.message);
     }
 }

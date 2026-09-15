@@ -12,11 +12,19 @@ use nidus::{Config, Namespaces, Record};
 /// Opens (or reopens) `name` through `ns`, writes one record into collection `"c"`, and
 /// flushes it durably.
 fn write_one(ns: &mut Namespaces, name: &str, vector: Vec<f32>) {
-    let db = ns.get(name).expect("namespace should open");
+    let handle = ns.get(name).expect("namespace should open");
+    let mut db = handle.write().unwrap();
     db.create_collection("c").unwrap();
     db.upsert("c", &[Record::new("only", vector, BTreeMap::new())])
         .unwrap();
     db.flush().unwrap();
+}
+
+/// Read one record back through a namespace handle, taking and releasing its read lock.
+fn read_one(ns: &mut Namespaces, name: &str) -> Option<Record> {
+    let handle = ns.get(name).expect("namespace should open");
+    let db = handle.read().unwrap();
+    db.get("c", "only")
 }
 
 #[test]
@@ -66,17 +74,9 @@ fn a_fresh_handle_over_the_same_base_reads_back_both_namespaces() {
         Config::new("unused", 3),
         base.to_string_lossy().into_owned(),
     );
-    let a = ns
-        .get("tenant-a")
-        .unwrap()
-        .get("c", "only")
-        .expect("tenant-a's row");
+    let a = read_one(&mut ns, "tenant-a").expect("tenant-a's row");
     assert_eq!(a.vector, Some(vec![1.0, 0.0, 0.0]));
-    let b = ns
-        .get("tenant-b")
-        .unwrap()
-        .get("c", "only")
-        .expect("tenant-b's row");
+    let b = read_one(&mut ns, "tenant-b").expect("tenant-b's row");
     assert_eq!(b.vector, Some(vec![0.0, 1.0, 0.0]));
 }
 
@@ -100,11 +100,7 @@ fn a_namespace_evicted_by_the_byte_budget_still_returns_its_records() {
         "tenant-a should have been pushed out of the warm set by the 1-byte budget"
     );
 
-    let rec = ns
-        .get("tenant-a")
-        .unwrap()
-        .get("c", "only")
-        .expect("tenant-a's row survives eviction and reload");
+    let rec = read_one(&mut ns, "tenant-a").expect("tenant-a's row survives eviction and reload");
     assert_eq!(rec.vector, Some(vec![1.0, 0.0, 0.0]));
 }
 

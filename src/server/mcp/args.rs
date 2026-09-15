@@ -1,10 +1,11 @@
 //! Argument parsing and error-mapping helpers shared by every tool handler. FROZEN after
-//! nidus-k28 unit A: later units add their own parsers to their own files, not here.
+//! nidus-k28 unit A: later units add their own parsers to their own files, not here — except
+//! `namespace` (nidus-pcpc.2) below, genuinely shared by every tool that touches a store.
 
 use std::sync::Arc;
 
 use rmcp::{ErrorData as McpError, model::Tool};
-use serde_json::{Map, Value as JsonValue};
+use serde_json::{Map, Value as JsonValue, json};
 
 /// How long a client may cache `tools/list` (SEP-2549). Long, and `Public` in `mod.rs`,
 /// because the list is a compile-time constant carrying no per-caller detail.
@@ -122,6 +123,40 @@ pub(super) fn optional_string_array(
             None,
         )),
     }
+}
+
+/// An optional `namespace` argument (nidus-pcpc.2): which store this one call addresses,
+/// when the server is running in namespaced mode. Type-checked only; [`super::NidusMcp::
+/// with_namespace`] resolves it against the server's actual addressing mode.
+pub(super) fn optional_namespace(
+    args: &Map<String, JsonValue>,
+) -> Result<Option<String>, McpError> {
+    match args.get("namespace") {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(s)) if !s.trim().is_empty() => Ok(Some(s.clone())),
+        Some(JsonValue::String(_)) => Err(McpError::invalid_params(
+            "`namespace` must not be empty",
+            None,
+        )),
+        Some(_) => Err(McpError::invalid_params(
+            "`namespace` must be a string",
+            None,
+        )),
+    }
+}
+
+/// The `namespace` property, spliced into every tool schema that touches a store
+/// (nidus-pcpc.2). Meaningless — refused, not ignored — outside namespaced mode.
+pub(super) fn namespace_schema() -> JsonValue {
+    json!({
+        "type": "string",
+        "description": "Which namespace this call addresses. Required on a server started \
+            in namespaced mode (many independent stores behind one process): the \
+            connection path does not scope a session, so a call that omits it is an error \
+            rather than a default (nidus-k9rj). Supplying it against a server started with \
+            a single `--dir` (one store, no namespaces) is refused rather than silently \
+            ignored."
+    })
 }
 
 /// Map a [`crate::server::ApiError`] onto an MCP error, split by status: a `4xx` is worth a
