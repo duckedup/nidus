@@ -1410,7 +1410,7 @@ mod tests {
         .await
         .unwrap();
 
-        let guard = mcp.state.db.read().expect("lock");
+        let guard = mcp.state.db().read().expect("lock");
         let db = guard.as_ref().expect("store");
         for id in ["a", "b"] {
             let rec = db

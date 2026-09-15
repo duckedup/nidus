@@ -942,20 +942,22 @@ def test_namespaced_clients_never_see_each_others_records(namespaced_server: str
     into every request rather than only the first, and that the prefix really reaches a
     distinct on-disk store on the other side of the socket, not just a distinct URL string.
     """
-    with NidusClient(namespaced_server, namespace="tenant-a", timeout=10.0) as a:
-        with NidusClient(namespaced_server, namespace="tenant-b", timeout=10.0) as b:
-            a.create_collection("docs")
-            b.create_collection("docs")
-            a.upsert("docs", [{"id": "1", "vector": [1.0, 0.0, 0.0], "attrs": {"tenant": "a"}}])
-            b.upsert("docs", [{"id": "1", "vector": [0.0, 1.0, 0.0], "attrs": {"tenant": "b"}}])
+    with (
+        NidusClient(namespaced_server, namespace="tenant-a", timeout=10.0) as a,
+        NidusClient(namespaced_server, namespace="tenant-b", timeout=10.0) as b,
+    ):
+        a.create_collection("docs")
+        b.create_collection("docs")
+        a.upsert("docs", [{"id": "1", "vector": [1.0, 0.0, 0.0], "attrs": {"tenant": "a"}}])
+        b.upsert("docs", [{"id": "1", "vector": [0.0, 1.0, 0.0], "attrs": {"tenant": "b"}}])
 
-            assert [r.id for r in a.records("docs")] == ["1"]
-            assert a.records("docs")[0].attrs == {"tenant": "a"}
-            assert [r.id for r in b.records("docs")] == ["1"]
-            assert b.records("docs")[0].attrs == {"tenant": "b"}
+        assert [r.id for r in a.records("docs")] == ["1"]
+        assert a.records("docs")[0].attrs == {"tenant": "a"}
+        assert [r.id for r in b.records("docs")] == ["1"]
+        assert b.records("docs")[0].attrs == {"tenant": "b"}
 
-            hits = a.search(query=[1.0, 0.0, 0.0], scope=["docs"], top_k=5)
-            assert [h.id for h in hits] == ["1"]
+        hits = a.search(query=[1.0, 0.0, 0.0], scope=["docs"], top_k=5)
+        assert [h.id for h in hits] == ["1"]
 
 
 def test_no_namespace_configured_against_a_namespaced_server_is_refused(

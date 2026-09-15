@@ -21,7 +21,7 @@ fn records(server: &RunningServer, ns: &str) -> (u16, Value) {
     server.get(&format!("/ns/{ns}/collections/c/records"))
 }
 
-/// 1. A second request reuses the warm store rather than reopening it: a corrupt on-disk
+/// Criterion 1: A second request reuses the warm store rather than reopening it: a corrupt on-disk
 /// manifest stays invisible until the store is actually evicted. The eviction half is
 /// load-bearing — without it, the reuse above would pass even if corruption were harmless.
 #[test]
@@ -63,7 +63,7 @@ fn warm_store_survives_a_corrupt_manifest_until_evicted() {
     );
 }
 
-/// 2. Eviction under the byte budget releases the writer lock, so a later request
+/// Criterion 2: Eviction under the byte budget releases the writer lock, so a later request
 /// re-opens cleanly. Counterfactual: marking a namespace cold without dropping its store
 /// would leave the writer lock held, and the re-open below would fail.
 #[test]
@@ -98,7 +98,7 @@ fn eviction_releases_the_writer_lock_and_a_later_request_reopens_cleanly() {
     );
 }
 
-/// 3. Per-namespace readiness answers per namespace, and `/ready` still answers with no
+/// Criterion 3: Per-namespace readiness answers per namespace, and `/ready` still answers with no
 /// namespace ever touched. Counterfactual: an aggregate readiness implementation has
 /// nothing per-name to report, and answering `/ready` from it needs a namespace opened.
 #[test]
@@ -146,7 +146,7 @@ fn ready_is_process_level_and_namespaces_reports_per_namespace_readiness() {
     }
 }
 
-/// 4. The listing route reports only warm namespaces and opens nothing. Counterfactual:
+/// Criterion 4: The listing route reports only warm namespaces and opens nothing. Counterfactual:
 /// an implementation that enumerates the base directory would report "cold" below too —
 /// it was never touched through the server, only created on disk beside it.
 #[test]

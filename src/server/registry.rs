@@ -5,7 +5,7 @@
 //! that can evict, which is what makes it exact rather than best-effort.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;

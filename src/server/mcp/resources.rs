@@ -31,9 +31,9 @@ pub(super) fn templates() -> Vec<ResourceTemplate> {
         ResourceTemplate::new(uri::NS_ENTRY_TEMPLATE, "namespaced entry")
             .with_title("Memory entry (explicit namespace)")
             .with_description(
-                "Same as `entry`, but names its namespace explicitly (nidus-pcpc.2) rather \
-                 than relying on the reading connection's own `/ns/{namespace}/mcp` scoping. \
-                 Only meaningful against a server started in namespaced mode.",
+                "Same as `entry`, but names its namespace explicitly (nidus-pcpc.2). On a \
+                 server started in namespaced mode this is how a namespace is chosen: the \
+                 connection path does not scope a session (nidus-k9rj).",
             )
             .with_mime_type("application/json"),
     ]

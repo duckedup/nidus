@@ -150,13 +150,12 @@ pub(super) fn optional_namespace(
 pub(super) fn namespace_schema() -> JsonValue {
     json!({
         "type": "string",
-        "description": "Which namespace this call addresses. Only applies to a server \
-            started in namespaced mode (many independent stores behind one process); \
-            omitting it there falls back to the namespace this connection was opened \
-            against (a client connected at `/ns/{namespace}/mcp` rather than bare `/mcp`), \
-            and an explicit value here overrides that. Supplying it against a server \
-            started with a single `--dir` (one store, no namespaces) is refused rather \
-            than silently ignored."
+        "description": "Which namespace this call addresses. Required on a server started \
+            in namespaced mode (many independent stores behind one process): the \
+            connection path does not scope a session, so a call that omits it is an error \
+            rather than a default (nidus-k9rj). Supplying it against a server started with \
+            a single `--dir` (one store, no namespaces) is refused rather than silently \
+            ignored."
     })
 }
 

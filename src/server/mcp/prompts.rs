@@ -127,9 +127,9 @@ pub(super) fn prompts() -> Vec<Prompt> {
                 .with_required(false),
             PromptArgument::new("namespace")
                 .with_description(
-                    "Which namespace to recall from, on a server running in namespaced \
-                     mode. Omit in single-store mode, or to use the namespace this \
-                     connection was already opened against.",
+                    "Which namespace to recall from. Required on a server running in \
+                     namespaced mode: the connection path does not scope a session \
+                     (nidus-k9rj). Omit in single-store mode.",
                 )
                 .with_required(false),
         ]),
