@@ -59,7 +59,7 @@ pub fn binary_truth(query_ids: &[String], qrels: &Qrels, threshold: f32) -> Vec<
                 .map(|judged| {
                     judged
                         .iter()
-                        .filter(|(_, &score)| score > threshold)
+                        .filter(|&(_, &score)| score > threshold)
                         .map(|(doc, _)| doc.clone())
                         .collect()
                 })
