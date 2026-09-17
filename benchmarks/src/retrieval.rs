@@ -442,8 +442,19 @@ fn run() -> Result<ExitCode> {
     // Same base as the RRF-only leg (`fusion_opts`'s untouched-default knobs plus the
     // `recall_k`-sized `top_k`/`candidates` both legs need) — `rerank` is the only field
     // that differs between the two hybrid legs.
+    //
+    // `overscan: 1`, NOT the default 10. `hybrid_reranked` widens the fetch to
+    // `top_k * overscan` (src/rerank/apply.rs:121-127), and `top_k` here is already
+    // `recall_k`, so the default would rerank 1000 documents per query: ~250k tokens
+    // against Voyage's 2M-per-minute rerank budget, which no pacing can absorb. Reranking
+    // exactly the `recall_k` fusion candidates is also the standard BEIR rerank protocol.
+    // Consequence, stated in the docs: this leg's Recall@100 equals the fusion leg's by
+    // construction, since reordering 100 candidates cannot change which 100 they are.
     let fusion_reranked = HybridOpts {
-        rerank: Some(RerankOpts::default()),
+        rerank: Some(RerankOpts {
+            overscan: 1,
+            ..RerankOpts::default()
+        }),
         ..fusion.clone()
     };
 
