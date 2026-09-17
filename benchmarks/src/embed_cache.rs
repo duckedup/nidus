@@ -26,7 +26,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use nidus::LocalFs;
 use nidus::backend::Persistence;
 use nidus::embed::cache::CachedEmbedder;
@@ -62,6 +62,11 @@ fn require_api_key(found: Option<String>) -> Result<String> {
 /// Build a `voyage-4` embedder whose vectors persist under `cache_dir`, keyed by `identity`
 /// (build one with [`cache_identity`]). The caller **must** call `.save()` when the run
 /// ends, or any API spend behind newly-cached vectors is thrown away.
+///
+/// `cache_dir` is given its OWN subdirectory per identity. `CachedEmbedder` writes a fixed
+/// object name and carries the identity only in its validity key, so datasets sharing one
+/// directory each load the previous one's blob as stale, re-embed in full, and then
+/// overwrite it. One directory each is what actually makes a rerun free.
 pub async fn cached_voyage(
     cache_dir: &Path,
     identity: &str,
@@ -77,7 +82,9 @@ pub async fn cached_voyage(
     // Dimension comes from the built embedder, not a hardcoded 1024, so this can never
     // drift from what `AnyEmbedder`/Voyage itself considers `voyage-4`'s width to be.
     let dimension = inner.dimension();
-    let persistence: Arc<dyn Persistence> = Arc::new(LocalFs::new(cache_dir)?);
+    let dir = cache_dir.join("embeddings").join(slug(identity));
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let persistence: Arc<dyn Persistence> = Arc::new(LocalFs::new(&dir)?);
     Ok(CachedEmbedder::open(
         inner,
         Some(persistence),
@@ -85,6 +92,14 @@ pub async fn cached_voyage(
         dimension,
         MAX_CACHE_ENTRIES,
     ))
+}
+
+/// Filesystem-safe form of a cache identity, for use as a directory name.
+fn slug(identity: &str) -> String {
+    identity
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 #[cfg(test)]
@@ -97,6 +112,29 @@ mod tests {
         assert!(
             err.contains(VOYAGE_API_KEY_VAR),
             "error must name {VOYAGE_API_KEY_VAR}, got: {err}"
+        );
+    }
+
+    #[test]
+    fn slug_is_filesystem_safe_and_still_distinguishes() {
+        // The slug is a directory name, so it must keep identities apart after mangling:
+        // collapsing separators is fine, collapsing two identities into one is not.
+        assert_eq!(slug("voyage-4/fiqa"), "voyage-4-fiqa");
+        assert_ne!(
+            slug(&cache_identity("voyage-4", "fiqa")),
+            slug(&cache_identity("voyage-4", "nfcorpus")),
+            "two datasets must not share a cache directory"
+        );
+        assert_ne!(
+            slug(&cache_identity("voyage-4", "fiqa")),
+            slug(&cache_identity("voyage-4-lite", "fiqa")),
+            "two models must not share a cache directory"
+        );
+        assert!(
+            slug(&cache_identity("voyage-4", "fiqa"))
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "slug must be safe as a directory name"
         );
     }
 
