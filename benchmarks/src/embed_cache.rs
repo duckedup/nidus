@@ -59,14 +59,10 @@ fn require_api_key(found: Option<String>) -> Result<String> {
     })
 }
 
-/// Build a `voyage-4` embedder whose vectors persist under `cache_dir`, keyed by `identity`
-/// (build one with [`cache_identity`]). The caller **must** call `.save()` when the run
-/// ends, or any API spend behind newly-cached vectors is thrown away.
-///
-/// `cache_dir` is given its OWN subdirectory per identity. `CachedEmbedder` writes a fixed
-/// object name and carries the identity only in its validity key, so datasets sharing one
-/// directory each load the previous one's blob as stale, re-embed in full, and then
-/// overwrite it. One directory each is what actually makes a rerun free.
+/// Build a `voyage-4` embedder whose vectors persist under `cache_dir`, keyed by `identity`.
+/// The caller **must** `.save()` at the end of a run or the spend is thrown away. Each
+/// identity gets its own subdirectory: `CachedEmbedder` writes one fixed object name, so a
+/// shared directory makes every dataset read the last one's blob as stale and re-embed.
 pub async fn cached_voyage(
     cache_dir: &Path,
     identity: &str,
