@@ -1874,7 +1874,7 @@ build until a real need exists.
   serving stale bytes. New object keys only (`hist-*`); the live `manifest` is unchanged.
   See §14.2.
 
-#### Exotic vector types — DECIDED, 2026-08 (nidus-m50.14), revised 2026-09 (nidus-85t)
+#### Exotic vector types — DECIDED, 2026-08 (nidus-m50.14), revised 2026-09 (nidus-85t, nidus-flz)
 
 Several **named** vectors per record, all at the store's one pinned dimension, is the
 model (nidus-85t): a record may carry `vector` (the reserved `default` name) and any
@@ -1882,10 +1882,11 @@ number of additional names declared on the collection first, each scored on its 
 folded into one record score by `Pool::Max` or `Pool::Sum`. One dimension per store is
 **unchanged**: every name shares that single pinned dimension, and a vector at a
 different dimension remains out of scope. This does **not** un-defer either of the two
-variants below: multi-vector late interaction (nidus-flz) is a different shape, a
-rerank-stage feature scoring token-level vectors post-retrieval rather than named
-columns on a record; sparse vectors (nidus-t52) are a different shape again, a genuine
-on-disk format change carrying a different kind of value entirely. Both remain deferred.
+variants below: multi-vector late interaction (nidus-flz) is a different shape, scoring
+token-level vectors rather than named columns on a record; sparse vectors (nidus-t52) are
+a different shape again, a genuine on-disk format change carrying a different kind of
+value entirely. Late interaction has since been **rejected** (2026-09, below); sparse
+remains deferred, against a trigger that can now fail.
 Three variants were evaluated against turbopuffer's surface and answered separately:
 
 - **`f16` storage — rejected, not deferred.** It buys ~2× on the vector matrix, which
@@ -1893,23 +1894,53 @@ Three variants were evaluated against turbopuffer's surface and answered separat
   pass that restores accuracy. Adding a third storage width would multiply the codec,
   scan-kernel, and quantization matrix for a strictly worse trade. Nothing is waiting on
   this; the branch is closed.
-- **Multi-vector late interaction (ColBERT-style) — deferred as a rerank-only feature.**
-  The useful form scores a candidate set produced by ordinary dense retrieval, so it
-  belongs on the hosted cross-encoder rerank seam (`crate::rerank`, shipped nidus-4ss,
-  above), not in the segment format. It needs no format change scoped that way, and it
-  should not be built until a caller wants it: this ticket built the seam it was
-  deferred onto, not late interaction itself.
-- **Sparse vectors (`SparseKNN`) — deferred, and deliberately not built now.** The byte
+- **Multi-vector late interaction (ColBERT-style) — rejected, 2026-09 (nidus-flz).** It
+  was deferred onto the hosted cross-encoder rerank seam on the reasoning that, scoped as
+  a rerank stage, it needed no format change. Shipping that seam disproved the premise.
+  `Reranker::rerank` is `(query: &str, documents: &[&str]) -> Vec<f32>` — text in, one
+  score per document out, over the network — and token-level vectors have nowhere to sit
+  in that signature, nor does any hosted provider return them through a rerank-shaped API.
+  Both ways around it lose. Recomputing token vectors per query means embedding every
+  candidate's full text on every search: more latency and more spend than the single
+  cross-encoder call already wired up, for a coarser score, because a cross-encoder is the
+  thing late interaction approximates cheaply — once you are paying for one, the
+  approximation buys nothing. Storing them is the format change the deferral claimed to
+  avoid, at 30–100 vectors per record, and it runs against the §14 scaling thesis rather
+  than with it: IVF was chosen over a graph index for roundtrip count and write
+  amplification against object storage (§14.3), a PLAID-shaped late-interaction pipeline is
+  a second index architecture with a worse access profile, and its working set is what
+  `max_vector_bytes` exists to bound. Scale is the argument against this, not for it. The
+  branch closes on the same grounds as `f16`: a strictly worse trade against something
+  already shipped. The gap it was standing in for — semantic rerank that does not call a
+  hosted provider — is real, and is tracked on its own merits as nidus-10dt, where late
+  interaction is one candidate among others and is judged against the nidus-yq9p.4 cost
+  and nidus-yq9p.5 quality numbers.
+- **Sparse vectors (`SparseKNN`) — deferred, against a measurable trigger (nidus-t52).**
+  The byte
   format could carry them additively, but the surrounding cost is out of proportion to
   demand: a breaking `Record` change, a second `Op` append, a working-set key bump that
   discards every deployed memory-tier snapshot, the sparse payload held twice in RAM
   outside `max_vector_bytes`, and no worst-case bound on a query over a common dimension.
-  No user has asked for SPLADE-style retrieval. Revisit when one does — the decision is
-  "not yet", not "never", and nothing in the format forecloses it.
+  The original trigger was "revisit when a caller asks", which names nobody and has no
+  failing mode, so it was replaced (2026-09): SPLADE's advantage over BM25 is learned term
+  expansion against vocabulary mismatch, which is what dense + BM25 weighted RRF (§7.6,
+  `src/fuse.rs`) already answers. Whether a gap survives that is a number, and the BEIR
+  lane (nidus-yq9p.5) produces it. If fusion trails a published SPLADE baseline on nDCG@10
+  by a margin worth a format change, that is the caller; if it does not, nidus-t52 closes
+  citing the measurement. The decision is still "not yet", not "never", and nothing in the
+  format forecloses it.
 
 The general rule this encodes: a change to the *segment format* needs a named caller,
 because it is the one layer where being wrong is expensive to walk back. Query-path
 features do not carry that burden and are judged on their own merits.
+
+The late-interaction reversal adds a corollary about deferrals themselves. A deferral that
+names the seam it will ride is making a claim about that seam, and the claim expires when
+the seam ships in a shape that cannot carry it. So a "defer onto X" entry is re-read when X
+lands, not when someone finally asks for the feature — otherwise the entry keeps vouching
+for a plan that stopped being buildable. The same reading applies to a trigger: "revisit
+when a caller asks" cannot fail and so never resolves, and is worth replacing with a
+measurement that can (nidus-t52, above).
 
 #### The Voyage default model — DECIDED, 2026-08 (nidus-0hq)
 
