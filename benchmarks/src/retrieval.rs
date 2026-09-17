@@ -42,6 +42,11 @@ struct Args {
     threshold: f32,
     cache: PathBuf,
     json: Option<PathBuf>,
+    /// Minimum gap between rerank calls. Voyage meters rerank-2.5 on a tokens-per-minute
+    /// budget, and one query reranks `candidates` documents, so an unpaced loop saturates
+    /// the minute window and then fails outright: the library's 1s/2s/4s retry cannot
+    /// outwait a limit that only resets on the minute.
+    rerank_delay_ms: u64,
 }
 
 impl Default for Args {
@@ -53,6 +58,8 @@ impl Default for Args {
             threshold: 0.0,
             cache: PathBuf::from("benchmarks/.cache"),
             json: None,
+            // ~20k tokens per query against a 2M TPM budget is 100 queries a minute.
+            rerank_delay_ms: 700,
         }
     }
 }
@@ -61,7 +68,7 @@ fn usage() {
     println!("nidus-bench-retrieval — BEIR retrieval quality: nDCG@10 and Recall@100 for FTS,");
     println!("vector, RRF fusion and fusion + rerank (nidus-yq9p.5). Needs VOYAGE_API_KEY.");
     println!(
-        "args: dataset=scifact,nfcorpus,fiqa  top_k=10  recall_k=100  threshold=0  \
+        "args: dataset=scifact,nfcorpus,fiqa  top_k=10  recall_k=100  threshold=0  rerank_delay_ms=700  \
          cache=benchmarks/.cache  json=<path>  help"
     );
 }
@@ -86,6 +93,7 @@ fn parse_args_from(tokens: impl Iterator<Item = String>) -> Result<Args> {
             "dataset" => a.datasets = parse_datasets(val)?,
             "top_k" => a.top_k = val.parse()?,
             "recall_k" => a.recall_k = val.parse()?,
+            "rerank_delay_ms" => a.rerank_delay_ms = val.parse()?,
             "threshold" => a.threshold = val.parse()?,
             "cache" => a.cache = PathBuf::from(val),
             "json" => a.json = Some(PathBuf::from(val)),
@@ -269,6 +277,7 @@ fn run_dataset(
     let mut vector = LegRun::new("vector only", corpus.queries.len());
     let mut rrf = LegRun::new("rrf fusion", corpus.queries.len());
     let mut reranked = LegRun::new("fusion + rerank", corpus.queries.len());
+    let mut last_rerank: Option<std::time::Instant> = None;
 
     for (i, (query_id, query_text)) in corpus.queries.iter().enumerate() {
         let qvec = &query_vectors[i];
@@ -295,6 +304,15 @@ fn run_dataset(
             .collect();
         rrf.push(query_id, ids);
 
+        // Pace the rerank leg against Voyage's tokens-per-minute budget. Sleep only the
+        // remainder, so the three local legs above pay for part of the gap.
+        if let Some(prev) = last_rerank {
+            let gap = std::time::Duration::from_millis(args.rerank_delay_ms);
+            if let Some(rest) = gap.checked_sub(prev.elapsed()) {
+                std::thread::sleep(rest);
+            }
+        }
+        last_rerank = Some(std::time::Instant::now());
         let ids = rt
             .block_on(hybrid_reranked(
                 &db,
