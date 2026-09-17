@@ -115,6 +115,11 @@ engine, scored on the same judgements, agrees to within a few points, so the ana
 scoring are behaving as BM25 should. And fusion beats both single legs everywhere, which is
 what RRF is for, with rerank adding the largest jump on FiQA (0.393 to 0.545).
 
+**Reproducibility.** Embeddings are cached on disk per dataset, so a rerun against a warm
+cache reproduces these numbers exactly. A rerun against a cold cache re-fetches the vectors,
+and Voyage does not guarantee bit-identical embeddings, so the last digit can move by about
+0.001. The FTS leg uses no API and is exactly reproducible either way.
+
 **What this does not prove.** This lane is not CI verified: it needs network and a paid
 API key, so these numbers are a recorded run, not a continuously enforced claim
 (`nidus-yq9p.7` will add floors against them). And three small datasets in English are not

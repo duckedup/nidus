@@ -147,6 +147,11 @@ recorded run on one developer machine. Nothing in CI re-verifies these numbers
 just bench-retrieval json=benchmarks/baselines/retrieval-<dataset>-<version>.json   # record
 ```
 
+Embeddings cache per dataset under `benchmarks/.cache/embeddings/<identity>/`, so a rerun
+against a warm cache makes no embedding API calls at all and reproduces its baseline exactly.
+A cold cache re-fetches, and Voyage is not bit-deterministic, so the last digit can move by
+about 0.001. The rerank leg always calls the API: it is never cached.
+
 The committed baselines are named `0.104.0` because that is the nidus they measured: this
 lane's PR changes nothing under `src/`, so the library under test is the released 0.104.0
 library even though the PR ships as 0.105.0. They were also recorded just before
