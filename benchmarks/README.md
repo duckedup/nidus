@@ -147,6 +147,13 @@ recorded run on one developer machine. Nothing in CI re-verifies these numbers
 just bench-retrieval json=benchmarks/baselines/retrieval-<dataset>-<version>.json   # record
 ```
 
+The committed baselines are named `0.104.0` because that is the nidus they measured: this
+lane's PR changes nothing under `src/`, so the library under test is the released 0.104.0
+library even though the PR ships as 0.105.0. They were also recorded just before
+`rerank_overscan` was added to the JSON inputs block, so that one field is absent from them.
+Its value for those runs was 1, the same value the code uses today, and every later run
+records it.
+
 ## Single-writer ingest decomposition
 
 ```bash
