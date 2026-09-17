@@ -242,7 +242,10 @@ fn run_dataset(
     rt: &tokio::runtime::Runtime,
     reranker: &AnyReranker,
 ) -> Result<Json> {
-    println!("\n═══ {} ═══════════════════════════════════════════", spec.name);
+    println!(
+        "\n═══ {} ═══════════════════════════════════════════",
+        spec.name
+    );
     println!("loading corpus (cache: {})...", args.cache.display());
     let corpus = beir::load(spec, &args.cache)?;
 
@@ -494,7 +497,14 @@ fn run() -> Result<ExitCode> {
     }
 
     if let Some(path) = &args.json {
-        write_json(path, &args, &fusion, &fusion_reranked, &nidus_version, &cells)?;
+        write_json(
+            path,
+            &args,
+            &fusion,
+            &fusion_reranked,
+            &nidus_version,
+            &cells,
+        )?;
     }
 
     Ok(ExitCode::SUCCESS)

@@ -33,8 +33,7 @@ pub fn ndcg_at_k(ranked: &[(String, Vec<String>)], qrels: &Qrels, k: usize) -> f
             continue;
         }
         let run_dcg = dcg(
-            docs.iter()
-                .map(|d| *judged.get(d).unwrap_or(&0.0) as f64),
+            docs.iter().map(|d| *judged.get(d).unwrap_or(&0.0) as f64),
             k,
         );
         let mut ideal: Vec<f64> = judged.values().map(|&r| r as f64).collect();
@@ -45,7 +44,11 @@ pub fn ndcg_at_k(ranked: &[(String, Vec<String>)], qrels: &Qrels, k: usize) -> f
             scored += 1;
         }
     }
-    if scored == 0 { 0.0 } else { total / scored as f64 }
+    if scored == 0 {
+        0.0
+    } else {
+        total / scored as f64
+    }
 }
 
 /// Flatten graded qrels into the binary truth sets `nidus::recall_at_k` expects: a doc counts

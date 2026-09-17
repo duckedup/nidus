@@ -116,10 +116,11 @@ fn fetch(spec: &DatasetSpec, cache_dir: &Path, dataset_dir: &Path) -> Result<()>
 /// `GET url`, streaming the response straight to `dest`. BEIR's host is a plain static
 /// file server: no auth, and a non-2xx status comes back as an error by default.
 fn download(url: &str, dest: &Path) -> Result<()> {
-    let res = ureq::get(url).call().with_context(|| format!("GET {url}"))?;
+    let res = ureq::get(url)
+        .call()
+        .with_context(|| format!("GET {url}"))?;
     let mut reader = res.into_body().into_reader();
-    let mut file =
-        File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
+    let mut file = File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
     io::copy(&mut reader, &mut file)
         .with_context(|| format!("writing {} from {url}", dest.display()))?;
     Ok(())
@@ -146,11 +147,10 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<()> {
             continue;
         }
         if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
-        let mut out_file = File::create(&out_path)
-            .with_context(|| format!("creating {}", out_path.display()))?;
+        let mut out_file =
+            File::create(&out_path).with_context(|| format!("creating {}", out_path.display()))?;
         io::copy(&mut entry, &mut out_file)
             .with_context(|| format!("extracting {}", out_path.display()))?;
     }
@@ -337,16 +337,23 @@ mod tests {
         );
         let docs = parse_corpus(fixture, Path::new(TEST_PATH)).unwrap();
         assert_eq!(docs.len(), 2);
-        assert_eq!(docs[0], ("1".to_string(), "A Title".to_string(), "body one".to_string()));
-        assert_eq!(docs[1], ("2".to_string(), String::new(), "body two".to_string()));
+        assert_eq!(
+            docs[0],
+            (
+                "1".to_string(),
+                "A Title".to_string(),
+                "body one".to_string()
+            )
+        );
+        assert_eq!(
+            docs[1],
+            ("2".to_string(), String::new(), "body two".to_string())
+        );
     }
 
     #[test]
     fn qrels_tsv_skips_the_header_row() {
-        let fixture = concat!(
-            "query-id\tcorpus-id\tscore\n",
-            "q1\td1\t1\n",
-        );
+        let fixture = concat!("query-id\tcorpus-id\tscore\n", "q1\td1\t1\n",);
         let qrels = parse_qrels(fixture, Path::new(TEST_PATH)).unwrap();
         assert!(!qrels.contains_key("query-id"));
         assert_eq!(qrels.len(), 1);
@@ -380,10 +387,12 @@ mod tests {
             ("q2".to_string(), "not in split".to_string()),
         ];
         let mut qrels: Qrels = Qrels::new();
-        qrels.entry("q1".to_string()).or_default().insert("d1".to_string(), 1.0);
+        qrels
+            .entry("q1".to_string())
+            .or_default()
+            .insert("d1".to_string(), 1.0);
 
-        let restricted =
-            restrict_queries_to_qrels(queries, &qrels, Path::new(TEST_PATH)).unwrap();
+        let restricted = restrict_queries_to_qrels(queries, &qrels, Path::new(TEST_PATH)).unwrap();
         assert_eq!(restricted.len(), 1);
         assert_eq!(restricted[0].0, "q1");
     }
@@ -392,7 +401,10 @@ mod tests {
     fn qrels_referencing_an_unknown_query_id_is_an_error() {
         let queries = vec![("q1".to_string(), "known".to_string())];
         let mut qrels: Qrels = Qrels::new();
-        qrels.entry("ghost".to_string()).or_default().insert("d1".to_string(), 1.0);
+        qrels
+            .entry("ghost".to_string())
+            .or_default()
+            .insert("d1".to_string(), 1.0);
 
         let err = restrict_queries_to_qrels(queries, &qrels, Path::new(TEST_PATH)).unwrap_err();
         assert!(err.to_string().contains("ghost"));
