@@ -64,7 +64,8 @@ this gives them a number.
 - Queries are embedded through the same path as documents, so both share the disk cache.
   That means query vectors are document-tagged, not the query-tagged vectors Voyage's own
   published numbers were measured with, which costs a little nDCG relative to those
-  numbers: a reader comparing against Voyage's published figures needs this caveat.
+  numbers: a reader comparing against Voyage's published figures needs this caveat. The
+  size of that gap is not yet measured (`nidus-ocdm`).
 - Fusion runs at the shipped defaults: `rrf_k` 60, `candidates` 100, both weights 1.0.
 - Document text is the BEIR title and body concatenated.
 - A document counts as relevant for Recall@100 when its qrel score is above zero; nDCG
@@ -84,7 +85,7 @@ reproduction: BEIR's baseline runs Elasticsearch's default analysis, while nidus
 | ------------------ | :-----: | :--------: |
 | BM25 (BEIR paper)  |  0.665  |    n/a     |
 | FTS only           |  0.691  |   0.931    |
-| vector only        |  0.738  |   0.967    |
+| vector only        |  0.737  |   0.967    |
 | fusion (defaults)  |  0.761  |   0.973    |
 | fusion + rerank    |  0.809  |   0.973    |
 
@@ -95,8 +96,8 @@ reproduction: BEIR's baseline runs Elasticsearch's default analysis, while nidus
 | BM25 (BEIR paper)  |  0.325  |    n/a     |
 | FTS only           |  0.329  |   0.249    |
 | vector only        |  0.316  |   0.351    |
-| fusion (defaults)  |  0.384  |   0.352    |
-| fusion + rerank    |  0.432  |   0.352    |
+| fusion (defaults)  |  0.384  |   0.351    |
+| fusion + rerank    |  0.432  |   0.351    |
 
 **FiQA-2018**
 

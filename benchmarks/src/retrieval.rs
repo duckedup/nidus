@@ -170,9 +170,41 @@ impl LegRun {
 /// Embedded corpus vectors and embedded query vectors, in their datasets' own order.
 type Embeddings = (Vec<Vec<f32>>, Vec<Vec<f32>>);
 
+/// How many texts to hand `embed_batch` at once. The cache only learns vectors from a call
+/// that returns Ok, and the Voyage adapter internally splits one call into 128-text requests
+/// and drops every earlier one if a later fails, so this bounds what a failure can cost.
+const EMBED_CHECKPOINT: usize = 1024;
+
+/// Embed `texts` in `EMBED_CHECKPOINT`-sized slices, flushing the cache after each, so a
+/// failure partway through a 57k-document corpus keeps every slice already paid for.
+fn embed_checkpointed(
+    rt: &tokio::runtime::Runtime,
+    embedder: &nidus::embed::cache::CachedEmbedder<nidus::embed::AnyEmbedder>,
+    what: &str,
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>> {
+    let mut out = Vec::with_capacity(texts.len());
+    for slice in texts.chunks(EMBED_CHECKPOINT) {
+        let refs: Vec<&str> = slice.iter().map(String::as_str).collect();
+        match rt.block_on(embedder.embed_batch(&refs)) {
+            Ok(v) => out.extend(v),
+            Err(e) => {
+                // Keep what the earlier slices already bought before surfacing the failure.
+                let _ = embedder.save();
+                return Err(anyhow!(
+                    "embedding {what} ({} of {} done): {e}",
+                    out.len(),
+                    texts.len()
+                ));
+            }
+        }
+        embedder.save()?;
+    }
+    Ok(out)
+}
+
 /// Embed a dataset's corpus and query texts through `embedder`'s document path (see
-/// `embed_cache`'s module docs for why queries use `embed_batch`, not `embed_query`), saving
-/// as soon as each half succeeds so a later failure never throws away spend already made.
+/// `embed_cache`'s module docs for why queries use `embed_batch`, not `embed_query`).
 fn embed_all(
     rt: &tokio::runtime::Runtime,
     embedder: &nidus::embed::cache::CachedEmbedder<nidus::embed::AnyEmbedder>,
@@ -180,27 +212,9 @@ fn embed_all(
     doc_texts: &[String],
     query_texts: &[String],
 ) -> Result<Embeddings> {
-    let doc_refs: Vec<&str> = doc_texts.iter().map(String::as_str).collect();
-    let doc_vectors = match rt.block_on(embedder.embed_batch(&doc_refs)) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = embedder.save();
-            return Err(anyhow!("embedding {dataset} corpus: {e}"));
-        }
-    };
-    embedder.save()?;
-
-    let query_refs: Vec<&str> = query_texts.iter().map(String::as_str).collect();
-    let query_vectors = match rt.block_on(embedder.embed_batch(&query_refs)) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = embedder.save();
-            return Err(anyhow!("embedding {dataset} queries: {e}"));
-        }
-    };
-    embedder.save()?;
-
-    Ok((doc_vectors, query_vectors))
+    let docs = embed_checkpointed(rt, embedder, &format!("{dataset} corpus"), doc_texts)?;
+    let queries = embed_checkpointed(rt, embedder, &format!("{dataset} queries"), query_texts)?;
+    Ok((docs, queries))
 }
 
 /// Build the one store this dataset shares across all four legs: a single collection

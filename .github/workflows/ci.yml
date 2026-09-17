@@ -385,6 +385,13 @@ jobs:
       # since it needs network and a paid, live VOYAGE_API_KEY.
       - if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
         run: cargo clippy -p nidus-bench --all-targets --features server,retrieval -- -D warnings
+      # The bench BINARIES are never run here, but the bench crate's unit tests are: the
+      # BEIR retrieval lane's nDCG, qrels-join and relevance-threshold tests are the only
+      # check on whether the published retrieval numbers are computed correctly, and
+      # nidus-bench is not a workspace default member, so `just test` never reaches them.
+      # These are pure logic over inline fixtures: no network, no API key, milliseconds.
+      - if: ${{ env.QUEUE_LITE != 'true' && env.SKIP_LANE != 'true' }}
+        run: cargo test -p nidus-bench --features retrieval
 
   # Build-thesis guard (epic nidus-54l, D0015): `--no-default-features` gives the lean
   # library build, and `default = ["serve"]` ships the whole AI ingest layer plus the
