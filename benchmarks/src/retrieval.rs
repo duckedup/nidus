@@ -387,6 +387,7 @@ fn write_json(
     path: &std::path::Path,
     args: &Args,
     fusion: &HybridOpts,
+    fusion_reranked: &HybridOpts,
     nidus_version: &str,
     cells: &[Json],
 ) -> Result<()> {
@@ -402,6 +403,10 @@ fn write_json(
             "threshold": args.threshold, "cache": args.cache.display().to_string(),
             "embed_provider": EMBED_PROVIDER, "embed_model": EMBED_MODEL,
             "rerank_provider": RERANK_PROVIDER, "rerank_model": RERANK_MODEL,
+            // The rerank leg's depth multiplier. Recorded because it is the difference
+            // between reranking the `recall_k` candidates and reranking ten times as many,
+            // so a run at another value is not comparable with this one.
+            "rerank_overscan": fusion_reranked.rerank.as_ref().map(|r| r.overscan),
             "rrf_k": fusion.rrf_k, "candidates": fusion.candidates,
             "vector_weight": fusion.vector_weight, "text_weight": fusion.text_weight,
         },
@@ -499,7 +504,7 @@ fn run() -> Result<ExitCode> {
     }
 
     if let Some(path) = &args.json {
-        write_json(path, &args, &fusion, &nidus_version, &cells)?;
+        write_json(path, &args, &fusion, &fusion_reranked, &nidus_version, &cells)?;
     }
 
     Ok(ExitCode::SUCCESS)
