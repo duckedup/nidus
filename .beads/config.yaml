@@ -56,3 +56,5 @@
 # sync.remote: "git+ssh://git@github.com/duckedup/nidus.git"
 
 export.git-add: false
+sync:
+    remote: "git+ssh://git@github.com/duckedup/nidus.git"
