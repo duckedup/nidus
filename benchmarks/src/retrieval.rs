@@ -34,6 +34,7 @@ const VOYAGE_API_KEY_VAR: &str = "VOYAGE_API_KEY";
 
 // ── args ─────────────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 struct Args {
     datasets: Vec<&'static str>,
     top_k: usize,
@@ -160,6 +161,9 @@ impl LegRun {
     }
 }
 
+/// Embedded corpus vectors and embedded query vectors, in their datasets' own order.
+type Embeddings = (Vec<Vec<f32>>, Vec<Vec<f32>>);
+
 /// Embed a dataset's corpus and query texts through `embedder`'s document path (see
 /// `embed_cache`'s module docs for why queries use `embed_batch`, not `embed_query`), saving
 /// as soon as each half succeeds so a later failure never throws away spend already made.
@@ -169,7 +173,7 @@ fn embed_all(
     dataset: &str,
     doc_texts: &[String],
     query_texts: &[String],
-) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+) -> Result<Embeddings> {
     let doc_refs: Vec<&str> = doc_texts.iter().map(String::as_str).collect();
     let doc_vectors = match rt.block_on(embedder.embed_batch(&doc_refs)) {
         Ok(v) => v,
