@@ -105,9 +105,9 @@ one binary:
    once ANN composes with named vectors.
 
 **What this does NOT prove.** Retrieval *quality* (nDCG@10, Recall@100 against labeled
-relevance judgements) is unmeasured here — that needs a labeled corpus (`nidus-yq9p.5`, BEIR
-subset, open and unbuilt). This suite proves named vectors are fast enough and
-approximation-safe; it does not prove records are retrieved *better*.
+relevance judgements) is covered separately, by `bench-retrieval` below, not by this suite.
+This suite proves named vectors are fast enough and approximation-safe; it does not prove
+records are retrieved *better*.
 
 ### Baselines
 
@@ -118,6 +118,34 @@ just bench-named json=benchmarks/baselines/named-<version>.json   # record
 Same convention as `bench-write`'s baselines: the file records the *inputs* next to the
 results, and a comparison only means something **on the same box** and against a baseline
 recorded with the same knobs.
+
+## BEIR retrieval quality
+
+```bash
+just bench-retrieval                                          # all three datasets
+just bench-retrieval dataset=scifact                          # one dataset
+```
+
+`bench-retrieval` (`nidus-yq9p.5`) answers whether nidus's results are good, not just fast.
+It runs against real labeled relevance judgements (BEIR's qrels) rather than synthetic
+data, which makes it the only bench here that does. Per dataset (SciFact, NFCorpus,
+FiQA-2018), it reports nDCG@10 and Recall@100 for four legs: FTS only, vector only, RRF
+fusion at the shipped defaults (`rrf_k` 60, `candidates` 100, both weights 1.0), and fusion
+plus rerank, embedding through Voyage `voyage-4` and reranking with `rerank-2.5`.
+
+It requires a live `VOYAGE_API_KEY` and network access, and downloads roughly 60k
+documents' worth of corpora on first run. Corpora and embeddings cache under
+`benchmarks/.cache/` (gitignored), so a rerun costs no API calls.
+
+**What this does NOT prove.** Three small English datasets, one embedding model, and one
+recorded run on one developer machine. Nothing in CI re-verifies these numbers
+(`nidus-yq9p.7` will add floors); a rerun is the only way to check they still hold.
+
+### Baselines
+
+```bash
+just bench-retrieval json=benchmarks/baselines/retrieval-<dataset>-<version>.json   # record
+```
 
 ## Single-writer ingest decomposition
 

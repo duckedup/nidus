@@ -12,6 +12,18 @@ pub mod engines;
 pub mod metrics;
 pub mod report;
 
+/// Retrieval-quality metrics (nDCG@10 and the qrels adapter for `recall_at_k`). Pure math,
+/// no IO, so it is NOT feature-gated: its tests run in every `cargo test -p nidus-bench`.
+pub mod qmetrics;
+
+/// BEIR dataset download, cache and parse (nidus-yq9p.5).
+#[cfg(feature = "retrieval")]
+pub mod beir;
+
+/// Disk-backed Voyage embedder for the retrieval bench.
+#[cfg(feature = "retrieval")]
+pub mod embed_cache;
+
 /// A live `nidus serve` child — shared by the HTTP engine adapter and the write-path
 /// decomposition bench.
 #[cfg(feature = "server")]

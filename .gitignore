@@ -16,6 +16,12 @@
 # Stray store directories/files created by examples or local experiments
 *.nidus
 
+# ── benchmark caches ─────────────────────────────────────────────────────────
+# Downloaded BEIR corpora and cached embeddings (nidus-yq9p.5). Large, re-fetchable,
+# and the embeddings cost money to regenerate, which is exactly why they are cached
+# and exactly why they are not committed.
+/benchmarks/.cache/
+
 # ── Editors / OS ─────────────────────────────────────────────────────────────
 .DS_Store
 *.swp
