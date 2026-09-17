@@ -42,10 +42,8 @@ struct Args {
     threshold: f32,
     cache: PathBuf,
     json: Option<PathBuf>,
-    /// Minimum gap between rerank calls. Voyage meters rerank-2.5 on a tokens-per-minute
-    /// budget, and one query reranks `candidates` documents, so an unpaced loop saturates
-    /// the minute window and then fails outright: the library's 1s/2s/4s retry cannot
-    /// outwait a limit that only resets on the minute.
+    /// Minimum gap between rerank calls, to stay under Voyage's tokens-per-minute budget
+    /// for rerank-2.5. An unpaced loop saturates the window and the retry cannot outwait it.
     rerank_delay_ms: u64,
 }
 
@@ -444,17 +442,9 @@ fn run() -> Result<ExitCode> {
     let nidus_version = std::env::var("NIDUS_VERSION").unwrap_or_else(|_| "unknown".into());
     let text_attr = RerankOpts::default().text_attr;
     let fusion = fusion_opts(args.recall_k);
-    // Same base as the RRF-only leg (`fusion_opts`'s untouched-default knobs plus the
-    // `recall_k`-sized `top_k`/`candidates` both legs need) — `rerank` is the only field
-    // that differs between the two hybrid legs.
-    //
-    // `overscan: 1`, NOT the default 10. `hybrid_reranked` widens the fetch to
-    // `top_k * overscan` (src/rerank/apply.rs:121-127), and `top_k` here is already
-    // `recall_k`, so the default would rerank 1000 documents per query: ~250k tokens
-    // against Voyage's 2M-per-minute rerank budget, which no pacing can absorb. Reranking
-    // exactly the `recall_k` fusion candidates is also the standard BEIR rerank protocol.
-    // Consequence, stated in the docs: this leg's Recall@100 equals the fusion leg's by
-    // construction, since reordering 100 candidates cannot change which 100 they are.
+    // Same base as the RRF-only leg; `rerank` is the only field that differs. `overscan: 1`,
+    // not the default 10: `hybrid_reranked` fetches `top_k * overscan` and `top_k` is already
+    // `recall_k`, so the default reranks 1000 docs a query. See nidus-yq9p.5.
     let fusion_reranked = HybridOpts {
         rerank: Some(RerankOpts {
             overscan: 1,
