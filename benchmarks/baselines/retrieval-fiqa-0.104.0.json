@@ -1,0 +1,48 @@
+{
+  "bench": "nidus-bench-retrieval",
+  "cells": [
+    {
+      "bm25_reference_ndcg_at_10": 0.236,
+      "candidates_used": 100,
+      "dataset": "fiqa",
+      "doc_count": 57638,
+      "legs": {
+        "fts_only": {
+          "ndcg_at_10": 0.2532113711561291,
+          "recall_at_100": 0.5606372665400445
+        },
+        "fusion_and_rerank": {
+          "ndcg_at_10": 0.5452630232786584,
+          "recall_at_100": 0.7051983938558017
+        },
+        "rrf_fusion": {
+          "ndcg_at_10": 0.39270983532533543,
+          "recall_at_100": 0.7051983938558017
+        },
+        "vector_only": {
+          "ndcg_at_10": 0.2877631095239283,
+          "recall_at_100": 0.6987546918102476
+        }
+      },
+      "query_count": 648
+    }
+  ],
+  "inputs": {
+    "cache": "benchmarks/.cache",
+    "candidates": 100,
+    "datasets": [
+      "fiqa"
+    ],
+    "embed_model": "voyage-4",
+    "embed_provider": "voyage",
+    "recall_k": 100,
+    "rerank_model": "rerank-2.5",
+    "rerank_provider": "voyage",
+    "rrf_k": 60.0,
+    "text_weight": 1.0,
+    "threshold": 0.0,
+    "top_k": 10,
+    "vector_weight": 1.0
+  },
+  "nidus_version": "0.104.0"
+}

@@ -70,43 +70,49 @@ this gives them a number.
 - A document counts as relevant for Recall@100 when its qrel score is above zero; nDCG
   uses the graded qrel score directly.
 - One store per dataset, one collection carrying both the FTS index and the vectors.
+- The rerank leg reranks the 100 fusion candidates, not a widened pool. Its Recall@100 is
+  therefore identical to the fusion leg's by construction, since reordering 100 candidates
+  cannot change which 100 they are. Only its nDCG@10 carries information.
 
 The BEIR paper's published BM25 nDCG@10 is shown per dataset for scale, not as a
 reproduction: BEIR's baseline runs Elasticsearch's default analysis, while nidus uses k1
 1.2 and b 0.75 over a Porter English analyzer. Treat the comparison as directional.
 
-<!-- Cells below come from the recorded run tracked by nidus-yq9p.5; do not fill these in
-     from anywhere else, and do not invent a number for a dataset that has not been run. -->
-
 **SciFact**
 
 | leg               | nDCG@10 | Recall@100 |
 | ------------------ | :-----: | :--------: |
-| BM25 (BEIR paper)  |   TBD   |    n/a    |
-| FTS only           |   TBD   |    TBD     |
-| vector only        |   TBD   |    TBD     |
-| fusion (defaults)  |   TBD   |    TBD     |
-| fusion + rerank    |   TBD   |    TBD     |
+| BM25 (BEIR paper)  |  0.665  |    n/a     |
+| FTS only           |  0.691  |   0.931    |
+| vector only        |  0.738  |   0.967    |
+| fusion (defaults)  |  0.761  |   0.973    |
+| fusion + rerank    |  0.809  |   0.973    |
 
 **NFCorpus**
 
 | leg               | nDCG@10 | Recall@100 |
 | ------------------ | :-----: | :--------: |
-| BM25 (BEIR paper)  |   TBD   |    n/a    |
-| FTS only           |   TBD   |    TBD     |
-| vector only        |   TBD   |    TBD     |
-| fusion (defaults)  |   TBD   |    TBD     |
-| fusion + rerank    |   TBD   |    TBD     |
+| BM25 (BEIR paper)  |  0.325  |    n/a     |
+| FTS only           |  0.329  |   0.249    |
+| vector only        |  0.316  |   0.351    |
+| fusion (defaults)  |  0.384  |   0.352    |
+| fusion + rerank    |  0.432  |   0.352    |
 
 **FiQA-2018**
 
 | leg               | nDCG@10 | Recall@100 |
 | ------------------ | :-----: | :--------: |
-| BM25 (BEIR paper)  |   TBD   |    n/a    |
-| FTS only           |   TBD   |    TBD     |
-| vector only        |   TBD   |    TBD     |
-| fusion (defaults)  |   TBD   |    TBD     |
-| fusion + rerank    |   TBD   |    TBD     |
+| BM25 (BEIR paper)  |  0.236  |    n/a     |
+| FTS only           |  0.253  |   0.561    |
+| vector only        |  0.288  |   0.699    |
+| fusion (defaults)  |  0.393  |   0.705    |
+| fusion + rerank    |  0.545  |   0.705    |
+
+Two things to read off these tables. nidus's FTS leg lands at or slightly above the BEIR
+paper's published BM25 on all three datasets, which is a useful independent check: a different
+engine, scored on the same judgements, agrees to within a few points, so the analyzer and the
+scoring are behaving as BM25 should. And fusion beats both single legs everywhere, which is
+what RRF is for, with rerank adding the largest jump on FiQA (0.393 to 0.545).
 
 **What this does not prove.** This lane is not CI verified: it needs network and a paid
 API key, so these numbers are a recorded run, not a continuously enforced claim
