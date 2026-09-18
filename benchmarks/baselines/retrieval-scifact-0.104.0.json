@@ -1,0 +1,48 @@
+{
+  "bench": "nidus-bench-retrieval",
+  "cells": [
+    {
+      "bm25_reference_ndcg_at_10": 0.665,
+      "candidates_used": 100,
+      "dataset": "scifact",
+      "doc_count": 5183,
+      "legs": {
+        "fts_only": {
+          "ndcg_at_10": 0.6908371725943065,
+          "recall_at_100": 0.9308888888888889
+        },
+        "fusion_and_rerank": {
+          "ndcg_at_10": 0.8089389301916309,
+          "recall_at_100": 0.9733333333333334
+        },
+        "rrf_fusion": {
+          "ndcg_at_10": 0.7609627784466013,
+          "recall_at_100": 0.9733333333333334
+        },
+        "vector_only": {
+          "ndcg_at_10": 0.737459020262512,
+          "recall_at_100": 0.9666666666666667
+        }
+      },
+      "query_count": 300
+    }
+  ],
+  "inputs": {
+    "cache": "benchmarks/.cache",
+    "candidates": 100,
+    "datasets": [
+      "scifact"
+    ],
+    "embed_model": "voyage-4",
+    "embed_provider": "voyage",
+    "recall_k": 100,
+    "rerank_model": "rerank-2.5",
+    "rerank_provider": "voyage",
+    "rrf_k": 60.0,
+    "text_weight": 1.0,
+    "threshold": 0.0,
+    "top_k": 10,
+    "vector_weight": 1.0
+  },
+  "nidus_version": "0.104.0"
+}

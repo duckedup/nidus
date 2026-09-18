@@ -489,6 +489,26 @@ bench-write *ARGS:
         cargo run -p nidus-bench --release --features server \
         --bin nidus-bench-write -- {{ARGS}}
 
+# BEIR retrieval quality (nidus-yq9p.5): nDCG@10 and Recall@100 over SciFact, NFCorpus and
+# FiQA-2018 for four legs (FTS only, vector only, RRF fusion at the shipped defaults, fusion
+# + rerank), against the BEIR paper's published BM25 numbers. Downloads the corpora on first
+# run and caches them plus the embeddings under benchmarks/.cache/ (gitignored).
+# REQUIRES a live VOYAGE_API_KEY and network. Never run in CI.
+#   just bench-retrieval                                  all three datasets
+#   just bench-retrieval dataset=scifact                  one dataset
+#   just bench-retrieval json=benchmarks/baselines/retrieval-scifact-<version>.json
+bench-retrieval *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NIDUS_VERSION="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')" \
+        cargo run -p nidus-bench --release --features retrieval \
+        --bin nidus-bench-retrieval -- {{ARGS}}
+
+# Compile + lint the benchmark crate, every feature the CI bit-rot guard covers. The
+# benchmarks themselves are never run here; this is the loop for editing them.
+bench-check:
+    cargo clippy -p nidus-bench --all-targets --features server,retrieval -- -D warnings
+
 # nidus-internal regression benchmarks (criterion); compares against saved baselines.
 # Targets the criterion bench directly so harness args reach it (the lib's libtest
 # harness would otherwise reject them).

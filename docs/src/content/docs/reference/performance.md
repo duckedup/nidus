@@ -50,6 +50,82 @@ going 8× deeper (50 → 400) costs about 1.3×, so buying fusion recall is chea
 it as that with/without delta rather than an absolute, and note it is
 single-threaded (`query_threads` unset).
 
+## Retrieval quality
+
+Speed numbers say nothing about whether the results are any good. This section measures
+that directly: nDCG@10 and Recall@100 over three BEIR datasets (SciFact, NFCorpus,
+FiQA-2018), for four legs (FTS only, vector only, RRF fusion at the shipped defaults, and
+fusion plus rerank). Fusion weights and analyzer choices were previously tuned by feel;
+this gives them a number.
+
+**Methodology**, so the table below is reproducible from this page alone:
+
+- Embeddings: Voyage `voyage-4` (1024 dimensions). Rerank: Voyage `rerank-2.5`.
+- Queries are embedded through the same path as documents, so both share the disk cache.
+  That means query vectors are document-tagged, not the query-tagged vectors Voyage's own
+  published numbers were measured with, which costs a little nDCG relative to those
+  numbers: a reader comparing against Voyage's published figures needs this caveat. The
+  size of that gap is not yet measured (`nidus-ocdm`).
+- Fusion runs at the shipped defaults: `rrf_k` 60, `candidates` 100, both weights 1.0.
+- Document text is the BEIR title and body concatenated.
+- A document counts as relevant for Recall@100 when its qrel score is above zero; nDCG
+  uses the graded qrel score directly.
+- One store per dataset, one collection carrying both the FTS index and the vectors.
+- The rerank leg reranks the 100 fusion candidates, not a widened pool. Its Recall@100 is
+  therefore identical to the fusion leg's by construction, since reordering 100 candidates
+  cannot change which 100 they are. Only its nDCG@10 carries information.
+
+The BEIR paper's published BM25 nDCG@10 is shown per dataset for scale, not as a
+reproduction: BEIR's baseline runs Elasticsearch's default analysis, while nidus uses k1
+1.2 and b 0.75 over a Porter English analyzer. Treat the comparison as directional.
+
+**SciFact**
+
+| leg               | nDCG@10 | Recall@100 |
+| ------------------ | :-----: | :--------: |
+| BM25 (BEIR paper)  |  0.665  |    n/a     |
+| FTS only           |  0.691  |   0.931    |
+| vector only        |  0.737  |   0.967    |
+| fusion (defaults)  |  0.761  |   0.973    |
+| fusion + rerank    |  0.809  |   0.973    |
+
+**NFCorpus**
+
+| leg               | nDCG@10 | Recall@100 |
+| ------------------ | :-----: | :--------: |
+| BM25 (BEIR paper)  |  0.325  |    n/a     |
+| FTS only           |  0.329  |   0.249    |
+| vector only        |  0.316  |   0.351    |
+| fusion (defaults)  |  0.384  |   0.351    |
+| fusion + rerank    |  0.432  |   0.351    |
+
+**FiQA-2018**
+
+| leg               | nDCG@10 | Recall@100 |
+| ------------------ | :-----: | :--------: |
+| BM25 (BEIR paper)  |  0.236  |    n/a     |
+| FTS only           |  0.253  |   0.561    |
+| vector only        |  0.288  |   0.699    |
+| fusion (defaults)  |  0.393  |   0.705    |
+| fusion + rerank    |  0.545  |   0.705    |
+
+Two things to read off these tables. nidus's FTS leg lands at or slightly above the BEIR
+paper's published BM25 on all three datasets, which is a useful independent check: a different
+engine, scored on the same judgements, agrees to within a few points, so the analyzer and the
+scoring are behaving as BM25 should. And fusion beats both single legs everywhere, which is
+what RRF is for, with rerank adding the largest jump on FiQA (0.393 to 0.545).
+
+**Reproducibility.** Embeddings are cached on disk per dataset, so a rerun against a warm
+cache reproduces these numbers exactly. A rerun against a cold cache re-fetches the vectors,
+and Voyage does not guarantee bit-identical embeddings, so the last digit can move by about
+0.001. The FTS leg uses no API and is exactly reproducible either way.
+
+**What this does not prove.** This lane is not CI verified: it needs network and a paid
+API key, so these numbers are a recorded run, not a continuously enforced claim
+(`nidus-yq9p.7` will add floors against them). And three small datasets in English are not
+a general retrieval-quality claim; they say fusion beats either leg alone on these corpora,
+nothing broader.
+
 ## Why it's fast
 
 The scoring kernel is plain safe Rust the optimizer can vectorize:
@@ -149,6 +225,7 @@ just bench-quant                # int8 quantization recall & speed sweep
 just bench-crit parallel_search # query_threads scaling (criterion)
 cargo bench -p nidus-bench --bench nidus_regression -- 'text_search|hybrid|rank_by'
                                  # text search, hybrid, and rank_by (criterion)
+just bench-retrieval            # BEIR retrieval quality (needs VOYAGE_API_KEY and network)
 ```
 
 The heavy DuckDB/LanceDB dependencies are **quarantined off nidus's own build

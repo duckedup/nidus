@@ -42,6 +42,14 @@ path = "src/named.rs"
 name = "nidus-bench-write"
 path = "src/write.rs"
 
+# BEIR retrieval quality (nidus-yq9p.5): nDCG@10 and Recall@100 for FTS, vector, RRF
+# fusion and fusion + rerank. Needs network and a live VOYAGE_API_KEY, so it is behind
+# the `retrieval` feature and is never run in CI.
+[[bin]]
+name = "nidus-bench-retrieval"
+path = "src/retrieval.rs"
+required-features = ["retrieval"]
+
 [dependencies]
 # `default-features = false`: this crate quarantines heavy deps (DuckDB, LanceDB)
 # behind explicit opt-in features, so it must not inherit nidus's full `serve` tree.
@@ -55,6 +63,10 @@ tempfile = "3"
 # default bench build stays library-only. Same crate nidus itself already uses for
 # its object-store backends, so this adds nothing new to the tree.
 ureq = { version = "3", optional = true }
+
+# BEIR datasets ship as zips (nidus-yq9p.5). Optional, `retrieval`-gated: D0005's build
+# budget gates `cargo tree -p nidus` only, not this quarantined bench crate.
+zip = { version = "8", optional = true, default-features = false, features = ["deflate"] }
 
 # Bundled DuckDB (compiles the C++ engine from source — self-contained, no system
 # libduckdb needed). `appender-arrow` enables Appender::append_record_batch, the only
@@ -97,4 +109,11 @@ lancedb = [
     "dep:arrow-schema",
     "dep:tokio",
     "dep:futures",
+]
+retrieval = [
+    "nidus/embed-voyage",
+    "nidus/rerank-voyage",
+    "dep:tokio",
+    "dep:ureq",
+    "dep:zip",
 ]
